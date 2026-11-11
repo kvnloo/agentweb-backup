@@ -1,4 +1,5 @@
 import { isEvaluationUser } from '../services/evaluationPolicy';
+import { mapCreateUserError } from "../utils/createUserError";
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
@@ -2043,7 +2044,8 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     });
   } catch (error) {
     console.error("Error creating user from waitlist:", error);
-    res.status(500).json({ message: "Error creating user" });
+    const mapped = mapCreateUserError(error);
+    res.status(mapped.status).json(mapped.body);
   }
 });
 

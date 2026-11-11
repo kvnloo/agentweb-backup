@@ -1,3 +1,4 @@
+import { fitGateOf, LeadFitGateConfig } from './leadFitGate';
 /** Server-assigned provenance, separate from untrusted lead/form fields. */
 export const LEAD_ORIGINS = ['form_fill', 'booking', 'linkedin', 'enrichment_import', 'manual', 'integration'] as const;
 export type LeadOrigin = typeof LEAD_ORIGINS[number];
@@ -30,6 +31,8 @@ export interface LeadNotificationsConfig {
   mentions?: string[];
   /** Deprecated; only noemail+*@waterheater.app placeholders are hidden. */
   excludeEmailPatterns?: string[];
+  /** ENG-2876: opt-in LLM junk filter for notifications only (dark by default). */
+  fitGate?: LeadFitGateConfig;
 }
 const record = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
 const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string' && x.trim().length > 0);
@@ -41,5 +44,8 @@ export function configOf(value: unknown): LeadNotificationsConfig | undefined {
   }
   if (value.mentions?.some((id: string) => !/^[UW][A-Z0-9]+$/.test(id))) return;
   if (value.leadTypes !== undefined && !isLeadTypes(value.leadTypes)) return;
-  return value as unknown as LeadNotificationsConfig;
+  // A malformed fitGate never disables notifications; it just leaves the gate off.
+  const { fitGate, ...rest } = value;
+  const gate = fitGateOf(fitGate);
+  return (gate ? { ...rest, fitGate: gate } : rest) as unknown as LeadNotificationsConfig;
 }

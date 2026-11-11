@@ -515,6 +515,18 @@ interface BrandBuildSessionGuard {
   userWrite: (patch: Record<string, unknown>) => Promise<any>;
   /** Org-level writes cannot be conditioned on the user's claim, so re-check it consistently just before. */
   assertStillCurrent: () => Promise<void>;
+  /**
+   * ENG-2875: true while this is the automated brand-build turn (current claim,
+   * and either the build is still running or no human has written in the
+   * session yet). A later tool call in the same automated turn stays additive
+   * even after an earlier call flipped the status to ready.
+   */
+  automatedTurn: boolean;
+  /**
+   * ENG-2875: the session history needed to decide automatedTurn could not be
+   * read. Founder updates must fail (retryable) rather than guess.
+   */
+  historyReadFailed: boolean;
 }
 
 /**
@@ -588,9 +600,32 @@ async function guardBrandBuildSession(
   // old session reopened later: ordinary chat, so no claim condition either.
   const claim = !refuse && sessionClaim && sessionClaim === currentStartedAt ? sessionClaim : undefined;
 
+  // ENG-2875: once the build is ready, a current-claim session is still the
+  // automated turn until a human writes in it. Unknown history defaults to
+  // automated (additive); an unreadable history fails founder updates instead.
+  let turnHumanMessages: number | undefined;
+  let historyReadFailed = false;
+  if (claim && user?.brandBuildStatus !== 'building') {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      turnHumanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
+    } catch (historyErr: any) {
+      console.warn('[brandBuild] session history read failed; founder updates in this call will be refused', {
+        userId,
+        error: historyErr?.message ?? String(historyErr),
+      });
+      historyReadFailed = true;
+      turnHumanMessages = 0;
+    }
+  }
+  const automatedTurn = isScrapeFounderWrite(claim, user?.brandBuildStatus, turnHumanMessages);
+
   return {
     refuse,
     claim,
+    automatedTurn,
+    historyReadFailed,
     userWrite: async (patch) => {
       if (!claim) return userDb.updateUser(userId, patch as any);
       try {
@@ -608,6 +643,89 @@ async function guardBrandBuildSession(
       if (fresh && fresh.brandBuildStartedAt !== claim) throw new SupersededBrandBuildWrite();
     },
   };
+}
+
+/** ENG-2875: a founders entry without a non-blank name would silently drop. */
+export function hasBlankFounderName(founders: unknown[]): boolean {
+  return founders.some((f: any) => !f || typeof f.name !== 'string' || !f.name.trim());
+}
+
+/**
+ * ENG-2875: founders writes are additive only from the current brand-build
+ * session during its automated turn (the site scrape): while the build is
+ * running, or after it is ready but before any human message in the session.
+ * Once a user writes in that session, edits are ordinary (authoritative).
+ */
+export function isScrapeFounderWrite(
+  sessionClaim: string | undefined,
+  brandBuildStatus: unknown,
+  humanMessages?: number,
+): boolean {
+  if (!sessionClaim) return false;
+  if (brandBuildStatus === 'building') return true;
+  return humanMessages === 0;
+}
+
+/**
+ * ENG-2875: merge an incoming founders list onto the stored one.
+ * The incoming array is authoritative for membership (founders it omits are
+ * removed, order follows the incoming list); each incoming founder is
+ * shallow-merged onto the existing founder with the same normalized name so a
+ * partial update (e.g. only voiceExamples) keeps the untouched fields.
+ *
+ * With `additive: true` (the automated onboarding brand build, which only sees
+ * what a site scrape found) no stored founder is removed: matches are merged,
+ * new founders appended, and founders the incoming list omits are kept.
+ */
+export function mergeFounders(
+  existing: unknown,
+  incoming: unknown,
+  opts: { additive?: boolean } = {},
+): any[] {
+  const normalize = (name: any) => (typeof name === 'string' ? name.trim().toLowerCase() : '');
+  const existingFounders: any[] = Array.isArray(existing) ? existing : [];
+  const incomingFounders: any[] = Array.isArray(incoming) ? incoming : [];
+  // Index existing founders by normalized name once (first match wins).
+  const existingByName = new Map<string, any>();
+  for (const f of existingFounders) {
+    const k = f ? normalize(f.name) : '';
+    if (k && !existingByName.has(k)) existingByName.set(k, f);
+  }
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  for (const founder of incomingFounders) {
+    if (!founder || !founder.name) continue;
+    const key = normalize(founder.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const match = existingByName.get(key);
+    merged.push(match ? { ...match, ...founder } : founder);
+  }
+  if (!opts.additive) return merged;
+  // Additive: stored order kept, matched founders updated in place, omitted
+  // founders kept, new founders appended.
+  const mergedByName = new Map(merged.map(m => [normalize(m.name), m] as [string, any]));
+  const out = existingFounders.map(f => {
+    const k = f ? normalize(f.name) : '';
+    const m = k ? mergedByName.get(k) : undefined;
+    if (m) mergedByName.delete(k);
+    return m ?? f;
+  });
+  return [...out, ...merged.filter(m => !existingByName.has(normalize(m.name)))];
+}
+
+/**
+ * ENG-2875: founders update for update_brand_guidelines. An empty incoming
+ * list keeps the stored founders unless clearAll is set (models send
+ * `founders: []` as a default while editing other fields).
+ */
+export function resolveFounderUpdate(
+  existing: unknown,
+  incoming: unknown[],
+  opts: { additive?: boolean; clearAll?: boolean } = {},
+): any[] {
+  if (incoming.length === 0 && !opts.clearAll) return Array.isArray(existing) ? existing : [];
+  return mergeFounders(existing, incoming, { additive: opts.additive });
 }
 
 export async function updateBrandGuidelines(
@@ -628,9 +746,28 @@ export async function updateBrandGuidelines(
         };
       }
 
+      // ENG-2875: reject blank founder names before any write (incl. initial guidelines).
+      const incomingFoundersRaw = (updateData as any)?.brandData?.founders;
+      if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Every founder needs a non-empty name. To remove every founder, pass founders: [] with clearAllFounders: true.',
+          error: 'Invalid founders',
+        };
+      }
+
       // ENG-2308: refuse / condition writes from a superseded brand-build session.
       const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
       if (guard.refuse) return supersededResult();
+      // ENG-2875: without the session history we cannot tell a human removal
+      // from the automated scrape, so fail the founders update (retryable).
+      if (guard.historyReadFailed && Array.isArray(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Could not verify this session before changing founders. Retry the update.',
+          error: 'Session history unavailable',
+        };
+      }
       const userWrite = guard.userWrite;
       const sessionClaim = guard.claim;
 
@@ -698,7 +835,7 @@ export async function updateBrandGuidelines(
       }
 
       // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
-      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
+      const { brandData, brandAssets, refreshMarketStrategy, clearAllFounders, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -706,36 +843,21 @@ export async function updateBrandGuidelines(
         ...brandData
       } as any;
 
-      // Special merge logic for founder profiles (merge by normalized founder name)
+      // ENG-2875: a provided founders array is authoritative for membership;
+      // fields are merged onto matching existing founders by normalized name.
+      // The current onboarding brand-build session (sessionClaim set) is a
+      // site scrape, not a user edit, so it never removes stored founders.
+      // Only while the build is still running is the claimed session the
+      // scrape; a user reopening it after the build is ready edits normally.
       if (brandData && Array.isArray((brandData as any).founders)) {
-        const normalize = (name: any) =>
-          typeof name === 'string' ? name.trim().toLowerCase() : '';
-
-        const existingFounders: any[] = Array.isArray((existingBrand.brandData as any)?.founders)
-          ? (existingBrand.brandData as any).founders
-          : [];
-        const incomingFounders: any[] = (brandData as any).founders || [];
-
-        const mergedFounders: any[] = [...existingFounders];
-        for (const newFounder of incomingFounders) {
-          if (!newFounder || !newFounder.name) continue;
-          const key = normalize(newFounder.name);
-          if (!key) continue;
-
-          const idx = mergedFounders.findIndex(
-            f => f && normalize(f.name) === key
-          );
-          if (idx >= 0) {
-            // Merge fields so a partial update (e.g. only voiceExamples) preserves other fields
-            mergedFounders[idx] = { ...mergedFounders[idx], ...newFounder };
-          } else {
-            // Append as new founder
-            mergedFounders.push(newFounder);
-          }
-        }
-
-        // Assign the merged array back
-        updatedBrandData.founders = mergedFounders;
+        const incomingFounders: any[] = (brandData as any).founders;
+        // ENG-2875: an empty founders array alongside another edit is a model
+        // default, not a removal. Clearing every founder needs clearAllFounders.
+        updatedBrandData.founders = resolveFounderUpdate(
+          (existingBrand.brandData as any)?.founders,
+          incomingFounders,
+          { additive: guard.automatedTurn, clearAll: clearAllFounders === true },
+        );
       }
 
       // Reject SVG files for logo/secondaryLogo assets

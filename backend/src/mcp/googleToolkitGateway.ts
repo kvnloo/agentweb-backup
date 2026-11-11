@@ -20,7 +20,7 @@ import {
 import { executeGoogleToolkitWrite } from './googleToolkitWrites';
 import { GOOGLE_ADS_PROVIDER, resolveProviderAccount } from './zomaProviders';
 
-export { isGoogleToolkitTool };
+export { isGoogleToolkitTool, isGoogleGuardedWrite };
 
 export interface GoogleToolkitCaller {
   userId: string;

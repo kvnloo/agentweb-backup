@@ -20,6 +20,7 @@ import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { parseWithImagesQuery, applyWithImagesQuery } from '../utils/withImagesQuery';
 import { approvalDb } from '../services/approvalDb';
+import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, WorkspaceCaller } from '../utils/workspaceAssets';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -2070,8 +2071,14 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 export async function getExecutionsWithAssets(
   userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
-  errorMessage: string
+  errorMessage: string,
+  // ENG-2874: the html-reports read lazily backfills searchableText/reportType and
+  // writes it back to the owner's records (and bills the classifier call). Only the
+  // owner's own read may do that; teammate reads in the shared workspace must be
+  // read-only so they never rewrite another member's result_files or incur their LLM cost.
+  options: { backfill?: boolean } = {},
 ): Promise<Record<string, any>> {
+  const backfill = options.backfill !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2311,7 +2318,7 @@ export async function getExecutionsWithAssets(
   // Enrich HTML report result files with searchable text content (fire-and-forget —
   // the result object is mutated in-place, but we don't block the response on it;
   // cached values are already populated so this only runs for brand-new reports).
-  if (assetType === 'html-reports') {
+  if (assetType === 'html-reports' && backfill) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
@@ -2629,6 +2636,31 @@ function addCachedHtmlReportsToResult(
   }
 }
 
+// ENG-2874: creative library is workspace-wide. Same-org members see each
+// other's assets (stamped with createdBy); users without an org see their own.
+async function workspaceCallerFor(userId: string): Promise<WorkspaceCaller> {
+  try {
+    const user = await userDb.getUserById(userId);
+    return { userId, orgId: user?.orgId || undefined };
+  } catch (err) {
+    console.error('[ENG-2874] getUserById failed; falling back to own assets:', err);
+    return { userId };
+  }
+}
+
+async function getWorkspaceExecutionsWithAssets(
+  userId: string,
+  assetType: 'images' | 'videos' | 'html-reports',
+  errorMessage: string,
+): Promise<Record<string, any>> {
+  const caller = await workspaceCallerFor(userId);
+  return getWorkspaceAssets(caller, {
+    getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
+    fetchForUser: (memberId) =>
+      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId }),
+  });
+}
+
 // Get all executions with images for the current user
 router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -2644,15 +2676,17 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(400).json({ message: parsed.error });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
     if (!parsed) {
       return res.json(result);
     }
 
     let approvalStatusByUrl: Record<string, string | undefined> = {};
     if (parsed.approved) {
-      const approvals = await approvalDb.getApprovalsByUserId(userId);
-      approvalStatusByUrl = Object.fromEntries(approvals.map((a) => [a.assetUrl, a.status]));
+      const members = await resolveWorkspaceMembers(await workspaceCallerFor(userId), {
+        getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
+      });
+      approvalStatusByUrl = await getWorkspaceApprovalStatusByUrl(members, (id) => approvalDb.getApprovalsByUserId(id));
     }
     const { tasks, nextCursor, total } = applyWithImagesQuery(result, parsed, approvalStatusByUrl);
     // Paging metadata travels in headers so the body shape stays Record<taskId, task>.
@@ -2674,7 +2708,7 @@ router.get('/executions/with-videos', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with videos:', error);
@@ -2691,7 +2725,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
     res.json(buildHtmlReportsResponsePayload(result));
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);

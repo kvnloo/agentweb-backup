@@ -40,6 +40,7 @@ Reads work without a payment method. Changes to ads need a payment method on fil
 ## Reads
 - `list_meta_ads_campaigns`, `get_meta_ads_metrics`, `call_meta_ads_insights_api` for campaigns and performance.
 - `call_meta_marketing_api` with LIST / GET / PREVIEW / SEARCH / GET_MATCH_QUALITY.
+- Datasets (pixels) and conversions: `ads_get_datasets`, `ads_get_dataset_details`, `ads_get_dataset_stats`, `ads_pixel_event_read` (event rules), `ads_get_customconversions`. Pixel reads take `pixel_id` and only work for pixels in the selected ad account. If Meta refuses a read, the result has `success: false` with Meta's reason and an `errorClass`.
 - With more than one connected ad account, pass `account_id`.
 
 ## Creatives: upload your own images and videos
@@ -61,7 +62,11 @@ Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Can
 For a batch, repeat steps 1 to 3 for each file, then create one ad per creative. Tell the user what was created and leave everything paused.
 
 ## Writes (CAMPAIGN, AD_SET, AD)
-Allowed: CREATE, and UPDATE of `status` (ACTIVE or PAUSED) or budget. Not available: DELETE and custom audiences. Creatives are covered above.
+Allowed: CREATE, and UPDATE of these fields. Not available: DELETE and custom audiences. Creatives are covered above.
+- CAMPAIGN: `status`, `daily_budget`/`lifetime_budget`, `bid_strategy`, `spend_cap`.
+- AD_SET: `status`, budgets, `bid_amount`, `bid_strategy`, `targeting` (full spec, replaces the current one, so it must include the locations, e.g. `geo_locations: {countries: ["US"]}`; use `excluded_custom_audiences: [{id}]` to exclude audiences), `start_time`, `end_time` (ISO 8601).
+- AD: `status`, `name`, `creative_id` (swap in an existing creative; to change ad copy, create a new creative first, then swap it in).
+Change a budget or `spend_cap` in its own UPDATE (not even with `status`), and swap a creative (`creative_id`) in its own UPDATE; Zoma refuses mixing them with other edits. On an ACTIVE ad set, a `start_time`/`end_time` change is also its own UPDATE, because it can start delivery. Times need a timezone offset (e.g. `2026-12-01T09:00:00-0800`). The UPDATE preview lists every field as current → proposed. `bid_strategy` is one of LOWEST_COST_WITHOUT_CAP, LOWEST_COST_WITH_BID_CAP, COST_CAP; `bid_amount` and `spend_cap` are major units like budgets; `bid_amount` is 0.01–1,000 (as on create) and needs a capped `bid_strategy`.
 
 Every write is two calls to `call_meta_marketing_api`:
 1. Call WITHOUT `confirm`. Nothing changes. You get a PREVIEW and a `preview_token`.

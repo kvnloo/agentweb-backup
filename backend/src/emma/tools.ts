@@ -1988,13 +1988,13 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. FOUNDERS: omit founders unless you are changing founders. If you send founders, send the COMPLETE list — any stored founder you leave out is removed (fields you omit are kept for founders matched by name). An empty founders array is ignored unless clearAllFounders=true. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
         brandData: {
           type: 'object',
-          description: 'Brand data object with only the fields that need to be updated',
+          description: 'Brand data object with only the fields that need to be updated (founders, if sent, is the complete founder list — omitted founders are removed)',
           properties: {
             brandName: { type: 'string', description: 'Brand name' },
             tagline: { type: 'string', description: 'Brand tagline or slogan' },
@@ -2032,7 +2032,7 @@ emmaToolRegistry.register({
                 },
                 required: ['name']
               },
-              description: 'Array of founder profiles'
+              description: 'Complete list of founder profiles. This list replaces the stored founders: always include every founder that should remain (fields you omit are kept for founders matched by name); founders left out are removed.'
             }
           }
         },
@@ -2047,6 +2047,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        clearAllFounders: {
+          type: 'boolean',
+          description: 'Set true together with brandData.founders: [] only when the user explicitly asks to remove every founder profile.'
         },
         refreshMarketStrategy: {
           type: 'boolean',
@@ -9659,7 +9663,36 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    // ENG-2907: a non-Google URL (e.g. a luma.com page) used to be sent to Drive
+    // verbatim as a fileId, 404, and cluster as a config failure. Refuse it up front.
+    let raw = String(args.url_or_id ?? '').trim();
+    // Unwrap google.com/url?q=<target> redirect links (Opslane P2 on #3960) so a
+    // wrapped Docs link is read, and a wrapped non-Google link is still refused.
+    try {
+      const wrapped = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+      if (/^(www\.)?google\.com$/i.test(wrapped.hostname) && wrapped.pathname === '/url') {
+        const target = wrapped.searchParams.get('q') ?? wrapped.searchParams.get('url');
+        if (target) raw = target.trim();
+      }
+    } catch { /* not a URL; handled below */ }
+    // Drive file IDs are [A-Za-z0-9_-]+; anything with a scheme, '/' or '.' is a URL,
+    // including scheme-less pastes like "luma.com/event/..." (Opslane P1 on #3960).
+    const hasScheme = /^https?:\/\//i.test(raw);
+    if (hasScheme || /[./]/.test(raw)) {
+      let host = '';
+      try { host = new URL(hasScheme ? raw : `https://${raw}`).hostname.toLowerCase(); } catch { /* treated as non-Google below */ }
+      if (!/^(docs|drive|sheets)\.google\.com$/.test(host)) {
+        // blocked+reason marks this a by-design refusal (ToolResultPolicyBlockedError)
+        // so a retried bad URL does not trip the repeated-failure breaker (CodeRabbit #3960).
+        return {
+          success: false,
+          blocked: true,
+          reason: 'non_google_url',
+          message: `Not a Google Docs/Sheets/Drive URL (${host || raw}): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.`,
+        };
+      }
+    }
+    const fileId = raw.match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? raw;
     return googleDriveImpl.readGoogleFileById(fileId, context.userId);
   },
 });

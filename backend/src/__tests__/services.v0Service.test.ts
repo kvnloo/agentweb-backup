@@ -1189,6 +1189,35 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     );
   });
 
+  it("ENG-2896: expected base SHA mismatch throws BaseShaConflictError and writes nothing", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    await expect(
+      commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "other-sha")
+    ).rejects.toMatchObject({ name: "BaseShaConflictError", expectedSha: "other-sha", actualSha: "main-sha" });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
+  it("ENG-2896: matching expected base SHA commits normally", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "main-sha");
+    expect(res.pushedCommitSha).toBe("new-sha");
+  });
+
+  it("ENG-2896: a concurrent push after the check surfaces as a conflict on retry, not a rebase", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce(ref)
+      .mockResolvedValue({ data: { object: { sha: "moved-sha" } } });
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockRejectedValueOnce({ response: { status: 422, data: { message: "Update is not a fast forward" } } });
+    await expect(
+      commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "main-sha")
+    ).rejects.toMatchObject({ name: "BaseShaConflictError", actualSha: "moved-sha" });
+    expect(mockAxiosPatch).toHaveBeenCalledTimes(1);
+  });
+
   it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
     mockAxiosGet.mockResolvedValue(ref);
     mockAxiosPost.mockResolvedValue(post);

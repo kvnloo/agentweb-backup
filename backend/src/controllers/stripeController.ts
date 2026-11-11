@@ -26,6 +26,11 @@ import {
 } from '../services/stripeService';
 import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 import { emitStripeSignals, emitAccountSignal } from '../services/serverSignalEmitter';
+import {
+  InMemoryPaymentFeedbackAskLedger,
+  isPaymentFeedbackAskEnabled,
+  shouldSendPaymentFeedbackAsk,
+} from '../services/paymentFeedbackTrigger';
 
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -144,6 +149,7 @@ export async function handleWebhook(req: Request, res: Response) {
         await handleInvoicePaymentSucceeded(event.data.object);
         // A pay-as-you-go overage invoice is recorded by settlement under its own payment types.
         if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_succeeded');
+        logPaymentFeedbackAskDecision(event.data.object);
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event.data.object);
@@ -345,6 +351,21 @@ async function handleInvoicePayment(
     });
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record ${eventType}: ${err.message}`);
+  }
+}
+
+// ENG-2856: process-local idempotency; the dark trigger only logs, so a restart re-asking is harmless.
+const paymentFeedbackAskLedger = new InMemoryPaymentFeedbackAskLedger();
+
+/** ENG-2856: dark post-payment feedback-ask trigger. Logs the decision only; never throws into the webhook. */
+function logPaymentFeedbackAskDecision(invoice: unknown): void {
+  try {
+    const enabled = isPaymentFeedbackAskEnabled();
+    if (!enabled) return;
+    const decision = shouldSendPaymentFeedbackAsk(invoice, { enabled, ledger: paymentFeedbackAskLedger });
+    console.log('[PaymentFeedbackAsk] decision', JSON.stringify(decision));
+  } catch (err: any) {
+    console.error(`[PaymentFeedbackAsk] decision failed: ${err?.message || err}`);
   }
 }
 

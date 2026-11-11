@@ -39,6 +39,7 @@ import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAuto
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -58,6 +59,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './agentMode/core/termination';
 import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
+import { createSerialReadState, recordSerialReadStep, SERIAL_READ_BATCH_MESSAGE } from './agentMode/core/serialReadSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -3856,6 +3858,8 @@ export class AgentModeService {
       // same resource with varying offset/limit (which evades both signature checks) is seen.
       const pagingCallCounts = new Map<string, number>();
       let pagingSpiralNudged = false;
+      // ENG-2863: consecutive one-read-per-step streak; nudges the model to batch lookups.
+      const serialReadState = createSerialReadState();
       // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
       // Meta write that keeps failing the same way — see the annotation logic
       // below (and applyMetaWriteRetryBackstop's own header) for why this
@@ -5306,6 +5310,12 @@ export class AgentModeService {
           (messages as any[]).push({ role: 'system', content: PAGING_SPIRAL_STOP_MESSAGE });
         }
 
+        // ENG-2863: serial-read spiral — one independent read per step burns the step cap.
+        if (recordSerialReadStep(serialReadState, responseMessage.tool_calls)) {
+          console.warn(`AgentMode: Detected serial single-read steps in session ${sessionId}, injecting batch-lookups nudge`);
+          (messages as any[]).push({ role: 'system', content: SERIAL_READ_BATCH_MESSAGE });
+        }
+
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
 
@@ -5612,6 +5622,10 @@ export class AgentModeService {
         }
       }
 
+      if (truncatedByStepBudget && !wasCancelled) {
+        content = buildIterationLimitReport(content, toolCalls);
+      }
+
       // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
       // content-filter and time-budget texts are assigned to `content` after the
       // model's own (often empty) message was already appended, so the transcript
@@ -5670,6 +5684,7 @@ export class AgentModeService {
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
             ...(citations.length > 0 ? { citations } : {}),
             // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
             // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
@@ -15375,9 +15390,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
       // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
       const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
-      const changes = fields.flatMap(field => {
+      type BudgetChange = { field: string; severity: 'unknown' | 'critical' | 'warning' | 'normal'; ratio: number | null; prior: number | undefined; proposed: number | undefined };
+      const changes = fields.flatMap((field): BudgetChange[] => {
         const proposed = money.params[field];
         if (proposed === undefined) return [];
+        // A spend cap is a ceiling: adding one to an object Meta read back with no cap only
+        // restricts spend. Requires a real read-back (id present) so a failed read stays unknown.
+        if (field === 'spend_cap' && prior?.id && (prior[field] === undefined || prior[field] === null || prior[field] === '')) {
+          const capped = classifyMetaBudgetChange(proposed, proposed);
+          if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
+        }
         return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
@@ -15530,6 +15552,35 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** Read-only signals tools reuse the same account-bound credential resolver as other toolkit reads. */
+  public async readToolkitMetaSignals(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    return executeSignalsRead(name, args, credentials);
+  }
+
+  /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
+  public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeExperimentRead } = await import('../mcp/metaToolkitExperiments');
+    return executeExperimentRead(name, args, credentials);
+  }
+
+  /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
+  public async readToolkitMetaActivityLog(userId: string, args: any) {
+    const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
+    const { classifyMetaReadFailure } = await import('../utils/metaReadErrorClass');
+    let credentials: { accountId: string; accessToken: string };
+    try {
+      credentials = await this.getMetaCredentials(userId, args?.account_id);
+    } catch (error: any) {
+      // ENG-2921: an expired/missing Meta connection is a readable reconnect result, not a bare 500.
+      if (classifyMetaReadFailure(error).kind === 'credential') return metaReadFailureResult(error);
+      throw error;
+    }
+    return executeActivityLogRead(args, credentials);
+  }
+
   /**
    * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
    * selected ad account (a video id addresses a node globally). Returns Meta's preferred
@@ -15565,6 +15616,111 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
       ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
     };
+  }
+
+  /**
+   * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
+   * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
+   */
+  public async readToolkitMetaAccountGraph(
+    userId: string, account_id: string, edge: '' | 'adsets', params: Record<string, string>,
+  ): Promise<any> {
+    if (edge !== '' && edge !== 'adsets') throw new Error(`Unsupported account edge: ${edge}`);
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const path = `act_${accountId.replace(/^act_/, '')}${edge ? `/${edge}` : ''}`;
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2918: read-only Graph GET for the catalog tools. The path must be the caller's own
+   * account node or a numeric node's catalog edge; metaToolkitCatalogs enforces that catalog
+   * ids belong to the account's business before calling this.
+   */
+  public async readToolkitMetaCatalogGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))$/.test(path)) {
+      throw new Error('Unsupported catalog path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2920: read-only Graph GET for the Pages / Instagram / Ad Library tools. Paths are
+   * allow-listed; metaToolkitPages enforces id ownership against the account before calling.
+   */
+  public async readToolkitMetaPagesGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+(\/(promote_pages|instagram_accounts))?|\d+\/(owned_pages|client_pages|media)|me\/accounts|ads_archive)$/.test(path)) {
+      throw new Error('Unsupported Pages/Instagram path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const own = `act_${String(accountId).replace(/^act_/, '')}`;
+    if (path.startsWith('act_') && path.split('/')[0] !== own) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
+  public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    let creative: any;
+    try {
+      creative = await metaService.getAdCreative(accessToken, creativeId);
+    } catch (error: any) {
+      // Meta code 100 = the node does not exist or is not visible to this token: a real "not
+      // found". Anything else (5xx, rate limit, network) is a failed lookup, not a verdict.
+      const code = Number(error?.structuredError?.code ?? error?.response?.error?.code);
+      if (code === 100) throw error;
+      const failed: any = new Error(String(error?.structuredError?.error_user_msg || error?.message || 'Meta request failed'));
+      failed.creativeLookupFailed = true;
+      throw failed;
+    }
+    MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */

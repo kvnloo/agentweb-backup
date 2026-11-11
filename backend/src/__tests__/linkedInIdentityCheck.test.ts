@@ -366,3 +366,14 @@ describe('verifyLinkedInIdentityForSend (shared guard)', () => {
     }));
   });
 });
+
+describe('crossCheckProfileIdentity — compound name split (ENG-2870)', () => {
+  it('does not refuse the identical full name split differently across provider and CRM', () => {
+    const { crossCheckProfileIdentity } = require('../services/linkedInIdentityCheck');
+    const r = crossCheckProfileIdentity(
+      { first_name: 'Diego', last_name: 'Javier Llorente', work_experience: [{ company: 'GRUPO CETROGAR' }] },
+      { firstName: 'Diego Javier', lastName: 'Llorente', company: 'GRUPO CETROGAR' },
+    );
+    expect(r.verdict).toBe('match');
+  });
+});

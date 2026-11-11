@@ -15,7 +15,6 @@
 
 import type { ConnectedAccount } from './connectedAccountsDb';
 import { metaService } from './metaService';
-import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { TOKEN_ALERT_CLASS } from './metaTrackingMonitor';
 
 /** At most one handoff per account per day; the cron runs every 12h. */
@@ -87,42 +86,35 @@ export function metaAccountAlertContext(accountId: string): Record<string, strin
   return { 'Alert Class': TOKEN_ALERT_CLASS, 'Alert Scope': `meta-ad-account:${accountId}` };
 }
 
-/** Raise the handoff. Returns true only when an alert was actually delivered. Never throws. */
+/**
+ * Raise the handoff. Returns true only when an alert was actually delivered. Never throws.
+ *
+ * Harsha 2026-11-07: alert ONLY when a connection that existed is now gone (token expired or
+ * rejected as dead). An in-date re-exchange failure or a reconnect read-back failure is not a
+ * lost connection — log it, do not alert. The alert carries facts only (no guessed next actor)
+ * and goes to the Meta connection list, not oncall/founders.
+ */
 export async function raiseMetaConnectionHandoff(input: MetaHandoffInput): Promise<boolean> {
   const decision = decideMetaHandoff(input);
   const who = input.customerEmail || input.userId;
   const accountLabel = `${input.account.account_name || 'Meta ad account'} (${input.account.account_id})`;
   const expiresAt = (input.account.config as any)?.token_expires_at as number | undefined;
-  const headline =
-    input.reason === 'reconnect_readback_failed'
-      ? 'reconnect did not restore access'
-      : decision.expired
-        ? 'token expired'
-        : 'token refresh failed';
-
+  const connectionLost =
+    input.reason === 'refresh_failed' && (decision.expired || isMetaTokenDeadError(input.error));
+  if (!connectionLost) {
+    console.warn(`[MetaConnectionHandoff] ${input.reason} for ${who} ${accountLabel} (not alerted): ${input.error}`);
+    return false;
+  }
   try {
-    return await sendAgentModeOncallAlert({
-      subject: `Meta connection: ${who} — ${accountLabel} ${headline}`,
-      message:
-        `Customer: ${who}\n` +
-        `Account: ${accountLabel}\n` +
-        `Token expires: ${expiresAt ? new Date(expiresAt).toISOString() : 'unknown'}\n` +
-        `Error: ${input.error}\n\n` +
-        `Next actor: ${decision.nextActor} — ${decision.action}`,
+    const { sendMetaConnectionExpiredAlert } = await import('./metaConnectionExpiredAlert');
+    return await sendMetaConnectionExpiredAlert({
+      accountId: String(input.account.account_id),
+      accountName: input.account.account_name,
+      customerEmail: input.customerEmail,
       userId: input.userId,
-      dedupeKey: `meta-connection:${input.userId}:${input.account.account_id}:${input.reason}`,
-      dedupeWindowMs: META_HANDOFF_DEDUPE_WINDOW_MS,
+      expiredAt: expiresAt,
+      error: input.error,
       now: input.now,
-      context: {
-        // ENG-2442: share the tracking monitor's per-account canonical (class + scope), so a
-        // handoff re-fire for an account whose 'cannot be read — token invalid' issue is already
-        // open lands on THAT issue as a recurrence instead of filing a parallel one each tick.
-        ...metaAccountAlertContext(input.account.account_id),
-        userId: input.userId,
-        accountId: input.account.account_id,
-        reason: input.reason,
-        nextActor: decision.nextActor,
-      },
     });
   } catch (error) {
     console.error(`[MetaConnectionHandoff] Failed to raise handoff for ${who} ${accountLabel}:`, error);

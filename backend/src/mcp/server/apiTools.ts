@@ -12,10 +12,12 @@ import { carryStoredStepModels } from '../../services/agentMode/workPlanStepMode
  * No direct service calls — all tools route through the REST API.
  */
 
+import { createHash } from 'node:crypto';
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import './readEmailTool';
+import './conversionSummaryTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1135,6 +1137,59 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM lead-list CSV export, own account only (ENG-2867) ──────────────────
+//
+// Thin wrappers over POST /api/crm/lists/:listId/leads/export and
+// GET /api/crm/lists/:listId/export-history. The route owns everything that
+// matters: list ownership/sharing checks (canDestructiveCrmList /
+// canAccessCrmList), Enigma card-revenue stripping, export-history record.
+// The tool deliberately takes no client_id/user override — identity is always
+// the calling key's runtime identity via ctx(context).
+
+function requireListId(raw: unknown): string | null {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id ? encodeURIComponent(id) : null;
+}
+
+mcpToolRegistry.register({
+  name: 'export_lead_list',
+  definition: {
+    name: 'export_lead_list',
+    description: 'Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID to export' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads/export`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_lead_list_exports',
+  readOnly: true,
+  definition: {
+    name: 'list_lead_list_exports',
+    description: 'List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/export-history`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
@@ -1872,6 +1927,223 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Knowledge base text-file writes, own account only (ENG-2892) ───────────
+//
+// Thin wrappers over the existing KB write routes (POST /api/emma/
+// create-knowledge-base, /attach-knowledge-base-files, /update-knowledge-base-
+// file and DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey). No new
+// storage: the routes own the GCS write and the task record.
+//
+// Ownership is decided here, not by the routes: the delete route also admits
+// admins and org editors, and getTask admits org viewers. These tools act only
+// on a KB whose owner is the calling key's runtime identity, and answer a
+// foreign KB/file exactly like a missing one so existence never leaks. There
+// is no client_id/user override. Every write is read back from the task record
+// before the tool reports success.
+
+export const KB_TEXT_FILE_MAX_BYTES = 1024 * 1024;
+const KB_MAIN_FILE = 'knowledge-base.txt';
+const KB_TEXT_FILE_EXTENSION = /\.(txt|md|markdown)$/i;
+// Control characters other than tab/newline/CR mark binary data.
+const KB_BINARY_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const KB_NOT_FOUND = 'Knowledge base or file not found';
+
+function kbArg(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/** Returns an error string when `content` is not acceptable KB text, else null. */
+function kbTextContentError(content: unknown): string | null {
+  if (typeof content !== 'string' || content.trim().length === 0) return 'content must be a non-empty text string';
+  const size = Buffer.byteLength(content, 'utf8');
+  if (size > KB_TEXT_FILE_MAX_BYTES) return `content is ${size} bytes; the maximum is ${KB_TEXT_FILE_MAX_BYTES} bytes`;
+  if (KB_BINARY_CHARS.test(content)) return 'content looks binary; only plain text or markdown is accepted';
+  return null;
+}
+
+function kbFileNameError(fileName: string): string | null {
+  if (!fileName) return 'file_name is required';
+  if (!KB_TEXT_FILE_EXTENSION.test(fileName)) return 'file_name must end in .txt, .md or .markdown';
+  return null;
+}
+
+/** The caller's own KB task, or null for a missing or foreign one (indistinguishable). */
+async function loadOwnKnowledgeBase(kbId: string, context: any): Promise<any | null> {
+  const ownerId = context?.userId || context?.agentUserId;
+  if (!kbId || !ownerId) return null;
+  try {
+    const task = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(kbId)}`, context: ctx(context) });
+    return task && task.userId === ownerId ? task : null;
+  } catch (error: any) {
+    if (/API error \((403|404)\)/.test(String(error?.message))) return null;
+    throw error;
+  }
+}
+
+/** Read back one file's stored key + size from the caller's own KB task. */
+async function readBackKbFile(kbId: string, fileName: string, context: any): Promise<{ file_key: string; size_bytes: number } | null> {
+  const task = await loadOwnKnowledgeBase(kbId, context);
+  if (!task) return null;
+  if (fileName === KB_MAIN_FILE) {
+    return { file_key: `tasks/${task.taskId}/${KB_MAIN_FILE}`, size_bytes: Number(task.knowledgeBaseSize) || 0 };
+  }
+  const matches = (task.knowledgeBaseFiles || []).filter((f: any) => f?.filename === fileName);
+  const entry = matches[matches.length - 1];
+  return entry ? { file_key: entry.key, size_bytes: Number(entry.size) || 0 } : null;
+}
+
+async function verifiedKbWrite(kbId: string, fileName: string, content: string, context: any) {
+  const expected = Buffer.byteLength(content, 'utf8');
+  const stored = await readBackKbFile(kbId, fileName, context);
+  if (!stored || stored.size_bytes !== expected) {
+    return jsonResult({ success: false, error: 'Write could not be verified on read-back', kb_id: kbId, file_name: fileName });
+  }
+  return jsonResult({
+    success: true,
+    kb_id: kbId,
+    file_name: fileName,
+    file_key: stored.file_key,
+    size_bytes: stored.size_bytes,
+    sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+  });
+}
+
+function routeFailure(data: any) {
+  return jsonResult({ success: false, error: data?.error || data?.message || 'Knowledge base write failed' });
+}
+
+mcpToolRegistry.register({
+  name: 'create_knowledge_base_file',
+  definition: {
+    name: 'create_knowledge_base_file',
+    description: `Create a plain-text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). With kb_id, adds file_name to that knowledge base; without kb_id, creates a new private knowledge base named kb_name whose main file (${KB_MAIN_FILE}) holds the content. Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases). Omit to create a new knowledge base.' },
+        kb_name: { type: 'string', description: 'Name for the new knowledge base (only when kb_id is omitted)' },
+        file_name: { type: 'string', description: 'File name ending in .txt, .md or .markdown (required with kb_id)' },
+        content: { type: 'string', description: 'File text' }
+      },
+      required: ['content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const kbId = kbArg(args?.kb_id);
+
+    if (!kbId) {
+      const kbName = kbArg(args?.kb_name);
+      if (!kbName) return jsonResult({ success: false, error: 'kb_name is required when kb_id is omitted' });
+      const data = await mcpFetch({
+        method: 'POST', path: '/api/emma/create-knowledge-base', context: ctx(context),
+        body: { name: kbName, content, knowledge_base_type: 'private' }
+      });
+      if (!data?.success || !data.taskId) return routeFailure(data);
+      return verifiedKbWrite(data.taskId, KB_MAIN_FILE, content, context);
+    }
+
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbId, context);
+    if (!task) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const lowered = fileName.toLowerCase();
+    const existingName = lowered === KB_MAIN_FILE
+      // An attachment stored under this exact case-variant name wins over the main file.
+      ? (fileName !== KB_MAIN_FILE && (task.knowledgeBaseFiles || []).find((f: any) => f?.filename === fileName)?.filename) || KB_MAIN_FILE
+      : (task.knowledgeBaseFiles || []).find((f: any) => String(f?.filename ?? '').toLowerCase() === lowered)?.filename;
+    if (existingName) {
+      // Report the stored name: update_knowledge_base_file_content matches names exactly.
+      return jsonResult({ success: false, error: `"${existingName}" already exists; use update_knowledge_base_file_content with file_name "${existingName}" to change it` });
+    }
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/attach-knowledge-base-files', context: ctx(context),
+      body: { task_id: task.taskId, files: [{ name: fileName, content }] }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_knowledge_base_file_content',
+  definition: {
+    name: 'update_knowledge_base_file_content',
+    description: `Replace the full content of an existing text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: `Existing file name (e.g. ${KB_MAIN_FILE})` },
+        content: { type: 'string', description: 'New file text (replaces the old content)' }
+      },
+      required: ['kb_id', 'file_name', 'content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    const exists = fileName === KB_MAIN_FILE || (task?.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName);
+    if (!task || !exists) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/update-knowledge-base-file', context: ctx(context),
+      body: { task_id: task.taskId, file_name: fileName, content, mode: 'replace' }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_knowledge_base_file',
+  definition: {
+    name: 'delete_knowledge_base_file',
+    description: `Delete one uploaded or attached file from one of your own knowledge bases. The main ${KB_MAIN_FILE} file cannot be deleted. Pass file_key when two files share a name. Returns confirmation that the file is gone.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: 'File name to delete' },
+        file_key: { type: 'string', description: 'Stored file key (optional; disambiguates duplicate names)' }
+      },
+      required: ['kb_id', 'file_name']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const fileName = kbArg(args?.file_name);
+    const fileKey = kbArg(args?.file_key);
+    if (!fileName) return jsonResult({ success: false, error: 'file_name is required' });
+    if (fileName === KB_MAIN_FILE) return jsonResult({ success: false, error: `The main ${KB_MAIN_FILE} file cannot be deleted` });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    // Only keys recorded on the caller's own task are ever sent to the delete route.
+    const matches = (task?.knowledgeBaseFiles || []).filter(
+      (f: any) => f?.filename === fileName && typeof f?.key === 'string' && (!fileKey || f.key === fileKey)
+    );
+    if (!task || matches.length === 0) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    if (matches.length > 1) {
+      return jsonResult({ success: false, error: `${matches.length} files are named "${fileName}"; pass file_key`, file_keys: matches.map((f: any) => f.key) });
+    }
+    const key: string = matches[0].key;
+    await mcpFetch({
+      method: 'DELETE',
+      path: `/api/tasks/${encodeURIComponent(task.taskId)}/knowledge-base/files/${encodeURIComponent(key)}`,
+      context: ctx(context)
+    });
+    const after = await loadOwnKnowledgeBase(task.taskId, context);
+    const stillPresent = !after || (after.knowledgeBaseFiles || []).some((f: any) => f?.key === key);
+    if (stillPresent) return jsonResult({ success: false, error: 'Delete could not be confirmed on read-back', kb_id: task.taskId, file_key: key });
+    return jsonResult({ success: true, deleted: true, kb_id: task.taskId, file_name: fileName, file_key: key });
+  }
+});
+
 // ─── Brand & Strategy ───────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -2003,6 +2275,145 @@ mcpToolRegistry.register({
       // The check above guards entry; this one rides through the HTML fetch inside.
       context?.assertPublishStillAuthorized
     );
+  }
+});
+
+/** Allow-list projection of GET /api/crm/sender-emails shared by list/update sender tools. */
+function projectSenderSettings(data: any) {
+  const senders = Array.isArray(data?.senders) ? data.senders : [];
+  const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
+  return {
+    senders: senders.map((s: any) => ({
+      id: s?.id ?? null,
+      email: s?.email ?? null,
+      from_name: s?.fromName ?? null,
+      sender_provider: s?.senderProvider ?? null,
+      connected_account_id: s?.connectedAccountId ?? null,
+      daily_limit: s?.dailyLimit ?? null,
+      effective_daily_limit: s?.effectiveDailyLimit ?? null,
+      // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+      sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
+      warmup_started_at: s?.warmupStartedAt ?? null,
+    })),
+    default_sender_id: data?.defaultSenderId ?? null,
+    default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
+    connected_email_accounts: mailboxes.map((a: any) => ({
+      account_id: a?.account_id ?? null,
+      account_name: a?.account_name ?? null,
+      email: a?.email ?? null,
+      platform: a?.platform ?? null,
+    })),
+  };
+}
+
+// ─── Sender Settings (ENG-2868) ─────────────────────────────────────────────
+
+/**
+ * ENG-2868 (ENG-2847.4 read half): read-only view of the caller's own CRM
+ * sender settings. Identity comes only from the runtime context — the tool
+ * accepts no arguments, so no account can be selected via args. The response
+ * is an explicit allow-list projection of GET /api/crm/sender-emails so a
+ * future field added to that route can never leak through here.
+ */
+mcpToolRegistry.register({
+  name: 'list_sender_settings',
+  readOnly: true,
+  definition: {
+    name: 'list_sender_settings',
+    description: "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: ctx(context) });
+    return jsonResult(projectSenderSettings(data));
+  }
+});
+
+// ENG-2897 (ENG-2847.7): set the caller's own default email / LinkedIn sender.
+// Identity is runtime-only (no client_id). Both ids are checked against the
+// caller's OWN config / OWN connected accounts before anything is written, and
+// the existing sender list is re-posted unchanged so only the defaults move.
+// Sequence activation state is never touched.
+mcpToolRegistry.register({
+  name: 'update_sender_settings',
+  definition: {
+    name: 'update_sender_settings',
+    description: 'Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        default_sender_id: { type: 'string', description: 'Sender id from list_sender_settings.senders[].id' },
+        default_linkedin_account_id: { type: 'string', description: 'Your own LinkedIn (unipile) connected account_id' },
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // null / "" / whitespace mean "not set" (same as omitting the field), so a
+    // client that always sends both keys can still change just one default.
+    const blankToUndefined = (v: any) => (v === null || (typeof v === 'string' && !v.trim()) ? undefined : v);
+    const senderId = blankToUndefined(args?.default_sender_id);
+    const linkedInId = blankToUndefined(args?.default_linkedin_account_id);
+    if (senderId === undefined && linkedInId === undefined) {
+      throw new Error('Provide default_sender_id and/or default_linkedin_account_id');
+    }
+    if (senderId !== undefined && typeof senderId !== 'string') {
+      throw new Error('default_sender_id must be a string');
+    }
+    if (linkedInId !== undefined && typeof linkedInId !== 'string') {
+      throw new Error('default_linkedin_account_id must be a string');
+    }
+    const scoped = ctx(context);
+    if (linkedInId !== undefined) {
+      const conn = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: scoped, queryParams: { platform: 'unipile' } });
+      const accounts: any[] = Array.isArray(conn?.accounts) ? conn.accounts : [];
+      const ownsIt = accounts.some((a: any) => a?.platform === 'unipile' && a?.account_id === linkedInId && a?.owned === true);
+      if (!ownsIt) {
+        throw new Error(`default_linkedin_account_id "${linkedInId}" is not a LinkedIn account you own`);
+      }
+    }
+    // The settings route stores the whole config, so this is read-modify-write.
+    // Narrow the lost-update window: re-read right before writing and restart if
+    // anything moved, then verify the stored result and retry if a concurrent
+    // writer overwrote our defaults. Never report a default that is not stored.
+    const fingerprint = (c: any) => JSON.stringify({
+      senders: (Array.isArray(c?.senders) ? c.senders : []).map((s: any) => s),
+      d: c?.defaultSenderId ?? null,
+      l: c?.defaultLinkedInAccountId ?? null,
+    });
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const current = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const senders: any[] = Array.isArray(current?.senders) ? current.senders : [];
+      if (senderId !== undefined && !senders.some((s: any) => s?.id === senderId)) {
+        throw new Error(`default_sender_id "${senderId}" is not one of your configured senders`);
+      }
+      const wantSender = senderId ?? current?.defaultSenderId ?? null;
+      const wantLinkedIn = linkedInId ?? current?.defaultLinkedInAccountId ?? null;
+      const recheck = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      if (fingerprint(recheck) !== fingerprint(current)) continue;
+      await mcpFetch({
+        method: 'POST',
+        path: '/api/crm/sender-emails',
+        context: scoped,
+        body: {
+          // Unchanged senders pass the route's grandfather check, so no re-validation side effects.
+          senders: senders.map((s: any) => ({
+            id: s.id, email: s.email, fromName: s.fromName, notes: s.notes,
+            senderType: s.senderType, senderProvider: s.senderProvider,
+            connectedAccountId: s.connectedAccountId, gmailAccountId: s.gmailAccountId,
+            dailyLimit: s.dailyLimit, warmupStartedAt: s.warmupStartedAt,
+          })),
+          defaultSenderId: wantSender,
+          defaultLinkedInAccountId: wantLinkedIn,
+        },
+      });
+      const after = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const stored = (senderId === undefined || after?.defaultSenderId === senderId)
+        && (linkedInId === undefined || after?.defaultLinkedInAccountId === linkedInId);
+      if (stored) return jsonResult(projectSenderSettings(after));
+    }
+    throw new Error('Sender settings changed concurrently and the update could not be applied; nothing was reported as saved. Re-read with list_sender_settings and retry.');
   }
 });
 
@@ -2403,6 +2814,69 @@ mcpToolRegistry.register({
   }
 });
 
+export const MAX_LANDING_PAGE_FILES_PER_UPDATE = 20;
+export const LANDING_PAGE_DRAFT_BRANCH = 'draft/agentweb-preview';
+
+mcpToolRegistry.register({
+  name: 'update_landing_page_files',
+  definition: {
+    name: 'update_landing_page_files',
+    description: 'ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        files: {
+          type: 'array',
+          maxItems: MAX_LANDING_PAGE_FILES_PER_UPDATE,
+          description: 'Files to write (max 20). Each: { path, content }.',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Repo path, e.g. "src/app/page.tsx"' },
+              content: { type: 'string', description: 'Full new file content' }
+            },
+            required: ['path', 'content']
+          }
+        },
+        commit_message: { type: 'string', description: 'Commit message (optional)' },
+        branch: { type: 'string', description: 'Target branch. Defaults to "draft/agentweb-preview". "main" is rejected.' },
+        expected_base_sha: { type: 'string', description: 'Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing.' }
+      },
+      required: ['page_id', 'files']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const branch: string = args.branch || LANDING_PAGE_DRAFT_BRANCH;
+    if (branch === 'main' || branch === 'refs/heads/main') {
+      throw new Error('update_landing_page_files never writes to main. Omit branch to use the draft/preview branch, then publish with publish_landing_page_changes.');
+    }
+    const files = args.files;
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error('files must be a non-empty array of { path, content }.');
+    }
+    if (files.length > MAX_LANDING_PAGE_FILES_PER_UPDATE) {
+      throw new Error(`files must not exceed ${MAX_LANDING_PAGE_FILES_PER_UPDATE} entries per commit (got ${files.length}).`);
+    }
+    for (const f of files) {
+      if (!f || typeof f.path !== 'string' || !f.path || typeof f.content !== 'string') {
+        throw new Error('Each file requires a string path and string content.');
+      }
+    }
+    const data: any = await mcpFetch({
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/update-files`, context: ctx(context),
+      body: {
+        files: files.map((f: any) => ({ file_path: f.path, content: f.content })),
+        commit_message: args.commit_message || `Update ${files.length} file(s) via update_landing_page_files`,
+        branch,
+        ...(args.expected_base_sha ? { expected_base_sha: args.expected_base_sha } : {})
+      }
+    });
+    const commitSha = typeof data?.commit_url === 'string' ? data.commit_url.split('/commit/')[1] : undefined;
+    return jsonResult({ ...data, commit_sha: commitSha });
+  }
+});
+
 mcpToolRegistry.register({
   name: 'list_landing_page_files',
   definition: {
@@ -2411,14 +2885,15 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        page_id: { type: 'string', description: 'The landing page ID' }
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2433,14 +2908,15 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id', 'file_path']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
