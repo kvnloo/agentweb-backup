@@ -31,6 +31,7 @@ import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
+import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
@@ -80,6 +81,8 @@ export interface MetaToolkitGatewayDeps {
   executeCreative?: (userId: string, args: any) => Promise<any>;
   /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
   runHealthTool?: typeof runMetaHealthTool;
+  /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
+  runCatalogTool?: typeof runMetaCatalogTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
   runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
@@ -298,6 +301,13 @@ export async function handleMetaToolkitCall(
     const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(health);
+  }
+
+  // ENG-2918: read-only catalog tools, scoped to the resolved account's business catalogs.
+  if (isMetaCatalogTool(request.toolName)) {
+    const catalogs = await (deps.runCatalogTool ?? runMetaCatalogTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(catalogs);
   }
 
   // ENG-2920: read-only Pages / Instagram / Ad Library tools, scoped to the resolved account.
