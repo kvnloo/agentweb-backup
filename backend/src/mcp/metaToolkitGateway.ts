@@ -435,7 +435,36 @@ export async function handleMetaToolkitCall(
           sessionId: request.sessionId,
         });
 
-  if (guardedWrite) await recordExecutedWrite(String(args.entity_type), String(args.action), result);
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  // ENG-2915: a BULK_CREATE result carries one verdict per creative; each is its own write event.
+  const executedWrites: any[] = !guardedWrite
+    ? []
+    : Array.isArray((result as any)?.results)
+      ? (result as any).results
+      : [result];
+  for (const write of executedWrites) {
+    if (typeof write?.verification !== 'string') continue;
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      platform: 'meta',
+      entityType: String(args.entity_type),
+      action: String(args.action),
+      verification: write.verification,
+      objectId: write.id ?? write.creative_id ?? write.image_hash ?? write.video_id ?? undefined,
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      write.metering = 'failed: this write executed but was not recorded in usage';
+    });
+  }
 
   await meter('meta');
   if (!guardedWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
