@@ -98,6 +98,8 @@ export interface CodingAgentResult {
   recovery?: CodingAgentRecoveryState;
   retryable?: boolean;
   baseCommitSha?: string;
+  /** ENG-2939: set when the run stopped at maxIterations (not a crash). In-memory only. */
+  terminationReason?: 'iteration_limit';
   latestCommitSha?: string;
   editedFiles?: string[];
   /**
@@ -1792,6 +1794,19 @@ function resolveOpenRouterUsagePricingModel(servedModel: string, requestedModel:
  * Extract a structured summary from the agent's message history
  * so the parent agent knows what happened when max iterations is hit.
  */
+/**
+ * ENG-2939: an iteration-limit stop on a multi-file task usually leaves real, saved edits on
+ * the draft branch. Without saying so, the parent agent re-ran the whole task from scratch and
+ * hit the limit again. Tell it the work is saved and to continue with only what remains.
+ */
+export function iterationLimitMessage(summary: string, editedFiles: string[], branch?: string): string {
+  if (editedFiles.length === 0) return summary;
+  const where = branch ? `on draft branch ${branch}` : 'on the draft branch';
+  return `${summary} The edits above are saved ${where} and are not lost. Do NOT re-run the whole task: `
+    + 'call coding_agent again with ONLY the remaining work (name the files still to change), '
+    + 'or split it into smaller tasks of a few files each.';
+}
+
 function extractFailureSummary(
   messages: Anthropic.MessageParam[],
   maxIterations: number
@@ -2203,7 +2218,8 @@ async function runCodingAgentInternal(
     const summary = extractFailureSummary(messages, maxIterations);
     return {
       success: false,
-      message: summary.message,
+      terminationReason: 'iteration_limit',
+      message: iterationLimitMessage(summary.message, Array.from(editedFiles), context.draftBranch),
       iterations: iteration,
       previewUrl: summary.previewUrl,
       branch: context.draftBranch,
