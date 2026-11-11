@@ -280,8 +280,10 @@ const ALLOWED: Record<string, string[]> = {
 const MICROS_HINT: Record<string, string> = { amount_micros: 'amount', cpc_bid_micros: 'cpc_bid', cpc_bid_ceiling_micros: 'cpc_bid_ceiling' };
 
 const nonBlank = (v: unknown): v is string => typeof v === 'string' && v.trim() !== '';
-/** Characters as Google counts them for these limits (code points, not UTF-16 units). */
-const chars = (v: string) => [...v].length;
+/** Double-width scripts (CJK, Hangul, kana, fullwidth forms) that Google counts as two characters toward ad-text limits. */
+const DOUBLE_WIDTH = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{20000}-\u{3FFFD}]/u;
+/** Characters as Google counts them for these limits: code points, double-width scripts weighted 2. */
+const chars = (v: string) => [...v].reduce((n, ch) => n + (DOUBLE_WIDTH.test(ch) ? 2 : 1), 0);
 const normalizeKeyword = (text: string) => text.trim().replace(/\s+/g, ' ').toLowerCase();
 const keywordKey = (k: { text: string; matchType: string }) => `${k.matchType}:${normalizeKeyword(k.text)}`;
 

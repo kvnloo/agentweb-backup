@@ -551,3 +551,17 @@ describe('ENG-2928 surface, scopes and metering', () => {
     expect(deps.recordUsage).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-2928 double-width text weighting', () => {
+  it('counts CJK characters as two toward the 30-char headline limit', () => {
+    const { validateGoogleWriteShape } = require('../mcp/googleToolkitWrites');
+    const args = {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE',
+      ad_group_resource_name: 'customers/1234567890/adGroups/1', type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['中'.repeat(16), 'Two', 'Three'], descriptions: ['Desc one here', 'Desc two here'],
+      final_url: 'https://example.com', status: 'PAUSED',
+    };
+    expect(() => validateGoogleWriteShape(args, 'USD')).toThrow();
+    expect(() => validateGoogleWriteShape({ ...args, headlines: ['中'.repeat(15), 'Two', 'Three'] }, 'USD')).not.toThrow();
+  });
+});
