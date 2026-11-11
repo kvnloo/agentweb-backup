@@ -19,6 +19,7 @@ import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitMa
 import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
+import { validateRef } from '../services/journeyAttribution';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -176,6 +177,8 @@ router.post('/mcp', async (req: Request, res: Response) => {
             args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
             sessionId: req.get('mcp-session-id') ?? undefined,
             userAgent: req.get('user-agent') ?? undefined,
+            // ENG-2906: `?ref=` on the MCP URL; validated (or dropped) when the event is recorded.
+            ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
           });
           return rpcResult(res, id, { content: toolResultContent(result), isError: false });
         } catch (error) {
@@ -199,6 +202,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
             getBackendUrl(),
             req.headers.authorization ? 'invalid_token' : undefined,
             META_TOOLKIT_MCP_RESOURCE_PATH,
+            validateRef(req.query.ref), // ENG-2906: carry ?ref= into the resource metadata
           ),
         );
       }

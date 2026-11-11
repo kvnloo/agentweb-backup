@@ -86,5 +86,13 @@ Rules:
 - A write is done only when the result says `verification: CONFIRMED`. `UNCONFIRMED` or `MISMATCH` is not success: tell the user and check the entity before retrying.
 - If a write is refused for a missing payment method or Meta connection, call `zoma_status` and relay its link.
 
+## Google Ads (when enabled for the account)
+`call_google_ads_api` uses the same two-call preview → `confirm: true` + `preview_token` flow and the same `verification: CONFIRMED` rule. Keywords, ads and asset groups are always created PAUSED; enabling each is its own UPDATE `status: ENABLED` preview.
+- **Keywords:** `KEYWORD ADD` (`ad_group_resource_name`, `keywords: [{text, matchType}]`, matchType BROAD / PHRASE / EXACT), `UPDATE` (`criterion_resource_name`, `status`), `REMOVE` (`criterion_resource_name`, permanent).
+- **Negative keywords:** `KEYWORD ADD_NEGATIVE` with `keywords` and exactly one of `campaign_resource_name` or `ad_group_resource_name`.
+- **Responsive search ad:** `AD CREATE` with `ad_group_resource_name`, 3–15 `headlines` (≤30 characters each), 2–4 `descriptions` (≤90 each) and an https `final_url`. Copy and URL cannot be edited later. Enable with `AD UPDATE` (`ad_resource_name`, `status`).
+- **Assets:** `ASSET UPLOAD` runs without a preview, because an asset can't spend until something uses it. Use `asset_type` IMAGE or LOGO with `data` set to an https image URL or the `file_url` from `zoma_prepare_upload`, TEXT with the text as `data`, or VIDEO with a YouTube video id. It returns the asset resource name.
+- **Performance Max, end to end:** (1) upload the logo (`LOGO`), the square and landscape images (`IMAGE`); (2) `BUDGET CREATE`; (3) `CAMPAIGN CREATE` with `type: PERFORMANCE_MAX`, `brand_business_name` (≤25 characters) and `brand_logo_asset_resource_name`; (4) `ASSET_GROUP CREATE` with `name`, `campaign_resource_name`, `final_url`, 3–15 `headlines` (≤30), 1–5 `long_headlines` (≤90), 2–5 `descriptions` (≤90, at least one ≤60), `square_image_assets`, `landscape_image_assets`, and optionally `logo_assets` / `video_assets`; (5) `ASSET_GROUP UPDATE status: ENABLED`, then `CAMPAIGN UPDATE status: ENABLED`, each with its own approval.
+
 ## Usage
 Call `zoma_usage` when the user asks what they have used this month. Billing is not enabled yet; usage is only recorded.

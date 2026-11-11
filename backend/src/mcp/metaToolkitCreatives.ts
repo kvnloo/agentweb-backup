@@ -44,6 +44,7 @@ import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import { assertAdsManagementGranted } from './metaToolkitWrites';
 import { MetaService } from '../services/metaService';
 import { probePublicMediaUrl, SsrfBlockedError } from '../utils/ssrfGuard';
+import { googleToolkitEnabled } from './zomaToolDefinitions';
 import { isOutcomeUnknownFailure } from './zomaWriteGuard';
 
 export const CREATIVE_ASSET_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'CREATE', 'BULK_CREATE'] as const;
@@ -74,6 +75,8 @@ export interface StagedObject {
 
 export interface MetaToolkitCreativeDeps {
   assertReady: (userId: string) => Promise<void>;
+  /** zoma_prepare_upload readiness; defaults to assertReady. ENG-2928: Meta OR Google Ads. */
+  assertUploadReady?: (userId: string) => Promise<void>;
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   bucket: () => string;
   presignPut: (key: string, contentType: string, expiresIn: number) => string;
@@ -98,6 +101,15 @@ const s3 = async () => import('../utils/s3Utils');
 
 const defaultDeps: MetaToolkitCreativeDeps = {
   assertReady: (userId) => assertZomaWriteReady(userId),
+  // ENG-2928: a staged file can also feed a Google Ads ASSET UPLOAD, so a Google-only user may stage.
+  assertUploadReady: async (userId) => {
+    try {
+      await assertZomaWriteReady(userId);
+    } catch (error) {
+      if (!(error instanceof ZomaNotReadyError) || !googleToolkitEnabled()) throw error;
+      await assertZomaWriteReady(userId, undefined, 'google_ads');
+    }
+  },
   listAccounts: getAccountsByUserIdIncludingOrgShared,
   bucket: () => process.env.AWS_S3_BUCKET || 'agentweb-user-files',
   presignPut: () => {
@@ -200,9 +212,10 @@ export function isPrivateAddress(ip: string): boolean {
  */
 async function resolveAssetUrl(
   userId: string, raw: unknown, kind: 'image' | 'video', deps: MetaToolkitCreativeDeps,
+  field = kind === 'image' ? 'params.image_url' : 'params.video_url',
 ): Promise<{ fetchUrl: string; source: 'staged' | 'url' }> {
   const value = typeof raw === 'string' ? raw.trim() : '';
-  if (!value) throw new MetaToolkitRefusal(`${kind === 'image' ? 'params.image_url' : 'params.video_url'} is required: a public https URL, or the file_url returned by zoma_prepare_upload for a local file.`);
+  if (!value) throw new MetaToolkitRefusal(`${field} is required: a public https URL, or the file_url returned by zoma_prepare_upload for a local file.`);
   const bucket = deps.bucket();
   const key = stagedKeyFromUrl(bucket, value);
   if (key) {
@@ -276,6 +289,15 @@ async function probeAssetUrl(url: string, host: string, kind: 'image' | 'video',
   return probe.finalUrl;
 }
 
+/**
+ * ENG-2928: the same URL rule for a Google Ads image asset — the caller's own staged file
+ * (re-signed for a short-lived fetch) or a public https URL. Returns the URL to fetch.
+ */
+export async function resolveZomaImageUrl(userId: string, raw: unknown, field: string, depsIn: MetaToolkitCreativeDeps = defaultDeps): Promise<string> {
+  const deps = await withS3Defaults(depsIn);
+  return (await resolveAssetUrl(userId, raw, 'image', deps, field)).fetchUrl;
+}
+
 /** zoma_prepare_upload: presigned PUT for a local file under the caller's own prefix. */
 export async function prepareZomaUpload(userId: string, args: any, depsIn: MetaToolkitCreativeDeps = defaultDeps) {
   const deps = await withS3Defaults(depsIn);
@@ -294,7 +316,7 @@ export async function prepareZomaUpload(userId: string, args: any, depsIn: MetaT
     throw new MetaToolkitRefusal(`size_bytes must be between 1 and ${max} for a ${kind}.`);
   }
   try {
-    await deps.assertReady(userId);
+    await (deps.assertUploadReady ?? deps.assertReady)(userId);
   } catch (error) {
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;

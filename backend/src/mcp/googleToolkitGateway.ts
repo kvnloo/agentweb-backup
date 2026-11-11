@@ -7,7 +7,8 @@
  *      unusable one — via the provider-neutral resolveProviderAccount;
  *   2. refuse anything outside the curated surface (googleToolkitManifest);
  *   3. reads → the same handler objects Emma registers; writes → googleToolkitWrites
- *      (preview → confirm → apply once → read-back);
+ *      (preview → confirm → apply once → read-back; ENG-2928 ASSET UPLOAD is non-spending,
+ *      so it applies once → read-back without a preview token);
  *   4. meter: one tool-use event per successful call, plus one write event per write that
  *      reached Google — both with platform 'google_ads'.
  */
@@ -15,12 +16,12 @@ import type { ConnectedAccount } from '../services/connectedAccountsDb';
 import type { McpAuthMethod, recordMcpWriteExecuted } from '../services/mcpUsageEventsService';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import {
-  assertGoogleToolkitCall, executeGoogleToolkitRead, isGoogleGuardedWrite, isGoogleToolkitTool,
+  assertGoogleToolkitCall, executeGoogleToolkitRead, isGoogleGuardedWrite, isGoogleToolkitTool, isGoogleToolkitWrite,
 } from './googleToolkitManifest';
 import { executeGoogleToolkitWrite } from './googleToolkitWrites';
 import { GOOGLE_ADS_PROVIDER, resolveProviderAccount } from './zomaProviders';
 
-export { isGoogleToolkitTool, isGoogleGuardedWrite };
+export { isGoogleToolkitTool, isGoogleGuardedWrite, isGoogleToolkitWrite };
 
 export interface GoogleToolkitCaller {
   userId: string;
@@ -58,7 +59,7 @@ export async function handleGoogleToolkitCall(
   args.customer_id = resolved.accountId;
   const currency = String((resolved.account.config as any)?.currency || 'USD');
 
-  const write = isGoogleGuardedWrite(request.toolName, args);
+  const write = isGoogleToolkitWrite(request.toolName, args);
   const result = write
     ? await (deps.executeWrite ?? executeGoogleToolkitWrite)(caller.userId, args, currency)
     : await (deps.executeRead ?? executeGoogleToolkitRead)(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
@@ -67,6 +68,7 @@ export async function handleGoogleToolkitCall(
   // A metering failure never makes an executed write look failed (that invites a retry).
   if (write && typeof result?.verification === 'string') {
     await deps.recordWrite({
+      product: 'zoma', // ENG-2906: every toolkit surface is the Zoma product
       userId: caller.userId,
       toolName: request.toolName,
       authMethod: caller.authMethod,

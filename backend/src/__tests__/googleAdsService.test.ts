@@ -54,6 +54,11 @@ jest.mock('../services/connectedAccountsDb', () => ({
 const mockAssertPublicHostname = jest.fn();
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  // ENG-2928: uploadAsset resolves once and pins; the same mock decides allow/block.
+  resolvePinnedPublicAddress: async (...args: any[]) => {
+    await mockAssertPublicHostname(...args);
+    return { hostname: 'example.com', address: '93.184.216.34', family: 4 };
+  },
   SsrfBlockedError: class SsrfBlockedError extends Error {
     constructor(message = 'URL resolves to a private/internal address') {
       super(message);
@@ -1702,6 +1707,16 @@ describe('uploadAsset — SSRF protection', () => {
     expect(opts.maxRedirects).toBe(0);
     expect(opts.maxContentLength).toBeGreaterThan(0);
     expect(opts.maxBodyLength).toBeGreaterThan(0);
+  });
+
+  it('pins the fetch to the validated address, so DNS cannot be rebound between check and connect (ENG-2928)', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assets/10' }] } });
+    await service.uploadAsset('user-123', '1234567890', { type: 'IMAGE', name: 'hero.jpg', data: 'https://rebind.example.com/hero.jpg' });
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(typeof opts.lookup).toBe('function');
+    const resolved = await new Promise<any[]>((resolve) => opts.lookup('rebind.example.com', {}, (...r: any[]) => resolve(r)));
+    expect(resolved).toEqual([null, '93.184.216.34', 4]);
   });
 
   it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
