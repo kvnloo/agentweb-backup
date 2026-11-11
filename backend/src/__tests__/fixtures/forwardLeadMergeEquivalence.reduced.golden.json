@@ -666,7 +666,7 @@
     "linkedin": "https://www.linkedin.com/in/anna",
     "listId": "L0",
     "nameCompanyKey": "anna|lee|acme",
-    "notes": "new note",
+    "notes": "n\n\nnew note",
     "phone": "555",
     "selectedSenderId": "s1",
     "status": "qualified",
@@ -698,7 +698,7 @@
       "nul",
       "list"
      ],
-     "leadDigest": "83b3d8c38729d866"
+     "leadDigest": "5f8da5dc169bcb0d"
     },
     {
      "crm": "attio",
@@ -714,7 +714,7 @@
       "nul",
       "list"
      ],
-     "leadDigest": "83b3d8c38729d866"
+     "leadDigest": "5f8da5dc169bcb0d"
     }
    ],
    "enrol": 1,
@@ -1074,7 +1074,7 @@
      "a": 1,
      "a.b": 1,
      "blank": "",
-     "caf\u00e9": 3,
+     "café": 3,
      "domain": "d",
      "flag": false,
      "forwardedAt": "2020-01-01T00:00:00.000Z",
@@ -1121,7 +1121,7 @@
    ":c",
    "a",
    "a.b",
-   "caf\u00e9",
+   "café",
    "domain",
    "forwardedAt",
    "k-1",
@@ -1157,7 +1157,7 @@
       "type",
       "a.b",
       "with space",
-      "caf\u00e9",
+      "café",
       "k-1",
       "#h",
       ":c",
@@ -1185,7 +1185,7 @@
       "type",
       "a.b",
       "with space",
-      "caf\u00e9",
+      "café",
       "k-1",
       "#h",
       ":c",
@@ -2466,7 +2466,7 @@
     "linkedin": "https://www.linkedin.com/in/anna",
     "listId": "L0",
     "nameCompanyKey": "anna|lee|acme",
-    "notes": "new note",
+    "notes": "n\n\nnew note",
     "phone": "555",
     "selectedSenderId": "s1",
     "status": "qualified",
@@ -2496,7 +2496,7 @@
       "nul",
       "list"
      ],
-     "leadDigest": "83b3d8c38729d866"
+     "leadDigest": "5f8da5dc169bcb0d"
     },
     {
      "crm": "attio",
@@ -2512,7 +2512,7 @@
       "nul",
       "list"
      ],
-     "leadDigest": "83b3d8c38729d866"
+     "leadDigest": "5f8da5dc169bcb0d"
     }
    ],
    "enrol": 1,

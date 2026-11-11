@@ -462,9 +462,11 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
     expect(lead.customFields.source).toBe('landing-page');
 
     // And the attribution.first_touch contact event fires (0 of these in prod).
-    const events = mockDynamoWrites.filter((w) => w.TableName === 'AW-ContactEvents');
+    // ENG-2936 adds one form.submitted history row per submission alongside it.
+    const contactEvents = mockDynamoWrites.filter((w) => w.TableName === 'AW-ContactEvents');
+    expect(contactEvents.map((w) => w.Item.eventType).sort()).toEqual(['attribution.first_touch', 'form.submitted']);
+    const events = contactEvents.filter((w) => w.Item.eventType === 'attribution.first_touch');
     expect(events).toHaveLength(1);
-    expect(events[0].Item.eventType).toBe('attribution.first_touch');
     expect(events[0].Item.payload.utmSource).toBe('meta');
     expect(events[0].Item.payload.utmCampaign).toBe(META_CAMPAIGN_ID);
   });

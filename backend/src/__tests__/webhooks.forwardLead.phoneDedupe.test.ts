@@ -410,13 +410,13 @@ describe('a phone-matched merge only FILLS BLANKS (never overwrites)', () => {
     (crmDb.createLead as jest.Mock).mockRejectedValueOnce(Object.assign(new Error('dup'), { duplicateEmail: true, existingLead: winner }));
     (crmDb.getLeadById as jest.Mock).mockResolvedValue(winner);
     await post({ phone: undefined, email: 'ana@example.com', company: 'New Co', notes: 'new' });
-    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'new' });
+    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'old\n\nnew' }); // ENG-2936: notes append
   });
 
   it('GUARD: an EMAIL repeat is unchanged - it still overwrites with the newer non-empty value', async () => {
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead_e1', listId: 'L1', email: 'ana@example.com', firstName: 'Ana', company: 'Old Co', notes: 'old', customFields: { budget: '10k' }, createdAt: '2026-10-01T00:00:00.000Z' });
     await post({ phone: undefined, email: 'ana@example.com', company: 'New Co', notes: 'new', customFields: { budget: '50k' } });
-    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'new' });
+    expect(sentToUpdate()[0]).toMatchObject({ company: 'New Co', notes: 'old\n\nnew' }); // ENG-2936: notes append
     expect(sentToUpdate()[0].customFields).toMatchObject({ budget: '50k' });
   });
 });

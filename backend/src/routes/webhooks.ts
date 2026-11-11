@@ -28,6 +28,8 @@ import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { appendNotes, collectOverwrittenValues } from '../utils/leadSubmissionHistory';
+import { onPublicFormSubmitted } from '../services/contactCaptureHooks';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
@@ -862,6 +864,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     let lead: any;
     let isNew = false;
     let isUpdated = false;
+    let overwrittenValues: Record<string, unknown> = {};
 
     // The one merge routine for an EXISTING lead. Two entry points reach it: the
     // getLeadByEmail hit at the top of this handler, and a createLead that lost a race to a
@@ -886,8 +889,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         if (newValue) {
           const existingValue = normalize(existingLead[field]);
           if (existingValue !== newValue && !(fillBlanksOnly && existingValue)) {
-            updates[field] = newValue;
-            changed = true;
+            // ENG-2936: notes from a second form append; replacing lost the first submission.
+            const value = field === 'notes' ? appendNotes(existingValue, newValue) : newValue;
+            if (value !== existingValue) {
+              updates[field] = value;
+              changed = true;
+            }
           }
         }
       }
@@ -915,6 +922,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // ENG-2123: what the caller's own data changed, before the attribution refresh below flips `changed`.
       const fieldsChanged = changed;
+      // ENG-2936: keep what this submission overwrites in its history entry.
+      overwrittenValues = collectOverwrittenValues(existingLead, updates);
 
       // Attribution merge (Lead UTM — mirrors the User schema contract).
       // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
@@ -1289,6 +1298,30 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
+    }
+    // ENG-2936: one append-only history entry per distinct submission on the contact's
+    // AW-ContactEvents timeline (existing table; logEvent dedupes on sourceRecordId, and a
+    // replayed submissionId already returned above from the ENG-2837 claim).
+    if (!suppressSideEffects && lead?.email && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
+      void onPublicFormSubmitted({
+        email: String(lead.email),
+        sourceRecordId: `forward-lead:${leadList.listId}:${submissionKey ? `client:${submissionKey}` : crypto.randomUUID()}`,
+        formName: (incomingCustomFields?.formName || incomingCustomFields?.form_name || leadData.customFields?.source || null) as string | null,
+        payload: {
+          listId: leadList.listId,
+          leadId: lead.leadId,
+          event: responseBody.event,
+          submittedAt: new Date().toISOString(),
+          pageUrl: incomingCustomFields?.page_url || incomingCustomFields?.pageUrl || touch?.landingUrl || null,
+          notes: leadData.notes || '',
+          fields: {
+            firstName: leadData.firstName, lastName: leadData.lastName, phone: leadData.phone,
+            company: leadData.company, title: leadData.title, linkedin: leadData.linkedin,
+            customFields: incomingCustomFields,
+          },
+          overwrittenValues,
+        },
+      }).catch(() => undefined);
     }
     res.status(responseStatus).json(responseBody);
 
