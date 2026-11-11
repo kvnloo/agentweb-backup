@@ -15659,11 +15659,78 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async readToolkitMetaCatalogGraph(
     userId: string, account_id: string, path: string, params: Record<string, string>,
   ): Promise<any> {
-    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds))$/.test(path)) {
+    // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
+    // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
+    if (!/^(act_\d+(\/adsets)?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-    if (path.startsWith('act_') && path !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2925: Graph write for the catalog write tools. POST creates on a catalog's products /
+   * product_sets edge or updates a numeric node; DELETE removes a numeric node. Paths are
+   * allow-listed; metaToolkitCatalogWrites enforces that every catalog / product / set id
+   * belongs to the account's business before calling this. `outcomeUnknown` marks a failure
+   * without a definite Meta answer (no response, timeout, 5xx), which may still have applied.
+   */
+  public async writeToolkitMetaCatalogGraph(
+    userId: string, account_id: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets))?$/ : /^\d+$/;
+    if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
+    const { accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${path}`,
+        params: { access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2920: read-only Graph GET for the Pages / Instagram / Ad Library tools. Paths are
+   * allow-listed; metaToolkitPages enforces id ownership against the account before calling.
+   */
+  public async readToolkitMetaPagesGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+(\/(promote_pages|instagram_accounts))?|\d+\/(owned_pages|client_pages|media)|me\/accounts|ads_archive)$/.test(path)) {
+      throw new Error('Unsupported Pages/Instagram path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const own = `act_${String(accountId).replace(/^act_/, '')}`;
+    if (path.startsWith('act_') && path.split('/')[0] !== own) throw new Error('Account mismatch.');
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     try {
       const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {

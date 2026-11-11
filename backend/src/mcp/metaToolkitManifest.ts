@@ -21,6 +21,8 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
 import { isMetaCatalogTool, META_CATALOG_TOOL_DEFINITIONS } from './metaToolkitCatalogs';
+import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './metaToolkitCatalogWrites';
+import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 
@@ -116,13 +118,16 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_CATALOG_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2925: product + product-set writes (deletes are preview → confirm) and the filter helper.
+    ...META_CATALOG_WRITE_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
   ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaPagesTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }
