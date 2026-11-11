@@ -15552,6 +15552,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
   }
 
+  /** Read-only signals tools reuse the same account-bound credential resolver as other toolkit reads. */
+  public async readToolkitMetaSignals(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    return executeSignalsRead(name, args, credentials);
+  }
+
   /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
   public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
     const credentials = await this.getMetaCredentials(userId, args.account_id);
@@ -15615,6 +15622,63 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
     return { accountId, accessToken };
+  }
+
+  /**
+   * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
+   * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
+   */
+  public async readToolkitMetaAccountGraph(
+    userId: string, account_id: string, edge: '' | 'adsets', params: Record<string, string>,
+  ): Promise<any> {
+    if (edge !== '' && edge !== 'adsets') throw new Error(`Unsupported account edge: ${edge}`);
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const path = `act_${accountId.replace(/^act_/, '')}${edge ? `/${edge}` : ''}`;
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2918: read-only Graph GET for the catalog tools. The path must be the caller's own
+   * account node or a numeric node's catalog edge; metaToolkitCatalogs enforces that catalog
+   * ids belong to the account's business before calling this.
+   */
+  public async readToolkitMetaCatalogGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds))$/.test(path)) {
+      throw new Error('Unsupported catalog path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
   }
 
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
