@@ -15645,6 +15645,36 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-2920: read-only Graph GET for the Pages / Instagram / Ad Library tools. Paths are
+   * allow-listed; metaToolkitPages enforces id ownership against the account before calling.
+   */
+  public async readToolkitMetaPagesGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+(\/(promote_pages|instagram_accounts))?|\d+\/(owned_pages|client_pages|media)|me\/accounts|ads_archive)$/.test(path)) {
+      throw new Error('Unsupported Pages/Instagram path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const own = `act_${String(accountId).replace(/^act_/, '')}`;
+    if (path.startsWith('act_') && path.split('/')[0] !== own) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
