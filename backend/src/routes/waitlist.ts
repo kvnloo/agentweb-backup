@@ -152,12 +152,12 @@ router.get('/zoma/capacity', authenticateToken, isAdmin, async (_req, res) => {
     res.status(503).json({ code: 'admission_unavailable' });
   }
 });
-router.post('/zoma/:email/decision', authenticateToken, isAdmin, async (req: AuthenticatedRequest, res) => {
+router.post('/zoma/:email/decision', authenticateToken, isAdmin, async (req, res) => {
   if (!zomaAdmissionEnabled()) return res.sendStatus(404);
   const { email } = req.params;
   const { decision } = req.body;
   if (!validateEmail(email) || !['approve', 'reject'].includes(decision)) return res.sendStatus(400);
-  const actor = req.user?.userId;
+  const actor = (req as AuthenticatedRequest).user?.userId;
   if (!actor) return res.sendStatus(403);
   try {
     const status = decision === 'approve' ? await admitZoma(email, actor) : await rejectZoma(email, actor);
