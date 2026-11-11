@@ -421,7 +421,20 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
 
-  const { result, createdId } = await deps.dispatch(userId, preview.metaWriteDispatch);
+  // ENG-2931: a throw after the token was consumed (timeout, 5xx, transport) is outcome-unknown:
+  // Meta may have applied it, so it is UNCONFIRMED, never success and never "did not apply".
+  let dispatched: { result: any; createdId?: string | null };
+  try {
+    dispatched = await deps.dispatch(userId, preview.metaWriteDispatch);
+  } catch (error: unknown) {
+    return {
+      success: false,
+      verification: 'UNCONFIRMED' as WriteVerification,
+      id: action === 'CREATE' ? null : (targetId(entity, args) ?? null),
+      message: `UNCONFIRMED: the ${action} ${entity} request failed without a definite answer from Meta (${error instanceof Error ? error.message : String(error)}), so it may or may not have been applied. Do not report this as done and do not retry blindly — check the ${entity} first.`,
+    };
+  }
+  const { result, createdId } = dispatched;
   if (result?.coalesced) {
     return { status: 'NO_CHANGE', success: true, message: String(result.message ?? 'No change was needed.') };
   }
