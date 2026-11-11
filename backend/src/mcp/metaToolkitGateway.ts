@@ -32,6 +32,7 @@ import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './z
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
+import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
@@ -86,6 +87,8 @@ export interface MetaToolkitGatewayDeps {
   runCatalogTool?: typeof runMetaCatalogTool;
   /** ENG-2925 catalog product / product-set writes; defaults to runMetaCatalogWriteTool. */
   runCatalogWriteTool?: typeof runMetaCatalogWriteTool;
+  /** ENG-2927 catalog event sources; defaults to runMetaEventSourceTool. */
+  runEventSourceTool?: typeof runMetaEventSourceTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
   runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
@@ -305,7 +308,7 @@ export async function handleMetaToolkitCall(
   assertMetaToolkitScope(
     caller,
     request.toolName,
-    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName),
+    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName) || isMetaEventSourceWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors') {
@@ -343,6 +346,15 @@ export async function handleMetaToolkitCall(
   if (isMetaCatalogWriteTool(request.toolName)) {
     const result: any = await (deps.runCatalogWriteTool ?? runMetaCatalogWriteTool)(request.toolName, caller.userId, accountId, args);
     const kind = CATALOG_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2927: catalog event sources (reads + preview-confirmed connect/disconnect).
+  if (isMetaEventSourceTool(request.toolName)) {
+    const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args);
+    const kind = EVENT_SOURCE_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
     await meter('meta');
     return stripCredentials(result);
