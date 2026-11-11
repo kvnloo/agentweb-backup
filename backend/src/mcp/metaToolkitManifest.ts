@@ -25,7 +25,7 @@ const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
-  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED) or budget. ' +
+  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED), budget, CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id (swap)/name. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
   'New campaigns, ad sets and ads are always created PAUSED; activating (status=ACTIVE) is its own separate preview and approval. ' +
