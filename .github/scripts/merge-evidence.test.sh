@@ -1048,6 +1048,45 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'ENG-2506: Opslane neutral with any other title still blocks' 1 'Opslane (neutral)'
 
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral "Opslane couldn't test this commit")"'
+]'
+run_gate "${d}"
+check '#3967: Opslane could-not-test abstention does not block' 0 'VERDICT: PASS'
+
+cr_run() { # $1 conclusion, $2 title
+  printf '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"status":"completed","conclusion":"%s","output":{"title":"%s"}}' "$1" "$2"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run neutral 'Review rate limited')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit rate-limited neutral does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run neutral 'Review found issues')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit neutral with any other title still blocks' 1 'CodeRabbit (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run failure 'Review rate limited')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit failure still blocks' 1 'CodeRabbit (failure)'
+
 # ---------------------------------------------------------------------------
 # ENG-2833 — a hung in_progress Opslane run is not a verdict
 # ---------------------------------------------------------------------------
