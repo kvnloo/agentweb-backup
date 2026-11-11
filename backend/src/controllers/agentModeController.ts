@@ -1122,6 +1122,11 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
 const LINKEDIN_INVITE_CAP_BLOCK_RE =
   /cannot resend yet|account[ -]level invitation (?:cooldown|cap|limit)|linkedin (?:daily volume limit reached|write actions are being paced)|daily (?:invite|volume).*(?:cap|limit)|(?:pacing|paced).*(?:cap|limit|refus|reach)/i;
 
+// ENG-2900: the account itself is dead (linkedInDisconnectedResponse in emma/impl/linkedin.ts).
+// Every later invite fails the same way, so it is a schedule-wide block like the cooldown —
+// and only the owner can clear it by reconnecting.
+const LINKEDIN_ACCOUNT_DISCONNECTED_RE = /linkedin account (?:is )?disconnected/i;
+
 type LinkedInInviteSendBlock = {
   notice: string;
   // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
@@ -1150,7 +1155,7 @@ type LinkedInInviteSendBlock = {
  * `evaluateLinkedInSendRequirement` on the ACTION, so a send failing in a way this
  * pattern does not recognise still fails the run.
  */
-function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
+export function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
   if (!Array.isArray(toolCalls)) return null;
   const inviteCalls = toolCalls.filter(
     (call: any) => call?.name === 'linkedin_outreach' && normalizeLinkedInOutreachAction(call) === 'send-invite',
@@ -1160,13 +1165,22 @@ function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): Lin
     const detail = [call?.error, call?.result?.error, call?.result?.message]
       .filter((value) => typeof value === 'string')
       .join('\n');
-    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail);
+    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail) || LINKEDIN_ACCOUNT_DISCONNECTED_RE.test(detail);
   });
   if (!blockedCall) return null;
 
   const detail = [blockedCall.error, blockedCall.result?.error, blockedCall.result?.message]
     .filter((value) => typeof value === 'string')
     .join(' ');
+  const blockedArgs0 = linkedInOutreachArgs(blockedCall);
+  if (LINKEDIN_ACCOUNT_DISCONNECTED_RE.test(detail)) {
+    return {
+      accountId: blockedArgs0 && typeof blockedArgs0.account_id === 'string' ? blockedArgs0.account_id : undefined,
+      notice:
+        'LinkedIn send-invite was blocked because the LinkedIn account is disconnected. ' +
+        'No invitations can be sent until it is reconnected in Settings > Connected Accounts; the remaining invitations were not sent.',
+    };
+  }
   const internalPacing = /daily (?:invite|volume).*(?:cap|limit)|write actions are being paced|pacing|paced/i.test(detail);
   const reason = internalPacing ? 'our internal pacing cap' : "LinkedIn's account-level invitation cooldown";
   const blockedArgs = linkedInOutreachArgs(blockedCall);

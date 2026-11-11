@@ -35,6 +35,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import { assertAdsManagementGranted } from './metaToolkitWrites';
 import { googleToolkitEnabled } from './zomaToolDefinitions';
+import { isOutcomeUnknownFailure } from './zomaWriteGuard';
 
 export const CREATIVE_ASSET_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'CREATE'] as const;
 export const ZOMA_UPLOAD_PREFIX = 'zoma-uploads';
@@ -329,8 +330,9 @@ function videoResult(videoId: string, st: { status: string; thumbnail_url?: stri
     };
   }
   if (st.status === 'processing') {
+    // ENG-2931: still processing is not a confirmed upload outcome, so never success.
     return {
-      success: true,
+      success: false,
       verification: 'UNCONFIRMED',
       video_id: videoId,
       video_status: 'processing',
@@ -414,9 +416,39 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
   if (!preview?.awaitingUserConfirmation || !preview.metaWriteDispatch) {
     return { success: false, status: 'FAILED', message: `Not created, nothing was sent to Meta: ${String(preview?.error || preview?.message || 'the creative could not be prepared.')}` };
   }
-  const { result, createdId } = await deps.dispatch(userId, preview.metaWriteDispatch);
-  if (!result?.success || result?.blocked || result?.throttled || !createdId) {
+  // ENG-2931: a transport throw, or an accepted request with no id, may still have created the
+  // creative at Meta: UNCONFIRMED (check before retrying), never success and never "not created".
+  let dispatched: { result: any; createdId?: string | null };
+  try {
+    dispatched = await deps.dispatch(userId, preview.metaWriteDispatch);
+  } catch (error: unknown) {
+    return {
+      success: false,
+      verification: 'UNCONFIRMED',
+      id: null,
+      message: `UNCONFIRMED: the creative request failed without a definite answer from Meta (${error instanceof Error ? error.message : String(error)}), so it may or may not have been created. List the account's creatives before retrying.`,
+    };
+  }
+  const { result, createdId } = dispatched;
+  if (isOutcomeUnknownFailure(result)) {
+    // ENG-2931: the wrapper caught a transport failure; the creative may exist at Meta.
+    return {
+      success: false,
+      verification: 'UNCONFIRMED',
+      id: null,
+      message: `UNCONFIRMED: the creative request failed without a definite answer from Meta (${String(result?.error || result?.message)}), so it may or may not have been created. List the account's creatives before retrying.`,
+    };
+  }
+  if (!result?.success || result?.blocked || result?.throttled) {
     return { success: false, status: 'FAILED', message: String(result?.error || result?.message || 'Meta did not create the creative.') };
+  }
+  if (!createdId) {
+    return {
+      success: false,
+      verification: 'UNCONFIRMED',
+      id: null,
+      message: 'UNCONFIRMED: Meta accepted the creative request but returned no creative id. List the account\'s creatives before retrying.',
+    };
   }
   const read = await deps.readCreative(userId, accountId, createdId).catch(() => null);
   const creative = read?.creative;
