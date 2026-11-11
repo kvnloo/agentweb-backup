@@ -32,6 +32,7 @@ import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './z
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
+import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
 export class MetaToolkitAuthError extends Error {
@@ -82,6 +83,8 @@ export interface MetaToolkitGatewayDeps {
   runHealthTool?: typeof runMetaHealthTool;
   /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
   runCatalogTool?: typeof runMetaCatalogTool;
+  /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
+  runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
 }
@@ -305,6 +308,13 @@ export async function handleMetaToolkitCall(
     const catalogs = await (deps.runCatalogTool ?? runMetaCatalogTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(catalogs);
+  }
+
+  // ENG-2920: read-only Pages / Instagram / Ad Library tools, scoped to the resolved account.
+  if (isMetaPagesTool(request.toolName)) {
+    const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(pages);
   }
 
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
