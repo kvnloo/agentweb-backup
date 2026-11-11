@@ -15653,7 +15653,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async readToolkitMetaCatalogGraph(
     userId: string, account_id: string, path: string, params: Record<string, string>,
   ): Promise<any> {
-    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds))$/.test(path)) {
+    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
