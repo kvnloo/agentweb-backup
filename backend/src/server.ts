@@ -437,6 +437,10 @@ const runDrain = async (reason: string): Promise<void> => {
   await import('./services/funding/claudeCodeBackendInstance')
     .then((m) => m.claudeCodeBackend.flush())
     .catch(() => undefined);
+  // ENG-2906: flush queued product-journey events (PostHog batches in memory).
+  await import('./services/journeyTracking')
+    .then((m) => m.flushJourney())
+    .catch(() => undefined);
   // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
   await import('./services/funding/claudeSubscriptionService')
     .then((m) => m.shutdownClaudeSubscriptionService())
@@ -1784,7 +1788,7 @@ createTestAccount().then(async () => {
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
-      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear bug stats,
       // DMs Harsha through the existing loop Slack rail, and appends one
       // snapshot for restart-safe trend rendering.
       if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {

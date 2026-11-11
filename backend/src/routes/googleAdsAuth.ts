@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getGoogleAdsConfig } from '../config/integrations';
 import { createAccount, getAccountsByUserId } from '../services/connectedAccountsDb';
+import { zomaMilestone } from '../services/journeyMilestones';
 import { googleAdsService } from '../services/googleAdsService';
 import type { GoogleAdsAccountNode, GoogleAdLeaf } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
@@ -240,6 +241,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         },
       });
     }
+    // ENG-2906: journey event; zomaStage only moves for users who already use Zoma.
+    void zomaMilestone(userId, 'google_connected', { emit: 'always', requireZoma: true, props: { platform: 'google_ads' } });
     res.json({ success: true, connected: selected.length });
   } catch (error: any) {
     console.error('[Google Ads OAuth /connect]', error);

@@ -39,6 +39,17 @@ import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
+import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
+
+/**
+ * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
+ * successful read / executed write moves the user's zomaStage and emits first_read /
+ * first_write once. Fire-and-forget: journey capture never delays or fails a tool call.
+ */
+const TOOLKIT_PRODUCT = 'zoma' as const;
+function journeyAfterCall(userId: string, event: 'first_read' | 'first_write', props: Record<string, unknown>) {
+  void zomaMilestone(userId, event, { emit: 'if_advanced', props: { product: TOOLKIT_PRODUCT, ...props } });
+}
 
 export class MetaToolkitAuthError extends Error {
   readonly status: 401 | 403 | 429;
@@ -232,12 +243,14 @@ export function stripCredentials<T>(value: T, depth = 0): T {
  * A refused or failed call is not metered.
  */
 export async function handleMetaToolkitCall(
-  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string },
+  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string },
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
-  const meter = (platform?: string) =>
-    deps.recordUsage({
+  const meter = (platform?: string) => {
+    void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
+    return deps.recordUsage({
+      product: TOOLKIT_PRODUCT,
       userId: caller.userId,
       toolName: request.toolName,
       ...(platform ? { platform } : {}),
@@ -246,7 +259,9 @@ export async function handleMetaToolkitCall(
       clientId: caller.clientId,
       sessionId: request.sessionId,
       userAgent: request.userAgent,
+      ref: request.ref,
     });
+  };
 
   // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.
@@ -255,6 +270,7 @@ export async function handleMetaToolkitCall(
   const recordExecutedWrite = async (entityType: string, action: string, result: any) => {
     if (typeof result?.verification !== 'string') return;
     await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      product: TOOLKIT_PRODUCT,
       userId: caller.userId,
       toolName: request.toolName,
       authMethod: caller.authMethod,
@@ -267,6 +283,8 @@ export async function handleMetaToolkitCall(
       action,
       verification: result.verification,
       objectId: result.id ?? result.image_hash ?? result.video_id ?? undefined,
+    }).then(() => {
+      journeyAfterCall(caller.userId, 'first_write', { platform: 'meta', toolName: request.toolName });
     }).catch((error) => {
       console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
       result.metering = 'failed: this write executed but was not recorded in usage';
@@ -300,14 +318,22 @@ export async function handleMetaToolkitCall(
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
-      assertMetaToolkitScope(caller, request.toolName, google.isGoogleToolkitWrite(request.toolName, request.args ?? {}));
-      return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
+      const googleWrite = google.isGoogleToolkitWrite(request.toolName, request.args ?? {});
+      assertMetaToolkitScope(caller, request.toolName, googleWrite);
+      const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
+      const googleResult = await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
         meter: () => meter('google_ads'),
-        recordWrite: deps.recordWrite ?? recordMcpWriteExecuted,
+        recordWrite: async (input) => {
+          const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
+          journeyAfterCall(caller.userId, 'first_write', { platform: 'google_ads', toolName: request.toolName });
+          return recorded;
+        },
         accessError: (message) => new MetaToolkitAuthError(message, 403),
-      }));
+      });
+      if (!googleWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'google_ads', toolName: request.toolName });
+      return stripCredentials(googleResult);
     }
   }
 
@@ -419,8 +445,38 @@ export async function handleMetaToolkitCall(
             sessionId: request.sessionId,
           });
 
-  if (guardedWrite) await recordExecutedWrite(String(args.entity_type), String(args.action), result);
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  // ENG-2915: a BULK_CREATE result carries one verdict per creative; each is its own write event.
+  const executedWrites: any[] = !guardedWrite
+    ? []
+    : Array.isArray((result as any)?.results)
+      ? (result as any).results
+      : [result];
+  for (const write of executedWrites) {
+    if (typeof write?.verification !== 'string') continue;
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      platform: 'meta',
+      entityType: String(args.entity_type),
+      action: String(args.action),
+      verification: write.verification,
+      objectId: write.id ?? write.creative_id ?? write.image_hash ?? write.video_id ?? undefined,
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      write.metering = 'failed: this write executed but was not recorded in usage';
+    });
+  }
 
   await meter('meta');
+  if (!guardedWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
   return stripCredentials(result);
 }

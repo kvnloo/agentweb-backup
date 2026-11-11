@@ -107,6 +107,7 @@ describe('mcpUsageEventsService', () => {
     expect(item.eventType).toBe('mcp_connection_attempted');
     expect(item.subjectId).toBe('user-1');
     expect(item.dimensions).toEqual({
+      product: 'unknown', // ENG-2906: every event names its product; the caller passed none
       authMethod: 'api_key',
       apiKeyId: 'key-1',
       clientType: 'claude_code',
