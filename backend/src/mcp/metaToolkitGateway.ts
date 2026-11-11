@@ -296,7 +296,7 @@ export async function handleMetaToolkitCall(
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
-      assertMetaToolkitScope(caller, request.toolName, google.isGoogleGuardedWrite(request.toolName, request.args ?? {}));
+      assertMetaToolkitScope(caller, request.toolName, google.isGoogleToolkitWrite(request.toolName, request.args ?? {}));
       return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
