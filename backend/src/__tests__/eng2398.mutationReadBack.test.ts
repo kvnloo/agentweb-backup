@@ -16,6 +16,7 @@ const VERIFIED = new Set([
   'updateKeyword', 'removeKeyword',
   'updateAd', 'removeAd',
   'removeConversionAction',
+  'updateAssetGroup', // ENG-2928: status read back via verifyFieldsReadBack
 ]);
 
 /** Explicit exemptions, each with the reason it is not a silent-success risk. */

@@ -46,6 +46,7 @@ function deps(over: Partial<MetaToolkitCreativeDeps> = {}): MetaToolkitCreativeD
     presignGet: jest.fn((key: string) => `https://${BUCKET}.s3.amazonaws.com/${key}?X-Amz-Signature=get`),
     headObject: jest.fn().mockResolvedValue({ key: 'k', contentLength: 2048, contentType: 'image/png' }),
     resolveHost: jest.fn().mockResolvedValue(['104.18.1.1']),
+    probeUrl: jest.fn(async (url: string) => ({ finalUrl: url, status: 200, contentType: '' })),
     uploadImage: jest.fn().mockResolvedValue({ success: true, image_hash: 'abc123hash', image_url: 'https://scontent/x.png' }),
     uploadVideo: jest.fn().mockResolvedValue({ success: true, video: { id: '998877' } }),
     videoStatus: jest.fn().mockResolvedValue({ status: 'ready', thumbnail_url: 'https://scontent/thumb.jpg' }),

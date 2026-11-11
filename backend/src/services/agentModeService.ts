@@ -534,7 +534,7 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 // DEFAULT_MAX_IMAGE_BYTES were used only by describeImage, which moved to
 // emma/impl/mediaVideo.ts (imports them there directly). assertPublicHostname
 // was already unused before this move (pre-existing, left as-is).
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { assertPublicHostname, DEFAULT_MAX_REDIRECTS, fetchBufferFollowingRedirects } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
@@ -13989,9 +13989,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      // Download image from URL
-      const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-      const buffer = Buffer.from(response.data as any);
+      // Download image from URL. ENG-2915: the URL can come from an external Zoma caller, so
+      // the fetch is pinned to a re-validated public address on every redirect hop (a probe
+      // before this fetch is not enough: DNS can rebind and a redirect can point inside), and
+      // the body is capped at Meta's 30 MB image limit with a bounded total time.
+      const { buffer } = await fetchBufferFollowingRedirects(imageUrl, {}, DEFAULT_MAX_REDIRECTS, 30_000, 30 * 1024 * 1024);
       // Simple filename extraction or default
       let filename = 'ad-image.jpg';
       try {
@@ -15687,7 +15689,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
     // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
     // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
-    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))?)$/.test(path)) {
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15720,7 +15722,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     userId: string, account_id: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>,
   ): Promise<any> {
     // ENG-2927: a catalog's external_event_sources edge (connect = POST, disconnect = DELETE).
-    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources))?$/ : /^\d+(\/external_event_sources)?$/;
+    // ENG-2926: business owned_product_catalogs (catalog create), a catalog's product_feeds, a feed's uploads / rules.
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules))?$/ : /^\d+(\/external_event_sources)?$/;
     if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
     const { accessToken } = await this.getMetaCredentials(userId, account_id);
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
