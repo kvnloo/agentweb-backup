@@ -13,11 +13,14 @@
  * they are refused at call time. A caller that ignores the schema still cannot reach an
  * excluded action.
  */
+import { SIGNAL_READ_DEFINITIONS } from './metaToolkitSignals';
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
+import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
+import { isMetaCatalogTool, META_CATALOG_TOOL_DEFINITIONS } from './metaToolkitCatalogs';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 
@@ -96,12 +99,21 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     return narrowDefinition(tool.definition);
   });
   // ENG-2303: toolkit-local Zoma onboarding tools (handled by the gateway, not the registry).
-  return [...metaTools, ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))), ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))), ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d)))];
+  // ENG-2916: read-only account health + learning-phase tools (handled by the gateway).
+  return [
+    ...metaTools,
+    ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...META_CATALOG_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+  ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }
