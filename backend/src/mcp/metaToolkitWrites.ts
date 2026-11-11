@@ -184,12 +184,28 @@ function validateEditFields(params: any, keys: string[]) {
   if (params.bid_strategy === 'LOWEST_COST_WITHOUT_CAP' && params.bid_amount !== undefined) {
     throw new MetaToolkitRefusal('bid_amount must not be set with LOWEST_COST_WITHOUT_CAP.');
   }
+  // Same bid guard as AD_SET CREATE (createMetaAdsAdSet): major units, $0.01 – $1,000.
+  if (params.bid_amount !== undefined) {
+    const bid = Number(params.bid_amount);
+    if (!Number.isFinite(bid) || bid < 0.01) throw new MetaToolkitRefusal('bid_amount must be at least 0.01.');
+    if (bid > 1000) throw new MetaToolkitRefusal('bid_amount exceeds safety limit of 1,000 (same limit as creating an ad set).');
+  }
   if (params.targeting !== undefined && (!params.targeting || typeof params.targeting !== 'object' || Array.isArray(params.targeting))) {
     throw new MetaToolkitRefusal('targeting must be a Meta targeting object (e.g. {geo_locations, age_min, excluded_custom_audiences}). Send the full targeting spec; it replaces the current one.');
   }
   const excluded = params.targeting?.excluded_custom_audiences;
   if (excluded !== undefined && (!Array.isArray(excluded) || excluded.some((a: any) => !a || typeof a !== 'object' || !a.id))) {
     throw new MetaToolkitRefusal('targeting.excluded_custom_audiences must be a list of {id} objects.');
+  }
+  // Same location guard as AD_SET CREATE: a replacement spec without locations would silently
+  // strip the ad set's country targeting (the spec replaces the current one as a whole).
+  if (params.targeting !== undefined) {
+    const geo = params.targeting.geo_locations;
+    const hasLocation = geo && typeof geo === 'object' && ['countries', 'regions', 'cities', 'zips', 'geo_markets', 'custom_locations', 'places']
+      .some((k) => Array.isArray(geo[k]) && geo[k].length > 0);
+    if (!hasLocation) {
+      throw new MetaToolkitRefusal('targeting.geo_locations is required and cannot be empty: the targeting spec replaces the current one, so include the locations (e.g. {"countries": ["US"]}) along with any other changes.');
+    }
   }
   for (const f of TIME_FIELDS) {
     if (params[f] === undefined) continue;
@@ -206,6 +222,12 @@ function validateEditFields(params: any, keys: string[]) {
   if (params.name !== undefined && (typeof params.name !== 'string' || !params.name.trim())) {
     throw new MetaToolkitRefusal('name must be a non-empty string.');
   }
+}
+
+const BOUND_PRIOR_FIELDS = ['status', 'name', 'daily_budget', 'lifetime_budget', 'spend_cap', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time', 'creative_id'];
+function priorStateForBinding(prior: Record<string, any> | null): Record<string, unknown> | null {
+  if (!prior) return null;
+  return Object.fromEntries(BOUND_PRIOR_FIELDS.filter((f) => prior[f] !== undefined).map((f) => [f, prior[f]]));
 }
 
 /** The YYYY-MM-DD part is a real calendar day (Date.parse rolls 2026-02-30 over to March). */
@@ -305,9 +327,18 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   if (action === 'UPDATE' && params.creative_id !== undefined) {
     try {
       await deps.assertCreativeOwned(userId, accountId, String(params.creative_id));
-    } catch {
+    } catch (error: any) {
+      // Only a confirmed "not in this account" answer says so; a Meta outage is not a verdict.
+      if (error?.creativeLookupFailed) {
+        throw new MetaToolkitRefusal(`Could not check creative ${params.creative_id} with Meta right now (${error?.message || 'Meta request failed'}). Nothing was changed; try again shortly.`);
+      }
       throw new MetaToolkitRefusal(`Creative ${params.creative_id} was not found in ad account ${accountId}. Nothing was changed.`);
     }
+  }
+  // A bid amount on an ad set that stays on the no-cap strategy is stored but unused by Meta.
+  if (action === 'UPDATE' && entity === 'AD_SET' && params.bid_amount !== undefined && params.bid_strategy === undefined
+    && prior?.bid_strategy === 'LOWEST_COST_WITHOUT_CAP') {
+    throw new MetaToolkitRefusal('This ad set uses LOWEST_COST_WITHOUT_CAP, which ignores bid_amount. Send bid_strategy (LOWEST_COST_WITH_BID_CAP or COST_CAP) together with bid_amount.');
   }
   // A schedule change on a live ad set can start or extend delivery (e.g. a past end_time moved
   // into the future), so it gets the same treatment as an activation: its own change, current
@@ -359,6 +390,9 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     ...(scheduleBudgetState ? { scheduleBudgetState } : {}),
     // Bind the status the schedule warning was based on, with or without a spend policy.
     ...(scheduleChange ? { schedulePriorStatus: prior?.status ?? null } : {}),
+    // Bind the entity's configured state (not delivery state), so an approval does not apply
+    // to an ad set someone else changed after the preview (targeting, status, bidding, …).
+    ...(action === 'UPDATE' ? { priorState: priorStateForBinding(prior) } : {}),
   });
   const now = deps.now();
   const secret = deps.secret();

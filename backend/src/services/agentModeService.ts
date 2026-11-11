@@ -15599,7 +15599,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-    const creative: any = await metaService.getAdCreative(accessToken, creativeId);
+    let creative: any;
+    try {
+      creative = await metaService.getAdCreative(accessToken, creativeId);
+    } catch (error: any) {
+      // Meta code 100 = the node does not exist or is not visible to this token: a real "not
+      // found". Anything else (5xx, rate limit, network) is a failed lookup, not a verdict.
+      const code = Number(error?.structuredError?.code ?? error?.response?.error?.code);
+      if (code === 100) throw error;
+      const failed: any = new Error(String(error?.structuredError?.error_user_msg || error?.message || 'Meta request failed'));
+      failed.creativeLookupFailed = true;
+      throw failed;
+    }
     MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
   }
 
