@@ -20,6 +20,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
+import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 
 const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
 
@@ -100,6 +101,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
   return [
     ...metaTools,
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
   ];
