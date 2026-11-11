@@ -25,6 +25,7 @@ import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { isZomaTool } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
+import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
@@ -269,6 +270,12 @@ export async function handleMetaToolkitCall(
     request.toolName,
     isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
   );
+  // ENG-2921: the error explainer is pure (static table) and needs no ad account.
+  if (request.toolName === 'ads_get_errors') {
+    const result = explainMetaError(args);
+    await meter('meta');
+    return result;
+  }
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
@@ -286,6 +293,14 @@ export async function handleMetaToolkitCall(
     const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
     // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
     if ((result as any)?.success !== false) await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2921: read-only account activity log; tools:read scope, no write metering.
+  if (isDiagnosticsRead(request.toolName)) {
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.readToolkitMetaActivityLog(caller.userId, args);
+    await meter('meta');
     return stripCredentials(result);
   }
 
