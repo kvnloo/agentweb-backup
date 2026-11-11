@@ -32,6 +32,9 @@ export interface TimeoutContinuationMessage {
     // hasUnresolvedMediaDeferral for the "soft" deferral shape (see
     // hasDeferredMediaBudgetToolCall).
     toolCalls?: DeferredToolCallLike[];
+    // ENG-2854: the turn stopped at the step limit; its report is terminal, so a
+    // passive session read must never auto-resume a deferral it still lists.
+    iterationLimitReached?: boolean;
   } | null;
   timestamp?: string;
   role?: string;
@@ -251,6 +254,7 @@ export function hasUnresolvedMediaDeferral(
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const last = messages[messages.length - 1];
   if (!last) return false;
+  if (last.metadata?.iterationLimitReached === true) return false;
   const isUnresolvedShape = last.role === 'user'
     ? last.metadata?.kind === 'auto-continuation'
     : last.role === 'tool'

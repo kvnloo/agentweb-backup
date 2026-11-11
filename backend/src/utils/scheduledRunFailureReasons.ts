@@ -18,6 +18,7 @@ export interface ScheduledRunFailureSignals {
   publishToolFailing?: boolean;
   sendPressExhausted?: boolean;
   attempts?: number;
+  terminationReason?: 'iteration_limit';
 }
 
 export function describeScheduledRunFailureReasons(
@@ -50,7 +51,10 @@ export function describeScheduledRunFailureReasons(
   if (extra.linkedInInviteSendRequirementMissed) {
     reasons.push('LinkedIn invite send requirement not met');
   }
-  if (run.workPlanCompleted === false) reasons.push('work plan not completed');
+  // ENG-2854: the step limit is the cause; the unfinished plan is its consequence.
+  if (run.terminationReason === 'iteration_limit') {
+    reasons.push('stopped at the iteration (step) limit; resumable report saved, not auto-retried');
+  } else if (run.workPlanCompleted === false) reasons.push('work plan not completed');
 
   const hasMisses = (run.functionCallMisses?.length ?? 0) > 0 || (run.keywordMisses?.length ?? 0) > 0;
   // Empty assistant text is normal for tool-call-only turns, so it only names the

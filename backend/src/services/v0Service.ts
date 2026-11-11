@@ -1871,13 +1871,25 @@ export function isRetryableGithubPushError(err: any): { retryable: boolean; reas
  * Returns the pushed commit SHA and the post-push timestamp (used to scope the
  * Vercel deployment poll).
  */
+/**
+ * ENG-2896: thrown when a caller-supplied expected base SHA no longer matches
+ * the branch head. Never retried — nothing has been written when it is thrown.
+ */
+export class BaseShaConflictError extends Error {
+  constructor(public readonly expectedSha: string, public readonly actualSha: string) {
+    super(`Branch head is ${actualSha}, expected ${expectedSha}. Re-read the branch and retry.`);
+    this.name = "BaseShaConflictError";
+  }
+}
+
 export async function commitFilesToRepoMain(
   repoFullName: string,
   ghHeaders: Record<string, string>,
   filesToCommit: RepoFileToCommit[],
   commitMessage: string,
   maxAttempts = 4,
-  branch = "main"
+  branch = "main",
+  expectedBaseSha?: string
 ): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
   const getMainSha = async (): Promise<string> => {
     const refRes = await axios.get<any>(
@@ -1900,6 +1912,13 @@ export async function commitFilesToRepoMain(
       // Idempotency: a prior attempt's patch already landed (lost-response case).
       if (pendingCommitSha && latestCommitSha === pendingCommitSha) {
         return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+      }
+
+      // ENG-2896: optimistic concurrency. Checked on every attempt, so a
+      // concurrent push that turns our ref update into a non-fast-forward
+      // surfaces as a conflict on the retry instead of a silent rebase.
+      if (expectedBaseSha && latestCommitSha !== expectedBaseSha) {
+        throw new BaseShaConflictError(expectedBaseSha, latestCommitSha);
       }
 
       const treeItems = await Promise.all(
@@ -1944,6 +1963,7 @@ export async function commitFilesToRepoMain(
 
       return { pushedCommitSha, pushTimestampMs: Date.now() };
     } catch (err: any) {
+      if (err instanceof BaseShaConflictError) throw err;
       lastErr = err;
 
       // Did the patch actually land despite this error? (lost response after a

@@ -218,6 +218,34 @@ describe('ENG-244 — real loop sets truncatedByStepBudget at the step budget', 
     expect(result.content).toMatch(/reached the maximum number of processing steps/i);
   });
 
+  it('ENG-2854: reports completed LP writes and resumable state without another loop', async () => {
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async () => buildLLMResponse({
+      content: '',
+      tool_calls: [{ id: `write-${call}`, name: 'coding_agent', arguments: JSON.stringify({
+        page_id: 'lp-flatfee', task_description: `Edit section ${call++}`,
+      }) }],
+    }));
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue({ content: JSON.stringify({
+      success: true, branch: 'draft/flatfee', previewUrl: 'https://preview.example/lp-flatfee',
+    }) });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+    const result = await service.generateMarketingResponse(
+      'Edit my landing page sections, then verify the preview.', [], 'test-user', service.default_model, 'test-session',
+    );
+    expect(call).toBe(40);
+    expect((service as any).executeTool.mock.calls).toHaveLength(39);
+    expect(result.content).toContain('lp-flatfee');
+    expect(result.content).toContain('draft/flatfee');
+    expect(result.content).toContain('https://preview.example/lp-flatfee');
+    expect(result.content).toMatch(/What changed/);
+    expect(result.content).toMatch(/What remains/);
+    expect(result.content).toMatch(/How to resume/);
+    expect(result.content).toMatch(/Yugo.*engineering/i);
+    expect(result.content).toMatch(/not.*automatically retr/i);
+    expect(result.responseMessages.filter((m: any) => m.role === 'assistant').at(-1)?.content).toBe(result.content);
+  });
+
   it('does NOT set truncatedByStepBudget on a clean run that finishes within budget (no false positive)', async () => {
     // Turn 1 gathers, turn 2 emits the final report with no tool call → clean
     // termination well under the budget.

@@ -131,6 +131,8 @@ async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
  * customer is removed, so it cannot make a user ready on its own.
  */
 async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
+  // Card requirement paused (2026-11-10, eng lead). Set ZOMA_REQUIRE_PAYMENT_METHOD=true to re-enable.
+  if (process.env.ZOMA_REQUIRE_PAYMENT_METHOD !== 'true') return true;
   return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
 

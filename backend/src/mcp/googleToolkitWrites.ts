@@ -31,7 +31,7 @@ import {
   consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
 } from './zomaWriteGuard';
 
-export type GoogleReadKind = 'budget' | 'campaign' | 'ad_group';
+export type GoogleReadKind = 'budget' | 'campaign' | 'ad_group' | 'campaign_conversion_goal';
 
 export interface GoogleBudgetState { resourceName: string; name?: string; amountMicros: number; explicitlyShared: boolean; referenceCount: number; status?: string }
 export interface GoogleCampaignState { resourceName: string; name?: string; status: string; budget?: string }
@@ -63,8 +63,9 @@ export function googleSpendCeilingPolicyFromEnv(raw = process.env.GOOGLE_TOOLKIT
   return { maxChangeRatio: -1 }; // invalid on purpose → evaluator refuses
 }
 
-const RESOURCE: Record<GoogleReadKind, string> = { budget: 'campaignBudgets', campaign: 'campaigns', ad_group: 'adGroups' };
+const RESOURCE: Record<GoogleReadKind, string> = { budget: 'campaignBudgets', campaign: 'campaigns', ad_group: 'adGroups', campaign_conversion_goal: 'campaignConversionGoals' };
 const GAQL: Record<GoogleReadKind, string> = {
+  campaign_conversion_goal: 'SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.resource_name = ',
   budget: 'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count, campaign_budget.status FROM campaign_budget WHERE campaign_budget.resource_name = ',
   campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget FROM campaign WHERE campaign.resource_name = ',
   ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign FROM ad_group WHERE ad_group.resource_name = ',
@@ -72,11 +73,18 @@ const GAQL: Record<GoogleReadKind, string> = {
 
 /** Resource names are only accepted inside the resolved customer (also keeps GAQL injection-free). */
 export function isCustomerResource(customerId: string, kind: GoogleReadKind, value: unknown): value is string {
+  if (!/^\d+$/.test(customerId)) return false;
+  if (kind === 'campaign_conversion_goal') return typeof value === 'string' && new RegExp(`^customers/${customerId}/campaignConversionGoals/\\d+~[A-Z][A-Z_]*~[A-Z][A-Z_]*$`).test(value);
   return typeof value === 'string' && new RegExp(`^customers/${customerId}/${RESOURCE[kind]}/\\d+$`).test(value);
 }
 
 export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   if (!row) return null;
+  if (kind === 'campaign_conversion_goal') {
+    const g = row.campaignConversionGoal;
+    return g?.resourceName && typeof g.biddable === 'boolean'
+      ? { resourceName: g.resourceName, campaign: g.campaign, name: row.campaign?.name, category: g.category, origin: g.origin, biddable: g.biddable } : null;
+  }
   if (kind === 'budget') {
     const b = row.campaignBudget;
     if (!b?.resourceName) return null;
@@ -154,6 +162,7 @@ interface ValidatedWrite {
 
 const COMMON = ['customer_id', 'entity_type', 'action'];
 const ALLOWED: Record<string, string[]> = {
+  'CAMPAIGN_CONVERSION_GOAL UPDATE': ['resource_name', 'biddable'],
   'BUDGET CREATE': ['name', 'amount', 'explicitly_shared'],
   'BUDGET UPDATE': ['budget_resource_name', 'amount'],
   'CAMPAIGN CREATE': ['name', 'type', 'budget_resource_name', 'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target', 'cpc_bid_ceiling', 'location_target_ids', 'status'],
@@ -202,6 +211,11 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
   };
 
   switch (op) {
+    case 'CAMPAIGN_CONVERSION_GOAL UPDATE': {
+      const rn = resource('campaign_conversion_goal', 'resource_name');
+      need(typeof args.biddable === 'boolean', 'biddable must be true or false.');
+      return { dispatchArgs: { ...base, resource_name: rn, biddable: args.biddable }, target: { kind: 'campaign_conversion_goal', resourceName: rn } };
+    }
     case 'BUDGET CREATE': {
       need(nonBlank(args.name), 'BUDGET CREATE requires name.');
       need(args.explicitly_shared === undefined || typeof args.explicitly_shared === 'boolean', 'explicitly_shared must be true or false.');
@@ -265,6 +279,10 @@ function createdResourceName(entity: string, result: any): string | undefined {
 
 function verify(validated: ValidatedWrite, entity: string, readBack: any | null): WriteVerification {
   if (!readBack) return 'UNCONFIRMED';
+  if (entity === 'CAMPAIGN_CONVERSION_GOAL') {
+    if (typeof readBack.biddable !== 'boolean') return 'UNCONFIRMED';
+    return readBack.biddable === validated.dispatchArgs.biddable ? 'CONFIRMED' : 'MISMATCH';
+  }
   if (entity === 'BUDGET') {
     if (!Number.isFinite(readBack.amountMicros)) return 'UNCONFIRMED';
     if (readBack.amountMicros !== validated.budgetMicros) return 'MISMATCH';
@@ -325,7 +343,13 @@ export async function executeGoogleToolkitWrite(
   const op = `${entity} ${action}`;
   let enableBudgetMicros: number | undefined;
 
-  if (op === 'BUDGET CREATE') {
+  if (op === 'CAMPAIGN_CONVERSION_GOAL UPDATE') {
+    const prior = await deps.read(userId, cid, 'campaign_conversion_goal', validated.target!.resourceName);
+    if (!prior || typeof prior.biddable !== 'boolean') refuseNotFound('Campaign conversion goal', validated.target!.resourceName);
+    state = { prior };
+    lines.push(`Campaign "${prior.name ?? prior.campaign ?? prior.resourceName}", category ${prior.category}, origin ${prior.origin}: biddable ${prior.biddable} → ${args.biddable}.`);
+    lines.push('This changes which conversion goal drives campaign bidding; it does not change the account default or campaign status.');
+  } else if (op === 'BUDGET CREATE') {
     lines.push(`Create budget "${args.name}": ${money(validated.budgetMicros!)}${validated.dispatchArgs.explicitly_shared ? ', SHARED (can be attached to several campaigns; it caps their combined spend)' : ''}.`);
   } else if (op === 'BUDGET UPDATE') {
     const prior: GoogleBudgetState | null = await deps.read(userId, cid, 'budget', validated.target!.resourceName);
@@ -360,11 +384,19 @@ export async function executeGoogleToolkitWrite(
     // Enabling a campaign starts spend at its budget, so the preview names that budget and
     // the ceiling applies to it — otherwise a budget set above the ceiling outside Zoma
     // (or before the ceiling existed) could be switched on here (Hardening, ENG-2823).
-    const budgetName = (prior as GoogleCampaignState).budget;
-    if (kind === 'campaign' && validated.expectedStatus === 'ENABLED' && isCustomerResource(cid, 'budget', budgetName)) {
+    let campaign = kind === 'campaign' ? prior as GoogleCampaignState : null;
+    if (kind === 'ad_group' && validated.expectedStatus === 'ENABLED') {
+      const campaignName = (prior as GoogleAdGroupState).campaign;
+      if (isCustomerResource(cid, 'campaign', campaignName)) {
+        campaign = await deps.read(userId, cid, 'campaign', campaignName);
+        state = { ...state, campaign };
+      }
+    }
+    const budgetName = campaign?.budget;
+    if (validated.expectedStatus === 'ENABLED' && isCustomerResource(cid, 'budget', budgetName)) {
       const budget: GoogleBudgetState | null = await deps.read(userId, cid, 'budget', budgetName);
       if (budget) {
-        state = { prior, budget };
+        state = { ...state, budget };
         enableBudgetMicros = budget.amountMicros;
         lines.push(`Budget "${budget.name ?? budget.resourceName}": ${money(budget.amountMicros)}.`);
         const note = sharedNote(budget);
@@ -384,11 +416,11 @@ export async function executeGoogleToolkitWrite(
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: validated.budgetMicros, prior });
     if (!verdict.allowed) throw new MetaToolkitRefusal(verdict.message.replace('(minor units)', '(micros)'));
   }
-  if (policy && op === 'CAMPAIGN UPDATE' && validated.expectedStatus === 'ENABLED') {
+  if (policy && (op === 'CAMPAIGN UPDATE' || op === 'AD_GROUP UPDATE') && validated.expectedStatus === 'ENABLED') {
     // Fail closed: a ceiling that cannot see the campaign's budget never allows enabling it.
     const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: enableBudgetMicros });
     if (!verdict.allowed) {
-      throw new MetaToolkitRefusal(`Enabling this campaign would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
+      throw new MetaToolkitRefusal(`Enabling this ${entity === 'AD_GROUP' ? 'ad group' : 'campaign'} would start spend at its budget. ${verdict.message.replace('(minor units)', '(micros)')}`);
     }
   }
 
@@ -446,7 +478,7 @@ export async function executeGoogleToolkitWrite(
   }
 
   const id = action === 'CREATE' ? createdResourceName(entity, result) : validated.target!.resourceName;
-  const kind: GoogleReadKind = entity === 'BUDGET' ? 'budget' : entity === 'CAMPAIGN' ? 'campaign' : 'ad_group';
+  const kind: GoogleReadKind = validated.target?.kind ?? (entity === 'BUDGET' ? 'budget' : entity === 'CAMPAIGN' ? 'campaign' : 'ad_group');
   const readBack = id ? await deps.read(userId, cid, kind, id).catch(() => null) : null;
   const verification = verify(validated, entity, readBack);
   const base = {
@@ -455,6 +487,7 @@ export async function executeGoogleToolkitWrite(
     id: id ?? null,
     status: readBack?.status ?? null,
     ...(readBack?.amountMicros !== undefined ? { amount_micros: readBack.amountMicros, amount: formatMicros(readBack.amountMicros, currency) } : {}),
+    ...(typeof readBack?.biddable === 'boolean' ? { biddable: readBack.biddable } : {}),
     ...(result.trackingWarning ? { tracking_warning: result.trackingWarning } : {}),
     ...(result.pausedChildEntitiesWarning ? { paused_children_warning: result.pausedChildEntitiesWarning } : {}),
   };

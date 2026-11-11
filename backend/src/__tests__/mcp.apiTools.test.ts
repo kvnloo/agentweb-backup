@@ -146,6 +146,82 @@ describe('apiTools', () => {
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
 
+  describe('update_landing_page_files (ENG-2896)', () => {
+    const files = [{ path: 'src/app/page.tsx', content: 'a' }, { path: 'src/app/x.tsx', content: 'b' }];
+    const call = () => mockMcpFetch.mock.calls[0][0] as any;
+
+    it('commits atomically to the draft branch by default and returns the commit SHA', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true, commit_url: 'https://github.com/o/r/commit/abc123' });
+      const res: any = await mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files }, context);
+      expect(call().method).toBe('PUT');
+      expect(call().path).toBe('/api/landing-pages/v0/generated/p1/update-files');
+      expect(call().body.branch).toBe('draft/agentweb-preview');
+      expect(call().body.files).toEqual([{ file_path: 'src/app/page.tsx', content: 'a' }, { file_path: 'src/app/x.tsx', content: 'b' }]);
+      expect(call().body.expected_base_sha).toBeUndefined();
+      expect(JSON.parse(res.content[0].text).commit_sha).toBe('abc123');
+    });
+
+    it('forwards expected_base_sha', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, expected_base_sha: 'f'.repeat(40) }, context);
+      expect(call().body.expected_base_sha).toBe('f'.repeat(40));
+    });
+
+    it('rejects main without calling the route', async () => {
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, branch: 'main' }, context)).rejects.toThrow(/never writes to main/);
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects more than 20 files without calling the route', async () => {
+      const many = Array.from({ length: 21 }, (_, i) => ({ path: `f${i}.txt`, content: 'x' }));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files: many }, context)).rejects.toThrow(/must not exceed 20/);
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a base-SHA conflict to the caller', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (409): Base SHA conflict: Branch head is b, expected a. Nothing was written.'));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, expected_base_sha: 'a'.repeat(40) }, context)).rejects.toThrow(/409.*Base SHA conflict/);
+    });
+
+    it('surfaces the own-account denial for a foreign page', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (403): Forbidden'));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'foreign', files }, context)).rejects.toThrow(/403/);
+    });
+
+    it('is not callable by a read-only (tools:read) aw_ key', () => {
+      const { findScopeDenial } = require('../mcp/server/apiKeyScopes');
+      const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'update_landing_page_files', arguments: {} } };
+      const lookup = (n: string) => mcpToolRegistry.getTool(n) as any;
+      expect(findScopeDenial(body, ['tools:read'], lookup)).toEqual({ tool: 'update_landing_page_files', requiredScope: 'tools:execute' });
+      expect(findScopeDenial(body, ['tools:read', 'tools:execute'], lookup)).toBeNull();
+    });
+  });
+
+  describe('landing page file tools branch (ENG-2864)', () => {
+    beforeEach(() => mockMcpFetch.mockResolvedValue({ ok: true }));
+    const path = () => (mockMcpFetch.mock.calls[0][0] as any).path as string;
+
+    it('list_landing_page_files forwards branch when given', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files?branch=draft%2Fagentweb-preview');
+    });
+
+    it('list_landing_page_files omits branch when absent', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files');
+    });
+
+    it('read_landing_page_file forwards branch when given', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx&branch=draft%2Fagentweb-preview');
+    });
+
+    it('read_landing_page_file omits branch when absent', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx');
+    });
+  });
+
   describe('list_tasks', () => {
     it('should call GET /api/tasks', async () => {
       mockMcpFetch.mockResolvedValue([{ taskId: 't1', name: 'Test' }]);

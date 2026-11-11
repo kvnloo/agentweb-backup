@@ -66,6 +66,8 @@ export interface GenerateMarketingResponseResult {
   sources: string[];
   responseMessages: any[];
   cancelled?: boolean;
+  // Loop termination signal carried unchanged across IPC; suppress automatic replay.
+  truncatedByStepBudget?: boolean;
   // ENG-473: count of responseMessages already persisted incrementally during the
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;

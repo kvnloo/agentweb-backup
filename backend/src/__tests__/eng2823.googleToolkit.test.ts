@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2823 — Zoma Google Ads toolkit on the provider-pluggable template.
  *  - Google reads go through the same handler objects Emma registers, against the caller's

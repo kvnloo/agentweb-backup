@@ -28,6 +28,7 @@ import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
+import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -3119,7 +3120,12 @@ export const taskDb = {
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
-        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        // ENG-2837: exclude the lead-submission claim partition server-side — claims are not
+        // configs, and an unbounded set of them must not be loaded into analytics memory.
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`, {
+          FilterExpression: "userId <> :leadSubmissionClaimPartition",
+          ExpressionAttributeValues: { ":leadSubmissionClaimPartition": LEAD_SUBMISSION_CLAIM_PARTITION },
+        }),
         this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
         this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
       ]);
@@ -3196,14 +3202,19 @@ export const taskDb = {
     }
   },
 
-  // Helper function to scan all items with pagination
-  async scanAllItems(tableName: string) {
+  // Helper function to scan all items with pagination. `filter` is applied server-side
+  // (Scan FilterExpression) so excluded items never reach this process.
+  async scanAllItems(
+    tableName: string,
+    filter?: { FilterExpression: string; ExpressionAttributeValues: Record<string, unknown> },
+  ) {
     const items: any[] = [];
     let lastEvaluatedKey: any = undefined;
 
     do {
       const params: any = {
         TableName: tableName,
+        ...filter,
       };
 
       if (lastEvaluatedKey) {
@@ -6703,6 +6714,9 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2837: do not dispatch the new-lead notification at the write. For a caller that must
+     *  make its own idempotency record durable first and then dispatches it itself. */
+    deferCreatedNotification?: boolean;
     /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
      *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
      *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
@@ -6912,9 +6926,11 @@ export const crmDb = {
         await dynamodb.put(params).promise();
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
-      void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
-        .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      if (!leadData.deferCreatedNotification) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
+          .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      }
 
       // Extract field names from lead data
       const fieldNames: string[] = [];

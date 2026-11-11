@@ -405,6 +405,59 @@ describe('agentToolGatewayService', () => {
           expect(result.repairs).not.toContain('elements->fields');
         });
 
+        // ENG-2858: Playwright MCP zod error at fields[0].name (expected string) when the
+        // model labels the field with `element` instead of `name`.
+        it('fills missing field name from element, label, or ref', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: {
+              fields: [
+                { element: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' },
+                { label: 'Name', type: 'textbox', ref: 'e13', value: 'Al' },
+                { type: 'checkbox', ref: 'e14', value: 'true' },
+                { name: 'Keep', element: 'ignored', type: 'textbox', ref: 'e15', value: 'x' },
+              ],
+            },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.repairs).toContain('fill_form:field.name');
+          expect((result.args as any).fields).toEqual([
+            { name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' },
+            { name: 'Name', type: 'textbox', ref: 'e13', value: 'Al' },
+            { name: 'e14', type: 'checkbox', ref: 'e14', value: 'true' },
+            { name: 'Keep', element: 'ignored', type: 'textbox', ref: 'e15', value: 'x' },
+          ]);
+        });
+
+        it('fills missing field name when fields is a JSON string or wrapped', () => {
+          const raw = [{ element: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          const expected = [{ name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' }];
+          for (const args of [{ fields: JSON.stringify(raw) }, { params: { fields: raw } }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'playwright_browser_fill_form',
+              args,
+              inputSchema: fillFormSchema,
+              effect: 'internal_write',
+            });
+            expect(result.status).toBe('repaired');
+            expect(result.repairs).toContain('fill_form:field.name');
+            expect((result.args as any).fields).toEqual(expected);
+          }
+        });
+
+        it('leaves already-named fields untouched', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: fieldList },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.repairs).not.toContain('fill_form:field.name');
+          expect(result.args).toEqual({ fields: fieldList });
+        });
+
         it('still rejects genuinely unknown arguments', () => {
           const result = validateAndRepairToolArgs({
             toolName: 'playwright_browser_fill_form',
@@ -2378,6 +2431,56 @@ describe('agentToolGatewayService', () => {
 
       expect(outcome.status).toBe('success');
       expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['add_lead_engagement', 'get_lead_engagements', 'update_lead', 'send_email_to_lead'])(
+      'ENG-2808: three not-found %s for different leads do not block a corrected, valid call',
+      async (toolName) => {
+        const runId = `run-eng2808-${toolName}`;
+        for (let i = 0; i < 3; i += 1) {
+          const outcome = await executeAgentToolThroughGateway({
+            toolName,
+            args: { list_id: `wrong-list-${i}`, lead_id: `lead-${i}`, event_type: 'custom.call' },
+            runId,
+            execute: () => Promise.resolve({
+              success: false,
+              message: 'Lead not found',
+              error: 'The specified lead does not exist in this list',
+            }),
+          });
+          expect(outcome.status).toBe('success');
+        }
+        const execute = jest.fn().mockResolvedValue({ success: true });
+        const outcome = await executeAgentToolThroughGateway({
+          toolName,
+          args: { list_id: 'correct-list', lead_id: 'lead-real', event_type: 'custom.call' },
+          runId,
+          execute,
+        });
+        expect(outcome.status).toBe('success');
+        expect(execute).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('ENG-2808: add_lead_engagement still trips when the SAME lead fails repeatedly', async () => {
+      const runId = 'run-eng2808-same';
+      const args = { list_id: 'list-a', lead_id: 'lead-a', event_type: 'custom.call' };
+      for (let i = 0; i < 3; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'add_lead_engagement',
+          args,
+          runId,
+          execute: () => Promise.resolve({
+            success: false,
+            message: 'Lead not found',
+            error: 'The specified lead does not exist in this list',
+          }),
+        });
+      }
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({ toolName: 'add_lead_engagement', args, runId, execute });
+      expect(outcome.status).toBe('error');
+      expect(execute).not.toHaveBeenCalled();
     });
 
     it('ENG-969: still trips when the SAME get_lead_details lead fails repeatedly', async () => {

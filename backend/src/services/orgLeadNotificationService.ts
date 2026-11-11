@@ -2,6 +2,7 @@ import { allowsLeadOrigin, configOf, LeadOrigin } from './leadNotificationConfig
 export type { LeadOrigin, LeadNotificationsConfig } from './leadNotificationConfig';
 import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
 import { createHash } from 'crypto';
+import { judgeLeadFit } from './leadFitGate';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
@@ -191,6 +192,7 @@ export async function processLeadNotificationJob(job: LeadNotificationJob): Prom
 async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullable<Awaited<ReturnType<typeof context>>>) {
   const step = stepOf(job);
   if (ctx.lead.system?.[step] === 'sent') return;
+  if (await suppressedByFitGate(job, ctx, step)) return;
   if (!await crmDb.claimLeadStepOnce(job.listId, job.leadId, step)) throw new Error('Lead notification claimed');
   let sent = false;
   try {
@@ -242,6 +244,34 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
     if (!sent) await crmDb.setLeadFields(job.listId, job.leadId, { removeSystemKeys: [step] });
     throw error;
   }
+}
+
+/**
+ * ENG-2876: judged once per delivery key; a recorded verdict is reused on queue retries.
+ * Notification-only: the lead stays in the CRM, labeled `leadFit: bad`. Fails open.
+ */
+async function suppressedByFitGate(job: LeadNotificationJob, ctx: NonNullable<Awaited<ReturnType<typeof context>>>, step: string): Promise<boolean> {
+  const gate = ctx.config.fitGate;
+  if (!gate?.enabled) return false;
+  const fitKey = `${step}_fit`;
+  const prior = ctx.lead.system?.[fitKey];
+  if (prior === 'bad') return true;
+  if (prior === 'good' || prior === 'maybe') return false;
+  const result = await judgeLeadFit(ctx.lead, ctx.customFields, gate, ctx.list.userId);
+  if (!result) return false;
+  try {
+    await crmDb.setLeadFields(job.listId, job.leadId, {
+      system: { [fitKey]: result.verdict },
+      ...(result.verdict === 'bad' ? { customFields: { leadFit: 'bad', leadFitReasons: result.reasons.join('; ') } } : {}),
+    });
+  } catch {
+    console.warn('[leadNotifications] fit verdict not recorded', { listId: job.listId, leadId: job.leadId });
+  }
+  if (result.verdict === 'bad') {
+    console.info('[leadNotifications] suppressed by fit gate', { orgId: job.orgId, listId: job.listId, leadId: job.leadId });
+    return true;
+  }
+  return false;
 }
 
 /** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
