@@ -61,6 +61,17 @@ function toEpochSeconds(v: string): number {
   return /^\d{9,10}$/.test(v) ? Number(v) : Date.parse(v) / 1000;
 }
 
+// Only an upstream HTTP response or a recognized transport code is evidence of
+// a Meta/network failure. Local exceptions must propagate to the HTTP 500 path.
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNABORTED', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
+  'ESOCKETTIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ENETUNREACH',
+  'EHOSTUNREACH', 'ERR_NETWORK',
+]);
+function isUpstreamFailure(error: any): boolean {
+  return !!error?.response || NETWORK_ERROR_CODES.has(error?.code);
+}
+
 /** Uses the existing Graph HTTP client; credentials are resolved server-side, never caller supplied. */
 export async function executeSignalsRead(
   name: string, args: any, credentials: { accountId: string; accessToken: string },
@@ -69,7 +80,7 @@ export async function executeSignalsRead(
   try {
     return sanitizePaging(await runSignalsRead(name, args, credentials, graph));
   } catch (error: any) {
-    if (error instanceof MetaToolkitRefusal) throw error;
+    if (error instanceof MetaToolkitRefusal || !isUpstreamFailure(error)) throw error;
     return signalsReadFailure(error);
   }
 }
@@ -134,7 +145,7 @@ async function runSignalsRead(
       try {
         return (await graph.get(`${base}/${path}`, { params: { ...params, access_token: credentials.accessToken }, timeout: 15_000 })).data;
       } catch (error: any) {
-        if (attempt >= 2 || classifyMetaReadFailure(error).kind !== 'transient') throw error;
+        if (!isUpstreamFailure(error) || attempt >= 2 || classifyMetaReadFailure(error).kind !== 'transient') throw error;
         await new Promise((resolve) => setTimeout(resolve, process.env.NODE_ENV === 'test' ? 0 : 500 * (attempt + 1)));
       }
     }
