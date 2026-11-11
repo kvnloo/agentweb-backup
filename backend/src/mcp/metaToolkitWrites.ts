@@ -49,7 +49,9 @@ const UPDATE_FIELDS: Record<string, string[]> = {
   AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time'],
   AD: ['status', 'creative_id', 'name'],
 };
-export const BID_STRATEGIES = ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP', 'LOWEST_COST_WITH_MIN_ROAS'];
+// LOWEST_COST_WITH_MIN_ROAS is not offered: it needs a ROAS floor (bid_constraints) that no
+// allowed UPDATE field carries, and the create path rejects ROAS bidding as unsupported.
+export const BID_STRATEGIES = ['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP', 'COST_CAP'];
 const TIME_FIELDS = ['start_time', 'end_time'] as const;
 /** ISO 8601 date-time with an explicit offset; Meta reads offsetless times in the ad account's timezone. */
 const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/;
@@ -162,7 +164,8 @@ function validateWriteShape(entity: string, action: string, args: any): any {
 
 /** ENG-2913: shape checks for the post-launch edit fields. */
 function validateEditFields(params: any, keys: string[]) {
-  const others = (fields: string[]) => keys.filter((k) => !fields.includes(k) && k !== 'status');
+  // status counts too: a coalesced budget repeat would also drop a bundled PAUSE.
+  const others = (fields: string[]) => keys.filter((k) => !fields.includes(k));
   if (keys.some((k) => SHAPED_BUDGET_FIELDS.includes(k)) && others(SHAPED_BUDGET_FIELDS).length) {
     throw new MetaToolkitRefusal(
       `Change the budget or spend cap in its own UPDATE, separately from ${others(SHAPED_BUDGET_FIELDS).join(', ')}. ` +
@@ -190,7 +193,7 @@ function validateEditFields(params: any, keys: string[]) {
   }
   for (const f of TIME_FIELDS) {
     if (params[f] === undefined) continue;
-    if (typeof params[f] !== 'string' || !ISO_WITH_OFFSET.test(params[f]) || Number.isNaN(Date.parse(params[f]))) {
+    if (typeof params[f] !== 'string' || !ISO_WITH_OFFSET.test(params[f]) || Number.isNaN(Date.parse(params[f])) || !isCalendarDate(params[f])) {
       throw new MetaToolkitRefusal(`${f} must be an ISO 8601 date-time with a timezone offset (e.g. 2026-12-01T09:00:00-0800).`);
     }
   }
@@ -203,6 +206,13 @@ function validateEditFields(params: any, keys: string[]) {
   if (params.name !== undefined && (typeof params.name !== 'string' || !params.name.trim())) {
     throw new MetaToolkitRefusal('name must be a non-empty string.');
   }
+}
+
+/** The YYYY-MM-DD part is a real calendar day (Date.parse rolls 2026-02-30 over to March). */
+function isCalendarDate(iso: string): boolean {
+  const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
 }
 
 function show(v: unknown): string {
@@ -347,6 +357,8 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     ...(diff.length ? { diff } : {}),
     ...(enableBudgetState ? { enableBudgetState } : {}),
     ...(scheduleBudgetState ? { scheduleBudgetState } : {}),
+    // Bind the status the schedule warning was based on, with or without a spend policy.
+    ...(scheduleChange ? { schedulePriorStatus: prior?.status ?? null } : {}),
   });
   const now = deps.now();
   const secret = deps.secret();
@@ -430,7 +442,10 @@ function verify(action: string, params: any, minor: any, readBack: Record<string
   for (const field of TIME_FIELDS) {
     if (params[field] === undefined) continue;
     if (!readBack[field]) return 'UNCONFIRMED';
-    if (Date.parse(readBack[field]) !== Date.parse(params[field])) return 'MISMATCH';
+    const got = Date.parse(readBack[field]);
+    const want = Date.parse(params[field]);
+    if (Number.isNaN(got) || Number.isNaN(want)) return 'UNCONFIRMED';
+    if (got !== want) return 'MISMATCH';
   }
   if (params.targeting !== undefined) {
     if (!readBack.targeting || typeof readBack.targeting !== 'object') return 'UNCONFIRMED';

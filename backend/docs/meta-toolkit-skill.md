@@ -65,7 +65,7 @@ Allowed: CREATE, and UPDATE of these fields. Not available: DELETE and custom au
 - CAMPAIGN: `status`, `daily_budget`/`lifetime_budget`, `bid_strategy`, `spend_cap`.
 - AD_SET: `status`, budgets, `bid_amount`, `bid_strategy`, `targeting` (full spec, replaces the current one; use `excluded_custom_audiences: [{id}]` to exclude audiences), `start_time`, `end_time` (ISO 8601).
 - AD: `status`, `name`, `creative_id` (swap in an existing creative; to change ad copy, create a new creative first, then swap it in).
-Change a budget or `spend_cap` in its own UPDATE, and swap a creative (`creative_id`) in its own UPDATE; Zoma refuses mixing them with other edits. On an ACTIVE ad set, a `start_time`/`end_time` change is also its own UPDATE, because it can start delivery. Times need a timezone offset (e.g. `2026-12-01T09:00:00-0800`). The UPDATE preview lists every field as current → proposed. `bid_strategy` is one of LOWEST_COST_WITHOUT_CAP, LOWEST_COST_WITH_BID_CAP, COST_CAP, LOWEST_COST_WITH_MIN_ROAS; `bid_amount` and `spend_cap` are major units like budgets.
+Change a budget or `spend_cap` in its own UPDATE (not even with `status`), and swap a creative (`creative_id`) in its own UPDATE; Zoma refuses mixing them with other edits. On an ACTIVE ad set, a `start_time`/`end_time` change is also its own UPDATE, because it can start delivery. Times need a timezone offset (e.g. `2026-12-01T09:00:00-0800`). The UPDATE preview lists every field as current → proposed. `bid_strategy` is one of LOWEST_COST_WITHOUT_CAP, LOWEST_COST_WITH_BID_CAP, COST_CAP; `bid_amount` and `spend_cap` are major units like budgets.
 
 Every write is two calls to `call_meta_marketing_api`:
 1. Call WITHOUT `confirm`. Nothing changes. You get a PREVIEW and a `preview_token`.
