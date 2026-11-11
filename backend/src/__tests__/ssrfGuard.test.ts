@@ -88,6 +88,27 @@ describe('assertPublicHostname', () => {
     await expect(assertPublicHostname('http://mapped.example.com')).rejects.toThrow(/private|internal/i);
   });
 
+  // ENG-2915: ranges that embed or route to internal IPv4 addresses.
+  it.each([
+    ['64:ff9b::a9fe:a9fe', 6],      // NAT64 → 169.254.169.254
+    ['64:ff9b::10.0.0.1', 6],       // NAT64, dotted form
+    ['2002:a9fe:a9fe::1', 6],       // 6to4 → 169.254.169.254
+    ['::7f00:1', 6],                // IPv4-compatible ::127.0.0.1
+    ['::ffff:a9fe:a9fe', 6],        // IPv4-mapped, hex form
+    ['198.18.0.1', 4],              // benchmarking
+    ['192.0.0.8', 4],               // IETF protocol assignments
+  ])('rejects %s (ENG-2915)', async (ip, family) => {
+    mockResolvesTo(ip as string, family as 4 | 6);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('https://embedded.example.com')).rejects.toThrow(/private|internal/i);
+  });
+
+  it.each([['2002:808:808::1', 6], ['2001:4860:4860::8888', 6], ['64:ff9b::808:808', 6]])('allows public %s (ENG-2915)', async (ip, family) => {
+    mockResolvesTo(ip as string, family as 4 | 6);
+    const { assertPublicHostname } = require('../utils/ssrfGuard');
+    await expect(assertPublicHostname('https://public.example.com')).resolves.toBeUndefined();
+  });
+
   it('rejects hostname literal `localhost`', async () => {
     const { assertPublicHostname } = require('../utils/ssrfGuard');
     await expect(assertPublicHostname('http://localhost/x')).rejects.toThrow(/private|internal/i);
