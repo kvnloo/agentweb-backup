@@ -30,6 +30,7 @@ import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWri
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
+import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 
 export class MetaToolkitAuthError extends Error {
@@ -76,6 +77,8 @@ export interface MetaToolkitGatewayDeps {
   recordWrite?: typeof recordMcpWriteExecuted;
   /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
   executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
+  runHealthTool?: typeof runMetaHealthTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
 }
@@ -285,6 +288,13 @@ export async function handleMetaToolkitCall(
     // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
     if ((result as any)?.success !== false) await meter('meta');
     return stripCredentials(result);
+  }
+
+  // ENG-2916: read-only account health / learning phase on the resolved (owned) account.
+  if (isMetaHealthTool(request.toolName)) {
+    const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(health);
   }
 
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
