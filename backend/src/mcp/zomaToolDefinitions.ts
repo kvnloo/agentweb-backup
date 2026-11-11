@@ -35,7 +35,7 @@ export const ZOMA_TOOL_DEFINITIONS = [
   {
     name: 'zoma_prepare_upload',
     description:
-      'Upload a creative (image or video) that is on the user\'s computer, e.g. a batch exported from Higgsfield, Midjourney or Canva. Returns a one-time upload_command (curl PUT, 15 minutes) and a file_url. Run the command with the real local path, then pass file_url as params.image_url to AD_CREATIVE UPLOAD_IMAGE or params.video_url to AD_CREATIVE UPLOAD_VIDEO. Not needed when the file already has a public https URL; pass that URL directly. One call per file.',
+      'Upload a creative (image or video) that is on the user\'s computer, e.g. a batch exported from Higgsfield, Midjourney or Canva. Returns a one-time upload_command (curl PUT, 15 minutes) and a file_url. Run the command with the real local path, then pass file_url as params.image_url to AD_CREATIVE UPLOAD_IMAGE or params.video_url to AD_CREATIVE UPLOAD_VIDEO (Meta), or as data to call_google_ads_api ASSET UPLOAD asset_type IMAGE/LOGO (Google Ads, images only). Not needed when the file already has a public https URL; pass that URL directly. One call per file.',
     inputSchema: {
       type: 'object',
       properties: {
