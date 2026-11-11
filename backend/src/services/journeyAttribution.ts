@@ -94,6 +94,23 @@ export function normalizeProduct(value: unknown): JourneyProduct {
   return isJourneyProduct(value) ? value : 'unknown';
 }
 
+/** `?product=` values the admin roster accepts. `unknown` is not a filter. */
+export const PRODUCT_FILTERS: readonly KnownProduct[] = ['zoma', 'emma_mcp', 'emma_web'];
+
+/** undefined = no filter; null = present but invalid (caller answers 400). */
+export function parseProductFilter(raw: unknown): KnownProduct | undefined | null {
+  if (raw === undefined) return undefined;
+  return typeof raw === 'string' && (PRODUCT_FILTERS as readonly string[]).includes(raw) ? (raw as KnownProduct) : null;
+}
+
+/** A user "has" a product when it is their signup product or it is in their products map. */
+export function userHasProduct(user: { signupProduct?: unknown; products?: unknown } | null | undefined, product: KnownProduct): boolean {
+  if (!user) return false;
+  if (user.signupProduct === product) return true;
+  const products = user.products;
+  return !!products && typeof products === 'object' && Object.prototype.hasOwnProperty.call(products, product);
+}
+
 export function validateRef(raw: unknown): string | undefined {
   return typeof raw === 'string' && REF_PATTERN.test(raw) ? raw : undefined;
 }
