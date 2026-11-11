@@ -903,6 +903,70 @@ describe('CRM Group Email Endpoints', () => {
         (deletePendingBatch as jest.Mock).mockResolvedValue(undefined);
       });
 
+      const casStore = (initial: any) => {
+        const st: any = { record: initial, tick: 0 };
+        (getPendingBatch as jest.Mock).mockImplementation(async () => (st.record ? { ...st.record } : null));
+        (upsertPendingBatch as jest.Mock).mockImplementation(async (_u: string, b: any, expected: string | null) => {
+          if ((st.record?.updatedAt ?? null) !== expected) throw new PendingBatchConflictError('list-1');
+          st.record = { ...b, updatedAt: `t${++st.tick}` };
+        });
+        (deletePendingBatch as jest.Mock).mockImplementation(async () => { st.record = null; });
+        return st;
+      };
+      const resetStore = () => {
+        (getPendingBatch as jest.Mock).mockResolvedValue(null);
+        (upsertPendingBatch as jest.Mock).mockResolvedValue(undefined);
+        (deletePendingBatch as jest.Mock).mockResolvedValue(undefined);
+      };
+
+      it('ENG-2929: failed background sends stay owed in the pending record (not dropped)', async () => {
+        const providerSend = jest.spyOn(sendAsSenderModule, 'sendAsSender').mockRejectedValue(new Error('gmail 500'));
+        const st = casStore({ listId: 'list-1', skippedLeadIds: ['0', '1', '2'], sentSoFar: 0, totalOriginal: 3, backgroundRunId: 'run-a', backgroundHeartbeatAt: new Date().toISOString(), updatedAt: 't0', createdAt: 'c' });
+        const sender = { id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderProvider: 'outlook' } as any;
+        const result = await runMailboxGroupEmailBackground({
+          userId: 'test-user-id', listId: 'list-1', sender, subject: 'Hi', htmlContent: '<p/>',
+          leads: manyLeads(3), buildMessage: (l: any) => ({ to: l.email, subject: 'Hi', html: '<p/>', headers: {} }),
+        }, 'run-a');
+        expect(result.failed).toBe(3);
+        expect(st.record).not.toBeNull();
+        expect(st.record.skippedLeadIds).toEqual(['0', '1', '2']);
+        expect(st.record.backgroundRunId).toBeUndefined();
+        providerSend.mockRestore();
+        resetStore();
+      });
+
+      it('ENG-2929: a new send to a half-sent list only emails leads still owed', async () => {
+        mailboxSenderConfig();
+        const providerSend = jest.spyOn(sendAsSenderModule, 'sendAsSender').mockResolvedValue(undefined as any);
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: manyLeads(60), lastEvaluatedKey: undefined });
+        const owed = Array.from({ length: 40 }, (_, i) => `${i + 20}`);
+        const st = casStore({ listId: 'list-1', skippedLeadIds: owed, sentSoFar: 20, totalOriginal: 60, updatedAt: 't0', createdAt: 'c' });
+        mockReq.body = { senderId: 'ol-1', senderEmail: 'hunter@baldwin.com', senderName: 'Hunter', subject: 'Hi', htmlContent: '<p>Hello</p>' };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+        expect(mockRes.status).toHaveBeenCalledWith(202);
+        expect((mockRes.json as jest.Mock).mock.calls[0][0].total).toBe(40);
+        for (let i = 0; i < 50 && st.record !== null; i++) await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setTimeout(r, 50));
+        const recipients = providerSend.mock.calls.map((c: any[]) => c[2].to);
+        expect(recipients).toHaveLength(40);
+        expect(recipients).not.toContain('lead0@test.com');
+        expect(recipients).not.toContain('lead19@test.com');
+        providerSend.mockRestore();
+        resetStore();
+      });
+
+      it('ENG-2929: dismissing the pending record is refused while a background run is live', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (getPendingBatch as jest.Mock).mockResolvedValue({ listId: 'list-1', skippedLeadIds: ['1'], backgroundRunId: 'r', backgroundHeartbeatAt: new Date().toISOString(), updatedAt: 'x' });
+        const handler = findHandler('/lists/:listId/group-email/pending', 'delete');
+        await handler!(mockReq, mockRes);
+        expect(mockRes.status).toHaveBeenCalledWith(409);
+        expect(deletePendingBatch).not.toHaveBeenCalled();
+        resetStore();
+      });
+
       it('FAIL: a thrown send counts as failed instead of crashing the request', async () => {
         (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
         (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({

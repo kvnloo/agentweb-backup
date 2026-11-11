@@ -7197,15 +7197,26 @@ function isLiveBackgroundRun(batch: GroupEmailPendingBatch | null, now = Date.no
  */
 export async function startMailboxGroupEmailInBackground(
   input: MailboxBackgroundSendInput,
-): Promise<{ ok: true; runId: string } | { ok: false; message: string }> {
-  const { userId, listId, sender, leads } = input;
+): Promise<{ ok: true; runId: string; total: number } | { ok: false; message: string }> {
+  const { userId, listId, sender } = input;
   const runId = randomUUID();
-  const remainingIds: string[] = leads.map((l: any) => l.leadId);
+  let leads = input.leads;
+  let remainingIds: string[] = leads.map((l: any) => l.leadId);
 
   let existing = await getPendingBatch(userId, listId).catch(() => null);
   for (let attempt = 0; ; attempt++) {
     if (isLiveBackgroundRun(existing)) {
       return { ok: false, message: 'A group email to this list is already sending in the background. Wait for it to finish or stop.' };
+    }
+    // An unfinished earlier run owns which leads are still owed this email: never re-email
+    // leads it already sent to. Only leads still in its remaining set are sent (ENG-2929).
+    if (existing) {
+      const owed = new Set(existing.skippedLeadIds ?? []);
+      leads = input.leads.filter((l: any) => owed.has(l.leadId));
+      remainingIds = leads.map((l: any) => l.leadId);
+      if (leads.length === 0) {
+        return { ok: false, message: 'Every lead in this list was already sent this email by an earlier unfinished send. Dismiss it to start a new one.' };
+      }
     }
     try {
       await upsertPendingBatch(userId, {
@@ -7234,10 +7245,10 @@ export async function startMailboxGroupEmailInBackground(
     }
   }
 
-  void runMailboxGroupEmailBackground(input, runId).catch((err) =>
+  void runMailboxGroupEmailBackground({ ...input, leads }, runId).catch((err) =>
     console.error(`[ENG-2929] background group email ${listId} crashed:`, err),
   );
-  return { ok: true, runId };
+  return { ok: true, runId, total: leads.length };
 }
 
 /** Exported for tests: the background loop itself. */
@@ -7248,6 +7259,9 @@ export async function runMailboxGroupEmailBackground(input: MailboxBackgroundSen
   let failed = 0;
   let unrecordedSent = 0;
   let stoppedEarlyReason: string | null = null;
+  // Leads whose send failed (not a daily-limit stop): never sent, so they stay owed for resume.
+  const failedIds: string[] = [];
+  const failedEmails: string[] = [];
 
   // Writes the remaining set + folded sent count, only while this run still owns the record.
   // Returns false when ownership was lost (another run superseded us, or the user dismissed it).
@@ -7274,7 +7288,9 @@ export async function runMailboxGroupEmailBackground(input: MailboxBackgroundSen
   for (let i = 0; i < leads.length; i++) {
     const lead = leads[i];
     // Mark attempted BEFORE sending: never re-send on resume, even after a crash here.
-    if (!(await persist(leads.slice(i + 1).map((l: any) => l.leadId)))) {
+    if (!(await persist([...failedIds, ...leads.slice(i + 1).map((l: any) => l.leadId)]))) {
+      console.error(`[ENG-2929] background group email ${listId} run ${runId} stopped: pending record no longer owned`);
+      if (socketId) io.to(socketId).emit('group-email-complete', { sent, failed, total, stoppedEarlyReason: 'Send stopped: its saved progress was replaced or dismissed.', aborted: true, failedEmails });
       return { sent, failed, stoppedEarlyReason, aborted: true };
     }
     try {
@@ -7285,20 +7301,24 @@ export async function runMailboxGroupEmailBackground(input: MailboxBackgroundSen
       if (err instanceof SenderDailyLimitExceededError) {
         stoppedEarlyReason = err.message;
         // Not sent — put it (and everyone after it) back for the next resume.
-        await persist(leads.slice(i).map((l: any) => l.leadId));
+        await persist([...failedIds, ...leads.slice(i).map((l: any) => l.leadId)]);
         break;
       }
       failed++;
+      failedIds.push(lead.leadId);
+      failedEmails.push(lead.email);
       console.error(`[ENG-2929] Failed to send group email to ${lead.email}:`, err?.message || err);
     }
     if (socketId) io.to(socketId).emit('group-email-progress', { sent, failed, total });
   }
 
-  if (stoppedEarlyReason) {
-    // Release ownership so the customer can resume after the daily cap resets.
+  if (stoppedEarlyReason || failedIds.length > 0) {
+    // Release ownership so the customer can resume (after the daily cap resets, or to retry
+    // the failed leads), keeping every unsent lead in the remaining set.
     const current = await getPendingBatch(userId, listId).catch(() => null);
     if (current?.backgroundRunId === runId) {
       const { backgroundRunId: _r, backgroundHeartbeatAt: _h, ...rest } = current;
+      if (!stoppedEarlyReason) rest.skippedLeadIds = failedIds;
       await upsertPendingBatch(userId, { ...rest, sentSoFar: (rest.sentSoFar ?? 0) + unrecordedSent }, current.updatedAt).catch((e) =>
         console.error('[ENG-2929] Failed to release pending batch:', e),
       );
@@ -7307,7 +7327,7 @@ export async function runMailboxGroupEmailBackground(input: MailboxBackgroundSen
     const current = await getPendingBatch(userId, listId).catch(() => null);
     if (current?.backgroundRunId === runId) await deletePendingBatch(userId, listId).catch(() => {});
   }
-  if (socketId) io.to(socketId).emit('group-email-complete', { sent, failed, total, stoppedEarlyReason });
+  if (socketId) io.to(socketId).emit('group-email-complete', { sent, failed, total, stoppedEarlyReason, failedEmails });
   return { sent, failed, stoppedEarlyReason, aborted: false };
 }
 
@@ -7473,7 +7493,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       }
       return res.status(202).json({
         background: true,
-        total,
+        total: started.total,
         sent: 0,
         failed: 0,
         failedEmails: [],
@@ -7482,7 +7502,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         skippedDueToLimit: 0,
         skippedLeadIds: [],
         stoppedEarlyReason: null,
-        message: `Sending to ${total} leads in the background from ${sender.email}. Progress is saved; you can close this window.`,
+        message: `Sending to ${started.total} leads in the background from ${sender.email}. Progress is saved; you can close this window.`,
       });
     }
 
@@ -7675,6 +7695,13 @@ router.delete('/lists/:listId/group-email/pending', async (req: Request, res: Re
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-2929: dismissing must not silently kill a live background send mid-list.
+    if (isLiveBackgroundRun(await getPendingBatch(userId, listId).catch(() => null))) {
+      return res.status(409).json({
+        message: 'This group email is still sending in the background. Wait for it to finish before dismissing.',
+        code: 'GROUP_EMAIL_ALREADY_SENDING',
+      });
+    }
     await deletePendingBatch(userId, listId);
     res.json({ message: 'Pending group email dismissed.' });
   } catch (error: any) {
