@@ -40,6 +40,12 @@ export interface GroupEmailPendingBatch {
   totalOriginal: number;
   createdAt: string;
   updatedAt: string;
+  /** ENG-2929: set while a background mailbox send owns this campaign. A run checks it before
+   * every send and stops if another run has taken over, so two runs never email the same lead. */
+  backgroundRunId?: string;
+  /** ENG-2929: ISO time of the background run's latest progress write; a run silent for longer
+   * than the stale window is treated as dead (instance restart) and may be superseded. */
+  backgroundHeartbeatAt?: string;
 }
 
 let cachedClient: AWS.DynamoDB.DocumentClient | null = null;
