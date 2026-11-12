@@ -69,6 +69,14 @@ interface User {
   subscriptionType?: string; // Subscription type for customer portal users
   /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
   spendThisMonthUsd?: number;
+  /** ENG-2906: product attribution (attribution only; never restricts access). */
+  signupProduct?: string;
+  signupClient?: string;
+  signupRef?: string;
+  attributionConfidence?: "tracked" | "inferred" | "verified";
+  products?: Record<string, { firstAt?: string; lastAt?: string }>;
+  zomaStage?: string;
+  zomaStageAt?: string;
   tokenUsage?: {
     month: string;
     totalTokens: number;

@@ -945,15 +945,21 @@ export async function getApolloApiKey(): Promise<string> {
  * percent-encoding to round-trip cleanly).
  *
  * Resolution order: `APOLLO_WEBHOOK_SECRET` env var if set and non-empty,
- * otherwise the built-in default. The default ships intentionally so the
- * webhook works in dev without extra setup; production deploys should set
- * the env var to a rotated value.
+ * otherwise the built-in default — outside production only. The default ships
+ * so the webhook works in dev without extra setup, but it is committed to the
+ * repo, so production (NODE_ENV=production) never uses it (ENG-2803): with no
+ * env value this throws, the sender falls back to a basic match (no webhook
+ * URL is handed out) and the receiving route answers 503.
  */
 const DEFAULT_APOLLO_WEBHOOK_SECRET = 'dev_apl_wh_8k3p2x9qm7n4r5z6_v1';
 
 export async function getApolloWebhookSecret(): Promise<string> {
   const fromEnv = process.env.APOLLO_WEBHOOK_SECRET?.trim();
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_APOLLO_WEBHOOK_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('APOLLO_WEBHOOK_SECRET is not set; the built-in default is not used in production');
+  }
+  return DEFAULT_APOLLO_WEBHOOK_SECRET;
 }
 
 export interface AttioCredentials {

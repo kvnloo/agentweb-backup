@@ -26,7 +26,12 @@ import {
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
+import type { RestrictionProfileId } from './toolRestrictionProfiles';
 import { meterUserUsage } from './usageRecorderService';
+import { computeLiveModalityCostUsd, LLM_PRICE_BOOK_PROVENANCE } from '../utils/llmPricing';
+import { checkTokenUsage, TURN_ADMISSION } from './tokenUsageService';
+import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
+import { meteringFeature } from './llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -157,6 +162,12 @@ interface LiveEntry {
   turnCount: number;
   /** Tool profile in effect — the onboarding profile hard-gates forbidden tools. */
   toolProfile: LiveToolProfile;
+  /**
+   * ENG-2816: the context every tool call of THIS session runs with. Frozen, and one per session, never the shared
+   * ATTENDED_TOOL_CONTEXT mutated: a share-link visitor's session carries `restrictionProfile`, which executeTool enforces,
+   * and that must not leak into any other concurrent call.
+   */
+  toolContext: Readonly<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +546,63 @@ export class LiveSessionAuthorizationError extends Error {
   }
 }
 
+/**
+ * ENG-2957: a voice call spends the account's allowance like a typed turn, so it is admitted the same way: refused when
+ * the account (the share link's owner, for a share-link call) is paused or over its limit. The message is the same one
+ * typed chat shows.
+ */
+export class LiveSessionUsageBlockedError extends Error {
+  readonly code = 'usage_paused';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'LiveSessionUsageBlockedError';
+  }
+}
+
+const LIVE_USAGE_CHECK_FAILED = "Voice couldn't check your usage allowance right now. Please try again in a moment.";
+
+/** What a share-link visitor sees: the owner's billing details are not theirs (same words as typed share chat). */
+const LIVE_SHARE_USAGE_PAUSED = 'AI usage is paused for this shared session. Please contact the owner of this link.';
+
+/**
+ * Admit one voice turn (or the start of a call) against the account's allowance. Throws LiveSessionUsageBlockedError.
+ * A share-link visitor's call is checked against the link owner's allowance but told only that the session is paused.
+ */
+async function assertLiveUsageAllowed(userId: string, restrictionProfile?: RestrictionProfileId | unknown): Promise<void> {
+  let usage: Awaited<ReturnType<typeof checkTokenUsage>>;
+  try {
+    usage = await checkTokenUsage(userId, TURN_ADMISSION);
+  } catch (err: any) {
+    console.error(`[liveVoiceService] usage check failed for ${userId}:`, err?.message);
+    throw new LiveSessionUsageBlockedError(LIVE_USAGE_CHECK_FAILED);
+  }
+  if (!usage.allowed) {
+    throw new LiveSessionUsageBlockedError(restrictionProfile === 'share_visitor'
+      ? LIVE_SHARE_USAGE_PAUSED
+      : buildUsageBlockCopy({ month: usage.month, paygBlock: usage.paygBlock }).message);
+  }
+}
+
+/**
+ * After each completed voice turn: if the allowance ran out during the call, tell the browser and end the call (the
+ * same check a typed turn gets before it runs). A failed check does not cut a live call; the next turn checks again.
+ */
+async function enforceLiveUsageAfterTurn(sessionId: string): Promise<void> {
+  const entry = activeSessions.get(sessionId);
+  if (!entry) return;
+  try {
+    await assertLiveUsageAllowed(entry.userId, (entry.toolContext as { restrictionProfile?: unknown }).restrictionProfile);
+  } catch (err: any) {
+    if (!(err instanceof LiveSessionUsageBlockedError) || err.message === LIVE_USAGE_CHECK_FAILED) return;
+    const current = activeSessions.get(sessionId);
+    if (!current || current !== entry) return;
+    console.warn(`[liveVoiceService] ending live session ${sessionId}: usage allowance reached`);
+    entry.emitFn('live:error', { sessionId, error: err.message, code: err.code });
+    closeLiveSession(sessionId, entry.socketId);
+  }
+}
+
 export class LiveSessionStartCancelledError extends Error {
   readonly code = 'LIVE_SESSION_START_CANCELLED';
 
@@ -615,6 +683,7 @@ export async function startLiveSession(
   userId: string,
   toolProfile: LiveToolProfile = 'default',
   signal?: AbortSignal,
+  restrictionProfile?: RestrictionProfileId,
 ): Promise<void> {
   // Read + write of pendingStarts happen in the same synchronous block, so two
   // overlapping calls can never both observe "no start in flight".
@@ -624,7 +693,7 @@ export async function startLiveSession(
     .catch(() => {})
     .then(() => {
       throwIfLiveStartCancelled(signal);
-      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal);
+      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal, restrictionProfile);
     });
   pendingStarts.set(sessionId, start);
   try {
@@ -641,10 +710,14 @@ async function doStartLiveSession(
   userId: string,
   toolProfile: LiveToolProfile,
   signal?: AbortSignal,
+  restrictionProfile?: RestrictionProfileId,
 ): Promise<void> {
   // Ownership gate FIRST — before any telemetry, before the existing-session
   // close below, and before any history is loaded or registered.
   await assertLiveSessionOwnership(sessionId, userId);
+  throwIfLiveStartCancelled(signal);
+  // ENG-2957: then the allowance, before any Gemini session (and its cost) exists.
+  await assertLiveUsageAllowed(userId, restrictionProfile);
   throwIfLiveStartCancelled(signal);
 
   const startedAt = Date.now();
@@ -680,6 +753,7 @@ async function doStartLiveSession(
     startedAt,
     turnCount: 0,
     toolProfile,
+    toolContext: restrictionProfile ? Object.freeze({ ...ATTENDED_TOOL_CONTEXT, restrictionProfile }) : ATTENDED_TOOL_CONTEXT,
   };
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
@@ -987,16 +1061,30 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   if (message.usageMetadata) {
     try {
       const um: any = message.usageMetadata;
+      const model = LIVE_MODEL.replace(/^models\//, '');
+      // Counts only (no content): one line per Gemini usage report, so billing can be checked against turn boundaries.
+      console.log(`[liveVoiceService] usage report for ${sessionId}: turn=${entry.turnCount} prompt=${um.promptTokenCount ?? 0} response=${um.responseTokenCount ?? um.candidatesTokenCount ?? 0} cached=${um.cachedContentTokenCount ?? 0} toolUse=${um.toolUsePromptTokenCount ?? 0} thoughts=${um.thoughtsTokenCount ?? 0} total=${um.totalTokenCount ?? 0} turnComplete=${Boolean(message.serverContent?.turnComplete)}`);
+      // ENG-2957: priced per modality (a voice call is mostly audio, billed well above the text rate), and tagged as
+      // live voice so usage reports and metrics can tell it apart from typed agent turns.
+      const modalityCostUsd = computeLiveModalityCostUsd(model, um);
+      // Token counts as Google defines them: cached tokens are part of the prompt (counted once, as cache reads);
+      // tool-use prompt tokens are input and thinking tokens are output. Cost comes from the per-modality override.
+      const cached = um.cachedContentTokenCount || 0;
       void meterUserUsage({
         userId: entry.userId,
-        model: LIVE_MODEL.replace(/^models\//, ''),
+        model,
         provider: 'gemini',
-        feature: 'agent_task',
-        inputTokens: um.promptTokenCount || 0,
-        outputTokens: um.responseTokenCount || um.candidatesTokenCount || 0,
-        cacheReadTokens: um.cachedContentTokenCount || 0,
+        // A voice call always has the user present: interactive.
+        feature: meteringFeature('live_voice', 'regular'),
+        inputTokens: Math.max(0, (um.promptTokenCount || 0) - cached) + (um.toolUsePromptTokenCount || 0),
+        outputTokens: (um.responseTokenCount || um.candidatesTokenCount || 0) + (um.thoughtsTokenCount || 0),
+        cacheReadTokens: cached,
         sessionId,
+        ...(modalityCostUsd !== null ? { costUsdOverride: modalityCostUsd, costProvenance: LLM_PRICE_BOOK_PROVENANCE } : {}),
       });
+      // The chat's own cost total includes its voice turns (per-chat cost reports, and the cap of an anonymous
+      // public-plan session, which is the sum of its sessions' totals).
+      if (modalityCostUsd && modalityCostUsd > 0) void chatbotDb.addToolCostToSession(sessionId, modalityCostUsd, 'live_voice');
     } catch {
       /* metering must never break the live stream */
     }
@@ -1118,7 +1206,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           let execution: Promise<any>;
           if (isOnboardingSafe) {
             execution = agentModeService.executeTool(
-              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, entry.toolContext,
             );
           } else {
             const executionKey = stableToolExecutionKey(toolName, toolArgs);
@@ -1126,7 +1214,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
             if (!trackedExecution) {
               trackedExecution = {
                 promise: Promise.resolve().then(() => agentModeService.executeTool(
-                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, entry.toolContext,
                 )),
                 settled: false,
               };
@@ -1238,6 +1326,8 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
     // Emit turn-complete with full content, artifacts, and tool calls for rich UI rendering
     emitFn('live:turn-complete', { sessionId, assistantText: assistantContent, userText, artifacts, toolCalls });
+    // ENG-2957: the next turn is admitted like a typed one; a call whose allowance ran out ends here.
+    void enforceLiveUsageAfterTurn(sessionId);
 
     // Fire-and-forget save — never blocks the audio stream
     if (assistantContent) {

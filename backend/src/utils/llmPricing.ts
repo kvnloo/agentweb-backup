@@ -28,7 +28,7 @@ import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoMod
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-10-12";
+export const LLM_PRICE_BOOK_VERSION = "2026-11-12";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -597,4 +597,74 @@ export function costScoreFromPrice(price: ModelPrice): number {
     (Math.log10(blended) - Math.log10(FLOOR_USD_PER_M)) /
     (Math.log10(CEILING_USD_PER_M) - Math.log10(FLOOR_USD_PER_M));
   return Math.round(100 * Math.max(0, Math.min(1, frac)));
+}
+
+
+/**
+ * ENG-2957: Gemini Live bills each modality at its own rate, and a voice call is mostly AUDIO tokens, which the text
+ * entry above (the approximation used before) under-prices about 4x on input and 2.7x on output. USD per 1M tokens,
+ * paid tier, from Google's pricing page (aistudio.google.com/docs/pricing, read 2026-11-12): input text 0.75, audio 3.00,
+ * image/video 1.00; output (thinking included) text 4.50, audio 12.00. Keyed by the bare model id.
+ */
+export const LIVE_MODALITY_PRICES: Readonly<Record<string, { input: Readonly<Record<string, number>>; output: Readonly<Record<string, number>> }>> = {
+  'gemini-3.1-flash-live-preview': {
+    input: { TEXT: 0.75, AUDIO: 3.0, IMAGE: 1.0, VIDEO: 1.0 },
+    output: { TEXT: 4.5, AUDIO: 12.0 },
+  },
+};
+
+interface LiveModalityTokens { modality?: unknown; tokenCount?: unknown }
+/** The parts of a Gemini Live `usageMetadata` that carry billable tokens. */
+export interface LiveUsageMetadata {
+  promptTokenCount?: number;
+  responseTokenCount?: number;
+  candidatesTokenCount?: number;
+  toolUsePromptTokenCount?: number;
+  thoughtsTokenCount?: number;
+  promptTokensDetails?: LiveModalityTokens[];
+  responseTokensDetails?: LiveModalityTokens[];
+  candidatesTokensDetails?: LiveModalityTokens[];
+  toolUsePromptTokensDetails?: LiveModalityTokens[];
+}
+
+const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+
+/** Tokens per modality from a details list, plus the remainder of `total` the details do not cover. */
+function splitByModality(total: number, details: LiveModalityTokens[] | undefined): { byModality: Record<string, number>; uncovered: number } {
+  const byModality: Record<string, number> = {};
+  let covered = 0;
+  for (const d of Array.isArray(details) ? details : []) {
+    const n = count(d?.tokenCount);
+    if (!n) continue;
+    const m = typeof d?.modality === 'string' ? d.modality.toUpperCase() : 'UNKNOWN';
+    byModality[m] = (byModality[m] ?? 0) + n;
+    covered += n;
+  }
+  return { byModality, uncovered: Math.max(0, total - covered) };
+}
+
+/**
+ * USD cost of one Gemini Live usage report, priced per modality. Null when the model has no per-modality rates (the
+ * caller then falls back to token pricing). A modality without a listed rate is billed at the highest rate of its
+ * direction, so an unknown kind of token is never under-charged; tokens a report does not break down are billed as
+ * text; thinking tokens are output text. No cache discount is applied (Google does not list one for Live).
+ */
+export function computeLiveModalityCostUsd(model: string, usage: LiveUsageMetadata | null | undefined): number | null {
+  const rates = LIVE_MODALITY_PRICES[String(model || '').replace(/^models\//, '')];
+  if (!rates || !usage) return null;
+  const maxIn = Math.max(...Object.values(rates.input));
+  const maxOut = Math.max(...Object.values(rates.output));
+  const price = (tokens: Record<string, number>, table: Record<string, number>, max: number) =>
+    Object.entries(tokens).reduce((sum, [m, n]) => sum + n * (table[m] ?? max), 0);
+
+  const prompt = splitByModality(count(usage.promptTokenCount), usage.promptTokensDetails);
+  const toolUse = splitByModality(count(usage.toolUsePromptTokenCount), usage.toolUsePromptTokensDetails);
+  const outputTotal = count(usage.responseTokenCount) || count(usage.candidatesTokenCount);
+  const output = splitByModality(outputTotal, usage.responseTokensDetails ?? usage.candidatesTokensDetails);
+
+  const inputUsd = price(prompt.byModality, rates.input, maxIn) + prompt.uncovered * rates.input.TEXT
+    + price(toolUse.byModality, rates.input, maxIn) + toolUse.uncovered * rates.input.TEXT;
+  const outputUsd = price(output.byModality, rates.output, maxOut) + output.uncovered * rates.output.TEXT
+    + count(usage.thoughtsTokenCount) * rates.output.TEXT;
+  return (inputUsd + outputUsd) / 1_000_000;
 }

@@ -237,6 +237,34 @@ Return ONLY valid JSON (no markdown, no backticks):
 enumOptions is required when fieldType is "enum", omit or set to [] for all other types.`;
 }
 
+/**
+ * Alias inference: maps a user-named field to a canonical FIELD_GROUPS name. Called once per config
+ * save for the fields the name heuristics could not resolve. ENG-2720: the first version only listed
+ * the canonical names, so models mapped "email of the CEO" onto the LEAD's own `email` (and "CTO phone"
+ * onto `phone`). It now says what a lead is, whose details each group holds, and that a field about
+ * anyone else maps to null. Synonyms ("contact number" -> phone) keep working: they are matched by meaning.
+ */
+export function buildAliasInferenceSystemPrompt(canonicalCheatsheet: string): string {
+  return `You map user-named CRM enrichment fields to canonical field names, based on what each field MEANS and WHO or WHAT it is about. Return strict JSON keyed by user field name.
+
+How the data is organised:
+- A "lead" is one person, one row in the user's list, who works at one company.
+- person_identity and person_career fields describe THE LEAD THEMSELVES: email is the lead's own work email, phone is the lead's own work or mobile phone, title is the lead's own job title, linkedin_url is the lead's own profile.
+- company_*, intent_signals and the other company groups describe THE LEAD'S CURRENT EMPLOYER: company_phone is the company's main line, hq_location is its headquarters, employee_count its headcount.
+
+Available canonical fields, grouped:
+${canonicalCheatsheet}
+
+Rules:
+- People name the same thing in many ways. Match by MEANING, not string similarity: "contact number", "mobile", "cell", "phone no." all mean phone; "work mail" means email; "position", "role", "job" mean title; "headcount", "team size" mean employee_count; "stag" with instruction "funding stage" means funding_stage.
+- First decide WHO the field is about. If it is about a specific other person or organisation (the CEO, a founder, an executive assistant, a manager, a competitor, a parent company, a referrer) rather than the lead or the lead's employer, return null. The attribute may exist in the list, but it belongs to someone else: "email of the CEO" is NOT email, "funding stage of the main competitor" is NOT funding_stage. Facts about the employer itself stay with the employer even when they name other parties: its investors (investors), its customers (customer_logos), its leadership changes (leadership_changes).
+- A person-level attribute with no stated owner ("contact number", "email address") belongs to the lead. A company-level attribute ("company phone", "main line", "office address") belongs to the company.
+- email and phone hold only the lead's work email and work or mobile phone. A personal, home or alternate email, or a home phone, is a different attribute: return null. (A mobile or cell number is still phone.)
+- Return null when the field is a custom concept with no canonical match (scores, internal notes, personal preferences).
+- Use the instruction text to disambiguate. If the instruction is empty, use the name alone.
+- Pick at most ONE canonical name per user field.`;
+}
+
 // Strip characters that break the prompt structure: quotes, newlines, backticks.
 // Bounded impact — the LLM still classifies correctly on sanitized text.
 const sanitizeInstruction = (s: string) => s.replace(/["\n`]/g, ' ').trim();

@@ -628,6 +628,45 @@ describe('CRM Database Service', () => {
     });
   });
 
+  describe('setLeadEmailIfMissing (Apollo late callback write, ENG-2803)', () => {
+    const ok = () => mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+    it('derives domain from the email, fill-if-empty, through the reserved-word placeholder', async () => {
+      ok();
+      const r = await crmDb.setLeadEmailIfMissing('list_1', 'lead_1', ' Ada@Example.com ', { source: 'web_search' });
+      expect(r.written).toBe(true);
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ExpressionAttributeValues[':email']).toBe('ada@example.com');
+      expect(call.ExpressionAttributeNames['#derivedDomainAttr']).toBe('domain');
+      expect(call.UpdateExpression).toContain('#derivedDomainAttr = if_not_exists(#derivedDomainAttr, :derivedDomain)');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
+      expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+      expect(call.ConditionExpression).toBe('attribute_exists(leadId) AND attribute_not_exists(email)');
+    });
+
+    it('sets no domain for a free-mail address', async () => {
+      ok();
+      await crmDb.setLeadEmailIfMissing('list_1', 'lead_1', 'someone@gmail.com', { source: 'web_search' });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.ExpressionAttributeNames).toBeUndefined();
+      expect(call.ExpressionAttributeValues).not.toHaveProperty(':derivedDomain');
+    });
+
+    it('keeps the domain on the retry after bootstrapping enrichmentMetadata', async () => {
+      const err = Object.assign(new Error('The document path provided in the update expression is invalid'), { code: 'ValidationException' });
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(err) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+      const r = await crmDb.setLeadEmailIfMissing('list_1', 'lead_1', 'ada@example.com', { source: 'web_search' });
+      expect(r.written).toBe(true);
+      const retry = mockDocumentClientMethods.update.mock.calls[2][0];
+      expect(retry.UpdateExpression).toContain('#derivedDomainAttr = if_not_exists(#derivedDomainAttr, :derivedDomain)');
+      expect(retry.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+    });
+  });
+
   describe('updateLead', () => {
     // ENG-2082: setLeadFields derives domain/lifecycle on an email write, but updateLead is
     // the ORDINARY path — a person editing the lead — and was left out of the first pass.

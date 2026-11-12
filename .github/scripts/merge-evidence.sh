@@ -571,7 +571,9 @@ fi
 # dropped abstention is not positive evidence either. Opslane uses more than
 # one abstention wording (#3559 got "Nothing to verify in this PR"), so the
 # exact-title match is against a closed allowlist.
-OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR"]'
+# #3967 got "Opslane couldn't test this commit" ("No test finished, so this
+# check doesn't block.") — the same abstention, a third wording.
+OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR","Opslane couldn'"'"'t test this commit"]'
 # shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
 opslane_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
   and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'
@@ -587,6 +589,31 @@ if [ "${opslane_noop}" -gt 0 ]; then
     hard_fail "failed to exclude Opslane nothing-to-verify check-runs at ${head_sha}"
   fi
   log "ignored ${opslane_noop} Opslane (neutral) check-run(s) with an abstention title: an abstention, not a verdict"
+fi
+
+# Pass 4b — DROP CODERABBIT'S RATE-LIMIT NEUTRAL.
+# CodeRabbit is advisory only (AGENTS.md: never a required check, never hold a
+# proven PR because it is unavailable or rate-limited). When rate-limited it
+# posts `neutral` titled "Review rate limited" — no review happened, so it is
+# not a verdict (#3967 held three ticks on it). Narrow match: app slug AND name
+# AND conclusion AND exact title. A CodeRabbit `failure`, or a neutral with any
+# other title, still blocks. A dropped run is not evidence.
+CODERABBIT_NOOP_TITLES='["Review rate limited"]'
+# shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
+coderabbit_filter='select((.app.slug // "") == "coderabbitai" and .name == "CodeRabbit"
+  and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'
+coderabbit_noop="$(printf '%s' "${runs_json}" | jq -r --argjson t "${CODERABBIT_NOOP_TITLES}" \
+  "[ .check_runs[] | ${coderabbit_filter} ] | length" 2>/dev/null)"
+if ! grep -qE '^[0-9]+$' <<<"${coderabbit_noop}"; then
+  hard_fail "failed to identify CodeRabbit rate-limited check-runs at ${head_sha}"
+fi
+if [ "${coderabbit_noop}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson t "${CODERABBIT_NOOP_TITLES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${coderabbit_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude CodeRabbit rate-limited check-runs at ${head_sha}"
+  fi
+  log "ignored ${coderabbit_noop} CodeRabbit (neutral) rate-limited check-run(s): advisory, no review ran"
 fi
 
 # Pass 5 — DROP A HUNG OPSLANE RUN (ENG-2833).
@@ -621,6 +648,31 @@ if [ "${opslane_hung}" -gt 0 ]; then
   fi
   log "ignored ${opslane_hung} Opslane check-run(s) still running after ${OPSLANE_STALE_MINUTES}m: Opslane is not required, and a hung advisory run is not a verdict"
 fi
+
+# Pass 5b — NAME AN OPSLANE CARRY-FORWARD FAILURE (ENG-2944, child of ENG-2749).
+# Opslane re-posts the previous head's `failure` as a 0s check-run
+# (started_at == completed_at) instead of re-testing the new head (ENG-2767).
+# Diagnostic only: the run is NOT dropped and still blocks exactly as before;
+# whether it should block is the parent's open decision. The distinct line
+# stops callers from update-branch churn hoping for a fresh run.
+OPSLANE_CF_SECONDS="${MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS:-2}"
+if ! grep -qE '^[0-9]+$' <<<"${OPSLANE_CF_SECONDS}"; then
+  hard_fail "MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS must be a whole number of seconds, got '${OPSLANE_CF_SECONDS}'"
+fi
+# shellcheck disable=SC2016 # $max is a jq variable
+if ! opslane_cf="$(printf '%s' "${runs_json}" | jq -r --argjson max "${OPSLANE_CF_SECONDS}" '
+  .check_runs[]
+  | select((.app.slug // "") == "opslane" and .name == "Opslane"
+      and (.status // "") == "completed" and .conclusion == "failure"
+      and (.started_at // "") != "" and (.completed_at // "") != ""
+      and ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) <= $max)
+  | "\(.id // "unknown") \(.details_url // .html_url // "no-url")"' 2>/dev/null)"; then
+  hard_fail "failed to identify Opslane carry-forward check-runs at ${head_sha}"
+fi
+while IFS= read -r cf_line; do
+  [ -n "${cf_line}" ] || continue
+  log "OPSLANE_CARRY_FORWARD: ${cf_line} — not a re-test of ${head_sha}; see ENG-2749"
+done <<<"${opslane_cf}"
 
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then

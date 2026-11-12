@@ -113,6 +113,7 @@ function formatClientType(value: string): string {
     chatgpt: "ChatGPT/OpenAI",
     hermes: "Hermes",
     openclaw: "OpenClaw",
+    databricks: "Databricks",
     api_key: "API key",
     unknown: "Unknown",
   };
