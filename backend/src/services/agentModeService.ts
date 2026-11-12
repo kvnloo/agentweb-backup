@@ -15796,6 +15796,37 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
   }
 
+  /**
+   * ENG-2942: account-scoped reads behind the toolkit's optimisation-event check. Both go
+   * through the signals read path, which binds every pixel read to the selected account.
+   */
+  public async toolkitMetaConversionLookup(userId: string, account_id: string) {
+    const credentials = await this.getMetaCredentials(userId, account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    const { eventNamesFromStats } = await import('../mcp/metaToolkitConversionGate');
+    const read = async (name: string, args: any) => {
+      const body: any = await executeSignalsRead(name, args, credentials);
+      if (body?.success === false) throw new Error(body.message || 'Meta read failed');
+      return body;
+    };
+    return {
+      listCustomConversions: async () => {
+        const all: any[] = [];
+        let after: string | undefined;
+        for (let pages = 0; pages < 20; pages += 1) {
+          const body = await read('ads_get_customconversions', after ? { after } : {});
+          all.push(...(Array.isArray(body?.data) ? body.data : []));
+          const next = body?.paging?.has_next ? body?.paging?.cursors?.after : undefined;
+          if (typeof next !== 'string' || !next) break;
+          after = next;
+        }
+        return all;
+      },
+      listPixelEventNames: async (pixelId: string) =>
+        eventNamesFromStats(await read('ads_get_dataset_stats', { pixel_id: pixelId, aggregation: 'event' })),
+    };
+  }
+
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
