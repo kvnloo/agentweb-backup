@@ -26,6 +26,7 @@ import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
 import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
 import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
+import { getMetaHelpArticles } from './metaToolkitHelp';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
@@ -394,8 +395,8 @@ export async function handleMetaToolkitCall(
         || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
-  if (request.toolName === 'ads_get_errors') {
-    const result = explainMetaError(args);
+  if (request.toolName === 'ads_get_errors' || request.toolName === 'ads_get_help_article') {
+    const result = request.toolName === 'ads_get_errors' ? explainMetaError(args) : getMetaHelpArticles(args);
     await meter('meta');
     return result;
   }

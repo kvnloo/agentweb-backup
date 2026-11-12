@@ -156,7 +156,7 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   // ENG-2921
   same(DIA, 'ENG-2921', 'ads_account_get_activity_logs'),
   same(DIA, 'ENG-2921', 'ads_get_errors'),
-  gap(DIA, 'ENG-2921', 'ads_get_help_article'),
+  same(DIA, 'ENG-2921', 'ads_get_help_article'),
 ];
 
 export interface ParitySummaryRow { category: string; covered: number; gap: number; not_applicable: number; total: number }
