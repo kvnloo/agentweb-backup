@@ -113,7 +113,7 @@ describe('reserveCallSlot', () => {
     const r = await reserve();
     if (!r.ok) throw new Error('expected a reservation');
     await r.release();
-    expect([...limits.counters.values()]).toEqual([0, 0, 0]);
+    expect([...limits.counters.values()]).toEqual([0, 0, 0, 0]);
     expect(limits.claims.size).toBe(0);
   });
 
