@@ -28,7 +28,7 @@ import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoMod
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-10-12";
+export const LLM_PRICE_BOOK_VERSION = "2026-11-12";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
