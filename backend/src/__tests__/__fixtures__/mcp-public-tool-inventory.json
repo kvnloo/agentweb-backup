@@ -1471,11 +1471,11 @@
       "properties": {
         "start_time": {
           "type": "string",
-          "description": "Start time in ISO 8601 format (e.g., \"2024-03-01T00:00:00.000Z\")"
+          "description": "Start time in ISO 8601 format (e.g., \"2024-03-01T00:00:00.000Z\"). Optional: defaults to 24 hours before end_time."
         },
         "end_time": {
           "type": "string",
-          "description": "End time in ISO 8601 format (e.g., \"2024-03-02T00:00:00.000Z\")"
+          "description": "End time in ISO 8601 format (e.g., \"2024-03-02T00:00:00.000Z\"). Optional: defaults to now."
         },
         "limit": {
           "type": "number",
@@ -1488,10 +1488,7 @@
           "default": false
         }
       },
-      "required": [
-        "start_time",
-        "end_time"
-      ]
+      "required": []
     },
     "sideEffect": "write",
     "gating": {
@@ -2307,7 +2304,7 @@
   {
     "name": "manage_crm_sequence",
     "listed": false,
-    "description": "Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.\n\n- \"create\": builds a new sequence as a DRAFT (nothing is sent). `audience_list_ids` are the lead lists whose new leads auto-enroll once it is active.\n- \"update\": edits a draft or paused sequence. An active sequence must be paused first.\n- \"preview_activation\": shows the user the exact steps, audience and timing and asks them to approve. Always do this before \"activate\".\n- \"activate\": starts sending. Only works in a live chat, after \"preview_activation\", once the user has picked \"Activate\" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.\n- \"pause\": stops sending. Always allowed.\n\nUse list_crm_sequences to find sequence ids.",
+    "description": "Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.\n\n- \"create\": builds a new sequence as a DRAFT (nothing is sent). `audience_list_ids` are the lead lists whose new leads auto-enroll once it is active.\n- \"update\": edits a draft or paused sequence. An active sequence must be paused first.\n- \"preview_activation\": shows the user the exact steps, audience and timing and asks them to approve. Always do this before \"activate\".\n- \"activate\": starts sending. Only works in a live chat, after \"preview_activation\", once the user has picked \"Activate\" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.\n- \"pause\": stops sending. Always allowed.\n- \"external_activation_preview\" / \"external_activate_confirm\" (external MCP callers only, e.g. an aw_ key acting on a human's out-of-chat approval): preview returns a digest bound to the current sequence version and the named `approver`, with no side effects; confirm activates only if the digest, approver and sequence are all unchanged since that preview.\n\nUse list_crm_sequences to find sequence ids.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2318,7 +2315,9 @@
             "update",
             "preview_activation",
             "activate",
-            "pause"
+            "pause",
+            "external_activation_preview",
+            "external_activate_confirm"
           ]
         },
         "sequence_id": {
@@ -2389,6 +2388,14 @@
         "preview_token": {
           "type": "string",
           "description": "activate only: the preview_token returned by preview_activation."
+        },
+        "approver": {
+          "type": "string",
+          "description": "external_* actions only: identity of the human who approved activation (e.g. slack:U123)."
+        },
+        "digest": {
+          "type": "object",
+          "description": "external_activate_confirm only: the `digest` object returned by external_activation_preview, unmodified."
         }
       },
       "required": [
