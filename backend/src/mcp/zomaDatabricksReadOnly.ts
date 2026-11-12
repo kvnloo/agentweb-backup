@@ -11,7 +11,7 @@
  *
  * What a Databricks caller may call (deny-by-default):
  *   - tools in READ_ONLY_TOOLKIT_TOOLS (verified reads),
- *   - zoma_status, zoma_usage, ads_get_errors (onboarding / local reads),
+ *   - zoma_status, zoma_usage, ads_get_errors, ads_get_help_article (onboarding / local reads),
  *   - call_meta_marketing_api with a read action (LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY)
  *     and no confirm / preview_token.
  * Everything else, including tools added later, is refused and hidden from tools/list.
@@ -27,7 +27,7 @@ const DATABRICKS_HOST_SUFFIXES = [
   'databricksapps.com', // Databricks Apps
 ];
 
-const DATABRICKS_EXTRA_ALLOWED = new Set(['zoma_status', 'zoma_usage', 'ads_get_errors']);
+const DATABRICKS_EXTRA_ALLOWED = new Set(['zoma_status', 'zoma_usage', 'ads_get_errors', 'ads_get_help_article']);
 
 /** Same list as META_TOOLKIT_V1_ACTIONS in metaToolkitManifest.ts (kept local to avoid an import cycle). */
 const MARKETING_API_READ_ACTIONS = new Set(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY']);
