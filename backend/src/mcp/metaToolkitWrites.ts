@@ -4,7 +4,7 @@
  *
  * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED), budget, and
  * (ENG-2913) post-launch edits: CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/
- * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id) + name. Every
+ * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id), and name on all three (ENG-2960). Every
  * UPDATE preview shows a before → after field diff and the read-back verifies every field.
  * Still excluded here: COPY_AD, RETAG_UTM, launch_*. ARCHIVE / DELETE / COPY are their own guarded
  * path (ENG-2922, metaToolkitLifecycle.ts). Custom audiences are metaToolkitAudiences.ts (ENG-2914).
@@ -48,8 +48,8 @@ export { GUARDED_WRITE_ENTITIES, GUARDED_WRITE_ACTIONS, isGuardedWriteRequest, P
 export type { WriteVerification };
 
 const UPDATE_FIELDS: Record<string, string[]> = {
-  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_strategy', 'spend_cap'],
-  AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time'],
+  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_strategy', 'spend_cap', 'name'],
+  AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time', 'name'],
   AD: ['status', 'creative_id', 'name'],
 };
 // LOWEST_COST_WITH_MIN_ROAS is not offered: it needs a ROAS floor (bid_constraints) that no
