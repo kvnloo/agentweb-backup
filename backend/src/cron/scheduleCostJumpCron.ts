@@ -12,7 +12,7 @@
  * at least MIN_BASELINE_DAYS billed days of history). Flagged schedules go out as ONE email a day to the oncall
  * list (`oncall_emails`), by email only: no Linear issue is filed (owner's choice, 2026-11-12).
  *
- * Read-only: no database writes, no change to any schedule. Registered in server.ts (daily, behind
+ * Read-only: no database writes, no change to any schedule. Registered in server.ts (behind
  * isCronEnabled()) as a 15-minute tick that only acts during one UTC hour (scheduleCostJumpTick), so a deploy
  * outside that hour never repeats a day's email.
  */
@@ -33,8 +33,9 @@ const FEATURE_PREFIX = 'agent_task:scheduled:';
 /**
  * The check ticks every 15 minutes (and once at boot) but only acts during this UTC hour (07:00 UTC =
  * 12:30 IST). Every deploy starts a new process; without a fixed hour each boot would email the same flagged
- * day again. With it, a day is emailed once per process within that hour, so only a restart inside that hour,
- * after the email went out, can repeat it. No shared state is needed (prod runs one instance).
+ * day again. With it, a day is emailed once per process within that hour. A deploy that overlaps that hour
+ * (immutable deploys run the old and new instance side by side; prod deploys ~12 times a day) can still send a
+ * flagged day twice; the owner accepted that duplicate over a stored per-day marker (2026-11-12).
  */
 export const SCHEDULE_COST_JUMP_TICK_MS = 15 * 60 * 1000;
 export const SCHEDULE_COST_JUMP_SEND_HOUR_UTC = 7;
