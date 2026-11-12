@@ -12,6 +12,7 @@
  * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
  * only. No new table, key or persistence model (data-plane gate respected).
  */
+import { withMetaToolkitBackoff } from '../utils/metaToolkitBackoff';
 import { agentApiKeyService } from '../services/agentApiKeyService';
 import { mcpOAuthService } from './oauth/oauthService';
 import {
@@ -89,6 +90,8 @@ export interface MetaToolkitGatewayDeps {
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   execute: typeof executeMetaToolkitCall;
   recordUsage: typeof recordMcpToolUse;
+  /** Injectable bounded BUC backoff sleep. */
+  sleep?: (ms: number) => Promise<void>;
   now: () => number;
   rateLimiter?: Pick<RateLimiter, 'check'>;
   /** ENG-2303 toolkit-local Zoma tools; defaults to runZomaTool. */
@@ -399,6 +402,11 @@ export async function handleMetaToolkitCall(
     await meter('meta');
     return result;
   }
+  const metaWrite = audienceTool ? isAudienceWriteRequest(args)
+    : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
+      || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
+      || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName);
+  return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
@@ -499,4 +507,5 @@ export async function handleMetaToolkitCall(
   await meter('meta');
   if (!guardedWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
   return stripCredentials(result);
+  });
 }
