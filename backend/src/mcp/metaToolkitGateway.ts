@@ -297,6 +297,8 @@ export async function handleMetaToolkitCall(
       authMethod: caller.authMethod,
       apiKeyId: caller.apiKeyId,
       clientId: caller.clientId,
+      // ENG-2747: the gateway has no client name; tag Databricks-origin OAuth callers directly.
+      ...(caller.databricksOrigin ? { clientType: 'databricks' as const } : {}),
       sessionId: request.sessionId,
       userAgent: request.userAgent,
       ref: request.ref,

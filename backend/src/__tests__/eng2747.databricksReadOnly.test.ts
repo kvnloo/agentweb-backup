@@ -133,6 +133,14 @@ describe('ENG-2747 gateway enforcement', () => {
     const { deps, raw } = makeDeps([DATABRICKS_REDIRECT]);
     await handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, deps);
     expect(raw.execute).toHaveBeenCalledTimes(1);
+    // Usage analytics tag the call as Databricks traffic.
+    expect(raw.recordUsage).toHaveBeenCalledWith(expect.objectContaining({ clientType: 'databricks' }));
+  });
+
+  it('does not tag non-Databricks OAuth callers as Databricks in usage', async () => {
+    const { deps, raw } = makeDeps([CLAUDE_REDIRECT]);
+    await handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, deps);
+    expect(raw.recordUsage).toHaveBeenCalledWith(expect.not.objectContaining({ clientType: 'databricks' }));
   });
 
   it('leaves non-Databricks OAuth clients, aw_ keys and unknown clients able to write', async () => {
