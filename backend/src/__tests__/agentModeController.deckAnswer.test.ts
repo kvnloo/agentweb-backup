@@ -617,3 +617,76 @@ describe('generateResponse — approval-deck cancel channel (ENG-1635/1644 Phase
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 });
+
+// ENG-2962: an outside agent on Emma's MCP server answers cards through emma_answer_question_deck, which reaches this route as a
+// self-call (isSelfCall, set by the auth middleware for `_svc` tokens). Reproduced on the test environment 2026-11-12: the agent
+// approved Emma's Smartlead release card itself. A self-call may not approve a card only a person may approve.
+describe('generateResponse — person-only approvals refused for MCP self-calls (ENG-2962)', () => {
+  const card = (kind: string, extra: Record<string, unknown> = {}) => ({
+    deckId: 'deck-1',
+    status: 'awaiting' as const,
+    items: [{ itemId: 'question-1', kind, question: 'Approve?', ...extra }],
+    createdAt: '2026-11-12T00:00:00.000Z',
+    finalizedAt: '2026-11-12T00:00:01.000Z',
+  });
+  const selfCallReq = (deckAnswer: any) => Object.assign(makeReq({ userId: ownerId }, deckAnswer), { isSelfCall: true });
+  const submitted = (deck: any) => ({ outcome: 'submitted', run: null, summary: null, answeredDeck: { ...deck, status: 'answered', answers: [] } });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    activeSessionGenerations.clear();
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockWorkerService.runInWorker.mockResolvedValue(workerResult as any);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it.each([
+    ['Smartlead push or release', 'smartlead_push_approval:release:abc:0123456789abcdef', 'approve', {}],
+    ['hot-lead call', 'hot_lead_call_approval:call:abc:0123456789abcdef', 'approve', {}],
+    ['CRM sequence activation', 'crm_sequence_activation:seq-1:tok', 'activate', {}],
+    ['paused Meta bundle', 'meta_write', 'approve', { metaWriteDispatch: { action: 'CREATE_PAUSED_BUNDLE' } }],
+  ])('a self-call approving a %s card is refused (403), nothing is submitted and Emma does not run', async (_label, kind, verdict, extra) => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(card(kind, extra) as any) as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers: [{ itemId: 'question-1', verdict }] }), res);
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual(expect.objectContaining({ code: 'APPROVAL_NEEDS_PERSON' }));
+    expect(res.body.error).toContain(`/agent-mode/${sessionId}`);
+    expect(mockAgentModeService.submitApprovalDeckAnswers).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('a self-call may still decline a person-only card', async () => {
+    const deck = card('smartlead_push_approval:start:abc:0123456789abcdef');
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(deck as any) as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue(submitted(deck));
+    const res = makeRes();
+    const answers = [{ itemId: 'question-1', verdict: 'decline' }];
+    await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user');
+  });
+
+  it('a self-call may still answer any other card (e.g. a Meta write deck)', async () => {
+    const deck = pendingDeck();
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(deck) as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue(submitted(deck));
+    const res = makeRes();
+    await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers: [{ itemId: 'write-1', verdict: 'approve' }, { itemId: 'write-2', verdict: 'approve' }] }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalled();
+  });
+
+  it('a person in the app (not a self-call) still approves a person-only card', async () => {
+    const deck = card('smartlead_push_approval:start:abc:0123456789abcdef');
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(deck as any) as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue(submitted(deck));
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, { deckId: 'deck-1', answers: [{ itemId: 'question-1', verdict: 'approve' }] }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalled();
+  });
+});

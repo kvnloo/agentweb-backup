@@ -1,4 +1,5 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import { personOnlyApprovalsIn, personOnlyRefusal } from '../services/personOnlyApprovals';
 import {
   acquireInteractiveGenerationSlot,
   buildTooManyRunsBody,
@@ -11321,6 +11322,16 @@ export const agentModeController = {
       if (deckAnswer) {
         if (!session.pendingApprovalDeck) {
           return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        // ENG-2962: an MCP tool answering on someone's behalf (a self-call) may not approve an action that only a person may approve:
+        // a Smartlead push or release, a hot-lead call, a CRM sequence activation or a paused Meta bundle. Declining stays allowed.
+        if ((req as AuthenticatedRequest).isSelfCall === true) {
+          const blocked = personOnlyApprovalsIn(session.pendingApprovalDeck, deckAnswer.answers);
+          if (blocked.length > 0) {
+            console.warn(JSON.stringify({ event: 'approval_needs_person', sessionId, actions: blocked.map(b => b.action) }));
+            const chatUrl = `${(process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro').replace(/\/$/, '')}/agent-mode/${encodeURIComponent(sessionId)}`;
+            return res.status(403).json({ error: personOnlyRefusal(chatUrl), code: 'APPROVAL_NEEDS_PERSON' });
+          }
         }
         const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
         if (result.outcome === 'invalid') {
