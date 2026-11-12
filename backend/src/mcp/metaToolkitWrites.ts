@@ -34,6 +34,7 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
@@ -81,6 +82,8 @@ export interface MetaToolkitWriteDeps {
   readBack: (userId: string, accountId: string, entity: string, id: string) => Promise<Record<string, any> | null>;
   /** ENG-2913: throws unless the creative belongs to the selected ad account (creative ids are global). */
   assertCreativeOwned: (userId: string, accountId: string, creativeId: string) => Promise<void>;
+  /** ENG-2942: account-scoped custom conversion / pixel event reads for AD_SET CREATE. */
+  conversionLookup?: (userId: string, accountId: string) => Promise<ConversionLookup>;
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
@@ -116,6 +119,7 @@ const defaultDeps: MetaToolkitWriteDeps = {
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
   assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
+  conversionLookup: async (userId, accountId) => (await ams()).toolkitMetaConversionLookup(userId, accountId),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
@@ -338,6 +342,11 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       }
       throw new MetaToolkitRefusal(`Creative ${params.creative_id} was not found in ad account ${accountId}. Nothing was changed.`);
     }
+  }
+  // ENG-2942: a custom conversion / custom pixel event is accepted only when the account has it.
+  if (entity === 'AD_SET' && action === 'CREATE' && params.promoted_object && deps.conversionLookup) {
+    const lookup = await deps.conversionLookup(userId, accountId);
+    await assertOptimisationEventConfigured(params.promoted_object, lookup);
   }
   // A bid amount on an ad set that stays on the no-cap strategy is stored but unused by Meta.
   if (action === 'UPDATE' && entity === 'AD_SET' && params.bid_amount !== undefined && params.bid_strategy === undefined
