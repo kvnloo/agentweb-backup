@@ -387,13 +387,22 @@ describe('generateConnectionFollowUpDraft — brand voice & market strategy cont
     mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
   });
 
-  it('injects brand voice from readBrandGuidelines().formattedContent into the prompt', async () => {
+  it('injects a compact messaging-first brand block from readBrandGuidelines().brandData (ENG-2967)', async () => {
     const leadWithLinkedIn = { ...MATCHING_LEAD, linkedin: 'https://www.linkedin.com/in/john-prospect' };
     mockCrmDb.findLeadsByLinkedin.mockResolvedValue([leadWithLinkedIn] as any);
     mockCrmDb.getLeadListById.mockResolvedValue(LIST as any);
+    // Real readBrandGuidelines shape: structured brandData plus an HTML
+    // formattedContent whose head is header + colors + fonts.
     mockReadBrandGuidelines.mockResolvedValue({
       exists: true,
-      formattedContent: 'Tone of voice: warm, concise, founder-led. We never use buzzwords.',
+      brandData: {
+        brandName: 'Acme Isolation',
+        valueProposition: 'Stops shadow-IT data leaks without blocking employees.',
+        toneOfVoice: 'warm, concise, founder-led',
+        primaryColor: '#FF0000',
+        fontFamily: 'Inter',
+      },
+      formattedContent: '<strong>🎨 Brand Guidelines Retrieved</strong><br>• Primary Color: #FF0000<br>• Font Family: Inter',
     });
     mockReadMarketStrategy.mockResolvedValue(null);
 
@@ -401,6 +410,9 @@ describe('generateConnectionFollowUpDraft — brand voice & market strategy cont
 
     const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
     expect(userMessage.content).toContain('warm, concise, founder-led');
+    expect(userMessage.content).toContain('Stops shadow-IT data leaks');
+    expect(userMessage.content).not.toContain('#FF0000');
+    expect(userMessage.content).not.toContain('Font Family');
   });
 
   it('injects market strategy from readMarketStrategy().formattedContent into the prompt', async () => {
@@ -429,7 +441,7 @@ describe('generateConnectionFollowUpDraft — brand voice & market strategy cont
     await notifyNewConnections([NEW_CONNECTION]);
 
     const userMessage = getOpenAICreate().mock.calls[0][0].messages.find((m: any) => m.role === 'user');
-    expect(userMessage.content).not.toContain('Brand voice:');
+    expect(userMessage.content).not.toContain('Sender brand:');
     expect(userMessage.content).not.toContain('Offer/market fit:');
   });
 });
