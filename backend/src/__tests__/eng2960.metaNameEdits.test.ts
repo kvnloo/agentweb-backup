@@ -101,7 +101,7 @@ describe('ENG-2960 CAMPAIGN / AD_SET / AD rename', () => {
     expect(deps.dispatch).not.toHaveBeenCalled();
     const done: any = await executeMetaToolkitWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, deps);
     expect(deps.dispatch).toHaveBeenCalledTimes(1);
-    expect(deps.dispatch.mock.calls[0][1].params).toEqual({ name: 'New' });
+    expect((deps.dispatch as jest.Mock).mock.calls[0][1].params).toEqual({ name: 'New' });
     expect(done.verification).toBe('CONFIRMED');
   });
 
