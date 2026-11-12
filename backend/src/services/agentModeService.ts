@@ -2359,6 +2359,25 @@ export class AgentModeService {
   }
 
   /**
+   * The live-voice model that voice mode switches a chat to, or null when none is served to this user. Voice mode is
+   * not a text pick: the model picker never offers this id (isModelSelectableBy refuses it), so the chat's voice button
+   * reads it from here instead (`/public/voice-model`). Same internal/adminOnly gates
+   * as the picker, and the first live registry entry wins, so there is exactly one answer.
+   */
+  getVoiceModelFor(isAdmin: boolean): string | null {
+    for (const id of Object.keys(this.llmModels)) {
+      const config = this.llmModels[id];
+      if (config.isLive && !config.internalOnly && (isAdmin || !config.adminOnly)) return id;
+    }
+    return null;
+  }
+
+  /** True when `modelId` is the voice model this user may switch a chat to (see getVoiceModelFor). */
+  isVoiceModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
+    return Boolean(modelId) && this.getVoiceModelFor(isAdmin) === modelId;
+  }
+
+  /**
    * ENG-55: registry facts the model-compare feature needs (display name, lab, live
    * flag) without exposing the registry. Null for ids that are not registry keys.
    */
