@@ -20,8 +20,17 @@ work plans; found by an independent review of the first version of this change).
 - Unchanged on purpose: both model-switch routes still refuse the live-voice model; `/model-options` and
   `/public/llm-models` still never list it.
 
-**Known, not changed here:** `live:start` has no usage or plan gate (usage is charged to the owner afterwards), and
-share-link visitors and public-plan pages get voice again; the switch route is not what gates voice.
+**Voice usage (owner, 2026-11-12: "voice has to have usage and everything linked up properly").**
+- Admission: a voice call is admitted like a typed turn (`checkTokenUsage(owner, TURN_ADMISSION)`), after the ownership
+  check and before any Gemini session exists; a paused or over-limit account (the share link's owner, for a share-link
+  call) is refused with typed chat's message and `code: 'usage_paused'`; a failed lookup refuses (fail closed). After
+  every completed turn the same check runs; a call whose allowance ran out is told so and ended (a transient lookup
+  failure does not cut a live call).
+- Cost: each Gemini usage report is priced per modality from the price book (`LIVE_MODALITY_PRICES`, Google's paid-tier
+  rates read 2026-11-12: input text 0.75, audio 3.00, image/video 1.00; output text 4.50, audio 12.00 USD per 1M tokens)
+  instead of the text-rate approximation, which under-priced audio about 4x in and 2.7x out. Metered under the
+  feature `live_voice` (was the generic `agent_task`), so usage reports show voice as its own line.
+- The switch route is still not what gates voice; the voice start is.
 
 **Testing:** `agentModeController.voiceModel.test.ts` (7 cases: the endpoint, the helper's gates, both switch routes
 still refuse the voice model); related suites pass. Portal PR: client-side enter/leave, button follows the endpoint,
