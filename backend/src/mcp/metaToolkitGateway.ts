@@ -40,6 +40,7 @@ import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload }
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
 import { executeMetaToolkitAudience } from './metaToolkitAudiences';
+import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 
 /**
@@ -53,9 +54,9 @@ function journeyAfterCall(userId: string, event: 'first_read' | 'first_write', p
 }
 
 export class MetaToolkitAuthError extends Error {
-  readonly status: 401 | 403 | 429;
+  readonly status: 401 | 403 | 429 | 503;
   readonly retryAfterSeconds?: number;
-  constructor(message: string, status: 401 | 403 | 429, retryAfterSeconds?: number) {
+  constructor(message: string, status: 401 | 403 | 429 | 503, retryAfterSeconds?: number) {
     super(message);
     this.name = 'MetaToolkitAuthError';
     this.status = status;
@@ -76,6 +77,8 @@ export interface MetaToolkitCaller {
   clientId?: string;
   /** ENG-2496 device-flow Zoma token id (never the token). */
   zomaTokenId?: string;
+  /** ENG-2747: OAuth client registered from a Databricks workspace; Zoma is read-only for it. */
+  databricksOrigin?: boolean;
 }
 
 export interface MetaToolkitGatewayDeps {
@@ -114,6 +117,8 @@ export interface MetaToolkitGatewayDeps {
   prepareUpload?: (userId: string, args: any) => Promise<any>;
   /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
   executeAudience?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
+  getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -171,7 +176,35 @@ export async function authenticateMetaToolkitCaller(
   const oauth = await deps.validateOAuthToken(token);
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
   enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
-  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
+  // ENG-2747 (option B): a client registered from a Databricks workspace gets read-only Zoma.
+  // Fail closed: if the client lookup fails, the call is refused (retryable), never let through.
+  let databricksOrigin: boolean;
+  try {
+    databricksOrigin = await isDatabricksOAuthClient(oauth.clientId, deps);
+  } catch (error) {
+    console.error('[meta-toolkit] OAuth client lookup failed:', error instanceof Error ? error.message : error);
+    throw new MetaToolkitAuthError('Could not verify this connection right now. Try again shortly.', 503, 5);
+  }
+  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId, databricksOrigin };
+}
+
+/**
+ * ENG-2747: whether an OAuth client was registered from a Databricks workspace. Redirect URIs are
+ * only ever appended, so a positive answer is cached for the process lifetime; a negative one for
+ * a few minutes. Not cached when a test injects its own lookup.
+ */
+const DATABRICKS_NEGATIVE_TTL_MS = 5 * 60 * 1000;
+const databricksClientCache = new Map<string, { databricks: boolean; until: number }>();
+
+async function isDatabricksOAuthClient(clientId: string, deps: MetaToolkitGatewayDeps): Promise<boolean> {
+  if (deps.getOAuthClientRedirectUris) return isDatabricksClient(await deps.getOAuthClientRedirectUris(clientId));
+  const now = Date.now();
+  const hit = databricksClientCache.get(clientId);
+  if (hit && hit.until > now) return hit.databricks;
+  const databricks = isDatabricksClient((await mcpOAuthService.getClient(clientId))?.redirectUris ?? null);
+  if (databricksClientCache.size > 10_000) databricksClientCache.clear();
+  databricksClientCache.set(clientId, { databricks, until: databricks ? Number.POSITIVE_INFINITY : now + DATABRICKS_NEGATIVE_TTL_MS });
+  return databricks;
 }
 
 /**
@@ -250,6 +283,10 @@ export async function handleMetaToolkitCall(
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  // ENG-2747 (option B): refused before any upstream call or metering.
+  if (caller.databricksOrigin && !isDatabricksAllowedCall(request.toolName, request.args)) {
+    throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
+  }
   const meter = (platform?: string) => {
     void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
     return deps.recordUsage({

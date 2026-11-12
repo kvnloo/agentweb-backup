@@ -115,7 +115,11 @@ describe('ENG-2283 Meta Toolkit gateway', () => {
   });
 
   it('accepts an MCP OAuth token and meters with the oauth client', async () => {
-    const deps = makeDeps({ validateOAuthToken: jest.fn().mockResolvedValue({ userId: 'user-2', clientId: 'claude' }) });
+    const deps = makeDeps({
+      validateOAuthToken: jest.fn().mockResolvedValue({ userId: 'user-2', clientId: 'claude' }),
+      // ENG-2747: a non-Databricks OAuth client.
+      getOAuthClientRedirectUris: jest.fn().mockResolvedValue(['https://claude.ai/api/mcp/auth_callback']),
+    });
     await call(deps, { authorization: 'Bearer oauth-token', args: { account_id: 'act_111' } });
     expect(deps.recordUsage).toHaveBeenCalledTimes(1);
     expect(deps.recordUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-2', authMethod: 'oauth', clientId: 'claude' }));
