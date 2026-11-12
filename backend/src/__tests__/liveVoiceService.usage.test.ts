@@ -61,6 +61,7 @@ jest.mock('../services/onboardingTelemetry', () => ({
 }));
 
 const mockAddMessageToSession = jest.fn();
+const mockAddToolCostToSession = jest.fn().mockResolvedValue(undefined);
 const mockAddMessagesToSession = jest.fn();
 // ENG-521: startLiveSession now resolves the session owner before starting.
 // These tests all drive sessions owned by 'test-user-id'. Cross-user rejection
@@ -74,6 +75,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: mockAddMessagesToSession,
     getChatSessionRecord: mockGetChatSessionRecord,
     getMessagesFromMessagesTable: mockGetMessagesFromMessagesTable,
+    addToolCostToSession: mockAddToolCostToSession,
   },
 }));
 
@@ -197,22 +199,42 @@ describe('voice admission after each turn', () => {
 });
 
 describe('voice metering', () => {
-  it('meters each usage report under live_voice with the per-modality price', async () => {
+  it('meters each usage report as interactive live voice, per-modality priced, and adds it to the chat cost', async () => {
     const callbacks = makeCallbacks();
     await startLiveSession('s-meter', 'sock', jest.fn(), 'test-user-id');
     const usageMetadata = {
-      promptTokenCount: 1200, responseTokenCount: 600,
+      promptTokenCount: 1200, responseTokenCount: 600, cachedContentTokenCount: 100, toolUsePromptTokenCount: 20, thoughtsTokenCount: 10,
       promptTokensDetails: [{ modality: 'AUDIO', tokenCount: 1000 }, { modality: 'TEXT', tokenCount: 200 }],
       responseTokensDetails: [{ modality: 'AUDIO', tokenCount: 500 }, { modality: 'TEXT', tokenCount: 100 }],
     };
     callbacks['onmessage']?.({ usageMetadata });
+    const cost = (1000 * 3 + 200 * 0.75 + 20 * 0.75 + 500 * 12 + 100 * 4.5 + 10 * 4.5) / 1e6;
     expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'test-user-id', feature: 'live_voice', model: 'gemini-3.1-flash-live-preview',
-      inputTokens: 1200, outputTokens: 600, sessionId: 's-meter',
-      costUsdOverride: (1000 * 3 + 200 * 0.75 + 500 * 12 + 100 * 4.5) / 1e6,
+      userId: 'test-user-id', feature: 'live_voice:interactive', model: 'gemini-3.1-flash-live-preview',
+      // cached tokens are part of the prompt: counted once, as cache reads; tool-use prompt is input; thinking is output
+      inputTokens: 1200 - 100 + 20, cacheReadTokens: 100, outputTokens: 600 + 10, sessionId: 's-meter',
       costProvenance: LLM_PRICE_BOOK_PROVENANCE,
     }));
+    expect(mockMeter.mock.calls[0][0].costUsdOverride).toBeCloseTo(cost, 12);
+    expect(mockAddToolCostToSession).toHaveBeenCalledWith('s-meter', expect.closeTo(cost, 12), 'live_voice');
     closeLiveSession('s-meter');
+  });
+});
+
+describe('share-link wording', () => {
+  it('a share-link visitor refused for usage is told only that the shared session is paused', async () => {
+    makeCallbacks();
+    mockCheckTokenUsage.mockResolvedValue({ allowed: false, month: '2026-11' });
+    await expect(startLiveSession('s-share', 'sock', jest.fn(), 'test-user-id', 'default', undefined, 'share_visitor'))
+      .rejects.toThrow('AI usage is paused for this shared session. Please contact the owner of this link.');
+  });
+
+  it('the owner (no restriction) gets the account wording, not the share wording', async () => {
+    makeCallbacks();
+    mockCheckTokenUsage.mockResolvedValue({ allowed: false, month: '2026-11' });
+    const err = await startLiveSession('s-own', 'sock', jest.fn(), 'test-user-id').catch((e) => e);
+    expect(err).toBeInstanceOf(LiveSessionUsageBlockedError);
+    expect(err.message).not.toMatch(/shared session/);
   });
 });
 
