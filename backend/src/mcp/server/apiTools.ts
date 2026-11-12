@@ -1346,12 +1346,13 @@ mcpToolRegistry.register({
 - "preview_activation": shows the user the exact steps, audience and timing and asks them to approve. Always do this before "activate".
 - "activate": starts sending. Only works in a live chat, after "preview_activation", once the user has picked "Activate" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.
 - "pause": stops sending. Always allowed.
+- "external_activation_preview" / "external_activate_confirm" (external MCP callers only, e.g. an aw_ key acting on a human's out-of-chat approval): preview returns a digest bound to the current sequence version and the named \`approver\`, with no side effects; confirm activates only if the digest, approver and sequence are all unchanged since that preview.
 
 Use list_crm_sequences to find sequence ids.`,
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['create', 'update', 'preview_activation', 'activate', 'pause'] },
+        action: { type: 'string', enum: ['create', 'update', 'preview_activation', 'activate', 'pause', 'external_activation_preview', 'external_activate_confirm'] },
         sequence_id: { type: 'string', description: 'Required for every action except create.' },
         name: { type: 'string', description: 'Sequence name (create; optional on update).' },
         description: { type: 'string' },
@@ -1378,6 +1379,8 @@ Use list_crm_sequences to find sequence ids.`,
           },
         },
         preview_token: { type: 'string', description: 'activate only: the preview_token returned by preview_activation.' },
+        approver: { type: 'string', description: 'external_* actions only: identity of the human who approved activation (e.g. slack:U123).' },
+        digest: { type: 'object', description: 'external_activate_confirm only: the `digest` object returned by external_activation_preview, unmodified.' },
       },
       required: ['action'],
     },
@@ -1469,6 +1472,78 @@ Use list_crm_sequences to find sequence ids.`,
         case 'pause': {
           const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body: { status: 'paused' } });
           return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'paused' };
+        }
+
+        case 'external_activation_preview':
+        case 'external_activate_confirm': {
+          // ENG-2961: out-of-chat activation for external MCP callers, bound to the ENG-2958
+          // digest. Never reachable from an Emma session; no approval card, no agent call.
+          if (context?.externalMcp !== true) {
+            return refuse('external_only', 'This action is only available to external MCP callers. In chat, use preview_activation.');
+          }
+          if (args?.client_id !== undefined && args?.client_id !== null) {
+            return refuse('own_account_only', 'External activation acts only on your own sequences; client_id is not accepted.');
+          }
+          const approver = typeof args?.approver === 'string' ? args.approver.trim() : '';
+          if (!approver) return { success: false, error: 'approver is required' };
+          const ext = await import('../../services/externalActivationPreview');
+          const sequence = await loadSequence();
+          if (sequence.userId !== undefined && context?.userId !== undefined && sequence.userId !== context.userId) {
+            return refuse('own_account_only', 'This sequence does not belong to your account.');
+          }
+          if (sequence.status === 'active') return { success: true, sequence_id: sequenceId, status: 'active', note: 'Already active.' };
+          if (!Array.isArray(sequence.steps) || sequence.steps.length === 0) {
+            return { success: false, error: 'This sequence has no steps, so there is nothing to send.' };
+          }
+
+          if (action === 'external_activation_preview') {
+            const digest = ext.buildExternalActivationPreview(sequence, { approverPrincipal: approver });
+            return {
+              success: true,
+              digest,
+              preview: {
+                sequence_id: sequenceId,
+                name: sequence.name,
+                audience: describeSequenceAudience(sequence),
+                steps: sequence.steps.map((s: any) => ({
+                  name: s.name,
+                  delay_days: s.delayDays,
+                  channel: s.channel ?? 'email',
+                  subject: s.subject,
+                  body_html: s.bodyHtml,
+                  message_text: s.messageText,
+                })),
+              },
+              message: 'Nothing was activated. Pass `digest` unchanged with the same approver to external_activate_confirm.',
+            };
+          }
+
+          const digest = args?.digest;
+          if (!digest || typeof digest !== 'object') {
+            return refuse('missing_digest', 'A digest from external_activation_preview is required. Nothing was activated.');
+          }
+          const verdict = ext.verifyExternalActivationPreview(digest, sequence, { approverPrincipal: approver });
+          if (!verdict.ok) {
+            const why = verdict.reason === 'version_drift'
+              ? 'The sequence changed after the preview. Preview it again.'
+              : verdict.reason === 'principal_mismatch'
+                ? 'The approver does not match the preview.'
+                : 'The digest is malformed or was altered.';
+            return refuse(verdict.reason === 'version_drift' ? 'stale_preview' : verdict.reason, `${why} Nothing was activated.`);
+          }
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview. Preview it again. Nothing was activated.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active', approver };
         }
 
         case 'preview_activation':
