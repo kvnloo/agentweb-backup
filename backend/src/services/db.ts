@@ -12777,7 +12777,7 @@ export const orgDb = {
   },
 
   /**
-   * Remove a single secret key from the org record.
+   * Remove a single secret key from the org record. Idempotent; throws on real failures.
    */
   async removeOrgSecret(orgId: string, key: string): Promise<void> {
     try {
@@ -12794,8 +12794,12 @@ export const orgDb = {
           ":updatedAt": new Date().toISOString(),
         },
       }).promise();
-    } catch {
-      // If secrets map or key doesn't exist, that's fine — already absent.
+    } catch (err: any) {
+      // Removing an absent key is a no-op in DynamoDB. The only "already absent" error is the
+      // whole secrets map missing (invalid document path); anything else is a real failure
+      // the caller must see rather than report as a successful disconnect.
+      if (err?.code === "ValidationException" && /document path/i.test(err?.message ?? "")) return;
+      throw err;
     }
   },
 };
