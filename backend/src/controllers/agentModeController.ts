@@ -12501,8 +12501,9 @@ export const agentModeController = {
   },
 
   /**
-   * GET /public/voice-model: the live-voice model a chat's voice button switches to, for pages that load the public
-   * model catalog (share links). The catalog itself never lists it (it feeds text pickers). null = no voice.
+   * GET /public/voice-model: the live-voice model behind the chat's voice button, or null when none is served. The model
+   * lists never carry it (they feed text pickers), and the model-switch routes keep refusing it: voice mode is a
+   * client-side mode, the chat's stored model is never changed to it (ENG-2957).
    */
   async getPublicVoiceModel(req: Request, res: Response) {
     try {
@@ -18164,11 +18165,7 @@ export const agentModeController = {
       // ENG-669: with the tier allowlist on, the pick is judged for the session OWNER (below), so an
       // admin or delegated caller cannot widen a user's session beyond what that user may run.
       const tierAllowlistOn = await modelAccess.isEnabled();
-      // Voice mode switches the chat to the live-voice model and back. It is not a text pick (generation refuses it and a
-      // stored one falls back to the default for text), so the text picker's selectability and plan checks do not apply;
-      // it is still judged for the session OWNER below (an admin-only voice model clears only for an admin owner).
-      const voicePickCandidate = !routerPick && typeof agentModeService.isLiveModel === 'function' && agentModeService.isLiveModel(canonicalModel);
-      if (!routerPick && !voicePickCandidate && !tierAllowlistOn && !agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
+      if (!routerPick && !tierAllowlistOn && !agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
         return res.status(403).json({ error: 'This model is not available for your account' });
       }
 
@@ -18185,12 +18182,7 @@ export const agentModeController = {
 
       // ENG-669: the same 422 model_unavailable the turn itself would answer, checked against the
       // OWNER: selectability (adminOnly clears only for an admin owner), then the owner's plan.
-      if (voicePickCandidate) {
-        const ownerIsAdmin = session.userId === user.userId ? !!user.isAdmin : await isUserAdmin(session.userId);
-        if (!agentModeService.isVoiceModelSelectableBy(canonicalModel, ownerIsAdmin)) {
-          return res.status(422).json(modelUnavailableBody(new ModelUnavailableError(String(llmModel), 'not_selectable')));
-        }
-      } else if (routerPick) {
+      if (routerPick) {
         try {
           await assertAgentWebModelSelectable({ ownerUserId: session.userId, session });
         } catch (modelError) {
@@ -18248,12 +18240,7 @@ export const agentModeController = {
       // ENG-2293: same gate as updateSessionLlmModel, same reasoning — shared
       // viewers are always non-admin, so this also now blocks adminOnly
       // auto-added models, not just opus.
-      // Voice mode on a share link (offered since PR #1211; visitors run under the share_visitor restriction since
-      // ENG-2816): the live-voice model is not a text pick, so the picker gate below does not apply to it. Viewers are
-      // judged as non-admin, so an admin-only voice model stays refused.
-      const voicePick = !routerPick && typeof agentModeService.isVoiceModelSelectableBy === 'function'
-        && agentModeService.isVoiceModelSelectableBy(canonicalModel, false);
-      if (!routerPick && !voicePick && !agentModeService.isModelSelectableBy(canonicalModel, false)) {
+      if (!routerPick && !agentModeService.isModelSelectableBy(canonicalModel, false)) {
         return res.status(403).json({ error: 'This model is not available for shared sessions' });
       }
 
@@ -18282,8 +18269,7 @@ export const agentModeController = {
       // ENG-669: the viewer writes the OWNER's session, so the pick must be in the owner's plan.
       // The viewer's 422 does not carry the owner's plan.
       try {
-        if (voicePick) { /* voice mode, not a text pick: no plan check (see above) */ }
-        else if (routerPick) await assertAgentWebModelSelectable({ ownerUserId: session.userId, session });
+        if (routerPick) await assertAgentWebModelSelectable({ ownerUserId: session.userId, session });
         else await assertModelInOwnerPlan({ ownerUserId: session.userId, model: String(llmModel), session });
       } catch (modelError) {
         if (!isModelUnavailableError(modelError)) throw modelError;
