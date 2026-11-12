@@ -5,7 +5,7 @@ import { parseBusinessUseCaseUsage } from './metaBusinessUsage';
 export const META_TOOLKIT_BUC_THRESHOLD_PCT = 90;
 export const META_TOOLKIT_MAX_BACKOFF_MS = 30_000;
 const context = new AsyncLocalStorage<{
-  write: boolean; retried: boolean; limited?: ReturnType<typeof limitedResult>;
+  write: boolean; writeSent?: boolean; retried: boolean; limited?: ReturnType<typeof limitedResult>;
   sleep: (ms: number) => Promise<void>;
 }>();
 function limitedResult(minutes: number) {
@@ -26,8 +26,10 @@ async function retryAllowed(headers: any, data: any, status?: number, method = '
   if (!state) return false;
   const limited = signal(headers, data, status);
   if (!limited) return false;
-  const write = state.write || method.toUpperCase() !== 'GET';
-  state.limited = write
+  const nonGet = method.toUpperCase() !== 'GET';
+  const write = state.write || nonGet;
+  // Warn only when a mutating request actually reached Meta; a throttled preview read changed nothing.
+  state.limited = state.writeSent || nonGet
     ? { ...limited, message: `${limited.message} This write was not retried and may have executed; verify its state before trying again.` }
     : limited;
   if (write || state.retried) throw new Error(limited.message);
@@ -37,20 +39,26 @@ async function retryAllowed(headers: any, data: any, status?: number, method = '
   return true;
 }
 function graph(url?: string) { try { return new URL(url ?? '').hostname === 'graph.facebook.com'; } catch { return false; } }
-// Installed once; unrelated requests have no async-local state and are untouched.
-axios.interceptors.request.use(config => {
-  const limited = context.getStore()?.limited;
-  if (limited && graph(config.url)) throw new Error(limited.message);
-  return config;
-});
-axios.interceptors.response.use(async response => {
-  if (graph(response.config.url) && await retryAllowed(response.headers, response.data, response.status, response.config.method)) return axios.request(response.config);
-  return response;
-}, async error => {
-  const response = error?.response;
-  if (graph(error?.config?.url) && await retryAllowed(response?.headers, response?.data, response?.status, error.config.method)) return axios.request(error.config);
-  throw error;
-});
+/** Attach toolkit backoff to an axios instance; requests outside toolkit context are untouched. */
+export function attachMetaToolkitBackoff<T extends typeof axios | ReturnType<typeof axios.create>>(client: T): T {
+  client.interceptors.request.use(config => {
+    const state = context.getStore();
+    if (state?.limited && graph(config.url)) throw new Error(state.limited.message);
+    if (state && graph(config.url) && (config.method ?? 'get').toUpperCase() !== 'GET') state.writeSent = true;
+    return config;
+  });
+  client.interceptors.response.use(async response => {
+    if (graph(response.config.url) && await retryAllowed(response.headers, response.data, response.status, response.config.method)) return client.request(response.config);
+    return response;
+  }, async error => {
+    const response = error?.response;
+    if (graph(error?.config?.url) && await retryAllowed(response?.headers, response?.data, response?.status, error.config.method)) return client.request(error.config);
+    throw error;
+  });
+  return client;
+}
+// Installed once on the default client.
+attachMetaToolkitBackoff(axios);
 
 /** Toolkit fetch path bypasses the legacy helper's independent retry budget. */
 export async function toolkitMetaFetch(url: string): Promise<Response> {

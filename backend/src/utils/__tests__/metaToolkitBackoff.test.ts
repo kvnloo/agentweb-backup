@@ -1,7 +1,7 @@
 import { parseBusinessUseCaseUsage } from '../metaBusinessUsage';
 import axios from 'axios';
 import { fetchWithRetry } from '../metaApiFetch';
-import { withMetaToolkitBackoff, META_TOOLKIT_MAX_BACKOFF_MS } from '../metaToolkitBackoff';
+import { withMetaToolkitBackoff, attachMetaToolkitBackoff, META_TOOLKIT_MAX_BACKOFF_MS } from '../metaToolkitBackoff';
 
 const url = 'https://graph.facebook.com/v25.0/act_1/campaigns';
 const response = (pct: number, data: any = { data: [{ id: '1' }] }, minutes = 2) => ({
@@ -58,5 +58,23 @@ describe('toolkit BUC bounded backoff', () => {
     const adapter = async (config: any) => ({ config, data: { data: [] }, status: 200, statusText: 'OK', headers: { 'x-business-use-case-usage': JSON.stringify({ '1': [{ total_time: ++calls === 1 ? 95 : 5 }] }) } });
     const result = await withMetaToolkitBackoff(false, sleep, async () => (await axios.get(url, { adapter })).data);
     expect(result).toEqual({ data: [] }); expect(calls).toBe(2); expect(sleep).toHaveBeenCalledTimes(1);
+  });
+  it('does not claim a write may have executed when only a preview read was throttled', async () => {
+    mocked.mockResolvedValue(response(100));
+    const result: any = await run(true);
+    expect(result).toMatchObject({ rate_limited: true }); expect(result.message).not.toContain('may have executed');
+  });
+  it('warns that a throttled sent write may have executed', async () => {
+    const adapter = async (config: any) => ({ config, data: {}, status: 200, statusText: 'OK', headers: { 'x-business-use-case-usage': JSON.stringify({ '1': [{ total_time: 99 }] }) } });
+    const result: any = await withMetaToolkitBackoff(true, sleep, async () => (await axios.post(url, {}, { adapter })).data);
+    expect(result.message).toContain('may have executed'); expect(sleep).not.toHaveBeenCalled();
+  });
+  it('applies to dedicated axios instances (lifecycle guard reads)', async () => {
+    let calls = 0;
+    const client = attachMetaToolkitBackoff(axios.create());
+    const adapter = async (config: any) => ({ config, data: { data: [] }, status: 200, statusText: 'OK', headers: { 'x-business-use-case-usage': JSON.stringify({ '1': [{ total_time: 100 }] }) } });
+    const result = await withMetaToolkitBackoff(false, sleep, async () => { calls++; return (await client.get(url, { adapter: async (c: any) => { calls++; return adapter(c); } })).data; });
+    expect(result).toMatchObject({ rate_limited: true, estimated_time_to_regain_access: expect.any(Number) });
+    expect(sleep).toHaveBeenCalledTimes(1);
   });
 });
