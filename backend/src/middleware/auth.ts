@@ -17,6 +17,11 @@ export interface AuthenticatedRequest extends Request {
     isDelegated: boolean;
     isContractor?: boolean;
   };
+  /**
+   * ENG-2962: true when the login token is a self-call token (`_svc`), which only mcpFetch mints: the request was made by an MCP
+   * tool on someone's behalf, not by a person in the app. Routes that need a person's own action (approving an outward action) check it.
+   */
+  isSelfCall?: boolean;
 }
 
 export interface UserPayload {
@@ -227,6 +232,7 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   // Set user properties to the request object
   const authReq = req as AuthenticatedRequest;
   authReq.user = result.user;
+  authReq.isSelfCall = result.decoded?._svc === true;
 
   // Handle delegate info if needed (for backward compatibility)
   if (result.decoded?.delegateAccess && result.adminUser) {
