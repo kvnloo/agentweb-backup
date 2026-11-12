@@ -30,7 +30,7 @@ export interface QuoteDeps {
     listId: string,
     limit: number,
     lastKey?: unknown,
-  ): Promise<{ items: Array<{ leadId?: unknown; email?: unknown }>; lastEvaluatedKey?: unknown }>;
+  ): Promise<{ items: Array<{ leadId?: unknown; email?: unknown } & BrokerIdentityFields>; lastEvaluatedKey?: unknown }>;
   /** The list's saved enrichment config, or undefined when none is saved. Rejects when a saved config cannot be read: the quote must fail, not guess. */
   getSavedConfig(listId: string, userId: string): Promise<EnrichmentConfig | undefined>;
   /** Whether this is an email the resolver would use as one (not blank, not a placeholder/test domain). */
@@ -46,6 +46,39 @@ export interface QuoteParams {
 
 const PAGE_SIZE = 200;
 
+/** The lead fields the Apollo broker needs (enrichmentGroupWaterfall tier 3.5a). */
+export interface BrokerIdentityFields {
+  firstName?: unknown;
+  lastName?: unknown;
+  company?: unknown;
+  domain?: unknown;
+  website?: unknown;
+  emailDomain?: unknown;
+}
+
+const filled = (v: unknown) => typeof v === 'string' && v.trim().length > 0;
+
+/**
+ * Whether the Apollo broker can be sent for this (emailless) lead: tier 3.5a needs a first and last name plus an
+ * email domain or a company. The run derives the email domain from the lead's domain or website, so those count.
+ */
+export function canReachApolloBroker(lead: BrokerIdentityFields | undefined): boolean {
+  if (!lead) return false;
+  return filled(lead.firstName) && filled(lead.lastName)
+    && (filled(lead.company) || filled(lead.domain) || filled(lead.website) || filled(lead.emailDomain));
+}
+
+/**
+ * Whether a run on this config can ask for a lead's email at all: an included field that is (or aliases) the
+ * canonical `email`, or a smart field depending on it. Without one the broker never fires (tier 3.5a only runs for
+ * a requested `email`; the identity resolver is called without a lead hint, so its broker step never runs).
+ */
+export function configRequestsEmail(config: EnrichmentConfig): boolean {
+  return config.fields.some(f => f.include && (
+    (f.aliasFor ?? f.name) === 'email' || (f.smartDependencies ?? []).includes('email')
+  ));
+}
+
 /**
  * The leads an enrich-v3 run would touch, and how many have no usable email (only those can trigger the
  * Apollo broker: the identity resolver skips it when an email is already known). The list is always paged,
@@ -58,23 +91,27 @@ export async function inspectLeads(
   deps: QuoteDeps,
   listId: string,
   leadIds?: string[],
-): Promise<{ count: number; emailless: number }> {
+): Promise<{ count: number; emailless: number; brokerEligible: number }> {
   const wanted = leadIds ? new Set(leadIds) : undefined;
   let count = 0;
   let emailless = 0;
+  let brokerEligible = 0;
   let lastKey: unknown = undefined;
   do {
     const page = await deps.getLeadsPage(listId, PAGE_SIZE, lastKey);
     for (const lead of page.items) {
       if (wanted && !(typeof lead?.leadId === 'string' && wanted.has(lead.leadId))) continue;
       count++;
-      if (!deps.hasUsableEmail(lead?.email)) emailless++;
+      if (!deps.hasUsableEmail(lead?.email)) {
+        emailless++;
+        if (canReachApolloBroker(lead)) brokerEligible++;
+      }
     }
     lastKey = page.lastEvaluatedKey;
     // Every wanted id found: the rest of the list cannot add to the count (ids are unique within a list).
     if (wanted && count >= wanted.size) break;
   } while (lastKey);
-  return { count, emailless };
+  return { count, emailless, brokerEligible };
 }
 
 export async function priceEnrichment(
@@ -83,11 +120,14 @@ export async function priceEnrichment(
 ): Promise<{ estimate: EnrichmentCostEstimate; config: EnrichmentConfig | undefined; leadCount: number }> {
   // Config first: if it cannot be read there is nothing to quote, so fail before paying for a pass over the list.
   const config = await deps.getSavedConfig(listId, userId);
-  const { count, emailless } = await inspectLeads(deps, listId, leadIds);
+  const { count, emailless, brokerEligible } = await inspectLeads(deps, listId, leadIds);
   const model = await enrichmentModelFor(userId);
+  // No requested email, no broker: price no Apollo line. A list with no saved config runs the default config, which includes email.
+  const asksForEmail = !config || configRequestsEmail(config);
   const estimate = estimateEnrichmentCost(listId, count, {
     userId,
-    emaillessCount: emailless,
+    emaillessCount: asksForEmail ? emailless : 0,
+    brokerEligibleCount: asksForEmail ? brokerEligible : 0,
     fieldCount: config ? effectiveFieldCount(config) : undefined,
     fieldCostUsd: expectedFieldCostUsd(model),
     enigmaPerLeadUsd: config && enigmaApplies(config, userId) ? enigmaFetchUsd('expected') : undefined,

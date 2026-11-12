@@ -10,26 +10,48 @@ import {
 import { getAllocatedRate } from '../../utils/vendorRateCard';
 
 describe('estimateEnrichmentCost (ENG-2716)', () => {
-  // ENG-2720: this used to pin the pre-fix $31.60 (gpt-5.5 at $8.47 per 112 leads). Apollo stays at $0.445
-  // per broker request (owner decision 2026-11-02): 34 requests x $0.445 = $15.13, and the LLM line is the
-  // measured Luna cost, 112 x $0.02 (tokens + OpenRouter web-search fee) = $2.24, lookups $3.61, web
-  // $1.37, unattributed $3.02 => $25.37.
-  it('estimates the Opiner reference run (112 leads): ~$25.4, down from $31.60 (only the LLM line changed)', () => {
-    const e = estimateEnrichmentCost('list-1', 112);
-    expect(e.breakdownUsd.apollo).toBe(15.13);
-    expect(e.breakdownUsd.llm).toBe(2.24);
-    expect(e.breakdownUsd.lookups).toBe(3.61);
-    expect(e.breakdownUsd.webSearch).toBe(1.37);
-    expect(e.totalUsd).toBe(25.37);
-    expect(e.totalUsd).toBeLessThan(31.6);
-    expect(e.leadCount).toBe(112);
+  // ENG-2720 recalibration (2026-11-12): pinned to what prod actually booked, not to a single reference run.
+  // Customer runs since the 11-04 changes: 118 contacts, $8.09 booked (lists of 5-12 fields, ~8 on average;
+  // 30 emailless contacts, none with a name to send to the Apollo broker, 1 broker request booked).
+  it('backtest: the Nov 4+ customer runs (118 contacts) quote within 5% of the $8.09 prod booked', () => {
+    const e = estimateEnrichmentCost('l', 118, { emaillessCount: 30, brokerEligibleCount: 0, fieldCount: 8 });
+    expect(e.totalUsd).toBeGreaterThan(8.09 * 0.95);
+    expect(e.totalUsd).toBeLessThan(8.09 * 1.05);
+    // the old constants quoted ~$14.8 for the same runs
+    expect(e.breakdownUsd.apollo).toBeCloseTo(0.45, 2);
+  });
+
+  // Oct 30 - Nov 3: one list, 146 emailless contacts that all had a name and company; 60 broker requests; $37.30 booked.
+  it('backtest: a 146-contact list of broker-eligible emailless leads quotes within 5% of the $37.30 booked', () => {
+    const e = estimateEnrichmentCost('l', 146, { emaillessCount: 146, brokerEligibleCount: 146, fieldCount: 10 });
+    expect(e.totalUsd).toBeGreaterThan(37.3 * 0.95);
+    expect(e.totalUsd).toBeLessThan(37.3 * 1.05);
+    expect(e.breakdownUsd.apollo).toBeCloseTo(60 * 0.445, 1);
+  });
+
+  it('has no unattributed per-lead remainder any more (that was gpt-5.5-era spend)', () => {
+    const e = estimateEnrichmentCost('l', 100, { emaillessCount: 0 });
+    expect(e.breakdownUsd.other).toBe(0);
+    expect(e.perLeadUsd).toBeCloseTo(ENRICHMENT_COST_RATES_USD.lookupPerLead + ENRICHMENT_COST_RATES_USD.webSearchPerLead + 10 * ENRICHMENT_COST_RATES_USD.llmPerFieldPerLead, 2);
   });
 
   it('prices the Apollo line from the vendor rate card, so a rate change cannot leave the estimate stale', () => {
     const rate = getAllocatedRate('apollo', 'waterfall_email')!;
     expect(rate).toBe(0.445);
     const e = estimateEnrichmentCost('l', 112);
-    expect(e.breakdownUsd.apollo).toBeCloseTo(112 * rate * ENRICHMENT_COST_RATES_USD.apolloRevealRate, 2);
+    expect(e.breakdownUsd.apollo).toBeCloseTo(112 * rate * ENRICHMENT_COST_RATES_USD.apolloEligibleRate, 2);
+  });
+
+  it('prices broker-eligible emailless leads at the eligible rate and the rest at the low rate', () => {
+    const rate = getAllocatedRate('apollo', 'waterfall_email')!;
+    const r = ENRICHMENT_COST_RATES_USD;
+    const e = estimateEnrichmentCost('l', 50, { emaillessCount: 40, brokerEligibleCount: 10 });
+    expect(e.breakdownUsd.apollo).toBeCloseTo((10 * r.apolloEligibleRate + 30 * r.apolloOtherRate) * rate, 2);
+    // eligible defaults to every emailless lead; clamped to [0, emailless]
+    expect(estimateEnrichmentCost('l', 50, { emaillessCount: 40 }).breakdownUsd.apollo).toBeCloseTo(40 * r.apolloEligibleRate * rate, 2);
+    expect(estimateEnrichmentCost('l', 50, { emaillessCount: 40, brokerEligibleCount: 99 }).breakdownUsd.apollo).toBeCloseTo(40 * r.apolloEligibleRate * rate, 2);
+    expect(estimateEnrichmentCost('l', 50, { emaillessCount: 40, brokerEligibleCount: -3 }).breakdownUsd.apollo).toBeCloseTo(40 * r.apolloOtherRate * rate, 2);
+    expect(estimateEnrichmentCost('l', 50, { emaillessCount: 0, brokerEligibleCount: 10 }).breakdownUsd.apollo).toBe(0);
   });
 
   it('scales the LLM line with the config field count (Opslane: a 40-field config was under-quoted)', () => {
@@ -72,7 +94,7 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
   });
 
   it('scales linearly and handles zero/invalid counts', () => {
-    expect(estimateEnrichmentCost('l', 224).totalUsd).toBe(50.74);
+    expect(estimateEnrichmentCost('l', 224).totalUsd).toBeCloseTo(estimateEnrichmentCost('l', 112).totalUsd * 2, 1);
     expect(estimateEnrichmentCost('l', 0).totalUsd).toBe(0);
     expect(estimateEnrichmentCost('l', NaN as any).leadCount).toBe(0);
   });

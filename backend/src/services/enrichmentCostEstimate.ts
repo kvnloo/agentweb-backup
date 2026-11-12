@@ -1,25 +1,33 @@
 /**
  * ENG-2716 (child of ENG-2715): pre-run cost estimate for CRM enrich-v3.
  *
- * Pure arithmetic over the rate card (no vendor calls, no I/O; the confirmation token reads the server secret). Per-lead shares are calibrated from the Opiner run of
- * 2026-10-27 (112 leads -> $31.60 actual at the time): Apollo broker waterfall on
- * ~30% of leads, LLM extraction, match/lookup calls, and web search. Apollo misses
- * still incur the lookup/LLM/web cost, so they are priced into every lead.
- *
- * ENG-2720: the Apollo line is read from the vendor rate card (the same number
- * the ledger books) instead of a hardcoded price, and the LLM line is the
- * measured Luna cost, so this estimate tracks what the run will actually book.
- * With the LLM line updated the Opiner reference run estimates ~$25.4, down from $31.60 (Apollo stays at the 9-credit $0.445 per the owner's 2026-11-02 decision). The LLM line
- * scales with the saved config's field count and the Apollo line with the leads that lack an
- * email; customers see the result as a percent of their allowance, never as dollars.
+ * Pure arithmetic over the rate card (no vendor calls, no I/O; the confirmation token reads the server secret).
+ * Per contact: Apollo match/org lookups and web search as booked on prod, the LLM line per web field, and the
+ * Apollo broker waterfall for emailless leads it can actually be sent for. The constants are calibrated on what
+ * prod booked (see ENRICHMENT_COST_RATES_USD); the Apollo price is read from the vendor rate card (the same
+ * number the ledger books, $0.445 per the owner's 2026-11-02 decision). Customers see the result as a percent
+ * of their allowance, never as dollars.
  */
 import { createHmac, timingSafeEqual } from 'crypto';
 import { getJwtSecret } from '../config/jwt';
 import { getAllocatedRate } from '../utils/vendorRateCard';
 
+/**
+ * Recalibrated 2026-11-12 (ENG-2720) against what prod actually booked. Customer runs since the 2026-11-04 changes
+ * (prod logs `runEnrichment DONE` joined to the `AW-UsageRecords` ledger by user and day; test accounts excluded):
+ * 118 contacts, 5 customers, $8.09 booked, $0.0686 per contact; the previous constants quoted ~$14.8 for those runs
+ * (+83%), mostly from the Apollo line. The Apollo broker (group tier 3.5a / resolver 6.5) only fires for a lead with
+ * no email that has a first and last name plus a company or domain, so the line is now priced on those leads:
+ * prod logs Oct 29 - Nov 12 show 60 of 146 such leads firing it on one list (41%) and 1 of 30 emailless leads
+ * without a name on another (3.3%). Backtest of the new constants: Nov 4+ runs $8.20 vs $8.09 booked (+1%); the
+ * Oct 30 - Nov 3 list with 146 eligible leads $36.9 vs $37.3 booked (-1%). The calibration rests on few lists;
+ * re-check it against the ledger as more runs land.
+ */
 export const ENRICHMENT_COST_RATES_USD = {
-  /** Share of leads that trigger the Apollo broker waterfall (Opiner: 34/112; prod-wide ~28%). */
-  apolloRevealRate: 34 / 112,
+  /** Share of emailless leads with a name and a company/domain that fire the Apollo broker (prod: 60/146). */
+  apolloEligibleRate: 60 / 146,
+  /** Share of other emailless leads that still fire it (the run can fill a name/company first; prod: 1/30). */
+  apolloOtherRate: 1 / 30,
   /**
    * LLM extraction plus OpenRouter web-search cost per web field per lead, booked. Enrichment moved
    * from gpt-5.5 (Opiner: $8.47 / 112 leads) to gpt-5.6-luna (ENG-2720). Measured on the real Opiner
@@ -32,15 +40,13 @@ export const ENRICHMENT_COST_RATES_USD = {
   llmPerFieldPerLead: 0.002,
   /** Field count the reference run (and the measurement above) used; also the default when no config is saved yet. */
   referenceFieldCount: 10,
-  /** Match / lookup calls per lead, paid on hits and misses (Opiner: $3.61 / 112). */
-  lookupPerLead: 3.61 / 112,
-  /** Web search per lead (Opiner: $1.37 / 112). */
-  webSearchPerLead: 1.37 / 112,
   /**
-   * Unattributed remainder of the Opiner run ($31.60 minus the itemised
-   * $28.58), spread per lead so the reference run reproduces exactly.
+   * Apollo person match + org lookups per contact as booked (prod since 11-04: $2.673 + $2.128 over 118 contacts).
+   * Cache hits are free, so this is below one paid match per contact (54 paid matches for 118 contacts).
    */
-  otherPerLead: (31.6 - 15.13 - 8.47 - 3.61 - 1.37) / 112,
+  lookupPerLead: (2.673 + 2.128) / 118,
+  /** You.com web search per contact as booked (prod since 11-04: $1.113 over 118 contacts). */
+  webSearchPerLead: 1.113 / 118,
 } as const;
 
 export interface EnrichmentCostEstimate {
@@ -58,10 +64,14 @@ export interface EstimateInputs {
   /**
    * Leads in the run that have no email. Only those can trigger the Apollo broker (the identity
    * resolver skips it when an email is already known), so a list where every lead has an email is
-   * quoted no Apollo line. Defaults to every lead (the previous behaviour). The observed 34/112 broker
-   * share is applied to this count, so the line never exceeds what it was before.
+   * quoted no Apollo line. Pass 0 when the saved config does not request an email. Defaults to every lead.
    */
   emaillessCount?: number;
+  /**
+   * Of the emailless leads, those with a first and last name plus a company or domain: the only ones the Apollo
+   * broker can be sent for. Defaults to every emailless lead (the conservative reading when the caller cannot tell).
+   */
+  brokerEligibleCount?: number;
   /** Included fields plus smart-field dependencies in the saved config. Defaults to the reference config. */
   fieldCount?: number;
   /** USD one Enigma card-revenue fetch books per lead; set only when the config asks for a card-revenue field the user may buy. */
@@ -80,13 +90,16 @@ export function estimateEnrichmentCost(listId: string, leadCount: number, inputs
   // Fail loud rather than estimate $0 if the key is ever removed from the card.
   const apolloWaterfallUsd = getAllocatedRate('apollo', 'waterfall_email');
   if (apolloWaterfallUsd === null) throw new Error('Apollo waterfall_email rate unavailable');
-  const apollo = emailless * apolloWaterfallUsd * r.apolloRevealRate;
+  const eligible = Number.isFinite(inputs.brokerEligibleCount)
+    ? Math.min(emailless, Math.max(0, Math.floor(inputs.brokerEligibleCount as number)))
+    : emailless;
+  const apollo = (eligible * r.apolloEligibleRate + (emailless - eligible) * r.apolloOtherRate) * apolloWaterfallUsd;
   const perField = Number.isFinite(inputs.fieldCostUsd) && (inputs.fieldCostUsd as number) > 0 ? (inputs.fieldCostUsd as number) : r.llmPerFieldPerLead;
   const llm = n * fields * perField;
   const enigmaPerLead = Number.isFinite(inputs.enigmaPerLeadUsd) && (inputs.enigmaPerLeadUsd as number) > 0 ? (inputs.enigmaPerLeadUsd as number) : 0;
   const lookups = n * r.lookupPerLead;
   const webSearch = n * r.webSearchPerLead;
-  const other = n * r.otherPerLead + n * enigmaPerLead;
+  const other = n * enigmaPerLead;
   const total = apollo + llm + lookups + webSearch + other;
   const totalUsd = round2(total);
   return {
