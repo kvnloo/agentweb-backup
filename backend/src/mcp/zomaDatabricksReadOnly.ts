@@ -19,7 +19,13 @@
 import { READ_ONLY_TOOLKIT_TOOLS } from './toolkitToolAnnotations';
 
 /** Hosts Databricks serves workspaces from (AWS, Azure, GCP). Matched as a dot-boundary suffix. */
-const DATABRICKS_HOST_SUFFIXES = ['databricks.com', 'azuredatabricks.net'];
+const DATABRICKS_HOST_SUFFIXES = [
+  'databricks.com', // AWS and GCP workspaces
+  'azuredatabricks.net', // Azure
+  'databricks.azure.cn', // Azure China
+  'cloud.databricks.us', // AWS GovCloud
+  'databricksapps.com', // Databricks Apps
+];
 
 const DATABRICKS_EXTRA_ALLOWED = new Set(['zoma_status', 'zoma_usage', 'ads_get_errors']);
 
@@ -29,7 +35,7 @@ const MARKETING_API_READ_ACTIONS = new Set(['LIST', 'GET', 'PREVIEW', 'SEARCH', 
 export function isDatabricksRedirectUri(uri: string): boolean {
   let host: string;
   try {
-    host = new URL(uri).hostname.toLowerCase();
+    host = new URL(uri).hostname.toLowerCase().replace(/\.$/, '');
   } catch {
     return false;
   }
@@ -72,6 +78,12 @@ export function databricksToolView<T extends { name: string; description?: strin
       if (props) {
         delete props.confirm;
         delete props.preview_token;
+        delete props.confirm_recent_spend;
+      }
+      // Narrowed to reads, so label it read-only for this caller (annotations come from the route).
+      const annotated = copy as T & { annotations?: Record<string, boolean> };
+      if (annotated.annotations) {
+        annotated.annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
       }
       copy.description = 'Meta Marketing API, read-only on Databricks. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY.';
       out.push(copy);

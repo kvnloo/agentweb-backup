@@ -54,9 +54,9 @@ function journeyAfterCall(userId: string, event: 'first_read' | 'first_write', p
 }
 
 export class MetaToolkitAuthError extends Error {
-  readonly status: 401 | 403 | 429;
+  readonly status: 401 | 403 | 429 | 503;
   readonly retryAfterSeconds?: number;
-  constructor(message: string, status: 401 | 403 | 429, retryAfterSeconds?: number) {
+  constructor(message: string, status: 401 | 403 | 429 | 503, retryAfterSeconds?: number) {
     super(message);
     this.name = 'MetaToolkitAuthError';
     this.status = status;
@@ -177,16 +177,34 @@ export async function authenticateMetaToolkitCaller(
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
   enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
   // ENG-2747 (option B): a client registered from a Databricks workspace gets read-only Zoma.
-  // Fail closed: if the client lookup fails, treat the caller as Databricks-origin (writes refused).
+  // Fail closed: if the client lookup fails, the call is refused (retryable), never let through.
   let databricksOrigin: boolean;
   try {
-    const lookup = deps.getOAuthClientRedirectUris ?? (async (id: string) => (await mcpOAuthService.getClient(id))?.redirectUris ?? null);
-    databricksOrigin = isDatabricksClient(await lookup(oauth.clientId));
+    databricksOrigin = await isDatabricksOAuthClient(oauth.clientId, deps);
   } catch (error) {
-    console.error('[meta-toolkit] OAuth client lookup failed; treating caller as read-only:', error instanceof Error ? error.message : error);
-    databricksOrigin = true;
+    console.error('[meta-toolkit] OAuth client lookup failed:', error instanceof Error ? error.message : error);
+    throw new MetaToolkitAuthError('Could not verify this connection right now. Try again shortly.', 503, 5);
   }
   return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId, databricksOrigin };
+}
+
+/**
+ * ENG-2747: whether an OAuth client was registered from a Databricks workspace. Redirect URIs are
+ * only ever appended, so a positive answer is cached for the process lifetime; a negative one for
+ * a few minutes. Not cached when a test injects its own lookup.
+ */
+const DATABRICKS_NEGATIVE_TTL_MS = 5 * 60 * 1000;
+const databricksClientCache = new Map<string, { databricks: boolean; until: number }>();
+
+async function isDatabricksOAuthClient(clientId: string, deps: MetaToolkitGatewayDeps): Promise<boolean> {
+  if (deps.getOAuthClientRedirectUris) return isDatabricksClient(await deps.getOAuthClientRedirectUris(clientId));
+  const now = Date.now();
+  const hit = databricksClientCache.get(clientId);
+  if (hit && hit.until > now) return hit.databricks;
+  const databricks = isDatabricksClient((await mcpOAuthService.getClient(clientId))?.redirectUris ?? null);
+  if (databricksClientCache.size > 10_000) databricksClientCache.clear();
+  databricksClientCache.set(clientId, { databricks, until: databricks ? Number.POSITIVE_INFINITY : now + DATABRICKS_NEGATIVE_TTL_MS });
+  return databricks;
 }
 
 /**

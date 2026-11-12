@@ -4,7 +4,10 @@
  * hidden from tools/list, and everyone else is unaffected.
  */
 jest.mock('../services/agentApiKeyService', () => ({ agentApiKeyService: { validateKey: jest.fn() } }));
-jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: { validateAccessToken: jest.fn() } }));
+const mockGetClient = jest.fn();
+jest.mock('../mcp/oauth/oauthService', () => ({
+  mcpOAuthService: { validateAccessToken: jest.fn(), getClient: (...a: unknown[]) => mockGetClient(...a) },
+}));
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 jest.mock('../services/mcpUsageEventsService', () => ({ recordMcpToolUse: jest.fn(), recordMcpWriteExecuted: jest.fn() }));
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
@@ -67,6 +70,10 @@ describe('ENG-2747 Databricks host detection', () => {
     'https://adb-1234567890123456.7.azuredatabricks.net/login/oauth/http.html',
     'https://1234567890123456.7.gcp.databricks.com/login/oauth/http.html',
     'https://acme.cloud.databricks.com/some/other/path',
+    'https://dbc-1.cloud.databricks.us/login/oauth/http.html',
+    'https://adb-1.2.databricks.azure.cn/login/oauth/http.html',
+    'https://myapp-123.aws.databricksapps.com/oauth/callback',
+    'https://acme.cloud.databricks.com./login/oauth/http.html',
   ])('recognises %s', (uri) => expect(isDatabricksRedirectUri(uri)).toBe(true));
 
   it.each([
@@ -140,13 +147,32 @@ describe('ENG-2747 gateway enforcement', () => {
     expect(raw.getOAuthClientRedirectUris).not.toHaveBeenCalled();
   });
 
-  it('fails closed: a client lookup error makes the OAuth caller read-only', async () => {
+  it('fails closed: a client lookup error refuses the call with a retryable 503, never lets it through', async () => {
     const { deps, raw } = makeDeps(() => Promise.reject(new Error('dynamo down')));
     const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    await expect(handleMetaToolkitCall({ authorization: OAUTH, ...createCampaign }, deps)).rejects.toThrow(/read-only/);
+    await expect(handleMetaToolkitCall({ authorization: OAUTH, ...createCampaign }, deps)).rejects.toMatchObject({ status: 503 });
+    await expect(authenticateMetaToolkitCaller(OAUTH, deps)).rejects.toMatchObject({ status: 503 });
     expect(raw.executeWrite).not.toHaveBeenCalled();
-    expect((await authenticateMetaToolkitCaller(OAUTH, deps)).databricksOrigin).toBe(true);
+    expect(raw.recordUsage).not.toHaveBeenCalled();
     spy.mockRestore();
+  });
+
+  it('uses the real client record and caches the answer per client', async () => {
+    const { deps } = makeDeps(null);
+    delete (deps as Partial<MetaToolkitGatewayDeps>).getOAuthClientRedirectUris;
+    (deps.validateOAuthToken as jest.Mock).mockResolvedValue({ userId: 'u1', clientId: 'dbx-client' });
+    mockGetClient.mockResolvedValue({ clientId: 'dbx-client', redirectUris: [DATABRICKS_REDIRECT] });
+    expect((await authenticateMetaToolkitCaller(OAUTH, deps)).databricksOrigin).toBe(true);
+    expect((await authenticateMetaToolkitCaller(OAUTH, deps)).databricksOrigin).toBe(true);
+    expect(mockGetClient).toHaveBeenCalledTimes(1);
+
+    (deps.validateOAuthToken as jest.Mock).mockResolvedValue({ userId: 'u1', clientId: 'claude-client' });
+    mockGetClient.mockResolvedValue({ clientId: 'claude-client', redirectUris: [CLAUDE_REDIRECT] });
+    expect((await authenticateMetaToolkitCaller(OAUTH, deps)).databricksOrigin).toBe(false);
+
+    (deps.validateOAuthToken as jest.Mock).mockResolvedValue({ userId: 'u1', clientId: 'zoma-device-setup' });
+    mockGetClient.mockResolvedValue(null);
+    expect((await authenticateMetaToolkitCaller(OAUTH, deps)).databricksOrigin).toBe(false);
   });
 });
 
@@ -171,6 +197,7 @@ describe('ENG-2747 Databricks tools/list view', () => {
     expect(narrowed.inputSchema.properties.action?.enum).toEqual(['LIST', 'GET', 'PREVIEW', 'SEARCH', 'GET_MATCH_QUALITY']);
     expect(narrowed.inputSchema.properties.confirm).toBeUndefined();
     expect(narrowed.inputSchema.properties.preview_token).toBeUndefined();
+    expect((narrowed as unknown as { annotations: { readOnlyHint: boolean } }).annotations.readOnlyHint).toBe(true);
     const original = all.find((t) => t.name === 'call_meta_marketing_api') as unknown as Schemaful;
     expect(original.inputSchema.properties.action?.enum).toContain('CREATE');
     expect(original.inputSchema.properties.confirm).toBeDefined();
