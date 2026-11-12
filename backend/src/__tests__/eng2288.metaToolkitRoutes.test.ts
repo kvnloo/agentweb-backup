@@ -45,7 +45,8 @@ describe('ENG-2288 Meta Toolkit HTTP routes', () => {
     mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'api_key' });
     const res = await request(app).get('/api/meta-toolkit/tools').set('Authorization', 'Bearer aw_x').expect(200);
     expect(mockAuthenticate).toHaveBeenCalledWith('Bearer aw_x');
-    expect(res.body.tools).toEqual([{ name: 'meta_get_insights' }]);
+    // ENG-2747: an unclassified tool is advertised with the conservative (destructive) annotations.
+    expect(res.body.tools).toEqual([{ name: 'meta_get_insights', annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }]);
   });
 
   it('POST call maps auth errors to their status (401/403)', async () => {

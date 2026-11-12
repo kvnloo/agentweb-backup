@@ -17,6 +17,7 @@ import {
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 import { validateRef } from '../services/journeyAttribution';
@@ -41,10 +42,11 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
 function toolkitManifest() {
-  if (!googleToolkitEnabled()) return getMetaToolkitManifest();
+  // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
+  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return [...getMetaToolkitManifest(), ...getGoogleToolkitManifest()];
+  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
 }
 
 const router = Router();
