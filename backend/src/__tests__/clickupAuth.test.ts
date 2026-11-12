@@ -327,7 +327,7 @@ describe('ClickUp Auth Routes', () => {
         .get('/api/oauth/clickup/status')
         .expect(200);
 
-      expect(response.body).toEqual({ connected: true, workspaces: [] });
+      expect(response.body).toEqual({ connected: true, workspaces: [], scope: 'solo' });
     });
 
     it('should return connected with workspaces on valid token', async () => {
@@ -349,6 +349,7 @@ describe('ClickUp Auth Routes', () => {
       expect(response.body).toEqual({
         connected: true,
         workspaces: [{ id: 'ws-1', name: 'Workspace 1', avatar: null }],
+        scope: 'solo',
       });
       expect(mockAxiosGet).toHaveBeenCalledWith(
         'https://api.clickup.com/api/v2/team',
