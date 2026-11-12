@@ -64,9 +64,10 @@ export function notifyPlatformCap(input: {
   const run = async (): Promise<void> => {
     if (event.kind === 'refused') return alertOnce(100, cap, cap, now);
     if (event.used === undefined) return;
-    if (event.used >= cap) return alertOnce(100, event.used, cap, now);
+    // Both reached levels are processed: two concurrent leads can both read the cap, and the 80% alert must not be lost then.
     const threshold = eightyPercentOf(cap);
     if (threshold < cap && event.used >= threshold) await alertOnce(80, event.used, cap, now);
+    if (event.used >= cap) await alertOnce(100, event.used, cap, now);
   };
   return run().catch(err => {
     console.warn('[hotLeadCall] platform cap alert failed', { error: errorName(err) });

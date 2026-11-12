@@ -91,8 +91,10 @@ export function slotTaker(nowS: number) {
 export type Reservation =
   // monthlyUsed: this org's count for the month right after this lead was counted; absent when the read failed (notices only).
   // platformUsed: the platform-wide count for the UTC day right after this lead was counted; absent when the read failed (alerts only).
-  | { ok: true; release: () => Promise<void>; monthlyUsed?: number; platformUsed?: number; platformCap: number }
-  | { ok: false; reason: LimitDenial };
+  // at: the instant whose UTC day the platform counter used; the alert's once-per-day claim is keyed by that same day, so a
+  // reservation that straddles midnight cannot claim the wrong day's alert.
+  | { ok: true; release: () => Promise<void>; monthlyUsed?: number; platformUsed?: number; platformCap: number; at?: Date }
+  | { ok: false; reason: LimitDenial; at?: Date };
 
 /**
  * Takes this lead's slot against the per-lead abuse limits, or says which one refused. Taken once, at the lead's
@@ -160,7 +162,7 @@ export async function reserveCallSlot(input: {
     for (const [reason, take] of counters) {
       if (!await take()) {
         await releaseAll();
-        return { ok: false, reason };
+        return reason === 'platform_daily_cap' ? { ok: false, reason, at: now } : { ok: false, reason };
       }
     }
   } catch (err) {
@@ -170,7 +172,7 @@ export async function reserveCallSlot(input: {
   const [monthlyUsed, platformUsed] = await Promise.all([
     readUsed(monthlyCapKey(orgId, limitTimeZone(config), now)), readUsed(platformDailyCapKey(now)),
   ]);
-  return { ok: true, release: releaseAll, monthlyUsed, platformUsed, platformCap };
+  return { ok: true, release: releaseAll, monthlyUsed, platformUsed, platformCap, at: now };
 }
 
 // For the 80% notices only: a failed read must never fail or refuse the call.

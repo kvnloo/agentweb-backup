@@ -94,7 +94,7 @@ describe('reserveCallSlot with the platform ceiling', () => {
     process.env[ENV] = '1';
     expect((await reserve(lead(1))).ok).toBe(true);
     const before = orgCounters();
-    expect(await reserve({ ...lead(2), orgId: 'other' })).toEqual({ ok: false, reason: 'platform_daily_cap' });
+    expect(await reserve({ ...lead(2), orgId: 'other' })).toEqual({ ok: false, reason: 'platform_daily_cap', at: NOW });
     expect(orgCounters()).toEqual(before);
     expect(limits.counters.get(hourlyCapKey('other', NOW))).toBe(0);
     expect(limits.counters.get(dailyCapKey('other', 'America/Chicago', NOW))).toBe(0);
@@ -128,11 +128,22 @@ describe('reserveCallSlot with the platform ceiling', () => {
     const retry = await reserve({ ...lead(1), retry: true });
     expect(retry).toMatchObject({ ok: true, platformUsed: 2 });
     // The ceiling is now spent: a second retry of the same lead, and a new lead, are both refused.
-    expect(await reserve({ ...lead(1), retry: true })).toEqual({ ok: false, reason: 'platform_daily_cap' });
-    expect(await reserve(lead(3))).toEqual({ ok: false, reason: 'platform_daily_cap' });
+    expect(await reserve({ ...lead(1), retry: true })).toEqual({ ok: false, reason: 'platform_daily_cap', at: NOW });
+    expect(await reserve(lead(3))).toEqual({ ok: false, reason: 'platform_daily_cap', at: NOW });
     expect(limits.counters.get(platformDailyCapKey(NOW))).toBe(2);
     // The refused retry kept the phone marker the first call took.
     expect(limits.claims.has(phoneMarkerKey('o', lead(1).phoneE164))).toBe(true);
+  });
+
+  it('reports the instant whose UTC day it counted, on success and on a platform refusal, so the alert keys the same day', async () => {
+    process.env[ENV] = '1';
+    const late = new Date('2026-10-19T23:59:59Z');
+    const first = await reserve({ ...lead(1), now: late });
+    const refused = await reserve({ ...lead(2), now: late });
+    expect(first).toMatchObject({ ok: true });
+    expect(first.ok && first.at).toEqual(late);
+    expect(refused).toMatchObject({ ok: false, reason: 'platform_daily_cap' });
+    expect(!refused.ok && refused.at).toEqual(late);
   });
 
   it('release gives the platform slot back', async () => {
@@ -187,7 +198,20 @@ describe('notifyPlatformCap', () => {
       notifyPlatformCap({ cap: 10, now: NOW, event: { kind: 'refused' } }),
     ]);
     expect(markers(errorSpy).filter(m => m.startsWith('[hotLeadCall] PLATFORM daily cap 100%'))).toHaveLength(1);
-    expect(send).toHaveBeenCalledTimes(1);
+    // The count that lands on the cap also owes the 80% level when none was sent (both reached levels are processed): one send per level.
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('a count that reaches the cap before any 80% alert still sends the 80% alert, then the 100% one (two concurrent reads of the cap)', async () => {
+    process.env.HOT_LEAD_CALL_ALERT_EMAIL = 'ops@example.com';
+    await Promise.all([
+      notifyPlatformCap({ cap: 5, now: NOW, event: { kind: 'counted', used: 5 } }),
+      notifyPlatformCap({ cap: 5, now: NOW, event: { kind: 'counted', used: 5 } }),
+    ]);
+    expect(markers(errorSpy).sort()).toEqual([`${platformMarker(100)} ${D} used=5 cap=5`, `${platformMarker(80)} ${D} used=5 cap=5`].sort());
+    expect(limits.claims.has(platformNoticeKey(80, D))).toBe(true);
+    expect(limits.claims.has(platformNoticeKey(100, D))).toBe(true);
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it('alerts again the next UTC day', async () => {

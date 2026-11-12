@@ -8,3 +8,4 @@ Alert at 80% and 100% once per level per UTC day: ERROR log `[hotLeadCall] PLATF
 Not verified against real DynamoDB beyond the existing `incrementBelow` (tests use the in-memory limit store). Runbook: `backend/docs/integrations/hot-lead-call.md`, "Platform-wide daily ceiling".
 
 The ceiling cannot be disabled by an operator, only raised (max 100000). A failed alert email keeps the claim at both levels (marker logs once per level per day). The press-2 retry path of the ceiling (transient, rescheduled, expiry at firstDueAt + 6h) is covered by a new e2e in `hotLeadCall.e2e.retry.test.ts`; nothing was run against real DynamoDB.
+- Review follow-up: the alert is keyed by the UTC day the reservation counted (carried as `at` on the platform refusal and on success), so a reservation straddling midnight cannot claim the wrong day; a count that lands on the cap also sends the 80% alert when none was sent (both reached levels are processed).

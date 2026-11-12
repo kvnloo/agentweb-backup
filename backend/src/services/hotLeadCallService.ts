@@ -229,10 +229,10 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Ready): Promise<st
     // Fire-and-forget (never awaited, never throws): the owner's one-per-month "paused until the 1st" email.
     if (slot.reason === 'org_monthly_cap') void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'refused' } });
     // Fire-and-forget: the operator alarm (error log + optional email) for the platform-wide daily ceiling.
-    if (slot.reason === 'platform_daily_cap') void notifyPlatformCap({ cap: platformDailyMax(), event: { kind: 'refused' } });
+    if (slot.reason === 'platform_daily_cap') void notifyPlatformCap({ cap: platformDailyMax(), now: slot.at, event: { kind: 'refused' } });
     return slot.reason;
   }
-  void notifyPlatformCap({ cap: slot.platformCap, event: { kind: 'counted', used: slot.platformUsed } });
+  void notifyPlatformCap({ cap: slot.platformCap, now: slot.at, event: { kind: 'counted', used: slot.platformUsed } });
   void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'counted', used: slot.monthlyUsed } });
 
   const store = getLeadCallStore();
