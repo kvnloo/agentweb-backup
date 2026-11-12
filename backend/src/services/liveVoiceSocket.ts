@@ -173,6 +173,8 @@ export function registerLiveStartHandler(socket: Socket): void {
       socket.emit('live:error', {
         sessionId,
         error: err?.message ?? 'Failed to start live session',
+        // ENG-2957: 'usage_paused' when the allowance refused the call.
+        ...(err?.code === 'usage_paused' ? { code: 'usage_paused' } : {}),
       });
     } finally {
       if (pendingStarts.get(sessionId) === controller) pendingStarts.delete(sessionId);
