@@ -17,6 +17,7 @@ export type McpToolSideEffect = 'read' | 'write';
 
 export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> = Object.freeze({
   assess_client_health: 'write',
+  cancel_smartlead_push: 'write',
   check_account_tracking_health: 'write',
   configure_landing_page_subdomain: 'write',
   create_knowledge_base_file: 'write',
@@ -68,6 +69,8 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   get_scheduled_chat_storage_diagnostics: 'write',
   get_scheduled_chat_test_history: 'write',
   get_session_transcript: 'write',
+  get_smartlead_campaign_stats: 'read',
+  get_smartlead_push_status: 'read',
   get_user_by_id: 'write',
   get_users_by_lifecycle_stage: 'write',
   inspect_orphaned_org_join_requests: 'write',
@@ -87,6 +90,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   list_sender_settings: 'read',
   get_conversion_summary: 'read',
   list_skills: 'write',
+  list_smartlead_campaigns: 'read',
   list_task_executions: 'write',
   list_tasks: 'write',
   manage_brand: 'write',
@@ -104,6 +108,8 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   manage_task: 'write',
   manage_user_notes: 'write',
   monitor_lead_volume: 'write',
+  pause_smartlead_push: 'write',
+  preview_smartlead_push: 'read',
   publish_landing_page_changes: 'write',
   read_email: 'read',
   read_knowledge_base_files: 'write',
