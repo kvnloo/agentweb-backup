@@ -3,7 +3,7 @@ import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { crmDb } from './db';
 import { registerProcessor } from './asyncJobQueue';
 import type { HotLeadCallConfig, HotLeadCallMember } from './hotLeadCallConfig';
-import { callableLeadPhone } from './hotLeadCallConfig';
+import { callableLeadPhone, platformDailyMax } from './hotLeadCallConfig';
 import type { LeadOrigin } from './leadNotificationConfig';
 import { isInsideLeadCallWindow } from './voice/leadLocalHours';
 import { getVoiceProvider } from './voice/voiceProvider';
@@ -15,6 +15,7 @@ import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotL
 import { getLeadCallStore } from './voice/leadCallStore';
 import type { HotLeadCallRecord } from './voice/leadCallStore.types';
 import { leadPhoneMacOf } from './voice/leadPhoneMac';
+import { notifyPlatformCap } from './voice/hotLeadCallPlatformAlert';
 import { isWithinCallWindow, reserveCallSlot, type Reservation } from './voice/hotLeadCallLimits';
 import { notifyMonthlyCap } from './voice/hotLeadCallCapNotices';
 import { selectHotLeadCallCandidates } from './hotLeadCallRoster';
@@ -227,8 +228,11 @@ async function reserveAndPlace(job: HotLeadCallJob, reviewed: Ready): Promise<st
     if (slot.reason !== 'in_progress') await recordSkip(reviewed.lead, slot.reason);
     // Fire-and-forget (never awaited, never throws): the owner's one-per-month "paused until the 1st" email.
     if (slot.reason === 'org_monthly_cap') void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'refused' } });
+    // Fire-and-forget: the operator alarm (error log + optional email) for the platform-wide daily ceiling.
+    if (slot.reason === 'platform_daily_cap') void notifyPlatformCap({ cap: platformDailyMax(), event: { kind: 'refused' } });
     return slot.reason;
   }
+  void notifyPlatformCap({ cap: slot.platformCap, event: { kind: 'counted', used: slot.platformUsed } });
   void notifyMonthlyCap({ orgId: job.orgId, ownerUserId: reviewed.ctx.orgOwnerUserId, config, event: { kind: 'counted', used: slot.monthlyUsed } });
 
   const store = getLeadCallStore();
@@ -311,7 +315,7 @@ type RetryOutcome =
 
 /**
  * Refusals that spend the retry for good: the lead cannot or must not be called, however long we wait. Everything else
- * (no one on duty, member cooldown, the hourly/daily/monthly caps, a closed window, an unreachable limit store or Twilio, any thrown
+ * (no one on duty, member cooldown, the hourly/daily/monthly caps and the platform daily ceiling, a closed window, an unreachable limit store or Twilio, any thrown
  * error, any reason not listed here) passes with time, so the claim is given back and the retry tried again later.
  */
 const PERMANENT_REFUSALS = new Set([
