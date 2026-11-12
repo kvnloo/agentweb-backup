@@ -13,23 +13,31 @@
  * list (`oncall_emails`), by email only: no Linear issue is filed (owner's choice, 2026-11-12).
  *
  * Read-only: no database writes, no change to any schedule. Registered in server.ts (daily, behind
- * isCronEnabled()). At most one email per evaluated day per process (a redeploy may repeat that day's email).
+ * isCronEnabled()) as a 15-minute tick that only acts during one UTC hour (scheduleCostJumpTick), so a deploy
+ * outside that hour never repeats a day's email.
  */
 
 import { usageRecordDb, type UsageRecordRow } from '../services/usageRecordDb';
 import { emailService } from '../services/emailService';
 
-/** Evaluated days already emailed by this process. */
-const emailedDays = new Set<string>();
+/** Evaluated days this process has finished (emailed, or nothing to report). */
+const finishedDays = new Set<string>();
 /** Test hook. */
 export function resetScheduleCostJumpDedupe(): void {
-  emailedDays.clear();
+  finishedDays.clear();
 }
 
 const TAG = '[scheduleCostJumpCron]';
 const FEATURE_PREFIX = 'agent_task:scheduled:';
 
-export const SCHEDULE_COST_JUMP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/**
+ * The check ticks every 15 minutes (and once at boot) but only acts during this UTC hour (07:00 UTC =
+ * 12:30 IST). Every deploy starts a new process; without a fixed hour each boot would email the same flagged
+ * day again. With it, a day is emailed once per process within that hour, so only a restart inside that hour,
+ * after the email went out, can repeat it. No shared state is needed (prod runs one instance).
+ */
+export const SCHEDULE_COST_JUMP_TICK_MS = 15 * 60 * 1000;
+export const SCHEDULE_COST_JUMP_SEND_HOUR_UTC = 7;
 /** Days before the evaluated day that form the baseline. */
 export const BASELINE_DAYS = 7;
 /** Billed days needed in the baseline before a schedule can be judged (new schedules are skipped). */
@@ -130,6 +138,22 @@ export interface ScheduleCostJumpSummary {
   alertSent: boolean;
 }
 
+/**
+ * The 15-minute tick registered in server.ts. Outside SCHEDULE_COST_JUMP_SEND_HOUR_UTC it does nothing (no
+ * ledger read). Inside it, it runs the check unless this process already finished the day; a day is finished
+ * when it had no jump or its email went out, so a failed send is tried again on the next tick of the hour.
+ */
+export async function scheduleCostJumpTick(
+  now: number = Date.now(),
+  readRows?: (start: string, end: string) => Promise<UsageRecordRow[]>,
+): Promise<ScheduleCostJumpSummary | null> {
+  if (new Date(now).getUTCHours() !== SCHEDULE_COST_JUMP_SEND_HOUR_UTC) return null;
+  if (finishedDays.has(utcDay(now, -1))) return null;
+  const summary = await runScheduleCostJumpCheck(now, readRows);
+  if (summary.jumps === 0 && summary.rowsRead > 0) finishedDays.add(summary.day);
+  return summary;
+}
+
 /** `now` and the ledger reader are injectable for tests; production uses Date.now() and the real ledger. */
 export async function runScheduleCostJumpCheck(
   now: number = Date.now(),
@@ -162,7 +186,7 @@ export async function runScheduleCostJumpCheck(
       `billing user ${j.billingUserId ?? 'unknown'}, last session ${j.lastSessionId ?? 'unknown'}`)
     .join('\n');
 
-  if (emailedDays.has(day)) {
+  if (finishedDays.has(day)) {
     console.log(`${TAG} ${day}: ${jumps.length} schedule cost jump(s), already emailed by this process`);
     return summary;
   }
@@ -173,7 +197,7 @@ export async function runScheduleCostJumpCheck(
       `${BASELINE_DAYS} days) and at least $${MIN_ALERT_USD} on ${day} (ENG-2743). Scheduled runs have no ` +
       `per-run cost cap yet (ENG-2812), so check whether each is real work or a loop / model change:\n\n${lines}`,
     );
-    if (summary.alertSent) emailedDays.add(day);
+    if (summary.alertSent) finishedDays.add(day);
   } catch (error) {
     console.error(`${TAG} Failed to send the alert:`, (error as Error)?.message);
   }

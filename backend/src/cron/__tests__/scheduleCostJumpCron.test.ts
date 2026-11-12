@@ -12,6 +12,8 @@ import {
   median,
   resetScheduleCostJumpDedupe,
   runScheduleCostJumpCheck,
+  scheduleCostJumpTick,
+  SCHEDULE_COST_JUMP_SEND_HOUR_UTC,
   totalsBySchedule,
   utcDay,
 } from '../scheduleCostJumpCron';
@@ -190,5 +192,54 @@ describe('runScheduleCostJumpCheck', () => {
     usageRecordDb.scanByDateRange.mockResolvedValueOnce([]);
     await runScheduleCostJumpCheck(NOW);
     expect(usageRecordDb.scanByDateRange).toHaveBeenCalledWith('2026-11-04', DAY);
+  });
+});
+
+describe('scheduleCostJumpTick (one UTC hour a day, so a deploy never repeats a day)', () => {
+  const IN_HOUR = Date.parse('2026-11-12T07:05:00.000Z');
+  const jumpRows = async () => [...history('a', 2), row('a', DAY, 9)];
+
+  it('acts only during the send hour (07 UTC) and reads nothing outside it', async () => {
+    expect(SCHEDULE_COST_JUMP_SEND_HOUR_UTC).toBe(7);
+    const read = jest.fn(jumpRows);
+    for (const t of ['2026-11-12T06:59:59.000Z', '2026-11-12T08:00:00.000Z', '2026-11-12T19:00:00.000Z']) {
+      expect(await scheduleCostJumpTick(Date.parse(t), read)).toBeNull();
+    }
+    expect(read).not.toHaveBeenCalled();
+    expect((await scheduleCostJumpTick(Date.parse('2026-11-12T07:00:00.000Z'), read))?.alertSent).toBe(true);
+    expect((await scheduleCostJumpTick(Date.parse('2026-11-12T07:59:59.000Z'), read))).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends a flagged day once, and later ticks of the hour read nothing', async () => {
+    const read = jest.fn(jumpRows);
+    expect((await scheduleCostJumpTick(IN_HOUR, read))?.alertSent).toBe(true);
+    expect(await scheduleCostJumpTick(IN_HOUR + 15 * 60_000, read)).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes a day with no jump after one read', async () => {
+    const read = jest.fn(async () => [...history('a', 5), row('a', DAY, 5)]);
+    expect((await scheduleCostJumpTick(IN_HOUR, read))?.jumps).toBe(0);
+    expect(await scheduleCostJumpTick(IN_HOUR + 15 * 60_000, read)).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(alert).not.toHaveBeenCalled();
+  });
+
+  it('tries again on the next tick of the hour when the send or the read failed', async () => {
+    alert.mockResolvedValueOnce(false);
+    const read = jest.fn(jumpRows);
+    expect((await scheduleCostJumpTick(IN_HOUR, read))?.alertSent).toBe(false);
+    expect((await scheduleCostJumpTick(IN_HOUR + 15 * 60_000, read))?.alertSent).toBe(true);
+    expect(alert).toHaveBeenCalledTimes(2);
+
+    resetScheduleCostJumpDedupe();
+    alert.mockClear();
+    const failing = jest.fn().mockRejectedValueOnce(new Error('throttled')).mockImplementation(jumpRows);
+    expect((await scheduleCostJumpTick(IN_HOUR, failing))?.rowsRead).toBe(0);
+    expect((await scheduleCostJumpTick(IN_HOUR + 15 * 60_000, failing))?.alertSent).toBe(true);
+    expect(alert).toHaveBeenCalledTimes(1);
   });
 });
