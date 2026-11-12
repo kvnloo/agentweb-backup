@@ -6,7 +6,7 @@
  * (ENG-2913) post-launch edits: CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/
  * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id) + name. Every
  * UPDATE preview shows a before → after field diff and the read-back verifies every field.
- * Still excluded: DELETE, COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*.
+ * Still excluded: DELETE, COPY_AD, RETAG_UTM, launch_*. Custom audiences are metaToolkitAudiences.ts (ENG-2914).
  * Creative assets (AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE) are metaToolkitCreatives.ts.
  *
  * Flow (preview → confirm, bound):
