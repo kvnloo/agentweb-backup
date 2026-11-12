@@ -57,6 +57,38 @@ export function consumePreviewToken(consumed: Map<string, number>, token: string
 }
 
 /**
+ * ENG-2945: the single swap point for single-use preview-token claims. The durable,
+ * cross-instance store (ENG-2862) is Requires: Me; until then every Zoma write toolkit
+ * shares one in-process store so a token confirmed through one toolkit cannot be replayed
+ * through another. `consume` resolves true exactly once per unexpired token.
+ */
+export interface ConsumedTokenStore {
+  consume(token: string, expiresAt: number, now?: number): Promise<boolean>;
+}
+
+export class InMemoryConsumedTokenStore implements ConsumedTokenStore {
+  private readonly consumed = new Map<string, number>();
+
+  async consume(token: string, expiresAt: number, now: number = Date.now()): Promise<boolean> {
+    for (const [t, exp] of this.consumed) if (exp <= now) this.consumed.delete(t);
+    if (expiresAt <= now || this.consumed.has(token)) return false;
+    this.consumed.set(token, expiresAt);
+    return true;
+  }
+}
+
+/** Process-wide default shared by every Meta + Google toolkit write path. */
+export const defaultConsumedTokenStore: ConsumedTokenStore = new InMemoryConsumedTokenStore();
+
+/** Toolkit deps accept the store, or a bare Map kept for existing test injection. */
+export type ConsumedTokens = ConsumedTokenStore | Map<string, number>;
+
+export async function consumeToken(store: ConsumedTokens, token: string, now: number): Promise<boolean> {
+  if (store instanceof Map) return consumePreviewToken(store, token, now);
+  return store.consume(token, Number(token.split('.')[1]), now);
+}
+
+/**
  * ENG-2931: a provider wrapper that caught a transport failure (no response, timeout,
  * connection reset, 5xx/408) returns a plain failure, but the write may still have been
  * applied. Those are outcome-unknown, never a definite "did not apply".

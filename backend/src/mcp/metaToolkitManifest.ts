@@ -48,7 +48,7 @@ const META_MARKETING_API_DESCRIPTION =
   'or MULTI-VARIANT (Advantage+): headlines[] / bodies[] / descriptions[] (up to 5 each) + image_hashes[] / video_ids[] (up to 10 each) + link_url → one creative Meta optimizes; ' +
   'AD_CREATIVE BULK_CREATE (params.items: up to 10 creatives, each with its media and optional overrides; other params are shared; items may use video_url) → per-item results, partial success reported; ' +
   'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
-  'Use PAGE LIST for page_id. Custom audiences are not available.';
+  'Use PAGE LIST for page_id. For custom audiences, lookalikes, customer lists and excluding existing customers use zoma_custom_audiences.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
