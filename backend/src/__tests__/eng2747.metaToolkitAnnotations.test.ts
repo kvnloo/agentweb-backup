@@ -145,6 +145,18 @@ describe('ENG-2747 Zoma toolkit tool annotations', () => {
       expect(tools.every((t) => t.annotations && typeof t.annotations.readOnlyHint === 'boolean')).toBe(true);
       expect(tools.find((t) => t.name === 'call_meta_marketing_api')?.annotations).toEqual(CONSERVATIVE);
       expect(tools.find((t) => t.name === 'list_meta_ads_campaigns')?.annotations.readOnlyHint).toBe(true);
+      expect(tools.find((t) => t.name === 'zoma_status')?.annotations).toEqual({
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
+      expect(tools.find((t) => t.name === 'zoma_usage')?.annotations).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      });
       expect(tools.some((t) => t.name === 'call_google_ads_api')).toBe(google === 'true');
     }
   });
