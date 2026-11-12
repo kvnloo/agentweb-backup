@@ -850,7 +850,7 @@ No new table or index. The feature writes:
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`; ENG-2783: `deferral` `{dueAt, count}`, `retryClaimToken`, `retryClaimedAt`, see [Press 2 and the retry](#press-2-and-the-retry)) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Lead contact status (`contactStatus: do-not-contact`, `contactStatusReason: opted-out`, `contactStatusNote`, `unsubscribedFromGroupEmail`) | existing fields on the lead row (AW-Leads), written by `/screen-result` when the lead presses 3 (a new writer of an existing mechanism) | webhooks (`crmDb.updateLead`) |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
-| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
+| `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, `hlc#cap#m#<orgId>#<YYYY-MM>`, platform-wide `hlc#cap#g#<UTC date>` (ENG-2783, TTL 2 days) with alert claims `hlc#notify#g80#<UTC date>` / `hlc#notify#g100#<UTC date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
 Notes:
 
@@ -986,6 +986,7 @@ back if the record is not created:
    candidate is used instead. Only when every candidate of a lead's first attempt is
    in cooldown is the lead skipped as `member_cooldown` (its slots are given back);
    on a later attempt, when none is left the record closes as `no_member_available`.
+   After the three org caps, LAST, the platform-wide ceiling `platform_daily_cap` (see [Platform-wide daily ceiling](#platform-wide-daily-ceiling)).
    Everything taken is given back when a later limit refuses (a monthly refusal returns the phone marker and the
    hourly and daily slots). Inbound callbacks are not counted against the monthly cap. A refusal records `call.skipped`
    `org_monthly_cap` and the Slack alert still goes out.
@@ -1053,6 +1054,56 @@ Known limits, accepted:
 - Phone-marker poisoning: whoever submits a number first holds its 24h marker,
   so a third party can submit a victim lead's number first and suppress the call
   for the genuine submission (the Slack alert still fires).
+
+## Platform-wide daily ceiling
+
+ENG-2783. The per-org caps bound one org; nothing bounded the platform, so a bug, an abusive org or a spike across many orgs could
+spend Twilio money without limit (each lead call costs real money, at zero margin). The platform ceiling caps the LEADS that get a
+call across ALL orgs per UTC day. It counts the same unit as the org caps (one per lead at its first attempt, a press-2 retry
+counts again) and adds no table or index: it is one more counter in the existing limit store (`AW-MCPSessions`).
+
+| Item | Value |
+|---|---|
+| Counter key | `hlc#cap#g#<UTC date YYYY-MM-DD>`, TTL 2 days (taken with `incrementBelow`, like the org counters) |
+| Refusal | `call.skipped` with reason `platform_daily_cap`; no record, no call, no member or lead rung; the Slack alert still goes out |
+| `HOT_LEAD_CALL_PLATFORM_DAILY_MAX` | positive integer, default **300** leads per UTC day, clamped to 100000. Unset, blank, zero, negative, fractional or non-numeric uses 300 (an invalid value logs one warn per process). Read on every lead, so a changed environment value applies after the instance restarts with it |
+| `HOT_LEAD_CALL_ALERT_EMAIL` | optional operator address for the alert email; unset means log only |
+
+**The default is a starting value.** 300 was chosen by the builder as a conservative number: about $45 a day at roughly $0.15 per lead
+call (member leg plus lead leg, a few minutes, at the $0.014 per minute list rate in [Metering and spend](#metering-and-spend)). It is the
+owner's to change.
+
+**Counter order.** The phone marker, then the org hourly, daily and monthly counters, then the platform counter LAST. A refusal by any
+earlier step never touches the shared platform counter, so the many per-org refusals cannot inflate it for a moment and falsely refuse
+another org's lead near the ceiling. Nothing refuses after it, so it is never rolled back by a later limit; a platform refusal gives
+back the phone marker and the org counters through the same `releaseAll()` (a refused lead holds no slot anywhere). `release()` after a lead that never got a
+record gives the platform slot back too. A press-2 retry goes through the same list, so it cannot bypass the ceiling.
+A `platform_daily_cap` refusal of a retry is transient: the retry is rescheduled like an org cap refusal (and given up as `retry_expired` after six hours).
+
+**Alert.** At 80% (`ceil(0.8 * cap)`; a cap below 5 has no separate 80% level) and at 100% (the lead that reaches the cap, and
+the first refusal) of the day's cap, once per level per UTC day (claims `hlc#notify#g80#<date>` / `hlc#notify#g100#<date>`, TTL 2 days):
+
+- an ERROR log line with a stable marker, the alarm hook: `[hotLeadCall] PLATFORM daily cap 80% <date> used=<n> cap=<n>` and
+  `[hotLeadCall] PLATFORM daily cap 100% <date> used=<n> cap=<n>`;
+- an email to `HOT_LEAD_CALL_ALERT_EMAIL` when set (plain subject and body; counts only, no lead data, phone numbers or org names).
+
+Fire-and-forget (`services/voice/hotLeadCallPlatformAlert.ts`): it never throws and never delays or fails the call. As for the org notice, a
+failed 80% send gives its claim back (retried at the next crossing), a failed 100% send KEEPS it and logs
+`[hotLeadCall] platform cap 100% alert email failed <date>`. To resend by hand, delete the claim row.
+
+**What an operator does when it fires.** The 80% marker is a heads-up. The 100% marker means leads are being skipped as
+`platform_daily_cap` until 00:00 UTC. First check whether it is a spike or abuse (count `call.skipped`/`call.initiated` per org for the day;
+one org or one form dominating is abuse, so disable that org's calling, see [Turn it off](#turn-it-off)). If the traffic is genuine, raise
+`HOT_LEAD_CALL_PLATFORM_DAILY_MAX` in the backend environment (Elastic Beanstalk configuration) and redeploy or restart; the next lead is
+checked against the new value. Skipped leads are not retried or deferred; the Slack alert already told the team, so they call them by hand.
+Customers are not told it is their limit: the only customer-visible trace is the skipped timeline event, and any wording for it says calling is temporarily paused. No customer email is sent for this ceiling.
+
+**Clearing counters.** Like the `hlc#cap#` rows an operator clears in a test window, delete `hlc#cap#g#<UTC date>` (and the two
+`hlc#notify#g..#<date>` claims to re-arm the alerts) in `AW-MCPSessions` to start the day's count again. Rows expire on their own after 2 days.
+
+Known limits: the ceiling is a fixed UTC day (up to 2x across midnight, like the other fixed windows); the counter is one hot
+DynamoDB item (about 300 writes a day is far below any partition limit); the counter expression is the existing `incrementBelow` and was
+only exercised against the in-memory fake here, not against real DynamoDB.
 
 ## Outcomes and timeline events
 
@@ -1329,7 +1380,7 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown` and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown`, `platform_daily_cap` (the platform-wide daily ceiling was reached; see [Platform-wide daily ceiling](#platform-wide-daily-ceiling)) and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
@@ -1347,7 +1398,7 @@ availability:
    several orgs, so each org can connect once.
 2. **A number-rotating bot can starve genuine leads.** A script that submits a
    different number each time uses up an org's daily and hourly caps; real leads
-   after that are skipped (`org_hourly_cap` / `org_daily_cap` / `org_monthly_cap`). The Slack alert
+   after that are skipped (`org_hourly_cap` / `org_daily_cap` / `org_monthly_cap`, or `platform_daily_cap` once the whole platform is at its ceiling). The Slack alert
    still fires for every lead.
 
 Mitigations to decide before general availability (none of them is built):
@@ -1615,7 +1666,7 @@ The transient-refusal release keeps its +15 minute floor (a refused cap or a bus
 | Class | Reasons | What happens |
 | --- | --- | --- |
 | Permanent (spends the retry) | `lead_missing`, `ctx_missing`, `lead_phone_changed`, `do_not_call`, `not_entitled`, `duplicate_phone` (another lead holds the number), `smoke_test`, `draft_lead`, `invalid_phone`, `country_not_allowed`, `unsafe_id`, `not_form_fill`, `has_record`, `retry_expired` | `call.skipped` where one applies; the claim stays; log `[hotLeadCall] retry dropped after claim <reason> <orgId>` |
-| Transient (everything else) | `no_one_available`, `member_cooldown`, `org_hourly_cap`, `org_daily_cap`, `org_monthly_cap`, `outside_calling_hours`, `outside_lead_hours`, `limits_unavailable`, `credentials_unavailable`, `disabled`, `no_caller_number`, a thrown error (`error`), any reason not listed above | the claim is given back with `LeadCallStore.releaseRetryClaim` (conditional on `retryClaimToken` being THIS run's token and the record still `finished`; a stale token cannot release a newer claim): `retryClaimToken` and `retryClaimedAt` are removed and `deferral.dueAt` becomes now + 15 minutes, or the next minute both windows are open if later; log `[hotLeadCall] retry rescheduled after claim <reason> <orgId>`; the run returns `rescheduled`. For a thrown error the claim is given back first and the error then goes on to the sweep (`failed`) |
+| Transient (everything else) | `no_one_available`, `member_cooldown`, `org_hourly_cap`, `org_daily_cap`, `org_monthly_cap`, `platform_daily_cap`, `outside_calling_hours`, `outside_lead_hours`, `limits_unavailable`, `credentials_unavailable`, `disabled`, `no_caller_number`, a thrown error (`error`), any reason not listed above | the claim is given back with `LeadCallStore.releaseRetryClaim` (conditional on `retryClaimToken` being THIS run's token and the record still `finished`; a stale token cannot release a newer claim): `retryClaimToken` and `retryClaimedAt` are removed and `deferral.dueAt` becomes now + 15 minutes, or the next minute both windows are open if later; log `[hotLeadCall] retry rescheduled after claim <reason> <orgId>`; the run returns `rescheduled`. For a thrown error the claim is given back first and the error then goes on to the sweep (`failed`) |
 | Expiry | a transient refusal when the new due time would pass `deferral.firstDueAt` + 6 hours | `call.skipped` `retry_expired`, the retry is spent |
 
 `deferral.firstDueAt` is written at press time and never changes, so no reschedule (a closed window at run time, or a transient refusal) can stretch the six hours; `releaseRetryClaim` writes it only as a fallback for legacy records without it. Once `restartForRetry` has succeeded the retry is spent: a real call began, whatever happens to it later.
