@@ -31,6 +31,7 @@ import { meterUserUsage } from './usageRecorderService';
 import { computeLiveModalityCostUsd, LLM_PRICE_BOOK_PROVENANCE } from '../utils/llmPricing';
 import { checkTokenUsage, TURN_ADMISSION } from './tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
+import { meteringFeature } from './llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -561,8 +562,14 @@ export class LiveSessionUsageBlockedError extends Error {
 
 const LIVE_USAGE_CHECK_FAILED = "Voice couldn't check your usage allowance right now. Please try again in a moment.";
 
-/** Admit one voice turn (or the start of a call) against the account's allowance. Throws LiveSessionUsageBlockedError. */
-async function assertLiveUsageAllowed(userId: string): Promise<void> {
+/** What a share-link visitor sees: the owner's billing details are not theirs (same words as typed share chat). */
+const LIVE_SHARE_USAGE_PAUSED = 'AI usage is paused for this shared session. Please contact the owner of this link.';
+
+/**
+ * Admit one voice turn (or the start of a call) against the account's allowance. Throws LiveSessionUsageBlockedError.
+ * A share-link visitor's call is checked against the link owner's allowance but told only that the session is paused.
+ */
+async function assertLiveUsageAllowed(userId: string, restrictionProfile?: RestrictionProfileId | unknown): Promise<void> {
   let usage: Awaited<ReturnType<typeof checkTokenUsage>>;
   try {
     usage = await checkTokenUsage(userId, TURN_ADMISSION);
@@ -571,7 +578,9 @@ async function assertLiveUsageAllowed(userId: string): Promise<void> {
     throw new LiveSessionUsageBlockedError(LIVE_USAGE_CHECK_FAILED);
   }
   if (!usage.allowed) {
-    throw new LiveSessionUsageBlockedError(buildUsageBlockCopy({ month: usage.month, paygBlock: usage.paygBlock }).message);
+    throw new LiveSessionUsageBlockedError(restrictionProfile === 'share_visitor'
+      ? LIVE_SHARE_USAGE_PAUSED
+      : buildUsageBlockCopy({ month: usage.month, paygBlock: usage.paygBlock }).message);
   }
 }
 
@@ -583,7 +592,7 @@ async function enforceLiveUsageAfterTurn(sessionId: string): Promise<void> {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
   try {
-    await assertLiveUsageAllowed(entry.userId);
+    await assertLiveUsageAllowed(entry.userId, (entry.toolContext as { restrictionProfile?: unknown }).restrictionProfile);
   } catch (err: any) {
     if (!(err instanceof LiveSessionUsageBlockedError) || err.message === LIVE_USAGE_CHECK_FAILED) return;
     const current = activeSessions.get(sessionId);
@@ -708,7 +717,7 @@ async function doStartLiveSession(
   await assertLiveSessionOwnership(sessionId, userId);
   throwIfLiveStartCancelled(signal);
   // ENG-2957: then the allowance, before any Gemini session (and its cost) exists.
-  await assertLiveUsageAllowed(userId);
+  await assertLiveUsageAllowed(userId, restrictionProfile);
   throwIfLiveStartCancelled(signal);
 
   const startedAt = Date.now();
@@ -1053,20 +1062,29 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     try {
       const um: any = message.usageMetadata;
       const model = LIVE_MODEL.replace(/^models\//, '');
+      // Counts only (no content): one line per Gemini usage report, so billing can be checked against turn boundaries.
+      console.log(`[liveVoiceService] usage report for ${sessionId}: turn=${entry.turnCount} prompt=${um.promptTokenCount ?? 0} response=${um.responseTokenCount ?? um.candidatesTokenCount ?? 0} cached=${um.cachedContentTokenCount ?? 0} toolUse=${um.toolUsePromptTokenCount ?? 0} thoughts=${um.thoughtsTokenCount ?? 0} total=${um.totalTokenCount ?? 0} turnComplete=${Boolean(message.serverContent?.turnComplete)}`);
       // ENG-2957: priced per modality (a voice call is mostly audio, billed well above the text rate), and tagged as
       // live voice so usage reports and metrics can tell it apart from typed agent turns.
       const modalityCostUsd = computeLiveModalityCostUsd(model, um);
+      // Token counts as Google defines them: cached tokens are part of the prompt (counted once, as cache reads);
+      // tool-use prompt tokens are input and thinking tokens are output. Cost comes from the per-modality override.
+      const cached = um.cachedContentTokenCount || 0;
       void meterUserUsage({
         userId: entry.userId,
         model,
         provider: 'gemini',
-        feature: 'live_voice',
-        inputTokens: um.promptTokenCount || 0,
-        outputTokens: um.responseTokenCount || um.candidatesTokenCount || 0,
-        cacheReadTokens: um.cachedContentTokenCount || 0,
+        // A voice call always has the user present: interactive.
+        feature: meteringFeature('live_voice', 'regular'),
+        inputTokens: Math.max(0, (um.promptTokenCount || 0) - cached) + (um.toolUsePromptTokenCount || 0),
+        outputTokens: (um.responseTokenCount || um.candidatesTokenCount || 0) + (um.thoughtsTokenCount || 0),
+        cacheReadTokens: cached,
         sessionId,
         ...(modalityCostUsd !== null ? { costUsdOverride: modalityCostUsd, costProvenance: LLM_PRICE_BOOK_PROVENANCE } : {}),
       });
+      // The chat's own cost total includes its voice turns (per-chat cost reports, and the cap of an anonymous
+      // public-plan session, which is the sum of its sessions' totals).
+      if (modalityCostUsd && modalityCostUsd > 0) void chatbotDb.addToolCostToSession(sessionId, modalityCostUsd, 'live_voice');
     } catch {
       /* metering must never break the live stream */
     }
