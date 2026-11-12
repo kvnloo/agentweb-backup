@@ -78,7 +78,26 @@ upsert a ghost row, never read-modify-write).
   (`attribute_not_exists`), independent of the stage, so a first write before the first read
   still records (and emits) `first_read` once.
 
-**No backfill.** Existing users get these fields only from new events after deploy.
+**Backfill (PR2, not yet applied).** `scripts/eng2906-backfill-products.ts` infers the fields
+for users that predate tracking, from `Dev-AW-LoopEvents` `mcp_*` rows and `AW-ZomaDeviceAuth`
+(planning + write safety in `services/journeyProductBackfill.ts`). It is a dry run by default
+(CSV); `--apply` is a data-plane action that needs Harsha's approval. Everything it writes is
+`attributionConfidence: inferred`, every write is conditional, and it never overwrites an
+existing value (so a tracked/verified attribution is never touched). `signupPath` is not
+guessed. Pre-ENG-2906 OAuth authorize/token rows carry no resource (the OAuth server is shared
+by `/mcp` and the Meta Toolkit), so they take the product of the same client's tool use and
+are otherwise ignored. Tool names Emma `/mcp` also registers (`call_meta_marketing_api`,
+`call_google_ads_api`, …) are not Zoma evidence; toolkit-only names, `zoma_` tools, the
+`zoma_token` auth method, Zoma clients and the gateway-only `platform` dimension are.
+
+## Admin roster
+
+`GET /api/admin/users` returns `signupProduct`, `products`, `zomaStage`, `zomaStageAt`,
+`signupClient`, `signupRef`, `attributionConfidence`, and accepts `?product=zoma|emma_mcp|emma_web`
+(400 otherwise): a user matches when it is the signup product or a key of `products`. Users with
+no attribution match no product. The partner-portal Users page shows a purple Zoma pill and a
+subtle Emma MCP pill beside the email (tooltip `Signed up via <product> · <client> · ref <ref>`,
+`(inferred)` when inferred) and a Product filter (All / Zoma / Emma MCP / Web).
 
 ## Journey events (PostHog)
 
