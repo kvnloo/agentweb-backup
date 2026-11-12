@@ -40,6 +40,7 @@ import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload }
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
 import { executeMetaToolkitAudience } from './metaToolkitAudiences';
+import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 
 /**
@@ -76,6 +77,8 @@ export interface MetaToolkitCaller {
   clientId?: string;
   /** ENG-2496 device-flow Zoma token id (never the token). */
   zomaTokenId?: string;
+  /** ENG-2747: OAuth client registered from a Databricks workspace; Zoma is read-only for it. */
+  databricksOrigin?: boolean;
 }
 
 export interface MetaToolkitGatewayDeps {
@@ -114,6 +117,8 @@ export interface MetaToolkitGatewayDeps {
   prepareUpload?: (userId: string, args: any) => Promise<any>;
   /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
   executeAudience?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
+  getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -171,7 +176,17 @@ export async function authenticateMetaToolkitCaller(
   const oauth = await deps.validateOAuthToken(token);
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
   enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
-  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
+  // ENG-2747 (option B): a client registered from a Databricks workspace gets read-only Zoma.
+  // Fail closed: if the client lookup fails, treat the caller as Databricks-origin (writes refused).
+  let databricksOrigin: boolean;
+  try {
+    const lookup = deps.getOAuthClientRedirectUris ?? (async (id: string) => (await mcpOAuthService.getClient(id))?.redirectUris ?? null);
+    databricksOrigin = isDatabricksClient(await lookup(oauth.clientId));
+  } catch (error) {
+    console.error('[meta-toolkit] OAuth client lookup failed; treating caller as read-only:', error instanceof Error ? error.message : error);
+    databricksOrigin = true;
+  }
+  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId, databricksOrigin };
 }
 
 /**
@@ -250,6 +265,10 @@ export async function handleMetaToolkitCall(
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  // ENG-2747 (option B): refused before any upstream call or metering.
+  if (caller.databricksOrigin && !isDatabricksAllowedCall(request.toolName, request.args)) {
+    throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
+  }
   const meter = (platform?: string) => {
     void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
     return deps.recordUsage({
