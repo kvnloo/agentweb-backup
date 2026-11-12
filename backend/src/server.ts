@@ -30,6 +30,7 @@ import {
   getEffectiveLiveUserId,
   registerLiveCloseHandler,
   registerLiveStartHandler,
+  authenticateConversableSocket,
 } from './services/liveVoiceSocket';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -166,22 +167,10 @@ io.use(async (socket, next) => {
 
   // Allow conversable (iShare) sockets — validate token against session in DynamoDB
   if (conversableToken && conversableSessionId) {
-    try {
-      const session = await chatbotDb.getChatSession(conversableSessionId);
-      if (!session) return next(new Error('Session not found'));
-      const interactiveToken = session.interactiveShareMetadata?.token;
-      if (!interactiveToken || interactiveToken !== conversableToken) {
-        return next(new Error('Invalid conversable token'));
-      }
-      if (!session.interactiveShareMetadata?.isActive) {
-        return next(new Error('Interactive share is not active'));
-      }
-      socket.data.conversableSessionId = conversableSessionId;
-      socket.data.conversableUserId = session.userId;
-      return next();
-    } catch (err: any) {
-      return next(new Error('Conversable auth error'));
-    }
+    const result = await authenticateConversableSocket(socket.handshake.auth, (id) => chatbotDb.getChatSession(id));
+    if (!result.ok) return next(new Error(result.error));
+    Object.assign(socket.data, result.data);
+    return next();
   }
 
   return next(new Error('Authentication error'));
