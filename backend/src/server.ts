@@ -1367,6 +1367,25 @@ createTestAccount().then(async () => {
         console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
       }
 
+      // Scheduled-run cost jump flag (ENG-2743) — runs daily. Read-only: compares each
+      // schedule's cost on the last complete UTC day with its own previous 7 days and sends
+      // one oncall digest when any jumped (>= 2x its median and >= $3).
+      try {
+        const { runScheduleCostJumpCheck, SCHEDULE_COST_JUMP_INTERVAL_MS } = await import('./cron/scheduleCostJumpCron');
+        if (isCronEnabled()) {
+          cronJobRegistry.track('scheduleCostJumpCron', runScheduleCostJumpCheck())
+            .catch(e => console.error('[scheduleCostJumpCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('scheduleCostJumpCron', runScheduleCostJumpCheck())
+            .catch(e => console.error('[scheduleCostJumpCron] Error:', e));
+        }, SCHEDULE_COST_JUMP_INTERVAL_MS);
+        console.log('[scheduleCostJumpCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[scheduleCostJumpCron] Failed to initialize:', error);
+      }
+
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
       // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
       // mailbox send (Graph produces no Resend webhooks), so this polls each connected
