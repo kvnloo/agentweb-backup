@@ -9,7 +9,7 @@
  *   - call_google_ads_api reads: LIST of BUDGET, CAMPAIGN, AD_GROUP, KEYWORD, AD,
  *     BIDDING_STRATEGY, CONVERSION_ACTION; LOCATION SEARCH.
  *   - call_google_ads_api guarded writes (googleToolkitWrites.ts): BUDGET CREATE/UPDATE,
- *     CAMPAIGN CREATE (PMax with brand)/UPDATE status, AD_GROUP CREATE/UPDATE status,
+ *     CAMPAIGN CREATE (PMax with brand)/UPDATE status|name, AD_GROUP CREATE/UPDATE status|name+cpc_bid (ENG-2959),
  *     CAMPAIGN_CONVERSION_GOAL UPDATE; ENG-2928: KEYWORD ADD/UPDATE status/REMOVE/ADD_NEGATIVE,
  *     AD CREATE (responsive search)/UPDATE status, ASSET_GROUP CREATE/UPDATE status.
  *   - call_google_ads_api direct (non-spending) write: ASSET UPLOAD — no preview token, but the
@@ -80,8 +80,9 @@ const GOOGLE_ADS_API_DESCRIPTION =
   'Google Ads API for external agents. Reads: LIST of BUDGET, CAMPAIGN, AD_GROUP (campaign_resource_name), KEYWORD/AD (ad_group_resource_name), ' +
   'BIDDING_STRATEGY, CONVERSION_ACTION, CAMPAIGN_CONVERSION_GOAL (campaign_id?); LOCATION SEARCH (query). ' +
   'Guarded writes: BUDGET CREATE (name, amount, explicitly_shared?) / UPDATE (budget_resource_name, amount); ' +
-  'CAMPAIGN CREATE (name, type, budget_resource_name, bidding_strategy | bidding_strategy_resource_name, location_target_ids?) / UPDATE (campaign_resource_name, status); ' +
-  'AD_GROUP CREATE (name, campaign_resource_name, type, cpc_bid?) / UPDATE (ad_group_resource_name, status). ' +
+  'CAMPAIGN CREATE (name, type, budget_resource_name, bidding_strategy | bidding_strategy_resource_name, location_target_ids?) / UPDATE (campaign_resource_name, status | name); ' +
+  'AD_GROUP CREATE (name, campaign_resource_name, type, cpc_bid?) / UPDATE (ad_group_resource_name, status | name? cpc_bid?). ' +
+  'CAMPAIGN/AD_GROUP UPDATE: status is sent alone; a rename or ad-group max CPC change is its own preview showing current vs new (cpc_bid also in micros). ' +
   'CAMPAIGN_CONVERSION_GOAL UPDATE (resource_name from LIST, biddable boolean only): preview shows campaign, category, origin and current/new biddable. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
@@ -112,7 +113,7 @@ function narrowApiDefinition(definition: any): any {
   kept.asset_type = { type: 'string', enum: ['IMAGE', 'LOGO', 'TEXT', 'VIDEO'], description: 'ASSET UPLOAD: IMAGE (marketing image), LOGO (square logo), TEXT, or VIDEO (YouTube).' };
   kept.data = { type: 'string', description: 'ASSET UPLOAD: IMAGE/LOGO → public https image URL or the file_url from zoma_prepare_upload; TEXT → the text (<=90 chars); VIDEO → the YouTube video id.' };
   kept.amount = { type: 'number', description: 'BUDGET CREATE/UPDATE: daily budget in MAJOR units of the account currency (50 = $50.00). Converted to micros; the preview echoes both.' };
-  kept.cpc_bid = { type: 'number', description: 'AD_GROUP CREATE: max CPC bid in MAJOR units of the account currency (converted to micros).' };
+  kept.cpc_bid = { type: 'number', description: 'AD_GROUP CREATE/UPDATE: max CPC bid in MAJOR units of the account currency (converted to micros).' };
   kept.cpc_bid_ceiling = { type: 'number', description: 'CAMPAIGN CREATE (TARGET_SPEND / TARGET_IMPRESSION_SHARE only): max CPC ceiling in MAJOR units of the account currency.' };
   kept.biddable = { type: 'boolean', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE only: whether the goal drives campaign bidding.' };
   kept.resource_name = { type: 'string', description: 'CAMPAIGN_CONVERSION_GOAL UPDATE: customers/<customer_id>/campaignConversionGoals/<campaignId>~<CATEGORY>~<ORIGIN> from LIST.' };
