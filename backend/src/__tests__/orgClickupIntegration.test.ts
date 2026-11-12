@@ -16,6 +16,7 @@ const EDITOR_USER_ID = "user-editor";
 const MEMBER_USER_ID = "user-member";   // regular org member (not KB editor)
 const SOLO_USER_ID = "user-solo";       // no org
 const OTHER_ORG_USER_ID = "user-other-org"; // belongs to a different org
+const ROLE_OWNER_USER_ID = "user-role-owner"; // orgRole "owner" but NOT org.ownerUserId (the XCures shape)
 
 const OWNER_ORG_ROLE: "owner" | "member" = "owner";
 const MEMBER_ORG_ROLE: "owner" | "member" = "member";
@@ -26,6 +27,7 @@ const mockUsers: Record<string, any> = {
   [OWNER_USER_ID]:     { userId: OWNER_USER_ID,     orgId: ORG_ID, orgRole: OWNER_ORG_ROLE },
   [EDITOR_USER_ID]:    { userId: EDITOR_USER_ID,    orgId: ORG_ID, orgRole: MEMBER_ORG_ROLE },
   [MEMBER_USER_ID]:    { userId: MEMBER_USER_ID,    orgId: ORG_ID, orgRole: MEMBER_ORG_ROLE },
+  [ROLE_OWNER_USER_ID]: { userId: ROLE_OWNER_USER_ID, orgId: ORG_ID, orgRole: OWNER_ORG_ROLE },
   [SOLO_USER_ID]:      { userId: SOLO_USER_ID },
   [OTHER_ORG_USER_ID]: { userId: OTHER_ORG_USER_ID, orgId: "other-org", orgRole: MEMBER_ORG_ROLE },
 };
@@ -66,6 +68,12 @@ const mockSetOrgSecret = jest.fn((orgId: string, key: string, value: string) => 
   mockOrg.secrets[key] = value;
   return Promise.resolve();
 });
+const mockSetOrgSecretIfAbsent = jest.fn((_orgId: string, key: string, value: string) => {
+  if (!mockOrg.secrets) mockOrg.secrets = {};
+  if (mockOrg.secrets[key]) return Promise.resolve(false);
+  mockOrg.secrets[key] = value;
+  return Promise.resolve(true);
+});
 const mockRemoveOrgSecret = jest.fn((_orgId: string, key: string) => {
   if (mockOrg.secrets) delete mockOrg.secrets[key];
   return Promise.resolve();
@@ -82,6 +90,7 @@ jest.mock("../services/db", () => ({
   orgDb: {
     getOrgById: mockGetOrgById,
     setOrgSecret: mockSetOrgSecret,
+    setOrgSecretIfAbsent: mockSetOrgSecretIfAbsent,
     removeOrgSecret: mockRemoveOrgSecret,
     getOrgSecret: mockGetOrgSecret,
   },
@@ -170,6 +179,12 @@ describe("ClickUp org-wide integration", () => {
       if (!mockOrg.secrets) mockOrg.secrets = {};
       mockOrg.secrets[key] = value;
       return Promise.resolve();
+    });
+    mockSetOrgSecretIfAbsent.mockImplementation((_orgId: string, key: string, value: string) => {
+      if (!mockOrg.secrets) mockOrg.secrets = {};
+      if (mockOrg.secrets[key]) return Promise.resolve(false);
+      mockOrg.secrets[key] = value;
+      return Promise.resolve(true);
     });
     mockRemoveOrgSecret.mockImplementation((_orgId: string, key: string) => {
       if (mockOrg.secrets) delete mockOrg.secrets[key];
@@ -344,22 +359,68 @@ describe("ClickUp org-wide integration", () => {
     });
   });
 
-  // ── ENG-2935: personal token must not stay invisible to the org ───────────
-  describe("Personal token promotion (ENG-2935)", () => {
+  // ── ENG-2935: a personal token is never shared silently ────────────────────
+  describe("Sharing a personal token with the org (ENG-2935)", () => {
+    const personal = (uid: string, tok = "personal-tok") => ({
+      clickup_access_token: `encrypted:${tok}:${uid}`,
+    });
     afterEach(() => {
-      delete mockUsers[OWNER_USER_ID].secrets;
-      delete mockUsers[MEMBER_USER_ID].secrets;
+      for (const id of [OWNER_USER_ID, ROLE_OWNER_USER_ID, MEMBER_USER_ID, EDITOR_USER_ID]) delete mockUsers[id].secrets;
     });
 
-    it("owner with only a personal token: GET /status promotes it to the org", async () => {
+    it("GET /status is read-only: reports scope=personal + canShare, never writes the org", async () => {
+      currentUserId = ROLE_OWNER_USER_ID;
+      mockUsers[ROLE_OWNER_USER_ID].secrets = personal(ROLE_OWNER_USER_ID);
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: true });
+      expect(mockSetOrgSecret).not.toHaveBeenCalled();
+      expect(mockSetOrgSecretIfAbsent).not.toHaveBeenCalled();
+      expect(mockOrg.secrets.clickup_access_token).toBeUndefined();
+    });
+
+    it("plain member's status says canShare=false", async () => {
+      currentUserId = MEMBER_USER_ID;
+      mockUsers[MEMBER_USER_ID].secrets = personal(MEMBER_USER_ID, "member-tok");
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: false });
+    });
+
+    it("org-level token reports scope=org", async () => {
+      currentUserId = MEMBER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "org" });
+    });
+
+    it("a lookup failure while resolving scope does NOT turn a working connection into 'disconnected'", async () => {
       currentUserId = OWNER_USER_ID;
-      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      // getAccessToken reads user+org first (2 calls); the scope lookup is the 3rd/4th.
+      mockGetUserById.mockResolvedValueOnce(mockUsers[OWNER_USER_ID]);
+      mockGetOrgById.mockResolvedValueOnce(mockOrg);
+      mockGetUserById.mockRejectedValueOnce(new Error("dynamo blip"));
 
       const res = await request(app).get("/api/clickup/status");
 
       expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ connected: true, scope: "org", promoted: true });
-      expect(mockSetOrgSecret).toHaveBeenCalledWith(ORG_ID, "clickup_access_token", `encrypted:personal-tok:${ORG_ID}`);
+      expect(res.body.connected).toBe(true);
+      expect(res.body.scope).toBeUndefined();
+    });
+
+    it("POST /share-with-org: role-only owner (not org.ownerUserId) shares their token", async () => {
+      currentUserId = ROLE_OWNER_USER_ID;
+      mockUsers[ROLE_OWNER_USER_ID].secrets = personal(ROLE_OWNER_USER_ID);
+
+      const res = await request(app).post("/api/clickup/share-with-org").send({});
+
+      expect(res.status).toBe(200);
+      expect(mockSetOrgSecretIfAbsent).toHaveBeenCalledWith(ORG_ID, "clickup_access_token", `encrypted:personal-tok:${ORG_ID}`);
 
       // A teammate with no personal token now resolves the shared token.
       currentUserId = MEMBER_USER_ID;
@@ -367,55 +428,78 @@ describe("ClickUp org-wide integration", () => {
       expect(teammate.body).toMatchObject({ connected: true, scope: "org" });
     });
 
-    it("never overwrites an org token that already exists", async () => {
-      currentUserId = OWNER_USER_ID;
-      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
-      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+    it("POST /share-with-org: KB editor may share", async () => {
+      currentUserId = EDITOR_USER_ID;
+      mockUsers[EDITOR_USER_ID].secrets = personal(EDITOR_USER_ID, "editor-tok");
 
-      const res = await request(app).get("/api/clickup/status");
-
-      expect(res.body).toMatchObject({ connected: true, scope: "org" });
-      expect(res.body.promoted).toBeUndefined();
-      expect(mockSetOrgSecret).not.toHaveBeenCalled();
-    });
-
-    it("does not overwrite a token an admin saved between the status read and the write", async () => {
-      currentUserId = OWNER_USER_ID;
-      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
-      mockGetOrgSecret.mockResolvedValueOnce(`encrypted:raced-tok:${ORG_ID}`);
-
-      const res = await request(app).get("/api/clickup/status");
-
-      expect(res.body).toMatchObject({ connected: true, scope: "org" });
-      expect(mockSetOrgSecret).not.toHaveBeenCalled();
-    });
-
-    it("plain member with a personal token: not promoted, told it is not shared", async () => {
-      currentUserId = MEMBER_USER_ID;
-      mockUsers[MEMBER_USER_ID].secrets = { clickup_access_token: `encrypted:member-tok:${MEMBER_USER_ID}` };
-
-      const res = await request(app).get("/api/clickup/status");
-
-      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: false });
-      expect(mockSetOrgSecret).not.toHaveBeenCalled();
-    });
-
-    it("promotion write failure is reported to the client instead of swallowed", async () => {
-      currentUserId = OWNER_USER_ID;
-      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
-      mockSetOrgSecret.mockRejectedValueOnce(new Error("dynamo down"));
-
-      const res = await request(app).get("/api/clickup/status");
+      const res = await request(app).post("/api/clickup/share-with-org").send({});
 
       expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: true });
-      expect(res.body.shareError).toMatch(/could not be shared/i);
+    });
+
+    it("POST /share-with-org: plain member is refused (403) and nothing is written", async () => {
+      currentUserId = MEMBER_USER_ID;
+      mockUsers[MEMBER_USER_ID].secrets = personal(MEMBER_USER_ID, "member-tok");
+
+      const res = await request(app).post("/api/clickup/share-with-org").send({});
+
+      expect(res.status).toBe(403);
+      expect(mockSetOrgSecretIfAbsent).not.toHaveBeenCalled();
+    });
+
+    it("POST /share-with-org: never overwrites an org token that already exists (409)", async () => {
+      currentUserId = ROLE_OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      mockUsers[ROLE_OWNER_USER_ID].secrets = personal(ROLE_OWNER_USER_ID);
+
+      const res = await request(app).post("/api/clickup/share-with-org").send({});
+
+      expect(res.status).toBe(409);
+      expect(res.body.alreadyShared).toBe(true);
+      expect(mockOrg.secrets.clickup_access_token).toBe(`encrypted:org-tok:${ORG_ID}`);
+    });
+
+    it("POST /share-with-org: no personal token -> 400, solo user -> 400", async () => {
+      currentUserId = ROLE_OWNER_USER_ID;
+      expect((await request(app).post("/api/clickup/share-with-org").send({})).status).toBe(400);
+
+      currentUserId = SOLO_USER_ID;
+      expect((await request(app).post("/api/clickup/share-with-org").send({})).status).toBe(400);
+      expect(mockSetOrgSecretIfAbsent).not.toHaveBeenCalled();
+    });
+
+    it("POST /share-with-org: refuses to share a token ClickUp rejects, or when ClickUp is down", async () => {
+      currentUserId = ROLE_OWNER_USER_ID;
+      mockUsers[ROLE_OWNER_USER_ID].secrets = personal(ROLE_OWNER_USER_ID);
+      const axios = require("axios");
+
+      axios.get.mockRejectedValueOnce({ response: { status: 401 } });
+      const rejected = await request(app).post("/api/clickup/share-with-org").send({});
+      expect(rejected.status).toBe(400);
+      expect(rejected.body.error).toMatch(/rejected your saved token/i);
+
+      axios.get.mockRejectedValueOnce(new Error("ETIMEDOUT"));
+      const down = await request(app).post("/api/clickup/share-with-org").send({});
+      expect(down.status).toBe(502);
+      expect(mockSetOrgSecretIfAbsent).not.toHaveBeenCalled();
+    });
+
+    it("status failure carries a reason: invalid_token vs unavailable", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      const axios = require("axios");
+
+      axios.get.mockRejectedValueOnce({ response: { status: 401 } });
+      expect((await request(app).get("/api/clickup/status")).body).toEqual({ connected: false, workspaces: [], reason: "invalid_token" });
+
+      axios.get.mockRejectedValueOnce({ response: { status: 503 } });
+      expect((await request(app).get("/api/clickup/status")).body).toEqual({ connected: false, workspaces: [], reason: "unavailable" });
     });
 
     it("owner disconnect also clears their personal token so status does not stay connected", async () => {
       currentUserId = OWNER_USER_ID;
       mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
-      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}`, other: "keep" };
+      mockUsers[OWNER_USER_ID].secrets = { ...personal(OWNER_USER_ID), other: "keep" };
 
       const res = await request(app).post("/api/clickup/disconnect").send({});
 
@@ -424,6 +508,21 @@ describe("ClickUp org-wide integration", () => {
       expect(mockUpdateUser).toHaveBeenCalledWith(OWNER_USER_ID, { secrets: { other: "keep" } });
       const status = await request(app).get("/api/clickup/status");
       expect(status.body).toEqual({ connected: false, workspaces: [] });
+    });
+
+    it("disconnect: if clearing the personal token fails the client is told to retry, and retry succeeds", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      mockUsers[OWNER_USER_ID].secrets = personal(OWNER_USER_ID);
+      mockUpdateUser.mockRejectedValueOnce(new Error("dynamo down"));
+
+      const first = await request(app).post("/api/clickup/disconnect").send({});
+      expect(first.status).toBe(500);
+      expect(first.body.error).toMatch(/click Disconnect again/i);
+
+      const retry = await request(app).post("/api/clickup/disconnect").send({});
+      expect(retry.status).toBe(200);
+      expect(mockUsers[OWNER_USER_ID].secrets).toEqual({});
     });
   });
 

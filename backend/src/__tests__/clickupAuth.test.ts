@@ -363,13 +363,13 @@ describe('ClickUp Auth Routes', () => {
         secrets: { clickup_access_token: 'encrypted-token' },
       });
       mockDecryptPassword.mockReturnValue({ password: 'expired-token' });
-      mockAxiosGet.mockRejectedValue(new Error('Request failed with status code 401'));
+      mockAxiosGet.mockRejectedValue(Object.assign(new Error('Request failed with status code 401'), { response: { status: 401 } }));
 
       const response = await request(app)
         .get('/api/oauth/clickup/status')
         .expect(200);
 
-      expect(response.body).toEqual({ connected: false, workspaces: [] });
+      expect(response.body).toEqual({ connected: false, workspaces: [], reason: 'invalid_token' });
     });
   });
 
