@@ -26,6 +26,7 @@ import {
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
+import type { RestrictionProfileId } from './toolRestrictionProfiles';
 import { meterUserUsage } from './usageRecorderService';
 import type { LLMUsageContext } from '../utils/llmService';
 import {
@@ -157,6 +158,12 @@ interface LiveEntry {
   turnCount: number;
   /** Tool profile in effect — the onboarding profile hard-gates forbidden tools. */
   toolProfile: LiveToolProfile;
+  /**
+   * ENG-2816: the context every tool call of THIS session runs with. Frozen, and one per session, never the shared
+   * ATTENDED_TOOL_CONTEXT mutated: a share-link visitor's session carries `restrictionProfile`, which executeTool enforces,
+   * and that must not leak into any other concurrent call.
+   */
+  toolContext: Readonly<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +622,7 @@ export async function startLiveSession(
   userId: string,
   toolProfile: LiveToolProfile = 'default',
   signal?: AbortSignal,
+  restrictionProfile?: RestrictionProfileId,
 ): Promise<void> {
   // Read + write of pendingStarts happen in the same synchronous block, so two
   // overlapping calls can never both observe "no start in flight".
@@ -624,7 +632,7 @@ export async function startLiveSession(
     .catch(() => {})
     .then(() => {
       throwIfLiveStartCancelled(signal);
-      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal);
+      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal, restrictionProfile);
     });
   pendingStarts.set(sessionId, start);
   try {
@@ -641,6 +649,7 @@ async function doStartLiveSession(
   userId: string,
   toolProfile: LiveToolProfile,
   signal?: AbortSignal,
+  restrictionProfile?: RestrictionProfileId,
 ): Promise<void> {
   // Ownership gate FIRST — before any telemetry, before the existing-session
   // close below, and before any history is loaded or registered.
@@ -680,6 +689,7 @@ async function doStartLiveSession(
     startedAt,
     turnCount: 0,
     toolProfile,
+    toolContext: restrictionProfile ? Object.freeze({ ...ATTENDED_TOOL_CONTEXT, restrictionProfile }) : ATTENDED_TOOL_CONTEXT,
   };
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
@@ -1118,7 +1128,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           let execution: Promise<any>;
           if (isOnboardingSafe) {
             execution = agentModeService.executeTool(
-              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, entry.toolContext,
             );
           } else {
             const executionKey = stableToolExecutionKey(toolName, toolArgs);
@@ -1126,7 +1136,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
             if (!trackedExecution) {
               trackedExecution = {
                 promise: Promise.resolve().then(() => agentModeService.executeTool(
-                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, entry.toolContext,
                 )),
                 settled: false,
               };

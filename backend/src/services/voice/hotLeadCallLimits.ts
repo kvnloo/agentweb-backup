@@ -1,29 +1,31 @@
 import { randomUUID } from 'crypto';
 import { localParts } from '../dripSendWindow';
-import { hhmmToMinutes, minutesOfDay, type HotLeadCallConfig } from '../hotLeadCallConfig';
+import { hhmmToMinutes, HOT_LEAD_CALL_LIMITS, minutesOfDay, platformDailyMax, type HotLeadCallConfig } from '../hotLeadCallConfig';
 import { getLimitStore } from './limitStore';
 import { keyedDigest } from './keyedDigest';
 
 // 'in_progress': this same lead already holds the phone marker, so another dispatch of it is placing the call.
-type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap';
+type LimitDenial = 'duplicate_phone' | 'in_progress' | 'org_hourly_cap' | 'org_daily_cap' | 'org_monthly_cap' | 'platform_daily_cap';
 
 const MINUTE_S = 60;
-const HOUR_S = 3600;
-const DAY_S = 24 * HOUR_S;
+export const HOUR_S = 3600;
+export const DAY_S = 24 * HOUR_S;
+// A calendar month is at most 31 days; the counter key is bucketed by month, so the TTL only has to outlive it.
+export const MONTH_TTL_S = 40 * DAY_S;
 const PHONE_WINDOW_S = DAY_S;
 
 // ---- calling hours -----------------------------------------------------------------------------------------
 
 const two = (n: number): string => String(n).padStart(2, '0');
 
-function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes: number } {
+export function localDayAndMinutes(timeZone: string, at: Date): { date: string; minutes: number } {
   const l = localParts(at.getTime(), timeZone);
   return { date: `${l.year}-${two(l.month)}-${two(l.day)}`, minutes: minutesOfDay(l) };
 }
 
 /**
  * True when calls are allowed at `at`: start inclusive, end exclusive, minute granularity (20:59:59 is in a
- * window ending 21:00). start > end wraps past midnight. The zone is the org's; the lead's own is not considered.
+ * window ending 21:00). start > end wraps past midnight. The zone is the org's; the lead's own local hours are checked separately (leadLocalHours.ts).
  * Fails closed when no window is configured (a validated enabled config always has one).
  */
 export function isWithinCallWindow(callingHours: HotLeadCallConfig['callingHours'], at: Date): boolean {
@@ -47,11 +49,52 @@ export const cooldownKey = (orgId: string, memberId: string): string => `hlc#coo
 // Fixed windows (not sliding): up to twice the cap can dial across an hour or day boundary, which is
 // bounded and keeps each check a single write. Hours are UTC clock hours; days are the org's local calendar day.
 export const hourlyCapKey = (orgId: string, at: Date): string => `hlc#cap#h#${orgId}#${at.toISOString().slice(0, 13)}`;
+/** The zone the org's daily windows follow: its calling-hours zone, UTC when none is set. */
+export const limitTimeZone = (config: Pick<HotLeadCallConfig, 'callingHours'>): string => config.callingHours?.timezone ?? 'UTC';
 export const dailyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#d#${orgId}#${localDayAndMinutes(timeZone, at).date}`;
+/** The org-local calendar month (YYYY-MM) that the monthly cap and its customer notices are bucketed by. */
+export const localMonth = (timeZone: string, at: Date): string => localDayAndMinutes(timeZone, at).date.slice(0, 7);
+export const monthlyCapKey = (orgId: string, timeZone: string, at: Date): string => `hlc#cap#m#${orgId}#${localMonth(timeZone, at)}`;
+
+/** The UTC calendar day (YYYY-MM-DD) the platform-wide ceiling is bucketed by. */
+export const utcDay = (at: Date): string => at.toISOString().slice(0, 10);
+/** Platform-wide: all orgs share one counter per UTC day (ENG-2783). TTL 2 days only has to outlive the bucket. */
+export const platformDailyCapKey = (at: Date): string => `hlc#cap#g#${utcDay(at)}`;
 
 // ---- reservation -----------------------------------------------------------------------------------------
 
-export type Reservation = { ok: true; release: () => Promise<void> } | { ok: false; reason: LimitDenial };
+/**
+ * One reservation's limit-store writes, each remembered so `releaseAll()` can give back everything taken so far
+ * (in reverse order). `claim` takes an expiring claim for `token`; `count` adds one below `cap`. Both return false on
+ * a refusal (nothing taken) and throw on a store failure (the caller releases and rethrows).
+ */
+export function slotTaker(nowS: number) {
+  const store = getLimitStore();
+  const undo: Array<() => Promise<void>> = [];
+  return {
+    async claim(key: string, ttlS: number, token: string): Promise<boolean> {
+      if (!await store.claim(key, token, nowS + ttlS, nowS)) return false;
+      undo.push(() => store.release(key, token));
+      return true;
+    },
+    async count(key: string, cap: number, ttlS: number): Promise<boolean> {
+      if (!await store.incrementBelow(key, cap, nowS + ttlS)) return false;
+      undo.push(() => store.decrement(key));
+      return true;
+    },
+    async releaseAll(): Promise<void> {
+      for (const step of undo.splice(0).reverse()) await step();
+    },
+  };
+}
+
+export type Reservation =
+  // monthlyUsed: this org's count for the month right after this lead was counted; absent when the read failed (notices only).
+  // platformUsed: the platform-wide count for the UTC day right after this lead was counted; absent when the read failed (alerts only).
+  // at: the instant whose UTC day the platform counter used; the alert's once-per-day claim is keyed by that same day, so a
+  // reservation that straddles midnight cannot claim the wrong day's alert.
+  | { ok: true; release: () => Promise<void>; monthlyUsed?: number; platformUsed?: number; platformCap: number; at?: Date }
+  | { ok: false; reason: LimitDenial; at?: Date };
 
 /**
  * Takes this lead's slot against the per-lead abuse limits, or says which one refused. Taken once, at the lead's
@@ -66,7 +109,17 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  * submit) finds 'in_progress' instead of a duplicate: nothing is lost, the first dispatch is placing the call.
  * Store failures throw (the job fails and nothing is dialed): fail closed.
  *
- * The hourly and daily caps count LEADS, one per lead at its first attempt: a lead that goes on to ring several
+ * The platform-wide daily ceiling (UTC day, all orgs, `platform_daily_cap`) is taken LAST, after the three org counters, for
+ * two reasons: (1) a refusal by any org counter then never touches the shared hot counter, so the many per-org refusals
+ * cannot inflate it for a moment and falsely refuse another org's lead near the ceiling; (2) nothing can refuse after it, so
+ * it is never rolled back by a later limit (only by `release()`), while a platform refusal rolls back the phone marker and
+ * the org counters through the same `releaseAll()`. It applies to retries exactly like the org counters (a press-2 retry is
+ * a lead call and counts afresh).
+ *
+ * The monthly cap (org-local calendar month, ENG-2783) is taken after the hourly and daily ones and counts the same unit.
+ * Inbound callbacks are not counted.
+ *
+ * The hourly, daily and monthly caps count LEADS, one per lead at its first attempt: a lead that goes on to ring several
  * members (up to maxAttemptsPerLead) plus the lead's own leg still costs one slot.
  *
  * Known limits (accepted):
@@ -78,50 +131,57 @@ export type Reservation = { ok: true; release: () => Promise<void> } | { ok: fal
  */
 export async function reserveCallSlot(input: {
   orgId: string; listId: string; leadId: string; phoneE164: string; config: HotLeadCallConfig; now?: Date;
+  /**
+   * The lead's one retry (press 2, ENG-2783): the 24h phone marker the lead's own first call took may still be held, and a
+   * marker held by THIS lead is accepted as it stands (nothing taken, nothing given back). A marker held by another lead
+   * still refuses, and the hourly, daily and monthly counters are taken afresh like any call.
+   */
+  retry?: boolean;
 }): Promise<Reservation> {
   const { orgId, phoneE164, config } = input;
   const now = input.now ?? new Date();
   const nowS = Math.floor(now.getTime() / 1000);
-  const store = getLimitStore();
-  const undo: Array<() => Promise<void>> = [];
-  const releaseAll = async (): Promise<void> => {
-    for (const step of undo.splice(0).reverse()) await step();
-  };
+  const { claim: takeClaim, count, releaseAll } = slotTaker(nowS);
 
+  const platformCap = platformDailyMax();
   const leadPrefix = `${input.listId}#${input.leadId}#`;
-  const claim = async (key: string, ttlS: number, tokenPrefix = ''): Promise<boolean> => {
-    const token = `${tokenPrefix}${randomUUID()}`;
-    if (!await store.claim(key, token, nowS + ttlS, nowS)) return false;
-    undo.push(() => store.release(key, token));
-    return true;
-  };
-  const count = async (key: string, cap: number, ttlS: number): Promise<boolean> => {
-    if (!await store.incrementBelow(key, cap, nowS + ttlS)) return false;
-    undo.push(() => store.decrement(key));
-    return true;
-  };
-
+  const claim = (key: string, ttlS: number, tokenPrefix: string): Promise<boolean> => takeClaim(key, ttlS, `${tokenPrefix}${randomUUID()}`);
   try {
     const phoneKey = phoneMarkerKey(orgId, phoneE164);
     if (!await claim(phoneKey, PHONE_WINDOW_S, leadPrefix)) {
-      const holder = await store.holder(phoneKey, nowS);
-      return { ok: false, reason: holder?.startsWith(leadPrefix) ? 'in_progress' : 'duplicate_phone' };
+      const holder = await getLimitStore().holder(phoneKey, nowS);
+      const own = !!holder?.startsWith(leadPrefix);
+      if (!(own && input.retry)) return { ok: false, reason: own ? 'in_progress' : 'duplicate_phone' };
     }
     const counters: Array<[LimitDenial, () => Promise<boolean>]> = [
       ['org_hourly_cap', () => count(hourlyCapKey(orgId, now), config.maxCallsPerHour, 2 * HOUR_S)],
-      ['org_daily_cap', () => count(dailyCapKey(orgId, config.callingHours?.timezone ?? 'UTC', now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_daily_cap', () => count(dailyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerDay, 2 * DAY_S)],
+      ['org_monthly_cap', () => count(monthlyCapKey(orgId, limitTimeZone(config), now), config.maxCallsPerMonth ?? HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default, MONTH_TTL_S)],
     ];
+    counters.push(['platform_daily_cap', () => count(platformDailyCapKey(now), platformCap, 2 * DAY_S)]);
     for (const [reason, take] of counters) {
       if (!await take()) {
         await releaseAll();
-        return { ok: false, reason };
+        return reason === 'platform_daily_cap' ? { ok: false, reason, at: now } : { ok: false, reason };
       }
     }
   } catch (err) {
     await releaseAll();
     throw err;
   }
-  return { ok: true, release: releaseAll };
+  const [monthlyUsed, platformUsed] = await Promise.all([
+    readUsed(monthlyCapKey(orgId, limitTimeZone(config), now)), readUsed(platformDailyCapKey(now)),
+  ]);
+  return { ok: true, release: releaseAll, monthlyUsed, platformUsed, platformCap, at: now };
+}
+
+// For the 80% notices only: a failed read must never fail or refuse the call.
+async function readUsed(key: string): Promise<number | undefined> {
+  try {
+    return await getLimitStore().read(key);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

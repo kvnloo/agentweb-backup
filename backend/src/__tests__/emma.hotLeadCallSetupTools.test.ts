@@ -687,7 +687,7 @@ describe('human approval for turning calling on', () => {
     expect(card.question).toContain('Dana Lee (***0100)');
     expect(card.question).toContain('from your number ***0111');
     expect(card.question).toContain('Both calls are billed to the organization owner per minute at the current rate of $0.014 per minute, each rounded up to a whole minute');
-    expect(card.question).toContain('6 leads per hour, 20 per day, at most 3 call attempts per lead, only 08:00-21:00 America/Chicago');
+    expect(card.question).toContain('6 leads per hour, 20 per day, 200 per month, at most 3 call attempts per lead, only 08:00-21:00 America/Chicago');
     expect(card.question).toContain('turn it off at any time');
     expect(card.question).not.toMatch(/4155550100|4155550111/);
     expect(isOn()).toBe(false);
@@ -717,7 +717,7 @@ describe('human approval for turning calling on', () => {
   });
   it('shows the caps that will be in force, including the ones sent in the same call', async () => {
     org.hotLeadCall = withNumber({ verified: true, maxCallsPerDay: 9, maxAttemptsPerLead: 2 });
-    expect((await call({ enabled: true, maxCallsPerHour: 3 })).questionDeckPayload![0].question).toContain('3 leads per hour, 9 per day, at most 2 call attempts per lead');
+    expect((await call({ enabled: true, maxCallsPerHour: 3 })).questionDeckPayload![0].question).toContain('3 leads per hour, 9 per day, 200 per month, at most 2 call attempts per lead');
   });
   it('uses a different digest when a stored cap differs', async () => {
     const digestOf = async () => String((await call()).questionDeckPayload![0].kind).split(':')[2];

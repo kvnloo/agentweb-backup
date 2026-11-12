@@ -101,6 +101,26 @@ describe('classifyToolFailureType', () => {
     it('classifies the Slack bot not being in the channel', () => {
       expect(classifyToolFailureType('Error', 'The Slack bot is not a member of channel C09JU')).toBe('config');
     });
+    // ENG-2819: update_email_draft_for_lead's no-contact-channel skip (ENG-2082) and
+    // do-not-contact refusal are deliberate guards, not handler bugs.
+    it('classifies the email-draft no-contact-channel skip as by_design (ENG-2819)', () => {
+      expect(
+        classifyToolFailureType('Error', 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'),
+      ).toBe('by_design');
+    });
+
+    it('classifies the email-draft do-not-contact refusal as by_design (ENG-2819)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Cannot draft email for this lead: Unsubscribed. Remove the do-not-contact flag first if you want to contact them.'),
+      ).toBe('by_design');
+    });
+
+    it('classifies the read_google_doc non-Google URL refusal as by_design (ENG-2907)', () => {
+      expect(
+        classifyToolFailureType('Error', 'Not a Google Docs/Sheets/Drive URL (luma.com): read_google_doc only reads Google files. Use a web page fetch tool for other URLs.'),
+      ).toBe('by_design');
+    });
+
     it('classifies the landing-page share non-member refusal as by_design (ENG-2585)', () => {
       expect(
         classifyToolFailureType('Error', "API error (400): 'x@y.com' is not a member of the page owner's organization"),

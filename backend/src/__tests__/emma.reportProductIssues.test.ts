@@ -8,9 +8,22 @@
  *  - enrichment failure never blocks the report
  */
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn(async () => ({ pageId: 'pg-1', notionUrl: 'https://notion.so/pg-1' })),
+// ENG-2817: the Notion fallback is gone; fileUserIssue is stubbed so these suites keep asserting
+// the payload the caller hands to the intake service (title/description/tags/context).
+const mockFileToTracker = jest.fn(async (_item: any): Promise<any> => ({ pageId: 'pg-1', notionUrl: 'https://notion.so/pg-1' }));
+jest.mock('../services/intakeService', () => ({
+  ...jest.requireActual('../services/intakeService'),
+  fileUserIssue: jest.fn(async (p: any) => {
+    const o = await mockFileToTracker({
+      title: p.title,
+      description: p.description,
+      additionalTags: p.notionTags || ['Customer Reported'],
+      context: p.notionContext,
+    });
+    return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Featurebase' };
+  }),
 }));
+
 jest.mock('../services/resendService', () => ({
   resendService: { sendEmail: jest.fn(async () => ({ id: 'em-1' })) },
 }));
@@ -31,11 +44,10 @@ jest.mock('../services/agentRunInspectorService', () => {
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
-import { createOncallItem } from '../services/notionService';
 import { fetchAgentRunSummaries } from '../services/agentRunInspectorService';
 
 const tool = () => emmaToolRegistry.getTool('report_product_issues')!;
-const lastOncallCall = () => (createOncallItem as jest.Mock).mock.calls.at(-1)![0];
+const lastOncallCall = () => mockFileToTracker.mock.calls.at(-1)![0];
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -113,7 +125,7 @@ describe('report_product_issues run-dossier enrichment', () => {
       issues: [{ title: 'Bug', description: 'desc', run_id: 'u-1:run:gone' }],
     }, { userId: 'u-1', externalMcp: true });
 
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
+    expect(mockFileToTracker).toHaveBeenCalledTimes(1);
     expect(lastOncallCall().description).toContain('desc');
     expect(JSON.stringify(result)).toContain('pg-1');
   });

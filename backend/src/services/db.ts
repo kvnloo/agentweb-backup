@@ -28,6 +28,7 @@ import { isSmokeTestPhone } from '../utils/smokeTestLead';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
+import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
@@ -3119,7 +3120,12 @@ export const taskDb = {
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
         this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
-        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        // ENG-2837: exclude the lead-submission claim partition server-side — claims are not
+        // configs, and an unbounded set of them must not be loaded into analytics memory.
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`, {
+          FilterExpression: "userId <> :leadSubmissionClaimPartition",
+          ExpressionAttributeValues: { ":leadSubmissionClaimPartition": LEAD_SUBMISSION_CLAIM_PARTITION },
+        }),
         this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
         this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
       ]);
@@ -3196,14 +3202,19 @@ export const taskDb = {
     }
   },
 
-  // Helper function to scan all items with pagination
-  async scanAllItems(tableName: string) {
+  // Helper function to scan all items with pagination. `filter` is applied server-side
+  // (Scan FilterExpression) so excluded items never reach this process.
+  async scanAllItems(
+    tableName: string,
+    filter?: { FilterExpression: string; ExpressionAttributeValues: Record<string, unknown> },
+  ) {
     const items: any[] = [];
     let lastEvaluatedKey: any = undefined;
 
     do {
       const params: any = {
         TableName: tableName,
+        ...filter,
       };
 
       if (lastEvaluatedKey) {
@@ -5474,6 +5485,8 @@ interface LeadRecordUpdateOp {
   remove?: string[];
   /** Fields that must currently hold exactly these values. */
   whenEquals?: Record<string, string | number>;
+  /** Fields that must currently be absent (a write-once marker). */
+  whenAbsent?: string[];
   maxIn?: Record<string, Record<string, number>>;
   appendNew?: Record<string, string[]>;
 }
@@ -5506,6 +5519,14 @@ const addEqualsConditions = (p: ExpressionParts, whenEquals: Record<string, stri
     p.names[`#f${p.n}`] = field;
     p.values[`:v${p.n}`] = expected;
     p.conditions.push(`#system.#k.#f${p.n} = :v${p.n}`);
+    p.n++;
+  }
+};
+
+const addAbsentConditions = (p: ExpressionParts, whenAbsent: string[]): void => {
+  for (const field of new Set(whenAbsent)) {
+    p.names[`#f${p.n}`] = field;
+    p.conditions.push(`attribute_not_exists(#system.#k.#f${p.n})`);
     p.n++;
   }
 };
@@ -5570,6 +5591,7 @@ function leadRecordUpdateExpression(key: string, op: LeadRecordUpdateOp) {
   addSetClauses(p, op.set ?? {});
   addRemoveClauses(p, op.remove ?? []);
   addEqualsConditions(p, op.whenEquals ?? {});
+  addAbsentConditions(p, op.whenAbsent ?? []);
   addMaxInClauses(p, op.maxIn ?? {});
   addAppendClauses(p, op.appendNew ?? {});
   return {
@@ -6692,6 +6714,9 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2837: do not dispatch the new-lead notification at the write. For a caller that must
+     *  make its own idempotency record durable first and then dispatches it itself. */
+    deferCreatedNotification?: boolean;
     /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
      *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
      *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
@@ -6901,9 +6926,11 @@ export const crmDb = {
         await dynamodb.put(params).promise();
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
-      void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
-        .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      if (!leadData.deferCreatedNotification) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
+          .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
+      }
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
@@ -11190,9 +11217,15 @@ export const crmDb = {
   async findLeadsBySystemRecord(
     listId: string,
     key: string,
-    op: { states: string[]; updatedBefore: string; maxRead: number },
+    op: { states: string[]; updatedBefore: string; maxRead: number; has?: string[]; lacks?: string[] },
   ): Promise<{ leadIds: string[]; read: number; truncated: boolean }> {
     if (op.states.length === 0 || op.maxRead <= 0) return { leadIds: [], read: 0, truncated: false };
+    // Optional field filters (the retry sweep looks for records with a deferral and no claim): same read cost, fewer hits.
+    const fieldNames: Record<string, string> = {};
+    const fieldFilters = [
+      ...(op.has ?? []).map((f, i) => { fieldNames[`#h${i}`] = f; return `attribute_exists(#system.#k.#h${i})`; }),
+      ...(op.lacks ?? []).map((f, i) => { fieldNames[`#l${i}`] = f; return `attribute_not_exists(#system.#k.#l${i})`; }),
+    ];
     const leadIds: string[] = [];
     let read = 0;
     let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -11201,9 +11234,9 @@ export const crmDb = {
         const result = await dynamodb.query({
           TableName: `${TABLE_PREFIX}AW-Leads`,
           KeyConditionExpression: 'listId = :listId',
-          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before`,
+          FilterExpression: `#system.#k.#state IN (${op.states.map((_, i) => `:s${i}`).join(', ')}) AND #system.#k.#updatedAt < :before${fieldFilters.map((f) => ` AND ${f}`).join('')}`,
           ProjectionExpression: 'leadId',
-          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt' },
+          ExpressionAttributeNames: { '#system': 'system', '#k': key, '#state': 'state', '#updatedAt': 'updatedAt', ...fieldNames },
           ExpressionAttributeValues: {
             ':listId': listId,
             ':before': op.updatedBefore,

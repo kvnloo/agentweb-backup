@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2496 — Zoma device-flow onboarding: security/auth invariants only.
  *  - expired device codes never progress or yield a token

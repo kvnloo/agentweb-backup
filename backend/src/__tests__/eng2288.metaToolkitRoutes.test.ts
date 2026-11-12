@@ -45,7 +45,15 @@ describe('ENG-2288 Meta Toolkit HTTP routes', () => {
     mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'api_key' });
     const res = await request(app).get('/api/meta-toolkit/tools').set('Authorization', 'Bearer aw_x').expect(200);
     expect(mockAuthenticate).toHaveBeenCalledWith('Bearer aw_x');
-    expect(res.body.tools).toEqual([{ name: 'meta_get_insights' }]);
+    // ENG-2747: an unclassified tool is advertised with the conservative (destructive) annotations.
+    expect(res.body.tools).toEqual([{ name: 'meta_get_insights', annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } }]);
+  });
+
+  it('GET /tools shows a Databricks-origin caller only the tools it may call (ENG-2747)', async () => {
+    mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'oauth', databricksOrigin: true });
+    mockManifest.mockReturnValueOnce([{ name: 'list_meta_ads_campaigns' }, { name: 'zoma_custom_audiences' }] as unknown as [{ name: string }]);
+    const res = await request(app).get('/api/meta-toolkit/tools').set('Authorization', 'Bearer t').expect(200);
+    expect(res.body.tools.map((t: { name: string }) => t.name)).toEqual(['list_meta_ads_campaigns']);
   });
 
   it('POST call maps auth errors to their status (401/403)', async () => {

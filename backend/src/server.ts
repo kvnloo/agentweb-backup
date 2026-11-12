@@ -30,6 +30,7 @@ import {
   getEffectiveLiveUserId,
   registerLiveCloseHandler,
   registerLiveStartHandler,
+  authenticateConversableSocket,
 } from './services/liveVoiceSocket';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -166,22 +167,10 @@ io.use(async (socket, next) => {
 
   // Allow conversable (iShare) sockets — validate token against session in DynamoDB
   if (conversableToken && conversableSessionId) {
-    try {
-      const session = await chatbotDb.getChatSession(conversableSessionId);
-      if (!session) return next(new Error('Session not found'));
-      const interactiveToken = session.interactiveShareMetadata?.token;
-      if (!interactiveToken || interactiveToken !== conversableToken) {
-        return next(new Error('Invalid conversable token'));
-      }
-      if (!session.interactiveShareMetadata?.isActive) {
-        return next(new Error('Interactive share is not active'));
-      }
-      socket.data.conversableSessionId = conversableSessionId;
-      socket.data.conversableUserId = session.userId;
-      return next();
-    } catch (err: any) {
-      return next(new Error('Conversable auth error'));
-    }
+    const result = await authenticateConversableSocket(socket.handshake.auth, (id) => chatbotDb.getChatSession(id));
+    if (!result.ok) return next(new Error(result.error));
+    Object.assign(socket.data, result.data);
+    return next();
   }
 
   return next(new Error('Authentication error'));
@@ -436,6 +425,10 @@ const runDrain = async (reason: string): Promise<void> => {
   // ENG-2113: a Claude-plan tool call that was still running when its turn ended is looked for one last time and saved, so it is not lost with the process.
   await import('./services/funding/claudeCodeBackendInstance')
     .then((m) => m.claudeCodeBackend.flush())
+    .catch(() => undefined);
+  // ENG-2906: flush queued product-journey events (PostHog batches in memory).
+  await import('./services/journeyTracking')
+    .then((m) => m.flushJourney())
     .catch(() => undefined);
   // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
   await import('./services/funding/claudeSubscriptionService')
@@ -1253,6 +1246,16 @@ createTestAccount().then(async () => {
         console.error('[stuckCallSweepCron] Failed to initialize:', error);
       }
 
+      // Hot-lead call due-retries (ENG-2783): every 5 minutes, places the one retry of a lead who pressed 2 ("not available
+      // now") once it is due; the job queue cannot run a job later. Does nothing while the global hot_lead_call_mode kill
+      // switch is off. HOT_LEAD_CALL_RETRY=off|0|false does not arm it.
+      try {
+        const { startHotLeadCallRetryCron } = await import('./cron/hotLeadCallRetryCron');
+        startHotLeadCallRetryCron({ enabled: isCronEnabled, track: (name, run) => cronJobRegistry.track(name, run) });
+      } catch (error) {
+        console.error('[hotLeadCallRetryCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
@@ -1774,7 +1777,7 @@ createTestAccount().then(async () => {
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
-      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear bug stats,
       // DMs Harsha through the existing loop Slack rail, and appends one
       // snapshot for restart-safe trend rendering.
       if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {

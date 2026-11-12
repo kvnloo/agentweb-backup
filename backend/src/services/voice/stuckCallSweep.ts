@@ -1,8 +1,8 @@
 import { crmDb, orgDb } from '../db';
 import { HOT_LEAD_CALL_LIMITS } from '../hotLeadCallConfig';
 import { closeBetweenAttempts, MEMBER_RING_TIMEOUT_SECONDS } from '../hotLeadCallPlacement';
-import { suppressLeadSideEffects } from '../../utils/sessionList';
 import { errorName, finishIfComplete, finishWaitingAttempt, leadLegExpected, meteredLegOf, meterLeg, type CallQuery } from './callFinalisation';
+import { hotLeadCallOrgListIds } from './hotLeadCallOrgLists';
 import { getLeadCallStore } from './leadCallStore';
 import type { HotLeadCallLeg, HotLeadCallRecord, HotLeadCallState } from './leadCallStore.types';
 import { BRIDGED_CALL_TIME_LIMIT_SECONDS, GATHER_TIMEOUT_SECONDS, LEAD_DIAL_TIMEOUT_SECONDS } from './twiml';
@@ -248,13 +248,7 @@ async function findCandidates(nowMs: number, summary: StuckSweepSummary): Promis
   for (const orgId of await orgDb.listHotLeadCallOrgIds()) {
     summary.orgs++;
     try {
-      const listIds = new Set<string>();
-      for (const member of await orgDb.getOrgMembers(orgId)) {
-        for (const list of await crmDb.getLeadListsByUserId(member.userId)) {
-          if (!suppressLeadSideEffects(list)) listIds.add(list.listId);
-        }
-      }
-      for (const listId of listIds) {
+      for (const listId of await hotLeadCallOrgListIds(orgId)) {
         const budget = Math.min(MAX_LEADS_READ_PER_LIST, MAX_LEADS_READ_PER_RUN - summary.leadsRead);
         if (budget <= 0) { summary.truncated = true; break; }
         summary.lists++;

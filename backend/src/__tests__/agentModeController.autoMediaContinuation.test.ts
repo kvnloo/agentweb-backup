@@ -877,6 +877,83 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
       expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
       expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+      // ENG-2816: the follow-up of a VISITOR's turn is a visitor turn too, not one with the owner's full tool set.
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(true);
+      expect(secondCallArgs.isInteractiveShare).toBe(true);
+    });
+
+    it('ENG-2816: a visitor\'s follow-up keeps the flag through EVERY round of a persistently slow provider', async () => {
+      const shareId = 'ishare-media-batch-chain';
+      const conversableToken = 'tok-media-batch-chain';
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const shareSession = {
+        ...mockSession,
+        sessionId: shareId,
+        interactiveShareMetadata: { isActive: true, token: conversableToken, sharedAt: new Date().toISOString(), expiresAt: '2099-01-01T00:00:00Z' },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...shareSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (shareSession as any),
+      );
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValue(workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ));
+
+      await agentModeController.generateSharedResponse({
+        params: { shareId },
+        query: { conversable: conversableToken },
+        body: { userMessage: 'Generate four 4:5 ad creatives', attachments: [] },
+        ip: '127.0.0.1',
+        headers: {},
+      } as unknown as Request, makeRes());
+      await flush(200);
+
+      // The visitor's own turn plus every continuation round (the cap is 4): none of them may run unflagged.
+      const calls = mockWorkerService.runInWorker.mock.calls as any[];
+      expect(calls.length).toBeGreaterThanOrEqual(3);
+      for (const c of calls) expect(c[0].isInteractiveShare).toBe(true);
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-2816: the follow-up of the share link OWNER\'s own turn stays an owner turn', async () => {
+      const shareId = 'ishare-media-batch-owner';
+      const conversableToken = 'tok-media-batch-owner';
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const shareSession = {
+        ...mockSession,
+        sessionId: shareId,
+        interactiveShareMetadata: { isActive: true, token: conversableToken, sharedAt: new Date().toISOString(), expiresAt: '2099-01-01T00:00:00Z' },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...shareSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (shareSession as any),
+      );
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+      const ownerCheck = jest.spyOn(require('../services/shareViewerIdentity'), 'isSessionOwnerRequest').mockResolvedValue(true);
+      try {
+        const shareReq = {
+          params: { shareId },
+          query: { conversable: conversableToken },
+          body: { userMessage: 'Generate four 4:5 ad creatives', attachments: [] },
+          ip: '127.0.0.1',
+          headers: { authorization: 'Bearer owner.jwt' },
+        } as unknown as Request;
+        await agentModeController.generateSharedResponse(shareReq, makeRes());
+        await flush();
+        expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+        expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(false);
+        expect((mockWorkerService.runInWorker.mock.calls[1][0] as any).isInteractiveShare).toBe(false);
+      } finally {
+        ownerCheck.mockRestore();
+      }
     });
   });
 
@@ -1082,6 +1159,42 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       const callArgs = mockWorkerService.runInWorker.mock.calls[0][0] as any;
       expect(callArgs.messageContent).toMatch(/automatic continuation/i);
+    });
+
+    it('ENG-2816: the owner reopening a chat whose deferred request was a VISITOR\'s resumes it as a visitor turn', async () => {
+      const iso = recentIso();
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [
+          { role: 'user', content: 'make four creatives', metadata: { timestamp: iso, ishareSender: { isAnonymous: true } } },
+          { role: 'assistant', content: '3 done', timestamp: iso, metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: iso } },
+        ],
+      } as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      await agentModeController.getSession(makeGetSessionReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(true);
+    });
+
+    it('ENG-2816: the owner reopening a chat whose deferred request was their own resumes as an owner turn, as before', async () => {
+      const iso = recentIso();
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [
+          { role: 'user', content: 'make four creatives', metadata: { timestamp: iso } },
+          { role: 'assistant', content: '3 done', timestamp: iso, metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: iso } },
+        ],
+      } as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      await agentModeController.getSession(makeGetSessionReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(false);
     });
 
     it('does NOT re-fire while a generation is already active for the session (avoids racing an in-flight resume)', async () => {

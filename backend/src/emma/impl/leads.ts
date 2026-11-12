@@ -1272,12 +1272,19 @@ export async function getLeadsNeedingFollowup(listId: string, userId: string, op
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      // ENG-2937: most lists never get an explicit linkedInAccountId, which made
+      // this tool fail 100% of the time. Fall back to the caller's own connected
+      // LinkedIn account — the same resolution the CRM routes use (crm.ts).
+      let accountId: string | null = (list as any).linkedInAccountId ?? null;
+      if (!accountId) {
+        const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+        accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+      }
       if (!accountId) {
         return {
           success: false,
-          message: 'This list has no LinkedIn account assigned',
-          error: 'Follow-up detection requires a LinkedIn account (list.linkedInAccountId) so connection status can be resolved. Assign one in the list settings.',
+          message: 'No LinkedIn account connected',
+          error: 'Follow-up detection needs a connected LinkedIn account to resolve connection status. Ask the user to connect LinkedIn (or assign an account to this list in its settings), then retry. Do not retry before that.',
         };
       }
 
@@ -2408,7 +2415,13 @@ export async function addLeadEngagement(
 
       const lead = await crmDb.getLeadById(listId, leadId);
       if (!lead) {
-        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+        // ENG-2808: tell the model how to recover instead of retrying the same pair.
+        return {
+          success: false,
+          message: 'Lead not found',
+          error: 'The specified lead does not exist in this list',
+          hint: 'Do not retry with the same lead_id/list_id. Look the lead up with search_leads (by name or email) to get its current lead_id and list_id, then call add_lead_engagement again.',
+        };
       }
 
       await crmDb.addLeadEngagement(listId, leadId, {

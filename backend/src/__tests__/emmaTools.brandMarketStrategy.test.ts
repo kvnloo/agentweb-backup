@@ -121,4 +121,16 @@ describe('brand/market-strategy cluster delegates to emma/impl/brandMarketStrate
     });
     expect(result).toBe(expected);
   });
+
+  // ENG-2875: the founders contract must reach the model. Agent mode copies
+  // definition.inputSchema verbatim into the OpenAI `parameters`, so the
+  // founders description lives at parameters.properties.brandData.properties.founders.
+  it('update_brand_guidelines declaration tells the model the founders list replaces stored founders', () => {
+    const def = emmaToolRegistry.getTool('update_brand_guidelines')!.definition as any;
+    const founders = def.inputSchema.properties.brandData.properties.founders;
+    expect(founders.description).toMatch(/replaces the stored founders/);
+    expect(founders.description).toMatch(/founders left out are removed/);
+    expect(def.description).toMatch(/any stored founder you leave out is removed/);
+    expect(def.inputSchema.properties.clearAllFounders.type).toBe('boolean');
+  });
 });

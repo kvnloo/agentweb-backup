@@ -2,7 +2,7 @@ jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: 
 import { orgDb } from '../services/db';
 import {
   applyHotLeadCallSettings, getHotLeadCallSettings, hotLeadCallRevisionOf, previewHotLeadCallSettings, updateHotLeadCallSettings,
-  BLOCKER_NO_HOURS, BLOCKER_NO_NUMBER, BLOCKER_NO_VERIFIED_PERSON, BLOCKER_NOT_ENTITLED, BLOCKER_UNVERIFIED,
+  BLOCKER_NO_CALLABLE_COUNTRY, BLOCKER_NO_HOURS, BLOCKER_NO_LEAD_OVERLAP, BLOCKER_NO_NUMBER, OWNER_MONTHLY_LIMIT_REFUSAL, WARNING_CANADA_NOT_CALLED, BLOCKER_NO_VERIFIED_PERSON, BLOCKER_NOT_ENTITLED, BLOCKER_UNVERIFIED,
 } from '../services/hotLeadCallSettingsService';
 import {
   ConflictError, ForbiddenError, NotEntitledError, RevisionRequiredError, UnattendedRunError, ValidationError,
@@ -49,7 +49,7 @@ afterEach(() => setHotLeadCallEntitledOverride(null));
 describe('getHotLeadCallSettings', () => {
   it('returns exactly the contract fields with masked phones and no full number anywhere', async () => {
     const dto = await getHotLeadCallSettings(org(), OWNER);
-    expect(Object.keys(dto).sort()).toEqual(['_revision', 'blockers', 'callingHours', 'canEnable', 'enabled', 'entitled', 'limits', 'maxAttemptsPerLead', 'announcedName', 'team', 'twilioNumberMasked'].sort());
+    expect(Object.keys(dto).sort()).toEqual(['_revision', 'blockers', 'callingHours', 'canEnable', 'enabled', 'entitled', 'limits', 'maxAttemptsPerLead', 'maxCallsPerMonth', 'warnings', 'announcedName', 'team', 'twilioNumberMasked'].sort());
     expect(dto).toMatchObject({
       entitled: true, enabled: true, canEnable: true, blockers: [], maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing', twilioNumberMasked: '***0111',
       callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' },
@@ -376,7 +376,8 @@ describe('previewHotLeadCallSettings', () => {
   it('lists candidates in call order and explains the exclusions with the two contract reasons', async () => {
     const dto = await previewHotLeadCallSettings(org(), OWNER, at);
     expect(dto).toEqual({
-      at: at.toISOString(), timezone: 'America/Chicago', outsideCallingHours: false,
+      at: at.toISOString(), timezone: 'America/Chicago', outsideCallingHours: false, outsideLeadHours: true, skipReason: 'outside_lead_hours',
+      warnings: ['Canadian numbers are not called yet; leads with a Canadian number are skipped even though Canada is allowed here'],
       candidates: [{ id: A, name: 'Dana Lee' }],
       excluded: [{ id: B, name: 'Sam Ortiz', reason: 'unverified' }],
     });
@@ -388,9 +389,172 @@ describe('previewHotLeadCallSettings', () => {
   });
   it('answers for an org with no settings', async () => {
     delete table.org.hotLeadCall;
-    expect(await previewHotLeadCallSettings(org(), OWNER, at)).toEqual({ at: at.toISOString(), timezone: null, outsideCallingHours: true, candidates: [], excluded: [] });
+    expect(await previewHotLeadCallSettings(org(), OWNER, at)).toEqual({ at: at.toISOString(), timezone: null, outsideCallingHours: true, outsideLeadHours: true, skipReason: 'outside_calling_hours', warnings: [], candidates: [], excluded: [] });
   });
   it('needs org:configure', async () => {
     await expect(previewHotLeadCallSettings(org(), { userId: 'm', orgRole: 'member' }, at)).rejects.toBeInstanceOf(ForbiddenError);
+  });
+});
+
+
+// ---- ENG-2783: monthly cap on the owner routes ------------------------------------------------------------------
+
+describe('maxCallsPerMonth on the owner routes', () => {
+  it('shows the default of 200 for a config stored without the field', async () => {
+    expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(200);
+  });
+  it.each([1, 150, 200])('accepts %i', async value => {
+    expect((await put({ maxCallsPerMonth: value })).maxCallsPerMonth).toBe(value);
+    expect((table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth).toBe(value);
+  });
+  it.each([201, 1500, 2000])('refuses %i with the support message, and writes nothing', async value => {
+    const errors = await fieldErrorsOf(put({ maxCallsPerMonth: value }));
+    expect(errors.maxCallsPerMonth).toBe(OWNER_MONTHLY_LIMIT_REFUSAL);
+    expect(table.writes).toEqual([]);
+  });
+  it('words the refusal for the owner', () => {
+    expect(OWNER_MONTHLY_LIMIT_REFUSAL).toBe('Higher monthly limits are set by AgentWeb support');
+  });
+  it.each([0, 2001, 1.5, '50', null])('refuses the invalid value %j', async value => {
+    expect(Object.keys(await fieldErrorsOf(put({ maxCallsPerMonth: value })))).toContain('maxCallsPerMonth');
+  });
+
+  describe('a value an operator stored above 200', () => {
+    beforeEach(() => { table.org.hotLeadCall = stored({ maxCallsPerMonth: 1500 }); });
+    it('is displayed', async () => {
+      expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(1500);
+    });
+    it('is preserved when the owner edits other fields', async () => {
+      const dto = await put({ announcedName: 'New Co', maxAttemptsPerLead: 2, callingHours: { start: '09:00', end: '20:00', timezone: 'America/Chicago' } });
+      expect(dto.maxCallsPerMonth).toBe(1500);
+      expect((table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth).toBe(1500);
+    });
+    it('survives a round trip of the displayed value, but cannot be changed to another value above 200', async () => {
+      expect((await put({ maxCallsPerMonth: 1500, announcedName: 'Same Co' })).maxCallsPerMonth).toBe(1500);
+      expect((await fieldErrorsOf(put({ maxCallsPerMonth: 1501 }))).maxCallsPerMonth).toBe(OWNER_MONTHLY_LIMIT_REFUSAL);
+    });
+    it('can be lowered by the owner', async () => {
+      expect((await put({ maxCallsPerMonth: 100 })).maxCallsPerMonth).toBe(100);
+    });
+  });
+
+  it('an unattended run cannot raise it', async () => {
+    table.org.hotLeadCall = stored({ maxCallsPerMonth: 100 });
+    await expect(updateHotLeadCallSettings(org(), { ...OWNER, unattended: true }, { _revision: rev(), maxCallsPerMonth: 150 })).rejects.toBeInstanceOf(UnattendedRunError);
+  });
+});
+
+// ---- ENG-2783: honest read-out ----------------------------------------------------------------------------------
+
+describe('read-out: Canada while Canadian calling is off', () => {
+  it('warns when the stored countries include Canada alongside the US, and still allows enabling', async () => {
+    const dto = await getHotLeadCallSettings(org(), OWNER);
+    expect(dto.warnings).toEqual([WARNING_CANADA_NOT_CALLED]);
+    expect(dto).toMatchObject({ canEnable: true, blockers: [] });
+  });
+  it('has no warning for US only', async () => {
+    table.org.hotLeadCall = stored({ allowedCountries: ['US'] });
+    expect(await getHotLeadCallSettings(org(), OWNER)).toMatchObject({ warnings: [], canEnable: true, blockers: [] });
+  });
+  it('has no warning for an org without settings', async () => {
+    delete table.org.hotLeadCall;
+    expect((await getHotLeadCallSettings(org(), OWNER)).warnings).toEqual([]);
+  });
+  it('blocks, for an org whose only country is Canada, in canEnable and blockers, enabled or not', async () => {
+    for (const enabled of [false, true]) {
+      table.org.hotLeadCall = stored({ enabled, allowedCountries: ['CA'] });
+      const dto = await getHotLeadCallSettings(org(), OWNER);
+      expect(dto.canEnable).toBe(false);
+      expect(dto.blockers).toEqual([BLOCKER_NO_CALLABLE_COUNTRY]);
+      expect(dto.warnings).toEqual([WARNING_CANADA_NOT_CALLED]);
+    }
+  });
+  it('refuses to turn calling on with only Canada, and writes nothing', async () => {
+    table.org.hotLeadCall = stored({ enabled: false, allowedCountries: ['CA'] });
+    expect((await fieldErrorsOf(put({ enabled: true }))).enabled).toContain(BLOCKER_NO_CALLABLE_COUNTRY);
+    expect(table.writes).toEqual([]);
+  });
+  it('refuses to turn calling on in the same save that sets only Canada', async () => {
+    table.org.hotLeadCall = stored({ enabled: false });
+    expect((await fieldErrorsOf(put({ enabled: true, allowedCountries: ['CA'] }))).enabled).toContain(BLOCKER_NO_CALLABLE_COUNTRY);
+  });
+  it('lets an org that is already on keep it through an unrelated edit, and keeps showing the blocker', async () => {
+    table.org.hotLeadCall = stored({ allowedCountries: ['CA'] });
+    expect(await put({ announcedName: 'Other Co' })).toMatchObject({ enabled: true, canEnable: false, blockers: [BLOCKER_NO_CALLABLE_COUNTRY] });
+  });
+  it('shows the warning in the preview', async () => {
+    expect((await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T19:00:00Z'))).warnings).toEqual([WARNING_CANADA_NOT_CALLED]);
+  });
+});
+
+describe('read-out: calling hours that never meet the lead window', () => {
+  it('words the blocker with the Eastern hours the owner must include', () => {
+    expect(BLOCKER_NO_LEAD_OVERLAP).toContain('13:00 and 18:00 Eastern');
+  });
+  const hours = (start: string, end: string, timezone = 'America/Chicago') => ({ callingHours: { start, end, timezone } });
+  it('the default 08:00-21:00 hours and the fixture hours pass', async () => {
+    for (const tz of ['America/Chicago', 'America/New_York', 'America/Los_Angeles']) {
+      table.org.hotLeadCall = stored(hours('08:00', '21:00', tz));
+      expect((await getHotLeadCallSettings(org(), OWNER)).blockers).toEqual([]);
+    }
+  });
+  it.each([
+    ['early morning only (Chicago 06:00-09:00)', '06:00', '09:00', 'America/Chicago'],
+    ['overnight (Chicago 22:00-04:00)', '22:00', '04:00', 'America/Chicago'],
+    ['ends exactly when the lead window opens (Chicago 08:00-12:00 = 13:00 Eastern)', '08:00', '12:00', 'America/Chicago'],
+    ['starts exactly when the lead window closes (Chicago 17:00-20:00 = 18:00 Eastern)', '17:00', '20:00', 'America/Chicago'],
+    ['evening Eastern', '19:00', '23:00', 'America/New_York'],
+    ['Pacific morning (06:00-09:59 = 09:00-12:59 Eastern)', '06:00', '09:59', 'America/Los_Angeles'],
+  ])('is a blocker for %s', async (_n, start, end, tz) => {
+    table.org.hotLeadCall = stored({ enabled: false, ...hours(start, end, tz) });
+    const dto = await getHotLeadCallSettings(org(), OWNER);
+    expect(dto).toMatchObject({ canEnable: false, blockers: [BLOCKER_NO_LEAD_OVERLAP] });
+    expect((await fieldErrorsOf(put({ enabled: true }))).enabled).toContain(BLOCKER_NO_LEAD_OVERLAP);
+    expect(table.writes).toEqual([]);
+  });
+  it.each([
+    ['a wide valid window (00:00-23:59)', '00:00', '23:59', 'America/Chicago'],
+    ['a wrapping window that covers the afternoon (14:00-02:00)', '14:00', '02:00', 'America/Chicago'],
+    ['one 15-minute slot inside the lead window (Chicago 12:00-12:15 = 13:00 Eastern)', '12:00', '12:15', 'America/Chicago'],
+    ['a 2-minute window inside the lead window (Chicago 12:04-12:06)', '12:04', '12:06', 'America/Chicago'],
+    ['a 1-minute window at the last minute of the lead window (New York 17:59-18:00)', '17:59', '18:00', 'America/New_York'],
+    ['the last minute before the lead window closes (Chicago 16:45-17:00)', '16:45', '17:00', 'America/Chicago'],
+    ['Pacific afternoon (10:00-15:00)', '10:00', '15:00', 'America/Los_Angeles'],
+    ['a zone far from the US (Europe/London 18:00-23:00 = 13:00-18:00 Eastern in winter)', '18:00', '23:00', 'Europe/London'],
+  ])('is not a blocker for %s', async (_n, start, end, tz) => {
+    table.org.hotLeadCall = stored({ enabled: false, ...hours(start, end, tz) });
+    expect(await getHotLeadCallSettings(org(), OWNER)).toMatchObject({ canEnable: true, blockers: [] });
+    expect((await put({ enabled: true })).enabled).toBe(true);
+  });
+  it('is shown for an org that is already on, and an unrelated edit does not turn it off', async () => {
+    table.org.hotLeadCall = stored(hours('06:00', '09:00'));
+    expect(await getHotLeadCallSettings(org(), OWNER)).toMatchObject({ enabled: true, canEnable: false, blockers: [BLOCKER_NO_LEAD_OVERLAP] });
+    expect(await put({ announcedName: 'Other Co' })).toMatchObject({ enabled: true, blockers: [BLOCKER_NO_LEAD_OVERLAP] });
+  });
+  it('is gone once the hours are fixed', async () => {
+    table.org.hotLeadCall = stored({ enabled: false, ...hours('06:00', '09:00') });
+    expect(await put({ callingHours: { start: '09:00', end: '20:00', timezone: 'America/Chicago' }, enabled: true })).toMatchObject({ enabled: true, blockers: [] });
+  });
+  it('is not reported when there are no hours at all (the missing-hours blocker covers it)', async () => {
+    table.org.hotLeadCall = stored({ enabled: false, callingHours: undefined });
+    expect((await getHotLeadCallSettings(org(), OWNER)).blockers).toEqual([BLOCKER_NO_HOURS]);
+  });
+});
+
+describe('preview: the lead window', () => {
+  it('says the lead window is open, with no skip reason, when both gates are open', async () => {
+    // 19:00Z on 2026-10-20 = 14:00 EDT = 11:00 PDT; Chicago 14:00 is inside 08:00-21:00.
+    expect(await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T19:00:00Z'))).toMatchObject({ outsideCallingHours: false, outsideLeadHours: false, skipReason: null });
+  });
+  it('names outside_lead_hours when only the lead window is closed', async () => {
+    // 15:00Z = 11:00 EDT, before the lead window; Chicago 10:00 is inside the org hours.
+    expect(await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T15:00:00Z'))).toMatchObject({ outsideCallingHours: false, outsideLeadHours: true, skipReason: 'outside_lead_hours' });
+  });
+  it('names outside_calling_hours first when the org hours are closed', async () => {
+    expect(await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T04:00:00Z'))).toMatchObject({ outsideCallingHours: true, outsideLeadHours: true, skipReason: 'outside_calling_hours' });
+  });
+  it('closes the lead window at 18:00 Eastern', async () => {
+    expect((await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T21:59:00Z'))).outsideLeadHours).toBe(false);
+    expect((await previewHotLeadCallSettings(org(), OWNER, new Date('2026-10-20T22:00:00Z'))).outsideLeadHours).toBe(true);
   });
 });
