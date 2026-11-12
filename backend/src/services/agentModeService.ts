@@ -15621,6 +15621,37 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-2914 Zoma custom audiences: one Graph call with the caller's credentials for the
+   * selected ad account. `{account}` in the path becomes act_<id>. Callers (mcp/metaToolkitAudiences)
+   * build the path from validated numeric ids and check node ownership themselves. Errors are
+   * re-thrown as a plain Error with only Meta's error fields: the axios error carries the access
+   * token in its config, so it must never reach a caller or a log.
+   */
+  public async toolkitMetaGraphRequest(
+    userId: string, account_id: string, method: 'GET' | 'POST' | 'DELETE', path: string, params: Record<string, any> = {},
+  ): Promise<any> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const url = `https://graph.facebook.com/${apiVersion}/${path.replace('{account}', `act_${accountId.replace(/^act_/, '')}`)}`;
+    try {
+      const { data } = method === 'GET'
+        ? await axios.get(url, { params: { ...params, access_token: accessToken }, timeout: 30_000 })
+        : method === 'POST'
+          ? await axios.post(url, params, { params: { access_token: accessToken }, timeout: 30_000 })
+          : await axios.delete(url, { params: { access_token: accessToken }, data: params, timeout: 30_000 });
+      return data;
+    } catch (error: any) {
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta
+        ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message, error_user_msg: meta.error_user_msg }
+        : null;
+      wrapped.status = error?.response?.status;
+      throw wrapped;
+    }
+  }
+
+  /**
    * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
    * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
    */
@@ -17014,7 +17045,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
-      console.error('AgentMode: Error managing custom audiences:', error);
+      // ENG-2914: never log the error object. A Meta SDK error carries the request (URL with the
+      // access token, and for user uploads the hashed member payload); log Meta's fields only.
+      console.error('AgentMode: Error managing custom audiences:', {
+        message: error?.message,
+        code: error?.structuredError?.code,
+        error_subcode: error?.structuredError?.error_subcode,
+      });
       // Meta's raw error.message (e.g. "Permissions error") is often too terse to
       // act on. metaService.handleError attaches a structuredError with Meta's own
       // consumer-facing error_user_msg (e.g. the exact accept-terms URL for
