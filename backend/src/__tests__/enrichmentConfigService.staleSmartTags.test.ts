@@ -1,7 +1,13 @@
 // ENG-2720: a field whose instruction was edited must not keep the smart tags made for the OLD instruction
 // when the new classification is missing (the call failed, or the two samples disagreed): every run would
 // skip fetching it and compute the old condition. Candidates are cleared before the model is asked.
-import { processEnrichmentConfig } from '../services/enrichmentConfigService';
+import { processEnrichmentConfig, type ConfigProcessingDeps } from '../services/enrichmentConfigService';
+import type { EnrichmentConfig, EnrichmentFieldConfig } from '../services/crmEnrichmentServiceV3';
+
+// Fixtures are plain objects; the service reads them as config/deps.
+const asConfig = (c: object) => c as unknown as EnrichmentConfig;
+const asDeps = (d: object) => d as unknown as ConfigProcessingDeps;
+const asField = (f: unknown) => f as EnrichmentFieldConfig & Record<string, unknown>;
 
 const OLD = 'qualified if the company has more than 50 employees';
 const stored = (extra: object = {}) => ({
@@ -9,11 +15,11 @@ const stored = (extra: object = {}) => ({
   fields: [{ name: 'q', type: 'string', instruction: OLD, include: true, overwritePolicy: 'fill_if_empty', smartCondition: OLD, smartDependencies: ['employee_count'], ...extra }],
 });
 const sent = (instruction: string) => ({ schemaVersion: 1, fields: [{ name: 'q', type: 'string', instruction, include: true, overwritePolicy: 'fill_if_empty' }] });
-const run = (instruction: string, classify: jest.Mock, storedConfig: any = stored()) =>
+const run = (instruction: string, classify: jest.Mock, storedConfig: object = stored()) =>
   processEnrichmentConfig(
-    { listId: 'l1', userId: 'u1', config: sent(instruction) as any },
-    { readListConfig: jest.fn().mockResolvedValue(storedConfig), llmInferAliases: jest.fn().mockResolvedValue({}), llmClassifySmartFields: classify } as any,
-  ).then(r => r.config.fields.find(f => f.name === 'q') as any);
+    { listId: 'l1', userId: 'u1', config: asConfig(sent(instruction)) },
+    asDeps({ readListConfig: jest.fn().mockResolvedValue(storedConfig), llmInferAliases: jest.fn().mockResolvedValue({}), llmClassifySmartFields: classify }),
+  ).then(r => asField(r.config.fields.find(f => f.name === 'q')));
 
 describe('stale smart tags after an instruction edit', () => {
   it('clears them when the new classification is undecided', async () => {
@@ -63,10 +69,10 @@ describe('stale smart tags after an instruction edit', () => {
       { name: 'r', type: 'boolean', instruction: R, include: true, overwritePolicy: 'fill_if_empty' },
     ] };
     const classify = jest.fn().mockResolvedValue({});
-    const out = await processEnrichmentConfig({ listId: 'l1', userId: 'u1', config: config as any }, {
+    const out = await processEnrichmentConfig({ listId: 'l1', userId: 'u1', config: asConfig(config) }, asDeps({
       readListConfig: jest.fn().mockResolvedValue(storedTwo), llmInferAliases: jest.fn().mockResolvedValue({}), llmClassifySmartFields: classify,
-    } as any);
-    const byName = Object.fromEntries(out.config.fields.map(f => [f.name, f as any]));
+    }));
+    const byName = Object.fromEntries(out.config.fields.map(f => [f.name, asField(f)]));
     expect(classify).toHaveBeenCalledWith([{ name: 'q', instruction: 'name of the CEO of the company' }], 'u1');
     expect(byName.q.smartCondition).toBeUndefined();
     expect(byName.r.smartCondition).toBe(R);

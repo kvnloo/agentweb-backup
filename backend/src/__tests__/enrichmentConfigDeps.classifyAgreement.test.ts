@@ -55,7 +55,7 @@ describe('agreeingClassifications', () => {
 
   it('drops fields missing from either sample and tolerates garbage entries', () => {
     expect(agreeingClassifications({ a: plain(), b: plain() }, { a: plain() })).toEqual({ a: plain() });
-    expect(agreeingClassifications({ a: null as any, b: 'x' as any }, { a: plain(), b: plain() })).toEqual({});
+    expect(agreeingClassifications({ a: null, b: 'x' } as unknown as Parameters<typeof agreeingClassifications>[0], { a: plain(), b: plain() })).toEqual({});
   });
 });
 
