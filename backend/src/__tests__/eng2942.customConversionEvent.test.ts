@@ -66,7 +66,7 @@ describe('ENG-2942 custom conversion optimisation events', () => {
     const created: any = await previewThenConfirm(deps, adSet({ pixel_id: '555', custom_conversion_id: '777', custom_event_type: 'OTHER' }));
     expect(created.success).toBe(true);
     expect(deps.dispatch).toHaveBeenCalledTimes(1);
-    expect(deps.dispatch.mock.calls[0][1].params.promoted_object.custom_conversion_id).toBe('777');
+    expect((deps.dispatch as jest.Mock).mock.calls[0][1].params.promoted_object.custom_conversion_id).toBe('777');
 
     (deps.readBack as jest.Mock).mockResolvedValue({ id: '999', status: 'ACTIVE', effective_status: 'ACTIVE' });
     const enabled: any = await previewThenConfirm(deps, { entity_type: 'AD_SET', action: 'UPDATE', account_id: '111', ad_set_id: '999', params: { status: 'ACTIVE' } });
