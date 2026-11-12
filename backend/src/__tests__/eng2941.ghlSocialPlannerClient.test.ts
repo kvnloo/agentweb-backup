@@ -1,4 +1,5 @@
 import {
+  buildDraftRequest,
   createSocialPlannerDraft,
   isGhlSocialPlannerEnabled,
   GhlSocialPlannerError,
@@ -79,6 +80,9 @@ describe('ENG-2941 GHL Social Planner draft client', () => {
     [{ text: 'x'.repeat(3001) }],
     [{ locationId: '../evil' }],
     [{ scheduleAt: 'tomorrow' }],
+    [{ scheduleAt: '2027-02-30T10:00:00Z' }],
+    [{ scheduleAt: '2027-02-01' }],
+    [{ mediaUrls: ['https://cdn.example.com/a.webp'] }],
   ])('rejects invalid input %j before sending', async (patch) => {
     const { calls, transport } = fake(ok);
     expect(await kindOf(createSocialPlannerDraft(transport, 'tok', { ...base, ...patch } as any))).toBe('validation_input');
@@ -112,6 +116,16 @@ describe('ENG-2941 GHL Social Planner draft client', () => {
       expect(err.retryable).toBe(retryable);
       if (status === 429) expect(err.retryAfterSeconds).toBe(30);
     }
+  });
+
+  it('reads id and status from the same top-level post object', async () => {
+    const { transport } = fake({ status: 201, body: { _id: 'p1', status: 'published' } });
+    expect(await kindOf(createSocialPlannerDraft(transport, 'tok', base))).toBe('unexpected');
+  });
+
+  it('maps mov/webm to their documented media types', () => {
+    const req = buildDraftRequest({ ...base, mediaUrls: ['https://c.example.com/a.mov', 'https://c.example.com/b.webm'] }, 'tok');
+    expect(JSON.parse(req.body).media.map((m: any) => m.type)).toEqual(['video/mov', 'video/webm']);
   });
 
   it('treats a transport throw as retryable', async () => {

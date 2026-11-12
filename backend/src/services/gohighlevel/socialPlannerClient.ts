@@ -110,19 +110,36 @@ export function validateDraftInput(input: CreateSocialPlannerDraftInput): void {
       throw inputError(`Media URL is not a valid URL: ${url}`);
     }
     if (parsed.protocol !== 'https:') throw inputError(`Media URL must use https: ${url}`);
+    if (mediaType(url) === null) throw inputError(`Unsupported media format: ${url}`);
   }
-  if (input.scheduleAt !== undefined && Number.isNaN(Date.parse(input.scheduleAt))) {
+  if (input.scheduleAt !== undefined && !isValidIsoInstant(input.scheduleAt)) {
     throw inputError(`scheduleAt is not a valid ISO-8601 time: ${input.scheduleAt}`);
   }
 }
 
-function mediaType(url: string): string {
+const ISO_INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function isValidIsoInstant(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const m = ISO_INSTANT_RE.exec(value);
+  if (!m) return false;
+  const [y, mo, d, h, mi, se] = [m[1], m[2], m[3], m[4], m[5], m[6] ?? '0'].map(Number);
+  if (mo < 1 || mo > 12 || h > 23 || mi > 59 || se > 59) return false;
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (d < 1 || d > daysInMonth) return false;
+  return !Number.isNaN(Date.parse(value));
+}
+
+// Media types accepted by Social Planner create-post, API version 2021-07-28.
+function mediaType(url: string): string | null {
   const path = new URL(url).pathname.toLowerCase();
-  if (/\.(mp4|mov|webm|m4v)$/.test(path)) return 'video/mp4';
+  if (/\.(mp4|m4v)$/.test(path)) return 'video/mp4';
+  if (/\.mov$/.test(path)) return 'video/mov';
+  if (/\.webm$/.test(path)) return 'video/webm';
   if (/\.png$/.test(path)) return 'image/png';
   if (/\.gif$/.test(path)) return 'image/gif';
-  if (/\.webp$/.test(path)) return 'image/webp';
-  return 'image/jpeg';
+  if (/\.(jpe?g)$/.test(path)) return 'image/jpeg';
+  return null;
 }
 
 export function buildDraftRequest(input: CreateSocialPlannerDraftInput, accessToken: string): GhlHttpRequest {
@@ -176,12 +193,11 @@ export function mapGhlError(res: GhlHttpResponse): GhlSocialPlannerError {
   return new GhlSocialPlannerError('unexpected', `Unexpected GoHighLevel response (${res.status}): ${msg}`, res.status);
 }
 
-function extractPostId(body: unknown): string | null {
+function extractPost(body: unknown): Record<string, any> | null {
   if (!body || typeof body !== 'object') return null;
   const b = body as Record<string, any>;
   const post = b.results?.post ?? b.post ?? b.results ?? b;
-  const id = post?._id ?? post?.id;
-  return typeof id === 'string' && id ? id : null;
+  return post && typeof post === 'object' ? post : null;
 }
 
 export async function createSocialPlannerDraft(
@@ -198,9 +214,11 @@ export async function createSocialPlannerDraft(
     throw new GhlSocialPlannerError('retryable', `GoHighLevel request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (res.status < 200 || res.status >= 300) throw mapGhlError(res);
-  const postId = extractPostId(res.body);
+  const post = extractPost(res.body);
+  const rawId = post?._id ?? post?.id;
+  const postId = typeof rawId === 'string' && rawId ? rawId : null;
   if (!postId) throw new GhlSocialPlannerError('unexpected', 'GoHighLevel accepted the request but returned no post id.', res.status);
-  const returnedStatus = (res.body as any)?.results?.post?.status ?? (res.body as any)?.post?.status;
+  const returnedStatus = post?.status;
   if (returnedStatus !== undefined && returnedStatus !== 'draft') {
     throw new GhlSocialPlannerError('unexpected', `GoHighLevel returned status "${returnedStatus}" for post ${postId}, not draft.`, res.status);
   }
