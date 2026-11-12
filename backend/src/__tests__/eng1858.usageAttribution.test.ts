@@ -340,7 +340,8 @@ describe('call sites pass userId / sessionId / feature to callLLM', () => {
   it('processEnrichmentConfig meters alias inference and smart-field classification to the saving user', async () => {
     const generateJSONContent = jest.fn()
       .mockResolvedValueOnce({ stag: 'funding_stage' }) // llmInferAliases
-      .mockResolvedValueOnce({}); // llmClassifySmartFields
+      .mockResolvedValueOnce({}) // llmClassifySmartFields, first sample
+      .mockResolvedValueOnce({}); // llmClassifySmartFields, second sample (ENG-2720: agreement)
     jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({ generateJSONContent } as any);
     const deps = { ...buildConfigProcessingDeps(), readListConfig: jest.fn().mockResolvedValue(null) };
 
@@ -358,7 +359,7 @@ describe('call sites pass userId / sessionId / feature to callLLM', () => {
       deps,
     );
 
-    expect(generateJSONContent).toHaveBeenCalledTimes(2);
+    expect(generateJSONContent).toHaveBeenCalledTimes(3); // 1 alias + 2 classification samples, all metered to the saving user
     for (const call of generateJSONContent.mock.calls) {
       // generateJSONContent(system, user, format, onUsage, usageContext)
       expect(call[4]).toEqual({ userId: MEMBER, feature: 'crm_enrichment_config' });
