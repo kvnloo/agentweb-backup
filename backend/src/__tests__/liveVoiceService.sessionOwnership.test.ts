@@ -26,6 +26,12 @@ const mockSessionSendRealtimeInput = jest.fn();
 const mockSessionSendToolResponse = jest.fn();
 const mockSessionClose = jest.fn();
 
+// ENG-2957: voice now checks the account's allowance at start and after each turn; these tests are about other rules.
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn(async () => ({ allowed: true, month: '2026-11' })),
+}));
+
 jest.mock('@google/genai', () => ({
   GoogleGenAI: jest.fn().mockImplementation(() => ({
     live: {
