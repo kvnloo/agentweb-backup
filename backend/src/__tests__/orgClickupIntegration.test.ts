@@ -510,6 +510,19 @@ describe("ClickUp org-wide integration", () => {
       expect(status.body).toEqual({ connected: false, workspaces: [] });
     });
 
+    it("disconnect: if the ORG removal fails it errors out and the personal token is left alone", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      mockUsers[OWNER_USER_ID].secrets = personal(OWNER_USER_ID);
+      mockRemoveOrgSecret.mockRejectedValueOnce(new Error("dynamo down"));
+
+      const res = await request(app).post("/api/clickup/disconnect").send({});
+
+      expect(res.status).toBe(500);
+      expect(mockUpdateUser).not.toHaveBeenCalled();
+      expect(mockUsers[OWNER_USER_ID].secrets).toEqual(personal(OWNER_USER_ID));
+    });
+
     it("disconnect: if clearing the personal token fails the client is told to retry, and retry succeeds", async () => {
       currentUserId = OWNER_USER_ID;
       mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
