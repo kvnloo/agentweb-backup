@@ -7,6 +7,12 @@
  * executor is where the restriction a tool call carries is observed. (That `executeTool` then refuses on it is proven against
  * the real service in agentModeService.restrictionProfile.test.ts.)
  */
+// ENG-2957: voice now checks the account's allowance at start and after each turn; these tests are about other rules.
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn(async () => ({ allowed: true, month: '2026-11' })),
+}));
+
 
 import http from 'http';
 import { AddressInfo } from 'net';

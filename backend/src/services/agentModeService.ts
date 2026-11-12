@@ -2359,6 +2359,19 @@ export class AgentModeService {
   }
 
   /**
+   * The live-voice model behind the chat's voice button, or null when none is served to this user (ENG-2957). Voice mode
+   * is a client-side mode: the chat's stored model is never switched to it, and isModelSelectableBy keeps refusing it as
+   * a text pick. Same internal/adminOnly gates as the picker; the first live registry entry wins.
+   */
+  getVoiceModelFor(isAdmin: boolean): string | null {
+    for (const id of Object.keys(this.llmModels)) {
+      const config = this.llmModels[id];
+      if (config.isLive && !config.internalOnly && (isAdmin || !config.adminOnly)) return id;
+    }
+    return null;
+  }
+
+  /**
    * ENG-55: registry facts the model-compare feature needs (display name, lab, live
    * flag) without exposing the registry. Null for ids that are not registry keys.
    */

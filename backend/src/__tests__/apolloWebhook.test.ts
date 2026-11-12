@@ -30,7 +30,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import apolloWebhookRouter, { cleanCallbackEmail } from '../routes/apolloWebhook';
+import apolloWebhookRouter, { cleanCallbackEmail, extractApolloEmail } from '../routes/apolloWebhook';
 import { crmDb } from '../services/db';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
@@ -239,6 +239,16 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
       ['null', null],
       ['number', 12345],
       ['empty', ''],
+      // ENG-2803: the shared strict validator (utils/sendEligibility) plus the callback-only rules.
+      ['doubled dot', 'a..b@x.com'],
+      ['leading dot', '.a@x.com'],
+      ['trailing dot in the local part', 'a.@x.com'],
+      ['domain label starting with a hyphen', 'a@x.-y.com'],
+      ['one-letter TLD', 'a@b.c'],
+      ['numeric TLD', 'a@b.123'],
+      ['CSV formula lead =', '=cmd@x.com'],
+      ['CSV formula lead +', '+tag@x.com'],
+      ['CSV formula lead -', '-x@x.com'],
     ];
     it.each(REJECTED)('does not write a %s and treats the callback as no_email', async (_label, bad) => {
       placeholderAndLead();
@@ -352,7 +362,8 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
       const excluded = [' ', '<', '>', '"', '\\', ',', ';', ':', '(', ')', '[', ']', '\u0000', '\n', '\r', '\t', '‮', '​', ' ', 'é'];
       for (const c of excluded) expect(cleanCallbackEmail(`a${c}b@x.com`)).toBeUndefined();
       expect(cleanCallbackEmail("a!#$%&'*+/=?^_`{|}~-b@x.com")).toBe("a!#$%&'*+/=?^_`{|}~-b@x.com");
-      expect(cleanCallbackEmail('a@b.c')).toBeUndefined(); // TLD needs 2+ letters
+      expect(cleanCallbackEmail('a@b.c')).toBeUndefined(); // TLD needs 2+ letters (callback-only rule)
+      expect(cleanCallbackEmail('a@x.xn--p1ai')).toBe('a@x.xn--p1ai'); // punycode TLD is legal (ENG-2803)
       expect(cleanCallbackEmail('a@b.co')).toBe('a@b.co');
       expect(cleanCallbackEmail('a@.b.com')).toBeUndefined();
       expect(cleanCallbackEmail('a@b-.com')).toBeUndefined();
@@ -360,10 +371,56 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
       expect(cleanCallbackEmail('a@xn--mnchen-3ya.de')).toBe('a@xn--mnchen-3ya.de');
     });
 
+    it('stops at the first usable address in a group and never reads the rest (ENG-2803)', () => {
+      const emails = new Proxy(['junk', 'first@acme.com', 'second@acme.com'], {
+        get(target, prop, recv) {
+          if (prop === '2') throw new Error('read past the first usable address');
+          return Reflect.get(target, prop, recv);
+        },
+      });
+      const out = extractApolloEmail({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: 'verified', emails }] }] } }] });
+      expect(out.email).toBe('first@acme.com');
+    });
+
+    // Typed handle on the mocked late write (ENG-2803 tests).
+    const lateWrite = () => (mockCrmDb as unknown as { setLeadEmailIfMissing: jest.Mock }).setLeadEmailIfMissing;
+
+    it('skips junk before the first usable address and writes that one', async () => {
+      placeholderAndLead();
+      const res = await send(wf('not-an-email', '=cmd@x.com', 'real@acme.com', 'later@acme.com'));
+      expect(res.status).toBe(200);
+      expect(lateWrite()).toHaveBeenCalledWith('L1', 'LD1', 'real@acme.com', expect.any(Object));
+    });
+
+    it('refuses a callback whose placeholder has expired, and writes nothing (ENG-2803)', async () => {
+      placeholderAndLead();
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', expiresAt: Math.floor(Date.now() / 1000) - 60, rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as unknown as Awaited<ReturnType<typeof mockCrmDb.getEnrichmentCacheItem>>);
+      const res = await send(wf('good@acme.com'));
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({ matched: false, expired: true });
+      expect(lateWrite()).not.toHaveBeenCalled();
+      expect(mockCrmDb.putEnrichmentCacheItem).not.toHaveBeenCalled();
+    });
+
+    it('accepts a callback whose placeholder has not expired yet', async () => {
+      placeholderAndLead();
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', expiresAt: Math.floor(Date.now() / 1000) + 3600, rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as unknown as Awaited<ReturnType<typeof mockCrmDb.getEnrichmentCacheItem>>);
+      const res = await send(wf('good@acme.com'));
+      expect(res.status).toBe(200);
+      expect(lateWrite()).toHaveBeenCalledWith('L1', 'LD1', 'good@acme.com', expect.any(Object));
+    });
+
     it('cleanCallbackEmail keeps ordinary and unusual-but-legal addresses', () => {
-      for (const ok of ['avery@example.com', 'first.last+tag@sub.example.co.uk', "o'brien@company.com", 'A@B.IO', '  padded@x.com  ']) {
+      for (const ok of ['avery@example.com', 'first.last+tag@sub.example.co.uk', "o'brien@company.com", '  padded@x.com  ']) {
         expect(cleanCallbackEmail(ok)).toBe(ok.trim());
       }
+      // Normalized the way the lead write stores it (ENG-2803).
+      expect(cleanCallbackEmail('A@B.IO')).toBe('a@b.io');
+      expect(cleanCallbackEmail(' Mixed.Case@Example.COM ')).toBe('mixed.case@example.com');
       expect(cleanCallbackEmail(undefined)).toBeUndefined();
       expect(cleanCallbackEmail('a'.repeat(64) + '@x.com')).toBe('a'.repeat(64) + '@x.com');
       expect(cleanCallbackEmail('a'.repeat(65) + '@x.com')).toBeUndefined();

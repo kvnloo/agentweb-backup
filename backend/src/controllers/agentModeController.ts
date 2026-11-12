@@ -12500,6 +12500,21 @@ export const agentModeController = {
     }
   },
 
+  /**
+   * GET /public/voice-model: the live-voice model behind the chat's voice button, or null when none is served. The model
+   * lists never carry it (they feed text pickers), and the model-switch routes keep refusing it: voice mode is a
+   * client-side mode, the chat's stored model is never changed to it (ENG-2957).
+   */
+  async getPublicVoiceModel(req: Request, res: Response) {
+    try {
+      const { user } = await getUserFromToken(req);
+      res.json({ voiceModel: agentModeService.getVoiceModelFor(user?.isAdmin === true) });
+    } catch (error) {
+      console.error('AgentMode: Get voice model error:', error);
+      res.status(500).json({ error: 'Failed to get voice model' });
+    }
+  },
+
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;

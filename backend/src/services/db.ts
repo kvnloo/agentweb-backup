@@ -10535,17 +10535,24 @@ export const crmDb = {
     const normalizedEmail = email.trim().toLowerCase();
     if (!normalizedEmail) return { written: false };
 
+    // ENG-2803: derive `domain` from the email like every other email write (createLead, updateLead,
+    // setLeadFields), as fill-if-empty: this is a fill-if-missing write, so a domain the lead already has
+    // stays. `domain` is a DynamoDB reserved keyword, hence the name placeholder (see updateLead).
+    const derivedDomain = extractDomainFromEmail(normalizedEmail);
     const params: any = {
       TableName: tableName,
       Key: { listId, leadId },
       UpdateExpression:
         'SET email = :email, ' +
         'enrichmentMetadata.email = :meta, ' +
-        'updatedAt = :ts',
+        'updatedAt = :ts' +
+        (derivedDomain ? ', #derivedDomainAttr = if_not_exists(#derivedDomainAttr, :derivedDomain)' : ''),
+      ...(derivedDomain ? { ExpressionAttributeNames: { '#derivedDomainAttr': 'domain' } } : {}),
       ExpressionAttributeValues: {
         ':email': normalizedEmail,
         ':meta': enrichmentEmailMeta,
         ':ts': new Date().toISOString(),
+        ...(derivedDomain ? { ':derivedDomain': derivedDomain } : {}),
       },
       // Two guards:
       //   1. attribute_exists(leadId) — don't auto-create a deleted lead

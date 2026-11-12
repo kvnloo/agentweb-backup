@@ -3,7 +3,8 @@
  * ENG-2303 guarded-write flow; Meta's is metaToolkitWrites.ts).
  *
  * Allowed: BUDGET CREATE/UPDATE (amount), CAMPAIGN CREATE (PMax with its brand business name +
- * logo) / UPDATE status, AD_GROUP CREATE / UPDATE status, CAMPAIGN_CONVERSION_GOAL UPDATE.
+ * logo) / UPDATE status or name, AD_GROUP CREATE / UPDATE status or name+cpc_bid (ENG-2959),
+ * CAMPAIGN_CONVERSION_GOAL UPDATE.
  * ENG-2928: KEYWORD ADD / UPDATE status / REMOVE / ADD_NEGATIVE (ad group or campaign level),
  * AD CREATE (RESPONSIVE_SEARCH_AD) / UPDATE status, ASSET_GROUP CREATE / UPDATE status, and
  * ASSET UPLOAD (image/logo from https or a staged file, text, YouTube video).
@@ -48,7 +49,7 @@ export type GoogleReadKind =
 
 export interface GoogleBudgetState { resourceName: string; name?: string; amountMicros: number; explicitlyShared: boolean; referenceCount: number; status?: string }
 export interface GoogleCampaignState { resourceName: string; name?: string; status: string; budget?: string; channelType?: string }
-export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string }
+export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string; cpcBidMicros?: number }
 export interface GoogleKeywordState { resourceName: string; text: string; matchType: string; status?: string; negative: boolean; adGroup?: string }
 export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[] }
 export interface GoogleAssetState { resourceName: string; name?: string; type: string; text?: string }
@@ -96,7 +97,7 @@ const GAQL: Record<GoogleReadKind, string> = {
   campaign_conversion_goal: 'SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.resource_name = ',
   budget: 'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count, campaign_budget.status FROM campaign_budget WHERE campaign_budget.resource_name = ',
   campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget, campaign.advertising_channel_type FROM campaign WHERE campaign.resource_name = ',
-  ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign FROM ad_group WHERE ad_group.resource_name = ',
+  ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign, ad_group.cpc_bid_micros FROM ad_group WHERE ad_group.resource_name = ',
   keyword: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.resource_name = `,
   ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
   asset: 'SELECT asset.resource_name, asset.name, asset.type, asset.text_asset.text FROM asset WHERE asset.resource_name = ',
@@ -156,7 +157,10 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
     return g?.resourceName ? ({ resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign, finalUrls: g.finalUrls } as GoogleAssetGroupState) : null;
   }
   const g = row.adGroup;
-  return g?.resourceName ? ({ resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign } as GoogleAdGroupState) : null;
+  return g?.resourceName ? ({
+    resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign,
+    ...(g.cpcBidMicros !== undefined && g.cpcBidMicros !== null ? { cpcBidMicros: Number(g.cpcBidMicros) } : {}),
+  } as GoogleAdGroupState) : null;
 }
 
 /** Multi-row reads: keyword lists, and a campaign's brand (business name + logos). */
@@ -235,6 +239,8 @@ interface ValidatedWrite {
   parent?: { kind: GoogleReadKind; resourceName: string };
   budgetMicros?: number;
   expectedStatus?: 'ENABLED' | 'PAUSED';
+  /** ENG-2959: CAMPAIGN / AD_GROUP non-status UPDATE — the values the read-back must show. */
+  expectedEdit?: { name?: string; cpcBidMicros?: number };
   /** KEYWORD ADD / ADD_NEGATIVE: what the read-back of the parent's keyword list must contain. */
   keywords?: ToolkitKeyword[];
   /** Keyword list read before (duplicates) and after (read-back) the write. */
@@ -264,9 +270,9 @@ const ALLOWED: Record<string, string[]> = {
   'BUDGET CREATE': ['name', 'amount', 'explicitly_shared'],
   'BUDGET UPDATE': ['budget_resource_name', 'amount'],
   'CAMPAIGN CREATE': ['name', 'type', 'budget_resource_name', 'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target', 'cpc_bid_ceiling', 'location_target_ids', 'status', 'brand_business_name', 'brand_logo_asset_resource_name'],
-  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status'],
+  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status', 'name'],
   'AD_GROUP CREATE': ['name', 'campaign_resource_name', 'type', 'cpc_bid', 'status'],
-  'AD_GROUP UPDATE': ['ad_group_resource_name', 'status'],
+  'AD_GROUP UPDATE': ['ad_group_resource_name', 'status', 'name', 'cpc_bid'],
   'KEYWORD ADD': ['ad_group_resource_name', 'keywords', 'status'],
   'KEYWORD UPDATE': ['criterion_resource_name', 'status'],
   'KEYWORD REMOVE': ['criterion_resource_name'],
@@ -369,6 +375,25 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     need(args.status === 'ENABLED' || args.status === 'PAUSED', 'status must be ENABLED or PAUSED.');
     return { dispatchArgs: { ...base, [field]: rn, status: args.status }, target: { kind, resourceName: rn }, expectedStatus: args.status };
   };
+  /** ENG-2959: CAMPAIGN UPDATE (status | name) and AD_GROUP UPDATE (status | name and/or cpc_bid). */
+  const statusOrEdit = (kind: 'campaign' | 'ad_group', field: string): ValidatedWrite => {
+    const edits = kind === 'campaign' ? ['name'] : ['name', 'cpc_bid'];
+    const present = edits.filter((k) => args[k] !== undefined);
+    if (args.status !== undefined) {
+      need(!present.length, `status must be sent alone. Change ${present.join(' / ')} in a separate ${op} preview and approval.`);
+      return statusOnly(kind, field);
+    }
+    need(present.length > 0, `${op} requires status${kind === 'campaign' ? ' or name' : ', name or cpc_bid'}.`);
+    const rn = resource(kind, field);
+    const dispatchArgs: Record<string, unknown> = { ...base, [field]: rn };
+    const expectedEdit: { name?: string; cpcBidMicros?: number } = {};
+    if (args.name !== undefined) {
+      need(nonBlank(args.name) && chars(args.name.trim()) <= 255, 'name must be a non-empty string of at most 255 characters.');
+      dispatchArgs.name = expectedEdit.name = (args.name as string).trim();
+    }
+    if (args.cpc_bid !== undefined) dispatchArgs.cpc_bid_micros = expectedEdit.cpcBidMicros = positiveMicros(args.cpc_bid, currency, 'cpc_bid');
+    return { dispatchArgs, target: { kind, resourceName: rn }, expectedEdit };
+  };
 
   switch (op) {
     case 'CAMPAIGN_CONVERSION_GOAL UPDATE': {
@@ -426,7 +451,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
       };
     }
     case 'CAMPAIGN UPDATE':
-      return statusOnly('campaign', 'campaign_resource_name');
+      return statusOrEdit('campaign', 'campaign_resource_name');
     case 'AD_GROUP CREATE': {
       createdPaused();
       need(nonBlank(args.name), 'AD_GROUP CREATE requires name.');
@@ -527,7 +552,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     case 'ASSET_GROUP UPDATE':
       return statusOnly('asset_group', 'asset_group_resource_name');
     default:
-      return statusOnly('ad_group', 'ad_group_resource_name');
+      return statusOrEdit('ad_group', 'ad_group_resource_name');
   }
 }
 
@@ -576,6 +601,15 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
     if (readBack.amountMicros !== validated.budgetMicros) return 'MISMATCH';
     const shared = validated.dispatchArgs.explicitly_shared;
     if (shared !== undefined && readBack.explicitlyShared !== shared) return 'MISMATCH';
+    return 'CONFIRMED';
+  }
+  if (validated.expectedEdit) {
+    const e = validated.expectedEdit;
+    if (e.name !== undefined && readBack.name !== e.name) return 'MISMATCH';
+    if (e.cpcBidMicros !== undefined) {
+      if (!Number.isFinite(readBack.cpcBidMicros)) return 'UNCONFIRMED';
+      if (readBack.cpcBidMicros !== e.cpcBidMicros) return 'MISMATCH';
+    }
     return 'CONFIRMED';
   }
   if (readBack.status !== validated.expectedStatus) return 'MISMATCH';
@@ -794,7 +828,16 @@ export async function executeGoogleToolkitWrite(
       throw new MetaToolkitRefusal('Negative keywords have no status to change. Use KEYWORD REMOVE to stop excluding it. Nothing was sent.');
     }
     state = { prior };
-    lines.push(`${noun} ${kind === 'keyword' ? keywordLabel(prior) : `"${prior.name ?? prior.resourceName}"`}: ${prior.status} → ${validated.expectedStatus}.`);
+    if (validated.expectedEdit) {
+      // ENG-2959: rename / ad-group max CPC — current vs new, status untouched.
+      const e = validated.expectedEdit;
+      lines.push(`${noun} "${prior.name ?? prior.resourceName}" (status ${prior.status}, unchanged):`);
+      if (e.name !== undefined) lines.push(`Name: "${prior.name ?? ''}" → "${e.name}".`);
+      if (e.cpcBidMicros !== undefined) {
+        const cur = Number.isFinite(prior.cpcBidMicros) ? `${formatMicros(prior.cpcBidMicros, currency)} (= ${prior.cpcBidMicros} micros)` : 'not set';
+        lines.push(`Max CPC: ${cur} → ${formatMicros(e.cpcBidMicros, currency)} (= ${e.cpcBidMicros} micros).`);
+      }
+    } else lines.push(`${noun} ${kind === 'keyword' ? keywordLabel(prior) : `"${prior.name ?? prior.resourceName}"`}: ${prior.status} → ${validated.expectedStatus}.`);
     // Enabling starts spend at the campaign's budget, so the preview names that budget and
     // the ceiling applies to it — otherwise a budget set above the ceiling outside Zoma
     // (or before the ceiling existed) could be switched on here (Hardening, ENG-2823).
