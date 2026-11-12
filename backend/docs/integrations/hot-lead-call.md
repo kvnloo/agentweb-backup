@@ -1059,7 +1059,7 @@ Known limits, accepted:
 
 ENG-2783. The per-org caps bound one org; nothing bounded the platform, so a bug, an abusive org or a spike across many orgs could
 spend Twilio money without limit (each lead call costs real money, at zero margin). The platform ceiling caps the LEADS that get a
-call across ALL orgs per UTC day. It counts the same unit as the org caps (one per lead at its first attempt, a press-2 retry
+call across ALL orgs per UTC day. It counts the same unit as the org caps: leads ATTEMPTED (one per lead at its first attempt; the slot stays taken once a record is created, even if Twilio rejects the call; not calls connected; a press-2 retry
 counts again) and adds no table or index: it is one more counter in the existing limit store (`AW-MCPSessions`).
 
 | Item | Value |
@@ -1069,8 +1069,8 @@ counts again) and adds no table or index: it is one more counter in the existing
 | `HOT_LEAD_CALL_PLATFORM_DAILY_MAX` | positive integer, default **300** leads per UTC day, clamped to 100000. Unset, blank, zero, negative, fractional or non-numeric uses 300 (an invalid value logs one warn per process). Read on every lead, so a changed environment value applies after the instance restarts with it |
 | `HOT_LEAD_CALL_ALERT_EMAIL` | optional operator address for the alert email; unset means log only |
 
-**The default is a starting value.** 300 was chosen by the builder as a conservative number: about $45 a day at roughly $0.15 per lead
-call (member leg plus lead leg, a few minutes, at the $0.014 per minute list rate in [Metering and spend](#metering-and-spend)). It is the
+**The default is a starting value.** 300 was chosen by the builder as a conservative number: about $45 a day at an order-of-$0.15 per-lead
+estimate, not a measurement (about two legs of about 5 minutes at the $0.014 per minute list rate in [Metering and spend](#metering-and-spend); retries, extra members rung and other costs are NOT included). It is the
 owner's to change.
 
 **Counter order.** The phone marker, then the org hourly, daily and monthly counters, then the platform counter LAST. A refusal by any
@@ -1087,14 +1087,14 @@ the first refusal) of the day's cap, once per level per UTC day (claims `hlc#not
   `[hotLeadCall] PLATFORM daily cap 100% <date> used=<n> cap=<n>`;
 - an email to `HOT_LEAD_CALL_ALERT_EMAIL` when set (plain subject and body; counts only, no lead data, phone numbers or org names).
 
-Fire-and-forget (`services/voice/hotLeadCallPlatformAlert.ts`): it never throws and never delays or fails the call. As for the org notice, a
-failed 80% send gives its claim back (retried at the next crossing), a failed 100% send KEEPS it and logs
-`[hotLeadCall] platform cap 100% alert email failed <date>`. To resend by hand, delete the claim row.
+Fire-and-forget (`services/voice/hotLeadCallPlatformAlert.ts`): it never throws and never delays or fails the call. As for the 100% org notice, a
+failed send KEEPS the claim at BOTH levels (releasing the 80% claim would re-log the ERROR marker, and re-fire a paging alarm, on every counted lead during a provider outage), so the ERROR marker logs once per level per day and a failed send logs one warn
+`[hotLeadCall] platform cap 80% alert email failed <date>` / `100% ...`. To resend by hand, delete the claim row.
 
 **What an operator does when it fires.** The 80% marker is a heads-up. The 100% marker means leads are being skipped as
 `platform_daily_cap` until 00:00 UTC. First check whether it is a spike or abuse (count `call.skipped`/`call.initiated` per org for the day;
 one org or one form dominating is abuse, so disable that org's calling, see [Turn it off](#turn-it-off)). If the traffic is genuine, raise
-`HOT_LEAD_CALL_PLATFORM_DAILY_MAX` in the backend environment (Elastic Beanstalk configuration) and redeploy or restart; the next lead is
+`HOT_LEAD_CALL_PLATFORM_DAILY_MAX` in the backend environment's environment variables and restart; the next lead is
 checked against the new value. Skipped leads are not retried or deferred; the Slack alert already told the team, so they call them by hand.
 Customers are not told it is their limit: the only customer-visible trace is the skipped timeline event, and any wording for it says calling is temporarily paused. No customer email is sent for this ceiling.
 

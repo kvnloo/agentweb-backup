@@ -44,7 +44,7 @@ export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = HOT_LEAD_CALL_LIMITS.maxC
 /**
  * Platform-wide ceiling (ENG-2783): leads that get a call per UTC day across ALL orgs. It bounds Twilio spend when a bug, an
  * abusive org or a spike gets past the per-org caps. 300 is a conservative starting value chosen by the builder (about
- * $45/day at roughly $0.15 per lead call, from the Twilio list rates); it is the owner's to change via
+ * $45/day at an order-of-$0.15 per-lead estimate, not a measurement: two legs of about 5 minutes at the $0.014/min list rate, other costs excluded); it is the owner's to change via
  * HOT_LEAD_CALL_PLATFORM_DAILY_MAX, with no deploy of code.
  */
 export const HOT_LEAD_CALL_PLATFORM_DAILY = { default: 300, min: 1, max: 100000 } as const;

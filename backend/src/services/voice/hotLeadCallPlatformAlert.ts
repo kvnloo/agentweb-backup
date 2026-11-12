@@ -6,8 +6,8 @@ import { eightyPercentOf } from './hotLeadCallCapNotices';
  * Operator alert for the platform-wide daily call ceiling (ENG-2783). At 80% and 100% of the cap, once per level per UTC
  * day (claims `hlc#notify#g80#<date>` / `hlc#notify#g100#<date>` in the limit store), it logs an ERROR line carrying a stable
  * marker (the alarm hook) and, when HOT_LEAD_CALL_ALERT_EMAIL is set, emails that address. Same discipline as the org notices
- * (hotLeadCallCapNotices.ts): nothing here throws, the call path does not await it, a failed 80% send gives the claim back
- * (retried at the next crossing), a failed 100% send keeps it. No lead data, phone numbers or org names: counts only.
+ * (hotLeadCallCapNotices.ts): nothing here throws, the call path does not await it, a failed send keeps the claim at both levels
+ * (the marker logs once per level per day). No lead data, phone numbers or org names: counts only.
  */
 
 type Level = 80 | 100;
@@ -17,8 +17,8 @@ export const platformNoticeKey = (level: Level, date: string): string => `hlc#no
 export const platformMarker = (level: Level): string => `[hotLeadCall] PLATFORM daily cap ${level}%`;
 
 const copy = (level: Level, used: number, cap: number, date: string) => level === 80
-  ? { subject: 'Hot-lead calling is at 80% of the platform daily limit', body: `Hot-lead calling has placed ${used} of the platform-wide ${cap} lead calls allowed for ${date} (UTC). Calls to new leads pause at ${cap} until the next UTC day. To raise the limit set HOT_LEAD_CALL_PLATFORM_DAILY_MAX.` }
-  : { subject: 'Hot-lead calling hit the platform daily limit', body: `Hot-lead calling reached the platform-wide limit of ${cap} lead calls for ${date} (UTC). New leads are skipped (reason platform_daily_cap) until the next UTC day. Check for a spike or abuse before raising HOT_LEAD_CALL_PLATFORM_DAILY_MAX.` };
+  ? { subject: 'Hot-lead calling is at 80% of the platform daily limit', body: `Hot-lead calling has attempted ${used} of the platform-wide ${cap} lead calls allowed for ${date} (UTC). Calls to new leads pause at ${cap} until the next UTC day. To raise the limit set HOT_LEAD_CALL_PLATFORM_DAILY_MAX.` }
+  : { subject: 'Hot-lead calling hit the platform daily limit', body: `Hot-lead calling reached the platform-wide limit of ${cap} lead calls attempted for ${date} (UTC). New leads are skipped (reason platform_daily_cap) until the next UTC day. Check for a spike or abuse before raising HOT_LEAD_CALL_PLATFORM_DAILY_MAX.` };
 
 async function sendAlertEmail(subject: string, body: string): Promise<'sent' | 'failed' | 'skipped'> {
   const to = process.env.HOT_LEAD_CALL_ALERT_EMAIL?.trim();
@@ -46,12 +46,9 @@ async function alertOnce(level: Level, used: number, cap: number, now: Date): Pr
     outcome = 'failed';
   }
   if (outcome !== 'failed') return;
-  if (level === 80) {
-    await store.release(key, token); // retried at the next crossing
-  } else {
-    // Kept (as for the org notice): every refused lead would otherwise redo the send during a provider outage. The log line above is the alarm.
-    console.warn(`[hotLeadCall] platform cap 100% alert email failed ${date}`);
-  }
+  // Kept at both levels (as for the 100% org notice): releasing would make every counted lead above 80% redo the send and
+  // re-log the ERROR marker, re-firing a paging alarm, during a provider outage. The ERROR line above is the alarm.
+  console.warn(`[hotLeadCall] platform cap ${level}% alert email failed ${date}`);
 }
 
 /**

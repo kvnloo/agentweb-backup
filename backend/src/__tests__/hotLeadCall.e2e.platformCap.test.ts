@@ -19,7 +19,8 @@ installWorld();
 const DAY1 = (m: number) => `2026-10-19T20:${m}:00.000Z`;
 const DAY2 = '2026-10-20T17:05:00.000Z';
 const submitAt = async (iso: string, id: string, n: number) => { setClock(iso); await submitLead(id, { phone: leadPhone(n) }); };
-const platformMarkers = () => world.consoleSpies[2].mock.calls.map(c => String(c[0])).filter(m => m.includes('PLATFORM daily cap'));
+const errorSpy = () => world.consoleSpies[2]; // consoleSpies = [log, warn, error, info]
+const platformMarkers = () => errorSpy().mock.calls.map(c => String(c[0])).filter(m => m.includes('PLATFORM daily cap'));
 
 beforeEach(() => { process.env.HOT_LEAD_CALL_PLATFORM_DAILY_MAX = '5'; delete process.env.HOT_LEAD_CALL_ALERT_EMAIL; });
 afterEach(() => { delete process.env.HOT_LEAD_CALL_PLATFORM_DAILY_MAX; });

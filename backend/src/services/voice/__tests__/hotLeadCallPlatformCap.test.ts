@@ -218,7 +218,7 @@ describe('notifyPlatformCap', () => {
     expect(JSON.stringify([...warnSpy.mock.calls, ...errorSpy.mock.calls])).not.toContain('ops@example.com');
   });
 
-  it('a failed 100% send keeps the claim (no resend storm); a failed 80% send gives it back for the next crossing', async () => {
+  it('a failed send keeps the claim at both levels (no resend storm, the ERROR marker logs once per level per day)', async () => {
     process.env.HOT_LEAD_CALL_ALERT_EMAIL = 'ops@example.com';
     send.mockResolvedValue('failed');
     await notifyPlatformCap({ cap: 10, now: NOW, event: { kind: 'refused' } });
@@ -227,11 +227,13 @@ describe('notifyPlatformCap', () => {
     expect(limits.claims.has(platformNoticeKey(100, D))).toBe(true);
     expect(markers(warnSpy).some(m => m.includes('platform cap 100% alert email failed'))).toBe(true);
 
+    errorSpy.mockClear();
     await notifyPlatformCap({ cap: 10, now: NOW, event: { kind: 'counted', used: 8 } });
-    expect(limits.claims.has(platformNoticeKey(80, D))).toBe(false);
-    send.mockResolvedValue('sent');
     await notifyPlatformCap({ cap: 10, now: NOW, event: { kind: 'counted', used: 9 } });
+    expect(send).toHaveBeenCalledTimes(2); // one 100% attempt, one 80% attempt
     expect(limits.claims.has(platformNoticeKey(80, D))).toBe(true);
+    expect(markers(errorSpy).filter(m => m.startsWith('[hotLeadCall] PLATFORM daily cap 80%'))).toHaveLength(1);
+    expect(markers(warnSpy).some(m => m.includes('platform cap 80% alert email failed'))).toBe(true);
   });
 
   it('never throws when the limit store fails', async () => {
