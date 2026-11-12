@@ -3842,6 +3842,24 @@ mcpToolRegistry.register({
 
 // ─── Chat History (admin-only) ──────────────────────────────────────────────
 
+const CHAT_HISTORY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** ENG-2972: resolve an optional start/end window (default: trailing 24h ending now). */
+export function resolveChatHistoryWindow(
+  args: any,
+  now: Date = new Date()
+): { start_time: string; end_time: string } | { error: string } {
+  const endRaw = typeof args?.end_time === 'string' && args.end_time.trim() ? args.end_time.trim() : undefined;
+  const startRaw = typeof args?.start_time === 'string' && args.start_time.trim() ? args.start_time.trim() : undefined;
+  const endMs = endRaw ? Date.parse(endRaw) : now.getTime();
+  if (Number.isNaN(endMs)) return { error: `end_time "${endRaw}" is not a valid ISO 8601 timestamp` };
+  const startMs = startRaw ? Date.parse(startRaw) : endMs - CHAT_HISTORY_DEFAULT_WINDOW_MS;
+  if (Number.isNaN(startMs)) return { error: `start_time "${startRaw}" is not a valid ISO 8601 timestamp` };
+  if (startMs >= endMs) return { error: 'start_time must be before end_time' };
+  // Caller-supplied values pass through verbatim; only missing ends are filled.
+  return { start_time: startRaw ?? new Date(startMs).toISOString(), end_time: endRaw ?? new Date(endMs).toISOString() };
+}
+
 mcpToolRegistry.register({
   name: 'get_chat_history',
   definition: {
@@ -3877,11 +3895,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       properties: {
         start_time: {
           type: 'string',
-          description: 'Start time in ISO 8601 format (e.g., "2024-03-01T00:00:00.000Z")'
+          description: 'Start time in ISO 8601 format (e.g., "2024-03-01T00:00:00.000Z"). Optional: defaults to 24 hours before end_time.'
         },
         end_time: {
           type: 'string',
-          description: 'End time in ISO 8601 format (e.g., "2024-03-02T00:00:00.000Z")'
+          description: 'End time in ISO 8601 format (e.g., "2024-03-02T00:00:00.000Z"). Optional: defaults to now.'
         },
         limit: {
           type: 'number',
@@ -3894,15 +3912,16 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
           default: false
         }
       },
-      required: ['start_time', 'end_time']
+      required: []
     }
   },
-  execute: async (args: any, context: any) => {
-    if (!args.start_time || !args.end_time) {
-      return jsonResult({
-        error: 'start_time and end_time are required. Provide ISO 8601 timestamps, e.g. start_time="2024-03-01T00:00:00.000Z"'
-      });
-    }
+  execute: async (rawArgs: any, context: any) => {
+    // ENG-2972: the model routinely calls this with no window ("recent chats"),
+    // and the old required:['start_time','end_time'] rejected those at schema
+    // validation. Default to the trailing 24h ending now instead.
+    const window = resolveChatHistoryWindow(rawArgs);
+    if ('error' in window) return jsonResult({ error: window.error });
+    const args = { ...(rawArgs || {}), start_time: window.start_time, end_time: window.end_time };
     const queryParams = new URLSearchParams({
       startTime: args.start_time,
       endTime: args.end_time,
