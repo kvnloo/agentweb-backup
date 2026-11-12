@@ -28,7 +28,7 @@ import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 
-const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
+export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
