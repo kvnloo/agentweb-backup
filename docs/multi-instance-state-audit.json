@@ -1,0 +1,989 @@
+{
+  "scannedFiles": 1461,
+  "constantLookupsSkipped": 314,
+  "counts": {
+    "auth/session": 7,
+    "oauth-state": 8,
+    "token single-use": 2,
+    "rate-limit": 9,
+    "cache-safe": 50,
+    "unclassified": 56
+  },
+  "findings": [
+    {
+      "file": "controllers/agentModeController.ts",
+      "line": 697,
+      "name": "turnOfGeneration",
+      "kind": "WeakMap",
+      "category": "auth/session"
+    },
+    {
+      "file": "controllers/agentModeController.ts",
+      "line": 773,
+      "name": "recordedRefusals",
+      "kind": "WeakMap",
+      "category": "unclassified"
+    },
+    {
+      "file": "controllers/agentModeController.ts",
+      "line": 1585,
+      "name": "activeSessionGenerations",
+      "kind": "Set",
+      "category": "auth/session"
+    },
+    {
+      "file": "controllers/agentModeController.ts",
+      "line": 1623,
+      "name": "sessionGenerationOwners",
+      "kind": "Map",
+      "category": "auth/session"
+    },
+    {
+      "file": "controllers/agentModeController.ts",
+      "line": 1750,
+      "name": "autoContinuationSessions",
+      "kind": "Set",
+      "category": "auth/session"
+    },
+    {
+      "file": "controllers/assetController.ts",
+      "line": 26,
+      "name": "visitMap",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "controllers/htmlTemplatesController.ts",
+      "line": 36,
+      "name": "fullyMigratedKeys",
+      "kind": "Set",
+      "category": "rate-limit"
+    },
+    {
+      "file": "cron/crmAutoEnrichmentCron.ts",
+      "line": 149,
+      "name": "listsInProgress",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "cron/linkedInConnectionSyncCron.ts",
+      "line": 577,
+      "name": "lastRecheckAtByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "cron/linkedInConnectionSyncCron.ts",
+      "line": 647,
+      "name": "lastFullWalkAtByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "emma/impl/searchResearch.ts",
+      "line": 172,
+      "name": "dataAnalysisConsistencyCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "loops/eval/okareoClient.ts",
+      "line": 37,
+      "name": "OKAREO_SECURITY_CHECKS",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "loops/index.ts",
+      "line": 120,
+      "name": "loops",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "mcp/server/httpClient.ts",
+      "line": 54,
+      "name": "userCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "mcp/server/readEmailTool.ts",
+      "line": 34,
+      "name": "callLog",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "observability/tracing.ts",
+      "line": 107,
+      "name": "activeRunSpans",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "routes/attioAuth.ts",
+      "line": 51,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/calendlyWebhook.ts",
+      "line": 117,
+      "name": "inFlightBookingListResolutions",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "routes/clickupAuth.ts",
+      "line": 59,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/crm.ts",
+      "line": 186,
+      "name": "crmDataFileCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "routes/crmApollo.ts",
+      "line": 66,
+      "name": "bulkEnrichInFlight",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "routes/googleAdsAuth.ts",
+      "line": 41,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/googleDriveAuth.ts",
+      "line": 58,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/landingPageGeneration.ts",
+      "line": 93,
+      "name": "inFlightDefaultListResolutions",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "routes/landingPageGeneration.ts",
+      "line": 311,
+      "name": "generationRateLimitMap",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "routes/landingPageGeneration.ts",
+      "line": 312,
+      "name": "editRateLimitMap",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "routes/landingPages.ts",
+      "line": 50,
+      "name": "cache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "routes/linkedInAdsAuth.ts",
+      "line": 89,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/linkedinAuth.ts",
+      "line": 105,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/loopEvents.ts",
+      "line": 52,
+      "name": "buckets",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "routes/seo.ts",
+      "line": 116,
+      "name": "gaTestCooldown",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "routes/slack.ts",
+      "line": 54,
+      "name": "activeSlackTurns",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "routes/slack.ts",
+      "line": 142,
+      "name": "TRUSTED_EXTERNAL_SLACK_TEAM_IDS",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "routes/socialPosts.ts",
+      "line": 28,
+      "name": "forceReloadCooldown",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "routes/twitterAuth.ts",
+      "line": 41,
+      "name": "pkceSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "routes/youtubeAuth.ts",
+      "line": 65,
+      "name": "tokenSessions",
+      "kind": "Map",
+      "category": "oauth-state"
+    },
+    {
+      "file": "server.ts",
+      "line": 61,
+      "name": "io (Socket.IO server)",
+      "kind": "Socket.IO",
+      "category": "auth/session",
+      "note": "no cross-instance adapter; engine.io sessions are per-process"
+    },
+    {
+      "file": "services/adsThresholds.ts",
+      "line": 262,
+      "name": "THRESHOLD_REGISTRY",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/chatBranching.ts",
+      "line": 424,
+      "name": "inflightKeys",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/agentMode/chatBranching.ts",
+      "line": 425,
+      "name": "recentBranches",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/chatBranching.ts",
+      "line": 427,
+      "name": "branchWindows",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/chatBranching.ts",
+      "line": 429,
+      "name": "lookupWindows",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/chatBranching.ts",
+      "line": 927,
+      "name": "unhealable",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/concurrentGenerationCap.ts",
+      "line": 57,
+      "name": "active",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentMode/deferredBillingMetering.ts",
+      "line": 31,
+      "name": "billingSubjectCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/agentMode/mediaBatchContinuation.ts",
+      "line": 90,
+      "name": "inFlight",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/agentMode/modelComparison.ts",
+      "line": 482,
+      "name": "inFlightCompares",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/agentMode/sandboxTelemetry.ts",
+      "line": 13,
+      "name": "sandboxRunIds",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentToolGatewayService.ts",
+      "line": 254,
+      "name": "runFailureCounts",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/agentToolGatewayService.ts",
+      "line": 258,
+      "name": "pendingRunBudgetReservations",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/apolloService.ts",
+      "line": 269,
+      "name": "memCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/asyncJobQueue.ts",
+      "line": 442,
+      "name": "processors",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/asyncJobQueue.ts",
+      "line": 448,
+      "name": "deleteOnCompleteSources",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/asyncJobQueue.ts",
+      "line": 449,
+      "name": "maxAttemptsBySource",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "services/businessFunnelService.ts",
+      "line": 885,
+      "name": "responseCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/capiSendBudget.ts",
+      "line": 18,
+      "name": "capiSendTimestampsByListId",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/capiSendBudget.ts",
+      "line": 54,
+      "name": "capiAccountPausedUntil",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/codingAgentRunService.ts",
+      "line": 63,
+      "name": "memoryRuns",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/creativeLineage.ts",
+      "line": 217,
+      "name": "userQueues",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/db.ts",
+      "line": 3597,
+      "name": "reportedUnsupportedLegacyScheduleIds",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/dripSendWindow.ts",
+      "line": 61,
+      "name": "formatters",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/emailJobTracker.ts",
+      "line": 43,
+      "name": "_jobs",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/emailProviderService.ts",
+      "line": 134,
+      "name": "providerRegistry",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/enrichSoService.ts",
+      "line": 186,
+      "name": "memCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/enrichmentConfigService.ts",
+      "line": 14,
+      "name": "CANONICAL_FIELD_NAMES",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/enrichmentSpecialists.ts",
+      "line": 53,
+      "name": "REGISTRY",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/enrichmentWaterfall.ts",
+      "line": 105,
+      "name": "apolloInflight",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/enrichmentWaterfall.ts",
+      "line": 107,
+      "name": "enrichSoInflight",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/foreplayService.ts",
+      "line": 67,
+      "name": "boardsCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/foreplayService.ts",
+      "line": 68,
+      "name": "boardAdsCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/foreplayService.ts",
+      "line": 69,
+      "name": "swipefileCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/funding/callFunding.ts",
+      "line": 59,
+      "name": "routingCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/funding/claudeRouteErrors.ts",
+      "line": 101,
+      "name": "toolsRanOf",
+      "kind": "WeakMap",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/funding/runFunding.ts",
+      "line": 102,
+      "name": "seenUnsetRunFundingSites",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/gmailService.ts",
+      "line": 68,
+      "name": "refreshLocks",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/heatScoreService.ts",
+      "line": 38,
+      "name": "ACTIVE_SALES_STATUSES",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/heatScoreService.ts",
+      "line": 43,
+      "name": "QUALIFIED_DEAL_STAGES",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/hubspotService.ts",
+      "line": 147,
+      "name": "refreshLocks",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/journeyAttribution.ts",
+      "line": 403,
+      "name": "emailCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/linkedInConnectionHealth.ts",
+      "line": 192,
+      "name": "siteWideUnknownSinceByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/linkedInWritePacer.ts",
+      "line": 121,
+      "name": "chainByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/linkedInWritePacer.ts",
+      "line": 123,
+      "name": "recentWritesByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/linkedInWritePacer.ts",
+      "line": 129,
+      "name": "queueDepthByAccount",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/liveVoiceService.ts",
+      "line": 166,
+      "name": "activeSessions",
+      "kind": "Map",
+      "category": "auth/session"
+    },
+    {
+      "file": "services/liveVoiceService.ts",
+      "line": 600,
+      "name": "pendingStarts",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/loopDispatchTracker.ts",
+      "line": 120,
+      "name": "fallbackStore",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/loopSlackApprovalDispatcher.ts",
+      "line": 72,
+      "name": "inFlightDispatches",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/messagingChannelService.ts",
+      "line": 109,
+      "name": "registry",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/metaConversionDivergence.ts",
+      "line": 207,
+      "name": "lastAlertAtByUser",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/metaPixelsCache.ts",
+      "line": 37,
+      "name": "cache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/metaTokenRefresh.ts",
+      "line": 64,
+      "name": "inFlightRefreshes",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/metaTrackingMonitor.ts",
+      "line": 628,
+      "name": "lastAlertAtByKey",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/modelRoles.ts",
+      "line": 105,
+      "name": "cache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/modelRoles.ts",
+      "line": 133,
+      "name": "memberships",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/onboardingOrchestratorWiring.ts",
+      "line": 500,
+      "name": "_inFlightReconciles",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/onboardingOrchestratorWiring.ts",
+      "line": 509,
+      "name": "_reconcileRequestedWhileRunning",
+      "kind": "Set",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/onboardingPipelineOrchestrator.ts",
+      "line": 439,
+      "name": "rateLimitState",
+      "kind": "Map",
+      "category": "rate-limit"
+    },
+    {
+      "file": "services/outlookService.ts",
+      "line": 52,
+      "name": "refreshLocks",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/paygOverageService.ts",
+      "line": 120,
+      "name": "lastLivePaymentMethodCheckAt",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/promptTemplatesService.ts",
+      "line": 53,
+      "name": "cache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/sandbox/insightsEngine.ts",
+      "line": 592,
+      "name": "reports",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/sandbox/metaGraphMatcher.ts",
+      "line": 36,
+      "name": "pendingFiles",
+      "kind": "WeakMap",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/sessionTrackingService.ts",
+      "line": 144,
+      "name": "repoLocks",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/slackService.ts",
+      "line": 1196,
+      "name": "displayNameCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/slackService.ts",
+      "line": 1282,
+      "name": "teamIdCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/smartleadEventPoll.ts",
+      "line": 54,
+      "name": "seen",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/smartleadEventPoll.ts",
+      "line": 67,
+      "name": "pendingBounce",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/smartleadEventPoll.ts",
+      "line": 69,
+      "name": "lastPolled",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/smartleadEventPoll.ts",
+      "line": 70,
+      "name": "loggedAt",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/smartleadService.ts",
+      "line": 107,
+      "name": "nextSlotAtByKey",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/smartleadWithdrawal.ts",
+      "line": 39,
+      "name": "failedBefore",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "services/smartleadWithdrawal.ts",
+      "line": 44,
+      "name": "loggedAt",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/specialists/crunchbaseSpecialist.ts",
+      "line": 149,
+      "name": "cbCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/specialists/enrichSoReverseLookup.ts",
+      "line": 28,
+      "name": "inflight",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/spendEnforcementBasis.ts",
+      "line": 112,
+      "name": "missingLogged",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/unipileCompanyService.ts",
+      "line": 87,
+      "name": "memCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/unipileProfileService.ts",
+      "line": 103,
+      "name": "memCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/unipileSearchParamService.ts",
+      "line": 159,
+      "name": "memCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/usageRecorderService.ts",
+      "line": 187,
+      "name": "reportedUnpricedRateKeys",
+      "kind": "Set",
+      "category": "rate-limit"
+    },
+    {
+      "file": "services/usageRecorderService.ts",
+      "line": 276,
+      "name": "billingOwnerCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/v0UsageGuard.ts",
+      "line": 31,
+      "name": "memoryUsage",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "services/voice/leadLocalHours.ts",
+      "line": 77,
+      "name": "overlapMemo",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "utils/agentModeAlerts.ts",
+      "line": 32,
+      "name": "lastAlertAtByKey",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "utils/errorReporter.ts",
+      "line": 95,
+      "name": "dedupCache",
+      "kind": "Map",
+      "category": "cache-safe"
+    },
+    {
+      "file": "utils/keyedMutex.ts",
+      "line": 17,
+      "name": "tails",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "utils/llmPricing.ts",
+      "line": 499,
+      "name": "warnedUnknownModels",
+      "kind": "Set",
+      "category": "cache-safe"
+    },
+    {
+      "file": "utils/metaActionFamilies.ts",
+      "line": 278,
+      "name": "disputedCosts",
+      "kind": "WeakMap",
+      "category": "unclassified"
+    },
+    {
+      "file": "utils/reportIntake.ts",
+      "line": 111,
+      "name": "trackedByScope",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "utils/sseProgress.ts",
+      "line": 11,
+      "name": "progressStore",
+      "kind": "Map",
+      "category": "unclassified"
+    },
+    {
+      "file": "utils/sseProgress.ts",
+      "line": 14,
+      "name": "activeConnections",
+      "kind": "Map",
+      "category": "auth/session"
+    },
+    {
+      "file": "utils/sseProgress.ts",
+      "line": 98,
+      "name": "cancelledSessions",
+      "kind": "Set",
+      "category": "token single-use"
+    },
+    {
+      "file": "workers/generateMarketingResponseWorker.ts",
+      "line": 111,
+      "name": "cancelledRequestIds",
+      "kind": "Set",
+      "category": "token single-use"
+    }
+  ],
+  "resolved": [
+    {
+      "concern": "Gmail OAuth connect tokens",
+      "issue": "ENG-301",
+      "file": "routes/gmailAuth.ts",
+      "note": "held in DynamoDB via services/oauthTokenSessionStore.ts",
+      "line": 10,
+      "status": "resolved"
+    },
+    {
+      "concern": "OAuth token session store (shared)",
+      "issue": "ENG-301",
+      "file": "services/oauthTokenSessionStore.ts",
+      "note": "durable one-time store available to other providers",
+      "line": 121,
+      "status": "resolved"
+    },
+    {
+      "concern": "MCP sessions",
+      "issue": "ENG-114",
+      "file": "mcp/server/mcpSessionStore.ts",
+      "note": "durable MCP session store + rehydration (mcp/server/mcpSessionRehydration.ts)",
+      "line": 1,
+      "status": "resolved"
+    },
+    {
+      "concern": "Zoma preview/confirm tokens",
+      "issue": "ENG-2945",
+      "file": "mcp/zomaWriteGuard.ts",
+      "note": "ConsumedTokenStore interface",
+      "line": 65,
+      "status": "resolved"
+    },
+    {
+      "concern": "Login session",
+      "issue": "-",
+      "file": "controllers/auth.ts",
+      "note": "stateless JWT; no server-side session store",
+      "line": 318,
+      "status": "resolved"
+    },
+    {
+      "concern": "Password-reset tokens",
+      "issue": "-",
+      "file": "controllers/auth.ts",
+      "note": "persisted on the user record, not in process memory",
+      "line": 771,
+      "status": "resolved"
+    }
+  ]
+}
