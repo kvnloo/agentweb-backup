@@ -2959,7 +2959,7 @@ View Session: ${sessionUrl}`;
         `<div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">` +
         `<h2 style="margin-top: 0;">${this.escapeHtml(subject)}</h2>` +
         `<p style="white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(message)}</p></div>`;
-      // sendEmail never throws; only a real send counts (a failed or suppressed one is retried next run).
+      // sendEmail never throws; only a real send counts as sent (a failed or suppressed one returns false).
       const outcome = await this.sendEmail(oncallEmails, `[PROD] ${subject}`, `${subject}\n\n${message}`, html);
       if (outcome !== 'sent') return false;
       console.log(`Oncall email sent to ${oncallEmails.length} recipient(s): ${subject}`);
