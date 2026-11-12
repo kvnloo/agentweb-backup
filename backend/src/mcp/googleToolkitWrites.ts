@@ -37,7 +37,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { resolveZomaImageUrl } from './metaToolkitCreatives';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
 } from './zomaWriteGuard';
 
 export type GoogleReadKind =
@@ -65,7 +65,7 @@ export interface GoogleToolkitWriteDeps {
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
 }
 
 /**
@@ -186,7 +186,7 @@ const defaultDeps: GoogleToolkitWriteDeps = {
   spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
 };
 
 function currencyDigits(currency: string): number {
@@ -864,7 +864,7 @@ export async function executeGoogleToolkitWrite(
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Google Ads state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+  if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
 
