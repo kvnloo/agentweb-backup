@@ -9,14 +9,22 @@
  * loop is metered as feature `agent_task:scheduled:<scheduleId>`), sums each schedule's cost per UTC day, and
  * compares the last complete day with the median of the schedule's previous billed days. A schedule is
  * flagged when that day cost at least MIN_ALERT_USD and at least JUMP_RATIO times its baseline median (with
- * at least MIN_BASELINE_DAYS billed days of history). Flagged schedules go out as ONE oncall digest a day.
+ * at least MIN_BASELINE_DAYS billed days of history). Flagged schedules go out as ONE email a day to the oncall
+ * list (`oncall_emails`), by email only: no Linear issue is filed (owner's choice, 2026-11-12).
  *
  * Read-only: no database writes, no change to any schedule. Registered in server.ts (daily, behind
- * isCronEnabled()). Dedupe is in-process via sendAgentModeOncallAlert, keyed by the evaluated day.
+ * isCronEnabled()). At most one email per evaluated day per process (a redeploy may repeat that day's email).
  */
 
 import { usageRecordDb, type UsageRecordRow } from '../services/usageRecordDb';
-import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { emailService } from '../services/emailService';
+
+/** Evaluated days already emailed by this process. */
+const emailedDays = new Set<string>();
+/** Test hook. */
+export function resetScheduleCostJumpDedupe(): void {
+  emailedDays.clear();
+}
 
 const TAG = '[scheduleCostJumpCron]';
 const FEATURE_PREFIX = 'agent_task:scheduled:';
@@ -154,18 +162,18 @@ export async function runScheduleCostJumpCheck(
       `billing user ${j.billingUserId ?? 'unknown'}, last session ${j.lastSessionId ?? 'unknown'}`)
     .join('\n');
 
+  if (emailedDays.has(day)) {
+    console.log(`${TAG} ${day}: ${jumps.length} schedule cost jump(s), already emailed by this process`);
+    return summary;
+  }
   try {
-    summary.alertSent = await sendAgentModeOncallAlert({
-      subject: `${jumps.length} scheduled run${jumps.length === 1 ? '' : 's'} cost ${JUMP_RATIO}x+ more than usual on ${day}`,
-      message:
-        `These schedules cost at least ${JUMP_RATIO}x their usual daily cost (median of the previous ` +
-        `${BASELINE_DAYS} days) and at least $${MIN_ALERT_USD} on ${day} (ENG-2743). Scheduled runs have no ` +
-        `per-run cost cap yet (ENG-2812), so check whether each is real work or a loop / model change:\n\n${lines}`,
-      dedupeKey: `schedule-cost-jump:${day}`,
-      dedupeWindowMs: SCHEDULE_COST_JUMP_INTERVAL_MS,
-      context: { day, jumps: jumps.length },
-      now,
-    });
+    summary.alertSent = await emailService.sendOncallEmailOnly(
+      `${jumps.length} scheduled run${jumps.length === 1 ? '' : 's'} cost ${JUMP_RATIO}x+ more than usual on ${day}`,
+      `These schedules cost at least ${JUMP_RATIO}x their usual daily cost (median of the previous ` +
+      `${BASELINE_DAYS} days) and at least $${MIN_ALERT_USD} on ${day} (ENG-2743). Scheduled runs have no ` +
+      `per-run cost cap yet (ENG-2812), so check whether each is real work or a loop / model change:\n\n${lines}`,
+    );
+    if (summary.alertSent) emailedDays.add(day);
   } catch (error) {
     console.error(`${TAG} Failed to send the alert:`, (error as Error)?.message);
   }

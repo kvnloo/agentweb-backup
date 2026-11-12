@@ -3,19 +3,20 @@
  * daily digest; normal days, cheap schedules and new schedules page nobody.
  */
 jest.mock('../../services/usageRecordDb', () => ({ usageRecordDb: { scanByDateRange: jest.fn() } }));
-jest.mock('../../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn(async () => true) }));
+jest.mock('../../services/emailService', () => ({ emailService: { sendOncallEmailOnly: jest.fn(async () => true) } }));
 
 import type { UsageRecordRow } from '../../services/usageRecordDb';
-import { sendAgentModeOncallAlert } from '../../utils/agentModeAlerts';
+import { emailService } from '../../services/emailService';
 import {
   findScheduleCostJumps,
   median,
+  resetScheduleCostJumpDedupe,
   runScheduleCostJumpCheck,
   totalsBySchedule,
   utcDay,
 } from '../scheduleCostJumpCron';
 
-const alert = sendAgentModeOncallAlert as jest.Mock;
+const alert = emailService.sendOncallEmailOnly as jest.Mock;
 const NOW = Date.parse('2026-11-12T06:00:00.000Z'); // evaluated day = 2026-11-11
 const DAY = '2026-11-11';
 
@@ -41,7 +42,7 @@ function history(scheduleId: string, usd: number, days = 7): UsageRecordRow[] {
   return Array.from({ length: days }, (_, i) => row(scheduleId, utcDay(Date.parse(`${DAY}T00:00:00Z`), -(i + 1)), usd));
 }
 
-beforeEach(() => { alert.mockClear(); alert.mockResolvedValue(true); });
+beforeEach(() => { alert.mockClear(); alert.mockResolvedValue(true); resetScheduleCostJumpDedupe(); });
 
 describe('findScheduleCostJumps', () => {
   it('flags a schedule that cost at least 2x its baseline median and at least $3', () => {
@@ -146,12 +147,23 @@ describe('runScheduleCostJumpCheck', () => {
     expect(read).toHaveBeenCalledWith('2026-11-04', DAY);
     expect(s).toEqual({ day: DAY, rowsRead: 16, jumps: 1, alertSent: true });
     expect(alert).toHaveBeenCalledTimes(1);
-    const a = alert.mock.calls[0][0];
-    expect(a.subject).toContain('1 scheduled run cost 2x+ more than usual on 2026-11-11');
-    expect(a.message).toContain('schedule a: $12.60 on 2026-11-11 (231 calls), 2.3x its median of $5.60/day over 7 prior day(s)');
-    expect(a.dedupeKey).toBe('schedule-cost-jump:2026-11-11');
-    expect(a.dedupeWindowMs).toBe(24 * 60 * 60 * 1000);
-    expect(a.now).toBe(NOW);
+    const [subject, message] = alert.mock.calls[0];
+    expect(subject).toBe('1 scheduled run cost 2x+ more than usual on 2026-11-11');
+    expect(message).toContain('schedule a: $12.60 on 2026-11-11 (231 calls), 2.3x its median of $5.60/day over 7 prior day(s)');
+  });
+
+  it('emails a given day at most once per process, and retries a day whose email was not sent', async () => {
+    const rows = async () => [...history('a', 2), row('a', DAY, 9)];
+    alert.mockResolvedValueOnce(false);
+    expect((await runScheduleCostJumpCheck(NOW, rows)).alertSent).toBe(false);
+    expect((await runScheduleCostJumpCheck(NOW, rows)).alertSent).toBe(true);
+    expect((await runScheduleCostJumpCheck(NOW, rows)).alertSent).toBe(false);
+    expect(alert).toHaveBeenCalledTimes(2);
+    // The next day is a new digest.
+    const next = Date.parse('2026-11-13T06:00:00.000Z');
+    const nextRows = async () => [...history('a', 2).map(r => ({ ...r, date: utcDay(Date.parse(`${r.date}T00:00:00Z`), 1) })), row('a', '2026-11-12', 9)];
+    expect((await runScheduleCostJumpCheck(next, nextRows)).alertSent).toBe(true);
+    expect(alert).toHaveBeenCalledTimes(3);
   });
 
   it('sends nothing on a normal day', async () => {
