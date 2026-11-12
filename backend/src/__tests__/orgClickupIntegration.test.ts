@@ -344,6 +344,89 @@ describe("ClickUp org-wide integration", () => {
     });
   });
 
+  // ── ENG-2935: personal token must not stay invisible to the org ───────────
+  describe("Personal token promotion (ENG-2935)", () => {
+    afterEach(() => {
+      delete mockUsers[OWNER_USER_ID].secrets;
+      delete mockUsers[MEMBER_USER_ID].secrets;
+    });
+
+    it("owner with only a personal token: GET /status promotes it to the org", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ connected: true, scope: "org", promoted: true });
+      expect(mockSetOrgSecret).toHaveBeenCalledWith(ORG_ID, "clickup_access_token", `encrypted:personal-tok:${ORG_ID}`);
+
+      // A teammate with no personal token now resolves the shared token.
+      currentUserId = MEMBER_USER_ID;
+      const teammate = await request(app).get("/api/clickup/status");
+      expect(teammate.body).toMatchObject({ connected: true, scope: "org" });
+    });
+
+    it("never overwrites an org token that already exists", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "org" });
+      expect(res.body.promoted).toBeUndefined();
+      expect(mockSetOrgSecret).not.toHaveBeenCalled();
+    });
+
+    it("does not overwrite a token an admin saved between the status read and the write", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+      mockGetOrgSecret.mockResolvedValueOnce(`encrypted:raced-tok:${ORG_ID}`);
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "org" });
+      expect(mockSetOrgSecret).not.toHaveBeenCalled();
+    });
+
+    it("plain member with a personal token: not promoted, told it is not shared", async () => {
+      currentUserId = MEMBER_USER_ID;
+      mockUsers[MEMBER_USER_ID].secrets = { clickup_access_token: `encrypted:member-tok:${MEMBER_USER_ID}` };
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: false });
+      expect(mockSetOrgSecret).not.toHaveBeenCalled();
+    });
+
+    it("promotion write failure is reported to the client instead of swallowed", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}` };
+      mockSetOrgSecret.mockRejectedValueOnce(new Error("dynamo down"));
+
+      const res = await request(app).get("/api/clickup/status");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ connected: true, scope: "personal", canShare: true });
+      expect(res.body.shareError).toMatch(/could not be shared/i);
+    });
+
+    it("owner disconnect also clears their personal token so status does not stay connected", async () => {
+      currentUserId = OWNER_USER_ID;
+      mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
+      mockUsers[OWNER_USER_ID].secrets = { clickup_access_token: `encrypted:personal-tok:${OWNER_USER_ID}`, other: "keep" };
+
+      const res = await request(app).post("/api/clickup/disconnect").send({});
+
+      expect(res.status).toBe(200);
+      expect(mockRemoveOrgSecret).toHaveBeenCalledWith(ORG_ID, "clickup_access_token");
+      expect(mockUpdateUser).toHaveBeenCalledWith(OWNER_USER_ID, { secrets: { other: "keep" } });
+      const status = await request(app).get("/api/clickup/status");
+      expect(status.body).toEqual({ connected: false, workspaces: [] });
+    });
+  });
+
   // ── getAccessToken resolution order ──────────────────────────────────────
   describe("getAccessToken() resolution", () => {
     // Import AFTER mocks are in place
