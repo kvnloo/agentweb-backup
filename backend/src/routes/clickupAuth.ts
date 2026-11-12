@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, orgDb } from '../services/db';
-import { encryptPassword } from '../utils/crypto';
+import { encryptPassword, decryptPassword } from '../utils/crypto';
 import { getAccessToken, getWorkspaces, listDocs, listTasks } from '../services/clickupService';
 import { getClickUpConfig } from '../config/integrations';
 import { canEditItem } from '../services/orgShareService';
@@ -85,39 +85,29 @@ const retrieveTokenSession = (sessionId: string, userId: string): string | null 
 // Org sharing of a personal token (ENG-2935)
 // ============================================
 // getAccessToken falls back to the caller's personal token when the org has none,
-// so an org admin who connected before joining (or before org-level storage
-// existed) looks "connected" while every teammate sees nothing. On status load,
-// promote the admin's working token to the org if — and only if — the org has none.
+// so an org admin who connected personally looks "connected" while every teammate
+// sees nothing. /status only REPORTS this (read-only). Sharing is an explicit,
+// admin-confirmed action (POST /share-with-org): copying a token org-wide lets
+// every member read — and act through Emma — as that person, so it is never
+// done silently.
 
-type ClickUpScope = 'solo' | 'org' | 'personal';
-interface ClickUpSharing { scope: ClickUpScope; promoted?: boolean; canShare?: boolean; shareError?: string }
+interface ClickUpSharing { scope?: 'solo' | 'org' | 'personal'; canShare?: boolean }
 
-async function resolveSharing(userId: string, accessToken: string): Promise<ClickUpSharing> {
-  const user = await userDb.getUserById(userId);
-  const orgId = user?.orgId;
-  if (!orgId) return { scope: 'solo' };
-
-  const org = await orgDb.getOrgById(orgId);
-  if ((org?.secrets as Record<string, string> | undefined)?.clickup_access_token) return { scope: 'org' };
-
-  const userLike = { userId, orgId, orgRole: user?.orgRole as 'owner' | 'member' | undefined };
-  if (!canEditItem({ userId: org?.ownerUserId }, userLike, org, orgId, 'knowledgeBase')) {
-    return { scope: 'personal', canShare: false };
-  }
-
+async function resolveSharing(userId: string): Promise<ClickUpSharing> {
   try {
-    // Re-check immediately before writing so a concurrent admin connect is never overwritten.
-    if (await orgDb.getOrgSecret(orgId, 'clickup_access_token')) return { scope: 'org' };
-    await orgDb.setOrgSecret(orgId, 'clickup_access_token', encryptPassword(accessToken, orgId));
-    console.log(`[ClickUp] Promoted personal token to org ${orgId} for user ${userId}`);
-    return { scope: 'org', promoted: true };
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+    if (!orgId) return { scope: 'solo' };
+
+    const org = await orgDb.getOrgById(orgId);
+    if ((org?.secrets as Record<string, string> | undefined)?.clickup_access_token) return { scope: 'org' };
+
+    const userLike = { userId, orgId, orgRole: user?.orgRole as 'owner' | 'member' | undefined };
+    return { scope: 'personal', canShare: canEditItem({ userId: org?.ownerUserId }, userLike, org, orgId, 'knowledgeBase') };
   } catch (error: any) {
-    console.error(`[ClickUp] Failed to promote personal token to org ${orgId}:`, error?.message);
-    return {
-      scope: 'personal',
-      canShare: true,
-      shareError: 'Your ClickUp connection could not be shared with your organization. Please reconnect ClickUp.',
-    };
+    // Sharing info is advisory; a lookup failure must not turn a working connection into "disconnected".
+    console.warn('[ClickUp Status] Could not resolve sharing scope:', error?.message);
+    return {};
   }
 }
 
@@ -342,12 +332,64 @@ router.get('/status', authenticateToken, async (req: any, res) => {
     // Verify token by fetching workspaces
     const workspaces = await getWorkspaces(accessToken);
 
-    const sharing = await resolveSharing(userId, accessToken);
-    res.json({ connected: true, workspaces, ...sharing });
+    res.json({ connected: true, workspaces, ...(await resolveSharing(userId)) });
   } catch (error: any) {
     console.warn('[ClickUp Status] Error checking status:', error.message);
-    // If the token is invalid, report disconnected
-    res.json({ connected: false, workspaces: [] });
+    // Tell the client WHY it is disconnected: ClickUp refusing the token (re-connect) is
+    // not the same as ClickUp or our lookup being unavailable (try again later).
+    const httpStatus = error?.response?.status;
+    const reason = httpStatus === 401 || httpStatus === 403 ? 'invalid_token' : 'unavailable';
+    res.json({ connected: false, workspaces: [], reason });
+  }
+});
+
+// ============================================
+// POST /share-with-org — explicit: make the caller's personal token the org's connection
+// ============================================
+router.post('/share-with-org', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+
+  try {
+    const user = await userDb.getUserById(userId);
+    const orgId = user?.orgId;
+    if (!orgId) return res.status(400).json({ error: 'You are not part of an organization.' });
+
+    const org = await orgDb.getOrgById(orgId);
+    const userLike = { userId, orgId, orgRole: user?.orgRole as 'owner' | 'member' | undefined };
+    if (!canEditItem({ userId: org?.ownerUserId }, userLike, org, orgId, 'knowledgeBase')) {
+      return res.status(403).json({ error: 'Only org admins or KB editors can share ClickUp with the org' });
+    }
+
+    const personal = (user?.secrets as Record<string, string> | undefined)?.clickup_access_token;
+    if (!personal) return res.status(400).json({ error: 'You have no personal ClickUp connection to share.' });
+
+    let token: string;
+    try {
+      token = decryptPassword(personal).password;
+    } catch {
+      return res.status(400).json({ error: 'Your ClickUp connection is unreadable. Please reconnect ClickUp.' });
+    }
+
+    try {
+      await getWorkspaces(token);
+    } catch (apiError: any) {
+      const status = apiError?.response?.status;
+      if (status === 401 || status === 403) {
+        return res.status(400).json({ error: 'ClickUp rejected your saved token. Please reconnect ClickUp, then share it.' });
+      }
+      return res.status(502).json({ error: 'ClickUp is not responding. Please try again in a few minutes.' });
+    }
+
+    const wrote = await orgDb.setOrgSecretIfAbsent(orgId, 'clickup_access_token', encryptPassword(token, orgId));
+    if (!wrote) {
+      return res.status(409).json({ error: 'Your organization already has a ClickUp connection.', alreadyShared: true });
+    }
+
+    console.log(`[ClickUp] Personal token shared with org ${orgId} by user ${userId}`);
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error('[ClickUp /share-with-org]', error);
+    res.status(500).json({ error: 'Failed to share ClickUp with your organization' });
   }
 });
 
@@ -440,11 +482,17 @@ router.post('/disconnect', authenticateToken, async (req: any, res) => {
 
       await orgDb.removeOrgSecret(orgId, 'clickup_access_token');
       // Also drop the caller's personal token; otherwise getAccessToken falls back to it
-      // and ClickUp keeps showing as connected after the admin disconnects.
+      // and ClickUp keeps showing as connected after the admin disconnects. Both steps are
+      // idempotent, so if this one fails the client can simply retry Disconnect.
       const personalSecrets = (user?.secrets as Record<string, string>) || {};
       if (personalSecrets.clickup_access_token) {
         const { clickup_access_token: _drop, ...rest } = personalSecrets;
-        await userDb.updateUser(userId, { secrets: rest });
+        try {
+          await userDb.updateUser(userId, { secrets: rest });
+        } catch (error: any) {
+          console.error('[ClickUp Disconnect] Org token removed but personal token removal failed:', error);
+          return res.status(500).json({ error: 'Disconnect only partly completed. Please click Disconnect again.' });
+        }
       }
       console.log(`[ClickUp Disconnect] Token removed for org ${orgId} by user ${userId}`);
       return res.json({ success: true });
