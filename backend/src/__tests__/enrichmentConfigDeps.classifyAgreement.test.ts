@@ -38,6 +38,17 @@ describe('agreeingClassifications', () => {
     expect(merged.q.dependencies).toEqual(['employee_count', 'industry', 'funding_stage']);
   });
 
+  it('keeps a paid contact dependency (email, phone) only when both samples name it', () => {
+    // A dependency missing from the config is fetched for every lead; an email fetch can reach the paid
+    // Apollo email waterfall, so one sample's guess is not enough (ENG-2720 review follow-up).
+    const oneSided = agreeingClassifications({ q: smart(['title', 'Email']) }, { q: smart(['title', 'phone']) });
+    expect(oneSided.q.dependencies).toEqual(['title']);
+    const bothNameIt = agreeingClassifications({ q: smart(['email', 'title']) }, { q: smart(['EMAIL', 'phone']) });
+    expect(bothNameIt.q.dependencies).toEqual(['email', 'title']);
+    const bothPhone = agreeingClassifications({ q: smart(['phone']) }, { q: smart(['phone', 'industry']) });
+    expect(bothPhone.q.dependencies).toEqual(['phone', 'industry']);
+  });
+
   it('keeps a smart field that names no dependencies (the evaluator also gets the lead\'s own columns)', () => {
     expect(agreeingClassifications({ q: smart([]) }, { q: smart([]) })).toEqual({ q: smart([]) });
   });

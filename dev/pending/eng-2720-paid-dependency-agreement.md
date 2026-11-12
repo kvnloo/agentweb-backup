@@ -1,0 +1,3 @@
+## ENG-2720 follow-up: paid smart-field dependencies need both samples (2026-11-12)
+
+Smart-field classification asks the model twice and keeps a field only when both samples agree (PR #3900). The agreed field's dependencies were the union of both samples. A dependency that is not already a column in the config is fetched for every lead, and an `email` fetch can reach the paid Apollo email waterfall (~$0.445 per emailless lead), so one sample's extra `email` cost money on every run. `agreeingClassifications` now keeps `email` and `phone` only when both samples name them; other dependencies stay a union. Found by the final independent review of #3900 (low).

@@ -87,9 +87,12 @@ const normalizedSet = (values: unknown): string[] =>
 /**
  * Keeps, per field, only a classification both samples agree on: the same smart flag, the same type and,
  * for an enum, the same set of options. A smart field keeps the dependencies named by either sample (a
- * missing input is worse than an extra one); none is fine, the evaluator also gets the lead's own columns.
- * Fields missing from either sample are dropped.
+ * missing input is worse than an extra one), except the paid contact fields in PAID_DEPENDENCIES: a dependency
+ * missing from the config is fetched for every lead, and an `email` fetch can reach the paid Apollo email
+ * waterfall, so those are kept only when both samples name them. None is fine, the evaluator also gets the
+ * lead's own columns. Fields missing from either sample are dropped.
  */
+const PAID_DEPENDENCIES: ReadonlySet<string> = new Set(['email', 'phone']);
 export function agreeingClassifications(
   a: Record<string, SmartFieldClassification>,
   b: Record<string, SmartFieldClassification>,
@@ -101,7 +104,10 @@ export function agreeingClassifications(
     if (!!x.isSmartField !== !!y.isSmartField || (x.fieldType ?? null) !== (y.fieldType ?? null)) continue;
     if (x.fieldType === 'enum' && normalizedSet(x.enumOptions).join('\u0000') !== normalizedSet(y.enumOptions).join('\u0000')) continue;
     if (!x.isSmartField) { out[name] = x; continue; }
-    out[name] = { ...x, dependencies: [...new Set([...normalizedSet(x.dependencies), ...normalizedSet(y.dependencies)])] };
+    const depsX = normalizedSet(x.dependencies);
+    const depsY = new Set(normalizedSet(y.dependencies));
+    const union = [...new Set([...depsX, ...depsY])];
+    out[name] = { ...x, dependencies: union.filter(d => !PAID_DEPENDENCIES.has(d) || (depsX.includes(d) && depsY.has(d))) };
   }
   return out;
 }
