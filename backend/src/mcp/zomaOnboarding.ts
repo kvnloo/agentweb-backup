@@ -51,8 +51,20 @@ export interface ZomaReadiness {
   email?: string;
   payment: { ready: boolean; link?: string; error?: string };
   meta: { ready: boolean; accounts: ZomaMetaAccountSummary[]; link?: string };
-  /** ENG-2823: present only while the Google Ads provider is enabled (ZOMA_GOOGLE_ADS_ENABLED). */
-  google_ads?: { ready: boolean; accounts: ZomaGoogleAdsAccountSummary[]; link?: string; writes_enabled: boolean };
+  /**
+   * ENG-2823/ENG-2973: always present. While the Google Ads provider is disabled
+   * (ZOMA_GOOGLE_ADS_ENABLED off) it is `{ available: false, ready: false, accounts: [],
+   * writes_enabled: false, reason: 'google_ads_provider_disabled' }` so callers can tell
+   * "not offered on this deployment" apart from a missing field.
+   */
+  google_ads: {
+    available: boolean;
+    ready: boolean;
+    accounts: ZomaGoogleAdsAccountSummary[];
+    link?: string;
+    writes_enabled: boolean;
+    reason?: 'google_ads_provider_disabled';
+  };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
   next_step: string | null;
@@ -202,13 +214,17 @@ export async function getZomaReadiness(
   if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
 
   const writes_enabled = payment.ready && meta.ready;
-  const readiness: ZomaReadiness = { email: user.email, payment, meta, writes_enabled, next_step: null };
+  const readiness: ZomaReadiness = {
+    email: user.email, payment, meta, writes_enabled, next_step: null,
+    google_ads: { available: false, ready: false, accounts: [], writes_enabled: false, reason: 'google_ads_provider_disabled' },
+  };
 
   // ENG-2823: Google Ads is provider #2. Connecting either platform is enough to use Zoma;
   // a missing one is offered with its own connect link but is not a required next step.
   if ((deps.googleEnabled ?? googleToolkitEnabled)()) {
     const google = usableAccounts(allAccounts, GOOGLE_ADS_PROVIDER, deps.now());
-    const g: NonNullable<ZomaReadiness['google_ads']> = {
+    const g: ZomaReadiness['google_ads'] = {
+      available: true,
       ready: google.length > 0,
       accounts: google.map(summarizeGoogle),
       writes_enabled: payment.ready && google.length > 0,
@@ -226,7 +242,8 @@ export async function getZomaReadiness(
   return readiness;
 }
 
-function nextStep(payment: ZomaReadiness['payment'], meta: ZomaReadiness['meta'], google?: ZomaReadiness['google_ads']): string | null {
+function nextStep(payment: ZomaReadiness['payment'], meta: ZomaReadiness['meta'], googleAds: ZomaReadiness['google_ads']): string | null {
+  const google = googleAds.available ? googleAds : undefined;
   if (!payment.ready) {
     if (payment.error) return payment.error;
     return [
@@ -253,8 +270,8 @@ export function formatZomaStatus(r: ZomaReadiness): string {
     `  ${box(r.payment.ready)} Payment method on file`,
     `  ${box(r.meta.ready)} Meta ad account connected${
       r.meta.accounts.length ? ` (${r.meta.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})` : ''
-    }${!r.meta.ready && r.google_ads?.ready && r.meta.link ? ` → ${r.meta.link}` : ''}`,
-    ...(r.google_ads
+    }${!r.meta.ready && r.google_ads.available && r.google_ads.ready && r.meta.link ? ` → ${r.meta.link}` : ''}`,
+    ...(r.google_ads.available
       ? [`  ${box(r.google_ads.ready)} Google Ads account connected${
         r.google_ads.accounts.length
           ? ` (${r.google_ads.accounts.map((a) => `${a.customer_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})`
