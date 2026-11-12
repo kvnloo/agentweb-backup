@@ -12730,6 +12730,43 @@ export const orgDb = {
   },
 
   /**
+   * Write an org secret only if that key is not already set — the check and the
+   * write are one conditional update, so a concurrent writer is never clobbered.
+   * Returns false when the key already exists.
+   */
+  async setOrgSecretIfAbsent(orgId: string, key: string, encryptedValue: string): Promise<boolean> {
+    const names = { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" };
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_exists(#secrets) AND attribute_not_exists(#secrets.#key)",
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: { ":val": encryptedValue, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code !== "ConditionalCheckFailedException") throw err;
+    }
+    // Either the key exists (done) or the secrets map is missing (create it, still conditionally).
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_not_exists(#secrets)",
+        ExpressionAttributeNames: { "#secrets": "secrets", "#updatedAt": "updatedAt" },
+        ExpressionAttributeValues: { ":secretsMap": { [key]: encryptedValue }, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  },
+
+  /**
    * Retrieve a single encrypted secret from the org record.
    * Returns null if the org doesn't exist or the key is absent.
    */
