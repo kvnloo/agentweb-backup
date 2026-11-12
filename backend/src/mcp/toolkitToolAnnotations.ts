@@ -102,6 +102,7 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
 /** Tools that are not read-only but whose effect is narrower than the conservative default. */
 const EXPLICIT_ANNOTATIONS: Readonly<Record<string, ToolkitToolAnnotations>> = Object.freeze({
   // Explains an error code from a static table; makes no Meta call.
+  ads_get_help_article: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   ads_get_errors: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   // Reads this user's own usage record; talks to no outside service.
   zoma_usage: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
