@@ -4,6 +4,7 @@ import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import type { DynamoAttributeMap, DynamoAttributeValue } from '../loops/core/ports';
 import { userDb } from './db';
 import { normalizeProduct, validateRef, type JourneyProduct } from './journeyAttribution';
+import { isDatabricksRedirectUri } from '../mcp/zomaDatabricksReadOnly';
 
 export const EMMA_MCP_LOOP_ID = 'emma-mcp';
 export const EVT_MCP_OAUTH_STARTED = 'mcp_oauth_started';
@@ -766,9 +767,16 @@ export function classifyMcpClient(input: {
   const redirectUri = cleanString(input.redirectUri)?.toLowerCase() ?? '';
   const haystack = `${clientName} ${userAgent} ${redirectUri}`;
 
-  // ENG-2747: Databricks registers its OAuth client as "Databricks" with a *.databricks.com redirect.
-  // Checked first: a Databricks agent may run any model, so a model name elsewhere must not win.
-  if (haystack.includes('databricks')) return 'databricks';
+  // ENG-2747: Databricks registers its OAuth client through DCR as "Databricks" with a redirect on a
+  // Databricks host. Checked first (a Databricks agent may run any model, so a model name elsewhere
+  // must not win), but never for aw_ key callers, which stay in the api_key bucket. The redirect
+  // uses the same host test as the Zoma read-only gate, so analytics and access agree.
+  if (
+    input.authMethod !== 'api_key' &&
+    (clientName === 'databricks' || (redirectUri !== '' && isDatabricksRedirectUri(redirectUri)))
+  ) {
+    return 'databricks';
+  }
 
   if (haystack.includes('claude-code') || haystack.includes('claude code') || haystack.includes('claudecode')) {
     return 'claude_code';
