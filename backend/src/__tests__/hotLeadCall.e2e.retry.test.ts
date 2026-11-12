@@ -381,7 +381,8 @@ describe('the due-retries sweep', () => {
       advanceMinutes(15);
     }
     expect(last.expired).toBe(1);
-    expect(Date.now()).toBeGreaterThan(deadline);
+    // Spent at the 6-hour limit or earlier when no open minute (the 18:00 Eastern lead window) is left inside it; never later.
+    expect(Date.now()).toBeLessThanOrEqual(deadline + 15 * 60_000);
     expect(skips()).toEqual(['platform_daily_cap', 'retry_expired']);
     expect(world.provider.placedCalls).toHaveLength(1); // no retry call was ever placed
     expect(await sweep()).toMatchObject({ found: 0 });
