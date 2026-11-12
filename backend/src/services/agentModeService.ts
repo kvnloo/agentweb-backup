@@ -41,6 +41,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -4381,6 +4382,21 @@ export class AgentModeService {
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
+
+        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
+        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        recordSessionBreakerShadowTurn({
+          sessionId,
+          userId,
+          billingUserId,
+          isScheduled: isScheduledSession,
+          costUsd: () => {
+            const usage: any = (response as any)?.usage;
+            if (!usage) return 0;
+            if (typeof usage.cost === 'number') return usage.cost;
+            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+          },
+        });
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
