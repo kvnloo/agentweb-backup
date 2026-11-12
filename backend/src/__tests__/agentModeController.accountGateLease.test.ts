@@ -109,10 +109,6 @@ jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue(undefined),
-}));
-
 jest.mock('../services/skillService', () => ({
   skillService: { getPublishedSkills: jest.fn().mockResolvedValue([]) },
 }));

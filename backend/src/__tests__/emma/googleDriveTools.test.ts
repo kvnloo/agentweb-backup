@@ -6,7 +6,6 @@
 
 // ── Mocks BEFORE imports ─────────────────────────────────────────────────────
 
-jest.mock('../../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../../services/resendService', () => ({
   resendService: { sendEmail: jest.fn().mockResolvedValue(undefined) },
 }));
@@ -161,6 +160,76 @@ describe('read_google_doc — URL parsing', () => {
       { userId: USER },
     );
     expect(mockReadGoogleFileById).toHaveBeenCalledWith('abc123XYZ_-', USER);
+  });
+
+  it('refuses a non-Google URL without calling Drive (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://luma.com/event/manage/evt-2y21s7TrBoMkWKw/guests' },
+      { userId: USER },
+    );
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/read_google_doc only reads Google files/);
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
+  it('refuses a google.com subdomain outside the three hosts, as a by-design block (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://unrelated.docs.google.com/page' },
+      { userId: USER },
+    );
+    expect(result.success).toBe(false);
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toBe('non_google_url');
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
+  it('refuses a scheme-less non-Google link without calling Drive (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'luma.com/event/manage/evt-2y21s7TrBoMkWKw/guests' },
+      { userId: USER },
+    );
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/read_google_doc only reads Google files/);
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
+  it('accepts a scheme-less docs.google.com link (ENG-2907)', async () => {
+    mockReadGoogleFileById.mockResolvedValue({ success: true });
+    const tool = await getTool('read_google_doc');
+    await tool.execute({ url_or_id: 'docs.google.com/document/d/D9/edit' }, { userId: USER });
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('D9', USER);
+  });
+
+  it('unwraps a google.com/url redirect to a Docs link (ENG-2907, Opslane P2)', async () => {
+    mockReadGoogleFileById.mockResolvedValue({ success: true });
+    const tool = await getTool('read_google_doc');
+    await tool.execute(
+      { url_or_id: 'https://www.google.com/url?q=https://docs.google.com/document/d/R1/edit&sa=D' },
+      { userId: USER },
+    );
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('R1', USER);
+  });
+
+  it('still refuses a google.com/url redirect to a non-Google link (ENG-2907)', async () => {
+    const tool = await getTool('read_google_doc');
+    const result = await tool.execute(
+      { url_or_id: 'https://www.google.com/url?q=https://luma.com/event/x' },
+      { userId: USER },
+    );
+    expect(result.reason).toBe('non_google_url');
+    expect(mockReadGoogleFileById).not.toHaveBeenCalled();
+  });
+
+  it('still accepts docs/sheets/drive.google.com URLs (ENG-2907)', async () => {
+    mockReadGoogleFileById.mockResolvedValue({ success: true });
+    const tool = await getTool('read_google_doc');
+    await tool.execute({ url_or_id: 'https://sheets.google.com/spreadsheets/d/S1/edit' }, { userId: USER });
+    await tool.execute({ url_or_id: 'https://drive.google.com/file/d/F1/view' }, { userId: USER });
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('S1', USER);
+    expect(mockReadGoogleFileById).toHaveBeenCalledWith('F1', USER);
   });
 
   it('uses the raw value as-is when no /d/<id> pattern is present', async () => {

@@ -40,7 +40,7 @@ const at = (hhmmCdt: string) => new Date(Date.parse(`2026-10-19T${hhmmCdt}:00-05
 
 const baseConfig = {
   enabled: true, team: referenceTeam(), twilioNumber: '+14155550111', announcedName: 'Acme Plumbing',
-  callingHours: { start: '09:00', end: '18:00', timezone: 'America/Chicago' }, maxAttemptsPerLead: 3, maxAgeMinutes: 30,
+  callingHours: { start: '09:00', end: '17:00', timezone: 'America/Chicago' }, maxAttemptsPerLead: 3, maxAgeMinutes: 30,
 };
 
 let provider: FakeVoiceProvider;
@@ -62,10 +62,10 @@ async function firstAttemptEnds(outcome = 'member_no_answer'): Promise<HotLeadCa
   if (!ended) throw new Error(`the first attempt did not reach member_ringing: ${ringing.state}`);
   return store.record!;
 }
-/** A first attempt fifteen minutes before the calling hours close at 18:00. */
+/** A first attempt fifteen minutes before the calling hours close at 17:00 (18:00 Eastern, when the lead-local window closes too, ENG-2783). */
 async function lateAttemptEnds(): Promise<HotLeadCallRecord> {
-  jest.setSystemTime(at('17:45'));
-  lead.createdAt = at('17:44').toISOString();
+  jest.setSystemTime(at('16:45'));
+  lead.createdAt = at('16:44').toISOString();
   return firstAttemptEnds();
 }
 const nextJob = (record: HotLeadCallRecord = store.record!) => ({
@@ -269,7 +269,7 @@ describe('requestNextHotLeadCallAttempt', () => {
     });
     it('the calling hours have closed', async () => {
       await lateAttemptEnds();
-      jest.setSystemTime(at('18:00'));
+      jest.setSystemTime(at('17:00'));
       await refused('no_candidates');
     });
   });
@@ -453,7 +453,7 @@ describe('processHotLeadCallNextAttempt', () => {
 
   it('closes the waiting record when the calling hours closed between the attempts', async () => {
     const record = await lateAttemptEnds();
-    jest.setSystemTime(at('18:00'));
+    jest.setSystemTime(at('17:00'));
     await processHotLeadCallNextAttempt(nextJob(record));
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'finished', outcome: 'no_member_available' });

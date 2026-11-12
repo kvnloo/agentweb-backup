@@ -51,7 +51,7 @@ export function storedConfigFixture(extra: Record<string, unknown> = {}, team: H
   return {
     enabled: true, team,
     twilioNumber: '+14155550111', twilioNumberSid: STORED_NUMBER_SID, leadTypes: ['form_fill'], maxAgeMinutes: 10, maxCallsPerHour: 6,
-    maxCallsPerDay: 20, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
+    maxCallsPerDay: 20, maxCallsPerMonth: 200, memberCooldownMinutes: 2, maxAttemptsPerLead: 3, announcedName: 'Acme Plumbing',
     callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'], ...extra,
   };
 }

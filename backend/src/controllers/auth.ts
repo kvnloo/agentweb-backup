@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
@@ -18,6 +19,8 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { metaService } from "../services/metaService";
 import { emitAppSignal } from "../services/serverSignalEmitter";
+import { MCP_CONSENT_SIGNUP_SOURCE, validateRef } from "../services/journeyAttribution";
+import { noteProductUse, noteSignup } from "../services/journeyMilestones";
 
 // ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
 // customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
@@ -109,6 +112,23 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
   }
 }
 
+/**
+ * ENG-2906: web signup attribution (Emma web app). A password signup made on the MCP OAuth
+ * consent page (portal sends signupSource "mcp") is left unattributed here on purpose: the row
+ * is stamped signupSource "mcp" and the consent decision attributes it moments later, once the
+ * OAuth client and product are known (it requires that marker; account age is never used).
+ * Google sign-ups cannot tell where they started, so they are webapp with confidence "inferred".
+ */
+function attributeWebSignup(userId: string, opts: { ref?: unknown; confidence: "explicit" | "inferred" }) {
+  void noteSignup(userId, {
+    product: "emma_web",
+    path: "webapp",
+    client: "web",
+    ref: validateRef(opts.ref),
+    confidence: opts.confidence,
+  }).then(() => noteProductUse(userId, "emma_web"));
+}
+
 export const register = async (req: Request, res: Response) => {
   try {
     let {
@@ -184,6 +204,7 @@ export const register = async (req: Request, res: Response) => {
     // attribution is known and the enrolled lead is missing UTM data.
     const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
 
+    let createUserError: unknown;
     const newUser = await userDb.createUser(
       email,
       userId,
@@ -197,7 +218,10 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist, // from waitlist
       touch // attribution — passes through onUserSignup hook
-    ).catch(() => undefined);
+    ).catch((err: unknown) => {
+      createUserError = err;
+      return undefined;
+    });
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
@@ -206,6 +230,13 @@ export const register = async (req: Request, res: Response) => {
       const raced = await userDb.getUserByEmail(email).catch(() => undefined);
       if (raced) {
         return res.status(400).json({ message: "User already exists" });
+      }
+      // ENG-2899: the email occupies the PK but no account resolves for it
+      // (e.g. a tombstone left by an email change). Say what to do instead
+      // of a retry-forever 503.
+      if (isConditionalCheckFailed(createUserError)) {
+        const mapped = mapCreateUserError(createUserError);
+        return res.status(mapped.status).json(mapped.body);
       }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
@@ -220,6 +251,7 @@ export const register = async (req: Request, res: Response) => {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
+      ...(req.body.signupSource === MCP_CONSENT_SIGNUP_SOURCE && { signupSource: MCP_CONSENT_SIGNUP_SOURCE }),
       ...(touch && {
         firstTouch: touch,
         lastTouch: touch,
@@ -227,6 +259,7 @@ export const register = async (req: Request, res: Response) => {
         ...(touch.utm?.medium && { utmMedium: touch.utm.medium }),
       }),
     });
+    if (req.body.signupSource !== MCP_CONSENT_SIGNUP_SOURCE) attributeWebSignup(userId, { ref: req.body.ref, confidence: "explicit" });
 
     // If a pending org invite exists for this email, stamp it on the new user so
     // ProtectedRoute redirects them to accept-invite instead of onboarding.
@@ -310,7 +343,8 @@ export const register = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("Error in register:", error);
-    res.status(500).json({ message: "Error creating user" });
+    const mapped = mapCreateUserError(error);
+    res.status(mapped.status).json(mapped.body);
   }
 };
 
@@ -488,6 +522,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfig?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({
@@ -554,6 +589,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({

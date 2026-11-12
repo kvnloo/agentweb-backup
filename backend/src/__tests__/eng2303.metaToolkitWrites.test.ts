@@ -1,3 +1,4 @@
+process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
 /**
  * ENG-2303 P3 acceptance (spec: /home/harsha/zoma-build/SPEC.md, "Guarded writes"):
  *  - a write without a preview is refused (nothing dispatched);
@@ -54,6 +55,7 @@ function makeDeps(over: Partial<MetaToolkitWriteDeps> = {}, currency = 'USD') {
     })),
     dispatch: jest.fn().mockResolvedValue({ result: { success: true, message: 'Campaign "X" created successfully' }, createdId: '999' }),
     readBack: jest.fn().mockResolvedValue({ id: '999', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000' }),
+    assertCreativeOwned: jest.fn().mockResolvedValue(undefined),
     spendCeilingPolicy: () => null,
     secret: () => 'test-secret',
     now: () => NOW,
@@ -139,8 +141,9 @@ describe('ENG-2303 guarded Meta writes', () => {
     const deps = makeDeps();
     const preview: any = await executeMetaToolkitWrite('u1', createArgs(), deps);
     const confirm = { ...createArgs(), confirm: true, preview_token: preview.preview_token };
-    await executeMetaToolkitWrite('u1', confirm, deps);
-    await expect(executeMetaToolkitWrite('u1', confirm, deps)).rejects.toThrow(/already used/);
+    const first: any = await executeMetaToolkitWrite('u1', confirm, deps);
+    // ENG-2931: a repeat confirm replays the first outcome; it never dispatches again.
+    await expect(executeMetaToolkitWrite('u1', confirm, deps)).resolves.toMatchObject({ verification: first.verification, replayed: true });
     expect(deps.dispatch).toHaveBeenCalledTimes(1);
   });
 
@@ -247,7 +250,7 @@ describe('ENG-2303 read-back node mapping', () => {
 
   it('reads each entity ownership-scoped and maps status/effective_status/budgets', async () => {
     await expect(readBackMetaNode(reader, '111', 'tok', 'CAMPAIGN', '1')).resolves.toEqual({
-      id: '1', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', lifetime_budget: undefined,
+      id: '1', status: 'PAUSED', effective_status: 'PAUSED', daily_budget: '5000', lifetime_budget: undefined, name: 'x', // ENG-2913: edit fields
     });
     expect(reader.listCampaigns).toHaveBeenCalledWith('111', 'tok', expect.objectContaining({ campaignId: '1' }));
     await expect(readBackMetaNode(reader, '111', 'tok', 'AD_SET', '2')).resolves.toBeNull();

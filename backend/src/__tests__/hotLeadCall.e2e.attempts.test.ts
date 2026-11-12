@@ -55,8 +55,10 @@ async function noAnswer(n: number): Promise<void> {
 beforeEach(() => configure());
 
 describe('the roster decides who is rung first', () => {
-  it('11:00: A is rung, A presses 1, the lead presses 1 and the call is connected and metered', async () => {
-    setClock(chicago('11:00'));
+  it('12:30: A (first in priority) is rung although B is also on duty, A presses 1, the lead presses 1 and the call is connected and metered', async () => {
+    // A's usual 09:00-12:00 shift is widened so A is on duty inside the lead window (12:00-17:00 Chicago); B (12:15-15:00) is on duty too.
+    configure({ team: [referenceMember('a', '09:00', '16:00'), ...TEAM.slice(1)] });
+    setClock(chicago('12:30'));
     await submitLead('lead-a');
     expect(rungPhones()).toEqual([PHONE.a]);
     expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.a, triedMemberIds: [ID.a], memberCallSid: 'CA00000001' });
@@ -74,6 +76,13 @@ describe('the roster decides who is rung first', () => {
     expect(rungPhones()).toEqual([PHONE.a]);
     expect(nextJobs()).toHaveLength(0);
     expect(usageSummary()).toEqual([['twilio:voice:CA00000001:member', 2], ['twilio:voice:CAL0000001:lead', 1]]);
+  });
+
+  it('12:30: A is off duty (shift ended 12:00), so B is the one rung', async () => {
+    setClock(chicago('12:30'));
+    await submitLead('lead-a');
+    expect(rungPhones()).toEqual([PHONE.b]);
+    expect(record()).toMatchObject({ state: 'member_ringing', attemptNo: 1, memberId: ID.b, triedMemberIds: [ID.b] });
   });
 
   it('12:05, a gap in the roster: skipped as no_one_available, no call and no record, and the Slack alert still fires', async () => {
@@ -192,7 +201,7 @@ describe('the lead decides, and the lead is never chased through the team', () =
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    expect((await call.leadPresses('2')).body).toContain('<Hangup/>');
+    expect((await call.leadPresses('4')).body).toContain('<Hangup/>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     await call.leadStatus('completed', 3, { CallDuration: '8' });
     await call.memberLegEnds('completed', '40');
@@ -320,11 +329,13 @@ describe('the world changes between two attempts', () => {
     expect(record()).toMatchObject({ state: 'finished', outcome: 'member_no_answer' });
   });
 
-  it('the calling hours end in between: the record is closed as no_member_available and no second call is placed', async () => {
-    setClock(chicago('17:58'));
+  // 17:00 Chicago is 18:00 Eastern, where the lead window closes too; 16:30 Chicago closes the org window alone (lead window still open).
+  it.each([['17:00', '16:58', '17:01'], ['16:30', '16:28', '16:31']])('the calling hours (end %s) end in between: the record is closed as no_member_available and no second call is placed', async (end, before, after) => {
+    configure({ callingHours: { start: '09:00', end, timezone: 'America/Chicago' } });
+    setClock(chicago(before));
     await submitLead('lead-a');
     expect(rungPhones()).toEqual([PHONE.c]);
-    betweenRequestAndJob(() => setClock(chicago('18:01')));
+    betweenRequestAndJob(() => setClock(chicago(after)));
     await noAnswer(1);
 
     expect(rungPhones()).toEqual([PHONE.c]); // D is on duty until 19:00, but the business is closed
@@ -332,10 +343,30 @@ describe('the world changes between two attempts', () => {
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_no_answer', 'call.completed']);
   });
 
-  it('the calling hours have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async () => {
-    setClock(chicago('17:58'));
+  // The next-attempt pass checks only the org's hours and the roster (hotLeadCallAttempts.ts), not the lead window, so with a wide
+  // org window the next member IS rung after 18:00 Eastern; the lead window then stops the call at /gather (lead_outside_hours).
+  it('the lead window closes alone (org open until 21:00): the next member is rung but /gather refuses to dial the lead', async () => {
+    configure({ callingHours: { start: '09:00', end: '21:00', timezone: 'America/Chicago' } });
+    setClock(chicago('16:58')); // 17:58 Eastern
     await submitLead('lead-a');
-    setClock(chicago('18:01'));
+    expect(rungPhones()).toEqual([PHONE.c]);
+    betweenRequestAndJob(() => setClock(chicago('17:01'))); // 18:01 Eastern
+    await noAnswer(1);
+    expect(rungPhones()).toEqual([PHONE.c, PHONE.d]);
+
+    const call = nthCall(2);
+    await call.memberAnswers();
+    const reply = await call.memberPresses('1');
+    expect(reply.body).not.toContain('<Dial');
+    expect(record()).toMatchObject({ outcome: 'lead_outside_hours' });
+    expect(eventsOf('lead-a')).toContain('call.failed');
+  });
+
+  it.each([['17:00', '16:58', '17:01'], ['16:30', '16:28', '16:31']])('the calling hours (end %s) have ended by the time the first attempt ends: finished with the attempt\'s own outcome', async (end, before, after) => {
+    configure({ callingHours: { start: '09:00', end, timezone: 'America/Chicago' } });
+    setClock(chicago(before));
+    await submitLead('lead-a');
+    setClock(chicago(after));
     await noAnswer(1);
 
     expect(nextJobs()).toHaveLength(0);

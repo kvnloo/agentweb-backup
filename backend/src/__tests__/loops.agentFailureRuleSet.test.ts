@@ -206,3 +206,36 @@ describe('AgentFailureRuleSet — claim_mismatch clustering (ENG-143)', () => {
     ]);
   });
 });
+
+describe('AgentFailureRuleSet — never-connected precondition (ENG-2943)', () => {
+  const rs = new AgentFailureRuleSet();
+  const fail = (tool: string, n: number, errorMessage: string) =>
+    Array.from({ length: n }, () => evt(EVT_TOOL_FAILED, tool, { errorClass: 'Error', failureType: 'config', errorMessage }));
+
+  it.each([
+    'No Fathom account connected. Please connect your Fathom account in Settings.',
+    'No Gmail account connected. Please connect your Gmail account in Settings → Connected Accounts.',
+    'No HubSpot account connected',
+    'No LinkedIn Outreach account connected.',
+  ])('excludes "%s" from admission', async (msg) => {
+    const out = await rs.evaluate([...invoked('t', 7), ...fail('t', 5, msg)], WINDOW);
+    expect(out).toHaveLength(0);
+  });
+
+  it('still files genuine auth failures on a connected account as config', async () => {
+    const out = await rs.evaluate(
+      [...invoked('t', 7), ...fail('t', 2, 'No Fathom account connected.'), ...fail('t', 4, 'invalid_grant: token expired or revoked')],
+      WINDOW,
+    );
+    expect(out).toHaveLength(1);
+    const p: any = out[0].payload;
+    expect(p.failureType).toBe('config');
+    expect(p.failures).toBe(4);
+    expect(JSON.stringify(out[0])).toContain('2 non-actionable excluded');
+  });
+
+  it('does not match missing-scope wording', async () => {
+    const out = await rs.evaluate([...invoked('t', 5), ...fail('t', 4, 'Missing scope ads_management on connected account')], WINDOW);
+    expect(out).toHaveLength(1);
+  });
+});

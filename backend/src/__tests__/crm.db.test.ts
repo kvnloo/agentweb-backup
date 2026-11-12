@@ -1464,6 +1464,27 @@ describe('CRM Database Service', () => {
     });
   });
 
+  describe('findLeadsBySystemRecord field filters', () => {
+    it('adds one exists / not-exists filter per named field, each with its own name placeholder', async () => {
+      mockDocumentClientMethods.query.mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'a' }], ScannedCount: 1 }) });
+      const found = await crmDb.findLeadsBySystemRecord('list_1', 'hot_lead_call', {
+        states: ['finished'], updatedBefore: 'z', maxRead: 10, has: ['deferral'], lacks: ['retryClaimToken'],
+      });
+      expect(found).toEqual({ leadIds: ['a'], read: 1, truncated: false });
+      const call = mockDocumentClientMethods.query.mock.calls[0][0];
+      expect(call.FilterExpression).toBe(
+        '#system.#k.#state IN (:s0) AND #system.#k.#updatedAt < :before AND attribute_exists(#system.#k.#h0) AND attribute_not_exists(#system.#k.#l0)',
+      );
+      expect(call.ExpressionAttributeNames).toMatchObject({ '#h0': 'deferral', '#l0': 'retryClaimToken' });
+    });
+
+    it('without filters the expression is the stuck sweep\'s, unchanged', async () => {
+      mockDocumentClientMethods.query.mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], ScannedCount: 0 }) });
+      await crmDb.findLeadsBySystemRecord('list_1', 'hot_lead_call', { states: ['dialing'], updatedBefore: 'z', maxRead: 10 });
+      expect(mockDocumentClientMethods.query.mock.calls[0][0].FilterExpression).toBe('#system.#k.#state IN (:s0) AND #system.#k.#updatedAt < :before');
+    });
+  });
+
   describe('updateLeadSystemRecordIf', () => {
     it('builds one conditional UpdateItem with state, set, max-map and list-append parts', async () => {
       const result = await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
@@ -1497,6 +1518,18 @@ describe('CRM Database Service', () => {
         ':from0': 'dialing', ':from1': 'member_ringing', ':v0': 'member_answered', ':v1': 'CA1', ':v3': 3, ':v4': 5,
         ':v5': ['member:1', 'lead'], ':v5_0': 'member:1', ':v5_1': 'lead',
       });
+      expectNoDanglingPlaceholders(call);
+    });
+
+    it('whenAbsent adds one attribute_not_exists condition per field (a write-once marker) with its own name placeholder', async () => {
+      await crmDb.updateLeadSystemRecordIf('list_1', 'lead_1', 'hot_lead_call', {
+        stateIn: ['finished'], set: { retryClaimToken: 't' }, whenEquals: { jobKey: 'j' }, whenAbsent: ['retryClaimToken', 'retryClaimToken', 'other'],
+      });
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ConditionExpression).toBe(
+        '#system.#k.#state IN (:from0) AND #system.#k.#f1 = :v1 AND attribute_not_exists(#system.#k.#f2) AND attribute_not_exists(#system.#k.#f3)',
+      );
+      expect(call.ExpressionAttributeNames).toMatchObject({ '#f2': 'retryClaimToken', '#f3': 'other' });
       expectNoDanglingPlaceholders(call);
     });
 
