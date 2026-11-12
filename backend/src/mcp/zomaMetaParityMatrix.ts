@@ -85,7 +85,7 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   gap(REP, 'ENG-2916', 'ads_insights_auction_ranking_benchmarks'),
   gap(REP, 'ENG-2916', 'ads_insights_industry_benchmark'),
   covered(REP, 'ENG-2916', 'ads_insights_performance_trend', { tool: 'call_meta_ads_insights_api' }),
-  covered(REP, 'ENG-2916', 'ads_get_ad_entities', { tool: 'list_meta_ads_campaigns' }),
+  gap(REP, 'ENG-2916', 'ads_get_ad_entities'),
 
   // ENG-2917
   same(SIG, 'ENG-2917', 'ads_get_datasets'),
