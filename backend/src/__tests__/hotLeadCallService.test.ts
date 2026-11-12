@@ -355,7 +355,7 @@ describe('processHotLeadCallJob', () => {
     store.record = callRecord({ state: 'dialing', jobKey: 'other-dispatch', claimToken: 'someone-elses' });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('goes on when a create that answers false actually committed this dispatch\'s own record (an SDK retry lost its response)', async () => {
@@ -367,7 +367,7 @@ describe('processHotLeadCallJob', () => {
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 1 });
-    expect([...limits.counters.values()]).toEqual([1, 1, 1]);
+    expect([...limits.counters.values()]).toEqual([1, 1, 1, 1]);
   });
 
   it.each([
@@ -566,7 +566,7 @@ describe('abuse limits (reservation)', () => {
 
   it('records a successful call against the phone marker, the cooldown and both counters', async () => {
     expect(await submit('l1', FIRST)).toBe('called');
-    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1, 1], claims: 2 });
   });
 
   it('refuses the same phone for 24h on a different lead row, then allows it again', async () => {
@@ -645,7 +645,7 @@ describe('abuse limits (reservation)', () => {
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('org_hourly_cap');
     // l2's phone marker and cooldown claim were released; only l1's phone marker remains, and the counters did not move.
-    expect(slots().counters).toEqual([1, 1, 1]);
+    expect(slots().counters).toEqual([1, 1, 1, 1]);
     expect([...limits.claims.keys()].filter(k => k.startsWith('hlc#phone#'))).toHaveLength(1);
   });
 
@@ -653,19 +653,19 @@ describe('abuse limits (reservation)', () => {
     store.record = callRecord({ state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('gives every slot back when store.create throws', async () => {
     store.create = async () => { throw new Error('ddb down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
-    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('keeps the slots when the call is placed and then rejected (the lead\'s call is spent)', async () => {
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1, 1], claims: 2 });
   });
 
   it('fails the job closed, dialing nothing and creating no record, and shows limits_unavailable on the lead', async () => {
@@ -1008,7 +1008,7 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
     expect(await submit(3)).toBe('org_monthly_cap');
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'org_monthly_cap' } }]);
-    expect([...limits.counters.entries()].map(([k, v]) => [k.split('#')[2], v]).sort()).toEqual([['d', 2], ['h', 2], ['m', 2]]);
+    expect([...limits.counters.entries()].map(([k, v]) => [k.split('#')[2], v]).sort()).toEqual([['d', 2], ['g', 2], ['h', 2], ['m', 2]]);
   });
 
   it('sends the 80% notice once at ceil(0.8 * cap) and the 100% notice once at the first refusal, with the approved copy', async () => {

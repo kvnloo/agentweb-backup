@@ -16,7 +16,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { perListBudget, resetRetrySweepRotationForTests, runHotLeadCallRetrySweep } from '../services/voice/hotLeadCallRetrySweep';
 import { resetHotLeadCallRetryCronForTests, runHotLeadCallRetryCron } from '../cron/hotLeadCallRetryCron';
 import { runStuckCallSweep } from '../services/voice/stuckCallSweep';
-import { cooldownKey, dailyCapKey, hourlyCapKey, monthlyCapKey, phoneMarkerKey } from '../services/voice/hotLeadCallLimits';
+import { cooldownKey, dailyCapKey, hourlyCapKey, monthlyCapKey, phoneMarkerKey, platformDailyCapKey } from '../services/voice/hotLeadCallLimits';
 import * as capNotices from '../services/voice/hotLeadCallCapNotices';
 import { processHotLeadCallRetry } from '../services/hotLeadCallService';
 import { getLeadCallStore } from '../services/voice/leadCallStore';
@@ -282,12 +282,16 @@ describe('the due-retries sweep', () => {
     });
   });
 
+  // The platform counter for the day of the run and of the next hour (a UTC midnight may fall between).
+  const fillPlatform = (n: number) => [new Date(), new Date(Date.now() + 60 * 60_000)].forEach((at) => world.limits.counters.set(platformDailyCapKey(at), n));
+
   describe.each([
     // [reason, what was arranged, arrange, undo]: a refusal that passes with time, so the claim is given back and a later run calls.
     ['no_one_available', 'nobody on duty at that hour', () => setOrg({ team: [{ ...callConfig.team[0], windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '01:00' }] }] }), () => setOrg({})],
     ['member_cooldown', 'the member in cooldown', () => world.limits.claims.set(cooldownKey('org-a', MEMBER_ID), { token: 'x', expiresAtS: FAR }), () => world.limits.claims.delete(cooldownKey('org-a', MEMBER_ID))],
     ['org_hourly_cap', 'a full hourly cap', () => world.limits.counters.set(hourlyCapKey('org-a', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(hourlyCapKey('org-a', new Date()))],
     ['org_daily_cap', 'a full daily cap', () => world.limits.counters.set(dailyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(dailyCapKey('org-a', 'America/Chicago', new Date()))],
+    ['platform_daily_cap', 'a reached platform-wide daily ceiling (ENG-2783)', () => fillPlatform(1000), () => fillPlatform(0)],
     ['org_monthly_cap', 'a full monthly cap', () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 100000), () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date()), 1)],
   ] as Array<[string, string, () => unknown, () => unknown]>)('transient refusal %s', (reason, label, arrange, undo) => {
     it(`${label}: call.skipped ${reason}, the claim is given back with a new due time 15 minutes on, and the next run places the call`, async () => {
@@ -354,6 +358,33 @@ describe('the due-retries sweep', () => {
     expect(skips()).toEqual(['member_cooldown', 'retry_expired']);
     expect(record().retryClaimToken).toEqual(expect.any(String));
     expect(world.provider.placedCalls).toHaveLength(1);
+    expect(await sweep()).toMatchObject({ found: 0 });
+  });
+
+  it('a platform_daily_cap refusal stays transient until firstDueAt + 6 hours (never spent early), then retry_expired (ENG-2783)', async () => {
+    await deferred();
+    fillPlatform(1000);
+    advanceMinutes(60);
+    const firstDue = (record().deferral as { dueAt: string }).dueAt;
+    const deadline = Date.parse(firstDue) + 6 * 3_600_000;
+    let last = { expired: 0, rescheduled: 0, refused: 0 };
+    for (let i = 0; i < 40 && !last.expired; i++) {
+      last = await sweep();
+      if (!last.expired) {
+        expect(Date.now()).toBeLessThanOrEqual(deadline);
+        expect(last).toMatchObject({ rescheduled: 1, refused: 0 });
+        expect(record().retryClaimToken).toBeUndefined(); // the claim was given back
+        expect(record().deferral).toMatchObject({ firstDueAt: firstDue });
+        expect(Date.parse((record().deferral as { dueAt: string }).dueAt)).toBeGreaterThanOrEqual(Date.now() + 15 * 60_000);
+        expect(skips()).toEqual(['platform_daily_cap']); // one note per reason, no retry_expired yet
+      }
+      advanceMinutes(15);
+    }
+    expect(last.expired).toBe(1);
+    // Spent at the 6-hour limit or earlier when no open minute (the 18:00 Eastern lead window) is left inside it; never later.
+    expect(Date.now()).toBeLessThanOrEqual(deadline + 15 * 60_000);
+    expect(skips()).toEqual(['platform_daily_cap', 'retry_expired']);
+    expect(world.provider.placedCalls).toHaveLength(1); // no retry call was ever placed
     expect(await sweep()).toMatchObject({ found: 0 });
   });
 
