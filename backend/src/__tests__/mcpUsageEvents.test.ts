@@ -337,5 +337,9 @@ describe('mcpUsageEventsService', () => {
     expect(classifyMcpClient({ clientName: 'Hermes MCP' })).toBe('hermes');
     expect(classifyMcpClient({ clientName: 'OpenClaw' })).toBe('openclaw');
     expect(classifyMcpClient({ authMethod: 'api_key' })).toBe('api_key');
+    // ENG-2747: the client Databricks registers through DCR (seen live 2026-11-12).
+    expect(classifyMcpClient({ clientName: 'Databricks' })).toBe('databricks');
+    expect(classifyMcpClient({ redirectUri: 'https://oregon.cloud.databricks.com/api/2.0/http/oauth/redirect' })).toBe('databricks');
+    expect(classifyMcpClient({ clientName: 'Databricks', userAgent: 'claude-agent' })).toBe('databricks');
   });
 });

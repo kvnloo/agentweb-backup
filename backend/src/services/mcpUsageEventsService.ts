@@ -23,6 +23,7 @@ export type McpClientType =
   | 'chatgpt'
   | 'hermes'
   | 'openclaw'
+  | 'databricks'
   | 'api_key'
   | 'unknown';
 
@@ -744,6 +745,7 @@ const MCP_CLIENT_TYPES = new Set<McpClientType>([
   'chatgpt',
   'hermes',
   'openclaw',
+  'databricks',
   'api_key',
   'unknown',
 ]);
@@ -763,6 +765,10 @@ export function classifyMcpClient(input: {
   const userAgent = cleanString(input.userAgent)?.toLowerCase() ?? '';
   const redirectUri = cleanString(input.redirectUri)?.toLowerCase() ?? '';
   const haystack = `${clientName} ${userAgent} ${redirectUri}`;
+
+  // ENG-2747: Databricks registers its OAuth client as "Databricks" with a *.databricks.com redirect.
+  // Checked first: a Databricks agent may run any model, so a model name elsewhere must not win.
+  if (haystack.includes('databricks')) return 'databricks';
 
   if (haystack.includes('claude-code') || haystack.includes('claude code') || haystack.includes('claudecode')) {
     return 'claude_code';
