@@ -16077,11 +16077,19 @@ export const agentModeController = {
       const { authorized } = req.body || {};
 
       if (typeof authorized !== 'boolean') {
+        console.warn(
+          `AgentMode: ENG-2975 publish consent change refused for schedule ${scheduleId} by user ` +
+          `${user?.userId} — invalid body (authorized=${typeof authorized}).`
+        );
         return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
       }
 
       const schedule = await scheduleDb.getScheduleById(scheduleId);
       if (!schedule || schedule.userId !== user.userId) {
+        console.warn(
+          `AgentMode: ENG-2975 publish consent change refused for schedule ${scheduleId} by user ` +
+          `${user.userId} — ${schedule ? 'not the schedule owner' : 'schedule not found'} (404).`
+        );
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
@@ -16091,6 +16099,10 @@ export const agentModeController = {
       // posts go out unseen under their name. Revoking stays open to delegation: it
       // only ever makes a schedule safer.
       if (authorized && (req as any).delegateInfo?.isDelegated) {
+        console.warn(
+          `AgentMode: ENG-2975 publish consent grant refused for schedule ${scheduleId} by user ` +
+          `${user.userId} — delegated session (403).`
+        );
         return res.status(403).json({
           error:
             'Unattended publishing can only be enabled by the account owner themselves, not from a ' +
@@ -16104,6 +16116,10 @@ export const agentModeController = {
       // worked) or everything (a mandate they never gave).
       const approvedTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
       if (authorized && approvedTools.length === 0) {
+        console.warn(
+          `AgentMode: ENG-2975 publish consent grant refused for schedule ${scheduleId} by user ` +
+          `${user.userId} — no publishing tool under required functions (400).`
+        );
         return res.status(400).json({
           error:
             'This schedule does not require a publishing tool, so there is nothing to authorize. ' +
@@ -16155,8 +16171,8 @@ export const agentModeController = {
               'This schedule changed while you were authorizing it, so nothing was saved — either its ' +
               'required functions moved, so the authorization would have covered a different set of tools ' +
               'than the one you approved, or its publishing permission was changed from somewhere else. ' +
-              'Reopen the schedule to see where it stands, then turn on "Publish without my review" again ' +
-              'if it still looks right.',
+              'Reopen the schedule to see where it stands, then check "Publish without my review" again and ' +
+              'click Update Schedule if it still looks right.',
           });
         }
         throw writeError;

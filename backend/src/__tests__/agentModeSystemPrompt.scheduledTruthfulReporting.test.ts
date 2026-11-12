@@ -323,6 +323,12 @@ describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', 
   it('the never-granted branch names the REAL self-service control (ENG-2265) — not an invented one', () => {
     expect(neverGranted).toContain('Publish without my review');
     expect(neverGranted).toContain('Required Actions');
+    // ENG-2975: the single real flow is check the box + Update Schedule + confirm;
+    // saving alone never grants it, and the model must not imply otherwise.
+    expect(neverGranted).toContain('Update Schedule');
+    expect(neverGranted).toContain('Standing publish authorization on');
+    expect(neverGranted).toMatch(/Saving the schedule alone does NOT grant it/);
+    expect(neverGranted).not.toMatch(/selected under Required Actions and saved/);
     expect(neverGranted).not.toContain('Autorizar publicación automática');
     expect(neverGranted).not.toContain('Autopublish');
   });

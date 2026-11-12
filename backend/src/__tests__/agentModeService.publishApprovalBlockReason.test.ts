@@ -59,6 +59,12 @@ describe('AgentModeService.publishApprovalBlock — accurate withhold reason (EN
     const result = block('post_on_connected_account', 'not_granted');
     expect(result.error).toContain('Publish without my review');
     expect(result.error).toContain('Required Actions');
+    // ENG-2975: the single real flow is check the box + Update Schedule + confirm;
+    // saving alone never grants it, and the model must not imply otherwise.
+    expect(result.error).toContain('Update Schedule');
+    expect(result.error).toContain('Standing publish authorization on');
+    expect(result.error).toMatch(/Saving the schedule alone does NOT grant it/);
+    expect(result.error).not.toMatch(/selected under Required Actions and saved/);
     expect(result.error).not.toContain('Autorizar publicación automática');
     expect(result.error).not.toContain('Autopublish');
   });
