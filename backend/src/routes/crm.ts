@@ -279,6 +279,7 @@ import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchCo
 import { randomUUID } from 'crypto';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
+import { brandMessagingContextFromGuidelines } from '../services/brandMessagingContext';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -5546,11 +5547,10 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const { agentModeService } = await import('../services/agentModeService');
 
-    // Get brand guidelines for context
-    const brandGuidelines = await agentModeService.readBrandGuidelines(userId);
-    const brandContext = brandGuidelines?.exists && brandGuidelines?.content
-      ? `\nSender context: ${String(brandGuidelines.content).slice(0, 500)}`
-      : '';
+    // Sender brand context. readBrandGuidelines returns { exists, brandData,
+    // formattedContent } — the old `.content` read was always undefined, so the
+    // note never saw the sender's brand (ENG-2967).
+    const senderBrand = brandMessagingContextFromGuidelines(await agentModeService.readBrandGuidelines(userId));
 
     const firstName = (lead as any).firstName || '';
     const lastName = (lead as any).lastName || '';
@@ -5561,7 +5561,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
     const notesLine = notes ? `\nWhat we know about them: ${notes.slice(0, 300)}` : '';
-    const senderContext = brandContext ? `\nSender context: ${brandContext.replace('\nSender context: ', '').slice(0, 400)}` : '';
+    const senderContext = senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : '';
 
     const prompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
