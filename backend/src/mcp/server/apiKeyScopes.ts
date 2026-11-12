@@ -22,6 +22,14 @@
 export const API_KEY_SCOPE_READ = 'tools:read';
 export const API_KEY_SCOPE_EXECUTE = 'tools:execute';
 export const API_KEY_SCOPE_EMAIL_READ = 'email:read';
+/**
+ * Smartlead over MCP (ENG-673 follow-on, for the Hermes agents). Opt-in like email:read, and for `aw_` keys only: a signed-in OAuth
+ * client (including marketplace clients) does not get them. `smartlead:read` reads the user's own campaigns, their numbers, a push
+ * preview and push progress; `smartlead:control` pauses or cancels a push (stop actions only). Starting, resuming or releasing a push is
+ * never offered over MCP: a person approves those in the portal.
+ */
+export const API_KEY_SCOPE_SMARTLEAD_READ = 'smartlead:read';
+export const API_KEY_SCOPE_SMARTLEAD_CONTROL = 'smartlead:control';
 export const DEFAULT_API_KEY_SCOPES = [API_KEY_SCOPE_READ, API_KEY_SCOPE_EXECUTE];
 
 export function effectiveApiKeyScopes(scopes: unknown): string[] {

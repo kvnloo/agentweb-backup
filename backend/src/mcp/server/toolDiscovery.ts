@@ -52,6 +52,9 @@ export function listedToolNames(): string[] {
  */
 const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
   'email:read': ['read_email', 'list_connected_accounts'],
+  // list_lead_lists gives the listId a preview needs.
+  'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status', 'list_lead_lists'],
+  'smartlead:control': ['pause_smartlead_push', 'cancel_smartlead_push', 'get_smartlead_push_status'],
 };
 
 /** What an external client sees in `tools/list`. `grantedScopes` is set only for api_key sessions. */
