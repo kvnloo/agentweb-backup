@@ -31,32 +31,47 @@ describe('contactDedupService', () => {
     jest.clearAllMocks();
   });
 
+  /** n genuine (old, no recency bonus) replies: heat 0 / 5 / 6 / 7. */
+  const replies = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      eventType: 'email.received',
+      createdAt: '2020-01-01T00:00:00.000Z',
+      eventData: { messageId: `m${i}`, text: 'Yes, interested.' },
+    }));
+
   describe('computeHeatScore', () => {
+    const now = new Date().toISOString();
     it('returns 0 for a lead with no engagement and no dates', () => {
       expect(computeHeatScore({})).toBe(0);
     });
 
-    it('caps engagement contribution at 5', () => {
-      const lead = { engagementCount: 50 };
-      // No recency bonus, just capped count
-      expect(computeHeatScore(lead)).toBe(5);
+    it('does not score outbound volume (engagementCount = sends)', () => {
+      expect(computeHeatScore({ engagementCount: 50 })).toBe(0);
     });
 
-    it('adds recency bonus for very recent contact', () => {
-      const lead = {
-        engagementCount: 2,
-        engagements: [{ createdAt: new Date().toISOString() }],
-      };
-      // 2 (count) + 5 (< 1 day) = 7
-      expect(computeHeatScore(lead)).toBe(7);
+    it('does not score a freshly created lead with no engagement', () => {
+      expect(computeHeatScore({ createdAt: now, engagements: [] })).toBe(0);
     });
 
-    it('caps final score at 10', () => {
+    it('does not score sends and status changes, however recent', () => {
       const lead = {
-        engagementCount: 20,
-        engagements: [{ createdAt: new Date().toISOString() }],
+        engagements: [
+          { eventType: 'custom.email_sent', createdAt: now },
+          { eventType: 'status.changed', createdAt: now, eventData: { from: 'new', to: 'contacted' } },
+          { eventType: 'linkedin.invite.sent', createdAt: now },
+        ],
       };
-      expect(computeHeatScore(lead)).toBe(10);
+      expect(computeHeatScore(lead)).toBe(0);
+    });
+
+    it('scores a recent genuine reply as Hot', () => {
+      const lead = { engagements: [{ eventType: 'email.received', createdAt: now, eventData: { subject: 'Re: intro', text: 'Yes, happy to chat Thursday.' } }] };
+      expect(computeHeatScore(lead)).toBe(8);
+    });
+
+    it('does not score an out-of-office auto-reply', () => {
+      const lead = { engagements: [{ eventType: 'custom.email_reply_received', createdAt: now, eventData: { subject: 'Automatic reply: Nov 17', notes: 'Auto-reply: traveling this week' } }] };
+      expect(computeHeatScore(lead)).toBe(0);
     });
   });
 
@@ -75,8 +90,8 @@ describe('contactDedupService', () => {
         if (listId === 'L1') {
           return {
             items: [
-              { leadId: 'a1', email: 'Foo@Example.com ', firstName: 'Foo', engagementCount: 1 },
-              { leadId: 'b1', email: 'bar@example.com', firstName: 'Bar', engagementCount: 3 },
+              { leadId: 'a1', email: 'Foo@Example.com ', firstName: 'Foo', engagements: replies(1) },
+              { leadId: 'b1', email: 'bar@example.com', firstName: 'Bar', engagements: replies(3) },
             ],
             lastEvaluatedKey: null,
             hasMore: false,
@@ -85,8 +100,8 @@ describe('contactDedupService', () => {
         if (listId === 'L2') {
           return {
             items: [
-              { leadId: 'a2', email: 'foo@example.com', firstName: 'Foo2', engagementCount: 5 },
-              { leadId: 'c1', email: '', firstName: 'Noemail', engagementCount: 1 },
+              { leadId: 'a2', email: 'foo@example.com', firstName: 'Foo2', engagements: replies(5) },
+              { leadId: 'c1', email: '', firstName: 'Noemail', engagements: replies(1) },
               { leadId: 'c2', email: null, firstName: 'AlsoNoEmail' },
             ],
             lastEvaluatedKey: null,
@@ -112,7 +127,7 @@ describe('contactDedupService', () => {
       expect(foo).toBeDefined();
       expect(foo!.lists).toHaveLength(2);
       expect(foo!.lists.map((l) => l.listId).sort()).toEqual(['L1', 'L2']);
-      // Higher engagementCount lead (L2's a2, count=5) should be primary.
+      // More genuine replies (L2's a2, count=5) should be primary.
       expect(foo!.primaryLead.leadId).toBe('a2');
 
       const bar = result.contacts.find((c) => c.email === 'bar@example.com');
@@ -203,9 +218,9 @@ describe('contactDedupService', () => {
       ]);
       asMock(crmDb.getLeadsByListId).mockResolvedValue({
         items: [
-          { leadId: '1', email: 'low@x.com', engagementCount: 0 },
-          { leadId: '2', email: 'high@x.com', engagementCount: 5 },
-          { leadId: '3', email: 'mid@x.com', engagementCount: 2 },
+          { leadId: '1', email: 'low@x.com', engagements: replies(0) },
+          { leadId: '2', email: 'high@x.com', engagements: replies(5) },
+          { leadId: '3', email: 'mid@x.com', engagements: replies(2) },
         ],
         lastEvaluatedKey: null,
         hasMore: false,
@@ -225,7 +240,7 @@ describe('contactDedupService', () => {
         { listId: 'L2', name: 'Customers', listType: 'customers' },
       ]);
       asMock(crmDb.getLeadsByListId).mockImplementation(async (listId: string) => ({
-        items: [{ leadId: listId, email: `${listId}@x.com`, engagementCount: 1 }],
+        items: [{ leadId: listId, email: `${listId}@x.com`, engagements: replies(1) }],
         lastEvaluatedKey: null,
         hasMore: false,
       }));
@@ -242,9 +257,9 @@ describe('contactDedupService', () => {
       ]);
       asMock(crmDb.getLeadsByListId).mockResolvedValue({
         items: [
-          { leadId: '1', email: 'a@x.com', engagementCount: 0 },
-          { leadId: '2', email: 'b@x.com', engagementCount: 5 },
-          { leadId: '3', email: 'c@x.com', engagementCount: 2 },
+          { leadId: '1', email: 'a@x.com', engagements: replies(0) },
+          { leadId: '2', email: 'b@x.com', engagements: replies(5) },
+          { leadId: '3', email: 'c@x.com', engagements: replies(2) },
         ],
         lastEvaluatedKey: null,
         hasMore: false,
@@ -267,7 +282,7 @@ describe('contactDedupService', () => {
           throw new Error('boom');
         }
         return {
-          items: [{ leadId: '1', email: 'ok@x.com', engagementCount: 1 }],
+          items: [{ leadId: '1', email: 'ok@x.com', engagements: replies(1) }],
           lastEvaluatedKey: null,
           hasMore: false,
         };
@@ -292,7 +307,7 @@ describe('contactDedupService', () => {
         const items = Array.from({ length: pageSize }, (_, i) => ({
           leadId: `lead-${callCount}-${i}`,
           email: `lead-${callCount}-${i}@x.com`,
-          engagementCount: 0,
+          engagements: replies(0),
         }));
         return {
           items,
@@ -322,7 +337,7 @@ describe('contactDedupService', () => {
         const items = Array.from({ length: pageSize }, (_, i) => ({
           leadId: `${listId}-lead-${i}`,
           email: `${listId}-lead-${i}@x.com`,
-          engagementCount: 0,
+          engagements: replies(0),
         }));
         return { items, lastEvaluatedKey: null };
       });
@@ -338,7 +353,7 @@ describe('contactDedupService', () => {
       ]);
 
       asMock(crmDb.getLeadsByListId).mockImplementation(async () => ({
-        items: [{ leadId: 'x', email: 'x@x.com', engagementCount: 0 }],
+        items: [{ leadId: 'x', email: 'x@x.com', engagements: replies(0) }],
         lastEvaluatedKey: null,
       }));
 

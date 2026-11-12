@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { isGenuineEngagementEvent } from '../services/leadEngagementSignals';
 import { statusAfterReviewedSend } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
@@ -352,18 +353,16 @@ const leadMatchesSearch = (lead: any, rawSearchQuery: string): boolean => {
   );
 };
 
-const ENGAGED_EVENT_KEYWORDS = ['clicked', 'replied', 'received'];
-
-const textIncludesEngagementKeyword = (value: any): boolean => {
-  const normalized = String(value || '').toLowerCase();
-  return ENGAGED_EVENT_KEYWORDS.some((keyword) => normalized.includes(keyword));
-};
+// Engagement = a genuine inbound reply, meeting or click. Substring-matching
+// "received"/"replied" on the raw event JSON counted out-of-office auto-replies,
+// bounces and any payload mentioning those words.
+const eventIsGenuineEngagement = (eventType: any, eventData: any): boolean =>
+  isGenuineEngagementEvent({ eventType, eventData });
 
 const leadHasManualEngagedEvents = (lead: any): boolean => {
   const manualEngagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
   return manualEngagements.some((engagement: any) =>
-    textIncludesEngagementKeyword(engagement?.eventType) ||
-    textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+    eventIsGenuineEngagement(engagement?.eventType, engagement?.eventData)
   );
 };
 
@@ -382,8 +381,7 @@ const buildEngagedLeadLookup = async (listId: string, userId: string): Promise<{
       const domainEvents = await emailEventsDb.getEventsByEmailDomain(userEmailDomain);
       for (const event of domainEvents) {
         if (
-          textIncludesEngagementKeyword(event?.eventType) ||
-          textIncludesEngagementKeyword(JSON.stringify(event?.data || {}))
+          eventIsGenuineEngagement(event?.eventType, event?.data)
         ) {
           const leadEmail = String(event?.leadEmail || '').trim().toLowerCase();
           if (leadEmail) {
@@ -396,8 +394,7 @@ const buildEngagedLeadLookup = async (listId: string, userId: string): Promise<{
     const linkedInEvents = await emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`);
     for (const event of linkedInEvents) {
       if (
-        textIncludesEngagementKeyword(event?.eventType) ||
-        textIncludesEngagementKeyword(JSON.stringify(event?.data || {}))
+        eventIsGenuineEngagement(event?.eventType, event?.data)
       ) {
         const linkedInUrl = String(event?.leadEmail || '').trim().toLowerCase();
         if (linkedInUrl) {
@@ -435,8 +432,7 @@ const leadMatchesEngagedLookup = (
 
   const manualEngagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
   return manualEngagements.some((engagement: any) =>
-      textIncludesEngagementKeyword(engagement?.eventType) ||
-      textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+      eventIsGenuineEngagement(engagement?.eventType, engagement?.eventData)
     );
 };
 

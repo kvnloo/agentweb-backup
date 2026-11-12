@@ -15,6 +15,7 @@
  */
 
 import { crmDb } from './db';
+import { computeGenuineHeatScore } from './leadEngagementSignals';
 import { phoneDigits, isDedupablePhone } from '../utils/smokeTestLead';
 import { isSessionList } from '../utils/sessionList';
 import type { LeadListType } from '../utils/leadSchema';
@@ -32,7 +33,7 @@ export interface DedupedContact {
   /** Display name, or email fallback. */
   name: string;
   company: string;
-  /** 0-10 coarse heat score derived from engagement count + recency. */
+  /** 0-10 heat score from genuine engagement (see leadEngagementSignals). */
   heatScore: number;
   /** ISO timestamp of the last engagement / updatedAt. */
   lastContactAt: string;
@@ -84,23 +85,13 @@ export interface DedupResult {
   hasMore?: boolean;
 }
 
-/** Coarse heat score — mirrors the frontend computeHeatScore utility. */
+/**
+ * Heat score (0-10; Warm >= 5, Hot >= 8) from genuine engagement only —
+ * inbound human replies, meetings, clicks. Outbound volume, status changes,
+ * auto-replies/OOO and lead creation do not score. See leadEngagementSignals.
+ */
 export function computeHeatScore(lead: any): number {
-  const engagementCount =
-    lead?.engagementCount ?? (Array.isArray(lead?.engagements) ? lead.engagements.length : 0) ?? 0;
-  let score = Math.min(engagementCount, 5);
-
-  const lastContact = pickLastContact(lead);
-  if (lastContact) {
-    const age = Date.now() - new Date(lastContact.at).getTime();
-    const days = age / (1000 * 60 * 60 * 24);
-    if (days < 1) score += 5;
-    else if (days < 3) score += 4;
-    else if (days < 7) score += 3;
-    else if (days < 14) score += 2;
-    else if (days < 30) score += 1;
-  }
-  return Math.min(10, Math.max(0, score));
+  return computeGenuineHeatScore(lead);
 }
 
 function pickLastContact(lead: any): { at: string; eventType?: string } | undefined {
