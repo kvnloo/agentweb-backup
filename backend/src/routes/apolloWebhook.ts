@@ -38,6 +38,7 @@ import { crmDb } from '../services/db';
 import { apolloAsyncRequestCacheKey } from '../services/apolloCacheKeys';
 import { apolloEmailStatusToConfidence } from '../services/apolloFieldMapper';
 import { getApolloWebhookSecret } from '../utils/secretsManager';
+import { isValidAddress, normalizeEmail } from '../utils/sendEligibility';
 
 /**
  * Constant-time secret check. Returns false for length mismatches
@@ -90,20 +91,25 @@ function cleanStatus(v: unknown): string | undefined {
 }
 
 /**
- * Shape gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801).
- * Only a string of at most 254 characters that is one plausible address: the local part is limited to the
- * RFC 5322 "atext" characters (letters, digits and !#$%&'*+/=?^_`{|}~- plus dots), which excludes whitespace,
- * control characters, NUL, bidi/zero-width characters, angle brackets, quotes, commas, semicolons, colons,
- * parentheses, brackets and backslashes (no header injection, markup or multi-address strings); the domain is
- * ASCII labels ending in a 2-63 letter TLD (internationalised domains must arrive as punycode). Apostrophes
- * and plus-tags stay legal (o'brien@x.com, a+b@x.co.uk). Anything else is treated as "no email" so a malformed
- * or forged value is never written. The length cap runs before the regex, so the regex input is bounded.
+ * Gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801, ENG-2803).
+ * The address is trimmed and lower-cased (as the lead write stores it), then must pass the same strict check
+ * the send path uses (utils/sendEligibility isValidAddress: unquoted RFC 5322 dot-atom local part, LDH domain
+ * labels, RFC 5321 lengths). That excludes whitespace, control and bidi characters, quotes, angle brackets,
+ * commas and other multi-address or injection shapes, empty or doubled dots, and non-ASCII domains (an IDN
+ * must arrive as punycode). On top of it, two callback-only rules: the top-level label is 2-63 letters or a
+ * punycode `xn--` label (no `a@b.c` or numeric TLDs from a vendor), and the local part may not start with `=`,
+ * `+` or `-`: the lead's email is exported to CSV unescaped, where a leading one of those is read as a formula.
+ * Apostrophes and plus-tags
+ * stay legal (o'brien@x.com, a+b@x.co.uk). Anything else is treated as "no email", so a malformed or forged
+ * value is never written. The length cap runs first, so the regex input is bounded.
  */
-const CALLBACK_EMAIL_SHAPE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
+const CSV_FORMULA_LEAD = /^[=+-]/;
+const CALLBACK_TLD = /\.(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
 export function cleanCallbackEmail(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const e = value.trim();
-  return e.length > 0 && e.length <= 254 && CALLBACK_EMAIL_SHAPE.test(e) ? e : undefined;
+  if (typeof value !== 'string' || value.length > 1024) return undefined;
+  const e = normalizeEmail(value);
+  if (e.length === 0 || e.length > 254 || CSV_FORMULA_LEAD.test(e) || !CALLBACK_TLD.test(e)) return undefined;
+  return isValidAddress(e) ? e : undefined;
 }
 
 /**
@@ -113,7 +119,7 @@ export function cleanCallbackEmail(value: unknown): string | undefined {
  * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
  * to `verified` regardless of the finder's self-claim.
  */
-function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string; rejected: number } {
+export function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string; rejected: number } {
   let rejected = 0; // candidate email values that were present but failed the shape gate
   const person = Array.isArray(payload.people) ? payload.people[0] : null;
   const groups = person?.waterfall?.emails;
@@ -122,12 +128,14 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
       const vendors = Array.isArray(grp?.vendors) ? grp.vendors : [];
       const finder = vendors.find((v) => Array.isArray(v?.emails) && v.emails.length > 0);
       if (!finder || !finder.emails || finder.emails.length === 0) continue;
-      const candidates = finder.emails as unknown[];
-      const email = candidates.map(cleanCallbackEmail).find((e): e is string => !!e);
-      if (!email) {
-        rejected += candidates.filter((v) => v !== null && v !== undefined && v !== '').length;
-        continue; // nothing in this group is a usable address; try the next group
+      // Stop at the first usable address: a large authenticated body must not be validated in full.
+      let email: string | undefined;
+      for (const candidate of finder.emails as unknown[]) {
+        email = cleanCallbackEmail(candidate);
+        if (email) break;
+        if (candidate !== null && candidate !== undefined && candidate !== '') rejected += 1;
       }
+      if (!email) continue; // nothing in this group is a usable address; try the next group
       const verified = vendors.some(
         (v) => v?.usedForVerification && typeof v?.status === 'string' && v.status.toLowerCase() === 'validated',
       );
@@ -177,6 +185,14 @@ router.post('/:secret', async (req: Request, res: Response) => {
       return res.status(202).json({ accepted: true, matched: false });
     }
     const { listId, leadId, userId: placeholderUserId } = placeholder.rawData;
+
+    // ENG-2803: the placeholder carries an expiry (epoch seconds, 7 days after Tier 3 wrote it). TTL is not
+    // enabled on the table, so the row outlives it; refuse late or replayed callbacks against an expired one.
+    const expiresAt = Number((placeholder as { expiresAt?: unknown }).expiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt * 1000 < Date.now()) {
+      console.warn('[apollo webhook] placeholder expired — refusing', requestId);
+      return res.status(202).json({ accepted: true, matched: false, expired: true });
+    }
 
     // C1: re-verify ownership. The placeholder is our own write (Tier 3 stamps
     // userId before handing the URL to Apollo), so a missing or mismatched

@@ -30,7 +30,9 @@ const DOMAIN_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const EMAIL_RE = new RegExp(`^${LOCAL_ATOM}(?:\\.${LOCAL_ATOM})*@${DOMAIN_LABEL}(?:\\.${DOMAIN_LABEL})+$`);
 
 // RFC 5321 limits: local part <= 64, domain <= 255, whole address <= 254 octets.
-function isValidAddress(email: string): boolean {
+// Expects a normalized (trimmed, lower-case) address; see normalizeEmail. Also the
+// gate for emails arriving in Apollo callbacks (routes/apolloWebhook.ts, ENG-2803).
+export function isValidAddress(email: string): boolean {
   if (email.length > 254 || !EMAIL_RE.test(email)) return false;
   const at = email.lastIndexOf('@');
   return at <= 64 && email.length - at - 1 <= 255;
