@@ -9,12 +9,17 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { taskDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
+import {
+  InMemoryPublicRateLimitStore,
+  PublicRateLimitStore,
+  emailRateLimitKey,
+  ipRateLimitKey,
+} from '../services/publicRateLimitStore';
 
-const router = express.Router();
-
-// Daily rate limit tracking (in-memory, resets on server restart)
-const dailyEmailTracker = new Map<string, number>(); // email -> last execution timestamp
-const dailyIpTracker = new Map<string, number[]>(); // ip -> execution timestamps (last 24h)
+// ENG-2946: per-email / per-IP daily limits live behind PublicRateLimitStore so
+// the durable cross-instance store (ENG-1755, data-plane gated) is a one-line swap.
+// Default: in-memory, resets on server restart (unchanged behavior).
+const defaultRateLimitStore = new InMemoryPublicRateLimitStore();
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -44,46 +49,8 @@ function isGlobalCeilingReached(now = Date.now()): boolean {
   return globalExecutionTimestamps.length >= maxExecutionsPerDay();
 }
 
-// Periodic cleanup to prevent unbounded Map growth
-setInterval(() => {
-  const cutoff = Date.now() - DAY_MS;
-  for (const [email, ts] of dailyEmailTracker) {
-    if (ts < cutoff) dailyEmailTracker.delete(email);
-  }
-  for (const [ip, timestamps] of dailyIpTracker) {
-    const recent = timestamps.filter(t => t > cutoff);
-    if (recent.length === 0) {
-      dailyIpTracker.delete(ip);
-    } else {
-      dailyIpTracker.set(ip, recent);
-    }
-  }
-}, CLEANUP_INTERVAL_MS);
-
-function isEmailRateLimited(email: string): boolean {
-  const lastExec = dailyEmailTracker.get(email.toLowerCase());
-  if (!lastExec) return false;
-  return (Date.now() - lastExec) < DAY_MS;
-}
-
-function isIpRateLimited(ip: string): boolean {
-  const timestamps = dailyIpTracker.get(ip);
-  if (!timestamps) return false;
-  const cutoff = Date.now() - DAY_MS;
-  const recent = timestamps.filter(t => t > cutoff);
-  dailyIpTracker.set(ip, recent);
-  return recent.length >= MAX_PER_IP_PER_DAY;
-}
-
-function recordEmailUsage(email: string): void {
-  dailyEmailTracker.set(email.toLowerCase(), Date.now());
-}
-
-function recordIpUsage(ip: string): void {
-  const timestamps = dailyIpTracker.get(ip) || [];
-  timestamps.push(Date.now());
-  dailyIpTracker.set(ip, timestamps);
-}
+// Periodic cleanup to prevent unbounded growth
+setInterval(() => defaultRateLimitStore.prune(DAY_MS), CLEANUP_INTERVAL_MS).unref?.();
 
 // Simple email validation
 function isValidEmail(email: string): boolean {
@@ -95,6 +62,14 @@ function isValidEmail(email: string): boolean {
  * Body: { email: string, taskInput: string, skillId?: string }
  * Returns: { executionId: string }
  */
+export interface LeadMagnetRouterOptions {
+  rateLimitStore?: PublicRateLimitStore;
+}
+
+export function createLeadMagnetRouter(options: LeadMagnetRouterOptions = {}): express.Router {
+  const router = express.Router();
+  const store = options.rateLimitStore ?? defaultRateLimitStore;
+
 router.post('/execute', async (req, res) => {
   try {
     if (isExecuteDisabled()) {
@@ -118,7 +93,8 @@ router.post('/execute', async (req, res) => {
     }
 
     // Rate limiting — email (1 per day)
-    if (isEmailRateLimited(email)) {
+    const emailKey = emailRateLimitKey(email);
+    if (!(await store.check(emailKey, MAX_PER_EMAIL_PER_DAY, DAY_MS)).allowed) {
       return res.status(429).json({
         message: 'Rate limit exceeded. You can run one free task per day.',
       });
@@ -127,7 +103,8 @@ router.post('/execute', async (req, res) => {
     // Rate limiting — IP (5 per day)
     // req.ip resolves to the real client IP via app.ts's `trust proxy` setting (ENG-493).
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    if (isIpRateLimited(clientIp)) {
+    const ipKey = ipRateLimitKey(clientIp);
+    if (!(await store.check(ipKey, MAX_PER_IP_PER_DAY, DAY_MS)).allowed) {
       return res.status(429).json({
         message: 'Too many requests from this address. Please try again later.',
       });
@@ -169,8 +146,8 @@ router.post('/execute', async (req, res) => {
     });
 
     // Record rate limit usage
-    recordEmailUsage(email);
-    recordIpUsage(clientIp);
+    await store.record(emailKey, DAY_MS);
+    await store.record(ipKey, DAY_MS);
     globalExecutionTimestamps.push(Date.now());
 
     return res.status(200).json({ executionId });
@@ -225,7 +202,14 @@ router.get('/status/:executionId', async (req, res) => {
   }
 });
 
+  return router;
+}
+
+const router = createLeadMagnetRouter();
 export default router;
 
-// Export for testing
-export { dailyEmailTracker, dailyIpTracker, globalExecutionTimestamps };
+// Export for testing (both names reset the shared default store; kept for
+// existing tests that clear them between cases).
+const dailyEmailTracker = defaultRateLimitStore;
+const dailyIpTracker = defaultRateLimitStore;
+export { dailyEmailTracker, dailyIpTracker, defaultRateLimitStore, globalExecutionTimestamps };
