@@ -32,7 +32,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertAdsManagementGranted } from './metaToolkitWrites';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
 } from './zomaWriteGuard';
 import {
   batches, buildAudienceSpec, hashIdentifiers, identifiersDigest, type HashedIdentifiers,
@@ -59,7 +59,7 @@ export interface MetaToolkitAudienceDeps {
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
 }
 
 const ams = async () => (await import('../services/agentModeService')).agentModeService;
@@ -86,7 +86,7 @@ const defaultDeps: MetaToolkitAudienceDeps = {
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
 };
 
 const AUDIENCE_FIELDS =
@@ -235,7 +235,7 @@ async function guarded(ctx: Ctx, action: string, fingerprintData: Record<string,
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Meta state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (!consumePreviewToken(ctx.deps.consumedTokens, ctx.previewToken as string, now)) {
+  if (!(await consumeToken(ctx.deps.consumedTokens, ctx.previewToken as string, now))) {
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
   return apply();

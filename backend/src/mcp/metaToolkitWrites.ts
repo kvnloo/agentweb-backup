@@ -38,7 +38,7 @@ import { assertOptimisationEventConfigured, type ConversionLookup } from './meta
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, isOutcomeUnknownFailure, previewFingerprint, previewResponse, previewTokenMatches,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, isOutcomeUnknownFailure, previewFingerprint, previewResponse, previewTokenMatches,
   rememberTokenOutcome, replayTokenOutcome,
   PREVIEW_TOKEN_TTL_MS, type WriteVerification,
 } from './zomaWriteGuard';
@@ -87,7 +87,7 @@ export interface MetaToolkitWriteDeps {
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
   /** ENG-2931: outcome per consumed preview token, replayed on a repeat confirm. */
   tokenOutcomes?: Map<string, { exp: number; outcome: any }>;
 }
@@ -123,7 +123,7 @@ const defaultDeps: MetaToolkitWriteDeps = {
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
   tokenOutcomes: new Map(),
 };
 
@@ -430,7 +430,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Meta state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+  if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
     // ENG-2931: a client that lost the answer and repeats the same confirm gets that outcome back.
     const replay = replayTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, now);
     if (replay) return replay;
