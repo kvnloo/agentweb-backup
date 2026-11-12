@@ -15620,6 +15620,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     };
   }
 
+  /** ENG-2922: resolved account + token for the toolkit's ARCHIVE/DELETE/COPY seam (mcp/metaToolkitLifecycle.ts). */
+  public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return { accountId, accessToken };
+  }
+
   /**
    * ENG-2914 Zoma custom audiences: one Graph call with the caller's credentials for the
    * selected ad account. `{account}` in the path becomes act_<id>. Callers (mcp/metaToolkitAudiences)

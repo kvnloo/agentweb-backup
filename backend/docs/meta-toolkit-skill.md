@@ -68,7 +68,7 @@ Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Can
 For a batch, upload each file (step 1–2) or pass public URLs straight to `BULK_CREATE`, then create one ad per creative. Tell the user what was created and leave everything paused.
 
 ## Writes (CAMPAIGN, AD_SET, AD)
-Allowed: CREATE, and UPDATE of these fields. Not available: DELETE. Creatives are covered above; custom audiences are below.
+Allowed: CREATE, UPDATE of these fields, ARCHIVE, DELETE and COPY. Creatives are covered above; custom audiences are below.
 - CAMPAIGN: `status`, `daily_budget`/`lifetime_budget`, `bid_strategy`, `spend_cap`.
 - AD_SET: `status`, budgets, `bid_amount`, `bid_strategy`, `targeting` (full spec, replaces the current one, so it must include the locations, e.g. `geo_locations: {countries: ["US"]}`; use `excluded_custom_audiences: [{id}]` to exclude audiences), `start_time`, `end_time` (ISO 8601).
 - AD: `status`, `name`, `creative_id` (swap in an existing creative; to change ad copy, create a new creative first, then swap it in).
@@ -85,6 +85,13 @@ Rules:
 - Budgets are in MAJOR units of the ad account currency (50 = $50.00; for TWD/JPY, 500 = NT$500 / ¥500). The preview echoes the converted amount — read it back to the user.
 - A write is done only when the result says `verification: CONFIRMED`. `UNCONFIRMED` or `MISMATCH` is not success: tell the user and check the entity before retrying.
 - If a write is refused for a missing payment method or Meta connection, call `zoma_status` and relay its link.
+
+### Archive, delete, copy
+Pass the entity's id (`campaign_id`, `ad_set_id` or `ad_id`); same preview and approval flow as above.
+- `ARCHIVE` stops delivery and keeps the entity and its history. Prefer it over `DELETE`.
+- `DELETE` cannot be undone. Say so to the user before asking for approval.
+- Both are refused when the entity spent in the last 24 hours (or Zoma could not check). Pause it first; only if the user explicitly accepts stopping it while it spends, repeat with `confirm_recent_spend: true` (it is part of the previewed call).
+- `COPY` duplicates the entity, always PAUSED. `params.deep_copy: true` also copies a campaign's ad sets and ads (or an ad set's ads). Put an ad set copy into another campaign with `params.campaign_id`, an ad copy into another ad set with `params.adset_id`. The result's `id` is the new copy.
 
 ## Custom audiences (`zoma_custom_audiences`)
 Reads (no preview): `LIST`; `GET` with `audience_id`; `LIST_AD_SETS` with `audience_id` (ad sets that include or exclude it, and whether they are active).

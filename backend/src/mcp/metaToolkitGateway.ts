@@ -37,6 +37,8 @@ import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite,
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
+import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
+import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
 import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 
@@ -94,6 +96,8 @@ export interface MetaToolkitGatewayDeps {
   recordWrite?: typeof recordMcpWriteExecuted;
   /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
   executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2922 ARCHIVE/DELETE/COPY; defaults to executeMetaToolkitLifecycle. */
+  executeLifecycle?: (userId: string, args: any) => Promise<any>;
   /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
   runHealthTool?: typeof runMetaHealthTool;
   /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
@@ -346,7 +350,9 @@ export async function handleMetaToolkitCall(
     request.toolName,
     audienceTool
       ? isAudienceWriteRequest(args)
-      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName) || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName),
+      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
+        || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
+        || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors') {
@@ -433,11 +439,14 @@ export async function handleMetaToolkitCall(
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
+  // ENG-2922: ARCHIVE/DELETE/COPY use the same preview→confirm guard (metaToolkitLifecycle.ts).
   const creativeAsset = isCreativeAssetRequest(request.toolName, args);
-  const guardedWrite = audienceTool || creativeAsset || isGuardedWriteRequest(request.toolName, args);
+  const lifecycle = !audienceTool && isLifecycleWriteRequest(request.toolName, args);
+  const guardedWrite = audienceTool || creativeAsset || lifecycle || isGuardedWriteRequest(request.toolName, args);
   let result: any;
   if (audienceTool) result = await (deps.executeAudience ?? executeMetaToolkitAudience)(caller.userId, args);
   else if (creativeAsset) result = await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args);
+  else if (lifecycle) result = await (deps.executeLifecycle ?? executeMetaToolkitLifecycle)(caller.userId, args);
   else if (guardedWrite) result = await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args);
   else result = await deps.execute(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
 
