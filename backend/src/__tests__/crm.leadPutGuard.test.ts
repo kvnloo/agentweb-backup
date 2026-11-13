@@ -340,4 +340,44 @@ describe('review status requires a persisted draft on the lead route (ENG-2966)'
     const b = await call({ status: 'contacted' });
     expect(b.res.status).not.toHaveBeenCalledWith(400);
   });
+  it('refuses clearing the only draft on a lead already in review (no status in the body)', async () => {
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'pending_review', messageDraft: { content: 'Hola' } });
+    const { res } = await call({ messageDraft: null });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+});
+
+const createLead = async (body: any) => {
+  const handler = findHandler(router, '/lists/:listId/leads', 'post')!;
+  const res = makeRes();
+  await handler({ params: { listId: 'list1' }, body, user: { userId: 'test-user-id' }, headers: {} }, res);
+  return res;
+};
+const bulkImport = async (leads: any[]) => {
+  const handler = findHandler(router, '/lists/:listId/leads/bulk-import', 'post')!;
+  const res = makeRes();
+  await handler({ params: { listId: 'list1' }, body: { leads }, user: { userId: 'test-user-id' }, headers: {} }, res);
+  return res;
+};
+
+describe('review status requires a draft on create and bulk import (ENG-2966)', () => {
+  it('create: refuses pending_review with no draft (also the MCP add path) — 400, no write', async () => {
+    const res = await createLead({ firstName: 'A', email: 'a@x.com', status: 'pending_review' });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(crmDb.createLead).not.toHaveBeenCalled();
+  });
+  it('create: allows pending_review with a draft, and other statuses without one', async () => {
+    asMockFn(crmDb.createLead).mockResolvedValue({ leadId: 'n1' });
+    const a = await createLead({ email: 'a@x.com', status: 'pending_review', messageDraft: { content: 'Hi' } });
+    expect(a.status).toHaveBeenCalledWith(201);
+    const b = await createLead({ email: 'b@x.com', status: 'new' });
+    expect(b.status).toHaveBeenCalledWith(201);
+  });
+  it('bulk import: rejects when any row is pending_review without a draft, naming the rows', async () => {
+    const res = await bulkImport([{ email: 'ok@x.com' }, { email: 'r@x.com', status: 'pending_review' }]);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json.mock.calls[0][0].rows).toEqual([1]);
+    expect(crmDb.getLeadListById).not.toHaveBeenCalled();
+  });
 });
