@@ -382,7 +382,7 @@
   {
     "name": "emma_answer_question_deck",
     "listed": true,
-    "description": "Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for \"Let Emma decide\" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.",
+    "description": "Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for \"Let Emma decide\" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI. Cards that need a person's approval (adding or releasing contacts in Smartlead, a hot-lead call, activating a CRM sequence, a paused Meta campaign bundle) cannot be approved this way: approving one returns an error with the link where the person approves it in AgentWeb; declining one works.",
     "inputSchema": {
       "type": "object",
       "properties": {
