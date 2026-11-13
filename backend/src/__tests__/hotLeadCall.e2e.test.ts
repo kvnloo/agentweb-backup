@@ -170,7 +170,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     const goodbye = await call.leadPresses('3');
-    expect(sayText(goodbye.body)).toBe('Smith & Sons will not call this number again. Goodbye.');
+    expect(sayText(goodbye.body)).toBe('Smith & Sons will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(goodbye.body).not.toContain('<Response/>');
     const told = await call.dialEnds('completed', { DialBridged: 'false' });
     expect(sayText(told.body)).toBe('The lead asked not to be called again. Their details are in your lead alert.');

@@ -20,8 +20,14 @@ export const LEAD_DECLINED_COPY = 'The lead did not confirm. Their details are i
 export const SCREEN_NO_INPUT_COPY = 'We did not get your answer. Goodbye.';
 export const LEAD_OPTED_OUT_MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
 export const LEAD_DEFERRED_MEMBER_COPY = 'The lead is not available right now. We will try again later.';
-const leadOptedOutCopy = (announcedName: string): string => `${announcedName} will not call this number again. Goodbye.`;
-const leadDeferredCopy = (announcedName: string): string => `Okay. ${announcedName} will call you again later. Goodbye.`;
+// 47 CFR 64.1200(b)(2): the callback number must be stated during or after the message. The prompt states it last, so a lead who
+// presses a key and interrupts it hears it in the reply to that key instead (press 3, 2 or another key). Press 1 connects to a person.
+const leadOptedOutCopy = (announcedName: string, callbackNumber: string): string =>
+  `${announcedName} will not call this number again. You can reach us on ${spokenPhoneNumber(requireE164(callbackNumber, 'callback number'))}. Goodbye.`;
+const leadDeferredCopy = (announcedName: string, callbackNumber: string): string =>
+  `Okay. ${announcedName} will call you again later. You can reach us on ${spokenPhoneNumber(requireE164(callbackNumber, 'callback number'))}. Goodbye.`;
+const leadOtherKeyCopy = (callbackNumber: string): string =>
+  `You can reach us on ${spokenPhoneNumber(requireE164(callbackNumber, 'callback number'))}. Goodbye.`;
 
 /**
  * A US number as it is read aloud: national 3-3-4 groups, each digit on its own (spaced, so text-to-speech does not
@@ -137,13 +143,18 @@ export function leadDeferredMemberTwiml(): string {
 }
 
 /** Said to the lead who pressed 2, on their own leg, before it hangs up: one later call is scheduled. */
-export function leadDeferredTwiml(announcedName: string): string {
-  return response(say(leadDeferredCopy(announcedName)), '<Hangup/>');
+export function leadDeferredTwiml(announcedName: string, callbackNumber: string): string {
+  return response(say(leadDeferredCopy(announcedName, callbackNumber)), '<Hangup/>');
 }
 
 /** Said to the lead who pressed 3, on their own leg, before it hangs up. */
-export function leadOptedOutTwiml(announcedName: string): string {
-  return response(say(leadOptedOutCopy(announcedName)), '<Hangup/>');
+export function leadOptedOutTwiml(announcedName: string, callbackNumber: string): string {
+  return response(say(leadOptedOutCopy(announcedName, callbackNumber)), '<Hangup/>');
+}
+
+/** Said to the lead who pressed any other key (a decline) on their own leg, before it hangs up: the callback number, then goodbye. */
+export function leadOtherKeyTwiml(callbackNumber: string): string {
+  return response(say(leadOtherKeyCopy(callbackNumber)), '<Hangup/>');
 }
 
 /**

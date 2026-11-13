@@ -20,6 +20,7 @@ import {
   leadDeferredTwiml,
   leadOptedOutMemberTwiml,
   leadOptedOutTwiml,
+  leadOtherKeyTwiml,
   leadPhoneChangedTwiml,
   leadScreenTwiml,
   leadUnreachableTwiml,
@@ -230,14 +231,14 @@ describe('twiml builders', () => {
   });
 
   it('builds the stop messages: the lead hears the goodbye naming the business, the member is told in the fixed copy', () => {
-    const lead = parseXml(leadOptedOutTwiml('Smith & Sons'));
+    const lead = parseXml(leadOptedOutTwiml('Smith & Sons', '+14155550111'));
     expect(lead.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
     expect(lead.children.map((c) => c.name)).not.toContain('Gather'); // nothing more is asked: the call ends after the goodbye
-    expect(lead.children[0].text).toBe('Smith & Sons will not call this number again. Goodbye.');
+    expect(lead.children[0].text).toBe('Smith & Sons will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     const member = parseXml(leadOptedOutMemberTwiml());
     expect(member.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
     expect(member.children[0].text).toBe('The lead asked not to be called again. Their details are in your lead alert.');
-    expect(parseXml(leadOptedOutTwiml(NASTY)).children[0].text).toBe(`${NASTY} will not call this number again. Goodbye.`);
+    expect(parseXml(leadOptedOutTwiml(NASTY, '+14155550111')).children[0].text).toBe(`${NASTY} will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.`);
   });
 
   it('answers the screening with an empty response so Twilio bridges the calls', () => {
@@ -310,11 +311,21 @@ describe('inbound callback TwiML', () => {
   });
 });
 
+describe('key-press replies state the callback number (64.1200(b)(2), ENG-2783)', () => {
+  it('says the number, then goodbye, for any other key, and refuses a non-E.164 number', () => {
+    const root = parseXml(leadOtherKeyTwiml('+14155550111'));
+    expect(root.children.map((c) => c.name)).toEqual(['Say', 'Hangup']);
+    expect(root.children[0].text).toBe('You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
+    expect(() => leadOtherKeyTwiml('4155550111')).toThrow('not E.164');
+    expect(() => leadOptedOutTwiml('X', 'nope')).toThrow('not E.164');
+  });
+});
+
 describe('press 2 copies (ENG-2783)', () => {
   it('says the two fixed lines, escaping the name', () => {
     const say = (xml: string): string => parseXml(xml).children[0].text;
-    expect(say(leadDeferredTwiml('Smith & Sons'))).toBe('Okay. Smith & Sons will call you again later. Goodbye.');
+    expect(say(leadDeferredTwiml('Smith & Sons', '+14155550111'))).toBe('Okay. Smith & Sons will call you again later. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(say(leadDeferredMemberTwiml())).toBe('The lead is not available right now. We will try again later.');
-    expect(leadDeferredTwiml('A <b>')).toContain('A &lt;b&gt;');
+    expect(leadDeferredTwiml('A <b>', '+14155550111')).toContain('A &lt;b&gt;');
   });
 });

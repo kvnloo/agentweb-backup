@@ -63,7 +63,7 @@ const deferred = () => firstCall('2');
 describe('press 2 on the first call', () => {
   it('records the deferral an hour out, says the right things to both parties, and finishes the record lead_deferred', async () => {
     const { pressed, told } = await deferred();
-    expect(sayText(pressed.body)).toBe('Okay. Smith & Sons will call you again later. Goodbye.');
+    expect(sayText(pressed.body)).toBe('Okay. Smith & Sons will call you again later. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(sayText(told.body)).toBe('The lead is not available right now. We will try again later.');
     expect(record()).toMatchObject({ state: 'finished', outcome: 'lead_deferred', deferral: { dueAt: '2026-10-19T18:00:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' } });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
@@ -88,7 +88,7 @@ describe('press 2 on the first call', () => {
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     expect(sayText((await call.leadAnswers()).body)).toMatch(/Press 1 and we'll connect you to a person now\. You can also call us on [\d ,]+\.$/);
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     expect(record()).toMatchObject({ outcome: 'lead_declined' });
     expect(record().deferral).toBeUndefined();
@@ -103,7 +103,7 @@ describe('press 2 on the first call', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     setHotLeadCallEnabledOverride(false);
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(record().deferral).toBeUndefined();
   });
 
@@ -138,7 +138,7 @@ describe('press 2 on the first call', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     await call.leadPresses('2');
-    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again');
+    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     await call.dialEnds('completed', { DialBridged: 'false' });
     await call.leadStatus('completed', 3, { CallDuration: '12' });
     await call.memberLegEnds('completed', '40');
@@ -220,8 +220,8 @@ describe('the due-retries sweep', () => {
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    // Not offered, so an ordinary decline: the bare hangup, the ordinary member copy, nothing scheduled.
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    // Not offered, so an ordinary decline: the callback-number reply, the ordinary member copy, nothing scheduled.
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     await call.leadStatus('completed', 3, { CallDuration: '10' });
     await call.memberLegEnds('completed', '30');
@@ -240,7 +240,7 @@ describe('the due-retries sweep', () => {
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again');
+    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(world.crm.lead(LIST, 'lead-a')).toMatchObject({ contactStatus: 'do-not-contact' });
     expect(world.limits.claims.has(dncKey('org-a', LEAD_E164))).toBe(true);
   });

@@ -85,8 +85,8 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
-| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "<business> will not call this number again. Goodbye." and the call ends (`<Hangup/>`, no further prompt); the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
-| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
+| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "<business> will not call this number again. You can reach us on <the org's number>. Goodbye." and the call ends (`<Hangup/>`, no further prompt); the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
+| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. You can reach us on <the org's number>. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
 | Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
@@ -1396,11 +1396,20 @@ The lead prompt (`screenPromptCopy` in `services/voice/twiml.ts`) is written aga
   do-not-call and END THE CALL IMMEDIATELY. The next sentence is "To stop these calls at any time, press 3." Press 3 is accepted during the
   prompt (the `<Say>` is nested in the `<Gather>`), writes the [do-not-call marker](#do-not-call-list) and the lead's contact status, then plays the
   one-line goodbye and `<Hangup/>`; nothing else is asked.
-- The callback number now comes LAST in the prompt, so a lead who presses a digit early never hears it. The owner has accepted this.
-- From 2026-11-25 (FCC 26-67) a caller may name a key press as the exclusive way to revoke consent if the call clearly says so. The prompt already
-  states that press 3 is how to stop the calls, which lets press 3 serve as the exclusive revocation method after that date. There is no
-  date-dependent behaviour in the code. Until then other reasonable revocations must still be honoured within 10 business days; the platform only
-  handles press 3 today, so operators do the others by a data write (do-not-call marker / lead contact status) or by telling support.
+- (b)(2): the callback number must be stated during or after the message. It is the prompt's LAST sentence ("You can also call us on <number>"), so it
+  is met by the prompt when it is played to the end. A lead who presses a key earlier interrupts the `<Say>` and never hears that sentence (the owner
+  accepted this order), so the number is stated in the reply to each key press that ends the call or does not connect the lead to a person: press 3
+  ("... You can reach us on <number>. Goodbye."), press 2 ("Okay. <business> will call you again later. You can reach us on <number>. Goodbye.") and any
+  other key ("You can reach us on <number>. Goodbye."). Press 1 connects the lead to a person, who speaks, so it has no such reply. No input (the
+  Gather times out after the whole prompt was played) gets "We did not get your answer. Goodbye."; the number was already heard. The number is the
+  org's Twilio number, read from the live org context (`ctx.config.twilioNumber`) the handler already resolves; without a live context or a valid
+  number the leg simply hangs up. The lead-facing terminal copies are exactly these; the other copies (`leadUnreachable`, `leadPhoneChanged`,
+  `leadDeclined`, the member-side opt-out/deferral lines) are played to the team member, not the lead.
+- Revocation: the prompt does NOT designate an exclusive revocation method. It says only "To stop these calls at any time, press 3", with no
+  exclusivity language. Under 64.1200(a)(10)/(11) operators therefore MUST keep honouring a revocation made by any reasonable means (email, a reply,
+  telling staff, the lead's own words) within 10 business days. The platform only handles press 3 itself, so operators do the others by a data write
+  (do-not-call marker / lead contact status) or by telling support. Designating press 3 as the exclusive method from 2026-11-25 (FCC 26-67) would
+  need clear and conspicuous wording on the call, and is NOT done. There is no date-dependent behaviour in the code.
 
 KNOWN OPEN ITEM (voicemail): the prompt may be played to a lead's voicemail box, because there is no answering-machine detection. The rules want a
 toll-free opt-out number on messages left on voicemail, and the org number is a local one. A follow-up should add machine detection and hang up

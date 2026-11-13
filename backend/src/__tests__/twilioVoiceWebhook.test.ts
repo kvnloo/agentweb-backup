@@ -750,7 +750,8 @@ describe('POST /screen-result', () => {
 
   it.each([['4'], ['11'], ['#'], [''], [undefined]])('Digits=%j: hangs the lead up, outcome lead_declined, call.lead_declined once', async (digits) => {
     const res = await screenResult(digits);
-    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    // A key (even an empty one) is answered with the callback number; a request with no Digits at all is a bare hangup.
+    expect(res.text).toBe(digits === undefined ? '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>' : '<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_declined' });
     expect(store.eventTypes()).toEqual(['call.lead_declined']);
   });
@@ -1222,6 +1223,17 @@ describe('POST /dial', () => {
     const replay = await dial('completed', { DialCallSid: LEAD_SID, DialBridged: 'false' });
     expect(replay.text).toContain('did not confirm');
     expect(store.eventTypes()).toEqual(['call.lead_declined']);
+  });
+
+  it('another key declines and the lead hears the callback number, then goodbye (Say + Hangup, no Gather)', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID });
+    const res = await screenResult('4');
+    expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
+  });
+
+  it('press 1 is unchanged: an empty response, so Twilio bridges the calls', async () => {
+    seed('bridging', { leadCallSid: LEAD_SID });
+    expect((await screenResult('1')).text).toContain('<Response/>');
   });
 
   it('does not repeat call.lead_declined when /screen-result already recorded the decline', async () => {
@@ -1853,7 +1865,7 @@ describe('privacy', () => {
 // ── press 3 at the screening prompt: stop calling this person (ENG-2783) ─────────────────────────────
 
 describe('lead presses 3: do not call again', () => {
-  const GOODBYE = 'Smith &amp; Sons will not call this number again. Goodbye.';
+  const GOODBYE = 'Smith &amp; Sons will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.';
   const MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
   // Computed per use: the digest key (JWT_SECRET) only exists inside each test.
   const dnc = () => dncKey('org-a', LEAD_PHONE);
@@ -1888,6 +1900,17 @@ describe('lead presses 3: do not call again', () => {
     expect(res.text).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${GOODBYE}</Say><Hangup/></Response>`);
     expect(res.text).not.toContain('<Gather');
     expect(res.text).not.toContain('<Dial');
+  });
+
+  it('writes the marker and the contact status before it speaks the goodbye with the number, and answers with Say + Hangup only', async () => {
+    const order: string[] = [];
+    mock(crmDb.updateLead).mockImplementationOnce(async () => { order.push('status'); return undefined as never; });
+    const res = await screenResult('3');
+    order.push('reply');
+    expect(order).toEqual(['status', 'reply']);
+    expect(limits.claims.get(dnc())).toBeDefined();
+    expect(res.text).toContain(`<Say>${GOODBYE}</Say><Hangup/>`);
+    expect(res.text).not.toMatch(/<Gather|<Dial/);
   });
 
   it('a later 1 cannot reverse the stop: nothing connects, the lead hears the goodbye again, and the stop is not written twice', async () => {
@@ -2005,12 +2028,12 @@ describe('lead presses 3: do not call again', () => {
     expect(mock(requestNextHotLeadCallAttempt)).not.toHaveBeenCalled();
   });
 
-  it('a 4, a 5 and no input still decline exactly as before (no stop is recorded)', async () => {
+  it('a 4, a 5 and no input still decline with no stop recorded (a key is answered with the callback number, no input with a bare hangup)', async () => {
     for (const digits of ['4', '5', undefined]) {
       seed('bridging', { leadCallSid: LEAD_SID });
       store.events = [];
       const res = await screenResult(digits);
-      expect(res.text).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+      expect(res.text).toBe(digits === undefined ? '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>' : '<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
       expect(store.record?.outcome).toBe('lead_declined');
     }
     expect(limits.claims.size).toBe(0);
@@ -2056,8 +2079,8 @@ describe('lead presses 3: do not call again', () => {
 
 describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
   const HOUR = 3_600_000;
-  const GOODBYE = 'Okay. Smith &amp; Sons will call you again later. Goodbye.';
-  const BARE_HANGUP = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
+  const GOODBYE = 'Okay. Smith &amp; Sons will call you again later. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.';
+  const BARE_HANGUP = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>'; // an ordinary decline: the lead hears the callback number (64.1200(b)(2)), then the call ends
   beforeEach(() => seed('bridging', { leadCallSid: LEAD_SID }));
 
   it('defers once: outcome lead_deferred, a deferral at least an hour away, one call.lead_declined, the lead hears the goodbye', async () => {
