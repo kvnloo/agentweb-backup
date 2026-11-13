@@ -87,6 +87,18 @@ const authorize = (extra: Record<string, string>) =>
     .query({ response_type: 'code', client_id: 'c1', redirect_uri: 'http://localhost:9/cb', code_challenge: 'ch', code_challenge_method: 'S256', ...extra });
 
 describe('GET /oauth/authorize product capture', () => {
+  it('adds a signed signup intent only to Zoma consent redirects', async () => {
+    const { isZomaSignup } = require('../services/zomaSignupIntent');
+    const zomaRequests: Record<string, string>[] = [{ resource: `${BASE}/api/meta-toolkit/mcp` }, { client_id: 'zoma-device-setup' }];
+    for (const extra of zomaRequests) {
+      const res = await authorize(extra);
+      expect(res.status).toBe(302);
+      const signupIntent = new URL(res.headers.location).searchParams.get('mcp_signup_intent');
+      expect(isZomaSignup({ signupIntent })).toBe(true);
+    }
+    const emma = await authorize({ resource: `${BASE}/mcp` });
+    expect(new URL(emma.headers.location).searchParams.has('mcp_signup_intent')).toBe(false);
+  });
   it('persists zoma + ref for the Meta Toolkit resource, keyed by client and PKCE challenge', async () => {
     const res = await authorize({ resource: `${BASE}/api/meta-toolkit/mcp`, ref: 'hn_launch' });
     expect(res.status).toBe(302);

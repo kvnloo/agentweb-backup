@@ -29,6 +29,7 @@ import {
   type AttributionConfidence,
   type JourneyProduct,
 } from '../../services/journeyAttribution';
+import { mintZomaSignupIntent } from '../../services/zomaSignupIntent';
 import { trackJourney } from '../../services/journeyTracking';
 import { noteProductUse, noteSignup, zomaMilestone } from '../../services/journeyMilestones';
 
@@ -298,6 +299,9 @@ export function setupMcpOAuth(app: express.Express) {
     consentUrl.searchParams.set('utm_source', 'mcp');
     consentUrl.searchParams.set('utm_medium', classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }));
     consentUrl.searchParams.set('mcp_client_id', client_id);
+    // The deployed consent page forwards this signed intent to /api/auth/register.
+    // Never infer Zoma from the generic signupSource=mcp marker (Emma shares it).
+    if (attribution.product === 'zoma') consentUrl.searchParams.set('mcp_signup_intent', mintZomaSignupIntent());
 
     return res.redirect(302, consentUrl.toString());
   });
