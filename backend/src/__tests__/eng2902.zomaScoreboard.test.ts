@@ -172,6 +172,23 @@ describe('first successful ad (provider-verified)', () => {
     expect(out.map((r) => [r.userId, r.outcome])).toEqual([['u1', 'already_recorded'], ['u2', 'no_impressions'], ['u3', 'deferred']]);
   });
 
+  it('a failed parent lookup is a provider error, not "not created through Zoma"', async () => {
+    const adApproval = write('u1', daysAgo(2), { entityType: 'AD', action: 'UPDATE', writeKind: 'approve', objectId: 'ad9' });
+    const deps = firstAdDeps([created, adApproval], { status: 'ACTIVE', impressions: 3 });
+    (deps.campaignOf as jest.Mock).mockRejectedValue(new Error('meta 500'));
+    expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'provider_error', error: 'meta 500' });
+  });
+
+  it('stops before the next provider call once the time budget is spent', async () => {
+    let t = NOW;
+    const second = write('u1', daysAgo(1), { action: 'UPDATE', writeKind: 'approve', objectId: 'c1' });
+    const deps = firstAdDeps([created, approved, second], { status: 'PAUSED' });
+    deps.now = () => t;
+    (deps.readCampaign as jest.Mock).mockImplementation(async () => { t += 50_000; return { accountId: '111', effectiveStatus: 'PAUSED' }; });
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('deferred');
+    expect(deps.readCampaign).toHaveBeenCalledTimes(1);
+  });
+
   it('a failing ad_live emit does not fail the check once the marker is written', async () => {
     const deps = firstAdDeps([created, approved], { status: 'ACTIVE', impressions: 2 });
     (deps.onFirstAd as jest.Mock).mockRejectedValue(new Error('posthog down'));
