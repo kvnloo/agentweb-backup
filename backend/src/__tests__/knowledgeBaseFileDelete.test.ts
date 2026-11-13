@@ -185,6 +185,14 @@ describe('task attachment delete only touches attachments listed on the task (EN
     expect(mockDeleteAttachment).toHaveBeenCalledWith('task-b', ATT_KEY);
   });
 
+  it('an attachment whose name has spaces, a literal % and non-ASCII characters is still deleted (exact round trip)', async () => {
+    const odd = 'tasks/task-b/attachments/1794561990749-tok-my file%20é #1+2.png';
+    mockGetTaskById.mockResolvedValue({ ...taskB(), attachments: [{ key: odd, name: 'my file%20é #1+2.png' }] });
+    const res = await delAtt(odd);
+    expect(res.status).toBe(204);
+    expect(mockDeleteAttachment).toHaveBeenCalledWith('task-b', odd);
+  });
+
   it('a task with no attachments refuses any key', async () => {
     mockGetTaskById.mockResolvedValue({ ...taskB() });
     expect((await delAtt(ATT_KEY)).status).toBe(404);
