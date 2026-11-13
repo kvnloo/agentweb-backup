@@ -13,7 +13,8 @@ import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/dele
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
-import { waitlistDb } from "../services/waitlistDb";
+import { waitlistDb, WaitlistCapacityCounterError } from "../services/waitlistDb";
+import { applyZomaWaitlistDecision } from "../services/zomaAdmission";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
@@ -2175,6 +2176,12 @@ router.put("/waitlist/:email/status", async (req, res) => {
       }
     }
 
+    // ENG-2881: under the Zoma gate, Invite/Reject is the admission decision (seat reserved first).
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as any).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
+
     // Update invitedAt timestamp for invited users
     let invitedAt;
     if (status === "invited") {
@@ -2211,6 +2218,9 @@ router.put("/waitlist/:email/status", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Error updating waitlist status" });
   }
@@ -2236,6 +2246,9 @@ router.put("/waitlist/:email", async (req, res) => {
     const updatedEntry = await waitlistDb.updateDetails(email, updates);
     res.json(updatedEntry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist entry:", error);
     res.status(500).json({ message: "Error updating waitlist entry" });
   }
@@ -2267,6 +2280,9 @@ router.put("/waitlist/:email/support-note", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist support note:", error);
     res.status(500).json({ message: "Error updating support note" });
   }
@@ -2296,7 +2312,7 @@ router.delete("/waitlist/:email", async (req, res) => {
     } else {
       // Use the message from deleteByEmail if available, otherwise a generic one
       res
-        .status(500)
+        .status(result.conflict ? 409 : 500)
         .json({ message: result.message || "Failed to delete waitlist entry" });
     }
   } catch (error) {

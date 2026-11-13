@@ -1,4 +1,6 @@
 import express from "express";
+import { AuthenticatedRequest } from '../middleware/auth';
+import { admitZoma, applyZomaWaitlistDecision, rejectZoma, zomaApprovedCount, zomaAdmissionEnabled } from '../services/zomaAdmission';
 import { waitlistDb } from "../services/waitlistDb";
 import { validateEmail } from "../utils/validation";
 import { authenticateToken } from "../middleware/auth";
@@ -129,6 +131,11 @@ router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
       return res.status(400).json({ message: "Invalid email" });
     }
 
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as AuthenticatedRequest).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
+
     const entry = await waitlistDb.updateStatus(
       email,
       status,
@@ -139,6 +146,31 @@ router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
   } catch (error) {
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Failed to update waitlist status" });
+  }
+});
+
+router.get('/zoma/capacity', authenticateToken, isAdmin, async (_req, res) => {
+  if (!zomaAdmissionEnabled()) return res.sendStatus(404);
+  try { res.json(await zomaApprovedCount()); }
+  catch (error) {
+    console.error('Zoma capacity read failed', error);
+    res.status(503).json({ code: 'admission_unavailable' });
+  }
+});
+router.post('/zoma/:email/decision', authenticateToken, isAdmin, async (req, res) => {
+  if (!zomaAdmissionEnabled()) return res.sendStatus(404);
+  const { email } = req.params;
+  const { decision } = req.body;
+  if (!validateEmail(email) || !['approve', 'reject'].includes(decision)) return res.sendStatus(400);
+  const actor = (req as AuthenticatedRequest).user?.userId;
+  if (!actor) return res.sendStatus(403);
+  try {
+    const status = decision === 'approve' ? await admitZoma(email, actor) : await rejectZoma(email, actor);
+    const expected = decision === 'approve' ? 'approved' : 'rejected';
+    res.status(status === expected ? 200 : status === 'not_found' ? 404 : 409).json({ status });
+  } catch (error) {
+    console.error('Zoma admission decision failed', error);
+    res.status(503).json({ code: 'admission_unavailable' });
   }
 });
 
