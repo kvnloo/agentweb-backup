@@ -368,7 +368,7 @@ function scalarProblems(body: Record<string, unknown>, errors: Errors): void {
   for (const field of HOT_LEAD_CALL_LIMIT_FIELDS) {
     const value = body[field];
     const { min, max } = HOT_LEAD_CALL_LIMITS[field];
-    // An operator may store up to the table maximum; the owner routes stop at the default (see the check in applyHotLeadCallSettings).
+    // An operator may store up to the table maximum; the owner routes stop at HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH (see the check in applyHotLeadCallSettings).
     if (field === 'maxCallsPerMonth' && typeof value === 'number' && Number.isInteger(value) && value > HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH && value <= max) continue;
     if (value !== undefined && !(typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max)) {
       errors[field] = `${field} must be a whole number from ${min} to ${max}`;

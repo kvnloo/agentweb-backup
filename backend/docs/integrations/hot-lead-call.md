@@ -450,7 +450,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the first job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. Further attempts must start within this long of the call record's `startedAt`. |
 | `maxCallsPerHour` | integer 1-30, default 6. Counts LEADS that get a call, one per lead at its first attempt: a lead can ring up to `maxAttemptsPerLead` members and then the lead's own leg and still uses one slot. |
 | `maxCallsPerDay` | integer 1-100, default 20. Counts leads the same way. |
-| `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
+| `maxCallsPerMonth` | integer 1-2000, default 150 (the allowance included in the plan price; ENG-2783, default lowered from 200; a config stored without it reads as 150, no data migration; stored values are unchanged). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. It must be the business's registered (legal) name: it is the name the lead hears as the caller and the name in the consent notice (47 CFR 64.1200(b)(1)). The setup tool description and the owner-facing validation messages say so; validation itself is unchanged (it cannot check that a name is the registered one). |
@@ -691,7 +691,7 @@ GET /api/orgs/me/hot-lead-call
 200 { "_revision": "9f2c...e1", "entitled": true, "enabled": false, "canEnable": false,
       "blockers": ["Verify the phone of at least one person"],
       "callingHours": { "start": "09:00", "end": "18:00", "timezone": "America/Chicago" },
-      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 200, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
+      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 150, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
       "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "phoneMasked": "***0100", "verified": false,
                   "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] } ],
       "limits": { "maxTeamSize": 10, "maxWindowsPerMember": 7, "minAttempts": 1, "maxAttempts": 5, "nameMaxLength": 40 } }
@@ -1054,7 +1054,7 @@ back if the record is not created:
 3. Limits, taken once per lead at its first attempt, in this order: `duplicate_phone`
    (same org and number within 24h), `org_hourly_cap` (UTC clock hour),
    `org_daily_cap` (org's local calendar day), `org_monthly_cap` (org's local calendar month, key
-   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 200, see `maxCallsPerMonth`). The three caps count LEADS, not member
+   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 150, see `maxCallsPerMonth`). The three caps count LEADS, not member
    calls (a lead rings up to `maxAttemptsPerLead` members and the lead's leg for one
    slot). Each is one conditional write. Then, for every attempt, first and next, the
    chosen member's cooldown: a member in cooldown is a per-attempt skip, the next
@@ -1091,7 +1091,7 @@ Known limits, accepted:
   the cap.
 - The 80% notice can fire for a count that is then given back when the call record is not created (rare); the email said
   "used N" for a moment when N was reached.
-- Rollout: every org starts at 200 leads per month on deploy, because stored configs without the field read as the default.
+- Rollout: every org without a stored value starts at 150 leads per month (it was 200 before the default was lowered; orgs with a stored value keep it), because stored configs without the field read as the default.
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
@@ -1254,7 +1254,7 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
 
 ### Raise a customer's monthly limit
 
-The default is 200 automatic calls per org-local calendar month and the customer can only lower it. To raise it for a
+The default is 150 automatic calls per org-local calendar month (the allowance in the plan price); the customer can set it from 1 to 200. To raise it for a
 customer, an operator writes `hotLeadCall.maxCallsPerMonth` (integer 201-2000) on the org item in AW-Organizations
 (a data write, no route; keep the rest of `hotLeadCall` unchanged, and write conditionally on the previous value like the
 settings service). The next call is checked against the new value. The customer keeps seeing and keeping it when they edit
