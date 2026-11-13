@@ -12,7 +12,7 @@ jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludi
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(), getUsersByIds: jest.fn() } }));
 
 import {
-  buildZomaScoreboard, classifyZomaWrite, verifyZomaFirstAds, zomaWriteKindFor,
+  buildZomaScoreboard, classifyZomaWrite, postApprovalImpressionWindow, verifyZomaFirstAds, zomaWriteKindFor,
   type FirstAdDeps, type ScoreboardDeps, type ZomaUserRecord, type ZomaWriteEvent,
 } from '../services/zomaScoreboard';
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
@@ -110,7 +110,10 @@ describe('first successful ad (provider-verified)', () => {
   it('records the first ad when a Zoma-created campaign approved through Zoma reads back ACTIVE with >= 1 impression', async () => {
     const deps = firstAdDeps([created, approved], { status: 'ACTIVE', impressions: 1 });
     expect(await verifyZomaFirstAds(deps)).toEqual([expect.objectContaining({ userId: 'u1', outcome: 'verified', campaignId: 'c1', impressions: 1 })]);
-    expect(deps.recorded.get('u1')).toEqual({ at: new Date(NOW).toISOString(), approvedAt: approved.ts, campaignId: 'c1', platform: 'meta', effectiveStatus: 'ACTIVE', impressions: 1 });
+    expect(deps.recorded.get('u1')).toEqual({
+      at: new Date(NOW).toISOString(), approvedAt: approved.ts, campaignId: 'c1', platform: 'meta',
+      effectiveStatus: 'ACTIVE', impressionsSince: '2026-11-09', impressions: 1,
+    });
     expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
   });
 
@@ -120,12 +123,53 @@ describe('first successful ad (provider-verified)', () => {
     expect(deps.recordFirstAd).not.toHaveBeenCalled();
   });
 
-  it('an approved campaign the provider reports as not ACTIVE (paused, in review, rejected) is not a first ad', async () => {
-    for (const status of ['PAUSED', 'PENDING_REVIEW', 'DISAPPROVED']) {
-      const deps = firstAdDeps([created, approved], { status, impressions: 50 });
-      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'not_active', effectiveStatus: status });
+  it('an approved campaign in review, rejected or deleted is not a first ad, even with impressions', async () => {
+    for (const status of ['PENDING_REVIEW', 'DISAPPROVED', 'DELETED', 'WITH_ISSUES', undefined]) {
+      const deps = firstAdDeps([created, approved], { status: status ?? '', impressions: 50 });
+      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'not_active' });
+      expect(deps.campaignImpressions).not.toHaveBeenCalled();
       expect(deps.recordFirstAd).not.toHaveBeenCalled();
     }
+  });
+
+  it('a campaign paused after delivering since its Zoma approval is a first ad (first-impression safety stop)', async () => {
+    for (const status of ['PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED']) {
+      const deps = firstAdDeps([created, approved], { status, impressions: 1 });
+      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'verified', campaignId: 'c1', effectiveStatus: status, impressions: 1 });
+      expect(deps.recorded.get('u1')).toEqual(expect.objectContaining({ approvedAt: approved.ts, effectiveStatus: status, impressions: 1 }));
+      expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('a paused campaign with no delivery since approval never went live', async () => {
+    const deps = firstAdDeps([created, approved], { status: 'PAUSED', impressions: 0 });
+    expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'not_active', effectiveStatus: 'PAUSED', impressions: 0 });
+    expect(deps.recordFirstAd).not.toHaveBeenCalled();
+  });
+
+  it('only counts impressions from the approval window, never older (pre-approval) delivery', async () => {
+    // Approval 2026-11-10T12:00Z; the window opens the UTC day before for account-timezone
+    // slack and closes 12h behind now, so it can never ask Meta for a day the account has not reached.
+    const deps = firstAdDeps([created, approved], { status: 'PAUSED' });
+    (deps.campaignImpressions as jest.Mock).mockImplementation(async (_u, _a, _c, range) => (range.since <= '2026-11-01' ? 500 : 0));
+    expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'not_active', impressions: 0 });
+    expect(deps.campaignImpressions).toHaveBeenCalledWith('u1', '111', 'c1', { since: '2026-11-09', until: '2026-11-12' });
+    expect(deps.recordFirstAd).not.toHaveBeenCalled();
+  });
+
+  it('the post-approval window covers every account timezone and is never inverted', () => {
+    expect(postApprovalImpressionWindow('2026-11-10T12:00:00Z', NOW)).toEqual({ since: '2026-11-09', until: '2026-11-12' });
+    // Approved minutes ago, just after UTC midnight: still a valid single-day-or-wider range.
+    const justNow = Date.parse('2026-11-13T00:30:00Z');
+    expect(postApprovalImpressionWindow('2026-11-13T00:20:00Z', justNow)).toEqual({ since: '2026-11-12', until: '2026-11-12' });
+  });
+
+  it('write-once holds for a paused first ad: a later check neither overwrites nor re-emits', async () => {
+    const deps = firstAdDeps([created, approved], { status: 'PAUSED', impressions: 4 });
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('verified');
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('already_recorded');
+    expect(deps.recordFirstAd).toHaveBeenCalledTimes(1);
+    expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
   });
 
   it('a campaign not created through Zoma never counts, even when live with impressions', async () => {
