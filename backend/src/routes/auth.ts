@@ -414,6 +414,11 @@ router.get('/google/callback',
 router.get('/tasks/:taskId/subscribers', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
+    // ENG-2989: the records include email addresses, imported fields and email history: the task's owner or an admin only.
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
     const subscribers = await subscriberDb.getTaskSubscribers(taskId);
     res.json(subscribers);
   } catch (error: any) {
