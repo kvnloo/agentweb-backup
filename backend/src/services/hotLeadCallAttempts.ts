@@ -57,7 +57,7 @@ async function loadNextAttemptContext(
   const now = new Date();
   const refusal = staticRefusal(ctx.config, record, now);
   if (refusal) return { refusal };
-  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) return { refusal: 'disabled' };
+  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId, orgId: ctx.orgId })) return { refusal: 'disabled' };
   return { ctx, now };
 }
 

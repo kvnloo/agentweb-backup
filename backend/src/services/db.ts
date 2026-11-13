@@ -961,6 +961,18 @@ export interface Organization {
    * member join/leave. Absent/0 = no extra seats purchased.
    */
   purchasedExtraSeats?: number;
+  /**
+   * Hot lead calls add-on (ENG-2783): mirror of the flat $70/month subscription item on the org owner's Stripe
+   * subscription, written only by the billing webhook (hotLeadCallBillingService.mirrorHotLeadCallBilling).
+   * Absent = never subscribed. Read by hotLeadCallEntitlement when HOT_LEAD_CALL_BILLING_REQUIRED=true.
+   */
+  hotLeadCallBilling?: HotLeadCallBilling;
+}
+
+export interface HotLeadCallBilling {
+  itemId: string;
+  status: 'active' | 'past_due' | 'canceled';
+  updatedAt: string;
 }
 
 export interface OrgShareSettings {

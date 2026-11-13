@@ -145,7 +145,7 @@ async function reviewWhy(input: JobInput, expectedOrgId?: string): Promise<Revie
     }
   }
   // After the stateless gates: it reads the org owner's plan. An org that lost its plan stops dialing here.
-  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) {
+  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId, orgId: ctx.orgId })) {
     await recordSkip(lead, 'not_entitled');
     return refusal('not_entitled');
   }

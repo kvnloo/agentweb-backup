@@ -16,7 +16,9 @@ import {
   ConflictError, ForbiddenError, NotEntitledError, NotFoundError, RevisionRequiredError, StoredStateInvalidError, UnattendedRunError,
   ValidationError, VerificationCodeError,
 } from './hotLeadCallErrors';
-import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
+import {
+  HOT_LEAD_CALL_SUBSCRIBE_MESSAGE, isHotLeadCallBillingActive, isHotLeadCallBillingRequired, isHotLeadCallEntitled, isHotLeadCallPlanEntitled,
+} from './voice/hotLeadCallEntitlement';
 import { isConditionalFailure, unchangedSince } from './voice/setupWrites';
 import {
   confirmVerification, startVerification, verificationAfterTeamEdit, verificationStateOf, VERIFICATION_MAX_ATTEMPTS,
@@ -225,7 +227,7 @@ function configOrNoMember(org: Organization): HotLeadCallConfig {
 
 export async function startMemberVerification(org: Organization, caller: HotLeadCallCaller, memberId: string | undefined) {
   requireConfigure(org, caller);
-  if (!await isHotLeadCallEntitled(org)) throw new NotEntitledError();
+  if (!await isHotLeadCallPlanEntitled(org)) throw new NotEntitledError();
   return startVerification(org, configOrNoMember(org), caller.userId, memberId);
 }
 
@@ -435,7 +437,8 @@ const summary = (errors: Errors) => `Some settings are not valid: ${Object.entri
  *
  * `beforeTurningOn` is for a caller whose request is not a person's click (the Emma tool): it runs after every
  * check above has passed, only for a change that turns calling on, and anything it throws stops the write.
- * The REST route has no such hook, because its caller is the person clicking.
+ * The REST route has no such hook, because its caller is the person clicking; it therefore cannot buy the paid
+ * add-on, and turning calling on there is refused while the add-on is required and not active.
  */
 export async function applyHotLeadCallSettings(
   org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>, beforeTurningOn?: (next: HotLeadCallConfig) => Promise<void>,
@@ -464,7 +467,7 @@ export async function applyHotLeadCallSettings(
   }
   if (Object.keys(errors).length || !team) throw new ValidationError(summary(errors), errors);
 
-  const entitled = await isHotLeadCallEntitled(org);
+  const entitled = await isHotLeadCallPlanEntitled(org);
   const wantsEnabled = (typeof body.enabled === 'boolean' ? body.enabled : undefined) ?? current?.enabled ?? false;
   // Turning calling on is what lets calls spend money; saving while off, or editing while already on, is not gated.
   if (wantsEnabled && !current?.enabled && !entitled) throw new NotEntitledError();
@@ -496,7 +499,14 @@ export async function applyHotLeadCallSettings(
     const reason = escalationOf(current, next);
     if (reason) throw new UnattendedRunError(`This needs a person to confirm in an interactive chat (${reason})`);
   }
-  if (next.enabled && !current?.enabled) await beforeTurningOn?.(next);
+  let addOnBought = false;
+  if (next.enabled && !current?.enabled) {
+    // The paid add-on (when billing is required) is bought by the chat tool's hook after approval; a caller without
+    // a hook (the portal's REST save) cannot buy it, so it is refused with the way to subscribe.
+    if (!beforeTurningOn && !await isHotLeadCallBillingActive(org)) throw new NotEntitledError(HOT_LEAD_CALL_SUBSCRIBE_MESSAGE);
+    await beforeTurningOn?.(next);
+    addOnBought = isHotLeadCallBillingRequired();
+  }
 
   const verification = verificationAfterTeamEdit(org.hotLeadCallVerification, next.team);
   try {
@@ -507,7 +517,7 @@ export async function applyHotLeadCallSettings(
     if (isConditionalFailure(err)) throw new ConflictError('The settings were changed by someone else. Reload them and try again.');
     throw err;
   }
-  return { dto: toDto({ hotLeadCall: next }, next, entitled), config: next };
+  return { dto: toDto({ hotLeadCall: next }, next, entitled && (addOnBought || await isHotLeadCallBillingActive(org))), config: next };
 }
 
 export async function updateHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>): Promise<HotLeadCallSettingsDto> {

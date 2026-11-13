@@ -8,7 +8,7 @@
  *
  * What an approval is bound to: a digest over the action, organization, user, chat session, the parameters (area
  * code, the number being released, or the settings change that turns calling on), the price as it is quoted now
- * (monthly rent or per-minute rate), and the revision of the stored hot lead call settings. A change to any of
+ * (monthly rent, per-minute rate or the flat add-on price), and the revision of the stored hot lead call settings. A change to any of
  * them makes an earlier approval stop matching.
  *
  * An approval is valid only when it
@@ -134,7 +134,12 @@ export interface EnableLimits {
 }
 
 export type ApprovalQuestionInput = { kind: string; priceText: string } & (
-  | { action: 'provision'; areaCode?: string }
+  | {
+    action: 'provision';
+    areaCode?: string;
+    /** The rent is included in the flat hot lead calls add-on, so the card says so (the rent itself is still quoted as a cost fact). */
+    coveredByAddon?: boolean;
+  }
   | { action: 'release'; number?: string }
   | {
     action: 'enable';
@@ -143,28 +148,33 @@ export type ApprovalQuestionInput = { kind: string; priceText: string } & (
     /** Who will be phoned, for example "Dana Lee (***0100)"; at least one. */
     members: string[];
     limits: EnableLimits;
+    /** Calling comes with the paid add-on, bought on approval: the card quotes the flat price (priceText) instead of per-minute rates. */
+    addon?: boolean;
   }
 );
 
 function questionText(input: ApprovalQuestionInput): string {
   switch (input.action) {
     case 'provision':
-      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released. Calls placed from it are also billed per minute.`;
+      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released.${input.coveredByAddon ? ' This rent is covered by the $70 per month hot lead calls add-on, so it is not charged to you separately.' : ' Calls placed from it are also billed per minute.'}`;
     case 'release':
       return `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.priceText}.`;
     case 'enable': {
       if (input.members.length === 0) throw new Error('The enable card needs the people who will be phoned');
       const { limits } = input;
       const hours = limits.callingHours ? `, only ${limits.callingHours.start}-${limits.callingHours.end} ${limits.callingHours.timezone}` : '';
-      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute. Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, ${limits.maxCallsPerMonth} per month, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
+      const billing = input.addon
+        ? `This costs ${input.priceText}. Calls beyond your monthly limit are not placed.`
+        : `Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute.`;
+      return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. ${billing} Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, ${limits.maxCallsPerMonth} per month, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
     }
   }
 }
 
-const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string) => string }> = {
+const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string, addon?: boolean) => string }> = {
   provision: { label: 'Buy the number', consequence: priceText => `Buys the number now and charges ${priceText} until it is released.` },
   release: { label: 'Release the number', consequence: () => 'Releases the number and turns calling off.' },
-  enable: { label: 'Turn calling on', consequence: priceText => `Calls start for new leads now, billed at ${priceText}.` },
+  enable: { label: 'Turn calling on', consequence: (priceText, addon) => (addon ? `Adds the add-on to your subscription (${priceText}) and starts calls for new leads now.` : `Calls start for new leads now, billed at ${priceText}.`) },
 };
 
 /**
@@ -181,7 +191,7 @@ export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDec
       recommended: true,
       why: 'Nothing is spent or changed unless you approve.',
     },
-    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText) },
+    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText, input.action === 'enable' && input.addon) },
   ];
   return { question: questionText(input), options, allowEmmaDecide: false, kind: input.kind, immutable: true };
 }
