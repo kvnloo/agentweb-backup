@@ -33,8 +33,12 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockCreditsRecentlyExhausted = jest.fn().mockReturnValue(false);
 jest.mock('../services/enrichSoLeadValidation', () => ({
   validateLeadsInBackground: jest.fn().mockResolvedValue(undefined),
+  isEnrichSoCreditsRecentlyExhausted: () => mockCreditsRecentlyExhausted(),
+  ENRICHSO_CREDITS_EXHAUSTED: 'ENRICHSO_CREDITS_EXHAUSTED',
+  ENRICHSO_CREDITS_EXHAUSTED_USER_MESSAGE: 'Email validation is unavailable: the enrich.so account is out of credits.',
 }));
 
 const mockEnrichSo = {
@@ -600,6 +604,24 @@ describe('POST /api/crm/lists/:listId/leads/validate-emails', () => {
     const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
     expect(res.status).toBe(202);
     expect(res.body).toEqual({ queued: 2, skipped: 1, alreadyDone: 1, jobId: expect.any(String) });
+  });
+
+  // ENG-2983: never report a queued "success" while enrich.so is out of credits.
+  it('returns an explicit 402 (no job) when enrich.so credits were recently exhausted', async () => {
+    mockCreditsRecentlyExhausted.mockReturnValueOnce(true);
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'u1' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ leadId: 'L1', email: 'a@b.com' }],
+      lastEvaluatedKey: undefined,
+    } as any);
+    const { validateLeadsInBackground } = jest.requireMock('../services/enrichSoLeadValidation');
+    (validateLeadsInBackground as jest.Mock).mockClear();
+
+    const res = await request(app).post('/api/crm/lists/L1/leads/validate-emails').send({});
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe('ENRICHSO_CREDITS_EXHAUSTED');
+    expect(res.body.jobId).toBeUndefined();
+    expect(validateLeadsInBackground).not.toHaveBeenCalled();
   });
 });
 
