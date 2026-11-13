@@ -11,14 +11,17 @@ import { getAllocatedRate } from '../../utils/vendorRateCard';
 
 describe('estimateEnrichmentCost (ENG-2716)', () => {
   // ENG-2720 recalibration (2026-11-12): pinned to what prod actually booked, not to a single reference run.
-  // Customer runs since the 11-04 changes: 118 contacts, $8.09 booked (lists of 5-12 fields, ~8 on average;
-  // 30 emailless contacts, none with a name to send to the Apollo broker, 1 broker request booked).
-  it('backtest: the Nov 4+ customer runs (118 contacts) quote within 5% of the $8.09 prod booked', () => {
-    const e = estimateEnrichmentCost('l', 118, { emaillessCount: 30, brokerEligibleCount: 0, fieldCount: 8 });
+  // Customer runs since the 11-04 changes: 118 PROCESSED contacts, $8.09 booked (lists of 5-12 fields, ~8 on average).
+  // Every processed contact had an email (the emailless leads of those lists were skipped by the resolver, which books
+  // nothing), and one booked $0.445 Apollo request fired on an emailed lead with no fresh email metadata (not modelled).
+  // This is a fit to the data the constants came from, not an independent validation.
+  it('backtest: the Nov 4+ customer runs (118 processed contacts) quote within 5% of the $8.09 prod booked', () => {
+    const e = estimateEnrichmentCost('l', 118, { emaillessCount: 0, fieldCount: 8 });
     expect(e.totalUsd).toBeGreaterThan(8.09 * 0.95);
     expect(e.totalUsd).toBeLessThan(8.09 * 1.05);
-    // the old constants quoted ~$14.8 for the same runs
-    expect(e.breakdownUsd.apollo).toBeCloseTo(0.45, 2);
+    expect(e.breakdownUsd.apollo).toBe(0);
+    // the old constants quoted $14.4-14.8 for the same runs
+    expect(e.totalUsd).toBeLessThan(14.4 * 0.6);
   });
 
   // 2026-11-03: one list, 146 emailless contacts that all had a name and company; 60 broker requests; $37.19 booked.
@@ -27,6 +30,30 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(e.totalUsd).toBeGreaterThan(37.19 * 0.95);
     expect(e.totalUsd).toBeLessThan(37.19 * 1.05);
     expect(e.breakdownUsd.apollo).toBeCloseTo(60 * 0.445, 1);
+  });
+
+  it('leaves skipped leads (no identity signal: the resolver books nothing for them) out of every per-lead line', () => {
+    // One list of those runs: 84 leads, 54 skipped by the resolver, 30 processed.
+    const all = estimateEnrichmentCost('l', 84, { emaillessCount: 54, brokerEligibleCount: 0, skippedCount: 54, fieldCount: 12 });
+    const processedOnly = estimateEnrichmentCost('l', 30, { emaillessCount: 0, fieldCount: 12 });
+    expect(all.totalUsd).toBe(processedOnly.totalUsd);
+    expect(all.breakdownUsd.apollo).toBe(0);
+    expect(all.leadCount).toBe(84); // the dialog still says how many leads the run covers
+    expect(estimateEnrichmentCost('l', 84, { fieldCount: 12 }).totalUsd).toBeGreaterThan(all.totalUsd * 2);
+  });
+
+  it('skipped leads are never priced as Apollo-eligible, even when the caller gives no eligible count', () => {
+    const r = ENRICHMENT_COST_RATES_USD;
+    const rate = getAllocatedRate('apollo', 'waterfall_email')!;
+    const e = estimateEnrichmentCost('l', 10, { emaillessCount: 10, skippedCount: 4 });
+    expect(e.breakdownUsd.apollo).toBeCloseTo(6 * r.apolloEligibleRate * rate, 2);
+    // clamped to the lead count and never negative
+    expect(estimateEnrichmentCost('l', 10, { skippedCount: 99 }).totalUsd).toBe(0);
+    expect(estimateEnrichmentCost('l', 10, { skippedCount: -5 }).totalUsd).toBe(estimateEnrichmentCost('l', 10).totalUsd);
+    expect(estimateEnrichmentCost('l', 10, { skippedCount: NaN }).totalUsd).toBe(estimateEnrichmentCost('l', 10).totalUsd);
+    // the Enigma line is per billable lead too
+    const base = estimateEnrichmentCost('l', 10, { enigmaPerLeadUsd: 0.28, skippedCount: 5 });
+    expect(base.breakdownUsd.other).toBeCloseTo(5 * 0.28, 2);
   });
 
   it('has no unattributed per-lead remainder any more (that was gpt-5.5-era spend)', () => {
@@ -42,7 +69,7 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(e.breakdownUsd.apollo).toBeCloseTo(112 * rate * ENRICHMENT_COST_RATES_USD.apolloEligibleRate, 2);
   });
 
-  it('prices broker-eligible emailless leads at the eligible rate and the rest at the low rate', () => {
+  it('prices broker-eligible emailless leads at the eligible rate and the rest at the other rate', () => {
     const rate = getAllocatedRate('apollo', 'waterfall_email')!;
     const r = ENRICHMENT_COST_RATES_USD;
     const e = estimateEnrichmentCost('l', 50, { emaillessCount: 40, brokerEligibleCount: 10 });

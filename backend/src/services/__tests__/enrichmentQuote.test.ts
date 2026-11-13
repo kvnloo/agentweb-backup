@@ -52,45 +52,45 @@ describe('inspectLeads', () => {
   it('pages through the whole list and counts leads without a usable email', async () => {
     const emails = Array.from({ length: 450 }, (_, i) => (i % 3 === 0 ? `a${i}@acme.com` : i % 3 === 1 ? '' : 'junk@example.com'));
     const d = deps(emails);
-    expect(await inspectLeads(d, 'l')).toEqual({ count: 450, emailless: 300, brokerEligible: 300 });
+    expect(await inspectLeads(d, 'l')).toEqual({ count: 450, emailless: 300, brokerEligible: 300, skipped: 0 });
     expect(d.pages).toBe(3);
   });
 
   it('counts a selected subset only for ids that belong to the list, with their real email state', async () => {
     const d = deps(['a@acme.com', '', 'junk@example.com', 'b@acme.com']);
     // l0 has an email, l1 none, l2 placeholder; l99 and "x" do not exist; l1 is repeated
-    expect(await inspectLeads(d, 'l', ['l0', 'l1', 'l2', 'l1', 'l99', 'x'])).toEqual({ count: 3, emailless: 2, brokerEligible: 2 });
+    expect(await inspectLeads(d, 'l', ['l0', 'l1', 'l2', 'l1', 'l99', 'x'])).toEqual({ count: 3, emailless: 2, brokerEligible: 2, skipped: 0 });
     expect(d.pages).toBe(1);
   });
 
   it('fake ids cannot amplify the count (they match nothing), so the quote cannot be scaled to resolve the rate', async () => {
     const fake = Array.from({ length: 100_000 }, (_, i) => `fake-${i}`);
-    expect(await inspectLeads(deps(['a@acme.com', '']), 'l', fake)).toEqual({ count: 0, emailless: 0, brokerEligible: 0 });
+    expect(await inspectLeads(deps(['a@acme.com', '']), 'l', fake)).toEqual({ count: 0, emailless: 0, brokerEligible: 0, skipped: 0 });
   });
 
   it('stops scanning once every requested id has been found (a small subset does not read the whole list)', async () => {
     const d = deps(Array(1000).fill(''));
-    expect(await inspectLeads(d, 'l', ['l0', 'l1'])).toEqual({ count: 2, emailless: 2, brokerEligible: 2 });
+    expect(await inspectLeads(d, 'l', ['l0', 'l1'])).toEqual({ count: 2, emailless: 2, brokerEligible: 2, skipped: 0 });
     expect(d.pages).toBe(1); // 1000 leads = 5 pages, the ids are on the first
     const far = deps(Array(1000).fill(''));
-    expect(await inspectLeads(far, 'l', ['l999'])).toEqual({ count: 1, emailless: 1, brokerEligible: 1 });
+    expect(await inspectLeads(far, 'l', ['l999'])).toEqual({ count: 1, emailless: 1, brokerEligible: 1, skipped: 0 });
     expect(far.pages).toBe(5);
   });
 
   it('still scans the whole list when a requested id does not exist (bounded by the list)', async () => {
     const d = deps(Array(1000).fill(''));
-    expect(await inspectLeads(d, 'l', ['l0', 'nope'])).toEqual({ count: 1, emailless: 1, brokerEligible: 1 });
+    expect(await inspectLeads(d, 'l', ['l0', 'nope'])).toEqual({ count: 1, emailless: 1, brokerEligible: 1, skipped: 0 });
     expect(d.pages).toBe(5);
   });
 
   it('ignores non-string lead ids on the page', async () => {
     const d = deps(['']);
     d.getLeadsPage = async () => ({ items: [{ leadId: 5 as unknown as string, email: '' }, { email: '' }] });
-    expect(await inspectLeads(d, 'l', ['5', 'undefined'])).toEqual({ count: 0, emailless: 0, brokerEligible: 0 });
+    expect(await inspectLeads(d, 'l', ['5', 'undefined'])).toEqual({ count: 0, emailless: 0, brokerEligible: 0, skipped: 0 });
   });
 
   it('handles an empty list', async () => {
-    expect(await inspectLeads(deps([]), 'l')).toEqual({ count: 0, emailless: 0, brokerEligible: 0 });
+    expect(await inspectLeads(deps([]), 'l')).toEqual({ count: 0, emailless: 0, brokerEligible: 0, skipped: 0 });
   });
 });
 
@@ -245,23 +245,47 @@ describe('Apollo line: only leads the broker can reach, only when the config ask
     return {
       getLeadsPage: async () => ({ items: leads.map((l, i) => ({ leadId: `l${i}`, ...l })) }),
       getSavedConfig: async () => config,
-      hasUsableEmail: (e: unknown) => typeof e === 'string' && e.includes('@'),
+      hasUsableEmail: (e: unknown) => typeof e === 'string' && e.includes('@') && !e.endsWith('@example.com'),
     };
   }
 
-  it('counts as broker-eligible only emailless leads with a first and last name plus a company, domain, website or email domain', async () => {
+  it('counts as broker-eligible only emailless leads with a first and last name plus a company or an email domain on the lead', async () => {
     const d = depsLeads([
       named('', 'A', 'B', 'Acme'),
-      named('', 'A', 'B', undefined, { domain: 'acme.com' }),
-      named('', 'A', 'B', undefined, { website: 'https://acme.com' }),
       named('', 'A', 'B', undefined, { emailDomain: 'acme.com' }),
+      // a website or domain alone is not enough: tier 3.5a reads only company / emailDomain
+      named('', 'A', 'B', undefined, { website: 'https://acme.com' }),
+      named('', 'A', 'B', undefined, { domain: 'acme.com' }),
       named('', 'A', undefined, 'Acme'),
       named('', undefined, 'B', 'Acme'),
       named('', '  ', 'B', 'Acme'),
       named('', 'A', 'B'),
       named('a@acme.com', 'A', 'B', 'Acme'),
     ]);
-    expect(await inspectLeads(d, 'l')).toEqual({ count: 9, emailless: 8, brokerEligible: 4 });
+    expect(await inspectLeads(d, 'l')).toEqual({ count: 9, emailless: 8, brokerEligible: 2, skipped: 3 }); // skipped: the three with only one name part
+  });
+
+  it('counts leads with no identity signal as skipped (no usable email, LinkedIn, or first and last name)', async () => {
+    const d = depsLeads([
+      named('', undefined, undefined, 'Acme'),                       // company only: skipped
+      named('', 'A', undefined, 'Acme'),                             // first name only: skipped
+      named('   ', undefined, undefined, undefined, { website: 'https://acme.com' }), // website only: skipped
+      named('', undefined, undefined, 'Acme', { linkedin: 'https://linkedin.com/in/x' }), // LinkedIn: resolvable
+      named('', 'A', 'B', undefined),                                // full name: resolvable
+      named('x@example.com', undefined, undefined, undefined),       // placeholder email, nothing else: skipped
+      named('real@acme.com', undefined, undefined, undefined),       // usable email: resolvable
+    ]);
+    expect(await inspectLeads(d, 'l')).toEqual({ count: 7, emailless: 6, brokerEligible: 0, skipped: 4 });
+  });
+
+  it('quotes skipped leads at zero: a list of leads with nothing to identify them costs nothing', async () => {
+    const nothing = Array.from({ length: 20 }, () => named('', undefined, undefined, 'Acme'));
+    const named20 = Array.from({ length: 20 }, () => named('', 'A', 'B', 'Acme'));
+    const free = await priceEnrichment(depsLeads(nothing, cfg('email', 'title')), { userId: 'u', listId: 'l' });
+    const paid = await priceEnrichment(depsLeads(named20, cfg('email', 'title')), { userId: 'u', listId: 'l' });
+    expect(free.estimate.totalUsd).toBe(0);
+    expect(free.leadCount).toBe(20);
+    expect(paid.estimate.totalUsd).toBeGreaterThan(0);
   });
 
   it('prices no Apollo line when the saved config does not include an email column', async () => {
@@ -281,10 +305,10 @@ describe('Apollo line: only leads the broker can reach, only when the config ask
     expect((await priceEnrichment(depsLeads(leads, excluded), { userId: 'u', listId: 'l' })).estimate.breakdownUsd.apollo).toBe(0);
   });
 
-  it('prices emailless leads without a name far lower than ones the broker can reach', async () => {
+  it('prices resolvable emailless leads the broker cannot reach yet (LinkedIn only) at the other rate, below the eligible rate', async () => {
     const reachable = await priceEnrichment(depsLeads(Array.from({ length: 30 }, () => named('', 'A', 'B', 'Acme')), cfg('email')), { userId: 'u', listId: 'l' });
-    const companyOnly = await priceEnrichment(depsLeads(Array.from({ length: 30 }, () => named('', undefined, undefined, 'Acme')), cfg('email')), { userId: 'u', listId: 'l' });
-    expect(companyOnly.estimate.breakdownUsd.apollo).toBeLessThan(reachable.estimate.breakdownUsd.apollo / 10);
-    expect(companyOnly.estimate.breakdownUsd.apollo).toBeGreaterThan(0);
+    const linkedinOnly = await priceEnrichment(depsLeads(Array.from({ length: 30 }, () => named('', undefined, undefined, undefined, { linkedin: 'https://linkedin.com/in/x' })), cfg('email')), { userId: 'u', listId: 'l' });
+    expect(linkedinOnly.estimate.breakdownUsd.apollo).toBeGreaterThan(0);
+    expect(linkedinOnly.estimate.breakdownUsd.apollo).toBeLessThan(reachable.estimate.breakdownUsd.apollo);
   });
 });
