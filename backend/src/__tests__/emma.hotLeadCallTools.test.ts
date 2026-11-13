@@ -370,11 +370,11 @@ describe('shared-session blocking', () => {
 
 
 describe('ENG-2783: monthly cap and honest read-out through the Emma tools', () => {
-  it('get shows the default 200 when the stored config has no value, and the stored value when an operator raised it', async () => {
+  it('get shows the default 150 when the stored config has no value, and the stored value when an operator raised it', async () => {
     const without = storedConfigFixture();
     delete (without as Record<string, unknown>).maxCallsPerMonth;
     org.hotLeadCall = without;
-    expect(await get()).toMatchObject({ maxCallsPerMonth: 200 });
+    expect(await get()).toMatchObject({ maxCallsPerMonth: 150 });
     org.hotLeadCall = storedConfigFixture({ maxCallsPerMonth: 1500 });
     expect(await get()).toMatchObject({ maxCallsPerMonth: 1500 });
   });

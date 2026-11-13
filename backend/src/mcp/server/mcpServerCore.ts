@@ -21,6 +21,7 @@ import {
   recordMcpFirstToolUse,
   recordMcpToolUse,
 } from '../../services/mcpUsageEventsService';
+import { noteProductUse } from '../../services/journeyMilestones';
 import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
@@ -127,6 +128,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       isInternal: sessionContext?.isInternal,
       authMethod: sessionContext?.authMethod,
       apiKeyId: sessionContext?.apiKeyId,
+      apiKeyScopes: sessionContext?.apiKeyScopes,
       oauthClientId: sessionContext?.oauthClientId,
       oauthClientName: sessionContext?.oauthClientName,
       clientType: sessionContext?.clientType,
@@ -144,8 +146,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
         ? sanitizePublicToolResult(rawResult)
         : rawResult;
       if (context.externalMcp && effectiveUserId) {
+        // ENG-2906: this server is the Emma /mcp surface.
+        void noteProductUse(effectiveUserId, 'emma_mcp');
         void Promise.all([
           recordMcpToolUse({
+            product: 'emma_mcp',
             userId: effectiveUserId,
             toolName: name,
             authMethod: sessionContext?.authMethod,
@@ -158,6 +163,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
             userAgent: sessionContext?.userAgent,
           }),
           recordMcpFirstToolUse({
+            product: 'emma_mcp',
             userId: effectiveUserId,
             toolName: name,
             authMethod: sessionContext?.authMethod,

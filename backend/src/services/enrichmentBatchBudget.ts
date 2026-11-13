@@ -18,10 +18,10 @@ const EXPECTED_FIELD_FLOOR_USD = 0.002;
 /** Admission reserves 10x the measured booked cost, never less than $0.02 (it was $0.10, sized for gpt-5.5). */
 const WEB_FIELD_GUARD_MULTIPLE = 10;
 const WEB_FIELD_GUARD_FLOOR_USD = 0.02;
-/** Unpriced model: reserve 25x Luna's token price (about $0.09 per field, above every priced model's reserve except the very dearest) instead of the floor. */
+/** Unpriced model: reserve 25x Luna's token price (about $0.09 per field, the same as gpt-5.5; a few dearer models such as gpt-4 and the $10/$50 aliases reserve more) instead of the floor. */
 const UNPRICED_MODEL_PRICE_RATIO = 25;
 
-/** How many times dearer (input + output price) the model is than Luna, at least 1; unpriced => the dearest case. */
+/** How many times dearer (input + output price) the model is than Luna, at least 1; unpriced => UNPRICED_MODEL_PRICE_RATIO (gpt-5.5-sized, not the dearest case). */
 function modelPriceRatio(model?: string): number {
   const luna = getModelPrice(LUNA_MODEL);
   const price = model ? getModelPrice(model) : luna;

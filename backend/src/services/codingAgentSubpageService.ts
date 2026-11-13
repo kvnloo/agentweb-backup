@@ -162,7 +162,7 @@ export async function addPageViaCodingAgent(
     try {
       const pub = await mcpFetch({
         method: "POST",
-        path: `/api/landing-pages/v0/generated/${id}/publish`,
+        path: `/api/landing-pages/v0/generated/${encodeURIComponent(id)}/publish`,
         context: { userId },
         body: { branch: draftBranch },
       });

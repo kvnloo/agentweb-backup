@@ -1,4 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
+import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -841,6 +842,12 @@ router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
 router.delete('/:taskId/subscribers/:email', async (req, res) => {
   try {
     const { taskId, email } = req.params;
+    // ENG-2989: same permission as adding a subscriber (the task's owner or an admin). This used to need only a login.
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
+
     await subscriberDb.removeSubscriber(taskId, email);
     res.status(204).send();
   } catch (error: any) {
@@ -888,6 +895,13 @@ router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: Authe
     }
     if (task.userId !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized to modify this task' });
+    }
+
+    // ENG-2986: only an attachment listed on THIS task may be deleted. The key used to go straight to S3, so an owner of any task could
+    // delete another account's object in the same bucket by naming its key.
+    const attachments: any[] = Array.isArray((task as any).attachments) ? (task as any).attachments : [];
+    if (!attachments.some((a: any) => typeof a?.key === 'string' && a.key === key)) {
+      return res.status(404).json({ error: 'Attachment not found on this task' });
     }
 
     await taskDb.deleteAttachment(taskId, key);
@@ -1642,8 +1656,19 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
       }
     }
 
-    // Decode the file key (it's URL encoded)
-    const decodedKey = decodeURIComponent(fileKey);
+    // ENG-2986: only a file that is listed on THIS task may be deleted. The key used to come straight from the URL, so anyone who could
+    // edit their own task could delete any object in the bucket (another account's file) by naming its key. Express has already decoded
+    // the param once; older clients also sent it double-encoded, so both forms are matched against the listed keys, and the LISTED key
+    // is what reaches storage (never the URL text).
+    const listedFiles: any[] = Array.isArray((task as any).knowledgeBaseFiles) ? (task as any).knowledgeBaseFiles : [];
+    let secondDecode: string | undefined;
+    try { secondDecode = decodeURIComponent(fileKey); } catch { secondDecode = undefined; }
+    const listed = listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === fileKey)
+      ?? (secondDecode !== undefined ? listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === secondDecode) : undefined);
+    if (!listed) {
+      return res.status(404).json({ message: 'File not found in this knowledge base' });
+    }
+    const decodedKey: string = listed.key;
     if (decodedKey.startsWith(S3_KEY_PREFIX)) {
       try {
         await s3

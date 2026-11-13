@@ -5,7 +5,7 @@ import * as ts from 'typescript';
 import { createHash } from 'crypto';
 import { refreshModelCatalog } from '../services/agentMode/modelCatalogRefresh';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
-import { MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP } from '../utils/llmPricing';
+import { MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP, LIVE_MODALITY_PRICES } from '../utils/llmPricing';
 
 /** Replace only changed object members; keep surrounding comments and unrelated entries. */
 export function patchObject(source: string, name: string, changes: Record<string, unknown>): string {
@@ -67,7 +67,8 @@ export function writeCatalogPlan(plan: Awaited<ReturnType<typeof refreshModelCat
     const canonical = (value: any): string => value && typeof value === 'object'
       ? `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}` : JSON.stringify(value);
     const fingerprint = createHash('sha256').update(canonical({
-      MODEL_PRICING: { ...MODEL_PRICING, ...plan.pricingChanges }, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP,
+      // ENG-2957: the same tables llmPricing.test.ts fingerprints, voice rates included, or the pin it writes fails CI.
+      MODEL_PRICING: { ...MODEL_PRICING, ...plan.pricingChanges }, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP, LIVE_MODALITY_PRICES,
     })).digest('hex').slice(0, 16);
     pin = pin.replace(/version: '\d{4}-\d{2}-\d{2}',/, `version: '${plan.date}',`)
       .replace(/fingerprint: '[a-f0-9]+',[^\n]*/, `fingerprint: '${fingerprint}', // Catalog refresh price-book pin.`);

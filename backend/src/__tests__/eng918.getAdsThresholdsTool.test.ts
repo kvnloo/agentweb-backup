@@ -78,6 +78,36 @@ describe('Emma Tools - get_ads_thresholds', () => {
     expect(getThresholdsForAccount).not.toHaveBeenCalled();
   });
 
+  // ENG-2938: prod failures were the model passing a well-formed-but-unnormalized id or the name.
+  it.each([
+    [`act_${OWNED}`], [` ACT_${OWNED} `], [Number(OWNED) as any], ['Main Account'],
+  ])('resolves an owned account passed as %p', async (accountArg) => {
+    const user = ownerWith(OWNED) as any;
+    user.connected_accounts[0].account_name = 'Main Account';
+    (userDb.getUserById as jest.Mock).mockResolvedValue(user);
+    (getThresholdsForAccount as jest.Mock).mockResolvedValue([]);
+    const tool = emmaToolRegistry.getTool(toolName)!;
+    const result = await tool.execute({ platform: 'meta', account_id: accountArg }, { userId: 'caller-1' });
+    expect(result.success).toBe(true);
+    expect(result.account_id).toBe(OWNED);
+    expect(getThresholdsForAccount).toHaveBeenCalledWith('meta', OWNED);
+  });
+
+  it('lists the valid connected ids when the account is not owned', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue(ownerWith(OWNED));
+    const tool = emmaToolRegistry.getTool(toolName)!;
+    const result = await tool.execute({ platform: 'meta', account_id: NOT_OWNED }, { userId: 'caller-1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain(OWNED);
+  });
+
+  it('says no Meta account is connected rather than an ownership error', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'caller-1', connected_accounts: [] });
+    const tool = emmaToolRegistry.getTool(toolName)!;
+    const result = await tool.execute({ platform: 'meta', account_id: OWNED }, { userId: 'caller-1' });
+    expect(result.error).toMatch(/No Meta ad account is connected/);
+  });
+
   it('returns the resolved set (registry defaults) for an owned account with no overrides', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(ownerWith(OWNED));
     (getThresholdsForAccount as jest.Mock).mockResolvedValue([]);

@@ -3,6 +3,7 @@
  * mcp/zomaDeviceFlow.ts; this file maps HTTP <-> flow and throttles per IP.
  *
  *   POST /api/zoma/setup              (unauthenticated) start; RFC 8628 device authorization response
+ *                                     optional `ref` (body or query, /^[a-z0-9_-]{1,64}$/) for attribution
  *   POST /api/zoma/setup/poll         {device_code} -> RFC errors, then next_step + link, then the token once
  *   GET  /api/zoma/activate           verification page; ?user_code= -> AgentWeb sign-in + consent
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
@@ -114,10 +115,11 @@ function failPage(res: Response, step: string, error: unknown) {
 export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps): Router {
   const router = Router();
 
-  router.post('/setup', throttle('setup', ZOMA_SETUP_MAX_PER_MINUTE), async (_req: Request, res: Response) => {
+  router.post('/setup', throttle('setup', ZOMA_SETUP_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       res.setHeader('Cache-Control', 'no-store');
-      return res.json(await startSetup(deps));
+      // ENG-2906: optional attribution ref (body or ?ref=); invalid values are dropped, never rejected.
+      return res.json(await startSetup(deps, { ref: req.body?.ref ?? req.query.ref }));
     } catch (error) {
       logZomaSetup({ step: 'setup_started', outcome: 'error', reason: error });
       return res.status(500).json({ error: 'server_error', error_description: 'Could not start Zoma setup.' });

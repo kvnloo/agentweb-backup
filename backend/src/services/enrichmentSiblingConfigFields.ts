@@ -15,18 +15,14 @@ import type { EnrichmentFieldConfig } from './crmEnrichmentServiceV3';
 import type { SiblingLeadResult } from './enrichmentIdentityResolver';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
-import { createLLMService, LLMUsageContext } from '../utils/llmService';
+import type { LLMUsageContext } from '../utils/llmService';
+import { createEnrichmentHelperLLM } from './enrichmentMappingLlm';
 
 const IDENTITY_FIELDS = new Set([
   'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
 ]);
 
 const DEFAULT_TTL_DAYS = 90;
-// Must be a model that `createLLMService` can construct successfully — the
-// Azure deployment used by the rest of the v3 enrichment pipeline. Bedrock
-// Claude IDs only resolve here when an inference-profile mapping is added
-// in `llmService.ts`, so changing this requires updating that map too.
-const MAPPING_MODEL = process.env.CRM_ENRICH_V3_EXTRACT_MODEL || 'gpt-5-chat-2';
 
 // ─── TTL helpers ──────────────────────────────────────────────────────────────
 
@@ -99,7 +95,7 @@ export async function buildLLMFieldMapping(
     `Return: {"fieldName": ["alias1", "alias2", ...], ...}`;
 
   try {
-    const llm = createLLMService(MAPPING_MODEL, 0.0);
+    const llm = await createEnrichmentHelperLLM(usageContext?.userId, process.env.CRM_ENRICH_V3_EXTRACT_MODEL);
     // Shadow usage metering: callers that don't pass a context still get the
     // call recorded under feature "enrichment" (userId falls back to "system").
     const parsed = await llm.generateJSONContent<Record<string, string[]>>(

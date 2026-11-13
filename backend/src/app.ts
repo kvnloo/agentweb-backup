@@ -12,6 +12,7 @@ import waitlistRoutes from "./routes/waitlist";
 import scheduleRoutes from "./routes/schedules";
 import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
+import adminZomaScoreboardRoutes from "./routes/adminZomaScoreboard";
 import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
 import adminV0CreditsRoutes from "./routes/adminV0Credits";
 import adminVendorRatesRoutes from "./routes/adminVendorRates";
@@ -435,6 +436,7 @@ app.use("/api/schedules", scheduleRoutes);
 // and never reaches the catch-all a second time since this mount already terminates the
 // response either way. See middleware/agentRunsAuth.ts.
 app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
+app.use("/api/admin", adminZomaScoreboardRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);

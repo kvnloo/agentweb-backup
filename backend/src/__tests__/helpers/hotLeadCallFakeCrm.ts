@@ -8,6 +8,14 @@
  * would reject the request (appending to a list or maxIn map the creator did not initialise).
  */
 
+import { callConsentRecord } from './hotLeadCallFixtures';
+
+/** The digits of a US test phone as E.164 (what consentPhoneDigits yields for the numbers these tests use). */
+const usDigits = (phone: unknown): string => {
+  const d = String(phone ?? '').replace(/\D/g, '');
+  return d.length === 10 ? `1${d}` : d;
+};
+
 type Json = Record<string, unknown>;
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -45,8 +53,17 @@ export class FakeCrm {
     for (const l of lists) this.lists.set(l.listId, { ...l, name: 'Inbound' });
   }
 
-  addLead(lead: FakeLead): void {
-    this.leads.set(this.key(lead.listId, lead.leadId), clone(lead));
+  /** ENG-2783: a lead carries a call-consent record unless `consent: false` (the gate `no_call_consent` refuses one without). */
+  addLead(lead: FakeLead, opts: { consent?: boolean } = {}): void {
+    const withConsent: FakeLead = opts.consent === false ? lead : { ...lead, system: { callConsent: callConsentRecord({ phoneDigits: usDigits(lead.phone) }), ...lead.system } };
+    this.leads.set(this.key(lead.listId, lead.leadId), clone(withConsent));
+  }
+
+  /** Changes a lead's phone and re-binds its consent record to the new number (a test about what happens AFTER the gates, e.g. lead_phone_changed). */
+  rePhone(listId: string, leadId: string, phone: string): void {
+    const lead = this.lead(listId, leadId);
+    lead.phone = phone;
+    if (lead.system?.callConsent) lead.system.callConsent = { ...(lead.system.callConsent as Json), phoneDigits: usDigits(phone) };
   }
 
   hasLead(listId: string, leadId: string): boolean {

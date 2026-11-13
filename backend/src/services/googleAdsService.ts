@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 import {
@@ -1682,7 +1682,7 @@ export class GoogleAdsService {
   private async verifyFieldsReadBack(
     customerId: string,
     accessToken: string,
-    entity: 'campaign_budget' | 'ad_group' | 'ad_group_criterion' | 'ad_group_ad',
+    entity: 'campaign_budget' | 'ad_group' | 'ad_group_criterion' | 'ad_group_ad' | 'asset_group',
     resourceName: string,
     expected: Record<string, { gaql: string; value: unknown }>,
     loginCustomerId?: string,
@@ -1759,7 +1759,7 @@ export class GoogleAdsService {
    * so we reject anything else rather than let a crafted string alter the query (e.g. one
    * engineered to return zero rows and silently skip the creative-addition gate).
    */
-  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups' | 'campaignCriteria'): void {
+  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups' | 'campaignCriteria' | 'assetGroups'): void {
     const idPattern = segment === 'campaignCriteria' ? '\\d+~\\d+' : '\\d+';
     if (typeof value !== 'string' || !new RegExp(`^customers/\\d+/${segment}/${idPattern}$`).test(value)) {
       throw new Error(`Invalid Google Ads ${segment} resource name`);
@@ -2040,7 +2040,47 @@ export class GoogleAdsService {
       }
     }
     const { resource, operations } = buildDeviceBidAdjustmentOperations(params, existing);
-    await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
+    const res = await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
+    await this.verifyDeviceBidModifiersReadBack(params, operations, res, accessToken, loginCustomerId);
+  }
+
+  /**
+   * ENG-2398: prove every device bid modifier landed. Read each targeted criterion / ad-group
+   * bid modifier back and compare bid_modifier numerically (proto3 JSON omits a 0 value, so a
+   * missing field reads as 0 — that is the -100% "exclude device" case). Any mismatch or
+   * missing resource throws GoogleAdsReadBackError, never a silent success.
+   */
+  private async verifyDeviceBidModifiersReadBack(
+    params: NormalizedDeviceBidAdjustments,
+    operations: any[],
+    mutateResult: any,
+    accessToken: string,
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const entity = params.scope === 'CAMPAIGN' ? 'campaign_criterion' : 'ad_group_bid_modifier';
+    const rowKey = params.scope === 'CAMPAIGN' ? 'campaignCriterion' : 'adGroupBidModifier';
+    const results: any[] = mutateResult?.results ?? [];
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      const resourceName: string | undefined = op.update?.resourceName ?? results[i]?.resourceName;
+      const expected = Number(op.update?.bidModifier ?? op.create?.bidModifier);
+      if (!resourceName || !this.isValidGoogleAdsResourceName(resourceName)) {
+        throw new GoogleAdsReadBackError(resourceName ?? '<missing resource name>', ['<invalid resource name>']);
+      }
+      const rows = await this.search(
+        params.customerId, accessToken,
+        `SELECT ${entity}.resource_name, ${entity}.bid_modifier FROM ${entity} WHERE ${entity}.resource_name = '${resourceName}'`,
+        loginCustomerId,
+      );
+      const row = rows[0]?.[rowKey];
+      if (!row) throw new GoogleAdsReadBackError(resourceName, [`<${entity} not found on read-back>`]);
+      const actual = Number(row.bidModifier ?? 0);
+      if (!Number.isFinite(actual) || Math.abs(actual - expected) > 1e-6) {
+        const err = new GoogleAdsReadBackError(resourceName, ['bid_modifier']);
+        console.error('[GoogleAds] read-back mismatch', { code: err.code, resource: resourceName, fields: ['bid_modifier'] });
+        throw err;
+      }
+    }
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
@@ -2367,17 +2407,65 @@ export class GoogleAdsService {
    */
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
+    /** ENG-2979: responsive search ad content edits (AdService on customers/{cid}/ads/{adId}). */
+    headlines?: string[];
+    descriptions?: string[];
+    finalUrl?: string;
   }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
-    const updateMask: string[] = [];
-    const update: any = { resourceName: adGroupAdResourceName };
-    if (params.status) { update.status = params.status; updateMask.push('status'); }
-    if (updateMask.length === 0) return false;
-    await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
-    const expected: Record<string, { gaql: string; value: unknown }> = {};
-    if (params.status) expected.status = { gaql: 'status', value: params.status };
-    await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName, expected, loginCustomerId);
+    const hasContent = params.headlines !== undefined || params.descriptions !== undefined || params.finalUrl !== undefined;
+    if (!params.status && !hasContent) return false;
+    if (hasContent) await this.updateResponsiveSearchAdContent(customerId, accessToken, adGroupAdResourceName, params, loginCustomerId);
+    if (params.status) {
+      const update: any = { resourceName: adGroupAdResourceName, status: params.status };
+      await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: 'status' }], loginCustomerId);
+      await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName,
+        { status: { gaql: 'status', value: params.status } }, loginCustomerId);
+    }
     return true;
+  }
+
+  /**
+   * ENG-2979: edit an existing RESPONSIVE_SEARCH_AD's headlines / descriptions / final URL in
+   * place. The Ad lives at customers/{cid}/ads/{adId} (the adGroupAd id is `<adGroupId>~<adId>`);
+   * the update_mask names only the changed fields, then every changed field is read back.
+   */
+  private async updateResponsiveSearchAdContent(
+    customerId: string,
+    accessToken: string,
+    adGroupAdResourceName: string,
+    params: { headlines?: string[]; descriptions?: string[]; finalUrl?: string },
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const match = /^customers\/(\d+)\/adGroupAds\/\d+~(\d+)$/.exec(adGroupAdResourceName);
+    if (!match || match[1] !== String(customerId)) throw new GoogleAdsReadBackError(adGroupAdResourceName, ['<invalid resource name>']);
+    const adResourceName = `customers/${match[1]}/ads/${match[2]}`;
+    const update: any = { resourceName: adResourceName };
+    const mask: string[] = [];
+    if (params.headlines !== undefined || params.descriptions !== undefined) update.responsiveSearchAd = {};
+    if (params.headlines !== undefined) {
+      update.responsiveSearchAd.headlines = params.headlines.map((text) => ({ text }));
+      mask.push('responsive_search_ad.headlines');
+    }
+    if (params.descriptions !== undefined) {
+      update.responsiveSearchAd.descriptions = params.descriptions.map((text) => ({ text }));
+      mask.push('responsive_search_ad.descriptions');
+    }
+    if (params.finalUrl !== undefined) { update.finalUrls = [params.finalUrl]; mask.push('final_urls'); }
+    await this.mutate(customerId, accessToken, 'ads', [{ update, updateMask: mask.join(',') }], loginCustomerId);
+
+    const rows = await this.search(customerId, accessToken,
+      'SELECT ad_group_ad.resource_name, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, '
+      + `ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
+      loginCustomerId);
+    const ad = rows[0]?.adGroupAd?.ad;
+    if (!ad) throw new GoogleAdsReadBackError(adGroupAdResourceName, ['<ad_group_ad not found on read-back>']);
+    const same = (a: unknown[] | undefined, b: string[]) => JSON.stringify(a ?? []) === JSON.stringify(b);
+    const unchanged: string[] = [];
+    if (params.headlines !== undefined && !same(ad.responsiveSearchAd?.headlines?.map((h: any) => h.text), params.headlines)) unchanged.push('responsive_search_ad.headlines');
+    if (params.descriptions !== undefined && !same(ad.responsiveSearchAd?.descriptions?.map((d: any) => d.text), params.descriptions)) unchanged.push('responsive_search_ad.descriptions');
+    if (params.finalUrl !== undefined && !same(ad.finalUrls, [params.finalUrl])) unchanged.push('final_urls');
+    if (unchanged.length) throw new GoogleAdsReadBackError(adGroupAdResourceName, unchanged);
   }
 
   /**
@@ -2512,6 +2600,10 @@ export class GoogleAdsService {
       update: { resourceName: assetGroupResourceName, finalUrls: retaggedUrls },
       updateMask: 'final_urls',
     }], loginCustomerId);
+    // ENG-2398: prove the full array landed (final_urls replaces the whole array).
+    await this.verifyFieldsReadBack(customerId, accessToken, 'asset_group', assetGroupResourceName, {
+      finalUrls: { gaql: 'final_urls', value: retaggedUrls },
+    }, loginCustomerId);
     return { success: true };
   }
 
@@ -2524,14 +2616,18 @@ export class GoogleAdsService {
   // ── Assets ───────────────────────────────────────────────────────────────
 
   async uploadAsset(userId: string, customerId: string, asset: {
-    type: 'IMAGE' | 'LOGO' | 'VIDEO';
+    type: 'IMAGE' | 'LOGO' | 'VIDEO' | 'TEXT';
     name: string;
     data: Buffer | string;
   }): Promise<string> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
     const assetContent: any = {};
-    if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
+    if (asset.type === 'TEXT') {
+      // ENG-2928: a standalone text asset (e.g. a PMax business name or headline).
+      if (typeof asset.data !== 'string' || asset.data.trim() === '') throw new Error('TEXT asset data must be the non-empty text');
+      assetContent.textAsset = { text: asset.data };
+    } else if (asset.type === 'IMAGE' || asset.type === 'LOGO') {
       let imageBuffer: Buffer;
       if (Buffer.isBuffer(asset.data)) {
         imageBuffer = asset.data;
@@ -2541,7 +2637,10 @@ export class GoogleAdsService {
         // server-side fetch: block private/internal hosts, disable redirects (a 302
         // to a private IP would otherwise bypass the guard), and cap the size.
         // Mirrors the established pattern in routes/crm.ts.
-        await assertPublicHostname(asset.data);
+        // ENG-2928: resolve once and PIN the connection to the validated address. A separate
+        // check followed by axios' own DNS lookup can be rebound to an internal address
+        // between the two (this path is now reachable by external Zoma API keys).
+        const pinned = await resolvePinnedPublicAddress(asset.data);
         const MAX_ASSET_BYTES = 10 * 1024 * 1024; // 10 MB
         // `as any` routes around the legacy @types/axios shim in this repo that
         // doesn't carry maxRedirects/validateStatus on its config interface
@@ -2553,7 +2652,12 @@ export class GoogleAdsService {
           maxContentLength: MAX_ASSET_BYTES,
           maxBodyLength: MAX_ASSET_BYTES,
           timeout: 15000,
+          signal: AbortSignal.timeout(15000),
           validateStatus: (s: number) => s >= 200 && s < 300,
+          lookup: (_hostname: string, options: any, callback: any) => {
+            if (typeof options === 'function') callback = options;
+            callback(null, pinned.address, pinned.family);
+          },
         } as any);
         imageBuffer = Buffer.from(response.data as ArrayBuffer);
       } else {
@@ -2569,7 +2673,7 @@ export class GoogleAdsService {
     }
 
     // LOGO is a fieldType for CampaignAsset, not a valid AssetType — always upload as IMAGE
-    const assetType = asset.type === 'LOGO' ? 'IMAGE' : asset.type === 'VIDEO' ? 'YOUTUBE_VIDEO' : 'IMAGE';
+    const assetType = asset.type === 'TEXT' ? 'TEXT' : asset.type === 'VIDEO' ? 'YOUTUBE_VIDEO' : 'IMAGE';
     const data = await this.mutate(customerId, accessToken, 'assets', [{
       create: { name: asset.name, type: assetType, ...assetContent },
     }], loginCustomerId);
@@ -2718,6 +2822,29 @@ export class GoogleAdsService {
     const assetGroupResourceName = batchResult.mutateOperationResponses[assetGroupResultIdx].assetGroupResult.resourceName;
 
     return { resourceName: assetGroupResourceName };
+  }
+
+  /** ENG-2928: campaign + final URLs of a PMax asset group, or null when it can't be found. */
+  async getAssetGroup(userId: string, customerId: string, assetGroupResourceName: string): Promise<{ campaignResourceName: string; finalUrls: string[]; status?: string } | null> {
+    this.assertResourceName(assetGroupResourceName, 'assetGroups');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT asset_group.campaign, asset_group.final_urls, asset_group.status FROM asset_group WHERE asset_group.resource_name = '${assetGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const g = rows[0]?.assetGroup;
+    return g?.campaign ? { campaignResourceName: g.campaign, finalUrls: g.finalUrls ?? [], status: g.status } : null;
+  }
+
+  /** ENG-2928: PMax asset groups are created PAUSED; this is how one is enabled (or paused again). */
+  async updateAssetGroup(userId: string, customerId: string, assetGroupResourceName: string, params: {
+    status?: 'ENABLED' | 'PAUSED';
+  }): Promise<boolean> {
+    if (!params.status) return false;
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'assetGroups', [{ update: { resourceName: assetGroupResourceName, status: params.status }, updateMask: 'status' }], loginCustomerId);
+    await this.verifyFieldsReadBack(customerId, accessToken, 'asset_group', assetGroupResourceName, { status: { gaql: 'status', value: params.status } }, loginCustomerId);
+    return true;
   }
 
   // ── Reporting ─────────────────────────────────────────────────────────────

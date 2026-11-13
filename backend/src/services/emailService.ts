@@ -2941,6 +2941,35 @@ View Session: ${sessionUrl}`;
     return this.sendEmail(to, copy.subject, text, html);
   },
 
+  /**
+   * ENG-2743: email the oncall list (`oncall_emails` setting, or ONCALL_EMAIL_LIST) WITHOUT filing a tracked
+   * issue. For low-urgency daily digests the owner asked to receive by email rather than as a Linear item.
+   * Production only (elsewhere it is logged and skipped). Returns whether the email was handed to the sender;
+   * never throws.
+   */
+  async sendOncallEmailOnly(subject: string, message: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV] Suppressed oncall email: ${subject}`);
+      return false;
+    }
+    try {
+      const oncallEmails = await getAlertEmails('oncall_emails', ['ruiw@agentweb.pro']);
+      if (oncallEmails.length === 0) return false;
+      const html =
+        `<div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">` +
+        `<h2 style="margin-top: 0;">${this.escapeHtml(subject)}</h2>` +
+        `<p style="white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(message)}</p></div>`;
+      // sendEmail never throws; only a real send counts as sent (a failed or suppressed one returns false).
+      const outcome = await this.sendEmail(oncallEmails, `[PROD] ${subject}`, `${subject}\n\n${message}`, html);
+      if (outcome !== 'sent') return false;
+      console.log(`Oncall email sent to ${oncallEmails.length} recipient(s): ${subject}`);
+      return true;
+    } catch (error) {
+      console.error('Error sending oncall email:', (error as Error)?.message);
+      return false;
+    }
+  },
+
   async sendOncallAlert(
     subject: string,
     message: string,

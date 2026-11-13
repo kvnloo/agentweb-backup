@@ -6,6 +6,15 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 }));
 
 jest.mock('axios');
+// ENG-2915: uploadMetaAdsImage downloads through the SSRF-pinned fetch. Route it to the
+// mocked axios.get so these tests keep controlling the downloaded bytes without real DNS.
+jest.mock('../utils/ssrfGuard', () => ({
+  ...jest.requireActual('../utils/ssrfGuard'),
+  fetchBufferFollowingRedirects: jest.fn(async (url: string) => {
+    const res = await jest.requireMock('axios').get(url);
+    return { buffer: Buffer.from(res.data), contentType: '', finalUrl: url };
+  }),
+}));
 import axios from 'axios';
 
 // slackService instantiates a Slack WebClient at import time (which reads
@@ -128,6 +137,21 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('Failed to download image');
+      });
+
+      it('downloads through the SSRF-pinned fetch with Meta\'s 30 MB cap, and a blocked URL never reaches Meta (ENG-2915)', async () => {
+        const { fetchBufferFollowingRedirects, SsrfBlockedError } = jest.requireMock('../utils/ssrfGuard');
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('image data') });
+        (metaService.uploadImage as jest.Mock).mockResolvedValue({ hash: 'h1' });
+        await agentModeService.uploadMetaAdsImage('user123', 'https://cdn.example.com/a.png');
+        expect(fetchBufferFollowingRedirects).toHaveBeenLastCalledWith('https://cdn.example.com/a.png', {}, 5, 30_000, 30 * 1024 * 1024);
+
+        (metaService.uploadImage as jest.Mock).mockClear();
+        fetchBufferFollowingRedirects.mockRejectedValueOnce(new SsrfBlockedError());
+        const blocked = await agentModeService.uploadMetaAdsImage('user123', 'https://rebind.example.com/a.png');
+        expect(blocked.success).toBe(false);
+        expect(metaService.uploadImage).not.toHaveBeenCalled();
       });
 
       it('should handle upload errors', async () => {
@@ -448,6 +472,27 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Successfully initiated user upload to audience audience_123');
+      });
+
+      it('a failed upload logs Meta\'s error fields only, never the request URL token or hashed members (ENG-2914)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        const sdkError: any = Object.assign(new Error('Permissions error'), {
+          url: 'https://graph.facebook.com/v25.0/aud/users?access_token=SECRET_TOKEN',
+          config: { params: { access_token: 'SECRET_TOKEN' }, data: { payload: { data: [['HASHED_MEMBER']] } } },
+          structuredError: { code: 200, error_subcode: 1870090 },
+        });
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockRejectedValue(sdkError);
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        try {
+          const result = await agentModeService.manageMetaCustomAudiences('user123', 'UPLOAD_USERS', '123456789', { id: 'audience_123', schema: ['EMAIL'], payload: 'a@b.co' });
+          expect(result.success).toBe(false);
+          const logged = JSON.stringify(spy.mock.calls, (_k, v) => (v instanceof Error ? { ...v, message: v.message } : v));
+          expect(logged).toContain('Permissions error');
+          expect(logged).not.toContain('SECRET_TOKEN');
+          expect(logged).not.toContain('HASHED_MEMBER');
+        } finally {
+          spy.mockRestore();
+        }
       });
 
       // ENG-600 known gap, now fixed: the naive split(',') parser mis-splits

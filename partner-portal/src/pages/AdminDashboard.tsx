@@ -77,6 +77,7 @@ import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import VendorRatesTab from "../components/admin/VendorRatesTab";
+import ZomaScoreboardTab from "../components/admin/ZomaScoreboardTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
@@ -119,6 +120,8 @@ import {
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
+import { matchesProductFilter, type ProductFilter } from "../utils/productBadges";
+import ProductPills from "../components/admin/ProductPills";
 import { ErrorState } from "../components/StatusState";
 import { withoutAgentWebModel } from "../utils/agentWebModel";
 
@@ -303,6 +306,14 @@ interface User {
   subscriptionType?: string; // Subscription type for customer portal users
   /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
   spendThisMonthUsd?: number;
+  /** ENG-2906: product attribution (attribution only; never restricts access). */
+  signupProduct?: string;
+  signupClient?: string;
+  signupRef?: string;
+  attributionConfidence?: "tracked" | "inferred" | "verified";
+  products?: Record<string, { firstAt?: string; lastAt?: string }>;
+  zomaStage?: string;
+  zomaStageAt?: string;
   /** ENG-1271: derived customer-vs-staff activity signal; absent on older backends. */
   selfActivity?: SelfActivitySignal | null;
   tokenUsage?: {
@@ -804,6 +815,7 @@ export default function AdminDashboard() {
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
+  const [userFilterProduct, setUserFilterProduct] = useState<ProductFilter>("all");
   const [userFilterHideBotLike, setUserFilterHideBotLike] = useState(true);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
@@ -1857,6 +1869,8 @@ export default function AdminDashboard() {
       if (userFilterHasUsage) {
         if ((user.spendThisMonthUsd ?? 0) <= 0) return false;
       }
+      // ENG-2906 product filter: signupProduct or the products map
+      if (!matchesProductFilter(user, userFilterProduct)) return false;
       return true;
     });
     return filtered.sort((a, b) => {
@@ -1873,7 +1887,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid, userFilterHasUsage]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid, userFilterHasUsage, userFilterProduct]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -4488,6 +4502,15 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 <MenuItem value="unpaid">Not Paying</MenuItem>
               </Select>
             </FormControl>
+            <FormControl size="small" sx={{ minWidth: 130 }}>
+              <InputLabel>Product</InputLabel>
+              <Select value={userFilterProduct} label="Product" onChange={(e) => setUserFilterProduct(e.target.value as ProductFilter)}>
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="zoma">Zoma</MenuItem>
+                <MenuItem value="emma_mcp">Emma MCP</MenuItem>
+                <MenuItem value="emma_web">Web</MenuItem>
+              </Select>
+            </FormControl>
             <FormControlLabel
               control={
                 <Checkbox
@@ -4513,8 +4536,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               label={<Typography variant="body2">Hide bots</Typography>}
               sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterProduct !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterProduct("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
@@ -4691,6 +4714,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                           <Box>
                             <Typography variant="body2" sx={{ fontWeight: 500 }}>
                               {user.email}
+                              <ProductPills user={user} />
                             </Typography>
                             {user.orgId ? (
                               <Typography variant="caption" color="text.secondary">
@@ -6846,6 +6870,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={27}>
           <VendorRatesTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={28}>
+          <ZomaScoreboardTab />
         </TabPanel>
         </Box>
       </Box>

@@ -34,13 +34,39 @@ export const HOT_LEAD_CALL_LIMITS = {
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
   // Leads that get a call in one org-local calendar month (ENG-2783). Stored values up to `max` are valid (an operator
   // raises a customer's limit by a data write); owner-level routes may only set up to HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH.
-  maxCallsPerMonth: { default: 200, min: 1, max: 2000 },
+  maxCallsPerMonth: { default: 150, min: 1, max: 2000 },
   memberCooldownMinutes: { default: 2, min: 1, max: 60 },
   /** Calls placed for one lead (each to a different team member) before giving up. */
   maxAttemptsPerLead: { default: 3, min: 1, max: 5 },
 } as const;
-/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set: the default. Higher values are an operator's data write. */
-export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default;
+/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set. Independent of the default (150, the included allowance): an owner may raise it to 200. Higher values are an operator's data write. */
+export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = 200;
+/**
+ * Platform-wide ceiling (ENG-2783): leads that get a call per UTC day across ALL orgs. It bounds Twilio spend when a bug, an
+ * abusive org or a spike gets past the per-org caps. 300 is a conservative starting value chosen by the builder (about
+ * $45/day at an order-of-$0.15 per-lead estimate, not a measurement: two legs of about 5 minutes at the $0.014/min list rate, other costs excluded); it is the owner's to change via
+ * HOT_LEAD_CALL_PLATFORM_DAILY_MAX, with no deploy of code.
+ */
+export const HOT_LEAD_CALL_PLATFORM_DAILY = { default: 300, min: 1, max: 100000 } as const;
+const warnedPlatformValues = new Set<string>();
+
+/** Parses HOT_LEAD_CALL_PLATFORM_DAILY_MAX: a positive integer (clamped to max); unset/blank -> default; anything else -> default with one warn per distinct value. */
+export function parsePlatformDailyMax(raw: string | undefined): number {
+  const { default: dflt, min, max } = HOT_LEAD_CALL_PLATFORM_DAILY;
+  const text = raw?.trim();
+  if (!text) return dflt;
+  if (/^\d{1,15}$/.test(text)) {
+    const n = Number(text);
+    if (n >= min) return Math.min(n, max);
+  }
+  if (!warnedPlatformValues.has(text)) {
+    warnedPlatformValues.add(text);
+    console.warn(`[hotLeadCall] HOT_LEAD_CALL_PLATFORM_DAILY_MAX is not a positive integer, using ${dflt}`, { length: text.length });
+  }
+  return dflt;
+}
+/** The current platform daily cap (read per call so an env change on a long-lived process needs no code path). */
+export const platformDailyMax = (): number => parsePlatformDailyMax(process.env.HOT_LEAD_CALL_PLATFORM_DAILY_MAX);
 type HotLeadCallLimitField = keyof typeof HOT_LEAD_CALL_LIMITS;
 export const HOT_LEAD_CALL_LIMIT_FIELDS = Object.keys(HOT_LEAD_CALL_LIMITS) as HotLeadCallLimitField[];
 

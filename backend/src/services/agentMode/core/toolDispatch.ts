@@ -42,6 +42,7 @@ import {
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
 import { endExecuteToolSpan, startRunChildSpan } from '../../../observability/tracing';
+import { restrictionRefusal, SHARE_VISITOR_BLOCKED_TOOLS } from '../../toolRestrictionProfiles';
 import {
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_TOOL_NAME,
@@ -259,33 +260,7 @@ export function seedSearchCallCountFromHistory(
  * org settings reads/writes and org/personal memory writes. Memory written here is injected
  * into later owner/org sessions, so a visitor could otherwise poison or delete it.
  */
-export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
-  'get_lead_notification_settings',
-  'update_lead_notification_settings',
-  'get_hot_lead_call_settings',
-  'update_hot_lead_call_settings',
-  'provision_hot_lead_call_number',
-  'release_hot_lead_call_number',
-  'start_hot_lead_call_verification',
-  'confirm_hot_lead_call_verification',
-  'list_smartlead_campaigns',
-  'get_smartlead_campaign_stats',
-  'preview_smartlead_push',
-  'start_smartlead_push',
-  'get_smartlead_push_status',
-  'pause_smartlead_push',
-  'resume_smartlead_push',
-  'cancel_smartlead_push',
-  'release_leads_from_smartlead',
-  // A Luma key can be shared with the whole org (ENG-2737). A share-link visitor runs as the link's owner, so these would reach every
-  // org-shared key, guests' registration answers and phone numbers included.
-  'luma_list_events',
-  'luma_get_guests',
-  'save_org_memory',
-  'delete_org_memory',
-  'save_memory',
-  'delete_memory',
-]);
+export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = SHARE_VISITOR_BLOCKED_TOOLS;
 
 export interface ToolExecOutcome {
   status: 'success' | 'error';
@@ -813,24 +788,22 @@ export async function executePreparedTools(
       // block context-restricted/shared-session tools even if the LLM hallucinates them.
       if (!hasAdminAccess && adminSkillToolNames.includes(toolCall.function.name)) {
         const errorMsg = isInteractiveShare
-          ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
+          ? (restrictionRefusal('share_visitor', toolCall.function.name, adminSkillToolNames) as string)
           : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
 
       // A share-link visitor runs under the owner's userId, so owner-only org-settings
-      // writes must be refused here rather than by the tool's own role check.
-      if (isInteractiveShare && SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(toolCall.function.name)) {
-        const errorMsg = `Tool "${toolCall.function.name}" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`;
-        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-        continue;
-      }
-
-      if (isInteractiveShare && toolCall.function.name === 'connect_account') {
-        const errorMsg = 'Account connections are not available in shared sessions. Tell the user they need to open Agent Mode in their own account to connect this account, then come back here.';
-        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
-        continue;
+      // writes must be refused here rather than by the tool's own role check. The rules live in the
+      // share_visitor restriction profile (toolRestrictionProfiles.ts); executeTool enforces the same
+      // profile, so a path that does not come through this preflight (voice) is refused there too.
+      if (isInteractiveShare) {
+        const refusal = restrictionRefusal('share_visitor', toolCall.function.name, adminSkillToolNames);
+        if (refusal) {
+          appendPreflightToolFailure(toolCall, functionArgs, refusal, JSON.stringify({ error: refusal }));
+          continue;
+        }
       }
 
       // ask_user_question passes the ask_ read classifier but halts the run for a question deck.
@@ -1016,6 +989,7 @@ export async function executePreparedTools(
               mockMode,
               isDelegatedAccess,
               isUnattendedRun,
+              ...(isInteractiveShare ? { restrictionProfile: 'share_visitor' as const } : {}),
             }),
           });
           endExecuteToolSpan(span, outcome.status === 'error'
@@ -1173,6 +1147,9 @@ export async function executePreparedTools(
           screenshotUrl,
           isDelegatedAccess,
           isUnattendedRun,
+          // ENG-2816: a share-link visitor's tool call carries its restriction down to executeTool, which enforces it
+          // again (defence in depth: the preflight above is the model-facing refusal, this is the one every path shares).
+          ...(isInteractiveShare ? { restrictionProfile: 'share_visitor' as const } : {}),
           // Long-render tools (compose_video) read this to hand off before the run's hard
           // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
           renderDeadlineMs: mediaGenerationDeadlineMs,

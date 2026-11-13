@@ -11,6 +11,7 @@ import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
   LLM_PRICE_BOOK_VERSION,
+  LIVE_MODALITY_PRICES,
   LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
@@ -48,7 +49,7 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
   const fingerprint = () =>
     require('crypto')
       .createHash('sha256')
-      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP, LIVE_MODALITY_PRICES }))
       .digest('hex')
       .slice(0, 16);
 
@@ -59,11 +60,13 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-10-12',
+      version: '2026-11-12',
+      // ENG-2957: + LIVE_MODALITY_PRICES (Gemini Live per-modality rates). Voice events stamped 2026-10-12 were priced
+      // at the text-rate approximation; from this version they are priced per modality.
       // + gemini-omni-1.1-flash video entry: additive only (no existing price moved),
       // so events already stamped 2026-10-08 still re-derive exactly.
       // + deprecated alias key openrouter/qwen/qwen3.8-max (same $2/$6 as -0902): additive.
-      fingerprint: '65453682d3ff3985',
+      fingerprint: 'a50bec7622a44a0d',
     });
   });
 });

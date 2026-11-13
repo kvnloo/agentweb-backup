@@ -85,7 +85,21 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     mockAuthenticate.mockResolvedValue({ userId: 'u1' });
     const res = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 'Bearer aw_x').expect(200);
     expect(mockAuthenticate).toHaveBeenCalledWith('Bearer aw_x');
-    expect(res.body.result.tools).toEqual([{ name: 'meta_get_insights', inputSchema: { type: 'object' } }]);
+    // ENG-2747: an unclassified tool is advertised with the conservative (destructive) annotations.
+    expect(res.body.result.tools).toEqual([
+      { name: 'meta_get_insights', inputSchema: { type: 'object' }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
+    ]);
+  });
+
+  it('tools/list shows a Databricks-origin caller only allowed tools, labelled (ENG-2747)', async () => {
+    mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'oauth', databricksOrigin: true });
+    mockManifest.mockReturnValueOnce([
+      { name: 'list_meta_ads_campaigns', inputSchema: { type: 'object' } },
+      { name: 'zoma_custom_audiences', inputSchema: { type: 'object' } },
+    ]);
+    const res = await rpc({ jsonrpc: '2.0', id: 9, method: 'tools/list' }, 'Bearer t').expect(200);
+    expect(res.body.result.tools.map((t: { name: string }) => t.name)).toEqual(['list_meta_ads_campaigns']);
+    expect(res.body.result.tools[0].annotations.readOnlyHint).toBe(true);
   });
 
   it('tools/call routes through the gateway and wraps the result as text content', async () => {

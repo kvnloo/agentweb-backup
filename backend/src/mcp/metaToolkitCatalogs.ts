@@ -15,8 +15,9 @@
  * Ownership: catalogs are business-owned, not ad-account-owned, and catalog ids are global.
  * Every catalog-level read first lists the catalogs of the resolved (owned) ad account's
  * business and refuses any catalog_id outside that set, so a caller cannot read a foreign
- * catalog by guessing its id. Reads only: no preview, no write gate, no storage. Writes
- * (create/update/delete, feeds, rules, event sources) are later slices.
+ * catalog by guessing its id. Reads only: no preview, no write gate, no storage. Product and
+ * product-set writes are metaToolkitCatalogWrites.ts (ENG-2925); feeds, rules and event
+ * sources are later slices.
  */
 
 import { MetaToolkitRefusal } from './metaToolkitErrors';
@@ -113,6 +114,32 @@ function parseLimit(raw: unknown): string {
   return String(n);
 }
 
+/**
+ * The catalogs of the ad account's business (owned + client-shared), deduped. This is the
+ * ownership set: every catalog-level read or write (ENG-2925) refuses a catalog outside it.
+ * businessId is '' when the account is not in a Business portfolio (then catalogs is empty).
+ */
+export async function readBusinessCatalogs(
+  read: (path: string, params: Record<string, string>) => Promise<any>, accountId: string,
+): Promise<{ businessId: string; catalogs: Map<string, any> }> {
+  const account = await read(`act_${String(accountId).replace(/^act_/, '')}`, { fields: 'business{id,name}' });
+  const businessId = account?.business?.id ? String(account.business.id) : '';
+  const catalogs = new Map<string, any>();
+  if (!/^\d+$/.test(businessId)) return { businessId: '', catalogs };
+  const catalogParams = { fields: CATALOG_FIELDS, limit: '100' };
+  const [owned, shared] = await Promise.all([
+    read(`${businessId}/owned_product_catalogs`, catalogParams),
+    read(`${businessId}/client_product_catalogs`, catalogParams),
+  ]);
+  for (const [list, access] of [[owned, 'owned'], [shared, 'shared']] as const) {
+    for (const c of Array.isArray(list?.data) ? list.data : []) {
+      const id = String(c?.id ?? '');
+      if (id && !catalogs.has(id)) catalogs.set(id, { catalog_id: id, name: c?.name, product_count: c?.product_count, vertical: c?.vertical, access });
+    }
+  }
+  return { businessId, catalogs };
+}
+
 export async function runMetaCatalogTool(name: MetaCatalogToolName, userId: string, accountId: string, args: any, deps: MetaCatalogDeps = defaultDeps) {
   const read = async (path: string, params: Record<string, string>) => {
     if (!CATALOG_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported catalog read.');
@@ -122,27 +149,12 @@ export async function runMetaCatalogTool(name: MetaCatalogToolName, userId: stri
       throw new MetaToolkitRefusal(`Could not read catalogs from Meta: ${error?.metaError?.message || error?.message || 'Meta request failed'}.`);
     }
   };
-  const acct = `act_${String(accountId).replace(/^act_/, '')}`;
-
-  const account = await read(acct, { fields: 'business{id,name}' });
-  const businessId = account?.business?.id ? String(account.business.id) : '';
-  if (!/^\d+$/.test(businessId)) {
+  const { businessId, catalogs } = await readBusinessCatalogs(read, accountId);
+  if (!businessId) {
     if (name === 'meta_list_catalogs') {
       return { account_id: accountId, catalogs: [], note: 'This ad account is not in a Meta Business portfolio, so it has no product catalogs. Catalogs require Meta Business Manager.' };
     }
     throw new MetaToolkitRefusal('This ad account is not in a Meta Business portfolio, so it has no product catalogs.');
-  }
-  const catalogParams = { fields: CATALOG_FIELDS, limit: '100' };
-  const [owned, shared] = await Promise.all([
-    read(`${businessId}/owned_product_catalogs`, catalogParams),
-    read(`${businessId}/client_product_catalogs`, catalogParams),
-  ]);
-  const catalogs = new Map<string, any>();
-  for (const [list, access] of [[owned, 'owned'], [shared, 'shared']] as const) {
-    for (const c of Array.isArray(list?.data) ? list.data : []) {
-      const id = String(c?.id ?? '');
-      if (id && !catalogs.has(id)) catalogs.set(id, { catalog_id: id, name: c?.name, product_count: c?.product_count, vertical: c?.vertical, access });
-    }
   }
 
   if (name === 'meta_list_catalogs') {

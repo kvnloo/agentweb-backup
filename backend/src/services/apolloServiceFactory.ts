@@ -67,14 +67,21 @@ const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
  * them, which lets us verify the secret on arrival.
  *
  * The secret resolves via getApolloWebhookSecret() so sender and receiver
- * use the same source (env override or built-in default). Returns null only
- * when no public base URL is configured — caller must skip Tier 3 in that
- * case rather than send an un-routable webhook URL.
+ * use the same source (env override, or the built-in default outside
+ * production). Returns null when no public base URL is configured or no
+ * secret can be resolved (production without APOLLO_WEBHOOK_SECRET) — the
+ * caller then sends a basic match rather than a webhook URL whose callbacks
+ * would be refused.
  */
 async function buildWebhookUrl(): Promise<string | null> {
   const base = process.env.BACKEND_URL || process.env.PUBLIC_BASE_URL;
   if (!base) return null;
-  const secret = await getApolloWebhookSecret();
+  let secret: string;
+  try {
+    secret = await getApolloWebhookSecret();
+  } catch {
+    return null;
+  }
   return `${base.replace(/\/$/, '')}/api/crm/webhooks/apollo/${encodeURIComponent(secret)}`;
 }
 

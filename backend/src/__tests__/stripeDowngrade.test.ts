@@ -39,6 +39,9 @@ jest.mock('stripe', () => {
   }));
 });
 
+const mockMirrorHotLeadCallBilling = jest.fn();
+jest.mock('../services/hotLeadCallBillingService', () => ({ mirrorHotLeadCallBilling: mockMirrorHotLeadCallBilling }));
+
 const mockGetUserById = jest.fn();
 const mockUpdateUser = jest.fn();
 const mockScanWithFilter = jest.fn();
@@ -154,6 +157,9 @@ describe('Stripe subscription downgrade handling', () => {
       const updateCall = mockUpdateUser.mock.calls[0][1];
       expect(updateCall.subscription_status).not.toBe('canceled');
       expect(updateCall.subscriptionType).not.toBe('Free');
+
+      // The deleted subscription may have carried the hot lead calls add-on: the mirror is judged from the surviving one.
+      expect(mockMirrorHotLeadCallBilling).toHaveBeenCalledWith(mockUser, expect.objectContaining({ id: 'sub_new_cheaper' }));
     });
 
     it('should NOT cancel when customer has a trialing subscription after deletion', async () => {
@@ -267,6 +273,8 @@ describe('Stripe subscription downgrade handling', () => {
         subscriptionType: 'Free',
         allowedPages: ['/', '/agent-mode', '/settings', '/guide'],
       }));
+      // A genuine cancellation mirrors the add-on from the deleted subscription (its item is gone with it).
+      expect(mockMirrorHotLeadCallBilling).toHaveBeenCalledWith(mockUser, expect.objectContaining({ id: 'sub_canceled' }));
     });
   });
 

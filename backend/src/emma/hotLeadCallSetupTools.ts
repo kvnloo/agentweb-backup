@@ -4,7 +4,7 @@ import { requireApproval, userIdOf } from './hotLeadCallApproval';
 import { MEMBER_ID, type HotLeadCallConfig } from '../services/hotLeadCallConfig';
 import { VERIFICATION_CODE_TTL_MS, VERIFICATION_MAX_ATTEMPTS, VERIFICATION_MAX_STARTS_PER_MEMBER_PER_DAY, VERIFICATION_MAX_STARTS_PER_ORG_PER_DAY } from '../services/voice/memberVerification';
 import { confirmMemberVerification, startMemberVerification, storedHotLeadCallConfig as storedConfig } from '../services/hotLeadCallSettingsService';
-import { assertHotLeadCallEntitled } from '../services/voice/hotLeadCallEntitlement';
+import { assertHotLeadCallEntitled, isHotLeadCallBillingRequired } from '../services/voice/hotLeadCallEntitlement';
 import { provisionNumber, releaseNumber, monthlyRentText } from '../services/voice/numberProvisioning';
 
 /**
@@ -76,7 +76,7 @@ emmaToolRegistry.register({
       context,
       priceText: monthlyRentText(),
       target: typeof areaCode === 'string' ? areaCode : null,
-      card: { action: 'provision', areaCode: typeof areaCode === 'string' ? areaCode : undefined },
+      card: { action: 'provision', areaCode: typeof areaCode === 'string' ? areaCode : undefined, coveredByAddon: isHotLeadCallBillingRequired() },
     });
     if (halt) return halt;
     const result = await provisionNumber({ org, config, userId: userIdOf(context), areaCode });

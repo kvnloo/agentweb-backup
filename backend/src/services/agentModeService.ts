@@ -1,4 +1,5 @@
 import { addCompanionTools } from './agentMode/companionTools';
+import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -11,6 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -40,6 +42,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -534,7 +537,7 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 // DEFAULT_MAX_IMAGE_BYTES were used only by describeImage, which moved to
 // emma/impl/mediaVideo.ts (imports them there directly). assertPublicHostname
 // was already unused before this move (pre-existing, left as-is).
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { assertPublicHostname, DEFAULT_MAX_REDIRECTS, fetchBufferFollowingRedirects } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
@@ -2354,6 +2357,19 @@ export class AgentModeService {
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * The live-voice model behind the chat's voice button, or null when none is served to this user (ENG-2957). Voice mode
+   * is a client-side mode: the chat's stored model is never switched to it, and isModelSelectableBy keeps refusing it as
+   * a text pick. Same internal/adminOnly gates as the picker; the first live registry entry wins.
+   */
+  getVoiceModelFor(isAdmin: boolean): string | null {
+    for (const id of Object.keys(this.llmModels)) {
+      const config = this.llmModels[id];
+      if (config.isLive && !config.internalOnly && (isAdmin || !config.adminOnly)) return id;
+    }
+    return null;
   }
 
   /**
@@ -4380,6 +4396,21 @@ export class AgentModeService {
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
+
+        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
+        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        recordSessionBreakerShadowTurn({
+          sessionId,
+          userId,
+          billingUserId,
+          isScheduled: isScheduledSession,
+          costUsd: () => {
+            const usage: any = (response as any)?.usage;
+            if (!usage) return 0;
+            if (typeof usage.cost === 'number') return usage.cost;
+            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+          },
+        });
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
@@ -9805,8 +9836,11 @@ export class AgentModeService {
     // an explicit `false` (attended) must survive distinctly from `undefined`
     // (caller has not resolved a value, fall back to session.sessionType).
     isUnattendedRun?: boolean;
+    // ENG-2816: the restriction the calling principal runs under (a share-link visitor), enforced again in executeTool.
+    restrictionProfile?: RestrictionProfileId;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
+    if (input.restrictionProfile) toolOptions.restrictionProfile = input.restrictionProfile;
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
@@ -9976,6 +10010,11 @@ export class AgentModeService {
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
+    // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
+    // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
+    // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    if (restricted) throw new ToolRestrictionDenied(restricted);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -13989,9 +14028,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      // Download image from URL
-      const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-      const buffer = Buffer.from(response.data as any);
+      // Download image from URL. ENG-2915: the URL can come from an external Zoma caller, so
+      // the fetch is pinned to a re-validated public address on every redirect hop (a probe
+      // before this fetch is not enough: DNS can rebind and a redirect can point inside), and
+      // the body is capped at Meta's 30 MB image limit with a bounded total time.
+      const { buffer } = await fetchBufferFollowingRedirects(imageUrl, {}, DEFAULT_MAX_REDIRECTS, 30_000, 30 * 1024 * 1024);
       // Simple filename extraction or default
       let filename = 'ad-image.jpg';
       try {
@@ -15566,6 +15607,51 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return executeExperimentRead(name, args, credentials);
   }
 
+  /**
+   * ENG-2980: account-bound Graph call for the experiment write tools. GET reads a numeric
+   * node or the account's own ad_studies edge; POST creates on the account's ad_studies edge
+   * or updates a numeric study node. metaToolkitExperimentWrites proves campaign and study
+   * ownership before calling. `outcomeUnknown` marks a failure without a definite Meta answer.
+   */
+  public async toolkitMetaExperimentGraph(
+    userId: string, account_id: string, method: 'GET' | 'POST', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+\/ad_studies|\d+)$/.test(path)) throw new Error('Unsupported experiment path.');
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      // Meta creates ad studies only on a Business or User ad_studies edge; the ad-account edge
+      // is read-only. Create on the account's owning business (else the token's user). The
+      // study's campaigns still come from this account and the write path reads it back.
+      let target = path;
+      if (method === 'POST' && path.startsWith('act_')) {
+        const { data: acct } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path.split('/')[0]}`, {
+          params: { fields: 'business{id}', access_token: accessToken }, timeout: 30_000,
+        });
+        const businessId = acct?.business?.id ? String(acct.business.id) : '';
+        target = /^\d+$/.test(businessId) ? `${businessId}/ad_studies` : 'me/ad_studies';
+      }
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${target}`,
+        params: { ...(method === 'GET' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
   public async readToolkitMetaActivityLog(userId: string, args: any) {
     const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
@@ -15618,6 +15704,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     };
   }
 
+  /** ENG-2922: resolved account + token for the toolkit's ARCHIVE/DELETE/COPY seam (mcp/metaToolkitLifecycle.ts). */
+  public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return { accountId, accessToken };
+  }
+
+  /**
+   * ENG-2914 Zoma custom audiences: one Graph call with the caller's credentials for the
+   * selected ad account. `{account}` in the path becomes act_<id>. Callers (mcp/metaToolkitAudiences)
+   * build the path from validated numeric ids and check node ownership themselves. Errors are
+   * re-thrown as a plain Error with only Meta's error fields: the axios error carries the access
+   * token in its config, so it must never reach a caller or a log.
+   */
+  public async toolkitMetaGraphRequest(
+    userId: string, account_id: string, method: 'GET' | 'POST' | 'DELETE', path: string, params: Record<string, any> = {},
+  ): Promise<any> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const url = `https://graph.facebook.com/${apiVersion}/${path.replace('{account}', `act_${accountId.replace(/^act_/, '')}`)}`;
+    try {
+      const { data } = method === 'GET'
+        ? await axios.get(url, { params: { ...params, access_token: accessToken }, timeout: 30_000 })
+        : method === 'POST'
+          ? await axios.post(url, params, { params: { access_token: accessToken }, timeout: 30_000 })
+          : await axios.delete(url, { params: { access_token: accessToken }, data: params, timeout: 30_000 });
+      return data;
+    } catch (error: any) {
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta
+        ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message, error_user_msg: meta.error_user_msg }
+        : null;
+      wrapped.status = error?.response?.status;
+      throw wrapped;
+    }
+  }
+
   /**
    * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
    * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
@@ -15653,11 +15776,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async readToolkitMetaCatalogGraph(
     userId: string, account_id: string, path: string, params: Record<string, string>,
   ): Promise<any> {
-    if (!/^(act_\d+|\d+\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources))$/.test(path)) {
+    // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
+    // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
+    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
       throw new Error('Unsupported catalog path.');
     }
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-    if (path.startsWith('act_') && path !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     try {
       const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
@@ -15671,6 +15797,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const meta = error?.response?.data?.error;
       const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
       wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2925: Graph write for the catalog write tools. POST creates on a catalog's products /
+   * product_sets edge or updates a numeric node; DELETE removes a numeric node. Paths are
+   * allow-listed; metaToolkitCatalogWrites enforces that every catalog / product / set id
+   * belongs to the account's business before calling this. `outcomeUnknown` marks a failure
+   * without a definite Meta answer (no response, timeout, 5xx), which may still have applied.
+   */
+  public async writeToolkitMetaCatalogGraph(
+    userId: string, account_id: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    // ENG-2927: a catalog's external_event_sources edge (connect = POST, disconnect = DELETE).
+    // ENG-2926: business owned_product_catalogs (catalog create), a catalog's product_feeds, a feed's uploads / rules.
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules))?$/ : /^\d+(\/external_event_sources)?$/;
+    if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
+    const { accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${path}`,
+        params: { ...(method === 'DELETE' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
       throw wrapped;
     }
   }
@@ -15721,6 +15884,37 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       throw failed;
     }
     MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
+  }
+
+  /**
+   * ENG-2942: account-scoped reads behind the toolkit's optimisation-event check. Both go
+   * through the signals read path, which binds every pixel read to the selected account.
+   */
+  public async toolkitMetaConversionLookup(userId: string, account_id: string) {
+    const credentials = await this.getMetaCredentials(userId, account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    const { eventNamesFromStats } = await import('../mcp/metaToolkitConversionGate');
+    const read = async (name: string, args: any) => {
+      const body: any = await executeSignalsRead(name, args, credentials);
+      if (body?.success === false) throw new Error(body.message || 'Meta read failed');
+      return body;
+    };
+    return {
+      listCustomConversions: async () => {
+        const all: any[] = [];
+        let after: string | undefined;
+        for (let pages = 0; pages < 20; pages += 1) {
+          const body = await read('ads_get_customconversions', after ? { after } : {});
+          all.push(...(Array.isArray(body?.data) ? body.data : []));
+          const next = body?.paging?.has_next ? body?.paging?.cursors?.after : undefined;
+          if (typeof next !== 'string' || !next) break;
+          after = next;
+        }
+        return all;
+      },
+      listPixelEventNames: async (pixelId: string) =>
+        eventNamesFromStats(await read('ads_get_dataset_stats', { pixel_id: pixelId, aggregation: 'event' })),
+    };
   }
 
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
@@ -16576,8 +16770,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
+    /**
+     * ENG-2962: set when the answer came from an MCP tool acting on someone's behalf (a self-call). It may not approve a card only a
+     * person may approve; decided here, on the very deck the answers are applied to (the write below is conditional on that deck
+     * still awaiting), not on an earlier read in the route.
+     */
+    options?: { refusePersonOnlyApprovals?: boolean },
   ): Promise<
     | { outcome: 'invalid'; reason: string }
+    | { outcome: 'needs_person'; actions: string[] }
     | { outcome: 'conflict' }
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
@@ -16598,6 +16799,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outcome: 'invalid',
         reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
       };
+    }
+
+    if (options?.refusePersonOnlyApprovals) {
+      const blocked = personOnlyApprovalsIn(deck, inboundAnswers);
+      if (blocked.length > 0) return { outcome: 'needs_person', actions: blocked.map(b => b.action) };
     }
 
     let answered: PendingApprovalDeck;
@@ -16972,7 +17178,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
-      console.error('AgentMode: Error managing custom audiences:', error);
+      // ENG-2914: never log the error object. A Meta SDK error carries the request (URL with the
+      // access token, and for user uploads the hashed member payload); log Meta's fields only.
+      console.error('AgentMode: Error managing custom audiences:', {
+        message: error?.message,
+        code: error?.structuredError?.code,
+        error_subcode: error?.structuredError?.error_subcode,
+      });
       // Meta's raw error.message (e.g. "Permissions error") is often too terse to
       // act on. metaService.handleError attaches a structuredError with Meta's own
       // consumer-facing error_user_msg (e.g. the exact accept-terms URL for

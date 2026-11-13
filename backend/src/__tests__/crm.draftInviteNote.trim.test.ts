@@ -192,3 +192,100 @@ describe('POST draft-invite-note — smart-trim to account limit', () => {
     expect(res.json).toHaveBeenCalledWith({ message: 'Failed to generate invite note' });
   });
 });
+
+describe('POST draft-invite-note — sender brand reaches the prompt (ENG-2967)', () => {
+  // Real readBrandGuidelines() success shape (emma/impl/brandMarketStrategy.ts):
+  // { success, message, exists, brandData, attachments, createdAt, updatedAt,
+  // formattedContent } — NO `.content` field. brandData fields are the ones
+  // declared on User.brandGuidelines.brandData in services/db.ts.
+  const realShapedGuidelines = {
+    success: true,
+    message: 'Brand guidelines retrieved successfully',
+    exists: true,
+    brandData: {
+      brandName: 'Acme Isolation',
+      tagline: 'Browser isolation for mid-market security teams',
+      valueProposition: 'Stops shadow-IT data leaks without blocking employees.',
+      domain: 'acme.example',
+      primaryColor: '#FF0000',
+      primaryColorEnd: '#00FF00',
+      secondaryColor: '#123456',
+      fontFamily: 'Inter',
+      toneOfVoice: 'Warm, concise, founder-led',
+      keyMessages: ['No agents to install', 'Deploys in a day'],
+      brandValues: ['Transparency'],
+      targetAudience: 'CISOs',
+      brandPersonality: 'Pragmatic',
+      isGradient: true,
+      founders: [],
+    },
+    attachments: [{ type: 'logo', url: 'https://cdn.example.com/logo.png', key: 'k', filename: 'logo.png' }],
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-02T00:00:00.000Z',
+    formattedContent: '<strong>🎨 Brand Guidelines Retrieved</strong><br>Primary Color: #FF0000<br>Font: Inter',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLeadListById.mockResolvedValue({ id: 'list-1', userId: 'test-user-id' });
+    mockGetLeadById.mockResolvedValue({ firstName: 'Fang', lastName: 'Tan', title: 'Head of Growth', company: 'Acme' });
+    mockResolveUserOwnedAccountId.mockResolvedValue('acct-1');
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+    mockGeminiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ content: 'Fang, your funnel work at Acme is sharp.' }) } }],
+    });
+  });
+
+  const callRoute = async () => {
+    const handler = findHandler(router, '/lists/:listId/leads/:leadId/draft-invite-note', 'post');
+    const req: any = { params: { listId: 'list-1', leadId: 'lead-1' }, body: {}, user: { userId: 'test-user-id' } };
+    const res = makeRes();
+    await handler(req, res);
+    return res;
+  };
+
+  const promptSentToLLM = (): string => {
+    expect(mockGeminiCreate).toHaveBeenCalled();
+    const { messages } = mockGeminiCreate.mock.calls[0][0];
+    return String(messages[0].content);
+  };
+
+  it('puts the structured brand block (offer, value prop, key messages, voice) in the LLM prompt', async () => {
+    mockReadBrandGuidelines.mockResolvedValue(realShapedGuidelines);
+
+    const res = await callRoute();
+    expect(res.status).not.toHaveBeenCalled();
+    expect(mockReadBrandGuidelines).toHaveBeenCalledWith('test-user-id');
+
+    const prompt = promptSentToLLM();
+    expect(prompt).toContain('Sender context (who is writing — do not pitch):');
+    expect(prompt).toContain('Brand: Acme Isolation');
+    expect(prompt).toContain('What we offer: Browser isolation for mid-market security teams');
+    expect(prompt).toContain('Value proposition: Stops shadow-IT data leaks without blocking employees.');
+    expect(prompt).toContain('Key messages: No agents to install; Deploys in a day');
+    expect(prompt).toContain('Voice/tone: Warm, concise, founder-led; Pragmatic');
+  });
+
+  it('keeps visual brand data and the HTML formattedContent out of the prompt', async () => {
+    mockReadBrandGuidelines.mockResolvedValue(realShapedGuidelines);
+
+    await callRoute();
+    const prompt = promptSentToLLM();
+    for (const visual of ['#FF0000', '#00FF00', '#123456', 'Inter', 'logo.png', '<strong>', 'Brand Guidelines Retrieved']) {
+      expect(prompt).not.toContain(visual);
+    }
+  });
+
+  it('omits the sender block when no guidelines exist or the read failed', async () => {
+    for (const result of [
+      { success: true, exists: false, message: 'No brand guidelines found', brandData: {}, attachments: [] },
+      { success: false, message: 'Failed to read brand guidelines', error: 'boom' },
+    ]) {
+      mockGeminiCreate.mockClear();
+      mockReadBrandGuidelines.mockResolvedValue(result);
+      const res = await callRoute();
+      expect(res.status).not.toHaveBeenCalled();
+      expect(promptSentToLLM()).not.toContain('Sender context');
+    }
+  });
+});
