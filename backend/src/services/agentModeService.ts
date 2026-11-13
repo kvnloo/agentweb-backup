@@ -15620,9 +15620,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     try {
+      // Meta creates ad studies only on a Business or User ad_studies edge; the ad-account edge
+      // is read-only. Create on the account's owning business (else the token's user). The
+      // study's campaigns still come from this account and the write path reads it back.
+      let target = path;
+      if (method === 'POST' && path.startsWith('act_')) {
+        const { data: acct } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path.split('/')[0]}`, {
+          params: { fields: 'business{id}', access_token: accessToken }, timeout: 30_000,
+        });
+        const businessId = acct?.business?.id ? String(acct.business.id) : '';
+        target = /^\d+$/.test(businessId) ? `${businessId}/ad_studies` : 'me/ad_studies';
+      }
       const { data } = await axios.request({
         method,
-        url: `https://graph.facebook.com/${apiVersion}/${path}`,
+        url: `https://graph.facebook.com/${apiVersion}/${target}`,
         params: { ...(method === 'GET' ? params : {}), access_token: accessToken },
         ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
         timeout: 30_000,
