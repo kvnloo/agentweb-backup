@@ -4,8 +4,10 @@
  */
 jest.mock("aws-sdk", () => {
   const update = jest.fn();
+  const query = jest.fn();
   (global as any).__update = update;
-  const client = new Proxy({ update }, {
+  (global as any).__query = query;
+  const client = new Proxy({ update, query }, {
     get: (t: any, k) => (k in t ? t[k] : jest.fn(() => ({ promise: async () => ({}) }))),
   });
   const inert = () => new Proxy({}, { get: () => jest.fn(() => ({ promise: async () => ({}) })) });
@@ -17,10 +19,11 @@ jest.mock("aws-sdk", () => {
   return sdk;
 });
 
-import { orgDb } from "../services/db";
+import { orgDb, userDb } from "../services/db";
 
 const update = (): jest.Mock => (global as any).__update;
 const ok = () => ({ promise: async () => ({}) });
+const ok2 = (v: unknown) => ({ promise: async () => v });
 const fail = (code: string, message = code) => ({ promise: async () => { throw Object.assign(new Error(message), { code }); } });
 
 beforeEach(() => update().mockReset());
@@ -67,5 +70,32 @@ describe("orgDb.setOrgSecretIfAbsent", () => {
   it("propagates non-conditional failures", async () => {
     update().mockReturnValueOnce(fail("InternalServerError"));
     await expect(orgDb.setOrgSecretIfAbsent("o1", "clickup_access_token", "enc")).rejects.toThrow();
+  });
+});
+
+describe("userDb.removeUserSecret (ENG-2935: no whole-map rewrite)", () => {
+  const query = () => (global as any).__query as jest.Mock;
+
+  it("removes only the one key with an atomic REMOVE, never SETting the secrets map", async () => {
+    query().mockReturnValue(ok2({ Items: [{ userId: "u1", email: "a@b.com" }] }));
+    update().mockReturnValueOnce(ok());
+    await userDb.removeUserSecret("u1", "clickup_access_token");
+    const params = update().mock.calls[0][0];
+    expect(params.Key).toEqual({ email: "a@b.com" });
+    expect(params.UpdateExpression).toMatch(/^REMOVE #secrets\.#key/);
+    expect(params.UpdateExpression).not.toMatch(/SET #secrets\b(?!\.)/);
+    expect(params.ExpressionAttributeNames["#key"]).toBe("clickup_access_token");
+  });
+
+  it("is a no-op when the secrets map does not exist", async () => {
+    query().mockReturnValue(ok2({ Items: [{ userId: "u1", email: "a@b.com" }] }));
+    update().mockReturnValueOnce(fail("ValidationException", "The document path provided in the update expression is invalid for update"));
+    await expect(userDb.removeUserSecret("u1", "clickup_access_token")).resolves.toBeUndefined();
+  });
+
+  it("surfaces real failures", async () => {
+    query().mockReturnValue(ok2({ Items: [{ userId: "u1", email: "a@b.com" }] }));
+    update().mockReturnValueOnce(fail("ProvisionedThroughputExceededException"));
+    await expect(userDb.removeUserSecret("u1", "clickup_access_token")).rejects.toThrow();
   });
 });

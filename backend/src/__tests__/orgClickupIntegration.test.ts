@@ -62,6 +62,10 @@ const mockUpdateUser = jest.fn((uid: string, updates: any) => {
   }
   return Promise.resolve({ ...mockUsers[uid], ...updates });
 });
+const mockRemoveUserSecret = jest.fn((uid: string, key: string) => {
+  if (mockUsers[uid]?.secrets) delete mockUsers[uid].secrets[key];
+  return Promise.resolve();
+});
 const mockGetOrgById = jest.fn((_orgId: string) => Promise.resolve(mockOrg));
 const mockSetOrgSecret = jest.fn((orgId: string, key: string, value: string) => {
   if (!mockOrg.secrets) mockOrg.secrets = {};
@@ -86,6 +90,7 @@ jest.mock("../services/db", () => ({
   userDb: {
     getUserById: mockGetUserById,
     updateUser: mockUpdateUser,
+    removeUserSecret: mockRemoveUserSecret,
   },
   orgDb: {
     getOrgById: mockGetOrgById,
@@ -197,6 +202,10 @@ describe("ClickUp org-wide integration", () => {
     mockDecryptPassword.mockImplementation((enc: string) => {
       const parts = enc.split(":");
       return { password: parts[1], userId: parts[2] };
+    });
+    mockRemoveUserSecret.mockImplementation((uid: string, key: string) => {
+      if (mockUsers[uid]?.secrets) delete mockUsers[uid].secrets[key];
+      return Promise.resolve();
     });
     mockUpdateUser.mockImplementation((uid: string, updates: any) => {
       if (updates.secrets !== undefined) {
@@ -505,7 +514,9 @@ describe("ClickUp org-wide integration", () => {
 
       expect(res.status).toBe(200);
       expect(mockRemoveOrgSecret).toHaveBeenCalledWith(ORG_ID, "clickup_access_token");
-      expect(mockUpdateUser).toHaveBeenCalledWith(OWNER_USER_ID, { secrets: { other: "keep" } });
+      expect(mockRemoveUserSecret).toHaveBeenCalledWith(OWNER_USER_ID, "clickup_access_token");
+      expect(mockUpdateUser).not.toHaveBeenCalled(); // never rewrites the whole secrets map
+      expect(mockUsers[OWNER_USER_ID].secrets).toEqual({ other: "keep" });
       const status = await request(app).get("/api/clickup/status");
       expect(status.body).toEqual({ connected: false, workspaces: [] });
     });
@@ -527,7 +538,7 @@ describe("ClickUp org-wide integration", () => {
       currentUserId = OWNER_USER_ID;
       mockOrg.secrets = { clickup_access_token: `encrypted:org-tok:${ORG_ID}` };
       mockUsers[OWNER_USER_ID].secrets = personal(OWNER_USER_ID);
-      mockUpdateUser.mockRejectedValueOnce(new Error("dynamo down"));
+      mockRemoveUserSecret.mockRejectedValueOnce(new Error("dynamo down"));
 
       const first = await request(app).post("/api/clickup/disconnect").send({});
       expect(first.status).toBe(500);
