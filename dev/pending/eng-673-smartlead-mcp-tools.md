@@ -24,6 +24,14 @@ every push rule apply unchanged. New route `GET /campaigns/:campaignId/stats` (i
 directly). Argument checks and result shapes moved from `emma/smartleadPushTools.ts` into `services/smartleadPushToolShared.ts` so both
 use one copy (no behaviour change for Emma). Each MCP call logs one `mcp_smartlead` line (tool, user, key id, outcome; no contact data).
 
+**Review follow-ups (independent review of 6106c7d49):** the HTTP layer now refuses these tools on the request's own auth method, so an
+OAuth request cannot borrow a session a key opened; `emma_search_tools` shows them only to a key that may call them; `list_lead_lists`
+is marked read-only (it is a GET) so a key with `smartlead:read` can find a listId; `smartlead:control` no longer lists
+`get_smartlead_push_status` (needs `smartlead:read`); when several Smartlead connections are available the error now names them so the
+agent can pass `accountId` (mcpFetch keeps the route's `details`); ids made only of dots are refused; wording says "someone with
+access to this list". Two older holes the review found are fixed separately (ENG-2962: agents approving Emma's cards; ENG-2963:
+unescaped ids in self-call paths).
+
 **Testing:** `mcp.smartleadTools.test.ts` (which tools exist, scopes, OAuth and anonymous refusals, tools/list, each route call, the
 preview allowlist, argument checks), stats route cases in `routes/__tests__/smartleadPush.test.ts`, key-creation cases in
 `agentApi.routes.test.ts`, regenerated MCP inventory (six tools added, none changed).

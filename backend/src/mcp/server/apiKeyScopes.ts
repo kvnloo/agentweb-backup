@@ -41,7 +41,7 @@ export interface ScopeDenial {
   requiredScope: string;
 }
 
-type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string } | undefined;
+type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string; apiKeyOnly?: boolean } | undefined;
 
 export function requiredScopeForTool(name: string, lookup: ToolLookup): string {
   const tool = lookup(name);
@@ -73,6 +73,21 @@ export function findApiKeyOnlyToolCall(body: unknown, lookup: ToolLookup): Scope
     const tool = String((message as any)?.params?.name ?? '');
     const requiredScope = lookup(tool)?.requiredScope;
     if (requiredScope && isOptInScope(requiredScope)) return { tool, requiredScope };
+  }
+  return null;
+}
+
+/**
+ * For any external caller that is not an `aw_` key (OAuth included): the first tools/call that targets an `apiKeyOnly` tool. Checked on
+ * the request's own auth method, so an OAuth request cannot borrow a session that a key opened.
+ */
+export function findApiKeyOnlyToolCallForNonKey(body: unknown, lookup: ToolLookup): ScopeDenial | null {
+  const messages = Array.isArray(body) ? body : [body];
+  for (const message of messages) {
+    if ((message as any)?.method !== 'tools/call') continue;
+    const tool = String((message as any)?.params?.name ?? '');
+    const handler = lookup(tool);
+    if (handler?.apiKeyOnly) return { tool, requiredScope: handler.requiredScope ?? '' };
   }
   return null;
 }

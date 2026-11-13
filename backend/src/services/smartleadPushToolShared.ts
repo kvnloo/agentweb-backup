@@ -19,7 +19,7 @@ export const ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 export const RUN_ID = /^[A-Za-z0-9]{10,40}$/;
 
 export function idArg(value: unknown, what: string): string {
-  if (typeof value !== 'string' || !ID.test(value)) throw new Error(`${what} is required`);
+  if (typeof value !== 'string' || !ID.test(value) || /^\.+$/.test(value)) throw new Error(`${what} is required`);
   return value;
 }
 

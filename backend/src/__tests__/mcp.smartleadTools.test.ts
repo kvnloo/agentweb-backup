@@ -20,9 +20,10 @@ jest.mock('../utils/scheduledPublishConsentGuard', () => ({
 }));
 
 import { mcpToolRegistry } from '../mcp/server/registry';
-import { SMARTLEAD_TOOLS_NOT_ON_MCP, listPushLink } from '../mcp/server/smartleadTools';
-import { findScopeDenial, findApiKeyOnlyToolCall, DEFAULT_API_KEY_SCOPES } from '../mcp/server/apiKeyScopes';
-import { getListedToolDefinitions } from '../mcp/server/toolDiscovery';
+import { SMARTLEAD_TOOLS_NOT_ON_MCP, listPushLink, withConnectionChoices } from '../mcp/server/smartleadTools';
+import { findScopeDenial, findApiKeyOnlyToolCall, findApiKeyOnlyToolCallForNonKey, DEFAULT_API_KEY_SCOPES } from '../mcp/server/apiKeyScopes';
+import { getListedToolDefinitions, searchTools } from '../mcp/server/toolDiscovery';
+import '../mcp/server/apiTools';
 
 const KEY = { userId: 'u-1', externalMcp: true, authMethod: 'api_key', apiKeyId: 'k-1' };
 const call = (name: string, args: unknown, context: any = KEY) => mcpToolRegistry.execute(name, args, context);
@@ -101,7 +102,55 @@ describe('tools/list', () => {
   it('lists the reads (and list_lead_lists for the listId) for smartlead:read, and the stops for smartlead:control', () => {
     expect(names(['smartlead:read'])).toEqual(expect.arrayContaining([...READ_TOOLS, 'list_lead_lists'].filter((n) => lookup(n))));
     expect(names(['smartlead:read'])).not.toContain('pause_smartlead_push');
-    expect(names(['smartlead:control'])).toEqual(expect.arrayContaining([...CONTROL_TOOLS, 'get_smartlead_push_status']));
+    expect(names(['smartlead:control'])).toEqual(expect.arrayContaining(CONTROL_TOOLS));
+    // A runId comes from get_smartlead_push_status, which needs smartlead:read: control alone does not list it.
+    expect(names(['smartlead:control'])).not.toContain('get_smartlead_push_status');
+  });
+});
+
+describe('the first call an agent makes: finding a list', () => {
+  it('list_lead_lists is read-only, so a tools:read key with smartlead:read can find a listId', () => {
+    expect(lookup('list_lead_lists')?.readOnly).toBe(true);
+    expect(findScopeDenial(toolsCall('list_lead_lists'), ['tools:read', 'smartlead:read'], lookup)).toBeNull();
+  });
+});
+
+describe('the HTTP layer refuses these tools on the request\'s own auth method (a session a key opened cannot be borrowed by OAuth)', () => {
+  it.each([...READ_TOOLS, ...CONTROL_TOOLS])('%s', (n) => {
+    expect(findApiKeyOnlyToolCallForNonKey(toolsCall(n), lookup)).toEqual({ tool: n, requiredScope: lookup(n)!.requiredScope });
+  });
+  it('a batch with one Smartlead call among others is refused; ordinary tools are not', () => {
+    expect(findApiKeyOnlyToolCallForNonKey([toolsCall('list_lead_lists'), toolsCall('pause_smartlead_push')], lookup)?.tool).toBe('pause_smartlead_push');
+    expect(findApiKeyOnlyToolCallForNonKey(toolsCall('list_lead_lists'), lookup)).toBeNull();
+  });
+});
+
+describe('emma_search_tools only offers what the caller may call', () => {
+  const found = (caller: any) => searchTools('smartlead campaign push', 20, caller).map((d: any) => d.name);
+  const external = (extra: any) => ({ externalMcp: true, ...extra });
+  it('an OAuth client, a default key and an anonymous caller are not shown them', () => {
+    expect(found(external({ authMethod: 'oauth' })).filter((n: string) => n.includes('smartlead'))).toEqual([]);
+    expect(found(external({ authMethod: 'api_key', apiKeyScopes: [...DEFAULT_API_KEY_SCOPES] })).filter((n: string) => n.includes('smartlead'))).toEqual([]);
+    expect(found(external({})).filter((n: string) => n.includes('smartlead'))).toEqual([]);
+  });
+  it('a key with smartlead:read sees the reads, not the stops; smartlead:control the reverse', () => {
+    const read = found(external({ authMethod: 'api_key', apiKeyScopes: ['smartlead:read'] }));
+    expect(read).toEqual(expect.arrayContaining(['list_smartlead_campaigns']));
+    expect(read).not.toContain('pause_smartlead_push');
+    expect(found(external({ authMethod: 'api_key', apiKeyScopes: ['smartlead:control'] }))).toContain('pause_smartlead_push');
+  });
+});
+
+describe('several Smartlead connections', () => {
+  it('the choices reach the agent so it can pass accountId', async () => {
+    const err: any = new Error('API error (409): Several Smartlead connections are available. Choose which one to use.');
+    err.details = [{ accountId: 'acc-1', accountName: 'Mindd', shared: false }, { accountId: 'acc-2', accountName: 'Team', shared: true }];
+    mockFetch.mockRejectedValue(err);
+    await expect(call('list_smartlead_campaigns', {})).rejects.toThrow(/acc-1 \(Mindd\); acc-2 \(Team\), shared by a teammate.*accountId/);
+  });
+  it('an error without choices passes through unchanged', () => {
+    const e = new Error('plain');
+    expect(withConnectionChoices(e)).toBe(e);
   });
 });
 
@@ -162,6 +211,7 @@ describe('what each tool does', () => {
   it('refuses bad arguments before any request', async () => {
     await expect(call('pause_smartlead_push', { runId: '../../start' })).rejects.toThrow(/runId/);
     await expect(call('get_smartlead_push_status', { listId: 'a/b' })).rejects.toThrow(/listId/);
+    await expect(call('get_smartlead_push_status', { listId: '..' })).rejects.toThrow(/listId/);
     await expect(call('get_smartlead_campaign_stats', { campaignId: -1 })).rejects.toThrow(/campaignId/);
     await expect(call('preview_smartlead_push', { listId: 'L1', campaignId: 7, token: 'x' })).rejects.toThrow(/Invalid/);
     await expect(call('list_smartlead_campaigns', { userId: 'someone-else' })).rejects.toThrow(/Invalid/);
