@@ -13,14 +13,44 @@ export const NOTES_SEPARATOR = '\n\n';
 
 const str = (v: unknown): string => (v === null || v === undefined ? '' : String(v).trim());
 
-/** Append `incoming` to `existing` unless it is empty or already present. */
+/**
+ * Upper bound on the merged notes string. DynamoDB caps an item at 400 KB; unbounded appends
+ * made a long-lived lead reject every new submission with a 500 (Opslane, PR #3979). The full
+ * text of every submission is still recorded on its AW-ContactEvents `form.submitted` entry, so
+ * the lead row keeps the most recent notes and drops the oldest blocks first.
+ */
+export const MAX_NOTES_CHARS = 50_000;
+
+/** True when `block` already appears in `notes` as a whole blank-line-bounded block. */
+function containsBlock(notes: string, block: string): boolean {
+  let from = 0;
+  for (;;) {
+    const i = notes.indexOf(block, from);
+    if (i < 0) return false;
+    const end = i + block.length;
+    const startOk = i === 0 || notes.slice(Math.max(0, i - NOTES_SEPARATOR.length), i) === NOTES_SEPARATOR;
+    const endOk = end === notes.length || notes.slice(end, end + NOTES_SEPARATOR.length) === NOTES_SEPARATOR;
+    if (startOk && endOk) return true;
+    from = i + 1;
+  }
+}
+
+function capNotes(notes: string): string {
+  if (notes.length <= MAX_NOTES_CHARS) return notes;
+  const blocks = notes.split(NOTES_SEPARATOR);
+  while (blocks.length > 1 && blocks.join(NOTES_SEPARATOR).length > MAX_NOTES_CHARS) blocks.shift();
+  const kept = blocks.join(NOTES_SEPARATOR);
+  return kept.length <= MAX_NOTES_CHARS ? kept : kept.slice(0, MAX_NOTES_CHARS);
+}
+
+/** Append `incoming` to `existing` unless it is empty or already present; bounded in size. */
 export function appendNotes(existing: unknown, incoming: unknown): string {
   const prev = str(existing);
   const next = str(incoming);
-  if (!next) return prev;
-  if (!prev) return next;
-  if (prev === next || prev.split(NOTES_SEPARATOR).includes(next)) return prev;
-  return `${prev}${NOTES_SEPARATOR}${next}`;
+  if (!next) return capNotes(prev);
+  if (!prev) return capNotes(next);
+  if (prev === next || containsBlock(prev, next)) return capNotes(prev);
+  return capNotes(`${prev}${NOTES_SEPARATOR}${next}`);
 }
 
 /**

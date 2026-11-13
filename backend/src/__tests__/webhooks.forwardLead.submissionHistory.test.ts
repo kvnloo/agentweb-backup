@@ -14,7 +14,7 @@ import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb, userDb } from '../services/db';
 import { onPublicFormSubmitted } from '../services/contactCaptureHooks';
-import { appendNotes, collectOverwrittenValues } from '../utils/leadSubmissionHistory';
+import { appendNotes, collectOverwrittenValues, MAX_NOTES_CHARS } from '../utils/leadSubmissionHistory';
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -110,6 +110,23 @@ describe('leadSubmissionHistory helpers', () => {
     expect(appendNotes('a', 'a')).toBe('a');
     expect(appendNotes('a\n\nb', 'b')).toBe('a\n\nb');
     expect(appendNotes('a', 'b')).toBe('a\n\nb');
+  });
+
+  it('appendNotes dedupes a multi-paragraph note already present as a whole block', () => {
+    const once = appendNotes('First note A', 'P1\n\nP2');
+    expect(once).toBe('First note A\n\nP1\n\nP2');
+    expect(appendNotes(once, 'P1\n\nP2')).toBe(once);
+    // a substring that is not block-bounded is still new text
+    expect(appendNotes('P1X\n\nP2', 'P1')).toBe('P1X\n\nP2\n\nP1');
+  });
+
+  it('appendNotes stays under the item-size cap, dropping the oldest blocks first', () => {
+    let notes = '';
+    for (let i = 0; i < 40; i += 1) notes = appendNotes(notes, `${i}-${'x'.repeat(14_000)}`);
+    expect(notes.length).toBeLessThanOrEqual(MAX_NOTES_CHARS);
+    expect(notes.endsWith(`39-${'x'.repeat(14_000)}`)).toBe(true);
+    expect(notes.includes('0-x')).toBe(false);
+    expect(appendNotes('', 'y'.repeat(MAX_NOTES_CHARS + 10)).length).toBe(MAX_NOTES_CHARS);
   });
   it('collectOverwrittenValues reports only non-empty conflicting priors', () => {
     expect(collectOverwrittenValues(
