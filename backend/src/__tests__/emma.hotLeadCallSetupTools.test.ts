@@ -5,6 +5,7 @@ jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: { getChatSession: jest.fn(), getMessagesFromMessagesTable: jest.fn(), claimMetaWriteManifestDigest: jest.fn() },
 }));
+jest.mock('../services/hotLeadCallBillingService', () => ({ ...jest.requireActual('../services/hotLeadCallBillingService'), addHotLeadCallBilling: jest.fn() }));
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/voice/hotLeadCallMode', () => ({ isHotLeadCallEnabled: jest.fn().mockResolvedValue(false) }));
 import { spokenCode } from './helpers/spokenCode';
@@ -14,6 +15,7 @@ import { join } from 'path';
 import { orgDb, userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { deckHalt, deckReply, type DeckMessage } from './helpers/approvalDeckHistory';
+import { addHotLeadCallBilling, HotLeadCallBillingError } from '../services/hotLeadCallBillingService';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
 import '../emma/hotLeadCallTools';
@@ -1163,5 +1165,55 @@ describe('verification on a team of several members', () => {
     const code = codeFromCall();
     await expect(confirm(code, undefined, MEMBER_ID)).rejects.toThrow('No verification is in progress');
     expect(teamOf().every(m => m.verifiedAt === undefined)).toBe(true);
+  });
+});
+
+describe('hot lead calls add-on (ENG-2783)', () => {
+  const UPDATE = 'update_hot_lead_call_settings';
+  const PRICE = '$70 per month, includes one calling number and 150 lead calls per month, billed to your subscription';
+  const call = (args: unknown = { enabled: true }) => run(UPDATE, args, attended()) as Promise<Halt & Record<string, unknown>>;
+  const isOn = () => (org.hotLeadCall as { enabled: boolean }).enabled;
+  const card = (halt: Halt) => halt.questionDeckPayload![0];
+  beforeEach(() => {
+    process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+    org.hotLeadCall = withNumber({ verified: true });
+  });
+  afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+
+  it('states the $70 price on the card, binds it into the digest, and buys nothing before approval', async () => {
+    const halt = await call();
+    expect(card(halt).question).toContain(PRICE);
+    expect(card(halt).question).not.toContain('per minute');
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+    // Without the requirement the same call yields a different digest (the per-minute price), so a price change needs a new card.
+    delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED;
+    const digestOf = (h: Halt) => card(h).kind.split(':')[2];
+    expect(digestOf(await call())).not.toBe(digestOf(halt));
+  });
+  it('adds the add-on only after approval, then turns calling on', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    await expect(call()).resolves.toMatchObject({ success: true, enabled: true });
+    expect(addHotLeadCallBilling).toHaveBeenCalledWith('org-a');
+    expect(isOn()).toBe(true);
+  });
+  it('leaves calling off when Stripe refuses', async () => {
+    (addHotLeadCallBilling as jest.Mock).mockRejectedValue(new HotLeadCallBillingError('card declined, nothing turned on'));
+    answerCard(recordHalt(await call()), 'approve');
+    await expect(call()).rejects.toThrow('nothing turned on');
+    expect(isOn()).toBe(false);
+    expect(writes).toEqual([]);
+  });
+  it('asks nothing extra and buys nothing when the add-on is already active', async () => {
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: '2026-11-13T00:00:00.000Z' };
+    const halt = await call();
+    expect(card(halt).question).toContain('per minute');
+    answerCard(recordHalt(halt), 'approve');
+    await call();
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+  });
+  it('the number card says the rent is covered by the $70', async () => {
+    org.hotLeadCall = configured({ verified: true });
+    const halt = (await run('provision_hot_lead_call_number', {}, attended())) as Halt;
+    expect(card(halt).question).toContain('covered by the $70 per month hot lead calls add-on');
   });
 });

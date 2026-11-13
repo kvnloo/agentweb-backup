@@ -55,10 +55,9 @@ export async function isHotLeadCallPlanEntitled(org: { ownerUserId?: string }): 
 /**
  * Whether the org's paid add-on lets it call: true when billing is not required (the default), otherwise only when
  * the mirrored add-on status is 'active'. When the caller holds only an org id the stored mirror is read; anything
- * unreadable is not active. The test override applies here too.
+ * unreadable is not active. The test override covers the plan check only, so tests can exercise this one.
  */
 export async function isHotLeadCallBillingActive(org: HotLeadCallEntitlementOrg): Promise<boolean> {
-  if (override !== null) return override;
   if (!isHotLeadCallBillingRequired()) return true;
   let billing = org.hotLeadCallBilling;
   if (billing === undefined && org.orgId) {
