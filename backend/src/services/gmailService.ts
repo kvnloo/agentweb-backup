@@ -305,9 +305,21 @@ export class GmailService implements IEmailService {
     }
     const out: Array<{ id: string; receivedAt?: string; raw: string }> = [];
     for (const id of ids) {
-      const detail = await this.withQuotaRetry(() =>
-        gmail.users.messages.get({ userId: 'me', id, format: 'raw' })
-      );
+      let detail;
+      try {
+        detail = await this.withQuotaRetry(() =>
+          gmail.users.messages.get({ userId: 'me', id, format: 'raw' })
+        );
+      } catch (error: any) {
+        // A message that no longer exists must not stall the whole batch;
+        // any other failure still throws so the caller keeps its cursor.
+        const code = error?.code ?? error?.response?.status;
+        if (code === 404) {
+          console.warn(`[gmailService] listRawMessages: skipping unfetchable message ${id} (404)`);
+          continue;
+        }
+        throw error;
+      }
       out.push({
         id,
         receivedAt: this.receivedAtIso(detail.data.internalDate),

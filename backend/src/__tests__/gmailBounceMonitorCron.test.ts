@@ -59,6 +59,10 @@ describe('parseHardBounces', () => {
     expect(parseHardBounces(raw, SENDER)).toEqual([{ recipient: 'c@example.com', status: '5.0.0' }]);
     expect(parseHardBounces(raw.replace('550 user unknown', 'Status: 4.4.1 retrying'), SENDER)).toEqual([]);
   });
+  it('does not treat X-Failed-Recipients as permanent without a visible 5xx/5.x.x status', () => {
+    const raw = 'From: mailer-daemon@example.org\r\nX-Failed-Recipients: c@example.com\r\nContent-Transfer-Encoding: base64\r\n\r\nRGVsYXllZDogNC40LjEgcmV0cnlpbmc=';
+    expect(parseHardBounces(raw, SENDER)).toEqual([]);
+  });
   it('unfolds RFC 3464 continuation lines in recipient blocks', () => {
     const raw = hardDsn('x@example.com').replace(
       /Final-Recipient: rfc822; x@example.com\r\nAction: failed\r\nStatus: 5.1.1/,
@@ -139,6 +143,14 @@ describe('runGmailBounceMonitor', () => {
     expect(crmDb.updateLead).not.toHaveBeenCalled();
     expect(emailEventsDb.addEmailEvent).not.toHaveBeenCalled();
     expect(s).toMatchObject({ hardBouncesFound: 0, leadsFlagged: 0 });
+  });
+
+  it('queries Gmail rfc822msgid with the bare original Message-ID', async () => {
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([user('2026-11-01T00:00:00.000Z')]);
+    const raw = hardDsn('victim@example.com') + '\r\n\r\nMessage-ID: <orig-1@mail.example.com>\r\n';
+    (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw }]);
+    await runGmailBounceMonitor();
+    expect(gmailService.hasMessages).toHaveBeenCalledWith('u1', SENDER, 'in:sent rfc822msgid:orig-1@mail.example.com to:victim@example.com');
   });
 
   it('isolates a failing account', async () => {

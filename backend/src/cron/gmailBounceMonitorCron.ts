@@ -83,6 +83,10 @@ export function parseHardBounces(raw: string, senderEmail: string): HardBounce[]
 
   const transient = /^Action:[ \t]*delayed/im.test(raw) || /^Status:[ \t]*4\./im.test(raw) || /\b4\.\d{1,3}\.\d{1,3}\b/.test(raw);
   if (transient) return [];
+  // X-Failed-Recipients alone does not prove permanence (delay notices carry it
+  // too, and their 4.x status may sit in an encoded MIME part we cannot see).
+  // Require a visible permanent SMTP reply (5yz) or enhanced status (5.x.x).
+  if (!/\b5\d\d\b|\b5\.\d{1,3}\.\d{1,3}\b/.test(raw.split(/\r?\n\r?\n/).slice(1).join('\n'))) return [];
   const failedHeader = headerValue(raw, 'X-Failed-Recipients');
   for (const part of failedHeader.split(',')) {
     const m = part.match(EMAIL);
@@ -118,7 +122,9 @@ async function hasOutboundCorrelation(
   recipient: string,
 ): Promise<boolean> {
   const msgId = originalMessageId(raw);
-  const query = msgId ? `in:sent rfc822msgid:${msgId} to:${recipient}` : `in:sent to:${recipient}`;
+  // Gmail's rfc822msgid: operator takes the bare id, without angle brackets.
+  const bareId = msgId ? msgId.replace(/^<|>$/g, '') : null;
+  const query = bareId ? `in:sent rfc822msgid:${bareId} to:${recipient}` : `in:sent to:${recipient}`;
   return gmailService.hasMessages(userId, accountId, query);
 }
 
