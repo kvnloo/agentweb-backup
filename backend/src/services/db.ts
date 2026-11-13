@@ -6668,7 +6668,7 @@ export const crmDb = {
     clientUserAgent?: string;
     /** ENG-2783: CRM-internal sidecar written in the creation put (so it exists before any post-create hook reads the
      *  row). Used for `system.callConsent`, which the hot-lead call gate must see on the very first pass. */
-    system?: Record<string, any>;
+    system?: Record<string, unknown>;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
