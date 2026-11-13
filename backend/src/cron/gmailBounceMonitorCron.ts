@@ -237,12 +237,15 @@ export async function runGmailBounceMonitor(): Promise<GmailBounceMonitorSummary
           await updateAccountConfig(user.userId, 'gmail', account.account_id, { lastBounceCheckAt: new Date().toISOString() });
         } catch (error) {
           summary.failed++;
-          console.error(`${TAG} Failed to seed cursor for ${account.account_id}:`, error);
+          console.error(`${TAG} Failed to seed cursor for user ${user.userId} (gmail account):`, error);
         }
         continue;
       }
 
-      const emailDomain = (user as any).emailDomain || senderEmail.split('@')[1] || '';
+      // Only the tenant's own domain partitions email.bounced events. Never fall back to the
+      // sender mail domain: a public domain (gmail.com) would be shared across tenants.
+      // Without a tenant domain the DNC flag still applies; the event is skipped.
+      const emailDomain = (user as any).emailDomain || '';
       try {
         const afterSec = Math.floor(new Date(storedCursor).getTime() / 1000);
         const messages = await gmailService.listRawMessages(
@@ -277,7 +280,7 @@ export async function runGmailBounceMonitor(): Promise<GmailBounceMonitorSummary
         }
       } catch (error) {
         summary.failed++;
-        console.error(`${TAG} Failed to process account ${account.account_id} for user ${user.userId}:`, error);
+        console.error(`${TAG} Failed to process gmail account for user ${user.userId}:`, error);
       }
     }
   }

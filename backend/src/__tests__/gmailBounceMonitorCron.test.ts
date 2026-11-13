@@ -130,6 +130,18 @@ describe('runGmailBounceMonitor', () => {
     expect(s).toMatchObject({ hardBouncesFound: 1, leadsFlagged: 2, eventsRecorded: 1, failed: 0 });
   });
 
+  it('without a tenant emailDomain, flags the lead but never partitions events by the sender mail domain', async () => {
+    const noDomain = { ...user('2026-11-01T00:00:00.000Z'), emailDomain: undefined };
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([noDomain]);
+    (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw: hardDsn('gone@example.com') }]);
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([{ listId: 'L1' }]);
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead1' });
+    const s = await runGmailBounceMonitor();
+    expect(crmDb.updateLead).toHaveBeenCalledWith('L1', 'lead1', expect.objectContaining({ contactStatus: 'do-not-contact' }));
+    expect(emailEventsDb.addEmailEvent).not.toHaveBeenCalled();
+    expect(s).toMatchObject({ hardBouncesFound: 1, leadsFlagged: 1, eventsRecorded: 0, failed: 0 });
+  });
+
   it('skips already-DNC leads and tolerates duplicate events', async () => {
     (userDb.getAllUsers as jest.Mock).mockResolvedValue([user('2026-11-01T00:00:00.000Z')]);
     (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw: hardDsn('gone@example.com') }]);
