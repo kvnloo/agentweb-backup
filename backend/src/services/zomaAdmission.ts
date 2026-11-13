@@ -9,6 +9,26 @@ export function zomaCapacity(): number {
   if (!Number.isSafeInteger(cap) || cap < 1) throw new Error('Invalid ZOMA_FREE_USER_CAP');
   return cap;
 }
+/** Harsha, Matt and Fangfang approve Zoma waitlist entries; override with ZOMA_WAITLIST_SLACK_CHANNEL. */
+const WAITLIST_SLACK_CHANNEL = 'C0CGETQP27Q';
+const WAITLIST_APPROVERS = ['U08TM4QFQ1L', 'U08TWRHKCG4', 'U08TWRKGESG'];
+type PostSlack = (channel: string, text: string) => Promise<unknown>;
+let postSlack: PostSlack = async (channel, text) => (await import('./slackService')).postSlackMessage(channel, text);
+/** Test seam for the approval ping. */
+export function setZomaWaitlistSlackPoster(fn: PostSlack) { postSlack = fn; }
+
+/** Fail-open approval ping: a Slack outage never blocks or fails a registration. */
+export async function notifyZomaWaitlisted(email: string, approvedCount: number, capacity: number): Promise<boolean> {
+  const channel = process.env.ZOMA_WAITLIST_SLACK_CHANNEL || WAITLIST_SLACK_CHANNEL;
+  const mentions = WAITLIST_APPROVERS.map((id) => `<@${id}>`).join(' ');
+  try {
+    await postSlack(channel, `${mentions} Zoma waitlist: ${email} is waiting for approval (${approvedCount}/${capacity} free seats used). Approve or reject in Admin → Waitlist.`);
+    return true;
+  } catch (error) {
+    console.error('[zoma-waitlist] approval ping failed (ignored):', error instanceof Error ? error.message : error);
+    return false;
+  }
+}
 export const waitlistedResponse = {
   code: 'waitlisted', status: 'waitlisted',
   message: 'You are on the waitlist. We will notify you when access is approved.',
@@ -45,6 +65,8 @@ export async function admitZoma(emailInput: string, actor?: string): Promise<str
           ConditionExpression: 'attribute_not_exists(zomaStatus)',
           ExpressionAttributeValues: { ':pending': 'waitlisted', ':now': now },
         }).promise();
+        // Only the request that created the waitlist decision pings; retries see zomaStatus and return above.
+        void notifyZomaWaitlisted(email, approvedCount, capacity);
         return 'waitlisted';
       } catch (err: any) {
         if (err.code === 'ConditionalCheckFailedException') continue;
@@ -71,6 +93,23 @@ export async function admitZoma(emailInput: string, actor?: string): Promise<str
   }
   throw new Error('Zoma admission contention; retry request');
 }
+/**
+ * A waitlist-form applicant (no admission decision yet) becomes a pending Zoma decision, so an
+ * admin Invite reserves a seat under the cap instead of sending an invitation the gate then refuses.
+ */
+export async function markZomaWaitlisted(emailInput: string): Promise<void> {
+  const email = emailInput.toLowerCase();
+  if (email === counterKey.email) throw new Error('Invalid admission email');
+  try {
+    await db.update({ TableName: table(), Key: { email },
+      UpdateExpression: 'SET zomaStatus = :pending, joinedAt = if_not_exists(joinedAt, :now)',
+      ConditionExpression: 'attribute_not_exists(zomaStatus)',
+      ExpressionAttributeValues: { ':pending': 'waitlisted', ':now': new Date().toISOString() },
+    }).promise();
+  } catch (err: any) {
+    if (err.code !== 'ConditionalCheckFailedException') throw err;
+  }
+}
 export async function rejectZoma(emailInput: string, actor: string): Promise<string> {
   const email = emailInput.toLowerCase();
   try {
@@ -84,4 +123,30 @@ export async function rejectZoma(emailInput: string, actor: string): Promise<str
     if (err.code !== 'ConditionalCheckFailedException') throw err;
     return (await entry(email))?.zomaStatus ?? 'not_found';
   }
+}
+
+/**
+ * ENG-2881: an admin Invite/Reject on the waitlist is the Zoma admission decision while the gate
+ * is on. Returns null when the legacy status update may proceed, or the HTTP refusal to send.
+ * Invite reserves the seat (capacity-checked, atomic) BEFORE any invitation is sent.
+ */
+export async function applyZomaWaitlistDecision(
+  entry: { zomaStatus?: string } | undefined, email: string, status: string, actor: string | undefined,
+): Promise<{ statusCode: number; body: Record<string, unknown> } | null> {
+  if (!zomaAdmissionEnabled() || (status !== 'invited' && status !== 'rejected') || !entry) return null;
+  const inviting = status === 'invited';
+  if (!inviting && !entry.zomaStatus) return null; // plain legacy rejection
+  if (!actor) return { statusCode: 403, body: { message: 'Admin identity required' } };
+  if (inviting && !entry.zomaStatus) await markZomaWaitlisted(email);
+  const decision = inviting ? await admitZoma(email, actor) : await rejectZoma(email, actor);
+  if (decision === (inviting ? 'approved' : 'rejected')) return null;
+  return {
+    statusCode: 409,
+    body: {
+      message: decision === 'capacity_exhausted'
+        ? 'All free Zoma seats are taken; this applicant stays on the waitlist.'
+        : `Zoma admission is already ${decision}.`,
+      zomaStatus: decision,
+    },
+  };
 }

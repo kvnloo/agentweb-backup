@@ -14,6 +14,7 @@ import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
 import { waitlistDb, WaitlistCapacityCounterError } from "../services/waitlistDb";
+import { applyZomaWaitlistDecision } from "../services/zomaAdmission";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
@@ -2174,6 +2175,12 @@ router.put("/waitlist/:email/status", async (req, res) => {
         return res.status(400).json({ message: "User already exists" });
       }
     }
+
+    // ENG-2881: under the Zoma gate, Invite/Reject is the admission decision (seat reserved first).
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as any).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
 
     // Update invitedAt timestamp for invited users
     let invitedAt;

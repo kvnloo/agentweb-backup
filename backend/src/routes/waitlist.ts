@@ -1,6 +1,6 @@
 import express from "express";
 import { AuthenticatedRequest } from '../middleware/auth';
-import { admitZoma, rejectZoma, zomaApprovedCount, zomaAdmissionEnabled } from '../services/zomaAdmission';
+import { admitZoma, applyZomaWaitlistDecision, rejectZoma, zomaApprovedCount, zomaAdmissionEnabled } from '../services/zomaAdmission';
 import { waitlistDb } from "../services/waitlistDb";
 import { validateEmail } from "../utils/validation";
 import { authenticateToken } from "../middleware/auth";
@@ -130,6 +130,11 @@ router.put("/:email/status", authenticateToken, isAdmin, async (req, res) => {
     if (!validateEmail(email)) {
       return res.status(400).json({ message: "Invalid email" });
     }
+
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as AuthenticatedRequest).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
 
     const entry = await waitlistDb.updateStatus(
       email,

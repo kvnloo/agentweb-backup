@@ -38,6 +38,8 @@ export interface WaitlistEntry {
   monthlyMarketingSpend?: string;
   businessArea?: string;
   marketingChannels?: string[];
+  /** ENG-2881 Zoma admission decision; written only by services/zomaAdmission. */
+  zomaStatus?: 'waitlisted' | 'approved' | 'rejected';
 }
 
 // Helper function to handle DynamoDB errors
@@ -127,7 +129,8 @@ export const waitlistDb = {
 
       const result = await dynamodb.scan(params).promise();
       return {
-        items: result.Items || [],
+        // The Zoma capacity counter shares the table but is not an applicant.
+        items: (result.Items || []).filter((item) => !isCapacityCounterEmail(String(item.email ?? ''))),
         lastEvaluatedKey: result.LastEvaluatedKey,
       };
     } catch (error) {
@@ -192,8 +195,14 @@ export const waitlistDb = {
       email: _email,
       joinedAt: _joinedAt,
       approvedCount: _approvedCount,
+      // Admission decisions move only through zomaAdmission (counter + decision in one transaction).
+      zomaStatus: _zomaStatus,
+      approvedBy: _approvedBy,
+      approvedAt: _approvedAt,
+      rejectedBy: _rejectedBy,
+      rejectedAt: _rejectedAt,
       ...writableDetails
-    } = details as Partial<WaitlistEntry> & { approvedCount?: unknown };
+    } = details as Partial<WaitlistEntry> & Record<'approvedCount' | 'approvedBy' | 'approvedAt' | 'rejectedBy' | 'rejectedAt', unknown>;
 
     if (Object.keys(writableDetails).length === 0) {
       return this.getByEmail(email.toLowerCase());
