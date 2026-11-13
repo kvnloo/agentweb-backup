@@ -1333,6 +1333,31 @@ export class UserDB {
   }
 
   /**
+   * Remove ONE key from the user's `secrets` map in a single atomic update. Unlike
+   * read-modify-write through updateUser, a concurrent write to a DIFFERENT secret
+   * is never overwritten. Absent key / absent map is a no-op.
+   */
+  async removeUserSecret(userId: string, key: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user?.email) throw new Error(`User with ID '${userId}' not found or has no email.`);
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+          ExpressionAttributeNames: { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" },
+          ExpressionAttributeValues: { ":updatedAt": new Date().toISOString() },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === "ValidationException" && /document path/i.test(error?.message ?? "")) return;
+      handleDynamoDbError(error, "removeUserSecret");
+      throw error;
+    }
+  },
+
+  /**
    * Returns a strongly current User record after resolving its stable primary
    * key from the UserIdIndex. DynamoDB does not support strongly consistent
    * reads on GSIs, so callers that must not act on recently removed OAuth
