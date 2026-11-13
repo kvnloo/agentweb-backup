@@ -31,7 +31,7 @@ export type JourneyEvent =
   | 'card_saved'
   | 'first_read'
   | 'first_write'
-  /** Stub — reserved for the first delivering ad; not emitted in PR1. */
+  /** ENG-2902: first provider-verified delivering Zoma ad (services/zomaScoreboard). */
   | 'ad_live';
 
 export type JourneySubject = { userId: string } | { anonId: string };
