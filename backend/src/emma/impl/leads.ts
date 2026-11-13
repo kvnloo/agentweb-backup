@@ -2609,6 +2609,13 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         const cleared = await crmDb.completeLeadEmailDraftSend(listId, leadId, claimToken, draft);
         if (!cleared) {
           console.warn('AgentMode: sent email but draft changed or claim lost mid-send; left stored draft intact (ENG-2984)');
+          // Our send finished: drop our claim so a replacement draft is sendable now. Token-
+          // conditional, so a no-op if another sender owns the claim.
+          try {
+            await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
+          } catch (releaseError) {
+            console.error('AgentMode: failed to release email draft claim after replaced draft (ENG-2984):', releaseError);
+          }
         }
       } catch (clearError) {
         console.error('AgentMode: failed to clear sent email draft (ENG-2984):', clearError);

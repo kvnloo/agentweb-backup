@@ -202,6 +202,20 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
     expect(row.emailDraft).toEqual(replacement);
   });
 
+  it('releases its own claim when the draft was replaced mid-send, so the replacement is sendable at once', async () => {
+    const replacement = { ...DRAFT, subject: 'Replacement' };
+    mockResendSendEmail.mockImplementationOnce(async () => {
+      row.emailDraft = { ...replacement };
+      return { id: 'email-1' };
+    }).mockImplementationOnce(async () => ({ id: 'email-2' }));
+    await send();
+    expect(row.claimToken).toBeNull();
+    const second = await send();
+    expect(second.success).toBe(true);
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
+    expect(row.emailDraft).toBeNull();
+  });
+
   it('a sender whose lease was taken over does not clear the draft or the new claim', async () => {
     mockResendSendEmail.mockImplementation(async () => {
       row.claimToken = 'tok-replacement';

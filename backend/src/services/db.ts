@@ -11278,11 +11278,13 @@ export const crmDb = {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: { listId, leadId },
-        UpdateExpression: 'SET emailDraft = :null, updatedAt = :now REMOVE emailDraftSendClaimedAt',
+        // No updatedAt: changing the GSI range key re-projects the sparse lookup indexes, which
+        // fails on legacy rows carrying "" index keys (see updateLead's self-heal). Bookkeeping
+        // only, like claimLeadEmailDraft.
+        UpdateExpression: 'SET emailDraft = :null REMOVE emailDraftSendClaimedAt',
         ConditionExpression: 'emailDraftSendClaimedAt = :token AND emailDraft = :sent',
         ExpressionAttributeValues: {
           ':null': null,
-          ':now': new Date().toISOString(),
           ':token': token,
           ':sent': sentDraft,
         },
