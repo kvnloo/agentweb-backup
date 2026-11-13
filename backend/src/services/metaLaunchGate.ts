@@ -57,7 +57,7 @@ const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
  * about them and must not block them (see the truncation check below).
  *
  * ⚠ `CAMPAIGN_CREATE` looks dead and is not. The usual CAMPAIGN CREATE never reaches that check:
- * `resolveMetaActivationCampaignId` returns the caller's `campaignId` untouched for any non-AD
+ * `resolveMetaActivationCampaignId` returns the caller's `campaignId` untouched for a CAMPAIGN
  * entity, so a create arrives with it undefined and is blocked earlier by the no-campaign guard.
  * But nothing rejects a `campaign_id` supplied alongside a CAMPAIGN CREATE — and when one is,
  * the check IS reached, and this entry is what correctly lets it through. Removing it on a

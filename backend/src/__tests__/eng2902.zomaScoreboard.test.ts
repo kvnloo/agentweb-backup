@@ -2,8 +2,9 @@
  * ENG-2902 Zoma launch scoreboard — behavioral contract (Harsha):
  *   active = non-team/test account with >= 1 successful Zoma write (create/edit/pause/approve)
  *            in the rolling 7 days;
- *   first successful ad = first Zoma-created campaign approved for go-live through Zoma, provider
- *            read-back ACTIVE AND >= 1 impression;
+ *   first successful ad = lifetime impressions >= 1 AND Zoma-created AND go-live approved through
+ *            Zoma AND (provider ACTIVE read-back at/after approval OR delivered), irrespective of
+ *            whether the campaign is paused now;
  *   team/test accounts excluded from every count.
  */
 jest.mock('../services/agentApiKeyService', () => ({ agentApiKeyService: { validateKey: jest.fn() } }));
@@ -12,7 +13,7 @@ jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludi
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(), getUsersByIds: jest.fn() } }));
 
 import {
-  buildZomaScoreboard, classifyZomaWrite, verifyZomaFirstAds, zomaWriteKindFor,
+  buildZomaScoreboard, classifyZomaWrite, isFirstSuccessfulAd, verifyZomaFirstAds, zomaWriteKindFor,
   type FirstAdDeps, type ScoreboardDeps, type ZomaUserRecord, type ZomaWriteEvent,
 } from '../services/zomaScoreboard';
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
@@ -110,7 +111,14 @@ describe('first successful ad (provider-verified)', () => {
   it('records the first ad when a Zoma-created campaign approved through Zoma reads back ACTIVE with >= 1 impression', async () => {
     const deps = firstAdDeps([created, approved], { status: 'ACTIVE', impressions: 1 });
     expect(await verifyZomaFirstAds(deps)).toEqual([expect.objectContaining({ userId: 'u1', outcome: 'verified', campaignId: 'c1', impressions: 1 })]);
-    expect(deps.recorded.get('u1')).toEqual({ at: new Date(NOW).toISOString(), approvedAt: approved.ts, campaignId: 'c1', platform: 'meta', effectiveStatus: 'ACTIVE', impressions: 1 });
+    expect(deps.recorded.get('u1')).toEqual({
+      at: new Date(NOW).toISOString(), approvedAt: approved.ts, campaignId: 'c1', platform: 'meta',
+      effectiveStatus: 'ACTIVE', approvedEntity: { type: 'CAMPAIGN', id: 'c1' },
+      activationEvidence: ['approval_read_back_active', 'provider_active_now', 'delivered'],
+      impressionsScope: 'lifetime', impressions: 1,
+    });
+    // Lifetime: the provider is asked for the campaign's total, never a date window.
+    expect(deps.campaignImpressions).toHaveBeenCalledWith('u1', '111', 'c1');
     expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
   });
 
@@ -120,12 +128,70 @@ describe('first successful ad (provider-verified)', () => {
     expect(deps.recordFirstAd).not.toHaveBeenCalled();
   });
 
-  it('an approved campaign the provider reports as not ACTIVE (paused, in review, rejected) is not a first ad', async () => {
-    for (const status of ['PAUSED', 'PENDING_REVIEW', 'DISAPPROVED']) {
-      const deps = firstAdDeps([created, approved], { status, impressions: 50 });
-      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'not_active', effectiveStatus: status });
+  it('a campaign paused after delivering is a first ad (first-impression safety stop)', async () => {
+    for (const status of ['PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED']) {
+      const deps = firstAdDeps([created, approved], { status, impressions: 1 });
+      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'verified', campaignId: 'c1', effectiveStatus: status, impressions: 1 });
+      expect(deps.recorded.get('u1')).toEqual(expect.objectContaining({
+        approvedAt: approved.ts, effectiveStatus: status, impressionsScope: 'lifetime', impressions: 1,
+        activationEvidence: ['approval_read_back_active', 'delivered'],
+      }));
+      expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('current status is not a condition: any status with lifetime delivery after a confirmed approval counts', async () => {
+    for (const status of ['PENDING_REVIEW', 'DISAPPROVED', 'DELETED', 'WITH_ISSUES', undefined]) {
+      const deps = firstAdDeps([created, approved], { status: status ?? '', impressions: 50 });
+      if (status === undefined) (deps.readCampaign as jest.Mock).mockResolvedValue({ accountId: '111' });
+      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'verified', impressions: 50 });
+      expect(deps.recordFirstAd).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('zero lifetime impressions is never a first ad, whatever the status', async () => {
+    for (const status of ['ACTIVE', 'PAUSED', 'PENDING_REVIEW']) {
+      const deps = firstAdDeps([created, approved], { status, impressions: 0 });
+      expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'no_impressions', effectiveStatus: status, impressions: 0 });
       expect(deps.recordFirstAd).not.toHaveBeenCalled();
     }
+  });
+
+  it('a non-numeric impressions answer is treated as no delivery, never as a first ad', async () => {
+    const deps = firstAdDeps([created, approved], { status: 'ACTIVE' });
+    (deps.campaignImpressions as jest.Mock).mockResolvedValue(Number.NaN);
+    expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'no_impressions', impressions: 0 });
+    expect(deps.recordFirstAd).not.toHaveBeenCalled();
+  });
+
+  it('a mismatched or unconfirmed go-live approval (no ACTIVE read-back) is never checked, even with delivery', async () => {
+    for (const verification of ['MISMATCH', 'UNCONFIRMED']) {
+      const deps = firstAdDeps([created, { ...approved, verification }], { status: 'PAUSED', impressions: 500 });
+      expect(await verifyZomaFirstAds(deps, { userId: 'u1' })).toEqual([{ userId: 'u1', outcome: 'no_go_live_approval' }]);
+      expect(deps.campaignImpressions).not.toHaveBeenCalled();
+      expect(deps.recordFirstAd).not.toHaveBeenCalled();
+    }
+  });
+
+  it('write-once holds for a paused first ad: a later check neither overwrites nor re-emits', async () => {
+    const deps = firstAdDeps([created, approved], { status: 'PAUSED', impressions: 4 });
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('verified');
+    (deps.campaignImpressions as jest.Mock).mockResolvedValue(900);
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('already_recorded');
+    expect(deps.recordFirstAd).toHaveBeenCalledTimes(1);
+    expect(deps.recorded.get('u1')).toEqual(expect.objectContaining({ impressions: 4 }));
+    expect(deps.onFirstAd).toHaveBeenCalledTimes(1);
+  });
+
+  it('the predicate is exactly: lifetime >= 1 AND Zoma-created AND Zoma-approved AND (ACTIVE read-back at/after approval OR delivered)', () => {
+    const base = { zomaCreated: true, approvedThroughZoma: true, approvalReadBackActive: true, currentEffectiveStatus: 'PAUSED', lifetimeImpressions: 1 };
+    expect(isFirstSuccessfulAd(base)).toBe(true);
+    // Delivered alone satisfies the ACTIVE-or-delivered clause.
+    expect(isFirstSuccessfulAd({ ...base, approvalReadBackActive: false })).toBe(true);
+    expect(isFirstSuccessfulAd({ ...base, lifetimeImpressions: 0 })).toBe(false);
+    expect(isFirstSuccessfulAd({ ...base, lifetimeImpressions: 0, currentEffectiveStatus: 'ACTIVE' })).toBe(false);
+    expect(isFirstSuccessfulAd({ ...base, zomaCreated: false })).toBe(false);
+    expect(isFirstSuccessfulAd({ ...base, approvedThroughZoma: false })).toBe(false);
   });
 
   it('a campaign not created through Zoma never counts, even when live with impressions', async () => {
