@@ -21,6 +21,10 @@ const REQUIRED_RELAXATIONS: Record<string, string[]> = {
   // ENG-2994: `level` has a server-side default ("info"); models omit it and were rejected
   // pre-execution with 'Missing required argument "level"' (4/17 calls in one window).
   playwright_browser_console_messages: ['level'],
+  // ENG-2994 follow-up (Opslane run 1999): the Playwright MCP server reports UNPREFIXED names
+  // (`browser_console_messages`), so key both forms or the lookup silently misses.
+  browser_network_requests: ['requestBody', 'requestHeaders'],
+  browser_console_messages: ['level'],
 };
 
 /**

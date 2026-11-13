@@ -43,4 +43,9 @@ describe('sanitizeMcpToolSchema — ENG-2994', () => {
     expect(out.properties.level.enum).toContain('error');
     expect(schema.required).toEqual(['level']);
   });
+
+  it('relaxes the unprefixed server names the Playwright MCP server actually reports', () => {
+    expect(sanitizeMcpToolSchema('browser_console_messages', { type: 'object', properties: { level: { type: 'string' } }, required: ['level'] }).required).toEqual([]);
+    expect(sanitizeMcpToolSchema('browser_network_requests', { type: 'object', required: ['requestBody', 'requestHeaders'] }).required).toEqual([]);
+  });
 });
