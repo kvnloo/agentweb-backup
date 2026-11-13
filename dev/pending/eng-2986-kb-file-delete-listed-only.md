@@ -11,6 +11,10 @@ the same rule. The portal and the `delete_knowledge_base_file` MCP tool only sen
 twice now answers 404 the second time (it used to answer 200 and touch storage again). A listed key containing a literal `%` no longer
 gets decoded into a different key.
 
+**Sibling route (found by the independent review, reproduced on env1):** `DELETE /api/tasks/:taskId/attachments/:key` only checked that
+the caller owns the task, then sent the URL key to S3: user B deleted user A's attachment object through B's own task (A's object
+went from 200 to gone). It now requires the key to be listed in that task's `attachments` (404 otherwise).
+
 **Not changed:** the `lead-volume-monitor` and client-health routes decode an already-decoded param, so a client name containing `%`
 returns 500 (separate, low severity).
 

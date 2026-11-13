@@ -2,6 +2,8 @@
  * ENG-2986: DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey must only delete a storage object that is listed on THAT task.
  * Reproduced on the test environment 2026-11-13: user B, who can edit B's own task, named user A's file key and A's object was
  * deleted from storage (A's file then read as "not found"). The route used the key straight from the URL.
+ * The sibling DELETE /api/tasks/:taskId/attachments/:key had the same hole (found by the review): it only checked task ownership and
+ * sent the URL key to S3.
  */
 import request from 'supertest';
 import express from 'express';
@@ -11,9 +13,10 @@ const mockUpdateTask = jest.fn();
 const mockGcsDelete = jest.fn();
 const mockGcsFile = jest.fn();
 const mockS3DeleteObject = jest.fn();
+const mockDeleteAttachment = jest.fn();
 
 jest.mock('../services/db', () => ({
-  taskDb: { getTaskById: mockGetTaskById, updateTask: mockUpdateTask, getTasksByUserId: jest.fn(), getTaskSchedules: jest.fn(), getTasksWithKnowledgeBase: jest.fn() },
+  taskDb: { getTaskById: mockGetTaskById, updateTask: mockUpdateTask, deleteAttachment: mockDeleteAttachment, getTasksByUserId: jest.fn(), getTaskSchedules: jest.fn(), getTasksWithKnowledgeBase: jest.fn() },
   subscriberDb: { getTaskSubscribers: jest.fn().mockResolvedValue([]) },
   scheduleDb: { updateSchedule: jest.fn() },
   userDb: { getUserById: jest.fn(async (id: string) => ({ userId: id, orgRole: 'member' })) },
@@ -158,5 +161,39 @@ describe('knowledge-base file delete only touches files listed on the task (ENG-
     currentUserId = 'user-x';
     expect((await del(GCS_KEY)).status).toBe(403);
     expect(mockGcsDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe('task attachment delete only touches attachments listed on the task (ENG-2986, sibling route)', () => {
+  const ATT_KEY = 'tasks/task-b/attachments/1794561990749_note.png';
+  const FOREIGN_ATT_KEY = 'users/user-a/files/1794561990000/tok/secret.png';
+  const delAtt = (key: string) => request(app).delete(`/api/tasks/task-b/attachments/${encodeURIComponent(key)}`);
+  beforeEach(() => {
+    mockGetTaskById.mockResolvedValue({ ...taskB(), attachments: [{ key: ATT_KEY, name: 'note.png' }] });
+    mockDeleteAttachment.mockResolvedValue(undefined);
+  });
+
+  it("another account's object key is refused with 404 and nothing is deleted", async () => {
+    const res = await delAtt(FOREIGN_ATT_KEY);
+    expect(res.status).toBe(404);
+    expect(mockDeleteAttachment).not.toHaveBeenCalled();
+  });
+
+  it('a listed attachment is deleted', async () => {
+    const res = await delAtt(ATT_KEY);
+    expect(res.status).toBe(204);
+    expect(mockDeleteAttachment).toHaveBeenCalledWith('task-b', ATT_KEY);
+  });
+
+  it('a task with no attachments refuses any key', async () => {
+    mockGetTaskById.mockResolvedValue({ ...taskB() });
+    expect((await delAtt(ATT_KEY)).status).toBe(404);
+    expect(mockDeleteAttachment).not.toHaveBeenCalled();
+  });
+
+  it("someone else's task is still a 403 first", async () => {
+    currentUserId = 'user-x';
+    expect((await delAtt(ATT_KEY)).status).toBe(403);
+    expect(mockDeleteAttachment).not.toHaveBeenCalled();
   });
 });

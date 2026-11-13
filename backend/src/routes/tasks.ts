@@ -890,6 +890,13 @@ router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: Authe
       return res.status(403).json({ error: 'Not authorized to modify this task' });
     }
 
+    // ENG-2986: only an attachment listed on THIS task may be deleted. The key used to go straight to S3, so an owner of any task could
+    // delete another account's object in the same bucket by naming its key.
+    const attachments: any[] = Array.isArray((task as any).attachments) ? (task as any).attachments : [];
+    if (!attachments.some((a: any) => typeof a?.key === 'string' && a.key === key)) {
+      return res.status(404).json({ error: 'Attachment not found on this task' });
+    }
+
     await taskDb.deleteAttachment(taskId, key);
     res.status(204).send();
   } catch (error) {
