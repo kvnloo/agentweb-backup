@@ -369,6 +369,13 @@ export async function addLeadsToList(
         deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
       });
 
+      // ENG-2996: new rows inherit the owner's do-not-contact flags and get
+      // their emails validated, same as the portal's CSV/bulk import.
+      const { applyLeadImportFollowups } = await import('../../services/leadImportFollowups');
+      const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
+      });
+
       // ENG-1133: report the import row by row, not just in aggregate. A large
       // import can be cut off mid-way (the whole-turn cap fires between calls),
       // and "25 new lead(s) created" tells the next turn nothing about WHICH
@@ -513,6 +520,8 @@ export async function addLeadsToList(
         // Two counts of the same thing is exactly the "numbers don't add up"
         // the ticket is about, so there is now one (ENG-1133).
         reconciliation,
+        ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: followups.inheritedDoNotContact.length } : {}),
+        ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
         ...(unimportedRows.length > 0
           ? { ...resume, unimportedRowRanges }
@@ -1608,6 +1617,29 @@ function foldEngagementSignal(
     }
   }
 
+/**
+ * ENG-2996: Emma suppresses a lead by moving its pipeline `status` to
+ * "do-not-contact" (any case/spacing). Send paths only read `contactStatus`, so
+ * the same write must set it too. A lead already unsubscribed/DNC keeps its
+ * existing contact status and reason.
+ */
+export function suppressionContactStatusUpdates(status: unknown, existingLead: any, userId: string): Record<string, any> {
+  if (typeof status !== 'string') return {};
+  const normalized = status.trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (normalized !== 'do-not-contact' && normalized !== 'dnc') return {};
+  if (existingLead?.contactStatus === 'do-not-contact' || existingLead?.contactStatus === 'unsubscribed') return {};
+  const now = new Date().toISOString();
+  return {
+    contactStatus: 'do-not-contact',
+    contactStatusReason: 'admin-flagged',
+    contactStatusNote: 'Set from pipeline status "do-not-contact"',
+    contactStatusUpdatedAt: now,
+    contactStatusUpdatedBy: userId,
+    unsubscribedFromGroupEmail: true,
+    unsubscribedFromGroupEmailAt: now,
+  };
+}
+
 export async function updateLead(listId: string, leadId: string, updates: Record<string, any>, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1653,6 +1685,9 @@ export async function updateLead(listId: string, leadId: string, updates: Record
           { source: 'agentMode.updateLead', listId, leadId },
         );
       }
+
+      // ENG-2996: a do-not-contact pipeline status is a suppression, not a label.
+      Object.assign(dbUpdates, suppressionContactStatusUpdates(dbUpdates.status, lead, userId));
 
       // Auto-create status change engagement if status changed
       if (dbUpdates.status !== undefined && (lead.status || null) !== dbUpdates.status) {
@@ -2113,7 +2148,9 @@ export async function updateLeadStatus(
       }
 
       const previousStatus = existingLead.status || null;
-      const updates: any = { status };
+      // ENG-2996: a do-not-contact pipeline status also sets contactStatus, which
+      // is what every send path (isDoNotContact / contactGuard) actually reads.
+      const updates: any = { status, ...suppressionContactStatusUpdates(status, existingLead, userId) };
       if (dealValue !== undefined) updates.dealValue = dealValue;
       if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
 
