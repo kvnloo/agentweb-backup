@@ -17,6 +17,8 @@ import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import './readEmailTool';
+// Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
+import './smartleadTools';
 import './conversionSummaryTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
@@ -250,7 +252,7 @@ mcpToolRegistry.register({
   name: 'emma_answer_question_deck',
   definition: {
     name: 'emma_answer_question_deck',
-    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI. Cards that need a person\'s approval (adding or releasing contacts in Smartlead, a hot-lead call, activating a CRM sequence, a paused Meta campaign bundle) cannot be approved this way: approving one returns an error with the link where the person approves it in AgentWeb; declining one works.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -485,16 +487,16 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${args.task_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
         const { action, task_id, ...updates } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${task_id}`, context: c, body: updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${encodeURIComponent(task_id)}`, context: c, body: updates });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${args.task_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -515,7 +517,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: `/api/tasks/${args.task_id}/execute`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'POST', path: `/api/tasks/${encodeURIComponent(args.task_id)}/execute`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -536,8 +538,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const path = args.execution_id
-      ? `/api/tasks/${args.task_id}/executions/${args.execution_id}`
-      : `/api/tasks/${args.task_id}/executions`;
+      ? `/api/tasks/${encodeURIComponent(args.task_id)}/executions/${encodeURIComponent(args.execution_id)}`
+      : `/api/tasks/${encodeURIComponent(args.task_id)}/executions`;
     const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
     return jsonResult(data);
   }
@@ -557,7 +559,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/schedules/task/${args.task_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/schedules/task/${encodeURIComponent(args.task_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -599,11 +601,11 @@ mcpToolRegistry.register({
       }
       case 'update': {
         const { action, schedule_id, ...updates } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/schedules/${schedule_id}`, context: c, body: updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/schedules/${encodeURIComponent(schedule_id)}`, context: c, body: updates });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/schedules/${args.schedule_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/schedules/${encodeURIComponent(args.schedule_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -800,7 +802,7 @@ mcpToolRegistry.register({
         if (args.revoke_autopublish === true) {
           publishConsent = await mcpFetch({
             method: 'POST',
-            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/publish-consent`,
             context: c,
             body: { authorized: false },
           });
@@ -808,15 +810,15 @@ mcpToolRegistry.register({
 
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.timezone !== undefined) body.timezone = args.timezone;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}`, context: c, body });
         return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
-        const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });
+        const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/toggle`, context: c, body: { status: args.status } });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -841,7 +843,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test`, context: ctx(context),
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/test`, context: ctx(context),
       body: { sendNotificationEmail: args.send_notification_email || false }
     });
     return jsonResult(data);
@@ -862,7 +864,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test-history`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/test-history`, context: ctx(context) });
     // A test run started via test_scheduled_chat executes in the background and can take
     // several minutes. When the history is still empty, returning a bare `[]` leads the model
     // to report "empty results" to the user as if the run finished with nothing. Instead,
@@ -901,7 +903,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/variables`, context: ctx(context),
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/variables`, context: ctx(context),
       body: {
         variableValues: args.variable_values,
         triggerRun: args.trigger_run || false,
@@ -926,7 +928,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/storage-diagnostics`, context: ctx(context)
+      method: 'GET', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/storage-diagnostics`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -1018,11 +1020,11 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -1066,7 +1068,7 @@ mcpToolRegistry.register({
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
     if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
     if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
-    const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
+    const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
 });
@@ -1075,6 +1077,8 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'list_lead_lists',
+  // A GET only: listing lists changes nothing. Read-only so a key scoped to tools:read (e.g. a Smartlead agent key) can find a listId.
+  readOnly: true,
   definition: {
     name: 'list_lead_lists',
     description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
@@ -1086,6 +1090,11 @@ mcpToolRegistry.register({
   },
   /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
+    // The tool is read-only so a tools:read key can find its own listIds, but reading ANOTHER account's lists (client_id, admin-only)
+    // stays a tools:execute capability, as it was before the tool was marked read-only.
+    if (args?.client_id && context?.externalMcp === true && context?.authMethod === 'api_key' && !(context.apiKeyScopes ?? []).includes('tools:execute')) {
+      throw new Error("client_id needs an API key that holds the 'tools:execute' scope.");
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',
@@ -1120,15 +1129,15 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${args.list_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${args.list_id}`, context: c, body: { name: args.name, description: args.description } });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c, body: { name: args.name, description: args.description } });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${args.list_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -1689,7 +1698,7 @@ mcpToolRegistry.register({
         const qp: Record<string, string> = {};
         if (args.limit) qp.limit = String(args.limit);
         if (args.last_key) qp.lastKey = args.last_key;
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/leads`, context: c, queryParams: qp });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, queryParams: qp });
         return jsonResult(data);
       }
       case 'add': {
@@ -1705,27 +1714,27 @@ mcpToolRegistry.register({
           const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
           return jsonResult({ dryRun: true, ...preview });
         }
-        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: leadPayload });
+        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, body: leadPayload });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/leads/${args.lead_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${listId}/leads/${args.lead_id}`, context: c, body: args.updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c, body: args.updates });
         return jsonResult(data);
       }
       case 'delete': {
         // Delete uses the single-lead endpoint if one ID, or we need to call per-lead
         if (args.lead_ids && args.lead_ids.length === 1) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${listId}/leads/${args.lead_ids[0]}`, context: c });
+          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_ids[0])}`, context: c });
           return jsonResult(data);
         }
         // For multiple deletes, call individually
         const results = [];
         for (const leadId of (args.lead_ids || [])) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${listId}/leads/${leadId}`, context: c });
+          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(leadId)}`, context: c });
           results.push(data);
         }
         return jsonResult({ deleted: args.lead_ids?.length || 0, results });
@@ -1819,16 +1828,16 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
         const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${plan_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -1868,25 +1877,25 @@ mcpToolRegistry.register({
     switch (args.action) {
       case 'add_phase': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/phases`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases`, context: c,
           body: { name: args.name, description: args.description, status: args.status }
         });
         return jsonResult(data);
       }
       case 'update_phase': {
         const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}`, context: c,
+          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c,
           body: { name: args.name, description: args.description, status: args.status }
         });
         return jsonResult(data);
       }
       case 'delete_phase': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c });
         return jsonResult(data);
       }
       case 'add_work_items': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items`, context: c,
           body: { workItems: args.work_items }
         });
         return jsonResult(data);
@@ -1894,14 +1903,14 @@ mcpToolRegistry.register({
       case 'update_work_item': {
         const { action: _a, plan_id: _p, phase_id: _ph, work_item_id: _w, ...updates } = args;
         const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items/${work_item_id}`, context: c,
+          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c,
           body: updates
         });
         return jsonResult(data);
       }
       case 'delete_work_item': {
         const data = await mcpFetch({
-          method: 'DELETE', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items/${work_item_id}`, context: c
+          method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c
         });
         return jsonResult(data);
       }
@@ -1911,15 +1920,15 @@ mcpToolRegistry.register({
       }
       case 'add_common_items': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/add-common-items`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/add-common-items`, context: c,
           body: { items: args.items, targetPhaseId: args.target_phase_id, newPhaseName: args.new_phase_name }
         });
         return jsonResult(data);
       }
       case 'send_status_report': {
         const path = phase_id
-          ? `/api/gtm-plan/${plan_id}/phases/${phase_id}/send-status-report`
-          : `/api/gtm-plan/${plan_id}/send-status-report`;
+          ? `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/send-status-report`
+          : `/api/gtm-plan/${encodeURIComponent(plan_id)}/send-status-report`;
         const data = await mcpFetch({
           method: 'POST', path, context: c,
           body: { includeSummary: args.include_summary, includeDetails: args.include_details }
@@ -2607,7 +2616,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/deploy`, context: ctx(context),
       body: {},
       timeoutMs: 25 * 60 * 1000, // 25 minutes — GitHub + Vercel deploy (extra headroom)
     });
@@ -2631,7 +2640,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/iterate`, context: ctx(context),
       body: { message: args.message },
       // An iteration is a full v0 generation round — it takes as long as a build. This passed
       // NO timeout, so it fell back to the ~5-min default and aborted while v0 was still
@@ -2672,7 +2681,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -2691,7 +2700,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -2759,7 +2768,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PUT', path: `/api/crm/lists/${args.list_id}/public-access`, context: ctx(context),
+      method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}/public-access`, context: ctx(context),
       body: { enabled: true }
     });
     return jsonResult(data);
@@ -2782,7 +2791,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/duplicate`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/duplicate`, context: ctx(context),
       body: { name: args.name }
     });
     return jsonResult(data);
@@ -2805,7 +2814,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/context`, context: ctx(context),
       body: { context: args.context }
     });
     return jsonResult(data);
@@ -2882,7 +2891,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PUT', path: `/api/landing-pages/v0/generated/${args.page_id}/github-edit`, context: ctx(context),
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/github-edit`, context: ctx(context),
       body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message, branch: args.branch }
     });
     return jsonResult(data);
@@ -2968,7 +2977,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2991,7 +3000,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -3012,7 +3021,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/deployment-status`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/deployment-status`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -3035,7 +3044,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/preview-url`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/preview-url`,
       queryParams: { branch: args.branch },
       context: ctx(context)
     });
@@ -3063,7 +3072,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/publish`,
       body: { branch: args.branch },
       context: ctx(context)
     });
@@ -3087,7 +3096,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/revert-publish`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/revert-publish`,
       context: ctx(context)
     });
     return jsonResult(data);
@@ -3615,7 +3624,7 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
 
           let existingSteps: any[] | undefined;
           try {
-            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
             existingSteps = Array.isArray(current?.steps) ? current.steps : [];
             // Stake the read: everything below is judged against these steps, so
             // a write that lands in between has to fail rather than quietly make
@@ -3693,7 +3702,7 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
 
         let data: any;
         try {
-          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c, body });
         } catch (error: any) {
           // The stake above was rejected. Nothing was written, and a blind retry
           // would re-send a payload built from steps that no longer exist.
@@ -3713,11 +3722,11 @@ async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -3821,17 +3830,17 @@ mcpToolRegistry.register({
         if (args.tool_names !== undefined) body.toolNames = args.tool_names;
         if (args.system_prompt !== undefined) body.systemPrompt = args.system_prompt;
         if (args.is_published !== undefined) body.isPublished = args.is_published;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/skills/${args.skill_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
         if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('delete') });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${args.skill_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
         if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('get') });
-        const data = await mcpFetch({ method: 'GET', path: `/api/skills/${args.skill_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -4765,8 +4774,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const path = args.action === 'freeze'
-      ? `/api/admin/users/${args.user_id}/deactivate`
-      : `/api/admin/users/${args.user_id}/reactivate`;
+      ? `/api/admin/users/${encodeURIComponent(args.user_id)}/deactivate`
+      : `/api/admin/users/${encodeURIComponent(args.user_id)}/reactivate`;
     const data = await mcpFetch({ method: 'POST', path, context: ctx(context) });
     return jsonResult(data);
   }
@@ -4815,17 +4824,17 @@ Actions:
 
     switch (action) {
       case 'list': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/admin/users/${user_id}/notes`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes`, context: ctx(context) });
         return jsonResult(data);
       }
       case 'add': {
         if (!content) return jsonResult({ error: 'content is required for add' });
-        const data = await mcpFetch({ method: 'POST', path: `/api/admin/users/${user_id}/notes`, context: ctx(context), body: { content } });
+        const data = await mcpFetch({ method: 'POST', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes`, context: ctx(context), body: { content } });
         return jsonResult(data);
       }
       case 'delete': {
         if (!note_id) return jsonResult({ error: 'note_id is required for delete' });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/users/${user_id}/notes/${note_id}`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes/${encodeURIComponent(note_id)}`, context: ctx(context) });
         return jsonResult(data);
       }
       default:
@@ -4881,12 +4890,12 @@ mcpToolRegistry.register({
       }
       case 'update': {
         if (!judge_id) return jsonResult({ error: 'judge_id is required for update' });
-        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${encodeURIComponent(judge_id)}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
         return jsonResult(data);
       }
       case 'delete': {
         if (!judge_id) return jsonResult({ error: 'judge_id is required for delete' });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${encodeURIComponent(judge_id)}`, context: ctx(context) });
         return jsonResult(data);
       }
       default:

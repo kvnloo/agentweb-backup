@@ -12,6 +12,7 @@ jest.mock('../services/hotLeadCallService', () => ({
   },
 }));
 jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
+import { callConsentRecord } from './helpers/hotLeadCallFixtures';
 import { notificationLookup } from '../services/leadNotificationLookup';
 const postMessage = jest.fn();
 const authTest = jest.fn();
@@ -82,7 +83,7 @@ beforeEach(() => {
   mock(orgDb.getOrgById).mockImplementation(async () => org);
   mock(crmDb.getLeadById).mockResolvedValue({
     listId: 'list-a', leadId: 'lead-a', firstName: 'Jane', email: 'jane@example.com', phone: '+12125550142',
-    createdAt: new Date().toISOString(), customFields: { source: 'landing' },
+    createdAt: new Date().toISOString(), customFields: { source: 'landing' }, system: { callConsent: callConsentRecord() },
   });
   mock(crmDb.claimLeadStepOnce).mockResolvedValue(true);
   mock(crmDb.setLeadFields).mockResolvedValue(undefined);

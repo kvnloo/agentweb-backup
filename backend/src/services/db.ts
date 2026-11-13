@@ -961,6 +961,18 @@ export interface Organization {
    * member join/leave. Absent/0 = no extra seats purchased.
    */
   purchasedExtraSeats?: number;
+  /**
+   * Hot lead calls add-on (ENG-2783): mirror of the flat $70/month subscription item on the org owner's Stripe
+   * subscription, written only by the billing webhook (hotLeadCallBillingService.mirrorHotLeadCallBilling).
+   * Absent = never subscribed. Read by hotLeadCallEntitlement when HOT_LEAD_CALL_BILLING_REQUIRED=true.
+   */
+  hotLeadCallBilling?: HotLeadCallBilling;
+}
+
+export interface HotLeadCallBilling {
+  itemId: string;
+  status: 'active' | 'past_due' | 'canceled';
+  updatedAt: string;
 }
 
 export interface OrgShareSettings {
@@ -1330,6 +1342,31 @@ export class UserDB {
     const item = result.Item;
     if (item?.userId?.startsWith("deleted_")) return undefined;
     return item;
+  }
+
+  /**
+   * Remove ONE key from the user's `secrets` map in a single atomic update. Unlike
+   * read-modify-write through updateUser, a concurrent write to a DIFFERENT secret
+   * is never overwritten. Absent key / absent map is a no-op.
+   */
+  async removeUserSecret(userId: string, key: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user?.email) throw new Error(`User with ID '${userId}' not found or has no email.`);
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+          ExpressionAttributeNames: { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" },
+          ExpressionAttributeValues: { ":updatedAt": new Date().toISOString() },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === "ValidationException" && /document path/i.test(error?.message ?? "")) return;
+      handleDynamoDbError(error, "removeUserSecret");
+      throw error;
+    }
   }
 
   /**
@@ -6666,6 +6703,9 @@ export const crmDb = {
     /** ENG-926 §B: client user-agent at capture (Meta `client_user_agent`). Paired with
      *  clientIp; Meta treats the two together as a match signal. */
     clientUserAgent?: string;
+    /** ENG-2783: CRM-internal sidecar written in the creation put (so it exists before any post-create hook reads the
+     *  row). Used for `system.callConsent`, which the hot-lead call gate must see on the very first pass. */
+    system?: Record<string, unknown>;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -6854,6 +6894,9 @@ export const crmDb = {
       }
       if (leadData.clientUserAgent) {
         item.clientUserAgent = leadData.clientUserAgent;
+      }
+      if (leadData.system && Object.keys(leadData.system).length > 0) {
+        item.system = leadData.system;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;
@@ -12779,6 +12822,43 @@ export const orgDb = {
   },
 
   /**
+   * Write an org secret only if that key is not already set — the check and the
+   * write are one conditional update, so a concurrent writer is never clobbered.
+   * Returns false when the key already exists.
+   */
+  async setOrgSecretIfAbsent(orgId: string, key: string, encryptedValue: string): Promise<boolean> {
+    const names = { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" };
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_exists(#secrets) AND attribute_not_exists(#secrets.#key)",
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: { ":val": encryptedValue, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code !== "ConditionalCheckFailedException") throw err;
+    }
+    // Either the key exists (done) or the secrets map is missing (create it, still conditionally).
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_not_exists(#secrets)",
+        ExpressionAttributeNames: { "#secrets": "secrets", "#updatedAt": "updatedAt" },
+        ExpressionAttributeValues: { ":secretsMap": { [key]: encryptedValue }, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  },
+
+  /**
    * Retrieve a single encrypted secret from the org record.
    * Returns null if the org doesn't exist or the key is absent.
    */
@@ -12789,7 +12869,7 @@ export const orgDb = {
   },
 
   /**
-   * Remove a single secret key from the org record.
+   * Remove a single secret key from the org record. Idempotent; throws on real failures.
    */
   async removeOrgSecret(orgId: string, key: string): Promise<void> {
     try {
@@ -12806,8 +12886,12 @@ export const orgDb = {
           ":updatedAt": new Date().toISOString(),
         },
       }).promise();
-    } catch {
-      // If secrets map or key doesn't exist, that's fine — already absent.
+    } catch (err: any) {
+      // Removing an absent key is a no-op in DynamoDB. The only "already absent" error is the
+      // whole secrets map missing (invalid document path); anything else is a real failure
+      // the caller must see rather than report as a successful disconnect.
+      if (err?.code === "ValidationException" && /document path/i.test(err?.message ?? "")) return;
+      throw err;
     }
   },
 };

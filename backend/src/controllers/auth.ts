@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { isZomaSignup } from '../services/zomaSignupIntent';
 import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
@@ -166,7 +167,10 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
-    if (zomaAdmissionEnabled()) {
+    if (zomaAdmissionEnabled() && req.body.signupIntent !== undefined && !isZomaSignup(req.body)) {
+      return res.status(400).json({ code: 'invalid_signup_intent', message: 'Please try again later.' });
+    }
+    if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
       try {
         if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
       } catch (error) {
@@ -489,9 +493,8 @@ export const googleCallback = async (
       }, null);
     }
 
-    if (!user && zomaAdmissionEnabled() && await admitZomaSignup(email) !== 'approved') {
-      return done({ statusCode: 403, ...waitlistedResponse }, null);
-    }
+    // Google registration has no Zoma product intent; these are Emma portal signups.
+    // Zoma setup/MCP registers on the consent page with a product-scoped signup intent.
 
     if (!user) {
       if (portalOrigin === "genius") {

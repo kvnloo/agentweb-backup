@@ -76,7 +76,7 @@ mcpToolRegistry.register({
     // the agent never has to chase an intermediate id with a second tool.
     const status: any = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${pageId}/deployment-status`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(pageId)}/deployment-status`,
       context: ctx(context),
     });
     if (status?.status === 'deployed' && status?.deployedUrl) {
