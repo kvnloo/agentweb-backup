@@ -16050,7 +16050,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
-      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // ENG-1636: an AD (or AD_SET) status flip usually arrives with only its own id, but the gate needs
       // the parent campaign to scope its tracking checks — and blocked such calls with
       // "no campaign was identified" even though Meta carries campaign_id on the ad
       // object. Resolve the parent instead of refusing a call whose campaign is one
@@ -16061,6 +16061,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         entityType: entity_type,
         campaignId: campaign_id,
         adId: ad_id,
+        adSetId: ad_set_id,
         accessToken: gateCreds.accessToken,
         accountId: gateCreds.accountId,
         resolver: metaService,
