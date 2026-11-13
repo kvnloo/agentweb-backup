@@ -484,11 +484,9 @@ router.post('/disconnect', authenticateToken, async (req: any, res) => {
       // Also drop the caller's personal token; otherwise getAccessToken falls back to it
       // and ClickUp keeps showing as connected after the admin disconnects. Both steps are
       // idempotent, so if this one fails the client can simply retry Disconnect.
-      const personalSecrets = (user?.secrets as Record<string, string>) || {};
-      if (personalSecrets.clickup_access_token) {
-        const { clickup_access_token: _drop, ...rest } = personalSecrets;
+      if ((user?.secrets as Record<string, string> | undefined)?.clickup_access_token) {
         try {
-          await userDb.updateUser(userId, { secrets: rest });
+          await userDb.removeUserSecret(userId, 'clickup_access_token');
         } catch (error: any) {
           console.error('[ClickUp Disconnect] Org token removed but personal token removal failed:', error);
           return res.status(500).json({ error: 'Disconnect only partly completed. Please click Disconnect again.' });
