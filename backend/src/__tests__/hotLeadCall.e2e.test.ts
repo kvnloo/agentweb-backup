@@ -72,7 +72,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     await call.leadStatus('in-progress', 2);
     expect(recordOf('lead-a')).toMatchObject({ state: 'bridging', leadCallSid: 'CA00000002' });
     const screening = await call.leadAnswers();
-    expect(sayText(screening.body)).toBe('This is an automated call from Smith & Sons. To stop these calls at any time, press 3. This call is about the enquiry you sent us. To reach a person at Smith & Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, or press 2 if you are not available and we will call you again later.');
+    expect(sayText(screening.body)).toBe("Hi, this is an automated call from Smith & Sons. To stop these calls at any time, press 3. We're calling about the enquiry you sent us. Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later. You can also call us on 4 1 5, 5 5 5, 0 1 1 1.");
     expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     expect(recordOf('lead-a')).toMatchObject({ state: 'connected', leadCallSid: 'CA00000002' });
     expect((await call.dialEnds('completed', { DialCallDuration: '125' })).body).toContain('<Hangup/>');

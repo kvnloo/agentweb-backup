@@ -38,12 +38,12 @@ export function spokenPhoneNumber(e164: string): string {
 // Pressing 2 ("not available now") schedules ONE later call through the due-retries cron (cron/hotLeadCallRetryCron.ts), so
 // option 2 is spoken only when a retry can really happen (`canDefer`: the lead's first call, retries not switched off); see
 // "Press 2 and the retry" in docs/integrations/hot-lead-call.md.
-// Order matters (47 CFR 64.1200(b)): the caller is named first and the press-3 opt-out follows at once, before anything else; see
+// Order matters (47 CFR 64.1200(b)): the caller is named first and the press-3 opt-out follows at once, before anything else; the callback number comes last; see
 // "Compliance basis of the script" in docs/integrations/hot-lead-call.md. announcedName must be the business's registered name.
 // The prompt is US-only (a Canadian number is refused upstream, HOT_LEAD_CALL_CA_ENABLED=false); any other E.164 number is
 // simply read digit by digit.
 const screenPromptCopy = (announcedName: string, callbackNumber: string, canDefer: boolean): string =>
-  `This is an automated call from ${announcedName}. To stop these calls at any time, press 3. This call is about the enquiry you sent us. To reach a person at ${announcedName}, call ${spokenPhoneNumber(callbackNumber)}. ${canDefer ? 'Press 1 to be connected now, or press 2 if you are not available and we will call you again later.' : 'Press 1 to be connected now.'}`;
+  `Hi, this is an automated call from ${announcedName}. To stop these calls at any time, press 3. We're calling about the enquiry you sent us. ${canDefer ? "Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later." : "Press 1 and we'll connect you to a person now."} You can also call us on ${spokenPhoneNumber(callbackNumber)}.`;
 export const NO_INPUT_COPY = 'We did not get a response. Goodbye.';
 export const LEAD_UNREACHABLE_COPY = 'Sorry, we could not reach them. Goodbye.';
 const memberPromptCopy = (announcedName: string): string => `New lead from ${announcedName}. Are you available to take the call now? Press 1.`;

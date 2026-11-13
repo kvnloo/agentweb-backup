@@ -77,7 +77,7 @@ describe('press 2 on the first call', () => {
     await call.memberAnswers();
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
-    expect(sayText((await call.leadAnswers()).body)).toContain('Press 1 to be connected now, or press 2 if you are not available and we will call you again later.');
+    expect(sayText((await call.leadAnswers()).body)).toContain("Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later.");
   });
 
   it('with retries switched off the prompt omits option 2 and a 2 is an ordinary decline with nothing scheduled', async () => {
@@ -87,7 +87,7 @@ describe('press 2 on the first call', () => {
     await call.memberAnswers();
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
-    expect(sayText((await call.leadAnswers()).body)).toMatch(/Press 1 to be connected now\.$/);
+    expect(sayText((await call.leadAnswers()).body)).toMatch(/Press 1 and we'll connect you to a person now\. You can also call us on [\d ,]+\.$/);
     expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     expect(record()).toMatchObject({ outcome: 'lead_declined' });
@@ -202,7 +202,7 @@ describe('the due-retries sweep', () => {
     await call.leadStatus('in-progress', 2);
     // The retry call is the last chance: option 2 is not offered, only 1 and 3.
     const prompt = sayText((await call.leadAnswers()).body);
-    expect(prompt).toMatch(/Press 1 to be connected now\.$/);
+    expect(prompt).toMatch(/Press 1 and we'll connect you to a person now\. You can also call us on [\d ,]+\.$/);
     expect(prompt).not.toContain('press 2');
     expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     await call.dialEnds('completed', { DialCallDuration: '60' });
