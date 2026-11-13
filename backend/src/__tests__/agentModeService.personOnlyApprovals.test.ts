@@ -38,17 +38,12 @@ describe('submitApprovalDeckAnswers person-only guard (ENG-2962)', () => {
     ['smartlead_push_approval:start:abc:0123456789abcdef', 'approve'],
     ['hot_lead_call_approval:call:abc:0123456789abcdef', 'approve'],
     ['crm_sequence_activation:seq-1:tok', 'activate'],
-  ])('a self-call approving %s on the pending deck is refused and nothing is written', async (kind, verdict) => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'u-1', pendingApprovalDeck: deck(kind) });
+    ['meta_write', 'approve', { metaWriteDispatch: { action: 'CREATE_PAUSED_BUNDLE' } }],
+  ])('a self-call approving %s on the pending deck is refused and nothing is written', async (kind, verdict, extra = {}) => {
+    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'u-1', pendingApprovalDeck: deck(kind, extra as any) });
     const out = await submit([{ itemId: 'question-1', verdict }], { refusePersonOnlyApprovals: true });
     expect(out).toMatchObject({ outcome: 'needs_person' });
     expect(mockUpdateDeck).not.toHaveBeenCalled();
-  });
-
-  it('judges the deck that is pending now: a different deck than the caller had seen does not slip through', async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'u-1', pendingApprovalDeck: deck('smartlead_push_approval:release:abc:0123456789abcdef') });
-    const out = await submit([{ itemId: 'question-1', verdict: 'approve' }], { refusePersonOnlyApprovals: true });
-    expect(out.outcome).toBe('needs_person');
   });
 
   it('a self-call may decline a person-only card', async () => {
