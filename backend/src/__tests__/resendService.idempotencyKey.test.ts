@@ -100,3 +100,5 @@ describe('ResendService — Idempotency-Key (ENG-2984)', () => {
     expect(b).not.toBe(a);
   });
 });
+
+export {};
