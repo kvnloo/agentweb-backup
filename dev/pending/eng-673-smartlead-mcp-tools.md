@@ -32,6 +32,12 @@ agent can pass `accountId` (mcpFetch keeps the route's `details`); ids made only
 access to this list". Two older holes the review found are fixed separately (ENG-2962: agents approving Emma's cards; ENG-2963:
 unescaped ids in self-call paths).
 
+**Second review round:** `client_id` on `list_lead_lists` (another account's lists, admin-only) needs `tools:execute` again for an `aw_` key,
+since the tool became read-only; the portal's Smartlead routes keep separate rate-limit buckets for agents (self-calls) and people, so
+a looping agent cannot lock a person out of the approval dialog; `list_lead_lists` is listed for `smartlead:read` only when the key
+also holds `tools:read`; connection names shown to an agent are stripped of control characters and line breaks; approval wording says
+"edit access to this list".
+
 **Testing:** `mcp.smartleadTools.test.ts` (which tools exist, scopes, OAuth and anonymous refusals, tools/list, each route call, the
 preview allowlist, argument checks), stats route cases in `routes/__tests__/smartleadPush.test.ts`, key-creation cases in
 `agentApi.routes.test.ts`, regenerated MCP inventory (six tools added, none changed).

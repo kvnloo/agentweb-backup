@@ -51,7 +51,9 @@ type Gate = typeof API_KEY_SCOPE_SMARTLEAD_READ | typeof API_KEY_SCOPE_SMARTLEAD
 export function withConnectionChoices(err: any): any {
   const choices = Array.isArray(err?.details) ? err.details.filter((c: any) => c && typeof c.accountId === 'string') : [];
   if (choices.length === 0) return err;
-  const list = choices.map((c: any) => `${c.accountId}${c.accountName ? ` (${String(c.accountName).slice(0, 60)})` : ''}${c.shared ? ', shared by a teammate' : ''}`).join('; ');
+  // A teammate who shares a connection names it: keep control characters and line breaks out of what an agent reads.
+  const clean = (v: unknown, n: number) => String(v).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+  const list = choices.map((c: any) => `${clean(c.accountId, 80)}${c.accountName ? ` (${clean(c.accountName, 60)})` : ''}${c.shared ? ', shared by a teammate' : ''}`).join('; ');
   return new Error(`${err.message} Available connections: ${list}. Call again with accountId set to one of them.`);
 }
 
@@ -164,8 +166,8 @@ register({
       preview,
       approveIn: link,
       nextStep: preview.canStart
-        ? `Nothing was pushed. To push, someone with access to this list opens ${link}, opens the list's settings menu, chooses "Push to Smartlead", picks this campaign and approves there.`
-        : `Nothing was pushed, and this push cannot start yet: see blocks and fieldsToDecide. Once they are resolved, someone with access to this list approves it at ${link} (the list's settings menu, "Push to Smartlead").`,
+        ? `Nothing was pushed. To push, someone with edit access to this list opens ${link}, opens the list's settings menu, chooses "Push to Smartlead", picks this campaign and approves there.`
+        : `Nothing was pushed, and this push cannot start yet: see blocks and fieldsToDecide. Once they are resolved, someone with edit access to this list approves it at ${link} (the list's settings menu, "Push to Smartlead").`,
     };
   },
 });

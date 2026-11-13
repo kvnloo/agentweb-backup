@@ -1090,6 +1090,11 @@ mcpToolRegistry.register({
   },
   /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
+    // The tool is read-only so a tools:read key can find its own listIds, but reading ANOTHER account's lists (client_id, admin-only)
+    // stays a tools:execute capability, as it was before the tool was marked read-only.
+    if (args?.client_id && context?.externalMcp === true && context?.authMethod === 'api_key' && !(context.apiKeyScopes ?? []).includes('tools:execute')) {
+      throw new Error("client_id needs an API key that holds the 'tools:execute' scope.");
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',
