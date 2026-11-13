@@ -17,6 +17,8 @@ const VERIFIED = new Set([
   'updateAd', 'removeAd',
   'removeConversionAction',
   'updateAssetGroup', // ENG-2928: status read back via verifyFieldsReadBack
+  'setDeviceBidAdjustments', 'retagAssetGroupUtm', // ENG-2398 residual
+  'updateResponsiveSearchAdContent', // ENG-2979: RSA fields read back, throws GoogleAdsReadBackError
 ]);
 
 /** Explicit exemptions, each with the reason it is not a silent-success risk. */
@@ -32,12 +34,11 @@ const EXEMPT: Record<string, string> = {
   addNegativeKeywords: 'create: returned resourceNames are evidence',
   addNegativeCampaignCriteria: 'create: validated by NegativeCampaignCriteriaValidationError before mutate',
   addProximityCriterion: 'create: returned resourceName is evidence',
-  setDeviceBidAdjustments: 'create-or-update bid modifiers; follow-up slice (ENG-592) — exempt until modifier read-back lands',
+  updateConversionGoalBiddable: 'ENG-2979-era: reads back and returns drift to the tool (same contract as updateConversionAction)',
   uploadAsset: 'create: returned asset resourceName is evidence',
   attachCampaignAssets: 'create: returned campaign_asset resourceNames are evidence',
   uploadClickConversions: 'not a config mutation; partialFailureError is returned to the caller',
   createTextAsset: 'private helper for createAssetGroup; returned resourceName is evidence',
-  retagAssetGroupUtm: 'asset-group final_url_suffix: follow-up slice (ENG-592) — exempt until asset-group read-back lands',
 };
 
 describe('ENG-2398 mutation surface coverage', () => {
@@ -132,5 +133,55 @@ describe('remove read-back (AC3)', () => {
   ])('removeAd resolves when resource reads back %s', async (_label, row) => {
     const { svc } = setup(row as any, 'adGroupAd');
     await expect(svc.removeAd('u', '123', AD)).resolves.toBeUndefined();
+  });
+});
+
+describe('ENG-2398 residual: device bid modifiers + asset-group retag read-back', () => {
+  const ASG = 'customers/123/assetGroups/9';
+  function svcWith(searchImpl: (q: string) => any[], mutateResult: any = { results: [{}] }) {
+    const svc = new GoogleAdsService();
+    jest.spyOn(svc, 'getAccountCredentials').mockResolvedValue({ accessToken: 't', loginCustomerId: undefined } as any);
+    const mutate = jest.spyOn(svc, 'mutate').mockResolvedValue(mutateResult);
+    const search = jest.spyOn(svc, 'search').mockImplementation(async (_c: string, _t: string, q: string) => searchImpl(q));
+    return { svc, mutate, search };
+  }
+  const campaignParams = { scope: 'CAMPAIGN', customerId: '123', campaignId: '5', adjustments: [{ device: 'MOBILE', bidModifier: 1.2 }] } as any;
+
+  it('campaign device modifier matching read-back resolves', async () => {
+    const { svc } = svcWith(() => [{ campaignCriterion: { bidModifier: 1.2 } }]);
+    await expect(svc.setDeviceBidAdjustments('u', campaignParams)).resolves.toBeUndefined();
+  });
+
+  it('campaign device modifier unchanged throws unsupported_field', async () => {
+    const { svc } = svcWith(() => [{ campaignCriterion: { bidModifier: 1 } }]);
+    await expect(svc.setDeviceBidAdjustments('u', campaignParams))
+      .rejects.toMatchObject({ code: 'unsupported_field', fields: ['bid_modifier'] });
+  });
+
+  it('-100% exclusion: omitted proto3 zero reads back as 0 and passes', async () => {
+    const p = { ...campaignParams, adjustments: [{ device: 'TABLET', bidModifier: 0 }] };
+    const { svc } = svcWith(() => [{ campaignCriterion: {} }]);
+    await expect(svc.setDeviceBidAdjustments('u', p)).resolves.toBeUndefined();
+  });
+
+  it('ad-group create reads back the returned resourceName; missing row is loud', async () => {
+    const p = { scope: 'AD_GROUP', customerId: '123', adGroupResourceName: AG, adjustments: [{ device: 'DESKTOP', bidModifier: 0.8 }] } as any;
+    const created = 'customers/123/adGroupBidModifiers/7~30000';
+    const ok = svcWith((q) => (q.includes(created) ? [{ adGroupBidModifier: { bidModifier: 0.8 } }] : []), { results: [{ resourceName: created }] });
+    await expect(ok.svc.setDeviceBidAdjustments('u', p)).resolves.toBeUndefined();
+    const gone = svcWith(() => [], { results: [{ resourceName: created }] });
+    await expect(gone.svc.setDeviceBidAdjustments('u', p)).rejects.toBeInstanceOf(GoogleAdsReadBackError);
+  });
+
+  it('retagAssetGroupUtm: final_urls not written throws; written resolves success', async () => {
+    const before = [{ assetGroup: { finalUrls: ['https://a.com/x'] }, campaign: {} }];
+    let calls = 0;
+    const bad = svcWith(() => (calls++ === 0 ? before : [{ assetGroup: { finalUrls: ['https://a.com/x'] } }]));
+    await expect(bad.svc.retagAssetGroupUtm('u', '123', ASG)).rejects.toMatchObject({ code: 'unsupported_field', fields: ['final_urls'] });
+    let n = 0; let written: string[] = [];
+    const ok = svcWith(() => (n++ === 0 ? before : [{ assetGroup: { finalUrls: written } }]));
+    ok.mutate.mockImplementation(async (_c: any, _t: any, _r: any, ops: any[]) => { written = ops[0].update.finalUrls; return { results: [{}] }; });
+    await expect(ok.svc.retagAssetGroupUtm('u', '123', ASG)).resolves.toEqual({ success: true });
+    expect(written[0]).toContain('utm_');
   });
 });
