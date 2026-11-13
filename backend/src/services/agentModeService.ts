@@ -1257,6 +1257,22 @@ export function titleFromUserMessage(message: string): string {
   return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
+/**
+ * The closing sentence of an ad-set read-back mismatch, worded from the status
+ * Meta actually reported. A PAUSED ad set is not delivering, so telling the user
+ * it "is live" was false; an ACTIVE or unknown status still says to pause it.
+ */
+export function describeMismatchedAdSetState(status: unknown): string {
+  const s = typeof status === 'string' ? status.toUpperCase() : '';
+  if (s === 'PAUSED' || s === 'ARCHIVED' || s === 'DELETED') {
+    return `It exists with status ${s} and is not delivering — review these settings in Ads Manager before activating it.`;
+  }
+  if (s === 'ACTIVE') {
+    return 'It is ACTIVE with settings that differ from the request — review or pause it in Ads Manager.';
+  }
+  return 'Its delivery status could not be confirmed — review it in Ads Manager and pause it if it is delivering.';
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-2103 (F2): dataAnalysisConsistencyCache (and its two bound constants)
@@ -12873,6 +12889,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Meta returns monetary fields as strings; compare stringified so
       // 1000 and "1000" are the same value and not a fake mismatch.
       const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      // Schedule fields are instants, not strings: Meta echoes them back in the
+      // ad account's timezone at whole-second precision (requested
+      // 16:44:56.157+00:00 is stored as 08:44:56-0800). Compare the instant at
+      // second resolution so an equivalent time is never reported as overridden.
+      const sameInstant = (requested: string | null, applied: string | null) => {
+        if (requested === null || applied === null) return false;
+        const r = Date.parse(requested);
+        const a = Date.parse(applied);
+        return Number.isFinite(r) && Number.isFinite(a) && Math.floor(r / 1000) === Math.floor(a / 1000);
+      };
+      const isScheduleField = (parameter: string) => parameter === 'start_time' || parameter === 'end_time';
       const readBackMismatches = expected
         .filter(([, requested]) => requested !== undefined)
         .map(([parameter, requested]) => ({
@@ -12880,7 +12907,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           requested: asComparable(requested),
           applied: asComparable(readBack?.[parameter])
         }))
-        .filter(m => m.requested !== m.applied);
+        .filter(m => m.requested !== m.applied &&
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -12896,7 +12924,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} ${describeMismatchedAdSetState(readBack?.status ?? adSet?.status)}`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
