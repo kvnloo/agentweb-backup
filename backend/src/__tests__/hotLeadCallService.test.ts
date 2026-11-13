@@ -39,7 +39,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
-import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
+import { teamMember, callRecord, callConsentRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const MEMBER_PHONE = '+14155550100';
@@ -78,7 +78,7 @@ beforeEach(() => {
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
   process.env.JWT_SECRET = 'test-secret';
-  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' } };
+  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' }, system: { callConsent: callConsentRecord() } };
   org = { orgId: 'org-a', hotLeadCall: config };
   mock(crmDb.getLeadListById).mockResolvedValue({ listId: 'list-a', userId: 'owner-a' });
   mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });

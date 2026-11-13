@@ -127,6 +127,8 @@ export const advanceMinutes = (n: number) => jest.setSystemTime(Date.now() + n *
 export const leadPhone = (n: number) => `(212) 555-01${String(10 + n)}`;
 
 interface SubmitOptions {
+  /** Default true. false = a form lead with no call-consent record. */
+  consent?: boolean;
   phone?: string;
   listId?: string;
   /** Carry a fresh server-side submission id, like a repeat form submission. */
@@ -142,8 +144,9 @@ export async function submitLead(leadId: string, o: SubmitOptions = {}): Promise
   if (!world.crm.hasLead(listId, leadId)) {
     world.crm.addLead({
       listId, leadId, firstName: 'Jane', email: `${leadId}@example.com`, phone: o.phone ?? LEAD_PHONE_AS_TYPED,
-      createdAt: new Date().toISOString(), customFields: { stage: 'complete', source: 'landing' }, ...o.lead,
-    });
+      createdAt: new Date().toISOString(), customFields: { stage: 'complete', source: 'landing' },
+      ...o.lead,
+    }, { consent: o.consent });
   }
   const submission = o.submission ? { submissionId: `sub-${++submissionSeq}`, submittedAt: new Date().toISOString() } : undefined;
   await dispatchLeadCreated(listId, leadId, o.origin ?? 'form_fill', submission);
@@ -253,3 +256,4 @@ function expectNoPhoneNumberAnywhere(): void {
     }
   }
 }
+export { callConsentRecord } from './hotLeadCallFixtures';

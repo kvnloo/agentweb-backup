@@ -98,7 +98,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(world.postMessage).toHaveBeenCalledTimes(1);
     expect(world.postMessage.mock.calls[0][0]).toMatchObject({ channel: 'C123' });
     expect(world.crm.callsTo('claimLeadStepOnce')).toBe(1);
-    expect(Object.keys(world.crm.lead(LIST, 'lead-a').system ?? {}).sort()).toEqual(['hot_lead_call', expect.stringMatching(/^leadNotification_/)]);
+    expect(Object.keys(world.crm.lead(LIST, 'lead-a').system ?? {}).sort()).toEqual(['callConsent', 'hot_lead_call', expect.stringMatching(/^leadNotification_/)]);
     expect(mock(queue.enqueueJob).mock.calls.map(([source]) => source).sort()).toEqual(['hot_lead_call', 'org_lead_notification']);
   });
 

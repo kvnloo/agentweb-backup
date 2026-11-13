@@ -261,6 +261,7 @@ describe('the due-retries sweep', () => {
     // [reason, what was arranged, arrange]: the lead cannot or must not be called however long we wait, so the retry is spent.
     ['do_not_call', 'the lead\'s contact status', () => { world.crm.lead(LIST, 'lead-a').contactStatus = 'do-not-contact'; }],
     ['do_not_call', 'the org marker (a 3 on another lead with the same number)', async () => { await markNumberDoNotCall('org-a', LEAD_E164); }],
+    ['no_call_consent', 'the lead\'s call-consent record gone (ENG-2783)', () => { delete world.crm.lead(LIST, 'lead-a').system!.callConsent; }],
     ['not_entitled', 'a plan that lapsed', () => setHotLeadCallEntitledOverride(false)],
     ['duplicate_phone', 'another lead holding the number', () => world.limits.claims.set(phoneMarkerKey('org-a', LEAD_E164), { token: 'list-a#other#z', expiresAtS: FAR })],
     ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; }],
@@ -675,6 +676,7 @@ function seedDeferred(listId: string, dueAt: string, mac = true): string {
   const e164 = `+1212555${String(100 + (i % 800)).padStart(4, '0')}`;
   world.crm.addLead({ listId, leadId, phone: e164, firstName: 'J', email: `${leadId}@example.com`, createdAt: '2026-10-19T00:00:00.000Z', customFields: { stage: 'complete' } });
   world.crm.lead(listId, leadId).system = {
+    ...world.crm.lead(listId, leadId).system,
     hot_lead_call: {
       state: 'finished', outcome: 'lead_deferred', jobKey: `j${i}`, startedAt: '2026-10-19T00:00:00.000Z', updatedAt: '2026-10-19T00:00:00.000Z', attemptNo: 1,
       memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {}, leadPhoneMac: mac ? leadPhoneMacOf('org-a', e164) : 'other', deferral: { dueAt, count: 1 },

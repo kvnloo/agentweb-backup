@@ -55,3 +55,11 @@ export function storedConfigFixture(extra: Record<string, unknown> = {}, team: H
     callingHours: { start: '08:00', end: '21:00', timezone: 'America/Chicago' }, allowedCountries: ['US', 'CA'], ...extra,
   };
 }
+
+/** ENG-2783: the call-consent record a form lead carries once the visitor ticked the notice (the gate `no_call_consent` needs it).
+ *  FakeCrm.addLead adds it to every lead by default; pass `{ consent: false }` for a lead that has none. */
+export const callConsentRecord = (over: Record<string, unknown> = {}) => ({
+  granted: true,
+  text: 'By checking this box and submitting, I agree that Acme Plumbing LLC may call me at the number above, including automated calls.',
+  version: 'v1', capturedAt: '2026-10-19T10:00:00.000Z', pageUrl: 'https://acme.example/quote', ip: '203.0.113.9', userAgent: 'jest', source: 'form' as const, ...over,
+});
