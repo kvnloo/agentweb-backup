@@ -17,7 +17,7 @@ jest.mock('../services/db', () => ({
     getLeadListsForUser: jest.fn(),
     updateLead: jest.fn(),
     claimLeadEmailDraft: jest.fn(async () => true),
-    restoreLeadEmailDraft: jest.fn(async () => true),
+    releaseLeadEmailDraftClaim: jest.fn(async () => undefined),
     batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
     updateLeadList: jest.fn(),

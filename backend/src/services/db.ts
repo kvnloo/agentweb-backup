@@ -11180,19 +11180,32 @@ export const crmDb = {
   },
 
   /**
-   * ENG-2984: atomically claims a lead's stored email draft for sending by removing it ONLY while
-   * it still equals `expectedDraft`. Of two concurrent senders reading the same draft exactly one
-   * wins; the loser gets false and must not send. Touches nothing but `emailDraft` (no updatedAt,
-   * so no GSI re-projection).
+   * ENG-2984: atomically claims a lead's stored email draft for sending. The draft itself is NOT
+   * removed (a crash/deploy mid-send must not lose it); instead a send-claim timestamp is set ONLY
+   * while the draft still equals `expectedDraft` and no fresh claim exists. Of two concurrent
+   * senders exactly one wins; the loser gets false and must not send. A claim older than
+   * `leaseMs` is treated as abandoned (crashed sender) so the user can retry. Touches only
+   * `emailDraftSendClaimedAt` (no updatedAt, so no GSI re-projection).
    */
-  async claimLeadEmailDraft(listId: string, leadId: string, expectedDraft: Record<string, unknown>): Promise<boolean> {
+  async claimLeadEmailDraft(
+    listId: string,
+    leadId: string,
+    expectedDraft: Record<string, unknown>,
+    leaseMs: number = 5 * 60 * 1000,
+  ): Promise<boolean> {
+    const now = Date.now();
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: { listId, leadId },
-        UpdateExpression: 'REMOVE emailDraft',
-        ConditionExpression: 'emailDraft = :expected',
-        ExpressionAttributeValues: { ':expected': expectedDraft },
+        UpdateExpression: 'SET emailDraftSendClaimedAt = :now',
+        ConditionExpression:
+          'emailDraft = :expected AND (attribute_not_exists(emailDraftSendClaimedAt) OR emailDraftSendClaimedAt < :staleBefore)',
+        ExpressionAttributeValues: {
+          ':expected': expectedDraft,
+          ':now': new Date(now).toISOString(),
+          ':staleBefore': new Date(now - leaseMs).toISOString(),
+        },
       }).promise();
       return true;
     } catch (err) {
@@ -11203,22 +11216,20 @@ export const crmDb = {
   },
 
   /**
-   * ENG-2984: puts a claimed draft back after a failed send, but only if no new draft was
-   * written meanwhile (and the lead still exists). Returns whether it was restored.
+   * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
+   * the draft). Idempotent; a missing lead is a no-op.
    */
-  async restoreLeadEmailDraft(listId: string, leadId: string, draft: Record<string, unknown>): Promise<boolean> {
+  async releaseLeadEmailDraftClaim(listId: string, leadId: string): Promise<void> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: { listId, leadId },
-        UpdateExpression: 'SET emailDraft = :draft',
-        ConditionExpression: 'attribute_exists(leadId) AND attribute_not_exists(emailDraft)',
-        ExpressionAttributeValues: { ':draft': draft },
+        UpdateExpression: 'REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'attribute_exists(leadId)',
       }).promise();
-      return true;
     } catch (err) {
-      if (isConditionalFailure(err)) return false;
-      handleDynamoDbError(err, 'restoreLeadEmailDraft');
+      if (isConditionalFailure(err)) return;
+      handleDynamoDbError(err, 'releaseLeadEmailDraftClaim');
       throw err;
     }
   },

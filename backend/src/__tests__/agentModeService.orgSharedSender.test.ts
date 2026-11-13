@@ -41,7 +41,7 @@ jest.mock('../services/db', () => ({
     })),
     updateLead: jest.fn(async () => undefined),
     claimLeadEmailDraft: jest.fn(async () => true),
-    restoreLeadEmailDraft: jest.fn(async () => true),
+    releaseLeadEmailDraftClaim: jest.fn(async () => undefined),
     addEngagement: jest.fn(async () => undefined),
   },
   userDb: {

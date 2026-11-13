@@ -1,7 +1,7 @@
 /**
  * ENG-2984: send_email_to_lead claims the stored draft atomically (conditional REMOVE on the
- * existing draft value) before the provider call, so two concurrent invocations for the same
- * lead produce at most one send; a failed send puts the draft back.
+ * existing draft value, draft kept until success) before the provider call, so two concurrent invocations for the same
+ * lead produce at most one send; a failed send releases the claim, and a crash leaves the draft for a retry after the lease.
  *
  * The DB mock models DynamoDB's conditional semantics on one in-memory row: claim succeeds only
  * while the stored draft still equals the expected value. Real sendAsSender runs; only the
@@ -50,7 +50,8 @@ const OWNER = 'user-1';
 const DRAFT = { subject: 'Hello', htmlContent: '<p>hi</p>', createdAt: '2026-11-01T00:00:00Z', updatedAt: '2026-11-01T00:00:00Z' };
 
 // One in-memory AW-Leads row.
-const row: { emailDraft: any } = { emailDraft: null };
+const row: { emailDraft: any; claimedAt: number | null } = { emailDraft: null, claimedAt: null };
+const LEASE_MS = 5 * 60 * 1000;
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -65,13 +66,12 @@ jest.mock('../services/db', () => ({
     }),
     claimLeadEmailDraft: jest.fn(async (_l: string, _id: string, expected: any) => {
       if (!row.emailDraft || JSON.stringify(row.emailDraft) !== JSON.stringify(expected)) return false;
-      row.emailDraft = null;
+      if (row.claimedAt !== null && row.claimedAt >= Date.now() - LEASE_MS) return false;
+      row.claimedAt = Date.now();
       return true;
     }),
-    restoreLeadEmailDraft: jest.fn(async (_l: string, _id: string, draft: any) => {
-      if (row.emailDraft) return false;
-      row.emailDraft = draft;
-      return true;
+    releaseLeadEmailDraftClaim: jest.fn(async () => {
+      row.claimedAt = null;
     }),
   },
 }));
@@ -84,6 +84,7 @@ const { crmDb } = require('../services/db');
 beforeEach(() => {
   jest.clearAllMocks();
   row.emailDraft = { ...DRAFT };
+  row.claimedAt = null;
   (settingsService.getSetting as jest.Mock).mockImplementation(async (name: string) => {
     if (name === `crm_sender_emails_${OWNER}`) {
       return {
@@ -117,7 +118,8 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
 
   it('claims the draft before the provider is called', async () => {
     mockResendSendEmail.mockImplementation(async () => {
-      expect(row.emailDraft).toBeNull();
+      expect(row.claimedAt).not.toBeNull();
+      expect(row.emailDraft).toEqual(DRAFT);
       return { id: 'email-1' };
     });
     const result = await send();
@@ -125,12 +127,34 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
     expect(crmDb.claimLeadEmailDraft).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({ subject: 'Hello' }));
   });
 
-  it('restores the draft when the provider send fails', async () => {
+  it('keeps the draft and releases the claim when the provider send fails', async () => {
     mockResendSendEmail.mockRejectedValue(new Error('Resend API error: boom'));
     const result = await send();
     expect(result.success).toBe(false);
-    expect(crmDb.restoreLeadEmailDraft).toHaveBeenCalledTimes(1);
+    expect(crmDb.releaseLeadEmailDraftClaim).toHaveBeenCalledTimes(1);
     expect(row.emailDraft).toEqual(DRAFT);
+    expect(row.claimedAt).toBeNull();
+  });
+
+  it('a crash mid-send never deletes the draft; a retry after the claim lease expires sends it', async () => {
+    // Simulate the process dying after the claim, before the provider returned: claim set, nothing released.
+    row.claimedAt = Date.now();
+    expect(row.emailDraft).toEqual(DRAFT);
+
+    // Immediate retry is refused (claim still fresh) — no duplicate send.
+    const early = await send();
+    expect(early.success).toBe(false);
+    expect(mockResendSendEmail).not.toHaveBeenCalled();
+    expect(row.emailDraft).toEqual(DRAFT);
+
+    // After the lease expires the draft is still there and a retry sends it once.
+    row.claimedAt = Date.now() - LEASE_MS - 1;
+    mockResendSendEmail.mockResolvedValue({ id: 'email-2' });
+    const retry = await send();
+    expect(retry.success).toBe(true);
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
+    expect(row.emailDraft).toBeNull();
+    expect(row.claimedAt).toBeNull();
   });
 
   it('a single non-concurrent send behaves as before: one send, success, draft cleared', async () => {
@@ -139,7 +163,7 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
     expect(result).toEqual(expect.objectContaining({ success: true, emailId: 'email-1', to: 'lead@contractor.com', subject: 'Hello' }));
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
     expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', { emailDraft: null });
-    expect(crmDb.restoreLeadEmailDraft).not.toHaveBeenCalled();
     expect(row.emailDraft).toBeNull();
+    expect(row.claimedAt).toBeNull();
   });
 });
