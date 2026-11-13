@@ -66,3 +66,41 @@ describe('updateLeadStatus draft saving (ENG-2361)', () => {
     expect(db.updateLead.mock.calls[0][2]).toEqual({ status: 'contacted' });
   });
 });
+
+describe('updateLeadStatus review-status draft guard (ENG-2966)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    db.getLeadListById.mockResolvedValue({ listId: 'L', userId: 'u' } as any);
+    db.updateLead.mockResolvedValue(undefined as any);
+    db.addLeadEngagement.mockResolvedValue(undefined as any);
+  });
+
+  it('refuses pending_review when the lead has no persisted draft and none is passed — writes nothing', async () => {
+    db.getLeadById.mockResolvedValue({ leadId: 'D', listId: 'L', status: 'qualified' } as any);
+    const r = await updateLeadStatus('L', 'D', 'pending_review', 'u');
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/draft/i);
+    expect(db.updateLead).not.toHaveBeenCalled();
+    expect(db.addLeadEngagement).not.toHaveBeenCalled();
+  });
+
+  it('refuses pending_review when only a whitespace draft is passed and nothing is stored', async () => {
+    db.getLeadById.mockResolvedValue({ leadId: 'D', listId: 'L', status: 'qualified', messageDraft: { content: '  ' } } as any);
+    const r = await updateLeadStatus('L', 'D', 'pending_review', 'u', undefined, undefined, undefined, { messageDraft: '   ' });
+    expect(r.success).toBe(false);
+    expect(db.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('allows pending_review when a draft is already persisted on the lead', async () => {
+    db.getLeadById.mockResolvedValue({ leadId: 'D', listId: 'L', status: 'qualified', emailDraft: { subject: 'S', textContent: 'B' } } as any);
+    const r = await updateLeadStatus('L', 'D', 'pending_review', 'u');
+    expect(r.success).toBe(true);
+    expect(db.updateLead.mock.calls[0][2]).toEqual({ status: 'pending_review' });
+  });
+
+  it('non-review statuses are unaffected by a missing draft', async () => {
+    db.getLeadById.mockResolvedValue({ leadId: 'D', listId: 'L', status: 'pending_review' } as any);
+    const r = await updateLeadStatus('L', 'D', 'contacted', 'u');
+    expect(r.success).toBe(true);
+  });
+});

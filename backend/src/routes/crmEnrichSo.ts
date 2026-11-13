@@ -23,7 +23,12 @@ import {
 } from '../services/crmAccessControl';
 import { getEnrichSoService } from '../services/enrichSoService';
 import { QuotaExceededError, LookupByEmailQuotaExceededError, type QuotaTracker } from '../services/enrichSoQuota';
-import { validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+import {
+  validateLeadsInBackground,
+  isEnrichSoCreditsRecentlyExhausted,
+  ENRICHSO_CREDITS_EXHAUSTED,
+  ENRICHSO_CREDITS_EXHAUSTED_USER_MESSAGE,
+} from '../services/enrichSoLeadValidation';
 import {
   startEmailJob,
   recordResult,
@@ -665,6 +670,11 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
     // UI can show a live counter + final breakdown via /email-jobs/:jobId.
     if (validatable.length === 0) {
       return res.status(200).json({ queued: 0, skipped, alreadyDone });
+    }
+    // ENG-2983: a recent 402 means every call will fail — tell the caller
+    // instead of queueing a job that reports success with no results.
+    if (isEnrichSoCreditsRecentlyExhausted()) {
+      return res.status(402).json({ code: ENRICHSO_CREDITS_EXHAUSTED, message: ENRICHSO_CREDITS_EXHAUSTED_USER_MESSAGE });
     }
     const job = startEmailJob({ kind: 'validate', listId, userId, total: validatable.length });
     validateLeadsInBackground(listId, validatable, userId, job.jobId, { autoDncOnFailure }).catch((err) => {

@@ -45,6 +45,7 @@ import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
 import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
+import { zomaWriteKindFor } from '../services/zomaWriteKind';
 
 /**
  * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
@@ -316,7 +317,7 @@ export async function handleMetaToolkitCall(
   // own event kind. Previews, mismatched confirms and refused/failed writes are not.
   // A metering failure must not make an executed write look failed (that invites a retry
   // and a duplicate), so it is logged and surfaced on the result instead of thrown.
-  const recordExecutedWrite = async (entityType: string, action: string, result: any) => {
+  const recordExecutedWrite = async (entityType: string, action: string, result: any, params?: unknown) => {
     if (typeof result?.verification !== 'string') return;
     await (deps.recordWrite ?? recordMcpWriteExecuted)({
       product: TOOLKIT_PRODUCT,
@@ -332,6 +333,7 @@ export async function handleMetaToolkitCall(
       action,
       verification: result.verification,
       objectId: result.id ?? result.creative_id ?? result.image_hash ?? result.video_id ?? undefined,
+      writeKind: zomaWriteKindFor(action, params),
     }).then(() => {
       journeyAfterCall(caller.userId, 'first_write', { platform: 'meta', toolName: request.toolName });
     }).catch((error) => {
@@ -516,7 +518,7 @@ export async function handleMetaToolkitCall(
   if (guardedWrite) {
     const entityType = audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type);
     const executedWrites: any[] = Array.isArray((result as any)?.results) ? (result as any).results : [result];
-    for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write);
+    for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write, args.params);
   }
 
   await meter('meta');

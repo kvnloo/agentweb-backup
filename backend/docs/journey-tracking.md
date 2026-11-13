@@ -107,10 +107,12 @@ setup Checkout, or payment readiness at token issue) · `first_read` (first succ
 read) · `first_write` (first executed toolkit write, `recordMcpWriteExecuted`). `first_*` are
 each emitted once, when their milestone field is first set.
 
-- `ad_live` — **stub only.** Hook point: when a delivering ad is first observed (e.g. the Zoma
-  insights read returns `effective_status=ACTIVE` with impressions > 0), call
-  `zomaMilestone(userId, 'ad_live', { emit: 'if_advanced' })` after adding `ad_live` to
-  `STAGE_FOR_EVENT` in `services/journeyMilestones.ts`. Nothing emits it today.
+- `ad_live` — first provider-verified delivering Zoma ad (ENG-2902). Emitted once, only by
+  `verifyZomaFirstAds` (`services/zomaScoreboard.ts`, admin `POST
+  /api/admin/zoma/scoreboard/verify-first-ads`): a Zoma-created campaign (CONFIRMED CAMPAIGN CREATE)
+  whose go-live was approved through Zoma (CONFIRMED UPDATE status=ACTIVE, `writeKind: approve`)
+  reads back `effective_status=ACTIVE` with lifetime impressions >= 1. It writes the write-once
+  `zomaFirstAdLive` map on AW-Users and moves `zomaStage` to `ad_live`.
 - `abandoned` — not emitted.
 
 Distinct id = AgentWeb `userId`; before signup, `zoma_setup_<hash>` (a hash of the device id),
