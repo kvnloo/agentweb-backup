@@ -2367,17 +2367,65 @@ export class GoogleAdsService {
    */
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
+    /** ENG-2979: responsive search ad content edits (AdService on customers/{cid}/ads/{adId}). */
+    headlines?: string[];
+    descriptions?: string[];
+    finalUrl?: string;
   }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
-    const updateMask: string[] = [];
-    const update: any = { resourceName: adGroupAdResourceName };
-    if (params.status) { update.status = params.status; updateMask.push('status'); }
-    if (updateMask.length === 0) return false;
-    await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
-    const expected: Record<string, { gaql: string; value: unknown }> = {};
-    if (params.status) expected.status = { gaql: 'status', value: params.status };
-    await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName, expected, loginCustomerId);
+    const hasContent = params.headlines !== undefined || params.descriptions !== undefined || params.finalUrl !== undefined;
+    if (!params.status && !hasContent) return false;
+    if (hasContent) await this.updateResponsiveSearchAdContent(customerId, accessToken, adGroupAdResourceName, params, loginCustomerId);
+    if (params.status) {
+      const update: any = { resourceName: adGroupAdResourceName, status: params.status };
+      await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: 'status' }], loginCustomerId);
+      await this.verifyFieldsReadBack(customerId, accessToken, 'ad_group_ad', adGroupAdResourceName,
+        { status: { gaql: 'status', value: params.status } }, loginCustomerId);
+    }
     return true;
+  }
+
+  /**
+   * ENG-2979: edit an existing RESPONSIVE_SEARCH_AD's headlines / descriptions / final URL in
+   * place. The Ad lives at customers/{cid}/ads/{adId} (the adGroupAd id is `<adGroupId>~<adId>`);
+   * the update_mask names only the changed fields, then every changed field is read back.
+   */
+  private async updateResponsiveSearchAdContent(
+    customerId: string,
+    accessToken: string,
+    adGroupAdResourceName: string,
+    params: { headlines?: string[]; descriptions?: string[]; finalUrl?: string },
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const match = /^customers\/(\d+)\/adGroupAds\/\d+~(\d+)$/.exec(adGroupAdResourceName);
+    if (!match || match[1] !== String(customerId)) throw new GoogleAdsReadBackError(adGroupAdResourceName, ['<invalid resource name>']);
+    const adResourceName = `customers/${match[1]}/ads/${match[2]}`;
+    const update: any = { resourceName: adResourceName };
+    const mask: string[] = [];
+    if (params.headlines !== undefined || params.descriptions !== undefined) update.responsiveSearchAd = {};
+    if (params.headlines !== undefined) {
+      update.responsiveSearchAd.headlines = params.headlines.map((text) => ({ text }));
+      mask.push('responsive_search_ad.headlines');
+    }
+    if (params.descriptions !== undefined) {
+      update.responsiveSearchAd.descriptions = params.descriptions.map((text) => ({ text }));
+      mask.push('responsive_search_ad.descriptions');
+    }
+    if (params.finalUrl !== undefined) { update.finalUrls = [params.finalUrl]; mask.push('final_urls'); }
+    await this.mutate(customerId, accessToken, 'ads', [{ update, updateMask: mask.join(',') }], loginCustomerId);
+
+    const rows = await this.search(customerId, accessToken,
+      'SELECT ad_group_ad.resource_name, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, '
+      + `ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
+      loginCustomerId);
+    const ad = rows[0]?.adGroupAd?.ad;
+    if (!ad) throw new GoogleAdsReadBackError(adGroupAdResourceName, ['<ad_group_ad not found on read-back>']);
+    const same = (a: unknown[] | undefined, b: string[]) => JSON.stringify(a ?? []) === JSON.stringify(b);
+    const unchanged: string[] = [];
+    if (params.headlines !== undefined && !same(ad.responsiveSearchAd?.headlines?.map((h: any) => h.text), params.headlines)) unchanged.push('responsive_search_ad.headlines');
+    if (params.descriptions !== undefined && !same(ad.responsiveSearchAd?.descriptions?.map((d: any) => d.text), params.descriptions)) unchanged.push('responsive_search_ad.descriptions');
+    if (params.finalUrl !== undefined && !same(ad.finalUrls, [params.finalUrl])) unchanged.push('final_urls');
+    if (unchanged.length) throw new GoogleAdsReadBackError(adGroupAdResourceName, unchanged);
   }
 
   /**
