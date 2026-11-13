@@ -118,6 +118,11 @@ describe('ENG-2881 registration admission boundary', () => {
     expect(r.status).toBe(201);
     expect(mockAdmitZoma).toHaveBeenCalledWith('ghost@unresolvable.test');
   });
+  it('does not reclassify an invalid Zoma intent as an Emma signup', async () => {
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupIntent: 'expired-or-tampered' });
+    expect(r.status).toBe(400);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
   it('approved registration creates an account with access', async () => {
     mockAdmitZoma.mockResolvedValue('approved');
     const r = await registerRequest();

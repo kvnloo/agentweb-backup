@@ -4,6 +4,8 @@
  *   challenge (the portal consent form does not round-trip extra params) -> auth code ->
  *   token -> usage events + journey. Unknown is allowed and NEVER rejects authorization.
  */
+const mockZomaAuthorizationAdmission = jest.fn().mockResolvedValue('approved');
+jest.mock('../services/zomaAuthorizationAdmission', () => ({ admitZomaAuthorizationSignup: (...a: unknown[]) => mockZomaAuthorizationAdmission(...a) }));
 const mockSvc = {
   getClient: jest.fn(),
   createAuthorizationCode: jest.fn(),
@@ -71,6 +73,7 @@ const flush = () => new Promise((r) => setImmediate(r));
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockZomaAuthorizationAdmission.mockResolvedValue('approved');
   process.env.BACKEND_URL = BASE;
   mockSvc.getClient.mockResolvedValue({ clientId: 'c1', clientName: 'Claude Code', redirectUris: ['http://localhost:9/cb'], tokenEndpointAuthMethod: 'none' });
   mockSvc.savePendingAuthorization.mockResolvedValue(undefined);
@@ -135,11 +138,21 @@ describe('POST /oauth/authorize/decision product propagation', () => {
       .type('form')
       .send({ client_id: 'c1', redirect_uri: 'http://localhost:9/cb', code_challenge: 'ch', code_challenge_method: 'S256', approved: 'true' });
 
+  it('blocks a new Zoma account at consent but never consults capacity for Emma', async () => {
+    mockZomaAuthorizationAdmission.mockResolvedValue('waitlisted');
+    mockSvc.takePendingAuthorization.mockResolvedValue({ product: 'zoma', confidence: 'explicit' });
+    expect((await decide()).status).toBe(202);
+    expect(mockSvc.createAuthorizationCode).not.toHaveBeenCalled();
+    mockZomaAuthorizationAdmission.mockClear();
+    mockSvc.takePendingAuthorization.mockResolvedValue({ product: 'emma_mcp', confidence: 'explicit' });
+    expect((await decide()).status).toBe(302);
+    expect(mockZomaAuthorizationAdmission).not.toHaveBeenCalled();
+  });
   it('puts the pending product + ref on the auth code and attributes a consent-page OAuth signup', async () => {
     mockSvc.takePendingAuthorization.mockResolvedValue({ product: 'zoma', confidence: 'explicit', ref: 'hn_launch' });
     const res = await decide();
     expect(res.status).toBe(302);
-    expect(mockSvc.takePendingAuthorization).toHaveBeenCalledWith('c1', 'ch');
+    expect(mockSvc.takePendingAuthorization).toHaveBeenCalledWith('c1', 'ch', true);
     expect(mockSvc.createAuthorizationCode.mock.calls[0][0]).toMatchObject({ product: 'zoma', attributionConfidence: 'explicit', ref: 'hn_launch' });
     await flush();
     expect(mockAuthorized.mock.calls[0][0]).toMatchObject({ product: 'zoma' });

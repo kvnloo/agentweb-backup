@@ -167,6 +167,9 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    if (zomaAdmissionEnabled() && req.body.signupIntent !== undefined && !isZomaSignup(req.body)) {
+      return res.status(400).json({ code: 'invalid_signup_intent', message: 'Please try again later.' });
+    }
     if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
       try {
         if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
