@@ -70,7 +70,9 @@ export function parseHardBounces(raw: string, senderEmail: string): HardBounce[]
   };
 
   const blocks = raw.split(/^(?=Final-Recipient:)/im).slice(1);
-  for (const block of blocks) {
+  for (const rawBlock of blocks) {
+    // RFC 3464 §2.1.1: fields may fold onto continuation lines.
+    const block = rawBlock.replace(/\r?\n[ \t]+/g, ' ');
     const recipientLine = block.match(/^Final-Recipient:[ \t]*(?:rfc822;)?[ \t]*<?([^\s>]+)>?/im);
     const action = (block.match(/^Action:[ \t]*(\S+)/im)?.[1] || '').toLowerCase();
     const status = block.match(/^Status:[ \t]*(\d\.\d{1,3}\.\d{1,3})/im)?.[1] || '';
@@ -87,6 +89,37 @@ export function parseHardBounces(raw: string, senderEmail: string): HardBounce[]
     if (m) add(m[0], '5.0.0');
   }
   return [...found.values()];
+}
+
+/**
+ * Pure — Message-ID of the original outbound message embedded in a DSN
+ * (text/rfc822-headers or message/rfc822 part), i.e. a Message-ID header that
+ * is not the DSN's own top-level one.
+ */
+export function originalMessageId(raw: string): string | null {
+  if (!raw) return null;
+  const parts = raw.split(/\r?\n\r?\n/);
+  const body = parts.slice(1).join('\n\n').replace(/\r?\n[ \t]+/g, ' ');
+  const m = body.match(/^Message-ID:[ \t]*(<[^>\s]+>)/im);
+  return m ? m[1] : null;
+}
+
+/**
+ * Forged-DSN guard (RFC 3464 §6.2): a mailer-daemon/postmaster From header is
+ * not proof of a failed delivery. Only suppress when the DSN correlates to an
+ * outbound message actually in this mailbox's Sent folder: by the embedded
+ * original Message-ID when present, otherwise by a sent message to the
+ * recipient.
+ */
+async function hasOutboundCorrelation(
+  userId: string,
+  accountId: string,
+  raw: string,
+  recipient: string,
+): Promise<boolean> {
+  const msgId = originalMessageId(raw);
+  const query = msgId ? `in:sent rfc822msgid:${msgId} to:${recipient}` : `in:sent to:${recipient}`;
+  return gmailService.hasMessages(userId, accountId, query);
 }
 
 async function flagLeadIfMatched(userId: string, candidateEmail: string, status: string): Promise<number> {
@@ -198,13 +231,19 @@ export async function runGmailBounceMonitor(): Promise<GmailBounceMonitorSummary
           MAX_MESSAGES_PER_RUN,
         );
         let newCursor = storedCursor;
-        for (const message of messages) {
+        // Process oldest first so the watermark only ever covers handled mail.
+        const ordered = [...messages].sort((a, b) => (a.receivedAt || '').localeCompare(b.receivedAt || ''));
+        for (const message of ordered) {
           const receivedAt = message.receivedAt || new Date().toISOString();
           if (receivedAt <= storedCursor) continue; // after: is second-granular
           summary.messagesScanned++;
           if (receivedAt > newCursor) newCursor = receivedAt;
 
           for (const bounce of parseHardBounces(message.raw, senderEmail)) {
+            if (!(await hasOutboundCorrelation(user.userId, account.account_id, message.raw, bounce.recipient))) {
+              console.warn(`${TAG} Ignoring uncorrelated DSN ${message.id} (no matching sent message)`);
+              continue;
+            }
             summary.hardBouncesFound++;
             summary.leadsFlagged += await flagLeadIfMatched(user.userId, bounce.recipient, bounce.status);
             if (emailDomain && (await recordBounceEvent(emailDomain, senderEmail, message.id, receivedAt, bounce))) {

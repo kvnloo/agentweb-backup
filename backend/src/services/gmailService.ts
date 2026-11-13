@@ -288,13 +288,23 @@ export class GmailService implements IEmailService {
     maxResults = 100,
   ): Promise<Array<{ id: string; receivedAt?: string; raw: string }>> {
     const gmail = await this.getGmailClient(userId, accountId);
-    const listData = await this.withQuotaRetry(() =>
-      gmail.users.messages.list({ userId: 'me', q: query, maxResults })
-    );
+    // Gmail lists newest first; follow every page so the caller never advances
+    // a watermark past unread older messages. Hard cap guards runaway queries:
+    // exceeding it throws, so the caller keeps its old cursor.
+    const MAX_PAGES = 50;
+    const ids: string[] = [];
+    let pageToken: string | undefined;
+    for (let page = 0; ; page++) {
+      if (page >= MAX_PAGES) throw new Error(`listRawMessages: more than ${MAX_PAGES} pages for query`);
+      const listData = await this.withQuotaRetry(() =>
+        gmail.users.messages.list({ userId: 'me', q: query, maxResults, pageToken })
+      );
+      for (const m of listData.data.messages || []) if (m.id) ids.push(m.id);
+      pageToken = listData.data.nextPageToken || undefined;
+      if (!pageToken) break;
+    }
     const out: Array<{ id: string; receivedAt?: string; raw: string }> = [];
-    for (const m of listData.data.messages || []) {
-      if (!m.id) continue;
-      const id = m.id;
+    for (const id of ids) {
       const detail = await this.withQuotaRetry(() =>
         gmail.users.messages.get({ userId: 'me', id, format: 'raw' })
       );
@@ -305,6 +315,15 @@ export class GmailService implements IEmailService {
       });
     }
     return out;
+  }
+
+  /** ENG-2981: true when at least one message matches the Gmail query. */
+  async hasMessages(userId: string, accountId: string, query: string): Promise<boolean> {
+    const gmail = await this.getGmailClient(userId, accountId);
+    const listData = await this.withQuotaRetry(() =>
+      gmail.users.messages.list({ userId: 'me', q: query, maxResults: 1 })
+    );
+    return (listData.data.messages || []).length > 0;
   }
 
   /**

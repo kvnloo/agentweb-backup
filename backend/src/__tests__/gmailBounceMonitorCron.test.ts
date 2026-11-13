@@ -8,10 +8,10 @@ jest.mock('../services/db', () => ({
   crmDb: { getLeadListsByUserId: jest.fn(), getLeadByEmail: jest.fn(), updateLead: jest.fn() },
 }));
 jest.mock('../services/connectedAccountsDb', () => ({ updateAccountConfig: jest.fn() }));
-jest.mock('../services/gmailService', () => ({ gmailService: { listRawMessages: jest.fn() } }));
+jest.mock('../services/gmailService', () => ({ gmailService: { listRawMessages: jest.fn(), hasMessages: jest.fn() } }));
 jest.mock('../services/emailEventsDb', () => ({ emailEventsDb: { addEmailEvent: jest.fn() } }));
 
-import { runGmailBounceMonitor, parseHardBounces } from '../cron/gmailBounceMonitorCron';
+import { runGmailBounceMonitor, parseHardBounces, originalMessageId } from '../cron/gmailBounceMonitorCron';
 import { userDb, crmDb } from '../services/db';
 import { updateAccountConfig } from '../services/connectedAccountsDb';
 import { gmailService } from '../services/gmailService';
@@ -59,10 +59,28 @@ describe('parseHardBounces', () => {
     expect(parseHardBounces(raw, SENDER)).toEqual([{ recipient: 'c@example.com', status: '5.0.0' }]);
     expect(parseHardBounces(raw.replace('550 user unknown', 'Status: 4.4.1 retrying'), SENDER)).toEqual([]);
   });
+  it('unfolds RFC 3464 continuation lines in recipient blocks', () => {
+    const raw = hardDsn('x@example.com').replace(
+      /Final-Recipient: rfc822; x@example.com\r\nAction: failed\r\nStatus: 5.1.1/,
+      'Final-Recipient: rfc822;\r\n folded@example.com\r\nAction:\r\n\tfailed\r\nStatus:\r\n 5.1.1',
+    );
+    expect(parseHardBounces(raw, SENDER)).toEqual([{ recipient: 'folded@example.com', status: '5.1.1' }]);
+  });
+});
+
+describe('originalMessageId', () => {
+  it('returns the embedded original Message-ID, not the DSN own one', () => {
+    const raw = 'From: mailer-daemon@googlemail.com\r\nMessage-ID: <dsn@google>\r\n\r\n--b\r\nContent-Type: text/rfc822-headers\r\n\r\nMessage-ID:\r\n <orig@nuerraa.com>\r\n';
+    expect(originalMessageId(raw)).toBe('<orig@nuerraa.com>');
+    expect(originalMessageId(hardDsn('a@example.com'))).toBeNull();
+  });
 });
 
 describe('runGmailBounceMonitor', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (gmailService.hasMessages as jest.Mock).mockResolvedValue(true);
+  });
   const user = (cursor?: string) => ({
     userId: 'u1',
     emailDomain: 'nuerraa.com',
@@ -110,6 +128,17 @@ describe('runGmailBounceMonitor', () => {
     const s = await runGmailBounceMonitor();
     expect(crmDb.updateLead).not.toHaveBeenCalled();
     expect(s).toMatchObject({ leadsFlagged: 0, eventsRecorded: 0, failed: 0 });
+  });
+
+  it('ignores a forged DSN with no correlated sent message (RFC 3464 §6.2)', async () => {
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([user('2026-11-01T00:00:00.000Z')]);
+    (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw: hardDsn('victim@example.com') }]);
+    (gmailService.hasMessages as jest.Mock).mockResolvedValue(false);
+    const s = await runGmailBounceMonitor();
+    expect(gmailService.hasMessages).toHaveBeenCalledWith('u1', SENDER, 'in:sent to:victim@example.com');
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+    expect(emailEventsDb.addEmailEvent).not.toHaveBeenCalled();
+    expect(s).toMatchObject({ hardBouncesFound: 0, leadsFlagged: 0 });
   });
 
   it('isolates a failing account', async () => {
