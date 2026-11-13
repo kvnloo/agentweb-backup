@@ -69,6 +69,7 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_experiment_list_tests',
   'ads_experiment_abtest_get_test',
   'ads_experiment_lift_get_test',
+  'ads_experiment_check_eligibility',
   'ads_account_get_activity_logs',
   'meta_account_health',
   'meta_learning_phase',

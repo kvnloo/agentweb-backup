@@ -137,11 +137,11 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
 
   // ENG-2919
   same(EXP, 'ENG-2919', 'ads_experiment_list_tests'),
-  gap(EXP, 'ENG-2919', 'ads_experiment_check_eligibility'),
-  gap(EXP, 'ENG-2919', 'ads_experiment_abtest_create_test'),
+  same(EXP, 'ENG-2980', 'ads_experiment_check_eligibility'),
+  same(EXP, 'ENG-2980', 'ads_experiment_abtest_create_test'),
   same(EXP, 'ENG-2919', 'ads_experiment_abtest_get_test'),
-  gap(EXP, 'ENG-2919', 'ads_experiment_abtest_update_test'),
-  gap(EXP, 'ENG-2919', 'ads_experiment_lift_create_test'),
+  same(EXP, 'ENG-2980', 'ads_experiment_abtest_update_test'),
+  same(EXP, 'ENG-2980', 'ads_experiment_lift_create_test'),
   same(EXP, 'ENG-2919', 'ads_experiment_lift_get_test'),
 
   // ENG-2920
