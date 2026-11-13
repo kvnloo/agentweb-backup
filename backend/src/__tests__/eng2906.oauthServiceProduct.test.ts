@@ -92,6 +92,13 @@ describe('ENG-2906 oauthService product persistence', () => {
     expect(mockDelete).toHaveBeenCalledWith(expect.objectContaining({ Key: { code: item.code } }));
   });
 
+  it('can preserve a Zoma pending request for retries after admission refusal', async () => {
+    const svc = new McpOAuthService();
+    await svc.savePendingAuthorization('c1', 'ch', { product: 'zoma', confidence: 'explicit' });
+    mockGet.mockResolvedValue({ Item: mockPut.mock.calls[0][0].Item });
+    await expect(svc.takePendingAuthorization('c1', 'ch', true)).resolves.toMatchObject({ product: 'zoma' });
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
   it('ignores an expired or malformed pending row', async () => {
     const svc = new McpOAuthService();
     mockGet.mockResolvedValue({ Item: { code: 'pending#x', kind: 'pending_authorization', product: 'nonsense', expiresAt: 1 } });

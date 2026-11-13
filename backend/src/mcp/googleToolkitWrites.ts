@@ -6,7 +6,7 @@
  * logo) / UPDATE status or name, AD_GROUP CREATE / UPDATE status or name+cpc_bid (ENG-2959),
  * CAMPAIGN_CONVERSION_GOAL UPDATE.
  * ENG-2928: KEYWORD ADD / UPDATE status / REMOVE / ADD_NEGATIVE (ad group or campaign level),
- * AD CREATE (RESPONSIVE_SEARCH_AD) / UPDATE status, ASSET_GROUP CREATE / UPDATE status, and
+ * AD CREATE (RESPONSIVE_SEARCH_AD) / UPDATE status or RSA content (ENG-2979), ASSET_GROUP CREATE / UPDATE status, and
  * ASSET UPLOAD (image/logo from https or a staged file, text, YouTube video).
  * Everything else stays refused by googleToolkitManifest.assertGoogleToolkitCall.
  *
@@ -51,7 +51,7 @@ export interface GoogleBudgetState { resourceName: string; name?: string; amount
 export interface GoogleCampaignState { resourceName: string; name?: string; status: string; budget?: string; channelType?: string }
 export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string; cpcBidMicros?: number }
 export interface GoogleKeywordState { resourceName: string; text: string; matchType: string; status?: string; negative: boolean; adGroup?: string }
-export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[] }
+export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[]; headlines?: string[]; descriptions?: string[] }
 export interface GoogleAssetState { resourceName: string; name?: string; type: string; text?: string }
 export interface GoogleAssetGroupState { resourceName: string; name?: string; status: string; campaign?: string; finalUrls?: string[] }
 export interface GoogleCampaignBrand { businessName?: string; logoAssets: string[] }
@@ -99,7 +99,7 @@ const GAQL: Record<GoogleReadKind, string> = {
   campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget, campaign.advertising_channel_type FROM campaign WHERE campaign.resource_name = ',
   ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign, ad_group.cpc_bid_micros FROM ad_group WHERE ad_group.resource_name = ',
   keyword: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.resource_name = `,
-  ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
+  ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
   asset: 'SELECT asset.resource_name, asset.name, asset.type, asset.text_asset.text FROM asset WHERE asset.resource_name = ',
   asset_group: 'SELECT asset_group.resource_name, asset_group.name, asset_group.status, asset_group.campaign, asset_group.final_urls FROM asset_group WHERE asset_group.resource_name = ',
   ad_group_keywords: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED' AND ad_group_criterion.ad_group = `,
@@ -146,7 +146,8 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   }
   if (kind === 'ad') {
     const a = row.adGroupAd;
-    return a?.resourceName ? ({ resourceName: a.resourceName, status: a.status, type: a.ad?.type, adGroup: a.adGroup, finalUrls: a.ad?.finalUrls } as GoogleAdState) : null;
+    return a?.resourceName ? ({ resourceName: a.resourceName, status: a.status, type: a.ad?.type, adGroup: a.adGroup, finalUrls: a.ad?.finalUrls,
+      headlines: a.ad?.responsiveSearchAd?.headlines?.map((h: any) => h.text), descriptions: a.ad?.responsiveSearchAd?.descriptions?.map((d: any) => d.text) } as GoogleAdState) : null;
   }
   if (kind === 'asset') {
     const a = row.asset;
@@ -241,6 +242,8 @@ interface ValidatedWrite {
   expectedStatus?: 'ENABLED' | 'PAUSED';
   /** ENG-2959: CAMPAIGN / AD_GROUP non-status UPDATE — the values the read-back must show. */
   expectedEdit?: { name?: string; cpcBidMicros?: number };
+  /** ENG-2979: AD UPDATE responsive search ad content — the values the read-back must show. */
+  expectedAdContent?: { headlines?: string[]; descriptions?: string[]; finalUrl?: string };
   /** KEYWORD ADD / ADD_NEGATIVE: what the read-back of the parent's keyword list must contain. */
   keywords?: ToolkitKeyword[];
   /** Keyword list read before (duplicates) and after (read-back) the write. */
@@ -278,7 +281,7 @@ const ALLOWED: Record<string, string[]> = {
   'KEYWORD REMOVE': ['criterion_resource_name'],
   'KEYWORD ADD_NEGATIVE': ['keywords', 'ad_group_resource_name', 'campaign_resource_name'],
   'AD CREATE': ['ad_group_resource_name', 'type', 'headlines', 'descriptions', 'final_url', 'status'],
-  'AD UPDATE': ['ad_resource_name', 'status'],
+  'AD UPDATE': ['ad_resource_name', 'status', 'headlines', 'descriptions', 'final_url'],
   'ASSET UPLOAD': ['asset_type', 'name', 'data'],
   'ASSET_GROUP CREATE': ['name', 'campaign_resource_name', 'final_url', 'headlines', 'long_headlines', 'descriptions', 'square_image_assets', 'landscape_image_assets', 'logo_assets', 'video_assets', 'status'],
   'ASSET_GROUP UPDATE': ['asset_group_resource_name', 'status'],
@@ -512,8 +515,22 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
         expectedStatus: 'PAUSED',
       };
     }
-    case 'AD UPDATE':
-      return statusOnly('ad', 'ad_resource_name');
+    case 'AD UPDATE': {
+      // ENG-2979: status | responsive search ad content (headlines / descriptions / final_url).
+      const present = ['headlines', 'descriptions', 'final_url'].filter((k) => args[k] !== undefined);
+      if (args.status !== undefined) {
+        need(!present.length, `status must be sent alone. Change ${present.join(' / ')} in a separate AD UPDATE preview and approval.`);
+        return statusOnly('ad', 'ad_resource_name');
+      }
+      need(present.length > 0, 'AD UPDATE requires status, or headlines / descriptions / final_url (responsive search ads only).');
+      const rn = resource('ad', 'ad_resource_name');
+      const dispatchArgs: Record<string, unknown> = { ...base, ad_resource_name: rn };
+      const expectedAdContent: NonNullable<ValidatedWrite['expectedAdContent']> = {};
+      if (args.headlines !== undefined) dispatchArgs.headlines = expectedAdContent.headlines = texts('headlines', GOOGLE_TEXT_LIMITS.rsaHeadlines);
+      if (args.descriptions !== undefined) dispatchArgs.descriptions = expectedAdContent.descriptions = texts('descriptions', GOOGLE_TEXT_LIMITS.rsaDescriptions);
+      if (args.final_url !== undefined) dispatchArgs.final_url = expectedAdContent.finalUrl = httpsUrl('final_url');
+      return { dispatchArgs, target: { kind: 'ad', resourceName: rn }, expectedAdContent };
+    }
     case 'ASSET UPLOAD': {
       need(['IMAGE', 'LOGO', 'TEXT', 'VIDEO'].includes(args.asset_type), 'asset_type must be IMAGE, LOGO, TEXT or VIDEO.');
       need(nonBlank(args.data), 'data is required: an https image URL or zoma_prepare_upload file_url (IMAGE/LOGO), the text (TEXT), or a YouTube video id (VIDEO).');
@@ -601,6 +618,18 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
     if (readBack.amountMicros !== validated.budgetMicros) return 'MISMATCH';
     const shared = validated.dispatchArgs.explicitly_shared;
     if (shared !== undefined && readBack.explicitlyShared !== shared) return 'MISMATCH';
+    return 'CONFIRMED';
+  }
+  if (validated.expectedAdContent) {
+    const e = validated.expectedAdContent;
+    const same = (a: unknown, b: string[]) => Array.isArray(a) && JSON.stringify(a) === JSON.stringify(b);
+    if (readBack.type !== 'RESPONSIVE_SEARCH_AD') return 'MISMATCH';
+    if (e.headlines && !Array.isArray(readBack.headlines)) return 'UNCONFIRMED';
+    if (e.descriptions && !Array.isArray(readBack.descriptions)) return 'UNCONFIRMED';
+    if (e.finalUrl !== undefined && !Array.isArray(readBack.finalUrls)) return 'UNCONFIRMED';
+    if (e.headlines && !same(readBack.headlines, e.headlines)) return 'MISMATCH';
+    if (e.descriptions && !same(readBack.descriptions, e.descriptions)) return 'MISMATCH';
+    if (e.finalUrl !== undefined && !same(readBack.finalUrls, [e.finalUrl])) return 'MISMATCH';
     return 'CONFIRMED';
   }
   if (validated.expectedEdit) {
@@ -798,7 +827,7 @@ export async function executeGoogleToolkitWrite(
     lines.push(`Create a responsive search ad in ad group "${adGroup.name ?? adGroup.resourceName}" (ad group is ${adGroup.status}) → ${d.final_url}`);
     lines.push(`Headlines (${(d.headlines as string[]).length}): ${(d.headlines as string[]).map((h) => `"${h}"`).join(' | ')}`);
     lines.push(`Descriptions (${(d.descriptions as string[]).length}): ${(d.descriptions as string[]).map((h) => `"${h}"`).join(' | ')}`);
-    lines.push('Headlines, descriptions and the final URL cannot be edited after creation (to change them, create a new ad).');
+    lines.push('Headlines, descriptions and the final URL can be changed later with AD UPDATE (its own preview and approval).');
   } else if (op === 'ASSET_GROUP CREATE') {
     const campaign = await readParent<GoogleCampaignState>('Campaign');
     if (campaign.channelType !== 'PERFORMANCE_MAX') {
@@ -828,7 +857,19 @@ export async function executeGoogleToolkitWrite(
       throw new MetaToolkitRefusal('Negative keywords have no status to change. Use KEYWORD REMOVE to stop excluding it. Nothing was sent.');
     }
     state = { prior };
-    if (validated.expectedEdit) {
+    if (validated.expectedAdContent) {
+      // ENG-2979: only responsive search ads are editable; current vs new, status untouched.
+      if (prior.type !== 'RESPONSIVE_SEARCH_AD') {
+        throw new MetaToolkitRefusal(`Ad ${prior.resourceName} is a ${prior.type ?? 'unknown type'} ad. Only RESPONSIVE_SEARCH_AD headlines, descriptions and final URL can be edited here. Nothing was sent.`);
+      }
+      const e = validated.expectedAdContent;
+      const list = (v: unknown) => (Array.isArray(v) && v.length ? (v as string[]).map((t) => `"${t}"`).join(' | ') : '(none)');
+      lines.push(`Responsive search ad ${prior.resourceName} (status ${prior.status}, unchanged):`);
+      if (e.headlines) lines.push(`Headlines: ${list(prior.headlines)} → ${list(e.headlines)}.`);
+      if (e.descriptions) lines.push(`Descriptions: ${list(prior.descriptions)} → ${list(e.descriptions)}.`);
+      if (e.finalUrl !== undefined) lines.push(`Final URL: ${prior.finalUrls?.[0] ?? '(none)'} → ${e.finalUrl}.`);
+      lines.push('Edited ads go back through Google policy review; the ad may stop serving until it is approved again.');
+    } else if (validated.expectedEdit) {
       // ENG-2959: rename / ad-group max CPC — current vs new, status untouched.
       const e = validated.expectedEdit;
       lines.push(`${noun} "${prior.name ?? prior.resourceName}" (status ${prior.status}, unchanged):`);

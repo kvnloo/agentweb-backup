@@ -6194,7 +6194,7 @@ emmaToolRegistry.register({
     const ctx = { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/crm/lists/${args.list_id}/analyze`,
+      path: `/api/crm/lists/${encodeURIComponent(args.list_id)}/analyze`,
       body: { instruction: args.instruction, time_range_days: args.time_range_days },
       context: ctx,
       timeoutMs: 5 * 60 * 1000, // 5 min — Gemini code execution can take a while

@@ -1,3 +1,5 @@
+import { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
+export { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
 import {
   normaliseUserDataField,
   NormalisableUserDataField,
@@ -153,20 +155,6 @@ export interface MetaAdsAdParams {
 }
 
 /**
- * Meta's real, dynamic Business Use Case (BUC) rate-limit signal — returned on
- * every Marketing API response (CAPI included) via the `X-Business-Use-Case-Usage`
- * header, NOT a fixed numeric limit Meta documents anywhere. Percentages of the
- * ad account's rolling hourly allowance used; `estimatedMinutesToRegainAccess`
- * only appears once actually throttled (a metric at/over 100).
- */
-export interface CapiUsage {
-  callCountPct: number;
-  totalTimePct: number;
-  totalCpuTimePct: number;
-  estimatedMinutesToRegainAccess?: number;
-}
-
-/**
  * Meta's default page on the list edges is 25 records. Asking for a larger page fetches the
  * same data in fewer round trips — it does not fetch more data, and it is not what bounds the
  * read; `META_LIST_MAX_PAGES` is.
@@ -312,37 +300,6 @@ export interface MetaOAuthConnectionHealth {
   grantedPermissions: string[];
   declinedRequiredPermissions: string[];
   permissionsError?: string;
-}
-
-/**
- * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
- * header is a JSON object keyed by ad account id, each value an array with one
- * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
- * no fixed number), so this is the only real signal for how close an account
- * is to being throttled. Never throws: a missing header (every existing mocked
- * test response lacks `.headers` entirely) or a malformed value is inconclusive,
- * not an error — returns `undefined` rather than guessing.
- */
-function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) => string | null } }): CapiUsage | undefined {
-  try {
-    const raw = response.headers?.get?.('x-business-use-case-usage');
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw);
-    const firstAccountEntries = Object.values(parsed)[0] as any[] | undefined;
-    const entry = firstAccountEntries?.[0];
-    if (!entry) return undefined;
-    return {
-      callCountPct: Number(entry.call_count) || 0,
-      totalTimePct: Number(entry.total_time) || 0,
-      totalCpuTimePct: Number(entry.total_cputime) || 0,
-      estimatedMinutesToRegainAccess:
-        entry.estimated_time_to_regain_access !== undefined
-          ? Number(entry.estimated_time_to_regain_access)
-          : undefined,
-    };
-  } catch {
-    return undefined;
-  }
 }
 
 /**

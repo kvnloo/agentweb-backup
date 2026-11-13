@@ -103,6 +103,8 @@ export interface McpWriteExecutedInput extends McpToolUseInput {
   /** Read-back verdict: CONFIRMED | MISMATCH | UNCONFIRMED. */
   verification: string;
   objectId?: string;
+  /** ENG-2902: create | edit | pause | approve (status→ACTIVE go-live); scoreboard input. */
+  writeKind?: string;
 }
 
 export interface McpUserUsage {
@@ -352,6 +354,7 @@ export async function recordMcpWriteExecuted(
       action: input.action,
       verification: input.verification,
       objectId: cleanString(input.objectId),
+      writeKind: cleanString(input.writeKind),
     },
   });
   await store.put(item);
