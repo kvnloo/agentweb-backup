@@ -6,6 +6,7 @@
 import request from 'supertest';
 import express from 'express';
 import webhookRouter from '../routes/webhooks';
+import { PUBLIC_LEAD_ALIAS_PATH, publicLeadAlias } from '../routes/publicLeadAlias';
 import { crmDb, userDb } from '../services/db';
 import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
 import { __configureLeadSubmissionIdempotencyForTests } from '../services/leadSubmissionIdempotency';
@@ -33,6 +34,7 @@ jest.mock('../services/emailEventsDb', () => ({ emailEventsDb: { eventExists: je
 
 const app = express();
 app.use(express.json());
+app.post(PUBLIC_LEAD_ALIAS_PATH, publicLeadAlias);
 app.use('/api/webhooks', webhookRouter);
 
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
@@ -66,7 +68,7 @@ describe('forward-lead call consent: a new lead', () => {
     expect(res.status).toBe(201);
     const rec = createdLead().system.callConsent;
     expect(rec).toEqual({
-      granted: true, text: TEXT, version: 'v1', capturedAt: expect.any(String), pageUrl: 'https://acme.example/quote',
+      granted: true, text: TEXT, version: 'v1', phoneDigits: '12125550142', capturedAt: expect.any(String), pageUrl: 'https://acme.example/quote',
       ip: createdLead().clientIp, userAgent: 'Mozilla/5.0 test', source: 'form',
     });
     expect(Date.parse(rec.capturedAt)).toBeGreaterThanOrEqual(before - 1);
@@ -78,7 +80,7 @@ describe('forward-lead call consent: a new lead', () => {
 
   it('uses the capture route\'s declared visitor ip and page when the Referer header is absent', async () => {
     const res = await request(app).post('/api/webhooks/forward-lead').set('User-Agent', 'node')
-      .send({ listId: 'list_1', email: 'a@b.com', visitorIp: '93.184.216.34', visitorUserAgent: 'Mozilla/5.0 (iPhone)', visitorPageUrl: 'https://acme.example/lp?x=1', callConsent: consent() });
+      .send({ listId: 'list_1', email: 'a@b.com', phone: '+12125550142', visitorIp: '93.184.216.34', visitorUserAgent: 'Mozilla/5.0 (iPhone)', visitorPageUrl: 'https://acme.example/lp?x=1', callConsent: consent() });
     await flush();
     expect(res.status).toBe(201);
     expect(createdLead().system.callConsent).toMatchObject({ ip: '93.184.216.34', userAgent: 'Mozilla/5.0 (iPhone)', pageUrl: 'https://acme.example/lp' });
@@ -121,10 +123,13 @@ describe('forward-lead call consent: a new lead', () => {
 
   it.each([
     ['the string "true"', consent({ granted: 'true' }), 'not_granted'],
-    ['granted false', consent({ granted: false }), 'not_granted'],
-    ['text too short', consent({ text: 'I agree to calls' }), 'text_too_short'],
-    ['text too long', consent({ text: `call ${'a'.repeat(1000)}` }), 'text_too_long'],
-    ['no call word', consent({ text: 'I agree to be contacted by this business about my enquiry.' }), 'text_no_call_word'],
+    ['text too short', consent({ text: 'I agree to automated calls' }), 'text_too_short'],
+    ['text too long', consent({ text: `call automated ${'a'.repeat(1000)}` }), 'text_too_long'],
+    ['no call word', consent({ text: 'I agree to be contacted by automated systems about my enquiry.' }), 'text_no_call_word'],
+    ['no automated word', consent({ text: 'I agree that Acme Plumbing LLC may call me at the number above about my enquiry.' }), 'text_no_automated_word'],
+    ['the literal placeholder', consent({ text: buildCallConsentNotice('[REGISTERED BUSINESS NAME]') }), 'placeholder_name'],
+    ['a lower-case spaced placeholder', consent({ text: buildCallConsentNotice('registered   business name') }), 'placeholder_name'],
+    ['a bracketed name placeholder', consent({ text: buildCallConsentNotice('[Your Company Name]') }), 'placeholder_name'],
     ['bad version', consent({ version: 'v 1!' }), 'bad_version'],
     ['not an object', 'yes', 'not_object'],
     ['text not a string', consent({ text: { a: 1 } }), 'bad_text'],
@@ -141,8 +146,34 @@ describe('forward-lead call consent: a new lead', () => {
   });
 });
 
+describe('the public alias /api/leads/public/:listId is the same handler', () => {
+  it('records consent through the alias exactly as forward-lead does', async () => {
+    const res = await request(app).post('/api/leads/public/list_1').send({ email: 'a@b.com', phone: '+12125550142', callConsent: consent() });
+    await flush();
+    expect(res.status).toBe(201);
+    expect(createdLead().system.callConsent).toMatchObject({ granted: true, phoneDigits: '12125550142' });
+  });
+});
+
+describe('forward-lead call consent: unticked box and no phone', () => {
+  it('granted: false (an unticked box) is the normal case: created without consent and NO warning', async () => {
+    const res = await post({ callConsent: consent({ granted: false }) });
+    await flush();
+    expect(res.status).toBe(201);
+    expect(createdLead().system).toBeUndefined();
+    expect(warnLines(warn)).toEqual([]);
+  });
+  it('a valid callConsent with no phone in the submission is ignored (no number to bind it to): one warning no_phone', async () => {
+    const res = await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_1', email: 'a@b.com', callConsent: consent() });
+    await flush();
+    expect(res.status).toBe(201);
+    expect(createdLead().system).toBeUndefined();
+    expect(warnLines(warn)).toEqual(['[forward-lead] call consent ignored: no_phone']);
+  });
+});
+
 describe('forward-lead call consent: an existing lead submitting again', () => {
-  const existing = (over: Record<string, unknown> = {}) => ({ leadId: 'lead_old', listId: 'list_1', email: 'a@b.com', firstName: 'Old', customFields: { source: 'landing-page' }, ...over });
+  const existing = (over: Record<string, unknown> = {}) => ({ leadId: 'lead_old', listId: 'list_1', email: 'a@b.com', firstName: 'Old', phone: '(212) 555-0142', customFields: { source: 'landing-page' }, ...over });
 
   it('records consent once when the lead has none, and dispatches the call gates AFTER the record is written', async () => {
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existing());
@@ -157,6 +188,37 @@ describe('forward-lead call consent: an existing lead submitting again', () => {
     expect((crmDb.updateLead as jest.Mock).mock.calls.every((c) => !('system' in c[2]))).toBe(true); // never a full-map system overwrite
     expect(dispatchLeadCreated).toHaveBeenCalledWith('list_1', 'lead_old', 'form_fill', expect.objectContaining({ submissionId: expect.any(String) }));
     expect((crmDb.createLeadSystemRecordOnce as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan((dispatchLeadCreated as jest.Mock).mock.invocationCallOrder[0]);
+  });
+
+  it('records when the submitted phone is the lead\'s own number written another way (same E.164)', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existing({ phone: '2125550142' }));
+    await post({ phone: '+1 (212) 555-0142', callConsent: consent() });
+    await flush();
+    expect(crmDb.createLeadSystemRecordOnce).toHaveBeenCalledTimes(1);
+    expect((crmDb.createLeadSystemRecordOnce as jest.Mock).mock.calls[0][3]).toMatchObject({ phoneDigits: '12125550142' });
+  });
+
+  it('FORGERY: V\'s email + a DIFFERENT phone + a ticked box records NOTHING on V (one warning phone_mismatch, lead still processed)', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existing());
+    const res = await post({ phone: '(646) 555-0188', callConsent: consent() });
+    await flush();
+    expect(res.status).toBe(200);
+    expect(crmDb.createLeadSystemRecordOnce).not.toHaveBeenCalled();
+    expect(warnLines(warn)).toEqual(['[forward-lead] call consent ignored: phone_mismatch']);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('6465550188');
+  });
+
+  it('a lead that consented with phone A and resubmits with phone B: the merge may change the stored phone, and the gate then refuses', async () => {
+    const { hasCallConsent } = jest.requireActual('../services/voice/callConsent');
+    const consented = existing({ system: { callConsent: { granted: true, text: TEXT, phoneDigits: '12125550142', capturedAt: '2026-01-01T00:00:00.000Z', source: 'form' } } });
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(consented);
+    await post({ phone: '(646) 555-0188', callConsent: consent() });
+    await flush();
+    const update = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+    expect(update.phone).toBe('(646) 555-0188'); // an email-matched merge DOES overwrite the stored phone
+    expect(crmDb.createLeadSystemRecordOnce).not.toHaveBeenCalled(); // first record kept, nothing new written
+    expect(hasCallConsent({ ...consented, ...update })).toBe(false); // the old record cannot cover the new number
+    expect(hasCallConsent(consented)).toBe(true);
   });
 
   it('keeps the FIRST record: a lead that already has consent is not written again, even with a different text', async () => {
