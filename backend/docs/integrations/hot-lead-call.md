@@ -763,7 +763,8 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
 - With `HOT_LEAD_CALL_BILLING_REQUIRED=true` the plan feature is necessary but not
   enough: the org also needs the paid add-on (see "Billing add-on" below). The
   plan check alone (`isHotLeadCallPlanEntitled`) gates the setup steps and the
-  decision to turn calling on; the plan AND the add-on (`isHotLeadCallEntitled`)
+  start of the "turn calling on" flow (the add-on is bought at its approval; the
+  portal's REST save, which cannot buy it, is refused while the add-on is missing); the plan AND the add-on (`isHotLeadCallEntitled`)
   gate dispatch, retries, inbound callbacks and the settings read-out.
 
 ## Billing add-on (ENG-2783)
@@ -771,8 +772,8 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
 - **Price**: a flat $70 per month per organization, charged to the organization
   owner as ONE extra item on the owner's existing Stripe subscription. It includes
   one calling number and 150 lead calls per month. The number's rent is folded in
-  (the number-purchase card still states the real Twilio rent but says it is
-  covered by the $70). Calls beyond the configured monthly limit are not priced:
+  (the number-purchase card still states the real Twilio rent and says it is
+  part of the $70 price). Calls beyond the configured monthly limit are not priced:
   the limit just stops them. No trial, monthly only. Hot lead Twilio spend is still
   recorded in the spend ledger and plan-pool enforcement is unchanged.
 - **Environment variables**
@@ -792,17 +793,27 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
   needs a new card. Only after the user approved, and just before the settings
   write, `addHotLeadCallBilling` adds the item (prorated charge now,
   `error_if_incomplete`, idempotency key per org+subscription+minute; an existing
-  item is found and left alone). If Stripe refuses (no active subscription, card
+  item is found and left alone). It refuses a subscription in a trial (the
+  proration charges nothing then) and one that is not monthly. After the charge the
+  mirror is written at once (entitlement never waits for the webhook), and a second
+  look removes any duplicate item that a racing request created (credited). If the
+  settings write fails after the charge (for example a concurrent edit) the add-on
+  stays active and is not charged again; the user approves a fresh card and the
+  card then states no price. If Stripe refuses (no active subscription, card
   declined, missing product id) the tool fails with a plain message and calling
   stays off; the approval is already used, so the user approves a fresh card to
   retry. The portal's REST save has no purchase hook: with billing required and the
   add-on inactive it refuses `enabled:true` with a message saying to subscribe.
 - **Mirror**: `customer.subscription.created/updated/deleted` write
   `Organization.hotLeadCallBilling = { itemId, status: 'active'|'past_due'|'canceled', updatedAt }`
-  from the live subscription, only when the Stripe customer's user is the org owner
+  from Stripe's CURRENT state of the subscription (the event only names it; a late or
+  out-of-order event cannot flip a paid add-on to canceled; the payload is used only
+  when Stripe cannot be read), only when the Stripe customer's user is the org owner
   (`stripeService.handleSubscriptionUpdated` -> `mirrorHotLeadCallBilling`). Item
   present: active/trialing -> active, past_due/unpaid/incomplete -> past_due,
-  otherwise canceled. Item gone: canceled, only for an org that has a mirror.
+  otherwise canceled. Item gone: canceled, only for an org that has a mirror. When the
+  owner's subscription is deleted but another one remains (a downgrade), the mirror is
+  judged from the remaining subscription.
   Duplicate deliveries write nothing. When not active, dispatch skips with
   `not_entitled` and a call in flight finishes.
 - **Cancel**: turning calling off does not cancel billing, and there is no
