@@ -39,7 +39,7 @@ const mockScan = jest.fn(() => ({ promise: async () => ({ Items: [...rows.values
 jest.mock('aws-sdk', () => ({ __esModule: true, default: { config: { update: jest.fn() }, DynamoDB: { DocumentClient: jest.fn(() => ({ get: mockGet, update: mockUpdate, transactWrite: mockTransact, scan: mockScan })) } } }));
 
 import { waitlistDb } from '../services/waitlistDb';
-import { admitZoma, applyZomaWaitlistDecision, setZomaWaitlistSlackPoster } from '../services/zomaAdmission';
+import { admitZoma, admitZomaSignup, applyZomaWaitlistDecision, setZomaWaitlistSlackPoster } from '../services/zomaAdmission';
 
 const posts: Array<{ channel: string; text: string }> = [];
 const flush = () => new Promise((r) => setImmediate(r));
@@ -127,6 +127,41 @@ describe('admin Invite/Reject is the admission decision', () => {
     delete process.env.ZOMA_WAITLIST_ENABLED;
     rows.set('w@company.co', { email: 'w@company.co', zomaStatus: 'waitlisted' });
     expect(await applyZomaWaitlistDecision(rows.get('w@company.co'), 'w@company.co', 'invited', 'admin-1')).toBeNull();
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(0);
+  });
+});
+
+describe('signups that are not a new free seat', () => {
+  const noInvite = { hasPendingOrgInvite: async () => false };
+  beforeEach(() => rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 60 }));
+
+  it('a teammate joining an org that invited them is admitted when full and takes no seat', async () => {
+    expect(await admitZomaSignup('mate@customer.co', { hasPendingOrgInvite: async () => true })).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+    expect(rows.has('mate@customer.co')).toBe(false);
+  });
+
+  it('an applicant invited before the gate was enabled is admitted without a seat', async () => {
+    rows.set('pre@company.co', { email: 'pre@company.co', status: 'invited' });
+    expect(await admitZomaSignup('pre@company.co', noInvite)).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it('our own team domain never consumes a seat', async () => {
+    expect(await admitZomaSignup('someone@agentweb.pro', noInvite)).toBe('approved');
+    expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(60);
+  });
+
+  it('everyone else still hits the cap, and a failed org lookup is not an exemption', async () => {
+    expect(await admitZomaSignup('late@company.co', noInvite)).toBe('waitlisted');
+    expect(await admitZomaSignup('late2@company.co', { hasPendingOrgInvite: async () => { throw new Error('ddb'); } })).toBe('waitlisted');
+  });
+
+  it('Reject on a waitlist-form applicant blocks a later self-signup even with seats free', async () => {
+    rows.set('__zoma_free_capacity__', { email: '__zoma_free_capacity__', approvedCount: 0 });
+    rows.set('form@company.co', { email: 'form@company.co', status: 'pending' });
+    expect(await applyZomaWaitlistDecision(rows.get('form@company.co'), 'form@company.co', 'rejected', 'admin-1')).toBeNull();
+    expect(await admitZomaSignup('form@company.co', noInvite)).toBe('rejected');
     expect(rows.get('__zoma_free_capacity__').approvedCount).toBe(0);
   });
 });

@@ -15,7 +15,7 @@ const mockJwtSign = jest.fn();
 const mockAdmitZoma = jest.fn();
 jest.mock('../services/zomaAdmission', () => ({
   ...jest.requireActual('../services/zomaAdmission'),
-  admitZoma: (...args: unknown[]) => mockAdmitZoma(...args),
+  admitZomaSignup: (...args: unknown[]) => mockAdmitZoma(...args),
 }));
 
 jest.mock('../services/db', () => ({
