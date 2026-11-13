@@ -263,6 +263,10 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     if (typeof data === 'object' && typeof data.error === 'string' && data.error !== message) {
       (err as { code?: string }).code = data.error;
     }
+    // A route's structured `details` (e.g. which Smartlead connections the caller may choose between) would otherwise be lost.
+    if (data && typeof data === 'object' && data.details !== undefined) {
+      (err as { details?: unknown }).details = data.details;
+    }
     throw err;
   }
 

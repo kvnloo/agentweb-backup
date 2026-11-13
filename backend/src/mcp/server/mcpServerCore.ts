@@ -128,6 +128,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       isInternal: sessionContext?.isInternal,
       authMethod: sessionContext?.authMethod,
       apiKeyId: sessionContext?.apiKeyId,
+      apiKeyScopes: sessionContext?.apiKeyScopes,
       oauthClientId: sessionContext?.oauthClientId,
       oauthClientName: sessionContext?.oauthClientName,
       clientType: sessionContext?.clientType,
