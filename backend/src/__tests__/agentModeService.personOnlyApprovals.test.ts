@@ -34,13 +34,13 @@ beforeEach(() => {
 });
 
 describe('submitApprovalDeckAnswers person-only guard (ENG-2962)', () => {
-  it.each([
+  it.each<[string, string, Record<string, unknown>?]>([
     ['smartlead_push_approval:start:abc:0123456789abcdef', 'approve'],
     ['hot_lead_call_approval:call:abc:0123456789abcdef', 'approve'],
     ['crm_sequence_activation:seq-1:tok', 'activate'],
     ['meta_write', 'approve', { metaWriteDispatch: { action: 'CREATE_PAUSED_BUNDLE' } }],
   ])('a self-call approving %s on the pending deck is refused and nothing is written', async (kind, verdict, extra = {}) => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'u-1', pendingApprovalDeck: deck(kind, extra as any) });
+    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'u-1', pendingApprovalDeck: deck(kind, extra) });
     const out = await submit([{ itemId: 'question-1', verdict }], { refusePersonOnlyApprovals: true });
     expect(out).toMatchObject({ outcome: 'needs_person' });
     expect(mockUpdateDeck).not.toHaveBeenCalled();
