@@ -70,6 +70,13 @@ describe('parseHardBounces', () => {
     const raw = 'From: mailer-daemon@example.org\r\nX-Failed-Recipients: c@example.com\r\nContent-Transfer-Encoding: base64\r\n\r\nRGVsYXllZDogNC40LjEgcmV0cnlpbmc=';
     expect(parseHardBounces(raw, SENDER)).toEqual([]);
   });
+  it('prefers Original-Recipient over a forwarded Final-Recipient', () => {
+    const raw = hardDsn('fwd@forwarder.example').replace(
+      /Final-Recipient:/,
+      'Original-Recipient: rfc822; lead@example.com\r\nFinal-Recipient:',
+    );
+    expect(parseHardBounces(raw, 'me@agentweb.pro').map((b) => b.recipient)).toEqual(['lead@example.com']);
+  });
   it('unfolds RFC 3464 continuation lines in recipient blocks', () => {
     const raw = hardDsn('x@example.com').replace(
       /Final-Recipient: rfc822; x@example.com\r\nAction: failed\r\nStatus: 5.1.1/,

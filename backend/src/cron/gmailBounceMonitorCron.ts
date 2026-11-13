@@ -69,11 +69,24 @@ export function parseHardBounces(raw: string, senderEmail: string): HardBounce[]
     if (a && a !== sender && !found.has(a)) found.set(a, { recipient: a, status });
   };
 
-  const blocks = raw.split(/^(?=Final-Recipient:)/im).slice(1);
+  // A per-recipient block may start with Original-Recipient (RFC 3464 §2.3),
+  // which precedes Final-Recipient; prefer it for lead matching because
+  // Final-Recipient can be a post-forwarding address.
+  const blocks = raw
+    .split(/^(?=Original-Recipient:|Final-Recipient:)/im)
+    .slice(1)
+    .reduce<string[]>((acc, b) => {
+      if (/^Final-Recipient:/i.test(b) && acc.length && /^Original-Recipient:/i.test(acc[acc.length - 1]) && !/^Final-Recipient:/im.test(acc[acc.length - 1])) {
+        acc[acc.length - 1] += b;
+      } else acc.push(b);
+      return acc;
+    }, []);
   for (const rawBlock of blocks) {
     // RFC 3464 §2.1.1: fields may fold onto continuation lines.
     const block = rawBlock.replace(/\r?\n[ \t]+/g, ' ');
-    const recipientLine = block.match(/^Final-Recipient:[ \t]*(?:rfc822;)?[ \t]*<?([^\s>]+)>?/im);
+    const recipientLine =
+      block.match(/^Original-Recipient:[ \t]*rfc822;[ \t]*<?([^\s>]+)>?/im) ||
+      block.match(/^Final-Recipient:[ \t]*(?:rfc822;)?[ \t]*<?([^\s>]+)>?/im);
     const action = (block.match(/^Action:[ \t]*(\S+)/im)?.[1] || '').toLowerCase();
     const status = block.match(/^Status:[ \t]*(\d\.\d{1,3}\.\d{1,3})/im)?.[1] || '';
     if (!recipientLine || !EMAIL.test(recipientLine[1])) continue;
