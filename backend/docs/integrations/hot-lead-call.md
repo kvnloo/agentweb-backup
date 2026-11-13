@@ -760,6 +760,80 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
   an org that loses its plan stops dialing. A call already in flight finishes.
 - `release_hot_lead_call_number` and `confirm_hot_lead_call_verification` stay
   available so an org that lost its plan can still stop paying for a number.
+- With `HOT_LEAD_CALL_BILLING_REQUIRED=true` the plan feature is necessary but not
+  enough: the org also needs the paid add-on (see "Billing add-on" below). The
+  plan check alone (`isHotLeadCallPlanEntitled`) gates the setup steps and the
+  start of the "turn calling on" flow (the add-on is bought at its approval; the
+  portal's REST save, which cannot buy it, is refused while the add-on is missing); the plan AND the add-on (`isHotLeadCallEntitled`)
+  gate dispatch, retries, inbound callbacks and the settings read-out.
+
+## Billing add-on (ENG-2783)
+
+- **Price**: a flat $70 per month per organization, charged to the organization
+  owner as ONE extra item on the owner's existing Stripe subscription. It includes
+  one calling number and 150 lead calls per month. The number's rent is folded in
+  (the number-purchase card still states the real Twilio rent and says it is
+  part of the $70 price). Calls beyond the configured monthly limit are not priced:
+  the limit just stops them. No trial, monthly only. Hot lead Twilio spend is still
+  recorded in the spend ledger and plan-pool enforcement is unchanged.
+- **Environment variables**
+  - `STRIPE_HOT_LEAD_CALL_PRODUCT_ID`: the Stripe product id. The item is created
+    with `price_data` (usd, 7000, monthly) against that product, and found again by
+    product id on the live subscription (never from the DB). Missing = the add-on
+    refuses to be added with a plain message and nothing is turned on.
+  - `HOT_LEAD_CALL_BILLING_REQUIRED`: the kill switch. Only the exact value `true`
+    makes billing required. Unset or anything else = billing is NOT checked, so
+    deploying this code changes nothing for any org (including the Super Premium
+    test org) until an operator sets it. Read on every call, so a
+    changed value applies as soon as the process has the new environment.
+- **Buying**: with billing required and the add-on not active, the approval card for
+  `update_hot_lead_call_settings` with `enabled:true` states "$70 per month,
+  includes one calling number and 150 lead calls per month, billed to your
+  subscription". That price text is part of the approved digest, so a price change
+  needs a new card. Only after the user approved, and just before the settings
+  write, `addHotLeadCallBilling` adds the item (prorated charge now,
+  `error_if_incomplete`, idempotency key per org+subscription+minute; an existing
+  item is found and left alone). It refuses a subscription in a trial (the
+  proration charges nothing then) and one that is not monthly. After the charge the
+  mirror is written at once (entitlement never waits for the webhook), and a second
+  look removes any duplicate item that a racing request created (credited). If the
+  settings write fails after the charge (for example a concurrent edit) the add-on
+  stays active and is not charged again; the user approves a fresh card and the
+  card then states no price. If Stripe refuses (no active subscription, card
+  declined, missing product id) the tool fails with a plain message and calling
+  stays off; the approval is already used, so the user approves a fresh card to
+  retry. The portal's REST save has no purchase hook: with billing required and the
+  add-on inactive it refuses `enabled:true` with a message saying to subscribe.
+- **Mirror**: `customer.subscription.created/updated/deleted` write
+  `Organization.hotLeadCallBilling = { itemId, status: 'active'|'past_due'|'canceled', updatedAt }`
+  from Stripe's CURRENT state of the subscription (the event only names it; a late or
+  out-of-order event cannot flip a paid add-on to canceled; the payload is used only
+  when Stripe cannot be read), only when the Stripe customer's user is the org owner
+  (`stripeService.handleSubscriptionUpdated` -> `mirrorHotLeadCallBilling`). Item
+  present: active/trialing -> active, past_due/unpaid/incomplete -> past_due,
+  otherwise canceled. Item gone: canceled, only for an org that has a mirror. When the
+  owner's subscription is deleted but another one remains (a downgrade), the mirror is
+  judged from the remaining subscription.
+  Duplicate deliveries write nothing. When not active, dispatch skips with
+  `not_entitled` and a call in flight finishes.
+- **Cancel**: turning calling off does not cancel billing, and there is no
+  cancel tool yet. Until there is, remove the item in the Stripe dashboard; the
+  webhook then marks the mirror `canceled`.
+- **Rollout**: (1) create the "Hot lead calls" product in Stripe TEST mode and set
+  `STRIPE_HOT_LEAD_CALL_PRODUCT_ID` in a non-production environment; (2) set
+  `HOT_LEAD_CALL_BILLING_REQUIRED=true` there and run: approve the card, check the
+  item and the mirror, fail a payment (past_due), remove the item (canceled);
+  (3) Harsha approves the new `hotLeadCallBilling` field and the live-mode product;
+  (4) set the product id in production; (5) mark existing paying orgs by hand-adding
+  the item (or leave the switch off until they are billed), then set
+  `HOT_LEAD_CALL_BILLING_REQUIRED=true`. Setting it first would stop dispatch for
+  every org without the item.
+- **Turn it off**: unset `HOT_LEAD_CALL_BILLING_REQUIRED` (or set it to anything
+  but `true`). Entitlement goes back to the plan check alone. Existing Stripe items
+  are not touched.
+- **Known gap**: number rent and phone verification happen before the add-on is
+  bought (it is bought when calling is turned on), so an org that never subscribes
+  has cost a number's rent and a few verification calls.
 
 ## Settings keys (AW-Settings)
 

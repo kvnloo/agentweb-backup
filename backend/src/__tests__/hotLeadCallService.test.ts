@@ -829,6 +829,39 @@ describe('plan entitlement', () => {
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
   });
 
+  describe('the paid add-on (HOT_LEAD_CALL_BILLING_REQUIRED)', () => {
+    afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+
+    it('required and not active: skips with not_entitled before any record, even though the plan includes calls', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'past_due', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
+      expect(provider.placedCalls).toHaveLength(0);
+      expect(store.record).toBeNull();
+    });
+
+    it('required and the org has never bought it: skips with not_entitled', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
+    });
+
+    it('required and active: calls as before', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(provider.placedCalls).toHaveLength(1);
+    });
+
+    it('not required (the default, also for any value but exactly "true"): never looks at the add-on', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'TRUE';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'canceled', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(provider.placedCalls).toHaveLength(1);
+    });
+  });
+
   it('reads the plan of the org’s billing owner, not of the list owner', async () => {
     setHotLeadCallEntitledOverride(null);
     org.ownerUserId = 'org-owner';
