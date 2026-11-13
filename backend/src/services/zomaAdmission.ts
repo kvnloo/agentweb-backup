@@ -1,4 +1,5 @@
 import AWS from 'aws-sdk';
+import { accountFlag } from './journeyProductBackfill';
 
 const db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
 const table = () => `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-Waitlist`;
@@ -110,6 +111,34 @@ export async function markZomaWaitlisted(emailInput: string): Promise<void> {
     if (err.code !== 'ConditionalCheckFailedException') throw err;
   }
 }
+export type ZomaSeatExemption = 'team' | 'org_invite' | 'legacy_invite';
+export interface ZomaSignupDeps {
+  hasPendingOrgInvite(email: string): Promise<boolean>;
+}
+const defaultSignupDeps: ZomaSignupDeps = {
+  hasPendingOrgInvite: async (email) => !!(await (await import('./db')).orgDb.getOrgWithPendingInviteForEmail(email)),
+};
+
+/**
+ * Signups that are not a new free Zoma seat: our own team domains, a teammate joining an org
+ * that invited them, and an applicant a human already invited before the gate was enabled.
+ * They are admitted without consuming a seat (and never waitlisted). A failed org lookup is
+ * not an exemption: the gate still applies.
+ */
+export async function zomaSeatExemption(emailInput: string, deps: ZomaSignupDeps = defaultSignupDeps): Promise<ZomaSeatExemption | null> {
+  const email = emailInput.toLowerCase();
+  if (accountFlag(email) === 'internal') return 'team';
+  if (await deps.hasPendingOrgInvite(email).catch(() => false)) return 'org_invite';
+  const row = await entry(email);
+  if (row && !row.zomaStatus && row.status === 'invited') return 'legacy_invite';
+  return null;
+}
+
+/** Registration-time admission (password + Google): exemptions first, then the capped seat. */
+export async function admitZomaSignup(email: string, deps: ZomaSignupDeps = defaultSignupDeps): Promise<string> {
+  return (await zomaSeatExemption(email, deps)) ? 'approved' : admitZoma(email);
+}
+
 export async function rejectZoma(emailInput: string, actor: string): Promise<string> {
   const email = emailInput.toLowerCase();
   try {
@@ -135,9 +164,9 @@ export async function applyZomaWaitlistDecision(
 ): Promise<{ statusCode: number; body: Record<string, unknown> } | null> {
   if (!zomaAdmissionEnabled() || (status !== 'invited' && status !== 'rejected') || !entry) return null;
   const inviting = status === 'invited';
-  if (!inviting && !entry.zomaStatus) return null; // plain legacy rejection
   if (!actor) return { statusCode: 403, body: { message: 'Admin identity required' } };
-  if (inviting && !entry.zomaStatus) await markZomaWaitlisted(email);
+  // A waitlist-form row has no decision yet: record one, so Reject also blocks a later self-signup.
+  if (!entry.zomaStatus) await markZomaWaitlisted(email);
   const decision = inviting ? await admitZoma(email, actor) : await rejectZoma(email, actor);
   if (decision === (inviting ? 'approved' : 'rejected')) return null;
   return {

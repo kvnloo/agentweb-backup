@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { admitZoma, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
+import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -168,7 +168,7 @@ export const register = async (req: Request, res: Response) => {
 
     if (zomaAdmissionEnabled()) {
       try {
-        if (await admitZoma(email) !== 'approved') return res.status(202).json(waitlistedResponse);
+        if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
       } catch (error) {
         console.error('Zoma admission unavailable', error);
         return res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
@@ -489,7 +489,7 @@ export const googleCallback = async (
       }, null);
     }
 
-    if (!user && zomaAdmissionEnabled() && await admitZoma(email) !== 'approved') {
+    if (!user && zomaAdmissionEnabled() && await admitZomaSignup(email) !== 'approved') {
       return done({ statusCode: 403, ...waitlistedResponse }, null);
     }
 

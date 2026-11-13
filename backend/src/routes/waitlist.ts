@@ -166,7 +166,8 @@ router.post('/zoma/:email/decision', authenticateToken, isAdmin, async (req, res
   if (!actor) return res.sendStatus(403);
   try {
     const status = decision === 'approve' ? await admitZoma(email, actor) : await rejectZoma(email, actor);
-    res.status(status === 'not_found' ? 404 : status === 'capacity_exhausted' || (decision === 'reject' && status === 'approved') ? 409 : 200).json({ status });
+    const expected = decision === 'approve' ? 'approved' : 'rejected';
+    res.status(status === expected ? 200 : status === 'not_found' ? 404 : 409).json({ status });
   } catch (error) {
     console.error('Zoma admission decision failed', error);
     res.status(503).json({ code: 'admission_unavailable' });
