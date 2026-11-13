@@ -783,8 +783,8 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
   - `HOT_LEAD_CALL_BILLING_REQUIRED`: the kill switch. Only the exact value `true`
     makes billing required. Unset or anything else = billing is NOT checked, so
     deploying this code changes nothing for any org (including the Super Premium
-    test org) until an operator sets it. Read on every call; no restart-free
-    guarantee beyond how the env is applied.
+    test org) until an operator sets it. Read on every call, so a
+    changed value applies as soon as the process has the new environment.
 - **Buying**: with billing required and the add-on not active, the approval card for
   `update_hot_lead_call_settings` with `enabled:true` states "$70 per month,
   includes one calling number and 150 lead calls per month, billed to your
