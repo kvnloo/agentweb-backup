@@ -1355,7 +1355,7 @@ export class UserDB {
       handleDynamoDbError(error, "removeUserSecret");
       throw error;
     }
-  },
+  }
 
   /**
    * Returns a strongly current User record after resolving its stable primary
