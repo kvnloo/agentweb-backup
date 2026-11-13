@@ -952,7 +952,7 @@ Rules the code enforces:
 
 ## Abuse limits and their known limits
 
-Gates run cheapest first (ids, phone, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
+Gates run cheapest first (ids, phone, call consent, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
 the limits that count run once, just before the record is created, and are given
 back if the record is not created:
 
@@ -1403,10 +1403,10 @@ consent record. A lead without one is skipped with a visible reason.
 ```
 
 It is accepted only when ALL hold: `granted` is the boolean `true` (not the string `"true"`); `text` is a string of 40 to 1000 characters after trimming
-that contains the word "call" (case-insensitive, whole word start: "calls" and "calling" match, "recall" does not) and does NOT contain the placeholder `[REGISTERED BUSINESS NAME]`;
+that contains the word "call" (case-insensitive, word start: "calls" and "calling" match, "recall" does not) AND the whole word "automated" (case-insensitive; the artificial-voice authorisation is the legally load-bearing part) and does NOT contain a placeholder (any bracketed text that includes the word "name", or `REGISTERED BUSINESS NAME` in any case or spacing);
 `version`, if present, matches `[A-Za-z0-9._-]{1,32}`. Anything else is IGNORED: the lead is still created (never a 400), nothing is stored, and ONE
 `console.warn` of the reason code only (`[forward-lead] call consent ignored: <reason>`, with no text, phone or email) is written. Reason codes: `not_object`, `not_granted`, `bad_text`,
-`text_too_short`, `text_too_long`, `text_no_call_word`, `placeholder_name`, `bad_version`. A missing field is the normal "form had no notice" case and does not warn.
+`text_too_short`, `text_too_long`, `text_no_call_word`, `text_no_automated_word`, `placeholder_name`, `bad_version`, and `no_phone` (a valid consent with no usable phone in the same submission: nothing to bind it to). A missing field and `granted: false` (an unticked box) are the normal cases and do not warn.
 The field is a handled key: it is never stored as a custom field or in `notes`, and never echoed in a response. The generated capture route also forwards the page the form was on as
 `visitorPageUrl` (its Referer), another handled key.
 
@@ -1417,8 +1417,10 @@ Code: `services/voice/callConsent.ts` (parse, record, notice text), `routes/webh
 On the lead row, in the existing `system` map (no new table, no new index): `system.callConsent`
 
 ```
-{ granted: true, text, version?, capturedAt, pageUrl?, ip?, userAgent?, source: 'form' | 'operator', note? }
+{ granted: true, text, version?, phoneDigits, capturedAt, pageUrl?, ip?, userAgent?, source: 'form' | 'operator', note? }
 ```
+
+- `phoneDigits`: the E.164 digits of the number the visitor submitted (`toE164(raw, 'US')`, the same normaliser `callableLeadPhone` uses). **Consent is bound to this number**: `hasCallConsent(lead)` requires `granted === true` AND `phoneDigits` equal to the normalised CURRENT `lead.phone`. A record without `phoneDigits`, or a lead without a phone, is not consent, and a lead whose phone changes can never inherit an old record.
 
 - `capturedAt`: the SERVER's ISO time, never supplied by the client.
 - `pageUrl`: the request's `Referer` (else `Origin`, else the capture route's `visitorPageUrl`), reduced to `scheme://host/path` (no query string, fragment or credentials), at most 300 characters.
@@ -1430,13 +1432,17 @@ That covers a brand-new lead (email or phone-only, the phone-dedupe separate-row
 
 Repeat submissions:
 
-- An EXISTING lead (same email or same phone) that has no `system.callConsent` gets it recorded by `crmDb.createLeadSystemRecordOnce(..., 'callConsent', record)`, a conditional write that
+- An EXISTING lead (same email or same phone) that has no `system.callConsent` AND whose stored phone (before this submission's merge) is the same number as the submitted one gets it recorded by `crmDb.createLeadSystemRecordOnce(..., 'callConsent', record)`, a conditional write that
   creates the key only if absent (never a full-map `system` overwrite, which would clobber the call record). This runs BEFORE the repeat submission's dispatch.
 - A repeat submission DOES dispatch the call gates (`dispatchLeadCreated(..., submission)`); the only call-specific refusal that sticks is `has_record` (a call already happened).
   So a lead first skipped as `no_call_consent` that submits again WITH consent IS called by that second submission (if every other gate passes, including `too_old`, measured from the new submission). The earlier `call.skipped` stays on the timeline.
+- If the submission carries a DIFFERENT phone, nothing is recorded and one warning `call consent ignored: phone_mismatch` is logged (reason only). This stops anyone who knows a lead's email from attaching a ticked box for their own number to that lead.
+  A resubmission CAN change the stored phone (an email-matched merge overwrites a differing phone with the submitted one; a phone-matched merge only fills blanks); the phone binding of the gate is what guarantees an old record never covers the new number. A lead that consented with number A and later gets number B is therefore skipped as `no_call_consent`, and because the first record wins it cannot record a second one (known gap below).
 - The FIRST granted record is kept forever. A later one, with the same or a different text, is IGNORED (not appended; no history array). Reason: the proof of what the person first agreed to must never be replaced, and a bounded history adds a read-modify-write on a hot row for no gain.
 - An idempotent replay (same `submissionId`, ENG-2837) returns the original response before anything is written: no second lead write, no second consent write.
-- Not covered: session-tracker lists (`upsertSessionLead`) never place calls and do not go through the consent write of a repeat submission.
+- Session-tracker lists: `upsertSessionLead` spreads `leadData` (including `system`) into `createLead`, so a consent record passes through on create; those lists suppress side effects and never dispatch the call. A session-list lead that did reach the gate without a record is skipped, which is intended. The repeat-submission consent write does not apply to the session upsert path.
+- Re-check paths: the consent gate lives only in `SKIP_GATES`, which only `reviewWhy` runs (dispatch, the job, the press-2 retry), always on a lead loaded by `getLeadById` with its full `system` map. The `/gather` and bridge re-checks (`twilioVoiceWebhook.ts`) and the stuck sweep do not re-evaluate `SKIP_GATES`; a call already placed is not re-gated.
+- `/api/leads/public/:listId` (`routes/publicLeadAlias.ts`) only moves the path id into `body.listId` and rewrites the URL to `/api/webhooks/forward-lead`, so it is the same handler (a test posts consent through the alias).
 
 ### The gate and who sees what
 
@@ -1460,10 +1466,11 @@ every lead capture form (the prompt always asks for a phone number). It is inclu
 
 ### The registered-name rule (READ THIS)
 
-The name in the notice must be the REGISTERED LEGAL NAME of the business that places the calls, not a brand or marketing name. No source of a registered name exists in the platform today
-(`brandName` is a marketing name), so the prompt tells the builder to keep the placeholder `[REGISTERED BUSINESS NAME]` exactly as written and NOT to invent a name. The site owner must replace it in the form's
-`CALL_CONSENT_TEXT` constant. Until then a submission whose text still contains the placeholder is IGNORED by the server (`placeholder_name`), so an unfinished form records no consent and its leads are not called.
-`BrandContext.registeredBusinessName` exists for the day a source is added; when set, the prompt uses it and gives no placeholder instruction.
+The name in the notice must be the REGISTERED LEGAL NAME of the business that places the calls. The platform has no field for a registered name, so the generator uses, in this order, data the generation routes
+already load (no new read): the org's hot-lead-call `announcedName` if configured, else the account's `companyName`, else the org's `name` (`registeredBusinessNameOf` in `services/v0Service.ts`). A candidate containing brackets, quotes or angle brackets is skipped.
+Those are the best available names, not verified legal names: the owner must check that the name printed in the notice is the registered one.
+When NO name is known the prompt carries NO consent block at all (no placeholder text anywhere): such a page has no checkbox, records no consent and therefore does not trigger calls until the notice is added.
+The server still rejects any consent text that contains a placeholder (bracketed text including the word "name", or `REGISTERED BUSINESS NAME` in any case or spacing).
 
 ### Existing landing pages
 
@@ -1472,7 +1479,7 @@ edited to carry the notice. This is intended and is the main go-live step: updat
 
 ### Retention (owner rule: 5 years)
 
-Consent records must be kept at least 5 years after the LAST call to that lead. Findings of the ENG-2783 review (no deletion code was changed):
+Consent records must be kept at least 5 years after the last call to that lead. Findings of the ENG-2783 review (no deletion code was changed):
 
 - No TTL: `AW-Leads` rows have no TTL attribute in code (only `ATTEMPT_USAGE` and `SMARTLEAD_PUSH_RUNS` get one, in `ensureCriticalTables.ts`), and the lead row builder sets no expiry. The live table's TTL setting was NOT checked (no AWS access): confirm it is off.
 - No purge, anonymise or erasure job touches leads. No GDPR/erasure code path exists for lead rows.
@@ -1484,9 +1491,10 @@ Consent records must be kept at least 5 years after the LAST call to that lead. 
 
 ### Back-filling consent given another way
 
-A lead who gave consent outside the form (for example on a phone call or in a signed document) can be made callable by an OPERATOR writing the same shape with `source: 'operator'` and a `note` saying how and when it was given
-(`createLeadSystemRecordOnce(listId, leadId, 'callConsent', { granted: true, text: <the wording the person agreed to>, capturedAt: <ISO time of the real consent>, source: 'operator', note })`; the text must also satisfy the 40-1000 characters and "call" rules to be meaningful).
-That is an owner/operator decision made per lead with evidence in hand; it is a data write and there is no UI or Emma tool for it.
+A lead who gave consent outside the form (for example on a phone call or in a signed document) can be made callable by an OPERATOR writing the same shape with `source: 'operator'` and a `note` saying how and when it was given. The operator calls
+`crmDb.createLeadSystemRecordOnce(listId, leadId, 'callConsent', { granted: true, text: <the wording the person agreed to, 40-1000 characters incl. "call" and "automated">, phoneDigits: <E.164 digits of the number to call>, capturedAt: <ISO time of the real consent>, source: 'operator', note })`.
+No script, Emma tool or UI exists for this today; it is a hand-run data write and an owner/operator decision per lead, with the evidence in hand. A lead that ALREADY has a `callConsent` cannot be back-filled this way (the first record wins; the write is refused),
+including a stale record bound to an old number: fixing that needs a deliberate data edit by the owner.
 
 ### Risk statements (what the record proves)
 
@@ -1494,7 +1502,18 @@ That is an owner/operator decision made per lead with evidence in hand; it is a 
   The record proves what the submitting client CLAIMED and when and from which address our server saw it; it does NOT prove that the owner of the number saw the notice or ticked a box. The server validates the shape (granted is the boolean true, length, the word "call", no placeholder), not the truth.
 - It does not prove the text matches what the page displayed (the AI-built form is not tested for that), nor that the person was the subscriber of the number.
 - `ip` is the visitor address the platform capture route declares and the backend accepts under its existing guarded path; a forwarder's own address is never recorded, so `ip` may be absent.
+- A ticked box for V's own phone number submitted with V's email is recorded: that proves a FORM SUBMISSION carrying that number, not that the submitter owns the number.
 - The third-party-called risk in [Compliance and third parties](#compliance-and-third-parties) remains: a person can type someone else's number and tick the box.
+
+### Known gaps
+
+- The record is a self-assertion by the form: no proof of number ownership, no OTP or double opt-in.
+- The public endpoint has no per-IP or per-phone submission limiter. What limits harm: the per-org hourly/daily/monthly caps, the calling hours, one call per lead, the press-3 stop and the do-not-call mark.
+- The notice goes on every generated capture form, whether or not the org has hot-lead calling.
+- `pageUrl` is client-declared when no Referer header is present (the capture route's `visitorPageUrl` is forwarded by the platform, but a direct caller can send any value).
+- A lead whose number changed after consenting cannot record a new consent (first record wins).
+- Release note: `routes/crmPublic.ts` creates `form_fill` leads without consent, so those leads no longer trigger calls.
+- Follow-ups: OTP or double opt-in, a per-IP limiter, and an "add the notice to my existing landing page" tool.
 
 ### Open items (not decided here)
 
