@@ -1496,11 +1496,23 @@ emmaToolRegistry.register({
     if (!user) return { success: false, error: 'User not found' };
 
     const { cleanAccountId, getConnectedMetaAccountsList } = await import('../services/metaAccountCredentials');
-    const cleaned = cleanAccountId(args.account_id);
-    const owned = getConnectedMetaAccountsList(user).some((acc: any) => acc.accountId === cleaned);
-    if (!owned) {
-      return { success: false, error: 'Ad account is not one of your connected accounts' };
+    // ENG-2938: the model routinely passes the id with whitespace, an `act_`/`ACT_` prefix, as a
+    // number, or the account *name* from list_connected_accounts. Normalize before the ownership
+    // check, and on a genuine miss tell the model which ids ARE valid so it can self-correct
+    // instead of failing the run.
+    const connected = getConnectedMetaAccountsList(user);
+    if (connected.length === 0) {
+      return { success: false, error: 'No Meta ad account is connected. Ask the user to connect Meta in Settings before reading thresholds.' };
     }
+    const raw = String(args.account_id ?? '').trim();
+    const normalized = cleanAccountId(raw.replace(/^act_/i, '').replace(/\s+/g, ''));
+    const match = connected.find((acc: any) => acc.accountId === normalized)
+      || connected.find((acc: any) => raw && String(acc.accountName).trim().toLowerCase() === raw.toLowerCase());
+    if (!match) {
+      const valid = connected.map((acc: any) => `${acc.accountId} (${acc.accountName})`).join(', ');
+      return { success: false, error: `Ad account is not one of your connected accounts. Connected Meta ad account ids: ${valid}` };
+    }
+    const cleaned: string = match.accountId;
 
     const { getThresholdsForAccount } = await import('../services/adsThresholdsDb');
     const { resolveThresholds, THRESHOLD_REGISTRY } = await import('../services/adsThresholds');
@@ -6182,7 +6194,7 @@ emmaToolRegistry.register({
     const ctx = { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/crm/lists/${args.list_id}/analyze`,
+      path: `/api/crm/lists/${encodeURIComponent(args.list_id)}/analyze`,
       body: { instruction: args.instruction, time_range_days: args.time_range_days },
       context: ctx,
       timeoutMs: 5 * 60 * 1000, // 5 min — Gemini code execution can take a while

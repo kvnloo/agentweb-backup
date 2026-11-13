@@ -18,28 +18,39 @@ import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
-import { GUARDED_WRITE_ACTIONS } from './metaToolkitWriteSurface';
+import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
 import { isMetaCatalogTool, META_CATALOG_TOOL_DEFINITIONS } from './metaToolkitCatalogs';
+import { isMetaCatalogFeedTool, META_CATALOG_FEED_TOOL_DEFINITIONS } from './metaToolkitCatalogFeeds';
+import { isMetaEventSourceTool, META_EVENT_SOURCE_TOOL_DEFINITIONS } from './metaToolkitEventSources';
+import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
+import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } from './metaToolkitExperimentWrites';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
+import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 
-const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO'] as const;
+export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
-  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED), budget, CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id (swap)/name. ' +
+  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED), budget, name (CAMPAIGN, AD_SET, AD), CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id (swap), ' +
+  'ARCHIVE (stops delivery, keeps history), DELETE (irreversible) and COPY (params.deep_copy for CAMPAIGN/AD_SET, ' +
+  'params.campaign_id = destination campaign for an AD_SET copy, params.adset_id = destination ad set for an AD copy; copies are created PAUSED). ' +
+  'ARCHIVE/DELETE are refused when the entity spent in the last 24 hours unless confirm_recent_spend=true after the user explicitly accepts it; prefer pausing first. ' +
   'Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), show the preview to the user, ' +
   'then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
   'New campaigns, ad sets and ads are always created PAUSED; activating (status=ACTIVE) is its own separate preview and approval. ' +
   'Budgets are in MAJOR units of the ad account currency (e.g. 50 = $50.00); the preview echoes the converted amount. ' +
   'A write is done only when the result says verification CONFIRMED. ' +
   'CREATIVES (no preview needed, they cannot spend until an ad uses them): AD_CREATIVE UPLOAD_IMAGE (params.image_url) → image_hash; ' +
-  'AD_CREATIVE UPLOAD_VIDEO (params.video_url) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
-  'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id with image_url/image_hash thumbnail) → creative_id; ' +
+  'AD_CREATIVE UPLOAD_VIDEO (params.video_url: any public https URL of the video FILE, e.g. a UGC .mp4 link, max 1 GB) → video_id + thumbnail_url, waits for Meta processing (re-check with params.video_id); ' +
+  'AD_CREATIVE CREATE (name, page_id, body, title, link_url, call_to_action_type + image_hash | image_url | video_id [Meta thumbnail used if none given]) → creative_id; ' +
+  'or carousel_cards (2-10 cards, each with its own image_hash/image_url/video_id and link_url) or placement_assets, with no top-level image; ' +
+  'or MULTI-VARIANT (Advantage+): headlines[] / bodies[] / descriptions[] (up to 5 each) + image_hashes[] / video_ids[] (up to 10 each) + link_url → one creative Meta optimizes; ' +
+  'AD_CREATIVE BULK_CREATE (params.items: up to 10 creatives, each with its media and optional overrides; other params are shared; items may use video_url) → per-item results, partial success reported; ' +
   'then AD CREATE with params.creative_id (guarded preview, created PAUSED). For a file on the user\'s computer call zoma_prepare_upload first. ' +
-  'Use PAGE LIST for page_id. DELETE and custom audiences are not available.';
+  'Use PAGE LIST for page_id. For custom audiences, lookalikes, customer lists and excluding existing customers use zoma_custom_audiences.';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
   'list_meta_ads_campaigns',
@@ -69,7 +80,9 @@ function narrowDefinition(definition: any): any {
     delete props.client_id;
     if (def.name === 'call_meta_marketing_api') {
       def.description = META_MARKETING_API_DESCRIPTION;
-      if (props.action?.enum) props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS, ...CREATIVE_UPLOAD_ACTIONS];
+      if (props.action?.enum) {
+        props.action.enum = [...META_TOOLKIT_V1_ACTIONS, ...GUARDED_WRITE_ACTIONS, ...LIFECYCLE_WRITE_ACTIONS, ...CREATIVE_UPLOAD_ACTIONS];
+      }
       props.confirm = {
         type: 'boolean',
         description: 'Writes only. Omit to get a PREVIEW (nothing changes). Set true only after the user explicitly approved that preview, together with its preview_token.',
@@ -77,6 +90,10 @@ function narrowDefinition(definition: any): any {
       props.preview_token = {
         type: 'string',
         description: 'Writes only. The preview_token returned by the preview the user approved. Single use, 15 minutes; the call must repeat the previewed arguments exactly.',
+      };
+      props.confirm_recent_spend = {
+        type: 'boolean',
+        description: 'ARCHIVE/DELETE only. Set true only when the user explicitly accepts stopping an entity that spent in the last 24 hours (or whose spend could not be checked). Part of the previewed arguments.',
       };
       // The waiver replay is not wired through the deck flow (§4).
       if (props.params?.properties) delete props.params.properties.override_tracking_check;
@@ -105,9 +122,18 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2980: experiment eligibility + A/B / lift writes (writes are preview → confirm).
+    ...META_EXPERIMENT_WRITE_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    JSON.parse(JSON.stringify(HELP_ARTICLE_DEFINITION)),
     ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_CATALOG_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2925: product + product-set writes (deletes are preview → confirm) and the filter helper.
+    ...META_CATALOG_WRITE_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2927: catalog event sources (connect/disconnect are preview → confirm).
+    ...META_EVENT_SOURCE_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2926: catalog create/update, feeds, upload sessions, feed rules (deletes are preview → confirm).
+    ...META_CATALOG_FEED_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
   ];
@@ -115,7 +141,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaPagesTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

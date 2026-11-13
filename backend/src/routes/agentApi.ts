@@ -5,12 +5,16 @@ import {
   API_KEY_SCOPE_EMAIL_READ,
   API_KEY_SCOPE_EXECUTE,
   API_KEY_SCOPE_READ,
+  API_KEY_SCOPE_SMARTLEAD_CONTROL,
+  API_KEY_SCOPE_SMARTLEAD_READ,
 } from "../mcp/server/apiKeyScopes";
 
 const GRANTABLE_API_KEY_SCOPES: readonly string[] = [
   API_KEY_SCOPE_READ,
   API_KEY_SCOPE_EXECUTE,
   API_KEY_SCOPE_EMAIL_READ,
+  API_KEY_SCOPE_SMARTLEAD_READ,
+  API_KEY_SCOPE_SMARTLEAD_CONTROL,
 ];
 
 const router = Router();
@@ -46,6 +50,13 @@ router.post(
         if (scopes.includes(API_KEY_SCOPE_EMAIL_READ) && authReq.delegateInfo?.isDelegated) {
           return res.status(403).json({
             error: `The '${API_KEY_SCOPE_EMAIL_READ}' scope cannot be granted from a delegated session.`,
+          });
+        }
+        // Same for the customer's own Smartlead account: the customer grants it, not someone acting for them.
+        const smartleadScope = [API_KEY_SCOPE_SMARTLEAD_READ, API_KEY_SCOPE_SMARTLEAD_CONTROL].find((s) => scopes.includes(s));
+        if (smartleadScope && authReq.delegateInfo?.isDelegated) {
+          return res.status(403).json({
+            error: `The '${smartleadScope}' scope cannot be granted from a delegated session.`,
           });
         }
       }

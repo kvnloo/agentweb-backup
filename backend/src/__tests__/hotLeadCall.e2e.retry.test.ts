@@ -16,7 +16,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { perListBudget, resetRetrySweepRotationForTests, runHotLeadCallRetrySweep } from '../services/voice/hotLeadCallRetrySweep';
 import { resetHotLeadCallRetryCronForTests, runHotLeadCallRetryCron } from '../cron/hotLeadCallRetryCron';
 import { runStuckCallSweep } from '../services/voice/stuckCallSweep';
-import { cooldownKey, dailyCapKey, hourlyCapKey, monthlyCapKey, phoneMarkerKey } from '../services/voice/hotLeadCallLimits';
+import { cooldownKey, dailyCapKey, hourlyCapKey, monthlyCapKey, phoneMarkerKey, platformDailyCapKey } from '../services/voice/hotLeadCallLimits';
 import * as capNotices from '../services/voice/hotLeadCallCapNotices';
 import { processHotLeadCallRetry } from '../services/hotLeadCallService';
 import { getLeadCallStore } from '../services/voice/leadCallStore';
@@ -63,7 +63,7 @@ const deferred = () => firstCall('2');
 describe('press 2 on the first call', () => {
   it('records the deferral an hour out, says the right things to both parties, and finishes the record lead_deferred', async () => {
     const { pressed, told } = await deferred();
-    expect(sayText(pressed.body)).toBe('Okay. Smith & Sons will call you again later. Goodbye.');
+    expect(sayText(pressed.body)).toBe('Okay. Smith & Sons will call you again later. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(sayText(told.body)).toBe('The lead is not available right now. We will try again later.');
     expect(record()).toMatchObject({ state: 'finished', outcome: 'lead_deferred', deferral: { dueAt: '2026-10-19T18:00:00.000Z', count: 1, firstDueAt: '2026-10-19T18:00:00.000Z' } });
     expect(eventsOf('lead-a')).toEqual(['call.initiated', 'call.member_answered', 'call.lead_declined', 'call.completed']);
@@ -77,7 +77,7 @@ describe('press 2 on the first call', () => {
     await call.memberAnswers();
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
-    expect(sayText((await call.leadAnswers()).body)).toContain('Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
+    expect(sayText((await call.leadAnswers()).body)).toContain("Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later.");
   });
 
   it('with retries switched off the prompt omits option 2 and a 2 is an ordinary decline with nothing scheduled', async () => {
@@ -87,8 +87,8 @@ describe('press 2 on the first call', () => {
     await call.memberAnswers();
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
-    expect(sayText((await call.leadAnswers()).body)).toMatch(/Press 1 to be connected now, or press 3 to stop these calls\.$/);
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect(sayText((await call.leadAnswers()).body)).toMatch(/Press 1 and we'll connect you to a person now\. You can also call us on [\d ,]+\.$/);
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     expect(record()).toMatchObject({ outcome: 'lead_declined' });
     expect(record().deferral).toBeUndefined();
@@ -103,7 +103,7 @@ describe('press 2 on the first call', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     setHotLeadCallEnabledOverride(false);
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(record().deferral).toBeUndefined();
   });
 
@@ -138,7 +138,7 @@ describe('press 2 on the first call', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     await call.leadPresses('2');
-    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again');
+    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     await call.dialEnds('completed', { DialBridged: 'false' });
     await call.leadStatus('completed', 3, { CallDuration: '12' });
     await call.memberLegEnds('completed', '40');
@@ -202,7 +202,7 @@ describe('the due-retries sweep', () => {
     await call.leadStatus('in-progress', 2);
     // The retry call is the last chance: option 2 is not offered, only 1 and 3.
     const prompt = sayText((await call.leadAnswers()).body);
-    expect(prompt).toMatch(/Press 1 to be connected now, or press 3 to stop these calls\.$/);
+    expect(prompt).toMatch(/Press 1 and we'll connect you to a person now\. You can also call us on [\d ,]+\.$/);
     expect(prompt).not.toContain('press 2');
     expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     await call.dialEnds('completed', { DialCallDuration: '60' });
@@ -220,8 +220,8 @@ describe('the due-retries sweep', () => {
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    // Not offered, so an ordinary decline: the bare hangup, the ordinary member copy, nothing scheduled.
-    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    // Not offered, so an ordinary decline: the callback-number reply, the ordinary member copy, nothing scheduled.
+    expect((await call.leadPresses('2')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Say>You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.</Say><Hangup/></Response>');
     expect(sayText((await call.dialEnds('completed', { DialBridged: 'false' })).body)).toBe('The lead did not confirm. Their details are in your lead alert.');
     await call.leadStatus('completed', 3, { CallDuration: '10' });
     await call.memberLegEnds('completed', '30');
@@ -240,7 +240,7 @@ describe('the due-retries sweep', () => {
     await call.memberPresses('1');
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
-    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again');
+    expect(sayText((await call.leadPresses('3')).body)).toContain('will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(world.crm.lead(LIST, 'lead-a')).toMatchObject({ contactStatus: 'do-not-contact' });
     expect(world.limits.claims.has(dncKey('org-a', LEAD_E164))).toBe(true);
   });
@@ -261,9 +261,10 @@ describe('the due-retries sweep', () => {
     // [reason, what was arranged, arrange]: the lead cannot or must not be called however long we wait, so the retry is spent.
     ['do_not_call', 'the lead\'s contact status', () => { world.crm.lead(LIST, 'lead-a').contactStatus = 'do-not-contact'; }],
     ['do_not_call', 'the org marker (a 3 on another lead with the same number)', async () => { await markNumberDoNotCall('org-a', LEAD_E164); }],
+    ['no_call_consent', 'the lead\'s call-consent record gone (ENG-2783)', () => { delete world.crm.lead(LIST, 'lead-a').system!.callConsent; }],
     ['not_entitled', 'a plan that lapsed', () => setHotLeadCallEntitledOverride(false)],
     ['duplicate_phone', 'another lead holding the number', () => world.limits.claims.set(phoneMarkerKey('org-a', LEAD_E164), { token: 'list-a#other#z', expiresAtS: FAR })],
-    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; }],
+    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199'); }],
   ] as Array<[string, string, () => unknown]>)('permanent refusal %s', (reason, label, arrange) => {
     it(`${label}: call.skipped ${reason}, nothing placed, the claim is kept and the retry is spent`, async () => {
       await deferred();
@@ -282,12 +283,16 @@ describe('the due-retries sweep', () => {
     });
   });
 
+  // The platform counter for the day of the run and of the next hour (a UTC midnight may fall between).
+  const fillPlatform = (n: number) => [new Date(), new Date(Date.now() + 60 * 60_000)].forEach((at) => world.limits.counters.set(platformDailyCapKey(at), n));
+
   describe.each([
     // [reason, what was arranged, arrange, undo]: a refusal that passes with time, so the claim is given back and a later run calls.
     ['no_one_available', 'nobody on duty at that hour', () => setOrg({ team: [{ ...callConfig.team[0], windows: [{ days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '01:00' }] }] }), () => setOrg({})],
     ['member_cooldown', 'the member in cooldown', () => world.limits.claims.set(cooldownKey('org-a', MEMBER_ID), { token: 'x', expiresAtS: FAR }), () => world.limits.claims.delete(cooldownKey('org-a', MEMBER_ID))],
     ['org_hourly_cap', 'a full hourly cap', () => world.limits.counters.set(hourlyCapKey('org-a', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(hourlyCapKey('org-a', new Date()))],
     ['org_daily_cap', 'a full daily cap', () => world.limits.counters.set(dailyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 1000), () => world.limits.counters.delete(dailyCapKey('org-a', 'America/Chicago', new Date()))],
+    ['platform_daily_cap', 'a reached platform-wide daily ceiling (ENG-2783)', () => fillPlatform(1000), () => fillPlatform(0)],
     ['org_monthly_cap', 'a full monthly cap', () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date(Date.now() + 60 * 60_000)), 100000), () => world.limits.counters.set(monthlyCapKey('org-a', 'America/Chicago', new Date()), 1)],
   ] as Array<[string, string, () => unknown, () => unknown]>)('transient refusal %s', (reason, label, arrange, undo) => {
     it(`${label}: call.skipped ${reason}, the claim is given back with a new due time 15 minutes on, and the next run places the call`, async () => {
@@ -354,6 +359,33 @@ describe('the due-retries sweep', () => {
     expect(skips()).toEqual(['member_cooldown', 'retry_expired']);
     expect(record().retryClaimToken).toEqual(expect.any(String));
     expect(world.provider.placedCalls).toHaveLength(1);
+    expect(await sweep()).toMatchObject({ found: 0 });
+  });
+
+  it('a platform_daily_cap refusal stays transient until firstDueAt + 6 hours (never spent early), then retry_expired (ENG-2783)', async () => {
+    await deferred();
+    fillPlatform(1000);
+    advanceMinutes(60);
+    const firstDue = (record().deferral as { dueAt: string }).dueAt;
+    const deadline = Date.parse(firstDue) + 6 * 3_600_000;
+    let last = { expired: 0, rescheduled: 0, refused: 0 };
+    for (let i = 0; i < 40 && !last.expired; i++) {
+      last = await sweep();
+      if (!last.expired) {
+        expect(Date.now()).toBeLessThanOrEqual(deadline);
+        expect(last).toMatchObject({ rescheduled: 1, refused: 0 });
+        expect(record().retryClaimToken).toBeUndefined(); // the claim was given back
+        expect(record().deferral).toMatchObject({ firstDueAt: firstDue });
+        expect(Date.parse((record().deferral as { dueAt: string }).dueAt)).toBeGreaterThanOrEqual(Date.now() + 15 * 60_000);
+        expect(skips()).toEqual(['platform_daily_cap']); // one note per reason, no retry_expired yet
+      }
+      advanceMinutes(15);
+    }
+    expect(last.expired).toBe(1);
+    // Spent at the 6-hour limit or earlier when no open minute (the 18:00 Eastern lead window) is left inside it; never later.
+    expect(Date.now()).toBeLessThanOrEqual(deadline + 15 * 60_000);
+    expect(skips()).toEqual(['platform_daily_cap', 'retry_expired']);
+    expect(world.provider.placedCalls).toHaveLength(1); // no retry call was ever placed
     expect(await sweep()).toMatchObject({ found: 0 });
   });
 
@@ -644,6 +676,7 @@ function seedDeferred(listId: string, dueAt: string, mac = true): string {
   const e164 = `+1212555${String(100 + (i % 800)).padStart(4, '0')}`;
   world.crm.addLead({ listId, leadId, phone: e164, firstName: 'J', email: `${leadId}@example.com`, createdAt: '2026-10-19T00:00:00.000Z', customFields: { stage: 'complete' } });
   world.crm.lead(listId, leadId).system = {
+    ...world.crm.lead(listId, leadId).system,
     hot_lead_call: {
       state: 'finished', outcome: 'lead_deferred', jobKey: `j${i}`, startedAt: '2026-10-19T00:00:00.000Z', updatedAt: '2026-10-19T00:00:00.000Z', attemptNo: 1,
       memberId: MEMBER_ID, triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {}, leadPhoneMac: mac ? leadPhoneMacOf('org-a', e164) : 'other', deferral: { dueAt, count: 1 },

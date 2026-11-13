@@ -141,8 +141,9 @@ describe('ENG-2303 guarded Meta writes', () => {
     const deps = makeDeps();
     const preview: any = await executeMetaToolkitWrite('u1', createArgs(), deps);
     const confirm = { ...createArgs(), confirm: true, preview_token: preview.preview_token };
-    await executeMetaToolkitWrite('u1', confirm, deps);
-    await expect(executeMetaToolkitWrite('u1', confirm, deps)).rejects.toThrow(/already used/);
+    const first: any = await executeMetaToolkitWrite('u1', confirm, deps);
+    // ENG-2931: a repeat confirm replays the first outcome; it never dispatches again.
+    await expect(executeMetaToolkitWrite('u1', confirm, deps)).resolves.toMatchObject({ verification: first.verification, replayed: true });
     expect(deps.dispatch).toHaveBeenCalledTimes(1);
   });
 
@@ -226,7 +227,7 @@ describe('ENG-2303 guarded Meta writes', () => {
 
   it('UPDATE is limited to status/budget fields and internal gate flags are refused', async () => {
     const deps = makeDeps();
-    await expect(executeMetaToolkitWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: '111', campaign_id: '1', params: { name: 'x' } }, deps))
+    await expect(executeMetaToolkitWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: '111', campaign_id: '1', params: { objective: 'OUTCOME_SALES' } }, deps))
       .rejects.toThrow(/can change only/);
     await expect(executeMetaToolkitWrite('u1', { entity_type: 'AD', action: 'UPDATE', account_id: '111', ad_id: '1', params: { daily_budget: 5 } }, deps))
       .rejects.toThrow(/can change only: status/);

@@ -96,7 +96,20 @@ const MAX_SAMPLE_TRACES = 3;
  *   model_uninstalled_tool — the model called a tool it does not have; registry/prompt
  * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
  */
-export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
+export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool', 'not_connected']);
+
+/**
+ * ENG-2943: the never-connected precondition ("No Fathom account connected.
+ * Please connect...") means the user never linked the integration. There is no
+ * account to repair and no handler bug, so it must not file an oncall row.
+ * Genuine auth failures on a connected account (expired/revoked token, missing
+ * scope, invalid_grant) do not match and stay `config`.
+ */
+const NEVER_CONNECTED_RE = /\bno\s+[\w .\-/]{1,40}?\s+accounts?\s+(?:is\s+|are\s+)?connected\b/i;
+
+export function isNeverConnectedMessage(message: string): boolean {
+  return NEVER_CONNECTED_RE.test(message);
+}
 
 /**
  * Directive per failure class. The whole defect was appending one sentence —
@@ -186,9 +199,9 @@ export class AgentFailureRuleSet
         stats.invocations++;
       } else {
         const ec = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
-        const ft = strDim(e.dimensions?.failureType) || '';
-        stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         const em = strDim(e.dimensions?.errorMessage) || '';
+        const ft = isNeverConnectedMessage(em) ? 'not_connected' : strDim(e.dimensions?.failureType) || '';
+        stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         // Store under this event's OWN (failure class, error class) pair, so
         // the directive can quote a message that actually belongs to both the
         // failure class AND the error class it is advising on.

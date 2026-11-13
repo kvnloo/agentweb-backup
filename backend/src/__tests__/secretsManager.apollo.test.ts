@@ -153,6 +153,32 @@ describe('secretsManager — getApolloWebhookSecret', () => {
     expect(await b()).toBe(fallback);
   });
 
+  describe('production (ENG-2803)', () => {
+    const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
+    afterEach(() => { process.env.NODE_ENV = ORIGINAL_NODE_ENV; });
+
+    it.each([['unset', undefined], ['empty', ''], ['whitespace-only', '   ']])(
+      'refuses to use the committed default when the env var is %s', async (_label, value) => {
+        process.env.NODE_ENV = 'production';
+        if (value !== undefined) process.env.APOLLO_WEBHOOK_SECRET = value;
+        const { getApolloWebhookSecret } = await import('../utils/secretsManager');
+        await expect(getApolloWebhookSecret()).rejects.toThrow(/APOLLO_WEBHOOK_SECRET is not set/);
+      });
+
+    it('uses the env var when it is set', async () => {
+      process.env.NODE_ENV = 'production';
+      process.env.APOLLO_WEBHOOK_SECRET = ' prod_value ';
+      const { getApolloWebhookSecret } = await import('../utils/secretsManager');
+      expect(await getApolloWebhookSecret()).toBe('prod_value');
+    });
+
+    it('still falls back to the default outside production', async () => {
+      process.env.NODE_ENV = 'development';
+      const { getApolloWebhookSecret } = await import('../utils/secretsManager');
+      expect(await getApolloWebhookSecret()).toBe('dev_apl_wh_8k3p2x9qm7n4r5z6_v1');
+    });
+  });
+
   it('falls back to default when env var is whitespace-only', async () => {
     process.env.APOLLO_WEBHOOK_SECRET = '   ';
     const { getApolloWebhookSecret: a } = require('../utils/secretsManager');

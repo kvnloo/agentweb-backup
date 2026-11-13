@@ -17,6 +17,12 @@ const mockSessionSendRealtimeInput = jest.fn();
 const mockSessionSendToolResponse = jest.fn();
 const mockSessionClose = jest.fn();
 
+// ENG-2957: voice now checks the account's allowance at start and after each turn; these tests are about other rules.
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn(async () => ({ allowed: true, month: '2026-11' })),
+}));
+
 jest.mock('@google/genai', () => ({
   GoogleGenAI: jest.fn().mockImplementation(() => ({
     live: {
@@ -1037,6 +1043,25 @@ describe('tool call surfacing', () => {
     mockLiveConnect.mockImplementation(({ callbacks: cbs }: any) => {
       Object.assign(makeCallbacks(), cbs);
       return Promise.resolve(mockSession);
+    });
+  });
+
+  it('ENG-2816: a refused tool (a share visitor calling an owner-only tool) reaches Gemini as an error, not as a result', async () => {
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-refused', 'socket-1', jest.fn(), 'test-user-id', 'default', undefined, 'share_visitor');
+    const refusal = 'Tool "save_memory" acts on the owner\'s organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.';
+    mockExecuteTool.mockRejectedValue(Object.assign(new Error(refusal), { name: 'ToolRestrictionDenied', deniedBy: 'restriction_profile' }));
+
+    callbacks['onmessage']?.({ toolCall: { functionCalls: [{ id: 'fc-refused', name: 'save_memory', args: { content: 'x' } }] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      expect.any(String), 'save_memory', { content: 'x' }, 'test-user-id', 'session-refused', false,
+      { isUnattendedRun: false, restrictionProfile: 'share_visitor' },
+    );
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [expect.objectContaining({ id: 'fc-refused', name: 'save_memory', response: { error: refusal } })],
     });
   });
 

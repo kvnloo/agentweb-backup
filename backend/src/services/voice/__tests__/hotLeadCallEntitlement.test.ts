@@ -63,3 +63,32 @@ describe('assertHotLeadCallEntitled', () => {
     await expect(assertHotLeadCallEntitled(ORG)).rejects.toThrow(HOT_LEAD_CALL_NOT_ENTITLED_MESSAGE);
   });
 });
+
+describe('billing add-on (ENG-2783)', () => {
+  const active = { ...ORG, hotLeadCallBilling: { status: 'active' } };
+  const lapsed = { ...ORG, hotLeadCallBilling: { status: 'past_due' } };
+  afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+
+  it.each([
+    ['unset', undefined, ORG, true],
+    ['"false"', 'false', ORG, true],
+    ['"TRUE" (not exactly true)', 'TRUE', ORG, true],
+    ['required, no add-on', 'true', ORG, false],
+    ['required, past_due', 'true', lapsed, false],
+    ['required, active', 'true', active, true],
+  ])('billing %s -> entitled %s', async (_name, env, org, expected) => {
+    if (env !== undefined) process.env.HOT_LEAD_CALL_BILLING_REQUIRED = env;
+    expect(await isHotLeadCallEntitled(org)).toBe(expected);
+  });
+
+  it('an active add-on does not make up for a plan without the feature', async () => {
+    process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+    mockTier.mockResolvedValue({ name: 'Starter', allowedFeatures: ['scheduled_chats'] });
+    expect(await isHotLeadCallEntitled(active)).toBe(false);
+  });
+
+  it('setup steps check the plan only, so the add-on can be bought when calling is turned on', async () => {
+    process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+    await expect(assertHotLeadCallEntitled(ORG)).resolves.toBeUndefined();
+  });
+});

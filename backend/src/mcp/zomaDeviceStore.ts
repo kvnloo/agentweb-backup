@@ -36,6 +36,8 @@ export interface ZomaDeviceRecord {
   createdAt: string;
   events?: ZomaSetupEvent[];
   lastPollOutcome?: string;
+  /** ENG-2906: validated attribution ref from POST /api/zoma/setup (?ref= or body.ref). */
+  ref?: string;
 }
 
 export interface ZomaTokenRecord {

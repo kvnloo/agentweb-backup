@@ -102,6 +102,10 @@ router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.
 // Get supported LLM models (public)
 router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedModels));
 
+// GET /api/agent-mode/public/voice-model
+// The live-voice model a chat's voice button switches to (share pages use the public catalog, which never lists it)
+router.get('/public/voice-model', asyncHandler(agentModeController.getPublicVoiceModel));
+
 // GET /api/agent-mode/public/reports-model-options
 // Get models suitable for report generation (public)
 router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));

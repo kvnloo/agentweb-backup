@@ -54,6 +54,11 @@ jest.mock('../services/connectedAccountsDb', () => ({
 const mockAssertPublicHostname = jest.fn();
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  // ENG-2928: uploadAsset resolves once and pins; the same mock decides allow/block.
+  resolvePinnedPublicAddress: async (...args: any[]) => {
+    await mockAssertPublicHostname(...args);
+    return { hostname: 'example.com', address: '93.184.216.34', family: 4 };
+  },
   SsrfBlockedError: class SsrfBlockedError extends Error {
     constructor(message = 'URL resolves to a private/internal address') {
       super(message);
@@ -1704,6 +1709,16 @@ describe('uploadAsset — SSRF protection', () => {
     expect(opts.maxBodyLength).toBeGreaterThan(0);
   });
 
+  it('pins the fetch to the validated address, so DNS cannot be rebound between check and connect (ENG-2928)', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assets/10' }] } });
+    await service.uploadAsset('user-123', '1234567890', { type: 'IMAGE', name: 'hero.jpg', data: 'https://rebind.example.com/hero.jpg' });
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(typeof opts.lookup).toBe('function');
+    const resolved = await new Promise<any[]>((resolve) => opts.lookup('rebind.example.com', {}, (...r: any[]) => resolve(r)));
+    expect(resolved).toEqual([null, '93.184.216.34', 4]);
+  });
+
   it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
     mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
     await expect(service.uploadAsset('user-123', '1234567890', {
@@ -1848,6 +1863,8 @@ describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', ()
 describe('setDeviceBidAdjustments (ENG-2036)', () => {
   it('updates the campaign device criteria bid_modifier in one atomic mutation', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'CAMPAIGN',
       customerId: '1234567890',
@@ -1857,7 +1874,7 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
         { device: 'TABLET', bidModifier: 0 },
       ],
     });
-    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3); // mutate + one read-back per criterion (ENG-2398)
     const [url, body] = mockAxiosPost.mock.calls[0];
     expect(url).toMatch(/campaignCriteria:mutate$/);
     expect(body.operations).toEqual([
@@ -1868,7 +1885,8 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
 
   it('creates ad-group device bid modifiers', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1234567890/adGroupBidModifiers/77~30000' }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.25 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'AD_GROUP',
       customerId: '1234567890',
@@ -1886,7 +1904,12 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [
       { adGroupBidModifier: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', device: { type: 'MOBILE' } } },
     ] } });
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001' },
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30002' },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 0.5 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.1 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'AD_GROUP',
       customerId: '1234567890',

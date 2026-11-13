@@ -56,6 +56,67 @@ export function consumePreviewToken(consumed: Map<string, number>, token: string
   return true;
 }
 
+/**
+ * ENG-2945: the single swap point for single-use preview-token claims. The durable,
+ * cross-instance store (ENG-2862) is Requires: Me; until then every Zoma write toolkit
+ * shares one in-process store so a token confirmed through one toolkit cannot be replayed
+ * through another. `consume` resolves true exactly once per unexpired token.
+ */
+export interface ConsumedTokenStore {
+  consume(token: string, expiresAt: number, now?: number): Promise<boolean>;
+}
+
+export class InMemoryConsumedTokenStore implements ConsumedTokenStore {
+  private readonly consumed = new Map<string, number>();
+
+  async consume(token: string, expiresAt: number, now: number = Date.now()): Promise<boolean> {
+    for (const [t, exp] of this.consumed) if (exp <= now) this.consumed.delete(t);
+    if (expiresAt <= now || this.consumed.has(token)) return false;
+    this.consumed.set(token, expiresAt);
+    return true;
+  }
+}
+
+/** Process-wide default shared by every Meta + Google toolkit write path. */
+export const defaultConsumedTokenStore: ConsumedTokenStore = new InMemoryConsumedTokenStore();
+
+/** Toolkit deps accept the store, or a bare Map kept for existing test injection. */
+export type ConsumedTokens = ConsumedTokenStore | Map<string, number>;
+
+export async function consumeToken(store: ConsumedTokens, token: string, now: number): Promise<boolean> {
+  if (store instanceof Map) return consumePreviewToken(store, token, now);
+  return store.consume(token, Number(token.split('.')[1]), now);
+}
+
+/**
+ * ENG-2931: a provider wrapper that caught a transport failure (no response, timeout,
+ * connection reset, 5xx/408) returns a plain failure, but the write may still have been
+ * applied. Those are outcome-unknown, never a definite "did not apply".
+ */
+export function isOutcomeUnknownFailure(result: any): boolean {
+  if (!result || result.success) return false;
+  const code = Number(result.code ?? result.status_code);
+  if (Number.isFinite(code) && code > 0) return code >= 500 || code === 408;
+  const text = `${result.error ?? ''} ${result.message ?? ''}`;
+  return /no response was received|timed? ?out|ETIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|network error|EPIPE|EAI_AGAIN/i.test(text);
+}
+
+/**
+ * ENG-2931: outcome remembered per consumed preview token, so a client that lost the answer
+ * and repeats its confirm gets that outcome back instead of a bare "already used". In-process
+ * and TTL-bound like the consumed-token set (no durable store — data-plane gate).
+ */
+export function rememberTokenOutcome(outcomes: Map<string, { exp: number; outcome: any }>, token: string, outcome: any): any {
+  outcomes.set(token, { exp: Number(token.split('.')[1]), outcome });
+  return outcome;
+}
+
+export function replayTokenOutcome(outcomes: Map<string, { exp: number; outcome: any }>, token: string, now: number): any | null {
+  for (const [t, v] of outcomes) if (v.exp <= now) outcomes.delete(t);
+  const hit = outcomes.get(token);
+  return hit ? { ...hit.outcome, replayed: true, note: 'This preview_token was already confirmed; this is the outcome of that confirm. Nothing new was sent.' } : null;
+}
+
 /** The PREVIEW response every provider returns for an unconfirmed call. */
 export function previewResponse(params: { secret: string; userId: string; now: number; fingerprint: string; preview: string }) {
   const exp = params.now + PREVIEW_TOKEN_TTL_MS;

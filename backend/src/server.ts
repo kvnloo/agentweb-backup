@@ -30,6 +30,7 @@ import {
   getEffectiveLiveUserId,
   registerLiveCloseHandler,
   registerLiveStartHandler,
+  authenticateConversableSocket,
 } from './services/liveVoiceSocket';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -166,22 +167,10 @@ io.use(async (socket, next) => {
 
   // Allow conversable (iShare) sockets — validate token against session in DynamoDB
   if (conversableToken && conversableSessionId) {
-    try {
-      const session = await chatbotDb.getChatSession(conversableSessionId);
-      if (!session) return next(new Error('Session not found'));
-      const interactiveToken = session.interactiveShareMetadata?.token;
-      if (!interactiveToken || interactiveToken !== conversableToken) {
-        return next(new Error('Invalid conversable token'));
-      }
-      if (!session.interactiveShareMetadata?.isActive) {
-        return next(new Error('Interactive share is not active'));
-      }
-      socket.data.conversableSessionId = conversableSessionId;
-      socket.data.conversableUserId = session.userId;
-      return next();
-    } catch (err: any) {
-      return next(new Error('Conversable auth error'));
-    }
+    const result = await authenticateConversableSocket(socket.handshake.auth, (id) => chatbotDb.getChatSession(id));
+    if (!result.ok) return next(new Error(result.error));
+    Object.assign(socket.data, result.data);
+    return next();
   }
 
   return next(new Error('Authentication error'));
@@ -436,6 +425,10 @@ const runDrain = async (reason: string): Promise<void> => {
   // ENG-2113: a Claude-plan tool call that was still running when its turn ended is looked for one last time and saved, so it is not lost with the process.
   await import('./services/funding/claudeCodeBackendInstance')
     .then((m) => m.claudeCodeBackend.flush())
+    .catch(() => undefined);
+  // ENG-2906: flush queued product-journey events (PostHog batches in memory).
+  await import('./services/journeyTracking')
+    .then((m) => m.flushJourney())
     .catch(() => undefined);
   // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
   await import('./services/funding/claudeSubscriptionService')
@@ -1374,6 +1367,26 @@ createTestAccount().then(async () => {
         console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
       }
 
+      // Scheduled-run cost jump flag (ENG-2743). Read-only: once a day, during one UTC hour
+      // (SCHEDULE_COST_JUMP_SEND_HOUR_UTC), compares each schedule's cost on the last complete
+      // UTC day with its own previous 7 days and emails the oncall list when any jumped
+      // (>= 2x its median and >= $3). Ticks every 15 minutes; outside that hour a tick does nothing.
+      try {
+        const { scheduleCostJumpTick, SCHEDULE_COST_JUMP_TICK_MS } = await import('./cron/scheduleCostJumpCron');
+        if (isCronEnabled()) {
+          cronJobRegistry.track('scheduleCostJumpCron', scheduleCostJumpTick())
+            .catch(e => console.error('[scheduleCostJumpCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('scheduleCostJumpCron', scheduleCostJumpTick())
+            .catch(e => console.error('[scheduleCostJumpCron] Error:', e));
+        }, SCHEDULE_COST_JUMP_TICK_MS);
+        console.log('[scheduleCostJumpCron] Initialized — 15-minute tick, acts once a day in its UTC hour');
+      } catch (error) {
+        console.error('[scheduleCostJumpCron] Failed to initialize:', error);
+      }
+
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
       // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
       // mailbox send (Graph produces no Resend webhooks), so this polls each connected
@@ -1784,7 +1797,7 @@ createTestAccount().then(async () => {
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
-      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear bug stats,
       // DMs Harsha through the existing loop Slack rail, and appends one
       // snapshot for restart-safe trend rendering.
       if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {

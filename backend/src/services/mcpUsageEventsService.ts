@@ -3,6 +3,8 @@ import AWS from 'aws-sdk';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import type { DynamoAttributeMap, DynamoAttributeValue } from '../loops/core/ports';
 import { userDb } from './db';
+import { normalizeProduct, validateRef, type JourneyProduct } from './journeyAttribution';
+import { isDatabricksRedirectUri } from '../mcp/zomaDatabricksReadOnly';
 
 export const EMMA_MCP_LOOP_ID = 'emma-mcp';
 export const EVT_MCP_OAUTH_STARTED = 'mcp_oauth_started';
@@ -22,6 +24,7 @@ export type McpClientType =
   | 'chatgpt'
   | 'hermes'
   | 'openclaw'
+  | 'databricks'
   | 'api_key'
   | 'unknown';
 
@@ -33,6 +36,8 @@ export interface McpUsageEventStore {
 }
 
 export interface McpConnectionAttemptInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   authMethod?: McpAuthMethod;
   apiKeyId?: string;
@@ -42,10 +47,14 @@ export interface McpConnectionAttemptInput {
   sessionId?: string;
   userAgent?: string;
   requestId?: string;
+  /** ENG-2906: validated `ref` from the MCP URL (?ref=); dropped when invalid. */
+  ref?: string;
   now?: Date;
 }
 
 export interface McpOAuthStartedInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   clientId: string;
   clientName?: string;
   clientType?: McpClientType;
@@ -56,6 +65,8 @@ export interface McpOAuthStartedInput {
 }
 
 export interface McpOAuthUserEventInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   clientId?: string;
   clientName?: string;
@@ -67,6 +78,8 @@ export interface McpOAuthUserEventInput {
 }
 
 export interface McpToolUseInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   toolName: string;
   authMethod?: McpAuthMethod;
@@ -79,6 +92,8 @@ export interface McpToolUseInput {
   userAgent?: string;
   /** ENG-2823: ad platform a Zoma toolkit call ran against ('meta' | 'google_ads'). */
   platform?: string;
+  /** ENG-2906: validated `ref` from the MCP URL (?ref=); dropped when invalid. */
+  ref?: string;
   now?: Date;
 }
 
@@ -88,6 +103,8 @@ export interface McpWriteExecutedInput extends McpToolUseInput {
   /** Read-back verdict: CONFIRMED | MISMATCH | UNCONFIRMED. */
   verification: string;
   objectId?: string;
+  /** ENG-2902: create | edit | pause | approve (status→ACTIVE go-live); scoreboard input. */
+  writeKind?: string;
 }
 
 export interface McpUserUsage {
@@ -216,6 +233,7 @@ export async function recordMcpOAuthStarted(
     ts,
     tsSession: `${ts}#${clientId}#${EVT_MCP_OAUTH_STARTED}#${Math.random().toString(36).slice(2, 10)}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       clientId,
       clientName: cleanString(input.clientName),
       clientType: input.clientType ?? classifyMcpClient(input),
@@ -257,6 +275,7 @@ export async function recordMcpConnectionAttempt(
     ts,
     tsSession: `${ts}#${input.userId}#${EVT_MCP_CONNECTION_ATTEMPTED}#${requestId}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -265,6 +284,7 @@ export async function recordMcpConnectionAttempt(
       sessionId: cleanString(input.sessionId),
       userAgent: cleanString(input.userAgent),
       requestId,
+      ref: validateRef(input.ref),
     },
   });
 
@@ -285,6 +305,7 @@ export async function recordMcpToolUse(
     ts,
     tsSession: `${ts}#${input.userId}#${EVT_MCP_TOOL_USED}#${Math.random().toString(36).slice(2, 10)}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -295,6 +316,7 @@ export async function recordMcpToolUse(
       toolName: input.toolName,
       userAgent: cleanString(input.userAgent),
       platform: cleanString(input.platform),
+      ref: validateRef(input.ref),
     },
   });
 
@@ -319,6 +341,7 @@ export async function recordMcpWriteExecuted(
     ts,
     tsSession: `${ts}#${input.userId}#${EVT_MCP_WRITE_EXECUTED}#${Math.random().toString(36).slice(2, 10)}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -331,6 +354,7 @@ export async function recordMcpWriteExecuted(
       action: input.action,
       verification: input.verification,
       objectId: cleanString(input.objectId),
+      writeKind: cleanString(input.writeKind),
     },
   });
   await store.put(item);
@@ -382,6 +406,7 @@ export async function recordMcpFirstToolUse(
     ts,
     tsSession: `first_use#${input.userId}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -562,6 +587,7 @@ async function recordMcpUserEvent(
     ts,
     tsSession: `${eventType}#${input.userId}#${cleanString(input.clientId) ?? 'unknown'}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: 'oauth',
       clientId: cleanString(input.clientId),
       clientName: cleanString(input.clientName),
@@ -723,6 +749,7 @@ const MCP_CLIENT_TYPES = new Set<McpClientType>([
   'chatgpt',
   'hermes',
   'openclaw',
+  'databricks',
   'api_key',
   'unknown',
 ]);
@@ -742,6 +769,17 @@ export function classifyMcpClient(input: {
   const userAgent = cleanString(input.userAgent)?.toLowerCase() ?? '';
   const redirectUri = cleanString(input.redirectUri)?.toLowerCase() ?? '';
   const haystack = `${clientName} ${userAgent} ${redirectUri}`;
+
+  // ENG-2747: Databricks registers its OAuth client through DCR as "Databricks" with a redirect on a
+  // Databricks host. Checked first (a Databricks agent may run any model, so a model name elsewhere
+  // must not win), but never for aw_ key callers, which stay in the api_key bucket. The redirect
+  // uses the same host test as the Zoma read-only gate, so analytics and access agree.
+  if (
+    input.authMethod !== 'api_key' &&
+    (clientName === 'databricks' || (redirectUri !== '' && isDatabricksRedirectUri(redirectUri)))
+  ) {
+    return 'databricks';
+  }
 
   if (haystack.includes('claude-code') || haystack.includes('claude code') || haystack.includes('claudecode')) {
     return 'claude_code';

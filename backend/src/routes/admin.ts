@@ -13,7 +13,8 @@ import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/dele
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
-import { waitlistDb } from "../services/waitlistDb";
+import { waitlistDb, WaitlistCapacityCounterError } from "../services/waitlistDb";
+import { applyZomaWaitlistDecision } from "../services/zomaAdmission";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
@@ -29,6 +30,7 @@ import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { deriveSelfActivity } from "../utils/selfActivity";
 import { getProjectionsBatch } from "../services/spendProjectionDb";
+import { parseProductFilter, PRODUCT_FILTERS, userHasProduct } from "../services/journeyAttribution";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
 import { grantTokenBonus, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
@@ -230,6 +232,14 @@ const ADMIN_USER_LIST_FIELDS = [
   "phoneNumber",
   "orgId",
   "orgRole",
+  // ENG-2906: product attribution (Zoma / Emma MCP / Emma web) for the Users page pills + filter.
+  "signupProduct",
+  "signupClient",
+  "signupRef",
+  "attributionConfidence",
+  "products",
+  "zomaStage",
+  "zomaStageAt",
 ] as const;
 
 const compactAdminUserForList = (user: any, hasUsageThisMonth = false, spendThisMonthUsd?: number): Record<string, any> => {
@@ -797,9 +807,15 @@ router.get("/email-deliverability/mx-sweep", async (_req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
+    // ENG-2906: optional ?product=zoma|emma_mcp|emma_web, applied before the per-user enrichment.
+    const product = parseProductFilter(req.query.product);
+    if (product === null) {
+      return res.status(400).json({ message: `product must be one of ${PRODUCT_FILTERS.join(", ")}` });
+    }
     // The partner-portal roster is where Access Portal lives; sandbox (eval_)
     // accounts must stay reachable here even though every fleet sweep excludes them.
-    const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
+    const allUsers = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
+    const users = product ? allUsers.filter((u: any) => userHasProduct(u, product)) : allUsers;
     // ENG-1271 / ENG-1250 AC7: "has spend this month" for the self-activity signal comes
     // from the spend ledger in one batched read, not the retired legacy counter. It is a
     // secondary signal, so a failed read must not take the whole roster down: log it and
@@ -2160,6 +2176,12 @@ router.put("/waitlist/:email/status", async (req, res) => {
       }
     }
 
+    // ENG-2881: under the Zoma gate, Invite/Reject is the admission decision (seat reserved first).
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as any).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
+
     // Update invitedAt timestamp for invited users
     let invitedAt;
     if (status === "invited") {
@@ -2196,6 +2218,9 @@ router.put("/waitlist/:email/status", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Error updating waitlist status" });
   }
@@ -2221,6 +2246,9 @@ router.put("/waitlist/:email", async (req, res) => {
     const updatedEntry = await waitlistDb.updateDetails(email, updates);
     res.json(updatedEntry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist entry:", error);
     res.status(500).json({ message: "Error updating waitlist entry" });
   }
@@ -2252,6 +2280,9 @@ router.put("/waitlist/:email/support-note", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist support note:", error);
     res.status(500).json({ message: "Error updating support note" });
   }
@@ -2281,7 +2312,7 @@ router.delete("/waitlist/:email", async (req, res) => {
     } else {
       // Use the message from deleteByEmail if available, otherwise a generic one
       res
-        .status(500)
+        .status(result.conflict ? 409 : 500)
         .json({ message: result.message || "Failed to delete waitlist entry" });
     }
   } catch (error) {

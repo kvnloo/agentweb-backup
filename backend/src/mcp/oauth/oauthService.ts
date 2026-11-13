@@ -15,6 +15,8 @@ import { isEvaluationUser, requireActiveEvaluation } from '../../services/evalua
 import AWS from "aws-sdk";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
+import type { AttributionConfidence, JourneyProduct } from "../../services/journeyAttribution";
+import { isJourneyProduct, validateRef } from "../../services/journeyAttribution";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
@@ -51,6 +53,20 @@ export interface OAuthAuthorizationCode {
   used: boolean;
   expiresAt: number; // epoch seconds (DynamoDB TTL)
   createdAt: string;
+  /** ENG-2906 attribution only — never consulted for authorization. Absent on legacy codes. */
+  product?: JourneyProduct;
+  attributionConfidence?: AttributionConfidence;
+  ref?: string;
+}
+
+/**
+ * ENG-2906: what /oauth/authorize learned (RFC 8707 resource, ref) before the portal consent
+ * page, which posts back only the standard fields. Keyed by client + PKCE challenge.
+ */
+export interface PendingAuthorizationAttribution {
+  product: JourneyProduct;
+  confidence: AttributionConfidence;
+  ref?: string;
 }
 
 export interface OAuthTokenRecord {
@@ -67,6 +83,8 @@ export interface OAuthTokenRecord {
   revoked: boolean;
   revokedAtSec?: number; // epoch seconds when this record's refresh was consumed; bounds replay grace.
   createdAt: string;
+  /** ENG-2906 attribution only; copied onto every rotated successor. Absent on legacy tokens. */
+  product?: JourneyProduct;
 }
 
 export interface TokenPairResponse {
@@ -104,18 +122,26 @@ export interface CreateAuthCodeParams {
   scope: string;
   codeChallenge: string;
   codeChallengeMethod: string;
+  product?: JourneyProduct;
+  attributionConfidence?: AttributionConfidence;
+  ref?: string;
 }
 
 export interface CreateTokenPairParams {
   clientId: string;
   userId: string;
   scope: string;
+  product?: JourneyProduct;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SUPPORTED_AUTH_METHODS = ['none', 'client_secret_basic', 'client_secret_post'];
 const AUTH_CODE_TTL_SEC = 600; // 10 minutes
+// A pending attribution row lives as long as a consent page plausibly stays open (sign-up included).
+const PENDING_AUTHORIZATION_TTL_SEC = 3600;
+const pendingAuthorizationKey = (clientId: string, codeChallenge: string) =>
+  `pending#${crypto.createHash('sha256').update(`${clientId}\n${codeChallenge}`).digest('hex')}`;
 const ACCESS_TOKEN_TTL_SEC = 3600; // 1 hour
 const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 3600; // 30 days
 // Duplicate-delivery grace: a consumed refresh token re-presented within this window
@@ -289,6 +315,9 @@ export class McpOAuthService {
       used: false,
       expiresAt: nowSec + AUTH_CODE_TTL_SEC,
       createdAt: new Date().toISOString(),
+      ...(isJourneyProduct(params.product) && { product: params.product }),
+      ...(params.attributionConfidence && { attributionConfidence: params.attributionConfidence }),
+      ...(validateRef(params.ref) ? { ref: params.ref } : {}),
     };
 
     await writeWithEvaluationGuard(dynamodb, params.userId, TABLE_PREFIX, { Put: {
@@ -297,6 +326,42 @@ export class McpOAuthService {
     } });
 
     return { code };
+  }
+
+  // ─── Pending authorization attribution (ENG-2906) ──────────────────────
+  // Stored in the codes table under a `pending#<sha256>` key. It has no `used` attribute, so
+  // consumeAuthorizationCode (which requires used === false) can never redeem it, and the key
+  // can never collide with a real 96-hex-char code. Best-effort: callers swallow failures.
+
+  async savePendingAuthorization(clientId: string, codeChallenge: string, attribution: PendingAuthorizationAttribution): Promise<void> {
+    const ref = validateRef(attribution.ref);
+    await dynamodb.put({
+      TableName: this.codesTable,
+      Item: {
+        code: pendingAuthorizationKey(clientId, codeChallenge),
+        kind: 'pending_authorization',
+        product: attribution.product,
+        attributionConfidence: attribution.confidence,
+        ...(ref ? { ref } : {}),
+        expiresAt: Math.floor(Date.now() / 1000) + PENDING_AUTHORIZATION_TTL_SEC,
+        createdAt: new Date().toISOString(),
+      },
+    }).promise();
+  }
+
+  async takePendingAuthorization(clientId: string, codeChallenge: string, preserveForRetry = false): Promise<PendingAuthorizationAttribution | null> {
+    const code = pendingAuthorizationKey(clientId, codeChallenge);
+    const result = await dynamodb.get({ TableName: this.codesTable, Key: { code } }).promise();
+    const item = result.Item;
+    if (!item || item.kind !== 'pending_authorization' || !isJourneyProduct(item.product) ||
+        !Number.isFinite(item.expiresAt) || item.expiresAt <= Math.floor(Date.now() / 1000)) return null;
+    // Admission can refuse consent. Keep the product hint for an identical retry;
+    // it expires via the existing DynamoDB TTL and cannot be redeemed as a code.
+    if (!preserveForRetry) await dynamodb.delete({ TableName: this.codesTable, Key: { code } }).promise().catch(() => undefined);
+    const confidence: AttributionConfidence =
+      item.attributionConfidence === 'explicit' || item.attributionConfidence === 'inferred' ? item.attributionConfidence : 'unknown';
+    const ref = validateRef(item.ref);
+    return { product: item.product, confidence, ...(ref ? { ref } : {}) };
   }
 
   async consumeAuthorizationCode(code: string, clientId?: string, redirectUri?: string, codeVerifier?: string): Promise<OAuthAuthorizationCode | null> {
@@ -384,6 +449,8 @@ export class McpOAuthService {
       ...(!familyId && { familyRevoked: false }),
       revoked: false,
       createdAt: new Date().toISOString(),
+      // Refresh passes the predecessor record as params, so product rides every rotation.
+      ...(isJourneyProduct(params.product) && { product: params.product }),
     };
 
     return { record, response: {

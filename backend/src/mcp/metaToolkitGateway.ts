@@ -12,6 +12,7 @@
  * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
  * only. No new table, key or persistence model (data-plane gate respected).
  */
+import { withMetaToolkitBackoff } from '../utils/metaToolkitBackoff';
 import { agentApiKeyService } from '../services/agentApiKeyService';
 import { mcpOAuthService } from './oauth/oauthService';
 import {
@@ -23,22 +24,43 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
-import { isZomaTool } from './zomaToolDefinitions';
+import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
 import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
+import { getMetaHelpArticles } from './metaToolkitHelp';
 import { executeMetaToolkitWrite, isGuardedWriteRequest } from './metaToolkitWrites';
 import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
+import { EXPERIMENT_WRITE_KIND, isMetaExperimentWrite, isMetaExperimentWriteTool, runMetaExperimentWriteTool } from './metaToolkitExperimentWrites';
+import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
+import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
+import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
+import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
+import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
+import { executeMetaToolkitAudience } from './metaToolkitAudiences';
+import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
+import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
+import { zomaWriteKindFor } from '../services/zomaWriteKind';
+
+/**
+ * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
+ * successful read / executed write moves the user's zomaStage and emits first_read /
+ * first_write once. Fire-and-forget: journey capture never delays or fails a tool call.
+ */
+const TOOLKIT_PRODUCT = 'zoma' as const;
+function journeyAfterCall(userId: string, event: 'first_read' | 'first_write', props: Record<string, unknown>) {
+  void zomaMilestone(userId, event, { emit: 'if_advanced', props: { product: TOOLKIT_PRODUCT, ...props } });
+}
 
 export class MetaToolkitAuthError extends Error {
-  readonly status: 401 | 403 | 429;
+  readonly status: 401 | 403 | 429 | 503;
   readonly retryAfterSeconds?: number;
-  constructor(message: string, status: 401 | 403 | 429, retryAfterSeconds?: number) {
+  constructor(message: string, status: 401 | 403 | 429 | 503, retryAfterSeconds?: number) {
     super(message);
     this.name = 'MetaToolkitAuthError';
     this.status = status;
@@ -59,6 +81,8 @@ export interface MetaToolkitCaller {
   clientId?: string;
   /** ENG-2496 device-flow Zoma token id (never the token). */
   zomaTokenId?: string;
+  /** ENG-2747: OAuth client registered from a Databricks workspace; Zoma is read-only for it. */
+  databricksOrigin?: boolean;
 }
 
 export interface MetaToolkitGatewayDeps {
@@ -69,6 +93,8 @@ export interface MetaToolkitGatewayDeps {
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   execute: typeof executeMetaToolkitCall;
   recordUsage: typeof recordMcpToolUse;
+  /** Injectable bounded BUC backoff sleep. */
+  sleep?: (ms: number) => Promise<void>;
   now: () => number;
   rateLimiter?: Pick<RateLimiter, 'check'>;
   /** ENG-2303 toolkit-local Zoma tools; defaults to runZomaTool. */
@@ -79,14 +105,28 @@ export interface MetaToolkitGatewayDeps {
   recordWrite?: typeof recordMcpWriteExecuted;
   /** Creative assets (AD_CREATIVE UPLOAD_IMAGE/UPLOAD_VIDEO/CREATE); defaults to executeMetaToolkitCreative. */
   executeCreative?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2922 ARCHIVE/DELETE/COPY; defaults to executeMetaToolkitLifecycle. */
+  executeLifecycle?: (userId: string, args: any) => Promise<any>;
   /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
   runHealthTool?: typeof runMetaHealthTool;
   /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
   runCatalogTool?: typeof runMetaCatalogTool;
+  /** ENG-2925 catalog product / product-set writes; defaults to runMetaCatalogWriteTool. */
+  runCatalogWriteTool?: typeof runMetaCatalogWriteTool;
+  /** ENG-2927 catalog event sources; defaults to runMetaEventSourceTool. */
+  runEventSourceTool?: typeof runMetaEventSourceTool;
+  /** ENG-2980 experiment eligibility + A/B / lift writes; defaults to runMetaExperimentWriteTool. */
+  runExperimentWriteTool?: typeof runMetaExperimentWriteTool;
+  /** ENG-2926 catalog create/update, feeds, upload sessions, feed rules; defaults to runMetaCatalogFeedTool. */
+  runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
   runPagesTool?: typeof runMetaPagesTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
+  executeAudience?: (userId: string, args: any) => Promise<any>;
+  /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
+  getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -144,7 +184,35 @@ export async function authenticateMetaToolkitCaller(
   const oauth = await deps.validateOAuthToken(token);
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
   enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
-  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
+  // ENG-2747 (option B): a client registered from a Databricks workspace gets read-only Zoma.
+  // Fail closed: if the client lookup fails, the call is refused (retryable), never let through.
+  let databricksOrigin: boolean;
+  try {
+    databricksOrigin = await isDatabricksOAuthClient(oauth.clientId, deps);
+  } catch (error) {
+    console.error('[meta-toolkit] OAuth client lookup failed:', error instanceof Error ? error.message : error);
+    throw new MetaToolkitAuthError('Could not verify this connection right now. Try again shortly.', 503, 5);
+  }
+  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId, databricksOrigin };
+}
+
+/**
+ * ENG-2747: whether an OAuth client was registered from a Databricks workspace. Redirect URIs are
+ * only ever appended, so a positive answer is cached for the process lifetime; a negative one for
+ * a few minutes. Not cached when a test injects its own lookup.
+ */
+const DATABRICKS_NEGATIVE_TTL_MS = 5 * 60 * 1000;
+const databricksClientCache = new Map<string, { databricks: boolean; until: number }>();
+
+async function isDatabricksOAuthClient(clientId: string, deps: MetaToolkitGatewayDeps): Promise<boolean> {
+  if (deps.getOAuthClientRedirectUris) return isDatabricksClient(await deps.getOAuthClientRedirectUris(clientId));
+  const now = Date.now();
+  const hit = databricksClientCache.get(clientId);
+  if (hit && hit.until > now) return hit.databricks;
+  const databricks = isDatabricksClient((await mcpOAuthService.getClient(clientId))?.redirectUris ?? null);
+  if (databricksClientCache.size > 10_000) databricksClientCache.clear();
+  databricksClientCache.set(clientId, { databricks, until: databricks ? Number.POSITIVE_INFINITY : now + DATABRICKS_NEGATIVE_TTL_MS });
+  return databricks;
 }
 
 /**
@@ -219,21 +287,60 @@ export function stripCredentials<T>(value: T, depth = 0): T {
  * A refused or failed call is not metered.
  */
 export async function handleMetaToolkitCall(
-  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string },
+  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string },
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
-  const meter = (platform?: string) =>
-    deps.recordUsage({
+  // ENG-2747 (option B): refused before any upstream call or metering.
+  if (caller.databricksOrigin && !isDatabricksAllowedCall(request.toolName, request.args)) {
+    throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
+  }
+  const meter = (platform?: string) => {
+    void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
+    return deps.recordUsage({
+      product: TOOLKIT_PRODUCT,
       userId: caller.userId,
       toolName: request.toolName,
       ...(platform ? { platform } : {}),
       authMethod: caller.authMethod,
       apiKeyId: caller.apiKeyId,
       clientId: caller.clientId,
+      // ENG-2747: the gateway has no client name; tag Databricks-origin OAuth callers directly.
+      ...(caller.databricksOrigin ? { clientType: 'databricks' as const } : {}),
       sessionId: request.sessionId,
       userAgent: request.userAgent,
+      ref: request.ref,
     });
+  };
+
+  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
+  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
+  // A metering failure must not make an executed write look failed (that invites a retry
+  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
+  const recordExecutedWrite = async (entityType: string, action: string, result: any, params?: unknown) => {
+    if (typeof result?.verification !== 'string') return;
+    await (deps.recordWrite ?? recordMcpWriteExecuted)({
+      product: TOOLKIT_PRODUCT,
+      userId: caller.userId,
+      toolName: request.toolName,
+      authMethod: caller.authMethod,
+      apiKeyId: caller.apiKeyId,
+      clientId: caller.clientId,
+      sessionId: request.sessionId,
+      userAgent: request.userAgent,
+      platform: 'meta',
+      entityType,
+      action,
+      verification: result.verification,
+      objectId: result.id ?? result.creative_id ?? result.image_hash ?? result.video_id ?? undefined,
+      writeKind: zomaWriteKindFor(action, params),
+    }).then(() => {
+      journeyAfterCall(caller.userId, 'first_write', { platform: 'meta', toolName: request.toolName });
+    }).catch((error) => {
+      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
+      result.metering = 'failed: this write executed but was not recorded in usage';
+    });
+  };
 
   // Creative upload staging needs no Meta account (it only mints an S3 PUT for the caller's own prefix).
   if (request.toolName === 'zoma_prepare_upload') {
@@ -243,8 +350,12 @@ export async function handleMetaToolkitCall(
     return result;
   }
 
+  // ENG-2914: custom audiences run against the resolved Meta ad account. Reads need
+  // tools:read; every write (and any unknown action) needs tools:execute.
+  const audienceTool = request.toolName === AUDIENCE_TOOL_NAME;
+
   // ENG-2303: onboarding tools must work before Meta is connected, so they skip account resolution.
-  if (isZomaTool(request.toolName)) {
+  if (isZomaTool(request.toolName) && !audienceTool) {
     assertMetaToolkitScope(caller, request.toolName, false);
     let result;
     try {
@@ -262,14 +373,22 @@ export async function handleMetaToolkitCall(
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
-      assertMetaToolkitScope(caller, request.toolName, google.isGoogleGuardedWrite(request.toolName, request.args ?? {}));
-      return stripCredentials(await google.handleGoogleToolkitCall(caller, request, {
+      const googleWrite = google.isGoogleToolkitWrite(request.toolName, request.args ?? {});
+      assertMetaToolkitScope(caller, request.toolName, googleWrite);
+      const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
+      const googleResult = await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
         meter: () => meter('google_ads'),
-        recordWrite: deps.recordWrite ?? recordMcpWriteExecuted,
+        recordWrite: async (input) => {
+          const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
+          journeyAfterCall(caller.userId, 'first_write', { platform: 'google_ads', toolName: request.toolName });
+          return recorded;
+        },
         accessError: (message) => new MetaToolkitAuthError(message, 403),
-      }));
+      });
+      if (!googleWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'google_ads', toolName: request.toolName });
+      return stripCredentials(googleResult);
     }
   }
 
@@ -277,16 +396,27 @@ export async function handleMetaToolkitCall(
   assertMetaToolkitScope(
     caller,
     request.toolName,
-    isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args),
+    audienceTool
+      ? isAudienceWriteRequest(args)
+      : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
+        || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
+        || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
+        || isMetaExperimentWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
-  if (request.toolName === 'ads_get_errors') {
-    const result = explainMetaError(args);
+  if (request.toolName === 'ads_get_errors' || request.toolName === 'ads_get_help_article') {
+    const result = request.toolName === 'ads_get_errors' ? explainMetaError(args) : getMetaHelpArticles(args);
     await meter('meta');
     return result;
   }
+  const metaWrite = audienceTool ? isAudienceWriteRequest(args)
+    : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
+      || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
+      || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
+        || isMetaExperimentWrite(request.toolName);
+  return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
-  if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+  if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
   if (isSignalsRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
@@ -310,11 +440,48 @@ export async function handleMetaToolkitCall(
     return stripCredentials(catalogs);
   }
 
+  // ENG-2925: catalog product / product-set writes (+ the read-only filter helper), scoped to
+  // the resolved account's business catalogs; executed writes are metered like other writes.
+  if (isMetaCatalogWriteTool(request.toolName)) {
+    const result: any = await (deps.runCatalogWriteTool ?? runMetaCatalogWriteTool)(request.toolName, caller.userId, accountId, args);
+    const kind = CATALOG_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2927: catalog event sources (reads + preview-confirmed connect/disconnect).
+  if (isMetaEventSourceTool(request.toolName)) {
+    const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args);
+    const kind = EVENT_SOURCE_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
+  // ENG-2926: catalog create/update, product feeds, upload sessions, feed rules.
+  if (isMetaCatalogFeedTool(request.toolName)) {
+    const result: any = await (deps.runCatalogFeedTool ?? runMetaCatalogFeedTool)(request.toolName, caller.userId, accountId, args);
+    const kind = CATALOG_FEED_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
+  }
+
   // ENG-2920: read-only Pages / Instagram / Ad Library tools, scoped to the resolved account.
   if (isMetaPagesTool(request.toolName)) {
     const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(pages);
+  }
+
+  // ENG-2980: experiment eligibility (read) + preview-confirmed A/B and lift writes.
+  if (isMetaExperimentWriteTool(request.toolName)) {
+    const result: any = await (deps.runExperimentWriteTool ?? runMetaExperimentWriteTool)(request.toolName, caller.userId, accountId, args);
+    const kind = EXPERIMENT_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
   }
 
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.
@@ -336,41 +503,26 @@ export async function handleMetaToolkitCall(
 
   // ENG-2303 P3: CAMPAIGN/AD_SET/AD CREATE + status/budget UPDATE go through the guarded
   // preview→confirm path; every other write stays refused by assertMetaToolkitV1Call.
+  // ENG-2922: ARCHIVE/DELETE/COPY use the same preview→confirm guard (metaToolkitLifecycle.ts).
   const creativeAsset = isCreativeAssetRequest(request.toolName, args);
-  const guardedWrite = creativeAsset || isGuardedWriteRequest(request.toolName, args);
-  const result = creativeAsset
-    ? await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args)
-    : guardedWrite
-      ? await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args)
-      : await deps.execute(request.toolName, args, {
-          userId: caller.userId,
-          sessionId: request.sessionId,
-        });
+  const lifecycle = !audienceTool && isLifecycleWriteRequest(request.toolName, args);
+  const guardedWrite = audienceTool || creativeAsset || lifecycle || isGuardedWriteRequest(request.toolName, args);
+  let result: any;
+  if (audienceTool) result = await (deps.executeAudience ?? executeMetaToolkitAudience)(caller.userId, args);
+  else if (creativeAsset) result = await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args);
+  else if (lifecycle) result = await (deps.executeLifecycle ?? executeMetaToolkitLifecycle)(caller.userId, args);
+  else if (guardedWrite) result = await (deps.executeWrite ?? executeMetaToolkitWrite)(caller.userId, args);
+  else result = await deps.execute(request.toolName, args, { userId: caller.userId, sessionId: request.sessionId });
 
-  // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
-  // own event kind. Previews, mismatched confirms and refused/failed writes are not.
-  // A metering failure must not make an executed write look failed (that invites a retry
-  // and a duplicate), so it is logged and surfaced on the result instead of thrown.
-  if (guardedWrite && typeof (result as any)?.verification === 'string') {
-    await (deps.recordWrite ?? recordMcpWriteExecuted)({
-      userId: caller.userId,
-      toolName: request.toolName,
-      authMethod: caller.authMethod,
-      apiKeyId: caller.apiKeyId,
-      clientId: caller.clientId,
-      sessionId: request.sessionId,
-      userAgent: request.userAgent,
-      platform: 'meta',
-      entityType: String(args.entity_type),
-      action: String(args.action),
-      verification: (result as any).verification,
-      objectId: (result as any).id ?? (result as any).image_hash ?? (result as any).video_id ?? undefined,
-    }).catch((error) => {
-      console.error('[meta-toolkit] write metering failed:', error instanceof Error ? error.message : error);
-      (result as any).metering = 'failed: this write executed but was not recorded in usage';
-    });
+  // ENG-2915: a BULK_CREATE result carries one verdict per creative; each is its own write event.
+  if (guardedWrite) {
+    const entityType = audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type);
+    const executedWrites: any[] = Array.isArray((result as any)?.results) ? (result as any).results : [result];
+    for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write, args.params);
   }
 
   await meter('meta');
+  if (!guardedWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
   return stripCredentials(result);
+  });
 }

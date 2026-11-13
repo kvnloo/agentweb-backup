@@ -37,8 +37,11 @@ import {
 import { isEvaluationUser, requireActiveEvaluation } from '../services/evaluationPolicy';
 import { getJwtSecret } from '../config/jwt';
 import type { MetaFinalizeResult, MetaAdAccountSelection } from '../services/metaOAuthFinalize';
+import { MCP_CONSENT_SIGNUP_SOURCE, validateRef, ZOMA_DEVICE_OAUTH_CLIENT_ID } from '../services/journeyAttribution';
+import { aliasJourney, anonymousSetupId, trackJourney } from '../services/journeyTracking';
+import { noteProductUse, noteSignup, zomaMilestone } from '../services/journeyMilestones';
 
-export const ZOMA_DEVICE_CLIENT_ID = 'zoma-device-setup';
+export const ZOMA_DEVICE_CLIENT_ID = ZOMA_DEVICE_OAUTH_CLIENT_ID;
 export const ZOMA_DEVICE_CLIENT_NAME = 'Zoma (agent setup)';
 export const ZOMA_TOKEN_PREFIX = 'zoma_';
 /** Time to sign in and approve (RFC 8628 expires_in). */
@@ -166,8 +169,9 @@ const mcpUrl = (deps: ZomaDeviceFlowDeps) => `${deps.backendUrl().replace(/\/+$/
 
 // ─── 1. Start ─────────────────────────────────────────────────────────────────
 
-export async function startSetup(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps) {
+export async function startSetup(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps, opts: { ref?: unknown } = {}) {
   const now = deps.now();
+  const ref = validateRef(opts.ref);
   for (let attempt = 0; attempt < 5; attempt++) {
     const deviceCode = crypto.randomBytes(32).toString('base64url');
     const userCode = newUserCode();
@@ -181,9 +185,11 @@ export async function startSetup(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
       expiresAt: now + ZOMA_DEVICE_EXPIRES_SEC * 1000,
       createdAt: new Date(now).toISOString(),
       events: [],
+      ...(ref ? { ref } : {}),
     });
     if (!created) continue; // user_code collision
     await track(deps, deviceId, undefined, 'setup_started', 'ok');
+    void trackJourney({ anonId: anonymousSetupId(deviceId) }, 'setup_started', { product: 'zoma', path: 'zoma_device', ...(ref ? { ref } : {}) });
     const verificationUri = activateUrl(deps);
     return {
       device_code: deviceCode,
@@ -233,6 +239,9 @@ export async function beginVerification(rawUserCode: unknown, deps: ZomaDeviceFl
   authorize.searchParams.set('state', device.deviceId);
   authorize.searchParams.set('code_challenge', crypto.createHash('sha256').update(device.pkceVerifier).digest('base64url'));
   authorize.searchParams.set('code_challenge_method', 'S256');
+  // ENG-2906: RFC 8707 resource names the product; ref rides to the auth code / signup.
+  authorize.searchParams.set('resource', mcpUrl(deps));
+  if (device.ref) authorize.searchParams.set('ref', device.ref);
   return { ok: true, redirect: authorize.toString() };
 }
 
@@ -268,7 +277,24 @@ export async function completeVerification(
     return { ok: false, message: 'This setup link has expired or was already used.' };
   }
   await track(deps, device.deviceId, grant.userId, 'approval', 'approved');
+  void journeyOnApproval(grant.userId, device);
   return { ok: true, deviceId: device.deviceId };
+}
+
+/**
+ * ENG-2906: join the anonymous setup to the user, attribute a signup made on the consent page
+ * (row stamped signupSource "mcp" — usually already attributed by the consent decision, so this
+ * is a no-op backstop), mark Zoma use.
+ */
+async function journeyOnApproval(userId: string, device: ZomaDeviceRecord): Promise<void> {
+  await aliasJourney(userId, anonymousSetupId(device.deviceId));
+  await noteSignup(
+    userId,
+    { product: 'zoma', path: 'zoma_device', client: 'zoma_device', ref: validateRef(device.ref), confidence: 'explicit' },
+    { requireSignupSource: MCP_CONSENT_SIGNUP_SOURCE },
+  );
+  await noteProductUse(userId, 'zoma');
+  await zomaMilestone(userId, 'signed_up', { emit: 'never' });
 }
 
 // ─── 2b. One browser journey: approval -> Meta -> payment -> done ────────────
@@ -502,6 +528,8 @@ export async function finishPayment(
       await track(deps, raw.deviceId, raw.userId, 'checkout_completed', 'error', error);
     }
     await track(deps, raw.deviceId, raw.userId, 'checkout_completed', verified ? 'ok' : 'unverified');
+    // ENG-2906: a Stripe-verified setup session for this user is the card_saved moment.
+    if (verified) void zomaMilestone(raw.userId, 'card_saved', { emit: 'always', requireZoma: true, props: { product: 'zoma', source: 'checkout' } });
     // Stripe can lag in listing the new payment method; a verified session for this user is enough.
     if (verified) return DONE_PAGE;
   }
@@ -601,6 +629,13 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
     createdAt: new Date(now).toISOString(),
   });
   if (!issued) return rfcError('invalid_grant', 'A Zoma token was already issued for this device_code; it is shown only once.');
+  // ENG-2906: readiness said payment is ready (card_saved, once, if not already recorded via
+  // checkout) and the agent now holds a zoma_ credential (connected).
+  void (async () => {
+    await noteProductUse(userId, 'zoma');
+    await zomaMilestone(userId, 'card_saved', { emit: 'if_advanced', requireZoma: true, props: { product: 'zoma', source: 'readiness' } });
+    await zomaMilestone(userId, 'connected', { emit: 'always', props: { product: 'zoma', path: 'zoma_device' } });
+  })();
   return {
     status: 200,
     body: {

@@ -1,4 +1,6 @@
 import { Request, Response } from "express";
+import { isZomaSignup } from '../services/zomaSignupIntent';
+import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -19,6 +21,8 @@ import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { metaService } from "../services/metaService";
 import { emitAppSignal } from "../services/serverSignalEmitter";
+import { MCP_CONSENT_SIGNUP_SOURCE, validateRef } from "../services/journeyAttribution";
+import { noteProductUse, noteSignup } from "../services/journeyMilestones";
 
 // ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
 // customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
@@ -110,6 +114,23 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
   }
 }
 
+/**
+ * ENG-2906: web signup attribution (Emma web app). A password signup made on the MCP OAuth
+ * consent page (portal sends signupSource "mcp") is left unattributed here on purpose: the row
+ * is stamped signupSource "mcp" and the consent decision attributes it moments later, once the
+ * OAuth client and product are known (it requires that marker; account age is never used).
+ * Google sign-ups cannot tell where they started, so they are webapp with confidence "inferred".
+ */
+function attributeWebSignup(userId: string, opts: { ref?: unknown; confidence: "explicit" | "inferred" }) {
+  void noteSignup(userId, {
+    product: "emma_web",
+    path: "webapp",
+    client: "web",
+    ref: validateRef(opts.ref),
+    confidence: opts.confidence,
+  }).then(() => noteProductUse(userId, "emma_web"));
+}
+
 export const register = async (req: Request, res: Response) => {
   try {
     let {
@@ -146,14 +167,26 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    if (zomaAdmissionEnabled() && req.body.signupIntent !== undefined && !isZomaSignup(req.body)) {
+      return res.status(400).json({ code: 'invalid_signup_intent', message: 'Please try again later.' });
+    }
+    if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
+      try {
+        if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
+      } catch (error) {
+        console.error('Zoma admission unavailable', error);
+        return res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
+      }
+    }
+
     // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
     const finalRoles =
       reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
         ? reqRoles
         : ["customer"];
 
-    // Check waitlist status only for non-free users (feature-flagged via SKIP_WAITLIST_CHECK)
-    const skipWaitlist = process.env.SKIP_WAITLIST_CHECK === 'true';
+    // Legacy waitlist metadata is separate from Zoma admission; SKIP_WAITLIST_CHECK
+    // must not bypass the capacity gate above.
     let waitlistEntry = null;
     let stripe_customer_id = undefined;
     let companyNameFromWaitlist = undefined;
@@ -232,6 +265,7 @@ export const register = async (req: Request, res: Response) => {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
+      ...(req.body.signupSource === MCP_CONSENT_SIGNUP_SOURCE && { signupSource: MCP_CONSENT_SIGNUP_SOURCE }),
       ...(touch && {
         firstTouch: touch,
         lastTouch: touch,
@@ -239,6 +273,7 @@ export const register = async (req: Request, res: Response) => {
         ...(touch.utm?.medium && { utmMedium: touch.utm.medium }),
       }),
     });
+    if (req.body.signupSource !== MCP_CONSENT_SIGNUP_SOURCE) attributeWebSignup(userId, { ref: req.body.ref, confidence: "explicit" });
 
     // If a pending org invite exists for this email, stamp it on the new user so
     // ProtectedRoute redirects them to accept-invite instead of onboarding.
@@ -458,6 +493,9 @@ export const googleCallback = async (
       }, null);
     }
 
+    // Google registration has no Zoma product intent; these are Emma portal signups.
+    // Zoma setup/MCP registers on the consent page with a product-scoped signup intent.
+
     if (!user) {
       if (portalOrigin === "genius") {
         // For genius portal, automatically create user using existing signup logic
@@ -501,6 +539,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfig?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({
@@ -567,6 +606,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({

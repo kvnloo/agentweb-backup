@@ -32,6 +32,7 @@ import {
 import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
 import { deleteSentInvitationsByProfileUrls } from '../services/unipileSentInvitationsDb';
 import { agentModeService } from '../services/agentModeService';
+import { brandMessagingContextFromGuidelines } from '../services/brandMessagingContext';
 
 export {
   sentInvitationChanged,
@@ -415,10 +416,11 @@ async function generateConnectionFollowUpDraft(lead: any, list: any): Promise<vo
       agentModeService.readMarketStrategy(userId).catch(() => null),
       userId ? crmDb.getLeadEngagements(lead.listId, lead.leadId, userId).catch(() => ({ engagements: [] })) : Promise.resolve({ engagements: [] }),
     ]);
-    // readBrandGuidelines / readMarketStrategy return { exists, formattedContent }
-    // — there is no `.guidelines` / `.strategy` field, so the previous checks were
-    // always false and brand/offer context never reached the prompt.
-    if (brand?.exists && brand.formattedContent) brandContext += `\nBrand voice: ${String(brand.formattedContent).slice(0, 500)}`;
+    // Brand comes from structured brandData, not a 500-char slice of the HTML
+    // formattedContent (which is mostly header, colors and fonts — ENG-2967).
+    // readMarketStrategy returns { exists, formattedContent }.
+    const senderBrand = brandMessagingContextFromGuidelines(brand);
+    if (senderBrand) brandContext += `\nSender brand:\n${senderBrand}`;
     if (strategy?.exists && strategy.formattedContent) brandContext += `\nOffer/market fit: ${String(strategy.formattedContent).slice(0, 500)}`;
 
     const engagements: any[] = (engagementsResult as any).engagements || [];
