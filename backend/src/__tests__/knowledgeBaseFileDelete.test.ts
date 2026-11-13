@@ -130,6 +130,18 @@ describe('knowledge-base file delete only touches files listed on the task (ENG-
     expect(mockGcsFile).toHaveBeenCalledWith('tasks/task-b/knowledge-base-files/5_100%25.md');
   });
 
+  it('an older client that double-encodes the key still deletes its listed file', async () => {
+    const res = await request(app).delete(`/api/tasks/task-b/knowledge-base/files/${encodeURIComponent(encodeURIComponent(GCS_KEY))}`);
+    expect(res.status).toBe(200);
+    expect(mockGcsFile).toHaveBeenCalledWith(GCS_KEY);
+  });
+
+  it('a malformed escape sequence is a 404, not a 500', async () => {
+    const res = await request(app).delete('/api/tasks/task-b/knowledge-base/files/%E0%A4%A');
+    expect([400, 404]).toContain(res.status);
+    expect(mockGcsDelete).not.toHaveBeenCalled();
+  });
+
   it('a traversal or lookalike key is not a listed key', async () => {
     expect((await del('tasks/task-b/knowledge-base-files/../../task-a/knowledge-base-files/1794561990000_victim.md')).status).toBe(404);
     expect((await del(GCS_KEY + '/../x')).status).toBe(404);
