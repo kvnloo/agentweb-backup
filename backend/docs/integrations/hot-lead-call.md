@@ -3,9 +3,9 @@
 When a landing-page form lead arrives with a phone number, AgentWeb phones a
 member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
-`1` it dials the lead, who hears "This is an automated call from <business name>
-about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
-Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls." and must press 1 as well; only then
+`1` it dials the lead, who hears "This is an automated call from <business name>. To stop these calls at any time, press 3.
+This call is about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
+Press 1 to be connected now, or press 2 if you are not available and we will call you again later." and must press 1 as well; only then
 are the two calls bridged. A 2 schedules one [retry](#press-2-and-the-retry) about an hour later. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
 [inbound callback](#inbound-callbacks) path. Pressing 3 puts the number on the org's [do-not-call list](#do-not-call-list). Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
@@ -69,7 +69,7 @@ sequenceDiagram
   LeadPhone-->>Tw: answers
   Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
   Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
-  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 ... press 2 if you are not available ... or press 3 to stop"
+  App-->>Tw: Gather 1 digit: "This is an automated call from <business>. To stop these calls at any time, press 3. ... call <number>. Press 1 ... or press 2 if you are not available ..."
   LeadPhone->>Tw: presses 1
   Tw->>App: POST /screen-result Digits=1
   App-->>Tw: empty Response - Twilio bridges the two calls
@@ -85,7 +85,7 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
-| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "Understood. <business> will not call this number again. Goodbye."; the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
+| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "<business> will not call this number again. Goodbye." and the call ends (`<Hangup/>`, no further prompt); the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
 | Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
 | Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
@@ -453,7 +453,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
-| `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
+| `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. It must be the business's registered (legal) name: it is the name the lead hears as the caller and the name in the consent notice (47 CFR 64.1200(b)(1)). The setup tool description and the owner-facing validation messages say so; validation itself is unchanged (it cannot check that a name is the registered one). |
 | `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock and its default 08:00-21:00 is not what a lead experiences: the lead's own local hours are a separate, fixed gate (10:00-18:00 lead-local, in practice about 13:00-18:00 Eastern for most US numbers; see [Lead-local hours](#lead-local-hours)), so a call needs both windows open. Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
@@ -1386,6 +1386,25 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
 | Slack alert arrives but no call | Expected whenever any gate refuses; the two paths are independent. |
 
+## Compliance basis of the script
+
+The lead prompt (`screenPromptCopy` in `services/voice/twiml.ts`) is written against 47 CFR 64.1200(b) for artificial-voice calls:
+
+- (b)(1): the call must clearly say at the START who is responsible for it, using the business's registered name. The prompt opens with
+  "This is an automated call from <announcedName>." `announcedName` must therefore be the registered (legal) name (see the config table).
+- (b)(3): an automated key-press opt-out must be offered within 2 seconds of that identification, and pressing it must record the number as
+  do-not-call and END THE CALL IMMEDIATELY. The next sentence is "To stop these calls at any time, press 3." Press 3 is accepted during the
+  prompt (the `<Say>` is nested in the `<Gather>`), writes the [do-not-call marker](#do-not-call-list) and the lead's contact status, then plays the
+  one-line goodbye and `<Hangup/>`; nothing else is asked.
+- From 2026-11-25 (FCC 26-67) a caller may name a key press as the exclusive way to revoke consent if the call clearly says so. The prompt already
+  states that press 3 is how to stop the calls, which lets press 3 serve as the exclusive revocation method after that date. There is no
+  date-dependent behaviour in the code. Until then other reasonable revocations must still be honoured within 10 business days; the platform only
+  handles press 3 today, so operators do the others by a data write (do-not-call marker / lead contact status) or by telling support.
+
+KNOWN OPEN ITEM (voicemail): the prompt may be played to a lead's voicemail box, because there is no answering-machine detection. The rules want a
+toll-free opt-out number on messages left on voicemail, and the org number is a local one. A follow-up should add machine detection and hang up
+without leaving a message.
+
 ## Compliance and third parties
 
 Two risks come with a public lead form and must be understood before general
@@ -1406,7 +1425,7 @@ Mitigations to decide before general availability (none of them is built):
 - CAPTCHA or honeypot enforcement on the lander endpoint.
 - A spoken disclosure to the lead (for example about recording) before the
   bridge. The screening prompt (`/screen`) is the place for it; today it names the business, gives the org's
-  number to call back, and offers press 1 (connect), press 2 (call again later) or press 3 (stop).
+  number to call back, and offers press 3 (stop, said first), press 1 (connect) and press 2 (call again later). See [Compliance basis of the script](#compliance-basis-of-the-script).
 - Requiring a name or an email besides the phone number.
 - Consent text on the landers.
 
@@ -1530,6 +1549,7 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - The member leg's REST `statusCallbackEvent: ['completed']` delivering exactly
   one completed callback with `CallDuration`, including for no-answer (assumed
   `0`).
+- Voicemail on the lead's leg: see the KNOWN OPEN ITEM in [Compliance basis of the script](#compliance-basis-of-the-script).
 - Voicemail: the member's voicemail answering the call. The prompt would play to
   the mailbox; there is no answering-machine detection and "press 1" will not be
   pressed, so it ends as `member_declined` after the Gather times out, and the
@@ -1623,8 +1643,7 @@ the 2 is an ordinary decline: `lead_declined`, event reason `not_available_no_re
 Nothing is promised that cannot happen.
 
 **Max one retry.** The retry keeps the record's `deferral`. `/screen-result` defers only a record that has none, so a 2 on the retry call is the plain decline above.
-**Prompt variants.** `/screen` speaks the three-option prompt ("Press 1 to be connected now, press 2 if you are not available and we will call you again later, or
-press 3 to stop these calls.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it is "Press 1 to be connected now, or press 3 to stop these calls."
+**Prompt variants.** `/screen` speaks the press-2 option ("... Press 1 to be connected now, or press 2 if you are not available and we will call you again later.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it ends "Press 1 to be connected now." In both variants the caller is named first and "To stop these calls at any time, press 3." follows at once"
 (`canDefer` in `leadScreenTwiml`). If the eligibility check itself throws (a failed lead or org read), `/screen` logs one warning (`retry eligibility unavailable, option 2 not offered: <error name>`) and serves the two-option prompt rather than hanging up on the lead.
 
 **The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls

@@ -645,7 +645,7 @@ describe('POST /screen', () => {
     const res = await screen();
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/xml/);
-    expect(res.text).toContain('This is an automated call from Smith &amp; Sons about the enquiry you sent us. To reach a person at Smith &amp; Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
+    expect(res.text).toContain('This is an automated call from Smith &amp; Sons. To stop these calls at any time, press 3. This call is about the enquiry you sent us. To reach a person at Smith &amp; Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, or press 2 if you are not available and we will call you again later.');
     expect(res.text).toContain('<Gather input="dtmf" numDigits="1" timeout="8"');
     expect(res.text).toContain(`action="${BASE}${MOUNT}/screen-result?${QUERY.replace(/&/g, '&amp;')}"`);
     expect(res.text).toContain('We did not get your answer. Goodbye.');
@@ -1853,7 +1853,7 @@ describe('privacy', () => {
 // ── press 3 at the screening prompt: stop calling this person (ENG-2783) ─────────────────────────────
 
 describe('lead presses 3: do not call again', () => {
-  const GOODBYE = 'Understood. Smith &amp; Sons will not call this number again. Goodbye.';
+  const GOODBYE = 'Smith &amp; Sons will not call this number again. Goodbye.';
   const MEMBER_COPY = 'The lead asked not to be called again. Their details are in your lead alert.';
   // Computed per use: the digest key (JWT_SECRET) only exists inside each test.
   const dnc = () => dncKey('org-a', LEAD_PHONE);
@@ -1881,6 +1881,13 @@ describe('lead presses 3: do not call again', () => {
     expect(store.record).toMatchObject({ state: 'bridging', outcome: 'lead_opted_out' });
     expect(store.events).toEqual([{ type: 'call.lead_declined', detail: { reason: 'opted_out' } }]);
     expect(store.record?.lastSequence).toMatchObject({ [`${LEAD_SID}#screen`]: 1, [`${MEMBER_SID}#dial`]: 1 });
+  });
+
+  it('answers press 3 with a one-line goodbye and a Hangup: the call ends, with no further Gather or prompt', async () => {
+    const res = await screenResult('3');
+    expect(res.text).toBe(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>${GOODBYE}</Say><Hangup/></Response>`);
+    expect(res.text).not.toContain('<Gather');
+    expect(res.text).not.toContain('<Dial');
   });
 
   it('a later 1 cannot reverse the stop: nothing connects, the lead hears the goodbye again, and the stop is not written twice', async () => {
@@ -2153,20 +2160,20 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
     beforeEach(() => seed('bridging'));
 
     it('on the first call, with retries on: all three options', async () => {
-      expect(await prompt()).toContain('Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
+      expect(await prompt()).toContain('Press 1 to be connected now, or press 2 if you are not available and we will call you again later.');
     });
 
     it('on the retry call (the record keeps its deferral): only 1 and 3', async () => {
       seed('bridging', { deferral: { dueAt: '2026-10-19T12:00:00.000Z', count: 1 }, retryClaimToken: 'tok' });
       const text = await prompt();
-      expect(text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(text).toContain('Press 1 to be connected now.');
       expect(text).not.toContain('press 2');
     });
 
     it('when no retry window can exist (the lead window never open within 36 hours): only 1 and 3, the same eligibility as the 2 itself', async () => {
       mock(isInsideLeadCallWindow).mockReturnValue(false);
       const text = await prompt();
-      expect(text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(text).toContain('Press 1 to be connected now.');
       expect(text).not.toContain('press 2');
     });
 
@@ -2185,7 +2192,7 @@ describe('lead presses 2: not available now (one retry, ENG-2783)', () => {
       mock(crmDb.getLeadById).mockRejectedValue(new Error('read failed for +14155550123'));
       const res = await screen();
       expect(res.status).toBe(200);
-      expect(res.text).toContain('Press 1 to be connected now, or press 3 to stop these calls.');
+      expect(res.text).toContain('Press 1 to be connected now.');
       expect(res.text).not.toContain('press 2');
       expect(res.text).toContain('<Gather');
       const warns = warnSpy().mock.calls.map((c) => c.join(' ')).filter((l) => l.includes('retry eligibility unavailable'));
