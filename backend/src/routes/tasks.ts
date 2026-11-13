@@ -1,4 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
+import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -841,6 +842,12 @@ router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
 router.delete('/:taskId/subscribers/:email', async (req, res) => {
   try {
     const { taskId, email } = req.params;
+    // ENG-2989: same permission as adding a subscriber (the task's owner or an admin). This used to need only a login.
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
+
     await subscriberDb.removeSubscriber(taskId, email);
     res.status(204).send();
   } catch (error: any) {

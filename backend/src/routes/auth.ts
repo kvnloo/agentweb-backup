@@ -1,4 +1,5 @@
 import express from 'express';
+import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import { register, login, googleCallback } from '../controllers/auth';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb, subscriberDb, orgDb } from '../services/db';
@@ -431,6 +432,12 @@ router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) =>
       return res.status(400).json({ message: 'Email is required' });
     }
 
+    // ENG-2989: the task's owner or an admin only (this route used to need only a login).
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
+
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
     res.status(201).json(subscriber);
   } catch (error: any) {
@@ -447,6 +454,11 @@ router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) =>
 router.delete('/tasks/:taskId/subscribers/:email', authenticateToken, async (req, res) => {
   try {
     const { taskId, email } = req.params;
+    // ENG-2989: the task's owner or an admin only (this route used to need only a login).
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
     await subscriberDb.removeSubscriber(taskId, email);
     res.status(204).send();
   } catch (error: any) {
