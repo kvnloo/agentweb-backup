@@ -77,6 +77,7 @@ import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import VendorRatesTab from "../components/admin/VendorRatesTab";
+import ZomaScoreboardTab from "../components/admin/ZomaScoreboardTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
@@ -6869,6 +6870,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={27}>
           <VendorRatesTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={28}>
+          <ZomaScoreboardTab />
         </TabPanel>
         </Box>
       </Box>
