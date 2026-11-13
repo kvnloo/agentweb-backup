@@ -254,10 +254,10 @@ describe('monthly cap (ENG-2783)', () => {
     expect((await reserve(capped(1))).ok).toBe(true);
   });
 
-  it('treats a config without the field as the default of 200', async () => {
+  it('treats a config without the field as the default of 150', async () => {
     const noField = { ...capped(1), maxCallsPerHour: 1000, maxCallsPerDay: 1000 } as Partial<HotLeadCallConfig>;
     delete noField.maxCallsPerMonth;
-    for (let i = 0; i < 200; i++) expect((await reserve(noField as HotLeadCallConfig)).ok).toBe(true);
+    for (let i = 0; i < 150; i++) expect((await reserve(noField as HotLeadCallConfig)).ok).toBe(true);
     expect(await reserve(noField as HotLeadCallConfig)).toEqual({ ok: false, reason: 'org_monthly_cap' });
   });
 
