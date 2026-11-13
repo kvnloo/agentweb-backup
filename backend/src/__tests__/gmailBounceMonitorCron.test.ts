@@ -169,7 +169,19 @@ describe('runGmailBounceMonitor', () => {
     const raw = hardDsn('victim@example.com') + '\r\n\r\nMessage-ID: <orig-1@mail.example.com>\r\n';
     (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw }]);
     await runGmailBounceMonitor();
-    expect(gmailService.hasMessages).toHaveBeenCalledWith('u1', SENDER, 'in:sent rfc822msgid:orig-1@mail.example.com to:victim@example.com');
+    expect(gmailService.hasMessages).toHaveBeenCalledWith('u1', SENDER, 'in:sent rfc822msgid:orig-1@mail.example.com');
+  });
+
+  it('falls back to a sent-to-recipient match when the embedded Message-ID does not resolve', async () => {
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([user('2026-11-01T00:00:00.000Z')]);
+    const raw = hardDsn('victim@example.com') + '\r\n\r\nMessage-ID: <rewritten@relay.example>\r\n';
+    (gmailService.listRawMessages as jest.Mock).mockResolvedValue([{ id: 'm1', receivedAt: '2026-11-02T00:00:00.000Z', raw }]);
+    (gmailService.hasMessages as jest.Mock).mockImplementation(async (_u: string, _a: string, q: string) => q === 'in:sent to:victim@example.com');
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([{ listId: 'L1' }, { listId: 'L2' }]);
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({ leadId: 'lead1', contactStatus: 'active' });
+    const s = await runGmailBounceMonitor();
+    expect(crmDb.updateLead).toHaveBeenCalledTimes(2);
+    expect(s).toMatchObject({ hardBouncesFound: 1, leadsFlagged: 2 });
   });
 
   it('isolates a failing account', async () => {

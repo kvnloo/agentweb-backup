@@ -139,8 +139,11 @@ async function hasOutboundCorrelation(
   const msgId = originalMessageId(raw);
   // Gmail's rfc822msgid: operator takes the bare id, without angle brackets.
   const bareId = msgId ? msgId.replace(/^<|>$/g, '') : null;
-  const query = bareId ? `in:sent rfc822msgid:${bareId} to:${recipient}` : `in:sent to:${recipient}`;
-  return gmailService.hasMessages(userId, accountId, query);
+  // The Message-ID is unique on its own; combining it with to: misses sends whose To header
+  // differs from the DSN's recipient (alias, Bcc, display form). If the embedded id does not
+  // resolve (rewritten by the relay), fall back to any sent message to the recipient.
+  if (bareId && (await gmailService.hasMessages(userId, accountId, `in:sent rfc822msgid:${bareId}`))) return true;
+  return gmailService.hasMessages(userId, accountId, `in:sent to:${recipient}`);
 }
 
 async function flagLeadIfMatched(userId: string, candidateEmail: string, status: string): Promise<number> {
