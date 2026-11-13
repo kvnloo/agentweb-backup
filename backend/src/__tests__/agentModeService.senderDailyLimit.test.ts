@@ -74,7 +74,7 @@ jest.mock('../services/db', () => ({
       emailDraft: { subject: 'Hello', htmlContent: '<p>hi</p>' },
     })),
     updateLead: jest.fn(async () => undefined),
-    claimLeadEmailDraft: jest.fn(async () => true),
+    claimLeadEmailDraft: jest.fn(async () => 'claim-token'),
     releaseLeadEmailDraftClaim: jest.fn(async () => undefined),
   },
 }));

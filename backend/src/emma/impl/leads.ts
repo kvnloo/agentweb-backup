@@ -2569,8 +2569,8 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
       // invocations both read the same draft above; only the one whose conditional claim
       // succeeds may send, so the lead gets at most one email. The draft stays stored until
       // the send succeeds, so a crash/deploy mid-send never loses it (stale claims expire).
-      const claimed = await crmDb.claimLeadEmailDraft(listId, leadId, draft);
-      if (!claimed) {
+      const claimToken = await crmDb.claimLeadEmailDraft(listId, leadId, draft);
+      if (!claimToken) {
         return {
           success: false,
           message: 'Email draft already sent or changed',
@@ -2592,7 +2592,7 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         // The send did not go out: release the claim so the user can retry now (best effort;
         // an unreleased claim also expires on its own).
         try {
-          await crmDb.releaseLeadEmailDraftClaim(listId, leadId);
+          await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
         } catch (releaseError) {
           console.error('AgentMode: failed to release email draft claim after send failure (ENG-2984):', releaseError);
         }
@@ -2604,7 +2604,7 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
 
       await crmDb.updateLead(listId, leadId, { emailDraft: null });
       try {
-        await crmDb.releaseLeadEmailDraftClaim(listId, leadId);
+        await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
       } catch (releaseError) {
         console.error('AgentMode: failed to release email draft claim after send (ENG-2984):', releaseError);
       }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import type { LeadNotificationsConfig, LeadOrigin } from './leadNotificationConfig';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
@@ -11235,8 +11236,11 @@ export const crmDb = {
     leadId: string,
     expectedDraft: Record<string, unknown>,
     leaseMs: number = 5 * 60 * 1000,
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     const now = Date.now();
+    // Ownership token: ISO timestamp prefix keeps the lexicographic stale-lease comparison
+    // valid; the random suffix lets release() remove only this caller's claim.
+    const token = `${new Date(now).toISOString()}#${randomUUID()}`;
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
@@ -11246,13 +11250,13 @@ export const crmDb = {
           'emailDraft = :expected AND (attribute_not_exists(emailDraftSendClaimedAt) OR emailDraftSendClaimedAt < :staleBefore)',
         ExpressionAttributeValues: {
           ':expected': expectedDraft,
-          ':now': new Date(now).toISOString(),
+          ':now': token,
           ':staleBefore': new Date(now - leaseMs).toISOString(),
         },
       }).promise();
-      return true;
+      return token;
     } catch (err) {
-      if (isConditionalFailure(err)) return false;
+      if (isConditionalFailure(err)) return null;
       handleDynamoDbError(err, 'claimLeadEmailDraft');
       throw err;
     }
@@ -11260,15 +11264,17 @@ export const crmDb = {
 
   /**
    * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
-   * the draft). Idempotent; a missing lead is a no-op.
+   * the draft). Removes the claim only while it still holds the caller's token, so a sender whose
+   * lease expired cannot drop a replacement sender's claim. Idempotent; a mismatch is a no-op.
    */
-  async releaseLeadEmailDraftClaim(listId: string, leadId: string): Promise<void> {
+  async releaseLeadEmailDraftClaim(listId: string, leadId: string, token: string): Promise<void> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: { listId, leadId },
         UpdateExpression: 'REMOVE emailDraftSendClaimedAt',
-        ConditionExpression: 'attribute_exists(leadId)',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token',
+        ExpressionAttributeValues: { ':token': token },
       }).promise();
     } catch (err) {
       if (isConditionalFailure(err)) return;

@@ -50,7 +50,7 @@ const OWNER = 'user-1';
 const DRAFT = { subject: 'Hello', htmlContent: '<p>hi</p>', createdAt: '2026-11-01T00:00:00Z', updatedAt: '2026-11-01T00:00:00Z' };
 
 // One in-memory AW-Leads row.
-const row: { emailDraft: any; claimedAt: number | null } = { emailDraft: null, claimedAt: null };
+const row: { emailDraft: any; claimedAt: number | null; claimToken: string | null; tokenSeq: number } = { emailDraft: null, claimedAt: null, claimToken: null, tokenSeq: 0 };
 const LEASE_MS = 5 * 60 * 1000;
 
 jest.mock('../services/db', () => ({
@@ -65,13 +65,16 @@ jest.mock('../services/db', () => ({
       if (updates.emailDraft === null) row.emailDraft = null;
     }),
     claimLeadEmailDraft: jest.fn(async (_l: string, _id: string, expected: any) => {
-      if (!row.emailDraft || JSON.stringify(row.emailDraft) !== JSON.stringify(expected)) return false;
-      if (row.claimedAt !== null && row.claimedAt >= Date.now() - LEASE_MS) return false;
+      if (!row.emailDraft || JSON.stringify(row.emailDraft) !== JSON.stringify(expected)) return null;
+      if (row.claimedAt !== null && row.claimedAt >= Date.now() - LEASE_MS) return null;
       row.claimedAt = Date.now();
-      return true;
+      row.claimToken = `tok-${++row.tokenSeq}`;
+      return row.claimToken;
     }),
-    releaseLeadEmailDraftClaim: jest.fn(async () => {
+    releaseLeadEmailDraftClaim: jest.fn(async (_l: string, _id: string, token: string) => {
+      if (row.claimToken !== token) return;
       row.claimedAt = null;
+      row.claimToken = null;
     }),
   },
 }));
@@ -85,6 +88,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   row.emailDraft = { ...DRAFT };
   row.claimedAt = null;
+  row.claimToken = null;
   (settingsService.getSetting as jest.Mock).mockImplementation(async (name: string) => {
     if (name === `crm_sender_emails_${OWNER}`) {
       return {
@@ -155,6 +159,19 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
     expect(row.emailDraft).toBeNull();
     expect(row.claimedAt).toBeNull();
+  });
+
+  it('releases only with the ownership token its own claim returned (stale sender cannot drop a newer claim)', async () => {
+    mockResendSendEmail.mockRejectedValueOnce(new Error('provider down'));
+    await send();
+    const token = await (crmDb.claimLeadEmailDraft as jest.Mock).mock.results[0].value;
+    expect(token).toMatch(/^tok-/);
+    expect(crmDb.releaseLeadEmailDraftClaim).toHaveBeenCalledWith('list-1', 'lead-1', token);
+    // A replacement sender's claim survives a release carrying a different (expired) token.
+    row.claimedAt = Date.now();
+    row.claimToken = 'tok-replacement';
+    await (crmDb.releaseLeadEmailDraftClaim as jest.Mock)('list-1', 'lead-1', token);
+    expect(row.claimToken).toBe('tok-replacement');
   });
 
   it('a single non-concurrent send behaves as before: one send, success, draft cleared', async () => {
