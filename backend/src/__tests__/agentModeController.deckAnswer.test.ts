@@ -236,7 +236,7 @@ describe('generateResponse — approval-deck answer channel (ENG-1635/1644)', ()
     );
 
     expect(res.statusCode).toBe(200);
-    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user');
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user', { refusePersonOnlyApprovals: false });
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
     const workerArgs = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
     expect(workerArgs.messageContent).toContain('Approval deck outcome');
@@ -667,7 +667,7 @@ describe('generateResponse — person-only approvals refused for MCP self-calls 
     const answers = [{ itemId: 'question-1', verdict: 'decline' }];
     await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers }), res);
     expect(res.statusCode).toBe(200);
-    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user');
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user', { refusePersonOnlyApprovals: true });
   });
 
   it('a self-call may still answer any other card (e.g. a Meta write deck)', async () => {
@@ -678,6 +678,17 @@ describe('generateResponse — person-only approvals refused for MCP self-calls 
     await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers: [{ itemId: 'write-1', verdict: 'approve' }, { itemId: 'write-2', verdict: 'approve' }] }), res);
     expect(res.statusCode).toBe(200);
     expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalled();
+  });
+
+  it('the service refuses on the deck it actually applies (the route read may have been stale): 403, nothing runs', async () => {
+    // The early route read shows an older, harmless deck; by submit time a person-only card is pending.
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingDeck()) as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue({ outcome: 'needs_person', actions: ['smartlead'] });
+    const res = makeRes();
+    await agentModeController.generateResponse(selfCallReq({ deckId: 'deck-1', answers: [{ itemId: 'write-1', verdict: 'decline' }, { itemId: 'write-2', verdict: 'decline' }] }), res);
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual(expect.objectContaining({ code: 'APPROVAL_NEEDS_PERSON' }));
+    expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 
   it('a person in the app (not a self-call) still approves a person-only card', async () => {

@@ -9,8 +9,10 @@ because the contact had never been pushed). Found by the review of the Smartlead
 
 **Fix**
 - `authenticateToken` marks a request made with a self-call token (`_svc`, minted only by `mcpFetch`) as `isSelfCall`.
-- `generateResponse` refuses (403 `APPROVAL_NEEDS_PERSON`) a self-call deck answer that would approve one of those cards, before
-  anything is submitted, with a message telling the person to approve on the card in AgentWeb (the chat link). Declining,
+- `generateResponse` refuses (403 `APPROVAL_NEEDS_PERSON`) a self-call deck answer that would approve one of those cards, with a
+  message telling the person to approve on the card in AgentWeb (the chat link). The decision is made twice: early in the route
+  (fast path) and again inside `submitApprovalDeckAnswers` on the deck it actually applies (the write is conditional on that deck still
+  awaiting), because the route's first read of the session can lag behind (review finding). Declining,
   commenting and answering any other card (plan choices, Meta write decks) through MCP still work.
 - `services/personOnlyApprovals.ts` says which cards are person-only (the three reserved card kinds and the paused-bundle write).
 
@@ -19,7 +21,13 @@ auth test (self-call tokens marked, app logins not), helper tests; breakage chec
 kind or the per-item match each fails a test. Related suites pass; `linkedInOutreachAuth.saveAccount` and
 `agentModeController.conditionalSkip` fail on main already.
 
-**Not changed:** the share-link route (a visitor is a person), and `manage_crm_sequence`'s external activation actions (ENG-2961),
-which take the approver's identity from the caller by design.
+**Not changed (and not claimed):** the share-link route (a visitor is a person), and `manage_crm_sequence`'s external activation pair
+(ENG-2961, another session): an `aw_` key can still activate a CRM sequence through `external_activation_preview` then
+`external_activate_confirm`, because the approver is a string the caller supplies and the digest is computed by the caller (the
+review read this from the code; not reproduced). That is ENG-2961's design for a human approving in Slack through an agent; whether it
+needs a verifiable approver (a signature from the Slack bridge, or a server-side approval record) is an owner decision. So this change
+closes the approval-card path for CRM sequences, not that one. Also noted by the review, not changed here: the person-only list is a
+prefix denylist kept in two places (`emma/tools.ts` `RESERVED_QUESTION_KIND_PREFIXES` lacks the CRM activation kind), and delegate
+tokens minted in `adminClientScope.ts` are not flagged `isSelfCall` (none reaches `/generate` today).
 
 **Rollback:** revert; no data, table or environment change.
