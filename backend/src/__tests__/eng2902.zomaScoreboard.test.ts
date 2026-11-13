@@ -163,6 +163,24 @@ describe('first successful ad (provider-verified)', () => {
     expect(deps.recordFirstAd).not.toHaveBeenCalled();
   });
 
+  it('recorded users do not use a check slot; users beyond the cap are deferred, not dropped', async () => {
+    const users = ['u1', 'u2', 'u3'].map((id) => user(id, `${id}@acme.co`));
+    const events = users.flatMap(({ userId }) => [write(userId, daysAgo(3)), write(userId, daysAgo(2), { action: 'UPDATE', writeKind: 'approve' })]);
+    const deps = firstAdDeps(events, { status: 'ACTIVE', impressions: 0 }, users);
+    deps.recorded.set('u1', { campaignId: 'c1' });
+    const out = await verifyZomaFirstAds(deps, { maxUsers: 1 });
+    expect(out.map((r) => [r.userId, r.outcome])).toEqual([['u1', 'already_recorded'], ['u2', 'no_impressions'], ['u3', 'deferred']]);
+  });
+
+  it('a failing ad_live emit does not fail the check once the marker is written', async () => {
+    const deps = firstAdDeps([created, approved], { status: 'ACTIVE', impressions: 2 });
+    (deps.onFirstAd as jest.Mock).mockRejectedValue(new Error('posthog down'));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('verified');
+    expect(deps.recorded.get('u1')).toEqual(expect.objectContaining({ campaignId: 'c1' }));
+    warn.mockRestore();
+  });
+
   it('unconfirmed approvals and Google writes are ignored', async () => {
     const deps = firstAdDeps([
       created,
