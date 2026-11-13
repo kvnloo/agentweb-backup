@@ -2602,11 +2602,16 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         throw error;
       }
 
-      await crmDb.updateLead(listId, leadId, { emailDraft: null });
+      // Clear the sent draft and our claim in one conditional write: only while we still own
+      // the claim AND the stored draft is the one we sent, so a draft replaced mid-send (or a
+      // replacement sender after our lease expired) is never deleted.
       try {
-        await crmDb.releaseLeadEmailDraftClaim(listId, leadId, claimToken);
-      } catch (releaseError) {
-        console.error('AgentMode: failed to release email draft claim after send (ENG-2984):', releaseError);
+        const cleared = await crmDb.completeLeadEmailDraftSend(listId, leadId, claimToken, draft);
+        if (!cleared) {
+          console.warn('AgentMode: sent email but draft changed or claim lost mid-send; left stored draft intact (ENG-2984)');
+        }
+      } catch (clearError) {
+        console.error('AgentMode: failed to clear sent email draft (ENG-2984):', clearError);
       }
 
       return {

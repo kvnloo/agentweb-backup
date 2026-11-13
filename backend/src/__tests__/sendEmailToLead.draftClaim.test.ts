@@ -71,6 +71,13 @@ jest.mock('../services/db', () => ({
       row.claimToken = `tok-${++row.tokenSeq}`;
       return row.claimToken;
     }),
+    completeLeadEmailDraftSend: jest.fn(async (_l: string, _id: string, token: string, sent: any) => {
+      if (row.claimToken !== token || JSON.stringify(row.emailDraft) !== JSON.stringify(sent)) return false;
+      row.emailDraft = null;
+      row.claimedAt = null;
+      row.claimToken = null;
+      return true;
+    }),
     releaseLeadEmailDraftClaim: jest.fn(async (_l: string, _id: string, token: string) => {
       if (row.claimToken !== token) return;
       row.claimedAt = null;
@@ -179,8 +186,29 @@ describe('sendEmailToLead — atomic draft claim (ENG-2984)', () => {
     const result = await send();
     expect(result).toEqual(expect.objectContaining({ success: true, emailId: 'email-1', to: 'lead@contractor.com', subject: 'Hello' }));
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
-    expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', { emailDraft: null });
+    expect(crmDb.completeLeadEmailDraftSend).toHaveBeenCalledWith('list-1', 'lead-1', expect.stringMatching(/^tok-/), expect.objectContaining({ subject: 'Hello' }));
     expect(row.emailDraft).toBeNull();
     expect(row.claimedAt).toBeNull();
+  });
+
+  it('does not delete a draft that was replaced while the send was in flight', async () => {
+    const replacement = { ...DRAFT, subject: 'Replacement' };
+    mockResendSendEmail.mockImplementation(async () => {
+      row.emailDraft = { ...replacement };
+      return { id: 'email-1' };
+    });
+    const result = await send();
+    expect(result.success).toBe(true);
+    expect(row.emailDraft).toEqual(replacement);
+  });
+
+  it('a sender whose lease was taken over does not clear the draft or the new claim', async () => {
+    mockResendSendEmail.mockImplementation(async () => {
+      row.claimToken = 'tok-replacement';
+      return { id: 'email-1' };
+    });
+    await send();
+    expect(row.emailDraft).toEqual(DRAFT);
+    expect(row.claimToken).toBe('tok-replacement');
   });
 });

@@ -11263,6 +11263,39 @@ export const crmDb = {
   },
 
   /**
+   * ENG-2984: after a successful send, clears the draft and the send-claim in ONE conditional
+   * write — only while the claim still holds the caller's token AND the stored draft still equals
+   * the draft that was sent. Returns false (nothing written) otherwise, so a draft replaced
+   * mid-send or a replacement sender's claim is never removed.
+   */
+  async completeLeadEmailDraftSend(
+    listId: string,
+    leadId: string,
+    token: string,
+    sentDraft: Record<string, unknown>,
+  ): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET emailDraft = :null, updatedAt = :now REMOVE emailDraftSendClaimedAt',
+        ConditionExpression: 'emailDraftSendClaimedAt = :token AND emailDraft = :sent',
+        ExpressionAttributeValues: {
+          ':null': null,
+          ':now': new Date().toISOString(),
+          ':token': token,
+          ':sent': sentDraft,
+        },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'completeLeadEmailDraftSend');
+      throw err;
+    }
+  },
+
+  /**
    * ENG-2984: releases a send-claim (after a failed send, or after a successful send has cleared
    * the draft). Removes the claim only while it still holds the caller's token, so a sender whose
    * lease expired cannot drop a replacement sender's claim. Idempotent; a mismatch is a no-op.
