@@ -82,7 +82,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   list_knowledge_bases: 'write',
   list_landing_page_files: 'write',
   list_landing_pages: 'write',
-  list_lead_lists: 'write',
+  list_lead_lists: 'read',
   list_predefined_work_plans: 'write',
   list_schedule_templates: 'write',
   list_scheduled_chats: 'write',

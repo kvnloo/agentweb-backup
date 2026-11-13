@@ -1077,6 +1077,8 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'list_lead_lists',
+  // A GET only: listing lists changes nothing. Read-only so a key scoped to tools:read (e.g. a Smartlead agent key) can find a listId.
+  readOnly: true,
   definition: {
     name: 'list_lead_lists',
     description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',

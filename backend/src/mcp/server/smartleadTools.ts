@@ -47,6 +47,14 @@ const RUN_ID_PROP = { type: 'string', description: 'The push (from get_smartlead
 
 type Gate = typeof API_KEY_SCOPE_SMARTLEAD_READ | typeof API_KEY_SCOPE_SMARTLEAD_CONTROL;
 
+/** When several Smartlead connections are available the route lists them in `details`; name them so the agent can pass accountId. */
+export function withConnectionChoices(err: any): any {
+  const choices = Array.isArray(err?.details) ? err.details.filter((c: any) => c && typeof c.accountId === 'string') : [];
+  if (choices.length === 0) return err;
+  const list = choices.map((c: any) => `${c.accountId}${c.accountName ? ` (${String(c.accountName).slice(0, 60)})` : ''}${c.shared ? ', shared by a teammate' : ''}`).join('; ');
+  return new Error(`${err.message} Available connections: ${list}. Call again with accountId set to one of them.`);
+}
+
 function register(p: {
   name: string;
   scope: Gate;
@@ -74,7 +82,7 @@ function register(p: {
           ...(error ? { error } : {}),
         }));
       try {
-        const result = await p.run(args, context);
+        const result = await p.run(args, context).catch((err: any) => { throw withConnectionChoices(err); });
         audit('ok');
         return jsonResult(result);
       } catch (err: any) {
@@ -156,8 +164,8 @@ register({
       preview,
       approveIn: link,
       nextStep: preview.canStart
-        ? `Nothing was pushed. To push, the person who owns the account opens ${link}, opens the list's settings menu, chooses "Push to Smartlead", picks this campaign and approves there.`
-        : `Nothing was pushed, and this push cannot start yet: see blocks and fieldsToDecide. Once they are resolved, the person who owns the account approves it at ${link} (the list's settings menu, "Push to Smartlead").`,
+        ? `Nothing was pushed. To push, someone with access to this list opens ${link}, opens the list's settings menu, chooses "Push to Smartlead", picks this campaign and approves there.`
+        : `Nothing was pushed, and this push cannot start yet: see blocks and fieldsToDecide. Once they are resolved, someone with access to this list approves it at ${link} (the list's settings menu, "Push to Smartlead").`,
     };
   },
 });
@@ -192,7 +200,7 @@ for (const action of ['pause', 'cancel'] as const) {
     scope: API_KEY_SCOPE_SMARTLEAD_CONTROL,
     readOnly: false,
     description: action === 'pause'
-      ? 'Pause a running Smartlead push; contacts already added stay in Smartlead. Only the person who owns the account can resume it, in AgentWeb.'
+      ? 'Pause a running Smartlead push; contacts already added stay in Smartlead. Resuming it is done by a person in AgentWeb, not by an agent.'
       : 'Cancel a Smartlead push for good; contacts already added stay in Smartlead (they can be removed there).',
     inputSchema: { type: 'object', properties: { runId: RUN_ID_PROP }, required: ['runId'], additionalProperties: false },
     run: async (args, context) => {

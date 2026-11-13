@@ -2151,7 +2151,7 @@
       },
       "required": []
     },
-    "sideEffect": "write",
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -3444,7 +3444,7 @@
   {
     "name": "pause_smartlead_push",
     "listed": false,
-    "description": "Pause a running Smartlead push; contacts already added stay in Smartlead. Only the person who owns the account can resume it, in AgentWeb.",
+    "description": "Pause a running Smartlead push; contacts already added stay in Smartlead. Resuming it is done by a person in AgentWeb, not by an agent.",
     "inputSchema": {
       "type": "object",
       "properties": {
