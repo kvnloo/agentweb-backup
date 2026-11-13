@@ -1,8 +1,0 @@
-## ENG-2977: Zoma toolkit Meta calls honor BUC with bounded backoff (2026-11-12)
-
-- Extracted the existing Meta service BUC parser into a shared leaf utility, retaining the service export and using the highest usage/estimate across account/use-case entries.
-- Meta toolkit calls now run in request-local backoff context. Graph axios responses and the shared fetch helper honor a named 90% usage threshold and throttle codes 4, 17, 32, 613, 80000–80014 (plus HTTP 429).
-- Reads share one retry budget per toolkit invocation. Meta's regain estimate is in minutes, converted to milliseconds with a hard 30-second sleep cap and injectable sleep. Missing estimates fall back to one minute for the caller, still capped to 30 seconds for sleep.
-- Writes never retry, including Graph POST/DELETE even if incorrectly classified upstream. Rate-limited results expose the regain estimate; writes warn that they may have executed and require verification before another attempt. Unrelated non-toolkit requests retain existing behavior.
-- Verified: 74 tests passed across three scoped Jest suites (gateway acceptance, transport/backoff, existing CAPI). Scoped semantic TypeScript check of four leaf files and gateway/service syntax checks: zero diagnostics. Jest emitted a worker teardown warning. No live Meta calls, production build/deploy, full-repo typecheck, or browser checks were run.
-- Risk: bounded extra latency for near-limit reads; high-usage successful reads may be replaced by an explicit rate-limited result after the single retry. Rollback: revert this change. Post-deploy smoke: invoke a connected-account toolkit read; confirm normal response and single usage event, then exercise a mocked throttle to verify bounded retry and caller-visible estimate.
