@@ -15,6 +15,7 @@
  */
 import type { InboundDeckAnswer, PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { SMARTLEAD_APPROVAL_KIND_PREFIX } from './smartleadPushApprovalGate';
+import { PAUSED_BUNDLE_ACTION } from './agentMode/metaPausedBundle';
 import { APPROVAL_KIND_RESERVED_PREFIX as HOT_LEAD_CALL_KIND_PREFIX, APPROVE_OPTION_ID } from './voice/hotLeadCallApprovalGate';
 import { ACTIVATION_KIND_PREFIX, ACTIVATE_OPTION_ID } from './crmSequenceActivationGate';
 
@@ -28,7 +29,7 @@ function personOnlyActionOf(item: DeckItem): { action: PersonOnlyAction; approvi
   if (kind.startsWith(SMARTLEAD_APPROVAL_KIND_PREFIX)) return { action: 'smartlead', approvingVerdict: APPROVE_OPTION_ID };
   if (kind.startsWith(HOT_LEAD_CALL_KIND_PREFIX)) return { action: 'hot_lead_call', approvingVerdict: APPROVE_OPTION_ID };
   if (kind === ACTIVATION_KIND_PREFIX || kind.startsWith(`${ACTIVATION_KIND_PREFIX}:`)) return { action: 'crm_sequence_activation', approvingVerdict: ACTIVATE_OPTION_ID };
-  if (item.metaWriteDispatch?.action === 'CREATE_PAUSED_BUNDLE') return { action: 'meta_paused_bundle', approvingVerdict: 'approve' };
+  if (item.metaWriteDispatch?.action === PAUSED_BUNDLE_ACTION) return { action: 'meta_paused_bundle', approvingVerdict: 'approve' };
   return null;
 }
 
