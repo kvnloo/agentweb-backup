@@ -8046,7 +8046,7 @@ export const crmDb = {
      *  main write only lands if the stored notes still equal this ('' = absent/empty);
      *  otherwise it throws ConditionalCheckFailedException and the caller re-reads and
      *  re-merges, so two concurrent submissions cannot overwrite each other's note. */
-    expectedNotes?: string;
+    expectedNotes?: string | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -8627,7 +8627,7 @@ export const crmDb = {
       };
       if (updates.expectedNotes !== undefined) {
         expressionAttributeNames['#notesGuard'] = 'notes';
-        if (updates.expectedNotes) {
+        if (updates.expectedNotes !== '') {
           params.ExpressionAttributeValues = { ...(params.ExpressionAttributeValues || {}), ':expectedNotes': updates.expectedNotes };
           params.ConditionExpression = '#notesGuard = :expectedNotes';
         } else {

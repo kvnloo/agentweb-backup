@@ -1029,7 +1029,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // ENG-2936: an appended note is read-modify-write, so guard it on the notes we read;
         // a concurrent same-email submission makes this throw and the caller re-merges.
         const write: any = { ...toKeyMergeUpdate(updates, existingCustomFields) };
-        if (updates.notes !== undefined) write.expectedNotes = existingLead.notes ?? '';
+        if (updates.notes !== undefined) write.expectedNotes = existingLead.notes === undefined ? '' : existingLead.notes;
         await crmDb.updateLead(leadList.listId, existingLead.leadId, write);
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent

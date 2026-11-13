@@ -74,9 +74,9 @@ describe('crmDb.updateLead — customFieldsKeyMerge', () => {
     expect(fake.list(L).fieldNames).not.toContain('expectedNotes');
   });
 
-  it.each([undefined, ''])('accepts a guarded first note when prior notes are %p', async (notes) => {
+  it.each([undefined, '', null])('accepts a guarded first note when prior notes are %p', async (notes) => {
     fake.seedLead(row(notes === undefined ? {} : { notes }));
-    await crmDb.updateLead(L, 'lead_1', { expectedNotes: '', notes: 'first' });
+    await crmDb.updateLead(L, 'lead_1', { expectedNotes: notes === undefined ? '' : notes, notes: 'first' });
     expect(fake.lead(L, 'lead_1').notes).toBe('first');
     assertWellFormed(leadUpdates()[0]);
   });
