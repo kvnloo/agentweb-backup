@@ -81,12 +81,27 @@ export function parseHardBounces(raw: string, senderEmail: string): HardBounce[]
   }
   if (blocks.length > 0) return [...found.values()];
 
-  const transient = /^Action:[ \t]*delayed/im.test(raw) || /^Status:[ \t]*4\./im.test(raw) || /\b4\.\d{1,3}\.\d{1,3}\b/.test(raw);
+  // Only the DSN's own explanation counts: cut the body before any quoted
+  // original-message headers so e.g. `Subject: Order 550` cannot qualify.
+  const body = raw.split(/\r?\n\r?\n/).slice(1).join('\n');
+  const quoted = body.search(/^(?:Received|Subject|Message-ID|From|To|Date|Return-Path):/im);
+  const explanation = quoted >= 0 ? body.slice(0, quoted) : body;
+  const transient =
+    /^Action:[ \t]*delayed/im.test(raw) ||
+    /^Status:[ \t]*4\./im.test(raw) ||
+    /\b4\.\d{1,3}\.\d{1,3}\b/.test(raw) ||
+    /^[ \t]*4\d\d[ \t-]/m.test(explanation) ||
+    /^Diagnostic-Code:[^\n]*\b4\d\d\b/im.test(explanation);
   if (transient) return [];
   // X-Failed-Recipients alone does not prove permanence (delay notices carry it
-  // too, and their 4.x status may sit in an encoded MIME part we cannot see).
-  // Require a visible permanent SMTP reply (5yz) or enhanced status (5.x.x).
-  if (!/\b5\d\d\b|\b5\.\d{1,3}\.\d{1,3}\b/.test(raw.split(/\r?\n\r?\n/).slice(1).join('\n'))) return [];
+  // too). Require a delivery-status value, not an arbitrary body number: a
+  // `Status: 5.x.x` field, a Diagnostic-Code with a 5yz reply, or an SMTP reply
+  // line that starts with 5yz, in the DSN explanation (not the quoted original).
+  const permanent =
+    /^Status:[ \t]*5\.\d{1,3}\.\d{1,3}/im.test(explanation) ||
+    /^Diagnostic-Code:[^\n]*\b5\d\d\b/im.test(explanation) ||
+    /^[ \t]*5\d\d[ \t-]/m.test(explanation);
+  if (!permanent) return [];
   const failedHeader = headerValue(raw, 'X-Failed-Recipients');
   for (const part of failedHeader.split(',')) {
     const m = part.match(EMAIL);

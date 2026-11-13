@@ -59,6 +59,13 @@ describe('parseHardBounces', () => {
     expect(parseHardBounces(raw, SENDER)).toEqual([{ recipient: 'c@example.com', status: '5.0.0' }]);
     expect(parseHardBounces(raw.replace('550 user unknown', 'Status: 4.4.1 retrying'), SENDER)).toEqual([]);
   });
+  it('ignores 5xx numbers in the quoted original and treats a 451 reply as transient', () => {
+    const raw = 'From: mailer-daemon@example.org\r\nX-Failed-Recipients: c@example.com\r\n\r\n451 Temporary failure\r\n\r\nSubject: Order 550\r\nMessage-ID: <x@y>';
+    expect(parseHardBounces(raw, 'me@example.com')).toEqual([]);
+    const quotedOnly = 'From: mailer-daemon@example.org\r\nX-Failed-Recipients: c@example.com\r\n\r\nDelivery problem\r\n\r\nSubject: Order 550\r\n';
+    expect(parseHardBounces(quotedOnly, 'me@example.com')).toEqual([]);
+  });
+
   it('does not treat X-Failed-Recipients as permanent without a visible 5xx/5.x.x status', () => {
     const raw = 'From: mailer-daemon@example.org\r\nX-Failed-Recipients: c@example.com\r\nContent-Transfer-Encoding: base64\r\n\r\nRGVsYXllZDogNC40LjEgcmV0cnlpbmc=';
     expect(parseHardBounces(raw, SENDER)).toEqual([]);
