@@ -15,9 +15,14 @@
  */
 import type { InboundDeckAnswer, PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { SMARTLEAD_APPROVAL_KIND_PREFIX } from './smartleadPushApprovalGate';
-import { PAUSED_BUNDLE_ACTION } from './agentMode/metaPausedBundle';
 import { APPROVAL_KIND_RESERVED_PREFIX as HOT_LEAD_CALL_KIND_PREFIX, APPROVE_OPTION_ID } from './voice/hotLeadCallApprovalGate';
 import { ACTIVATION_KIND_PREFIX, ACTIVATE_OPTION_ID } from './crmSequenceActivationGate';
+
+/**
+ * Same value as `PAUSED_BUNDLE_ACTION` in agentMode/metaPausedBundle.ts. Not imported: that module pulls in MetaService (and axios) at
+ * load, which this small gate, loaded by the chat controller, must not. personOnlyApprovals.test.ts pins the two together.
+ */
+const PAUSED_BUNDLE_ACTION = 'CREATE_PAUSED_BUNDLE';
 
 /** What a card is, for the refusal message. */
 export type PersonOnlyAction = 'smartlead' | 'hot_lead_call' | 'crm_sequence_activation' | 'meta_paused_bundle';

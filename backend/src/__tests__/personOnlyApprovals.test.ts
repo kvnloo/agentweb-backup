@@ -1,4 +1,5 @@
 import { personOnlyApprovalsIn } from '../services/personOnlyApprovals';
+import { PAUSED_BUNDLE_ACTION } from '../services/agentMode/metaPausedBundle';
 
 const deck = (items: any[]) => ({ deckId: 'd', status: 'awaiting', items, createdAt: '', finalizedAt: '' } as any);
 
@@ -26,5 +27,12 @@ describe('personOnlyApprovalsIn (ENG-2962)', () => {
   it('tolerates missing or malformed input', () => {
     expect(personOnlyApprovalsIn(undefined, [])).toEqual([]);
     expect(personOnlyApprovalsIn(deck([{ itemId: 'a', kind: 'smartlead_push_approval:x' }]), 'nope')).toEqual([]);
+  });
+});
+
+describe('constants shared with the gates', () => {
+  it('the paused-bundle action here is the one the Meta code uses', () => {
+    const d = deck([{ itemId: 'e', kind: 'meta_write', metaWriteDispatch: { action: PAUSED_BUNDLE_ACTION } }]);
+    expect(personOnlyApprovalsIn(d, [{ itemId: 'e', verdict: 'approve' }]).map((x) => x.action)).toEqual(['meta_paused_bundle']);
   });
 });
