@@ -52,9 +52,10 @@ const graph = async () => import('../services/agentMode/metaToolkitLifecycleGrap
 async function graphContext(userId: string, accountId: string): Promise<MetaGraphContext> {
   const { agentModeService } = await import('../services/agentModeService');
   const axios = (await import('axios')).default;
+  const { attachMetaToolkitBackoff } = await import('../utils/metaToolkitBackoff');
   // Bounded: a stalled Graph call must not hold the request open (a hung COPY retried after a
   // client timeout could create a second copy).
-  return { http: axios.create({ timeout: 30_000 }), ...(await agentModeService.getToolkitMetaGraphCredentials(userId, accountId)) };
+  return { http: attachMetaToolkitBackoff(axios.create({ timeout: 30_000 })), ...(await agentModeService.getToolkitMetaGraphCredentials(userId, accountId)) };
 }
 async function metaWriter(userId: string, accountId: string) {
   const { metaService } = await import('../services/metaService');

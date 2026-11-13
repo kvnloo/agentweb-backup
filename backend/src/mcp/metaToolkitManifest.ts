@@ -27,12 +27,13 @@ import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './m
 import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
+import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
 const META_MARKETING_API_DESCRIPTION =
   'Meta Marketing API for external agents. Reads: LIST, GET, PREVIEW, SEARCH, GET_MATCH_QUALITY. ' +
-  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED), budget, CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id (swap)/name, ' +
+  'Guarded writes (CAMPAIGN, AD_SET, AD only): CREATE, and UPDATE of status (ACTIVE/PAUSED), budget, name (CAMPAIGN, AD_SET, AD), CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id (swap), ' +
   'ARCHIVE (stops delivery, keeps history), DELETE (irreversible) and COPY (params.deep_copy for CAMPAIGN/AD_SET, ' +
   'params.campaign_id = destination campaign for an AD_SET copy, params.adset_id = destination ad set for an AD copy; copies are created PAUSED). ' +
   'ARCHIVE/DELETE are refused when the entity spent in the last 24 hours unless confirm_recent_spend=true after the user explicitly accepts it; prefer pausing first. ' +
@@ -120,6 +121,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    JSON.parse(JSON.stringify(HELP_ARTICLE_DEFINITION)),
     ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_CATALOG_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),

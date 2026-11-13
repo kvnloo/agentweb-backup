@@ -49,6 +49,8 @@ const STAGE_FOR_EVENT: Partial<Record<JourneyEvent, ZomaStage>> = {
   card_saved: 'card_saved',
   first_read: 'first_read',
   first_write: 'first_write',
+  // ENG-2902: only from verifyZomaFirstAds, after the provider read-back proves ACTIVE + impressions.
+  ad_live: 'ad_live',
 };
 
 /**

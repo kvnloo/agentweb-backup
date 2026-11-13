@@ -13,6 +13,7 @@ import '../apiTools';
 import '../workflowTools';
 import {
   AGENT_EXECUTION_TOOLS,
+  DETERMINISTIC_TOOLS,
   filterDeterministicTools,
   isAgentExecutionTool,
 } from '../agentExecutionTools';
@@ -44,5 +45,32 @@ describe('ENG-2948 agent-execution tool classification', () => {
     const remaining = filterDeterministicTools(mcpToolRegistry.getToolNames());
     expect(remaining.some(isAgentExecutionTool)).toBe(false);
     expect(remaining).toEqual(expect.arrayContaining(DETERMINISTIC));
+  });
+});
+
+describe('ENG-2969 registry drift guard', () => {
+  // Load every module mcpServerCore loads so the registry matches production.
+  beforeAll(async () => {
+    await import('../mcpServerCore');
+  });
+
+  it('every registered main-MCP tool is classified exactly once', () => {
+    const registered = mcpToolRegistry.getToolNames();
+    const execution = new Set(AGENT_EXECUTION_TOOLS);
+    const deterministic = new Set(DETERMINISTIC_TOOLS);
+    const unclassified = registered.filter((n) => !execution.has(n) && !deterministic.has(n));
+    const both = registered.filter((n) => execution.has(n) && deterministic.has(n));
+    const hint =
+      'classify it in backend/src/mcp/server/agentExecutionTools.ts ' +
+      '(AGENT_EXECUTION_TOOLS if it can start/resume/delegate an Emma agent run, else DETERMINISTIC_TOOLS)';
+    if (unclassified.length) throw new Error(`Unclassified MCP tool(s): ${unclassified.join(', ')} — ${hint}`);
+    if (both.length) throw new Error(`MCP tool(s) in both classifications: ${both.join(', ')} — ${hint}`);
+    expect(execution.size + deterministic.size).toBe(registered.length);
+  });
+
+  it('classification lists contain no stale (unregistered) or duplicate names', () => {
+    const all = [...AGENT_EXECUTION_TOOLS, ...DETERMINISTIC_TOOLS];
+    expect(new Set(all).size).toBe(all.length);
+    expect(all.filter((n) => !mcpToolRegistry.getTool(n))).toEqual([]);
   });
 });

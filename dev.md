@@ -1,3 +1,502 @@
+## ENG-2979: Google toolkit RSA content edits via guarded preview (2026-11-12)
+
+- `call_google_ads_api` AD UPDATE now accepts `headlines` / `descriptions` / `final_url` for RESPONSIVE_SEARCH_AD ads (status still sent alone). Preview shows current vs new; confirm mutates `customers/{cid}/ads/{adId}` (AdService) with an update_mask of only the changed fields; read-back verifies each field (MISMATCH/UNCONFIRMED never success). Non-RSA and foreign ads refused.
+- Files: `backend/src/mcp/googleToolkitWrites.ts`, `googleToolkitManifest.ts`, `services/googleAdsService.ts` (`updateAd` + `updateResponsiveSearchAdContent`), `emma/impl/adsCrmApis.ts`.
+
+## ENG-2902: Zoma launch scoreboard — per-user admin tracker (2026-11-12)
+
+- Admin → Growth & CRM → **Zoma** (partner portal tab 28) reads `GET /api/admin/zoma/scoreboard` (admin only, no-store).
+- **Active (rolling 7d)** = non-team/test account with >= 1 *successful* Zoma write in the last 7 days. Successful = `mcp_write_executed` with `verification=CONFIRMED`. Only the Zoma toolkit gateways (Meta + Google) record that event, so it is a Zoma write by construction. Kinds: create (CREATE/BULK_CREATE/UPLOAD_*/COPY), pause (UPDATE status=PAUSED), approve (UPDATE status=ACTIVE = go-live approval), edit (everything else). New events carry `dimensions.writeKind`. Events before this change have none, so a legacy UPDATE counts as edit (still active). Signup, reads, previews, MISMATCH/UNCONFIRMED writes never count.
+- **First successful ad** = write-once AW-Users `zomaFirstAdLive {at, approvedAt, campaignId, platform:'meta', effectiveStatus:'ACTIVE', impressions}`, recorded only by `POST /api/admin/zoma/scoreboard/verify-first-ads` (the "Check first ads" button, optional `{userId}`). It requires: a CONFIRMED Zoma CAMPAIGN CREATE by that user (60-day lookback); a CONFIRMED Zoma go-live approval (`writeKind=approve`) on that campaign or one of its ad sets/ads, with the parent resolved via provider read; a Meta read-back `effective_status=ACTIVE`; and lifetime insights impressions >= 1. The write is conditional (`attribute_not_exists`). On first write `zomaStage` → `ad_live` and the `ad_live` journey event fires. Bounded per call: 10 provider-checked users (recorded users do not use a slot), 5 approvals per user, 5 Meta accounts, and a 40s budget. The rest is returned `deferred` for the next click. Provider failures are reported as `provider_error`, never recorded. A failed `ad_live` emit is logged and never fails the check. Verification is on demand: the board shows "N approval(s) awaiting proof" until someone clicks.
+- **Excluded**: `journeyProductBackfill.accountFlag` — our domains, admins, and test/fixture locals or domains. These are listed (dimmed, chip) and excluded from every summary count.
+- Users = AW-Users with `products.zoma` or `signupProduct=zoma`, plus any write-event subject (Zoma users from before ENG-2906 attribution).
+- Limits: Google go-live (`ENABLED`) is not classified as approve and Google first ads are not verified (Google toolkit is dark). Approvals made before writeKind existed cannot be proven as go-live approvals.
+- Data plane: one new optional attribute `zomaFirstAdLive` on existing AW-Users rows and an optional `writeKind` dimension on existing event rows. No table, index, key, migration or backfill.
+- Test: `backend$ npx jest --runInBand --runTestsByPath src/__tests__/eng2902.zomaScoreboard.test.ts`; `partner-portal$ npx jest src/components/admin/__tests__/ZomaScoreboardTab.test.tsx src/pages/__tests__/adminNavigation.test.ts`.
+- Rollback: revert. `zomaFirstAdLive` and `writeKind` are inert to the old code.
+
+## ENG-2881: Zoma waitlist + 60-user free-plan cap (2026-11-09)
+
+- Dark by default: `ZOMA_WAITLIST_ENABLED=true` enables admission for all new password and Google OAuth registrations in this backend deployment. Only enable on the intended Zoma deployment; request roles and `SKIP_WAITLIST_CHECK` cannot bypass it. `ZOMA_FREE_USER_CAP` defaults to 60 (positive integer).
+- Existing accounts are never disabled or checked against the cap on login. Overflow creates a durable waitlist decision, not an account or JWT. Password registration returns HTTP 202 `{code:"waitlisted",status:"waitlisted",message:...}`; OAuth reports 403 `waitlisted` through the existing callback error path. Pending/rejected decisions do not auto-activate on retries.
+- Data-plane gate: needs Harsha pre-merge approval. Uses existing AW-Waitlist table (Dev- in development), a reserved item `email=__zoma_free_capacity__` with integer `approvedCount`, and per-email `zomaStatus`, `approvedBy/At`, `rejectedBy/At`. Counter increment + email approval are one conditional DynamoDB transaction; duplicate attempts do not increment twice. Failed account creation retains its approval reservation for a safe retry. Count means approved seats/reservations, not completed account creations. There is intentionally no automatic decrement/reclamation.
+- Before enablement, pause new registrations, audit existing approved free accounts and initialize the counter to that count (not zero unless genuinely empty), then enable on all instances before reopening registrations. Existing approved users remain grandfathered even if the audited count already exceeds the cap; new admissions then stop. Missing/invalid counter fails closed; this change performs no provisioning/backfill and no real AWS writes were executed. This bootstrap requires a separately approved operator action; never reset an existing counter. Disabling/re-enabling the gate requires re-auditing accounts created while dark.
+- Admin API (existing authenticateToken + isAdmin): `GET /api/waitlist/zoma/capacity`; `POST /api/waitlist/zoma/:email/decision` with `{decision:"approve"|"reject"}`. Actor comes from authenticated user, not request body. Manual approval respects cap; rejection cannot revoke an approved seat. The decision endpoint sends no email; an approved applicant retries normal signup.
+- Launch wiring (2026-11-12): while enabled, the existing Admin → Waitlist **Invite** button (`PUT /api/admin/waitlist/:email/status` and `PUT /api/waitlist/:email/status`, status `invited`) first reserves a seat via the same transaction and returns 409 when the cap is full (no invitation sent); **rejected** on a decided row records the rejection; Invite on a rejected row / Reject on an approved row return 409. A waitlist-form row with no decision is marked waitlisted then admitted, so an invitation can never be refused by the gate. The existing invitation email is the approval notice (no new copy). Each new waitlist decision posts once (fail-open) to Slack `C0CGETQP27Q` (override `ZOMA_WAITLIST_SLACK_CHANNEL`) tagging Harsha, Matt and Fangfang; the bot must be a channel member. The counter row is hidden from the admin waitlist list, and `zomaStatus`/`approved*`/`rejected*` are stripped from waitlist CRUD.
+- Test: from backend, `npx jest --runInBand --runTestsByPath src/__tests__/eng2881.zomaAdmission.test.ts src/__tests__/auth.registrationPersistence.test.ts src/__tests__/waitlistRoutes.auth.test.ts`. Mocks exercise under-capacity/60th/61st, concurrent distinct/duplicate admissions, sticky overflow, audit, manual decisions, admin auth, response contract, OAuth bypass prevention and existing-account grandfathering. Run backend no-emit compile separately.
+- Verification result: scoped Jest 34/34 passing across 3 suites. Full no-emit TypeScript check could not execute: root `npx tsc` resolved the wrong package; direct installed compiler was blocked by the runtime lifecycle scanner (TypeScript compiler exceeds its 1 MiB scan cap). CI exact-head backend build remains required; no successful full typecheck is claimed.
+- Local CodeRabbit review: fixed missing admin error logging. Deferred its email-ownership-before-reservation suggestion: the current password signup contract has no email-verification prerequisite and requires immediate under-cap access. Existing route rate limiting remains (10 authentication attempts/15 min/IP), but deliberate multi-address seat exhaustion is a known pre-enable risk requiring product/security approval or a separate verified-email signup change. Do not treat rate limiting as proof of email ownership. Reservations intentionally survive persistence failures; there is no unauthenticated release path.
+- Not tested: live DynamoDB transaction contention/IAM/bootstrap, staging/prod or browser UI, email delivery, full suite. Local Jest may report pre-existing open timers and expected negative-path logs. No server/browser was started.
+- Rollback: set `ZOMA_WAITLIST_ENABLED=false` on every instance (reopens unrestricted signup), or revert this code. Preserve counter/approval records; do not delete/reset them. Re-audit before any re-enable. After an approved deployment, first verify dark signup behavior/config; after approved enablement, inspect admin count and use isolated staging fixtures for boundary smoke, never consume production seats for testing.
+- Review fixes (2026-11-12): registration goes through `admitZomaSignup`. Our team domains (`accountFlag` internal), pending org invitees, and waitlist rows already `invited` before the gate was enabled are admitted **without consuming a seat** (never waitlisted). A failed org lookup is not an exemption. Reject on a waitlist-form row now records a durable Zoma rejection, so a later self-signup is refused. `POST /api/waitlist/zoma/:email/decision` returns 409 whenever the outcome differs from the request (e.g. approving a rejected applicant).
+
+## ENG-2978: Zoma ads_get_help_article parity tool (2026-11-12)
+
+- Added a pure, read-only `ads_get_help_article` toolkit lookup with a conservative two-entry official Meta documentation index and one-line summaries. Supports normalized topic aliases and diagnostics error codes/subcodes; unknown queries return an explicit no-curated-article result.
+- Registered the tool in the Meta manifest and account-free gateway path, marked its annotations read-only, and closed its parity matrix gap. No provider requests, account access, writes, or generated URLs.
+- Verification: 39 tests passed across ENG-2978, ENG-2921, and ENG-2950 (3 suites), including host allowlisting, unknown inputs, scope enforcement, metering, and no-account/no-write behavior. Scoped TypeScript check passed for help lookup, annotations, and parity matrix plus their imported dependencies.
+- Not tested: live Meta endpoints, full repository typecheck/build, production smoke. Jest reports existing open handles and requires forced exit.
+- Risk: small static index intentionally does not cover every topic. Rollback: revert this change; no data migration or state cleanup required. Post-deploy smoke: list tools, then call `ads_get_help_article` with `topic: rate limiting` and an unknown topic; verify official URL versus empty articles.
+
+## ENG-2977: Zoma toolkit Meta calls honor BUC with bounded backoff (2026-11-12)
+
+- Extracted the existing Meta service BUC parser into a shared leaf utility, retaining the service export and using the highest usage/estimate across account/use-case entries.
+- Meta toolkit calls now run in request-local backoff context. Graph axios responses and the shared fetch helper honor a named 90% usage threshold and throttle codes 4, 17, 32, 613, 80000–80014 (plus HTTP 429).
+- Reads share one retry budget per toolkit invocation. Meta's regain estimate is in minutes, converted to milliseconds with a hard 30-second sleep cap and injectable sleep. Missing estimates fall back to one minute for the caller, still capped to 30 seconds for sleep.
+- Writes never retry, including Graph POST/DELETE even if incorrectly classified upstream. Rate-limited results expose the regain estimate; writes warn that they may have executed and require verification before another attempt. Unrelated non-toolkit requests retain existing behavior.
+- Verified: 74 tests passed across three scoped Jest suites (gateway acceptance, transport/backoff, existing CAPI). Scoped semantic TypeScript check of four leaf files and gateway/service syntax checks: zero diagnostics. Jest emitted a worker teardown warning. No live Meta calls, production build/deploy, full-repo typecheck, or browser checks were run.
+- Risk: bounded extra latency for near-limit reads; high-usage successful reads may be replaced by an explicit rate-limited result after the single retry. Rollback: revert this change. Post-deploy smoke: invoke a connected-account toolkit read; confirm normal response and single usage event, then exercise a mocked throttle to verify bounded retry and caller-visible estimate.
+
+## ENG-2976: Pure playbook provenance + usage ledger reducer (2026-11-12)
+
+Shadow-only `reducePlaybookLedger` in `backend/src/services/marketingPlaybookLedger.ts`: per (org, playbook, version) usage, campaigns, outcomes, provenance with `missing_provenance` flag, cross-org events rejected. Not wired into any live path; no persistence.
+
+## ENG-2973: zoma_status reports Google Ads explicitly unavailable when provider is off (2026-11-12)
+
+`ZomaReadiness.google_ads` is now always present; with ZOMA_GOOGLE_ADS_ENABLED off it is `{ available: false, ..., reason: "google_ads_provider_disabled" }`. Flag-on shape gains `available: true`. Text rendering unchanged.
+
+## ENG-2972: get_chat_history accepts an omitted time window (2026-11-12)
+
+- `get_chat_history` start_time/end_time are now optional; a missing window defaults to the trailing 24h ending now. Fixes schema_reject (invalid_args) when the model calls it without a range. Invalid/inverted windows return an actionable error.
+
+## ENG-2971: pure playbook consolidation + archival planner, shadow-only (2026-11-12)
+
+Added `backend/src/services/marketingPlaybookConsolidation.ts` (`planPlaybookConsolidation`): keep latest semver, archive superseded/expired, review stale, report invalid, propose same-org duplicate merges. Pure; not wired.
+
+## ENG-2969: MCP tool classification drift guard (2026-11-12)
+
+Added `DETERMINISTIC_TOOLS` beside `AGENT_EXECUTION_TOOLS` in `backend/src/mcp/server/agentExecutionTools.ts` (109 + 9 = all 118 main-MCP registrations). Jest drift guard fails on any unclassified, double-classified, or stale tool name. No runtime change.
+
+## ENG-2968: Org-wide social posts list (2026-11-12)
+
+GET /social-posts fans out to same-org members (ENG-2874 member resolution), stamps createdBy/canModify; teammate account activity + memory GET readable within org, cross-org stays 403/404. Edits stay owner-only.
+
+## ENG-2961: external sequence activation preview/confirm MCP actions (2026-11-12)
+
+manage_crm_sequence gains external_activation_preview / external_activate_confirm for external MCP callers only, bound to the ENG-2958 digest (sequence version + approver). Stale/tampered/foreign/missing digest refused; activation uses the existing atomic guarded write. No schema changes.
+
+## ENG-2960: Meta toolkit CAMPAIGN/AD_SET/AD name-only edits via guarded write gateway (2026-11-12)
+
+- `call_meta_marketing_api` guarded UPDATE now accepts `name` on CAMPAIGN and AD_SET (AD already did), through the existing ownership check, preview/confirm token and read-back verification. Unknown fields stay refused; budget, creative swap and activation must still be their own UPDATE.
+
+## ENG-2959: Google toolkit CAMPAIGN rename + AD_GROUP name/max CPC via guarded preview (2026-11-12)
+
+- `call_google_ads_api` guarded writes now accept CAMPAIGN UPDATE `name` and AD_GROUP UPDATE `name`/`cpc_bid` (major units -> micros), each through the preview/confirm token flow with current-vs-new preview and read-back verification. `status` must still be sent alone; all other UPDATE fields stay refused.
+
+## ENG-2958: pure external activation-preview digest (2026-11-12)
+
+Added backend/src/services/externalActivationPreview.ts: version hash + approver-bound digest for external (Slack-approved) CRM sequence activation previews. Pure; not wired into manage_crm_sequence.
+
+## ENG-2957: the chat's voice button works again (broken since 2026-10-07) (2026-11-12)
+
+The portal's "Switch to voice mode" button only entered voice mode when the text picker's model list contained the
+live-voice model (`gemini-3.1-flash-live-preview`), and then saved that model as the chat's model. Two changes on
+2026-10-07 broke it without an error: PR #3339 (ENG-903) removed the live-voice model from `/model-options` (a text
+picker must never offer it), and commit `8b0794b64` (PR #3276, ENG-2293) made both model-switch routes refuse live
+models. Share pages had lost the button on 2026-08-19 (the public catalog hides live models). Production logs held no
+voice session started from the app.
+
+**Design: voice mode is client-side.** The voice session never reads the chat's stored model (`live:start` checks
+ownership only), so the portal now enters and leaves voice mode in the picker only and never saves the voice model.
+Saving it (the pre-2026-10-07 behaviour) left chats stored on the live model whenever voice was left without pressing
+End, and several text paths read the stored model and fail on it (share-link plan check, Slack and email replies,
+work plans; found by an independent review of the first version of this change).
+
+**What changed (backend)**
+- `agentModeService.getVoiceModelFor(isAdmin)`: the served live-voice model, with the picker's internal-only and
+  admin-only gates.
+- New `GET /api/agent-mode/public/voice-model` returns `{ voiceModel }` (null = no voice button).
+- Unchanged on purpose: both model-switch routes still refuse the live-voice model; `/model-options` and
+  `/public/llm-models` still never list it.
+
+**Voice usage (owner, 2026-11-12: "voice has to have usage and everything linked up properly").**
+- Admission: a voice call is admitted like a typed turn (`checkTokenUsage(owner, TURN_ADMISSION)`), after the ownership
+  check and before any Gemini session exists; a paused or over-limit account (the share link's owner, for a share-link
+  call) is refused with typed chat's message and `code: 'usage_paused'`; a failed lookup refuses (fail closed). After
+  every completed turn the same check runs; a call whose allowance ran out is told so and ended (a transient lookup
+  failure does not cut a live call).
+- Cost: each Gemini usage report is priced per modality from the price book (`LIVE_MODALITY_PRICES`, Google's paid-tier
+  rates read 2026-11-12: input text 0.75, audio 3.00, image/video 1.00; output text 4.50, audio 12.00 USD per 1M tokens)
+  instead of the text-rate approximation, which under-priced audio about 4x in and 2.7x out. Metered under the
+  feature `live_voice` (was the generic `agent_task`), so usage reports show voice as its own line.
+- Usage reports were measured on the test environment (3-turn call, 2026-11-12): exactly one report per turn, each the
+  turn's own usage (prompt ~91k each turn: the full context incl. every tool declaration is re-sent per turn, growing by
+  only that turn; response 95/83/78), so each report is charged as it arrives. A count-only log line per report stays.
+- Price book version bumped to 2026-11-12 with `LIVE_MODALITY_PRICES` in the pinned fingerprint (voice events before it
+  were priced at the text-rate approximation).
+- Feature `live_voice:interactive`; token counts as Google defines them (cached tokens once, as cache reads; tool-use
+  prompt as input; thinking as output). The voice cost is also added to the chat's own cost (`addToolCostToSession`,
+  key `live_voice`), so per-chat cost includes voice and an anonymous public-plan session's cap counts it.
+- Share-link visitors refused for usage see typed share chat's wording, not the owner's billing message; the portal
+  shows the usage message (not "try again") for `usage_paused`.
+- Cost note: a voice turn sends about 91k input tokens (mostly tool declarations), about $0.07 a turn; trimming the
+  voice tool list is the main lever for voice cost (not in this change).
+- The switch route is still not what gates voice; the voice start is.
+
+**Testing:** `agentModeController.voiceModel.test.ts` (7 cases: the endpoint, the helper's gates, both switch routes
+still refuse the voice model); related suites pass. Portal PR: client-side enter/leave, button follows the endpoint,
+voice panel note.
+
+**Rollback:** revert both PRs; the button goes back to doing nothing.
+
+## ENG-2956: Typed deterministic scheduled-action contract + validator (2026-11-12)
+
+- New pure module `backend/src/mcp/scheduledActionContract.ts`: `ScheduledAction` type and
+  `validateScheduledAction(action, registry)` returning `{ ok: true } | { ok: false, reason, detail }`.
+- Rejects agent-execution tools (ENG-2948 `isAgentExecutionTool`), unknown, internalOnly, admin-only,
+  and scope-gated tools, plus `client_id`/`userId` identity overrides in args. Never throws.
+- Not wired anywhere: no scheduler, persistence, or tool-registration changes. Scheduler wiring is a
+  later data-plane (Requires: Me) child of ENG-2847.
+
+## ENG-2955: Pure model-credential resolver for BYOK vs platform keys (2026-11-12)
+
+Added `backend/src/services/modelCredentialResolver.ts`: pure, unwired resolver choosing a customer BYOK API-key ref (billed customer_direct) or the platform default (agentweb_metered); rejects subscription/OAuth logins and unknown providers with typed errors; cross-tenant guarded; returns ref ids only. Slice of ENG-2851.
+
+## ENG-2950: Zoma Meta Ads MCP parity coverage matrix + CI check (2026-11-12)
+
+Added `backend/src/mcp/zomaMetaParityMatrix.ts` (Meta tool -> Zoma tool/action, gap with owner, or n/a) and a jest check that every mapping exists in the advertised Zoma manifest. 83 rows from ENG-2913..2921: 61 covered, 22 gap. Pure data; no behavior change.
+
+## ENG-2949: Multi-instance in-memory state audit script + report (2026-11-12)
+
+`backend/scripts/multi-instance-state-audit.mjs` statically inventories module-level Map/Set stores, Socket.IO without adapter and MemoryStore in `backend/src`, classifies them, and proves already-ported stores (ENG-301, ENG-114, ENG-2945, JWT login, DB password reset). Report: `docs/multi-instance-state-audit.{md,json}`. No runtime change.
+
+## ENG-2947: Pure usage-alert outcome analyzer over exported telemetry lines (2026-11-12)
+
+Added `backend/src/services/usageAlertOutcomeAnalysis.ts` + `backend/scripts/analyze-usage-alert-outcomes.ts`: read-only analysis of `[usageTelemetry]` log exports (per-subject off-track/alert/funnel outcome, CTA conversion, 7-day model switches). No persistence; no runtime call sites.
+
+## ENG-2945: ConsumedTokenStore port for Zoma preview tokens (2026-11-12)
+
+Zoma Meta + Google write toolkits now claim preview tokens through one shared `ConsumedTokenStore` (in-memory default, `backend/src/mcp/zomaWriteGuard.ts`), so a token confirmed through one toolkit cannot be replayed through another in-process. Durable cross-instance store stays gated on ENG-2862. No persistence added.
+
+## ENG-2953: Shadow-wire session turn/spend breaker into the agent loop (2026-11-12)
+
+- New `backend/src/services/sessionBreakerShadow.ts`, called once per agent-loop LLM turn in `agentModeService.ts`. DARK: no-op unless `SESSION_BREAKER_SHADOW=true` (caps `SESSION_BREAKER_SHADOW_MAX_TURNS`, default 40; `SESSION_BREAKER_SHADOW_MAX_SPEND_USD`, default 5).
+- When on, logs one `session_breaker_would_pause` JSON line per cap multiple crossed. Never pauses, alters responses, writes tables, or notifies. Accumulators are in-memory per instance.
+
+## ENG-2803: Apollo waterfall callback hardening (2026-11-12)
+
+Follow-ups from the ENG-2801 reviews (PR #3890) on the async Apollo email callback (`POST /api/crm/webhooks/apollo/<secret>`):
+
+- **Production fails closed on a missing webhook secret.** `getApolloWebhookSecret()` no longer falls back to the committed default when `NODE_ENV=production`; it throws. The sender then hands Apollo no webhook URL and sends a basic match (booked `email_reveal`, as the existing no-webhook path already did), and the route answers 503. Prod has `APOLLO_WEBHOOK_SECRET` set (rotated 2026-11-04, checked 2026-11-12 that it is not the default), so nothing changes there today. Outside production the default still applies.
+- **One strict email gate.** The callback email is trimmed and lower-cased, then must pass `isValidAddress` from `utils/sendEligibility.ts` (now exported; same check as the send path), plus two callback-only rules: the TLD is 2-63 letters or a punycode `xn--` label, and the local part may not start with `=`, `+` or `-` (lead emails are exported to CSV unescaped). Newly rejected: `a..b@x.com`, `.a@x.com`, `a.@x.com`, `a@x.-y.com`, formula-leading addresses. Newly accepted: punycode TLDs (`a@x.xn--p1ai`).
+- **First usable address wins.** `extractApolloEmail` stops validating a vendor's `emails` array at the first usable address (a large authenticated body no longer validates every entry).
+- **Expired placeholders are refused.** A callback whose `apollo:async_request` placeholder is past its `expiresAt` (7 days after Tier 3 wrote it) answers 202 `{ matched: false, expired: true }` and writes nothing. TTL is still disabled on `AW-EnrichmentRawCache`, so the rows persist; enabling TTL is an infra change, not in this PR. `status` is deliberately not enforced: the placeholder is stamped before the lead write, so a retry after a failed lead write must still be accepted.
+- **Late write sets `domain`.** `setLeadEmailIfMissing` derives `domain` from the email (`extractDomainFromEmail`, free-mail domains skipped) as fill-if-empty (`if_not_exists`, through a name placeholder: `domain` is a reserved keyword), the same as the enrichment write. Verified against DynamoDB Local: lead without `enrichmentMetadata` (bootstrap + retry), existing domain kept, existing email untouched, free mail sets no domain, deleted lead not recreated.
+
+Not in this PR: callbacks for leads in lists owned by an org owner/editor other than the run user are still refused (owner rule is a product decision); `validateLeadEmailInBackground` is not run on a late write (Apollo already reports the verification status; the check costs an enrich.so call).
+
+## ENG-2783: Platform-wide daily call cap with operator alert (2026-11-12)
+
+Hot-lead auto-calls now have a platform-wide ceiling across all orgs: at most `HOT_LEAD_CALL_PLATFORM_DAILY_MAX` leads are attempted per UTC day (a slot stays taken once a record is created, even if Twilio rejects the call) (default 300, a conservative builder-chosen start of about $45/day at an order-of-$0.15 per-lead estimate, not a measurement: about two legs of ~5 minutes at $0.014/min, retries and other costs excluded; the owner's to change; clamped to 100000, invalid values use the default with one warn). The next lead is skipped with `call.skipped` reason `platform_daily_cap` (no call, Slack alert still sent). The counter is taken last in `reserveCallSlot`, so an org refusal never leaks into it and a platform refusal rolls the org counters back; a press-2 retry counts too.
+
+New env vars: `HOT_LEAD_CALL_PLATFORM_DAILY_MAX`, `HOT_LEAD_CALL_ALERT_EMAIL` (optional operator address; unset means log only).
+New limit-store key families (existing `AW-MCPSessions` table, no table or index change): `hlc#cap#g#<UTC date>` (TTL 2 days), `hlc#notify#g80#<date>`, `hlc#notify#g100#<date>`.
+Alert at 80% and 100% once per level per UTC day: ERROR log `[hotLeadCall] PLATFORM daily cap 80%` / `100%` (alarm hook) plus the email when configured.
+Not verified against real DynamoDB beyond the existing `incrementBelow` (tests use the in-memory limit store). Runbook: `backend/docs/integrations/hot-lead-call.md`, "Platform-wide daily ceiling".
+
+The ceiling cannot be disabled by an operator, only raised (max 100000). A failed alert email keeps the claim at both levels (marker logs once per level per day). The press-2 retry path of the ceiling (transient, rescheduled, expiry at firstDueAt + 6h) is covered by a new e2e in `hotLeadCall.e2e.retry.test.ts`; nothing was run against real DynamoDB.
+- Review follow-up: the alert is keyed by the UTC day the reservation counted (carried as `at` on the platform refusal and on success), so a reservation straddling midnight cannot claim the wrong day; a count that lands on the cap also sends the 80% alert when none was sent (both reached levels are processed).
+
+## ENG-2743: daily oncall flag for scheduled runs whose cost jumps (2026-11-12)
+
+New cron `backend/src/cron/scheduleCostJumpCron.ts` (registered in `server.ts`, behind `isCronEnabled()`), read-only. It ticks every 15 minutes (and at boot) but only acts during 07:00-07:59 UTC (`SCHEDULE_COST_JUMP_SEND_HOUR_UTC`), once per day per process, so a deploy outside that hour never repeats a day's email. It reads the usage ledger (`usageRecordDb.scanByDateRange`, the last complete UTC day plus the 7 days before it) and sums each schedule's agent-loop cost per day (feature `agent_task:scheduled:<scheduleId>`, all models together). A schedule is flagged when that day cost at least $3 and at least 2x the median of its billed days in the previous 7 (needs at least 3 billed days; new schedules are skipped). All flagged schedules go out as ONE email a day to the oncall list (`oncall_emails` setting, or `ONCALL_EMAIL_LIST`) through the new `emailService.sendOncallEmailOnly`: email only, no Linear issue (Manan's choice, 2026-11-12; `sendOncallAlert` files a Bug/Needs-PM issue for Harsha since 2026-11-07). Production only. A failed read or send is tried again on the next tick of the hour. A deploy that overlaps that hour (immutable deploys run old and new instances side by side; prod deploys ~12 times a day, spread over the day) can send a flagged day twice; accepted by Manan (2026-11-12) over storing a per-day marker. With several instances each would send.
+
+Backtest on the prod ledger (Oct 25 - Nov 11, nothing sent): flags Nuerraa's newsletter `b2bce0d0` on Oct 26/28/29 (3.8-5.7x), `04b34124` on Nov 1 ($33.60, 7.4x, Opus calls) and Oct 26/28, plus two smaller jumps (Oct 29, Nov 3); nothing Nov 4-11. A gradual climb that never doubles in one day (hourly `0052c195`, $5.6 -> $11.6 over five days) is not flagged.
+
+No new setting, table or write. Thresholds are constants in the module. The per-run cap itself stays with ENG-2812.
+
+## ENG-2944: merge-evidence.sh names Opslane carry-forward failures (2026-11-11)
+
+- `merge-evidence.sh` pass 5b logs `OPSLANE_CARRY_FORWARD: <id> <url> — not a re-test of <head>; see ENG-2749` when an Opslane `failure` completed in <= `MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS` (default 2). Diagnostic only: the run still blocks; exit codes unchanged. Policy stays with ENG-2749.
+- Tests: `bash .github/scripts/merge-evidence.test.sh` (143/143), 4 new fixtures.
+
+## ENG-2943: Never-connected integration errors no longer file oncall rows (2026-11-11)
+
+Agent failure rule set reclassifies "No <X> account connected" tool failures as non-dispatchable `not_connected`; genuine connected-account auth failures stay `config`.
+
+## ENG-2942: Meta toolkit accepts configured custom conversion events for new ad sets (2026-11-11)
+
+- `backend/src/mcp/metaToolkitConversionGate.ts`: AD_SET CREATE with `custom_conversion_id` or `OTHER`+`custom_event_str` is checked against the account's custom conversions / pixel event stats; unknown, archived, wrong-pixel, or unverifiable events are refused. Standard events (LEAD etc.) unchanged.
+
+## ENG-2941: GoHighLevel Social Planner draft client, dark (2026-11-11)
+
+- Added `backend/src/services/gohighlevel/socialPlannerClient.ts`, a typed client for GHL v2 Social Planner create-post (`POST /social-media-posting/{locationId}/posts`). The HTTP transport is injected.
+- It only creates drafts. A non-draft status is refused before any request is built. Inputs are validated (https media, max 3000 chars of text, at least one account id). Errors are typed: auth, validation, rate_limited, retryable, unexpected.
+- Dark: `GHL_SOCIAL_PLANNER_ENABLED` defaults to off, and the client is not registered as an Emma tool. OAuth and credential storage, tool registration and enablement stay on ENG-2872.
+
+## ENG-2940: Facebook Page organic posting adapter, dark (2026-11-11)
+
+Added `FacebookPageAdapter` (feed/photos publish, list posts, counts) with mocked Graph API tests. Not registered in socialPlatformService: dark until Meta App Review grants pages_manage_posts and Page selection on connect stores a MetaPageConfig.
+
+## ENG-2939: coding_agent iteration-limit stops say edits are saved and to continue (2026-11-11)
+
+- When coding_agent hits its iteration limit after editing files, its result now says the edits are saved on the draft branch and tells the parent to continue with only the remaining work instead of re-running the whole task. Result carries `terminationReason: 'iteration_limit'`. Still a failure (invalid_output); no persistence change.
+
+## ENG-2938: get_ads_thresholds normalizes account ids and lists valid ones on miss (2026-11-11)
+
+The tool now accepts act_/ACT_-prefixed, padded, numeric ids or the account name, returns a clear no-Meta-connected error, and on a true ownership miss lists the connected ids so the model self-corrects. Regression: eng918.getAdsThresholdsTool.test.ts (5 red -> green).
+
+## ENG-2937: get_leads_needing_followup falls back to user-owned LinkedIn account (2026-11-11)
+
+Lists without linkedInAccountId now resolve the caller's connected Unipile account (same as CRM routes); actionable error only when none is connected.
+
+## ENG-2932: Zoma first-ad journey mocked E2E harness (2026-11-11)
+
+Added `backend/src/__tests__/eng2932.zomaFirstAdJourney.test.ts`: fresh org -> Meta connect -> campaign/ad set/ad CREATE -> launch, against an in-memory Meta Graph shared by dispatch and read-back. Covers happy path, Meta-rejected ad create, failed enable, and silently-unapplied enable (MISMATCH). No product code change; no bugs found on these paths.
+
+## ENG-2931: Zoma writes never report success on failed/unverified writes (2026-11-11)
+
+- Meta guarded writes and AD_CREATIVE CREATE: a dispatch throw (timeout/transport) now returns
+  `UNCONFIRMED` (may have applied, do not retry blindly) instead of an unhandled error.
+- AD_CREATIVE CREATE accepted with no creative id is `UNCONFIRMED`, not "not created".
+- UPLOAD_VIDEO still processing returns `success: false` (was `success: true` with `UNCONFIRMED`).
+- Table-driven invariant test covers Meta campaign/ad set/ad/update, creatives, and Google
+  budget/campaign writes x {provider error, 5xx, timeout, missing id, read-back failure,
+  read-back mismatch}; creates still land PAUSED. No persistence change.
+
+## ENG-2929: Mailbox group emails over 50 leads run in the background (2026-11-11)
+
+- `POST /api/crm/lists/:listId/group-email/send` no longer rejects Gmail/Outlook sends over 50 eligible leads (`MAILBOX_SENDER_LEAD_CAP_EXCEEDED` removed). Above 50 it claims the list's pending-batch record (CAS), returns 202 `{ background: true, total }`, and sends in the background; sender `dailyLimit`/warmup still enforced per send by `sendAsSender`.
+- At-most-once: each lead is removed from the durable remaining set before its send, so a crash/deploy never re-emails on resume. Live run ownership (`backgroundRunId` + 2-min heartbeat) blocks a concurrent send/resume on the same list with 409 `GROUP_EMAIL_ALREADY_SENDING`.
+- Progress: existing `GET .../group-email/pending` record (`sentSoFar`/`totalOriginal`) plus socket `group-email-progress` / `group-email-complete`.
+- Rollback: revert this PR (restores the 50 cap).
+
+## ENG-2927: Zoma catalog event sources tools (2026-11-11)
+
+- Six Meta toolkit tools: meta_event_source_get / get_catalogs / get_health / get_recommendations (read) and meta_event_source_connect / disconnect (preview -> confirm, read-back verified).
+- Pixel ownership = the resolved ad account's adspixels; catalog ownership = business catalog set. agentModeService catalog Graph allow-list gains act_<id>/adspixels (read) and <catalog>/external_event_sources (POST/DELETE).
+
+## ENG-2926: Zoma catalog create/update, product feeds, upload sessions, feed rules (2026-11-11)
+
+- New `backend/src/mcp/metaToolkitCatalogFeeds.ts`: 10 Meta Toolkit tools; feed/rule deletes are preview -> confirm; every write is read back; feed URLs https-only with no embedded credentials, query strings redacted on echo.
+- Feed listing stays `meta_list_product_feeds` (ENG-2918).
+
+## ENG-2925: Zoma catalog products + product sets CRUD (2026-11-11)
+
+Adds the catalog write tools in `backend/src/mcp/metaToolkitCatalogWrites.ts`: meta_product_create, meta_update_product, meta_delete_product, meta_product_set_create, meta_product_set_update, meta_product_set_delete. It also adds one read-only helper, meta_get_suggested_filter, which builds a product-set filter from simple criteria and samples the products it matches.
+
+- Scope: the six mutating tools need `tools:execute` on aw_ keys (gateway `assertMetaToolkitScope` write=true). The filter helper needs only `tools:read`.
+- Ownership: every catalog id must be in the account business's catalog set (`readBusinessCatalogs`, extracted from the ENG-2918 reads). For a product or product-set id, the tool reads the node's `product_catalog{id}` and that catalog must be in the set.
+- Deletes use preview → confirm with the shared `zomaWriteGuard` HMAC token. The token is single-use and bound to the user, the target and its current state (and, for sets, the in-use list and `confirm_in_use`).
+- A product set that an ACTIVE ad set of the account promotes (`promoted_object.product_set_id`) is refused unless `confirm_in_use=true`. If the account has more than 500 ad sets, the delete fails closed. Ad sets in other accounts of the business are not checked; the preview says so.
+- Every write is read back independently and sets `result.verification`, so the gateway meters it as a write (entity PRODUCT / PRODUCT_SET, action CREATE/UPDATE/DELETE). A delete counts as CONFIRMED only when the read-back gets Meta code 100 (not found). On read-back, price is not compared because Meta reformats it, and image_url is not compared because Meta re-hosts it. A set's filter is compared by containment.
+- Graph: `readToolkitMetaCatalogGraph` additionally allows a bare numeric node and `act_<id>/adsets`. The new `writeToolkitMetaCatalogGraph` allows POST to `<id>`, `<id>/products` and `<id>/product_sets`, and DELETE of `<id>`. It marks failures that have no definite Meta answer as `outcomeUnknown`, and those are reported UNCONFIRMED. The Meta connection needs `catalog_management` for these writes; Meta refuses them otherwise and the tool reports FAILED.
+- No storage. Tokens are per process, as with the other Zoma writes.
+
+## ENG-2924: Zoma catalog health read tools (2026-11-11)
+
+Adds four read-only Meta toolkit tools on the ENG-2918 ownership-checked catalog path: meta_list_dpa_eligible_catalogs, meta_get_catalog_diagnostics, meta_get_dynamic_ads_health, meta_get_catalog_data_sources. Graph allow-list extended to `diagnostics` and `external_event_sources` edges. No writes, no storage.
+
+## ENG-2918: Zoma read-only product catalog tools (2026-11-11)
+
+Slice 1 of ENG-2918: meta_list_catalogs, meta_list_products, meta_list_product_sets, meta_list_product_feeds on the Zoma Meta toolkit. Catalog ids are checked against the resolved ad account business (owned + client catalogs) before any catalog-level read. Writes are later slices.
+
+## ENG-2928: Zoma Google Ads — keywords, negatives, RSA, PMax assets and asset groups (2026-11-10)
+
+The Zoma Google toolkit (`backend/src/mcp/googleToolkitWrites.ts`) now covers KEYWORD ADD /
+UPDATE status / REMOVE / ADD_NEGATIVE (ad group or campaign level), AD CREATE
+(RESPONSIVE_SEARCH_AD, 3-15 headlines <=30 chars, 2-4 descriptions <=90) / UPDATE status,
+ASSET_GROUP CREATE / UPDATE status, and ASSET UPLOAD (IMAGE/LOGO from https or a
+`zoma_prepare_upload` file, TEXT, YouTube VIDEO). PERFORMANCE_MAX CAMPAIGN CREATE now requires
+and forwards `brand_business_name` + `brand_logo_asset_resource_name`, the gap vs Emma's
+`call_google_ads_api` that made Zoma-created PMax campaigns unservable. Everything dispatches
+through the Emma handler; guarded writes keep preview + single-use token, PAUSED creates and
+independent GAQL read-back. ASSET UPLOAD is non-spending, so it has no token but keeps the write
+gate, key scope, read-back and metering. New Emma/service path: `ASSET_GROUP UPDATE` status
+(`googleAdsService.updateAssetGroup`, creative-addition gate on ENABLED) and TEXT assets in
+`uploadAsset`. GAQL read shapes are exercised with an HTTP-level fake only, not yet against live
+Google Ads.
+
+## ENG-2921: Zoma account activity log + error explainer (2026-11-10)
+
+- Slice 1 of ENG-2921: toolkit/MCP tools `ads_account_get_activity_logs` (read-only, `act_<id>/activities`, since/until/limit/after cursor) and `ads_get_errors` (static Meta error-code table; no Graph call, no ad account needed).
+- tools:read scope only; no write metering. Arguments are allow-listed; credentials are server-resolved and account-bound.
+- Deferred: `ads_get_help_article` and x-business-use-case-usage backoff — later slices.
+- Rollback: revert; no persistence changes, no Graph mutations.
+
+## ENG-2920: Zoma read-only Pages, Instagram and Ad Library tools (2026-11-10)
+
+Slice 1: six read-only toolkit tools (ad-account/business/user Pages, IG accounts, IG media with ownership check, Ad Library search). Page tokens stripped. ads_boost_ig_post (spend) is slice 2.
+
+## ENG-2919: Zoma experiment read tools (2026-11-10)
+
+- Slice 1 of ENG-2919: read-only toolkit/MCP tools `ads_experiment_list_tests`, `ads_experiment_abtest_get_test`, `ads_experiment_lift_get_test` over Meta ad studies (`act_<id>/ad_studies`, `/<study_id>`).
+- Study reads first prove membership through the selected account's `ad_studies` edge (cursor pagination, never caller `next` URLs) and refuse a study of the other type. tools:read scope only; no write metering.
+- Deferred: `ads_experiment_check_eligibility` and the delivery-changing create/update tools (preview+token) — later slices.
+- Rollback: revert; no persistence changes, no Graph mutations.
+
+## ENG-2917: Zoma signals read tools (2026-11-10)
+
+- Add read-only toolkit/MCP tools `ads_get_datasets`, `ads_get_dataset_details`, `ads_get_dataset_stats`, `ads_pixel_event_read`, and `ads_get_customconversions`.
+- Use Graph GET with account-scoped server credentials. Pixel reads first establish membership through the selected account's adspixels edge; ownership pagination follows cursors, never arbitrary next URLs. Reads require only tools:read and emit no write metering.
+- Event rules use Meta's documented `/<pixel_id>/event_rules` edge: https://developers.facebook.com/documentation/ads-commerce/marketing-api/reference/ads-pixel/event_rules . Availability remains subject to upstream permissions/API version.
+- Deferred `ads_pixel_parameter_read`: no existing implementation or clearly documented parameter-rules read endpoint was found; do not invent an endpoint. Remaining slices: signals CRUD writes, CAPI test events, preflight.
+- Validation: targeted Jest suites and scoped TypeScript check; full project typecheck attempted at 4096 MB heap and exhausted memory. No live Meta calls or production smoke.
+- Rollback: revert this change; no persistence changes or Graph mutations.
+
+## ENG-2916: Zoma account health + learning-phase reads (2026-11-10)
+
+- New read-only Zoma toolkit tools `meta_account_health` (account_status, disable_reason, spend cap / amount spent / remaining in major units, warnings) and `meta_learning_phase` (per ad set learning_stage_info: LEARNING / SUCCESS / FAIL, optional campaign filter).
+- Module `backend/src/mcp/metaToolkitHealth.ts`; gateway runs them on the ownership-resolved account and meters once; Graph read via `agentModeService.readToolkitMetaAccountGraph` (act_<id> node or `adsets` edge only).
+- Remaining ENG-2916 Meta-parity reads (opportunity score, anomaly/benchmark/trend insights, ad entities) are later slices.
+
+## ENG-2913: Zoma post-launch edits — bids, bid strategy, targeting, schedule, creative swap (2026-11-10)
+
+Meta Toolkit UPDATE now allows CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/bid_strategy/targeting/start_time/end_time, AD creative_id/name. Previews show current → proposed diffs (bound into the preview token); read-back verifies every edited field (targeting by containment).
+
+## ENG-2907: read_google_doc refuses non-Google URLs (2026-11-10)
+
+`read_google_doc` now rejects http(s) URLs not on docs/sheets/drive.google.com before calling Drive (previously a luma.com URL was sent as a fileId, 404d, and clustered as a config failure). The refusal classifies as `by_design`.
+
+## ENG-2906: product-aware signup + Zoma journey capture, backend PR1 (2026-11-10)
+
+- One shared account; product (`zoma` | `emma_mcp` | `emma_web` | `unknown`) is attribution only,
+  never an authorization input. Unknown is always allowed. Full contract: `backend/docs/journey-tracking.md`.
+- The portal OAuth consent form posts back only the standard fields, so `/oauth/authorize` stores
+  `resource`/`ref` as a `pending#<sha256(client_id, code_challenge)>` row in `AW-MCPOAuthCodes`
+  (no `used` attribute → never redeemable). Product then rides code → token → every refresh.
+- AW-Users: write-once `signup*` set, `products.<p>.{firstAt,lastAt}` (hourly), forward-only
+  `zomaStage` via `zomaStage IN (<earlier stages>)` — all single conditional UpdateItems with
+  `attribute_exists(email)`, no read-modify-write. No backfill; pre-ENG-2906 rows and events have
+  no product (read as "not tracked", not `unknown`). Row/person `attributionConfidence` is
+  `tracked | inferred | verified` (internal `explicit` → `tracked`; `unknown` omitted).
+- OAuth signups are attributed only for rows register stamped `signupSource = "mcp"` (consent
+  page), never by account age. `first_read`/`first_write` have their own write-once fields, so
+  either order emits both once.
+- `?ref=` on the MCP URL reaches `/oauth/authorize` because the 401 challenge and the
+  protected-resource metadata echo it into `resource` (SDK clients send that, not their URL).
+- Known gaps: a Google sign-up that starts from the MCP consent flow (via the portal login page)
+  is attributed `webapp` (confidence `inferred`) — Google OAuth state does not carry the source,
+  and fixing it needs a portal change. A client that ignores both the challenge URL and the
+  server URL's query on discovery still loses `ref` at authorize; it is still recorded on `/mcp`
+  connection and toolkit usage events. `ad_live` is a documented stub; `abandoned` is not emitted.
+
+## ENG-2900: Name a disconnected LinkedIn account as the invite block (2026-11-10)
+
+Scheduled LinkedIn runs whose send-invite fails with "LinkedIn account disconnected" now get the same schedule-wide block notice as the invitation cooldown, telling the owner to reconnect in Settings > Connected Accounts, instead of only "stopped at the iteration (step) limit".
+
+## ENG-2899: registration uniqueness conflict returns an actionable 409 (2026-11-10)
+
+`userDb.createUser` rejects with `ConditionalCheckFailedException` when the email already
+occupies the user PK (e.g. a tombstone left by an email change). Register now answers 409
+`{ code: "email_unavailable" }` with contact-support guidance (login and reset skip tombstones) when no live account
+resolves for the email (live-account races keep the existing 400); admin create-from-waitlist
+maps the same conflict to 409. Other failures are unchanged (register 503, admin 500).
+Shared mapper: `backend/src/utils/createUserError.ts`.
+
+## ENG-2898: get_conversion_summary own-account MCP tool (2026-11-10)
+
+New read-only MCP tool `get_conversion_summary` (aw_ tools:read callable): for the key owner only, over a YYYY-MM-DD range (default last 30 days, max 366), returns per-landing-page unique leads + form-submission conversions, per-lead-list leads added, and totals. Counts/ids/names only; org-member lists/pages excluded; client_id/user_id rejected. Uses existing own-scoped routes, bounded scan of 10k leads with `truncated` flag; no schema/index change.
+
+## ENG-2897: update_sender_settings MCP tool (2026-11-10)
+
+New write MCP tool `update_sender_settings` sets the calling key owner's default email sender and/or default LinkedIn (unipile) sender. The sender id must be one of the caller's own configured senders and the LinkedIn account must be one the caller owns (org-shared teammate rows rejected); the sender list is re-posted unchanged and the response is the list_sender_settings read-back. Not callable with a tools:read key. Also classifies export_lead_list, list_lead_list_exports and inspect_client_usage in the annotation policy and refreshes the public tool inventory fixture, which was red on main.
+
+## ENG-2896: atomic multi-file LP update MCP tool (2026-11-10)
+
+- New aw_-callable MCP tool `update_landing_page_files` wraps PUT /update-files: up to 20 files, one commit, draft/agentweb-preview by default, main rejected.
+- `expected_base_sha` (route + commitFilesToRepoMain) gives optimistic concurrency: mismatch -> 409, nothing written; a concurrent push between check and ref update surfaces as a conflict on retry instead of a silent rebase.
+- No schema/persistence change; auth is the existing authorizeLandingPageAccess edit check; read-only keys denied via the existing scope gate.
+
+## ENG-2892: Own-account KB file write MCP tools (2026-11-10)
+
+New `aw_`-key MCP tools in `backend/src/mcp/server/apiTools.ts`, next to the KB read tools:
+`create_knowledge_base_file`, `update_knowledge_base_file_content`, `delete_knowledge_base_file`.
+They wrap the existing routes (`/api/emma/create-knowledge-base`, `/attach-knowledge-base-files`,
+`/update-knowledge-base-file`, `DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey`); no new
+storage or schema.
+
+- Ownership is enforced in the tool, not left to the routes: the delete route also admits admins and
+  org editors, and `GET /api/tasks/:id` admits org viewers. The tool reads the task and acts only when
+  `task.userId` is the key's runtime identity. A foreign KB/file, a route 403 and a missing one all
+  answer `Knowledge base or file not found`. Only file keys recorded on the caller's own task are ever
+  sent to the delete route (the route itself will delete any GCS key in its bucket if asked).
+- Text only: `.txt`/`.md`/`.markdown`, control characters rejected as binary, 1 MiB cap.
+- Every write is read back from the task record (key + size, plus sha256 of the written text); a
+  size mismatch reports failure. Delete re-reads the task and confirms the key is gone.
+- Update is replace-only and refuses a file that does not exist (the underlying route would silently
+  create it).
+- All three are classified `write` in `toolAnnotationPolicy.ts`, so `tools:read` keys are denied.
+
+Known, not from this change: `mcp.publicToolInventory.test.ts` already fails on `main` because
+`export_lead_list`, `list_lead_list_exports` (ENG-2867) and `inspect_client_usage` are unclassified.
+
+## ENG-2891: pure versioned campaign-playbook model + validator/diff, shadow-only (2026-11-09)
+
+`backend/src/services/marketingPlaybook.ts`: `validatePlaybook` (semver, unknown actions, duplicate step ids, high-risk steps need an ENG-2890-provable rollback) and `diffPlaybooks`. Dark: no persistence, not wired into any runtime path.
+
+## ENG-2882: Zoma activation queue pure core (2026-11-09)
+
+Dark pure module `backend/src/services/zomaActivationQueue.ts`: activation stage, >1 business-day stall rule, next action, daily follow-up list, help alert targets (Harsha, Fangfang). Not wired to any store or notifier yet.
+
+## ENG-2816: live voice on a share link now obeys the same tool restrictions as typed chat (2026-11-05)
+
+Second step of ENG-2816 (step 1, owner recognition for typed chat, is live). A share-link visitor acts under the OWNER's
+userId, so every "does this user own it" check passes for them. Typed chat refuses a list of owner-only tools to a visitor
+in its preflight (`agentMode/core/toolDispatch.ts`); live voice never went through that preflight, so a visitor on a
+voice call could use them. This closes that.
+
+**What changed**
+- `services/toolRestrictionProfiles.ts` (new, imports nothing): one registry of restriction profiles. `share_visitor` holds
+  the owner-only block list (moved here from toolDispatch, which re-exports it under its old name), admin tools and
+  `connect_account`, with the same refusal wording typed chat has always used ("... is not available in shared sessions").
+  An unrecognised profile id is treated as the strictest known one. A new restricted source later is one new entry.
+- `agentModeService.executeTool` (where every path ends: typed chat, voice, nested calls) now refuses a tool its caller's
+  `restrictionProfile` forbids, by throwing `ToolRestrictionDenied`, next to the sandbox guard. Thrown, not returned: voice
+  hands a thrown message to Gemini as an error and marks the tool card failed, whereas a returned failure object would be
+  summarised as if the tool had run. `executePreparedAgentTool` forwards the profile; the typed-chat dispatcher passes it on
+  every tool call of a share turn (both sites), keeping its own preflight refusal unchanged for the model-facing message.
+- Voice: each live session gets its own frozen `toolContext` (never the shared `ATTENDED_TOOL_CONTEXT` mutated) used at both
+  `executeTool` sites, so the restriction reaches the onboarding-safe tools (connect_account) as well as the rest.
+  `startLiveSession(..., restrictionProfile)`; `liveVoiceSocket.getLiveRestrictionProfile(socket)` decides: an interactive
+  share socket is a visitor unless it is the session owner's own logged-in view.
+- Handshake: the conversable-socket branch of the Socket.IO middleware moved out of `server.ts` into
+  `liveVoiceSocket.authenticateConversableSocket` (same checks, same error strings, same precedence, now testable). It also
+  reads an optional `auth.viewerToken` (the portal sends the viewer's login there; the portal PR must be live first) and
+  records `conversableViewerIsOwner` through the step-1 `isSessionOwnerRequest` (a verified normal login that is the session
+  owner's own, never a delegate or service token). A bad or missing `viewerToken` never fails the connection.
+- The visitor flag now survives the media auto-continuation after a timed-out shared turn (parameter carried through every
+  round) and the owner-reopen durability backstop (`lastUserTurnWasShareVisitor`: a continuation re-runs the last real
+  request, so it runs under that request's restrictions whoever opens the chat).
+
+**What did not change.** The owner on their own share link (when the portal sends their login), every normal signed-in
+voice call, onboarding voice, and typed chat are unchanged. No table, index, IAM or environment change.
+
+**Rollout order matters.** Merge and deploy the portal PR (sends `viewerToken`) FIRST. If this backend change goes live
+first, an owner on a tab opened before the portal deploy connects as a visitor on voice until they reload. Nothing is
+exposed in that case, but their own voice tools would be refused.
+
+**Not covered here (separate decisions):** link expiry, usage-limit and evaluation-account checks on voice; scheduled-chat
+marking (next PR, needs the data-plane approval); the public variables link; approval-inbox resume.
+
+**Testing.** Live voice cannot be run on a test environment (needs a Gemini key). Instead a real Socket.IO server and
+client drive the production handshake, the real start handler and the real voice service with only Gemini, the database and
+the tool executor mocked (`liveVoiceSocket.shareVisitor.test.ts`); the real `executeTool` is exercised separately
+(`agentModeService.restrictionProfile.test.ts`); the real dispatcher by `toolDispatch.shareProfile.test.ts`; the follow-up
+turns by additions to `agentModeController.autoMediaContinuation.test.ts` and `timeoutContinuation.shareVisitor.test.ts`.
+Mutation checks (break the code, a test fails) for every rule. Production check: the owner's own account, owner logged in
+versus a private window, by voice.
+
+**Rollback.** Revert; voice visitors regain the unrestricted owner tool set (the bug).
+
+## ENG-2720: enrichment helper LLM calls ran on the retired gpt-5-chat-2 (gpt-5.5) and the alias prompt gave the model too little context (2026-11-05)
+
+**Symptom 1 (cost/consistency).** After the extraction default moved to gpt-5.6-luna, three small LLM calls around an enrichment run still named `gpt-5-chat-2`: alias inference and smart-field classification when a list's enrichment config is saved (`enrichmentConfigDeps.ts`, env `CRM_ENRICH_V3_ALIAS_MODEL` / `CRM_ENRICH_V3_CLASSIFY_MODEL`) and the sibling field mapping at the start of a run (`enrichmentSiblingConfigFields.ts`, env `CRM_ENRICH_V3_EXTRACT_MODEL`). `gpt-5-chat-2` was removed from the registry on 2026-08-19 and `LEGACY_MODEL_ALIASES` rewrites it to gpt-5.5 (about 25x Luna's token price), so these ran on gpt-5.5 while the rest of enrichment ran on the cheap default.
+
+**Fix 1.** `createEnrichmentHelperLLM(userId, envModel?)` (`services/enrichmentMappingLlm.ts`) uses the env override if set, else `resolveModelForUser(userId, 'enrichment')`, the same role the extraction, critic and web-search calls use, so the role default (`CRM_ENRICH_V3_DEFAULT_MODEL` rollback included) and an org's own override cover the whole pipeline. Like the extraction calls it retries an empty 200 (`requireContent`) and the cheap default falls back to gpt-5.5 on a provider error. `CHEAP_DEFAULT_MODEL` / `FALLBACK_MODEL` moved there from `enrichmentV3RealDeps.ts` (same values). All three calls still fail soft (`{}` / field-to-itself mapping) exactly as before.
+
+**Symptom 2 (wrong aliases, any model).** The alias prompt was a bare list of canonical names with one example. It never said what a lead is or whose details each group holds, so models (Luna and gpt-6-sol alike) mapped "email of the CEO" onto the lead's own `email`, "CTO phone" onto `phone` and "founder LinkedIn" onto `linkedin_url`. At run time an alias to `email` fills the custom column with the lead's own email and can trigger the paid Apollo email waterfall.
+
+**Fix 2.** `buildAliasInferenceSystemPrompt` (`services/enrichmentPrompts.ts`) says a lead is one person at one company, that `person_identity` / `person_career` hold the lead's own details and every other group the lead's employer's, to match synonyms by meaning ("contact number", "mobile", "cell" = phone), to decide who a field is about first, and to return null for a specific other person or organisation (the CEO, a founder, an assistant, a competitor...), while employer-level lists such as its investors, customers and leadership changes still map to `investors`, `customer_logos` and `leadership_changes`; and that `email` / `phone` hold only the lead's work email and work or mobile phone, so a personal, home or alternate email or a home phone is a different attribute (null) while a mobile or cell number is still `phone`. Without that last rule "personal email address" and "alternate email" were aliased to the work `email` on both models (2 of 5 and 4-5 of 5); with it the 42-field set plus those traps scored 144/144 on Luna and gpt-6-sol (the deployed wording scored 137/144 on both). Other look-alikes were already handled: assistant phone, parent company, spouse, board member, CEO LinkedIn were null on every try. Measured on env1 with a 36-field gold set (24 synonym / company cases, 11 third-party or custom traps), 3 repeats, 108 checks per cell: old prompt Luna 94% / gpt-6-sol 95% (every miss was a third-party field aliased to the lead); new prompt Luna 108/108 / gpt-6-sol 107/108 (the one miss is a conservative null). Synonyms were already right with the old prompt; none regressed.
+
+**Fix 3 (saved classifications).** The smart-field classification is saved on the list (smart flag, inferred type, enum options, dependencies) and decides how every later run treats the field, and the model is not deterministic. `llmClassifySmartFields` now asks twice in parallel and `agreeingClassifications` keeps a field only when both samples agree on the smart flag, the type and (enum) the option set; a smart field keeps the dependencies named by either sample (none is fine: the evaluator also gets the lead's own columns). A field they disagree on, or any field when one call fails, is left unclassified, nothing is cached, and the next save asks again. `processEnrichmentConfig` clears the stored smart tags (`smartCondition`, `smartDependencies`, `notSmartInstruction`) of every classification candidate, and of every field whose instruction was emptied, before asking, because they were made for the previous instruction: without that, an edited field with no new answer kept computing the old condition on every run (the failed-call case had the same hole before this PR). On Luna (8 repeats, 17 fields) a single sample was wrong 4.0% of the time and the agreed result 2.2% (6% of fields left undecided). A second gold run with employer-level lists (investors, customers, leadership changes) and look-alike third-party fields (lead investor's email, a customer's phone, a board member) scored 126/126 on both Luna and gpt-6-sol. The classification prompt itself is unchanged: a sharper "can it be looked up?" rule fixed one field class in one run but the same prompt scored 4.0% and 0.7% in two runs, so the effect is within noise, and a "<label> if <condition> is an enum" rule made Sol misclassify "good fit if ..." (14 of 16), so it was dropped.
+
+**Known limits.** A field the two samples keep disagreeing on stays unclassified, so it runs as an ordinary web-fetched field (a derived "qualifies if..." field can then cost a search per lead instead of one cheap evaluation); nothing tells the user beyond a server warning with the count, and the PUT response has no list of such fields. Alias inference is sampled once (the classification gets two): with the current prompt it was 108/108 and 144/144 on the gold sets, and a wrong alias is only kept for fields that had none. Configs saved before this change keep any `aliasFor` they already have (`f.aliasFor ?? infer`), so a wrong alias such as "email of the CEO" → `email` stays until the field is recreated or its alias is cleared; a one-off audit of stored configs would find them. On a model that accepts temperature 0 the two classification samples are nearly identical, so the second call adds cost for little gain (the default Luna ignores temperature). An instruction that names a label but not its alternatives ("high if hiring and funded") is typed boolean by Luna, string by gpt-6-sol and enum by Claude; the real config save returned boolean on all three tries, which the smart evaluator reads as true/false. Naming the labels in the instruction ("... otherwise low") removes the ambiguity. Classifications already saved are not changed by a model switch or rollback; they are redone when the field's instruction changes.
+
+**Not changed.** The V1 service (`crmEnrichmentService.ts`: `DEFAULT_ENRICH_MODEL` / `DEFAULT_SUGGEST_MODEL`, the admin `crm-enrichment-config` setting) still defaults to `gpt-5-chat-2`, and prod has a stored `crm-enrichment-config` row that pins both to `gpt-5-chat-2`, so changing the code defaults would not change prod. V1 is live code (the customer portal reaches it through `POST /lists/:listId/leads/enrich-web` and the field refresh route), left alone on purpose: across the whole `AW-UsageRecords` table the features `crm_enrichment_extract`, `crm_enrichment_critic` and `crm_enrichment_suggest` hold 6 calls and $0.21, one user, last on 2026-09-24, and V1 extraction was never benchmarked on Luna. Exhausted `requireContent` retries still do not count in the run-level failure counters. Also a two-line comment fix in `enrichmentBatchBudget.ts` (the unpriced reserve equals gpt-5.5's, it is not above every priced model).
+
+**Cost.** Alias inference: one short call per saved config. Classification: two, and a field the samples disagree on is asked again (2 calls) at every later save until they agree, so a save costs at most 1 alias + 2 classification calls however many fields it has. Emma's in-memory path (`emma/enrichmentToolRunner.ts`) re-classifies uncached fields on each enrichment call, now 2 calls. Sibling mapping: one per run. Not per lead. On Luna each call is a fraction of a cent (not measured per call). The config PUT route has no rate limiter of its own (unchanged).
+
 ## ENG-2890: pure rollback-plan builder for reversible campaign actions (2026-11-10)
 
 - `backend/src/services/marketingActionRollback.ts`: `buildRollbackPlan(action, snapshot)` returns the exact inverse (status/budget/bid) for owned ad/adset/campaign edits, else `{reversible:false}`. Fail closed on missing/mismatched snapshot. Shadow only, not wired into any execution path.
