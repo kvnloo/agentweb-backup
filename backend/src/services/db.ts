@@ -8042,6 +8042,11 @@ export const crmDb = {
      *  leads at once — those are not live conversions and must not fan out thousands of
      *  Purchase events. No such path exists today; this is the seam for the first one. */
     suppressConversionRelay?: boolean;
+    /** ENG-2936: optimistic-concurrency guard for an appended `notes` value. When set, the
+     *  main write only lands if the stored notes still equal this ('' = absent/empty);
+     *  otherwise it throws ConditionalCheckFailedException and the caller re-reads and
+     *  re-merges, so two concurrent submissions cannot overwrite each other's note. */
+    expectedNotes?: string;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -8620,6 +8625,16 @@ export const crmDb = {
         ExpressionAttributeValues: Object.keys(expressionAttributeValues).length > 0 ? expressionAttributeValues : undefined,
         ReturnValues: 'ALL_NEW' as const,
       };
+      if (updates.expectedNotes !== undefined) {
+        expressionAttributeNames['#notesGuard'] = 'notes';
+        if (updates.expectedNotes) {
+          params.ExpressionAttributeValues = { ...(params.ExpressionAttributeValues || {}), ':expectedNotes': updates.expectedNotes };
+          params.ConditionExpression = '#notesGuard = :expectedNotes';
+        } else {
+          params.ExpressionAttributeValues = { ...(params.ExpressionAttributeValues || {}), ':emptyNotes': '' };
+          params.ConditionExpression = 'attribute_not_exists(#notesGuard) OR #notesGuard = :emptyNotes';
+        }
+      }
       if (Object.keys(expressionAttributeNames).length > 0) {
         params.ExpressionAttributeNames = expressionAttributeNames;
       }
@@ -8661,7 +8676,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'customFieldsKeyMerge', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'customFieldsKeyMerge', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay', 'expectedNotes'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {

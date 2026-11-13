@@ -187,14 +187,18 @@ export class LeadTableFake {
     }
   }
 
-  private checkCondition(expr: string | undefined, item: any, names: Record<string, string>, usedN: Set<string>): boolean {
+  private checkCondition(expr: string | undefined, item: any, names: Record<string, string>, usedN: Set<string>, values: Record<string, any> = {}): boolean {
     if (!expr) return true;
-    return expr.split(/\s+AND\s+/i).every((clauseRaw) => {
+    return expr.split(/\s+OR\s+/i).map((alternative) => alternative.split(/\s+AND\s+/i).map((clauseRaw) => {
+      const equality = clauseRaw.trim().match(/^(#[A-Za-z0-9_]+)\s*=\s*(:[A-Za-z0-9_]+)$/);
+      if (equality) {
+        return item !== undefined && this.getPath(item, this.pathOf(equality[1], names, usedN)) === values[equality[2]];
+      }
       const m = clauseRaw.trim().match(/^(attribute_exists|attribute_not_exists)\((.*)\)$/s);
       if (!m) throw new Error(`leadTableFake: unsupported ConditionExpression clause: ${clauseRaw}`);
       const present = item !== undefined && this.getPath(item, this.pathOf(m[2], names, usedN)) !== undefined;
       return m[1] === 'attribute_exists' ? present : !present;
-    });
+    }).every(Boolean)).some(Boolean);
   }
 
   client() {
@@ -246,7 +250,7 @@ export class LeadTableFake {
         const key = t === 'leads' ? self.leadKey(p.Key.listId, p.Key.leadId) : p.Key.listId;
         const store = t === 'leads' ? self.leads : self.lists;
         const existing = store.get(key);
-        if (!self.checkCondition(p.ConditionExpression, existing, names, usedN)) {
+        if (!self.checkCondition(p.ConditionExpression, existing, names, usedN, values)) {
           throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
         }
         const item = existing ?? clone(p.Key);

@@ -87,6 +87,18 @@ describe('ENG-2936 forward-lead submission history', () => {
     expect(entry.payload.fields.customFields.team_size).toBe('10');
   });
 
+  it('re-reads and re-merges when another submission wins the notes write', async () => {
+    const concurrent = { ...demo, notes: `${demo.notes}\n\nother visitor` };
+    (crmDb.updateLead as jest.Mock).mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValueOnce(concurrent);
+    const res = await post({ notes: 'this visitor' });
+    expect(res.status).toBe(200);
+    expect(crmDb.getLeadById).toHaveBeenCalledWith('list_123', 'lead_1', { consistentRead: true });
+    expect((crmDb.updateLead as jest.Mock).mock.calls[1][2]).toMatchObject({
+      expectedNotes: concurrent.notes, notes: `${concurrent.notes}\n\nthis visitor`,
+    });
+  });
+
   it('caller submissionId gives a deterministic history key, so logEvent dedupes a retry', async () => {
     await post({ submissionId: 'sub-1', notes: 'x' });
     await flush();

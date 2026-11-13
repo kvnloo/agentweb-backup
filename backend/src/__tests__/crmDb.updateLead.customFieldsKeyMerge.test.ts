@@ -60,6 +60,27 @@ describe('crmDb.updateLead — customFieldsKeyMerge', () => {
     fake.seedLead(row());
   });
 
+  it('rejects stale notes without applying sibling edits, then accepts a fresh merge', async () => {
+    fake.seedLead(row({ notes: 'original\n\nconcurrent' }));
+    await expect(crmDb.updateLead(L, 'lead_1', {
+      expectedNotes: 'original', notes: 'original\n\nvisitor', firstName: 'stale',
+    })).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    expect(fake.lead(L, 'lead_1').firstName).toBeUndefined();
+    await crmDb.updateLead(L, 'lead_1', {
+      expectedNotes: 'original\n\nconcurrent', notes: 'original\n\nconcurrent\n\nvisitor',
+    });
+    expect(fake.lead(L, 'lead_1').notes).toBe('original\n\nconcurrent\n\nvisitor');
+    expect(fake.lead(L, 'lead_1').expectedNotes).toBeUndefined();
+    expect(fake.list(L).fieldNames).not.toContain('expectedNotes');
+  });
+
+  it.each([undefined, ''])('accepts a guarded first note when prior notes are %p', async (notes) => {
+    fake.seedLead(row(notes === undefined ? {} : { notes }));
+    await crmDb.updateLead(L, 'lead_1', { expectedNotes: '', notes: 'first' });
+    expect(fake.lead(L, 'lead_1').notes).toBe('first');
+    assertWellFormed(leadUpdates()[0]);
+  });
+
   it('writes one document-path SET per key and never the whole map', async () => {
     await crmDb.updateLead(L, 'lead_1', { firstName: 'Ann', customFields: { q1: 'a', q2: 2 }, customFieldsKeyMerge: true });
     const [main] = leadUpdates();

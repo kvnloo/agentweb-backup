@@ -902,7 +902,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // concurrent submission of the same email (the adopt in the create branch below). Sharing
     // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
     // enclosing `lead` and `isUpdated`.
-    const mergeIntoExistingLead = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
+    const mergeIntoExistingLeadOnce = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
       // ENG-2123: a lead matched by PHONE (not email) only has its blanks filled, never overwritten.
       const fillBlanksOnly = opts.fillBlanksOnly === true;
       consentBasePhone = existingLead.phone;
@@ -1026,7 +1026,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // ENG-2320: customFields goes to DynamoDB PER KEY (see toKeyMergeUpdate). `updates` keeps
         // the full merged map because `lead` below (what the response cascade renders) is built
         // from it.
-        await crmDb.updateLead(leadList.listId, existingLead.leadId, toKeyMergeUpdate(updates, existingCustomFields));
+        // ENG-2936: an appended note is read-modify-write, so guard it on the notes we read;
+        // a concurrent same-email submission makes this throw and the caller re-merges.
+        const write: any = { ...toKeyMergeUpdate(updates, existingCustomFields) };
+        if (updates.notes !== undefined) write.expectedNotes = existingLead.notes ?? '';
+        await crmDb.updateLead(leadList.listId, existingLead.leadId, write);
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
@@ -1036,6 +1040,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       lead = { ...existingLead, ...updates };
+    };
+
+    // Share the retry across email hits, phone matches, and create-race adoption.
+    const mergeIntoExistingLead = async (initial: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
+      let current = initial;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await mergeIntoExistingLeadOnce(current, opts);
+          return;
+        } catch (err: any) {
+          const lost = err?.code === 'ConditionalCheckFailedException' || err?.name === 'ConditionalCheckFailedException';
+          if (!lost || attempt >= 4) throw err;
+          current = (await crmDb.getLeadById(leadList.listId, current.leadId, { consistentRead: true })) || current;
+        }
+      }
     };
 
     // ENG-2837: everything above is a read; from here on a lead write may happen (and may
