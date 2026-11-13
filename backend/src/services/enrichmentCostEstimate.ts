@@ -15,7 +15,7 @@ import { getAllocatedRate } from '../utils/vendorRateCard';
 /**
  * Recalibrated 2026-11-12 (ENG-2720) against what prod actually booked. Customer runs since the 2026-11-04 changes
  * (prod logs `runEnrichment DONE` joined to the `AW-UsageRecords` ledger by user and day; test accounts excluded):
- * 118 processed contacts, 5 customers, $8.09 booked ($0.0686 per contact, $0.0661 of it before the one Apollo
+ * 118 processed contacts, 4 customers, $8.09 booked ($0.0686 per contact, $0.0661 of it before the one Apollo
  * broker request); the previous constants quoted $14.4-14.8 for those runs (+78% to +83% depending on the field
  * count), about 60% of it from the Apollo line.
  *
@@ -29,8 +29,16 @@ import { getAllocatedRate } from '../utils/vendorRateCard';
  *
  * Backtest, from the same prod data the constants come from (so a fit, not a validation): Nov 4+ runs quote $7.80
  * without the one broker request vs $8.09 booked (-4%); the 11-03 list with 146 eligible leads $36.94 vs $37.19
- * booked (-1%). Booked cost per contact varies a lot between runs (about $0.01 for cached re-runs to $0.14 for
- * fresh lists); this is the expected value across them. Re-check against the ledger as more runs land.
+ * booked (-1%). Per run the error is large, because booked cost per contact depends on what Apollo already has
+ * cached (the cache is shared across customers) and on how many distinct companies a list spans: $0.009-$0.019
+ * per contact for cache-served re-runs, $0.09-$0.14 for small cold runs, $0.072 for the 146-lead cold list. This is
+ * the average across them, right in total and not for a single run.
+ *
+ * Known limits (see also the dev note): (1) the broker share (41%) was measured only on leads that have a LinkedIn
+ * URL, where Apollo's LinkedIn match supplied the email for the rest; for eligible leads WITHOUT a LinkedIn URL it
+ * is unmeasured (no customer list had any; the test account's synthetic leads always fire) and probably higher, up
+ * to every such lead at $0.445. (2) Emailed leads with no fresh email metadata can fire the broker (above).
+ * Re-check against the ledger as more runs land.
  */
 export const ENRICHMENT_COST_RATES_USD = {
   /** Share of emailless leads with a first and last name plus a company/email domain that fire the Apollo broker (prod: 60/146). */
