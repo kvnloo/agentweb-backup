@@ -10,11 +10,12 @@ const mockGetTaskById = jest.fn();
 const mockGetUserById = jest.fn();
 const mockAddSubscriber = jest.fn();
 const mockRemoveSubscriber = jest.fn();
+const mockGetTaskSubscribers = jest.fn();
 
 jest.mock('../services/db', () => ({
   userDb: { getUserById: mockGetUserById },
   taskDb: { getTaskById: mockGetTaskById },
-  subscriberDb: { addSubscriber: mockAddSubscriber, removeSubscriber: mockRemoveSubscriber, getTaskSubscribers: jest.fn().mockResolvedValue([]) },
+  subscriberDb: { addSubscriber: mockAddSubscriber, removeSubscriber: mockRemoveSubscriber, getTaskSubscribers: mockGetTaskSubscribers },
   orgDb: { getOrgById: jest.fn() },
 }));
 
@@ -77,6 +78,18 @@ describe('auth router task subscriber routes need the task owner or an admin (EN
     expect((await remove()).status).toBe(404);
     expect(mockAddSubscriber).not.toHaveBeenCalled();
     expect(mockRemoveSubscriber).not.toHaveBeenCalled();
+  });
+
+  it("another user cannot list someone else's task subscribers (emails, imported fields, history)", async () => {
+    mockGetTaskSubscribers.mockResolvedValue([{ email: 'sub@example.com', customFields: { phone: '555' } }]);
+    const res = await request(app).get('/api/auth/tasks/task-a/subscribers');
+    expect(res.status).toBe(403);
+    expect(JSON.stringify(res.body)).not.toContain('sub@example.com');
+    expect(mockGetTaskSubscribers).not.toHaveBeenCalled();
+    currentUserId = 'user-a';
+    const own = await request(app).get('/api/auth/tasks/task-a/subscribers');
+    expect(own.status).toBe(200);
+    expect(own.body[0].email).toBe('sub@example.com');
   });
 
   it('the email is still required', async () => {

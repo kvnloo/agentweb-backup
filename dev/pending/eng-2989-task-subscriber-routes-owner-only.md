@@ -10,11 +10,15 @@ check and refused B (403).
 had), used by all three routes: 401 without a caller or user record, 404 for an unknown task, 403 for anyone else. The portals' own calls
 (task owners, admins in the partner portal) are unaffected. The auth-router routes have no callers in the repos; kept, not deleted.
 
-**Not changed (noted for a decision):** `GET /api/tasks/:taskId/subscribers` is public and returns the task's subscriber records
-(including email addresses) to anyone who has the task id; `GET /api/auth/tasks/:taskId/subscribers` returns them to any signed-in user.
-Both may be deliberate (public unsubscribe flow, counts); whether the addresses should be returned to non-owners is a separate question.
+**Also gated (review):** `GET /api/auth/tasks/:taskId/subscribers` returned the full subscriber records (emails, imported fields, email
+history) to any signed-in user; it now needs the task's owner or an admin too.
 
-**Testing:** `taskSubscriberDelete.test.ts` and `authTaskSubscribers.test.ts` (stranger refused on each route and nothing changed, owner
+**Not changed, filed separately (they are public, unauthenticated endpoints, a different kind of fix):** `GET /api/tasks/:taskId/subscribers`
+returns the same full records to anyone who has the task id; `POST /:taskId/subscribers/join` adds any address without a task-exists
+check, double opt-in or rate limit (and sends a welcome email from the owner's account); `POST /:taskId/resubscribe` undoes an
+unsubscribe from just a task id and email.
+
+**Testing:** `taskSubscriberDelete.test.ts` and `authTaskSubscribers.test.ts` (stranger refused on each route, including the subscriber list, and nothing changed, owner
 and admin allowed, unknown task, helper cases); the first set fails on the old routes; breakage checks on the helper and each route.
 
 **Rollback:** revert; no data, table or environment change.
