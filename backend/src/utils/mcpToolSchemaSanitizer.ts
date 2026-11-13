@@ -18,6 +18,9 @@
 // original tool name -> parameter names to drop from `required`
 const REQUIRED_RELAXATIONS: Record<string, string[]> = {
   playwright_browser_network_requests: ['requestBody', 'requestHeaders'],
+  // ENG-2994: `level` has a server-side default ("info"); models omit it and were rejected
+  // pre-execution with 'Missing required argument "level"' (4/17 calls in one window).
+  playwright_browser_console_messages: ['level'],
 };
 
 /**
