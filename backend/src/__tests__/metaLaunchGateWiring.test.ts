@@ -424,3 +424,68 @@ describe('AD activation without campaign_id resolves its parent (ENG-1636)', () 
     expect((runMetaTrackingGate as jest.Mock).mock.calls[0][1]).toBe(CAMPAIGN);
   });
 });
+
+/*
+ * ENG-01 live run — an AD_SET activation sent with only ad_set_id previewed fine, then the
+ * confirmed write was blocked with "no campaign was identified for this AD_SET_UPDATE". The
+ * write path now resolves the ad set's parent (account-scoped) exactly as ENG-1636 does for
+ * ads. The gate still runs on the resolved campaign; a failed lookup still blocks loudly.
+ */
+describe('AD_SET activation without campaign_id resolves its parent (ENG-01)', () => {
+  const AD_SET = '120200000000555';
+
+  it('resolves the parent campaign from the ad set and hands it to the gate', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+    (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
+    const lookup = jest.spyOn(metaService, 'getAdSetCampaignIdForAccount').mockResolvedValue(CAMPAIGN);
+    const adSetsSpy = jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: true });
+
+    await service.callMetaMarketingApi(
+      'user-1', 'AD_SET', 'UPDATE', ACCOUNT, undefined, AD_SET, undefined, { status: 'ACTIVE', confirm: true }, 'sess-1',
+    );
+
+    expect(lookup).toHaveBeenCalledWith('tok', ACCOUNT, AD_SET);
+    expect((runMetaTrackingGate as jest.Mock).mock.calls[0][1]).toBe(CAMPAIGN);
+    expect(adSetsSpy).toHaveBeenCalled();
+    // The derived campaign only scopes the gate; it is not injected into the approved write.
+    expect(adSetsSpy.mock.calls[0][3]).toBeUndefined();
+  });
+
+  it('falls through with no campaign when the lookup fails — the gate still blocks loudly', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+    (runMetaTrackingGate as jest.Mock).mockResolvedValue({
+      proceed: false,
+      blockResult: {
+        success: false, blocked: true, reason: 'tracking_preflight',
+        error: 'Launch blocked: could not verify Meta tracking because no campaign was identified for this AD_SET_UPDATE.',
+      },
+    });
+    jest.spyOn(metaService, 'getAdSetCampaignIdForAccount').mockRejectedValue(new Error('Graph read failed'));
+    const adSetsSpy = jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: true });
+
+    const res: any = await service.callMetaMarketingApi(
+      'user-1', 'AD_SET', 'UPDATE', ACCOUNT, undefined, AD_SET, undefined, { status: 'ACTIVE', confirm: true }, 'sess-1',
+    );
+
+    expect((runMetaTrackingGate as jest.Mock).mock.calls[0][1]).toBeUndefined();
+    expect(res).toEqual(expect.objectContaining({ blocked: true, reason: 'tracking_preflight' }));
+    expect(adSetsSpy).not.toHaveBeenCalled();
+  });
+
+  it('still requires write approval: an unapproved activation never reads the parent or writes', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+    (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
+    (service as any).claimMetaWriteManifestGrant.mockResolvedValue({ granted: false, digest: 'stub-digest' });
+    const lookup = jest.spyOn(metaService, 'getAdSetCampaignIdForAccount').mockResolvedValue(CAMPAIGN);
+    const adSetsSpy = jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: true });
+
+    await service.callMetaMarketingApi(
+      'user-1', 'AD_SET', 'UPDATE', ACCOUNT, undefined, AD_SET, undefined, { status: 'ACTIVE' }, 'sess-1',
+    );
+
+    expect(lookup).not.toHaveBeenCalled();
+    expect(runMetaTrackingGate).not.toHaveBeenCalled();
+    expect(adSetsSpy).not.toHaveBeenCalled();
+  });
+});
+
