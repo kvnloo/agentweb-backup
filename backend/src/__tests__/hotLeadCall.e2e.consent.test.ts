@@ -12,7 +12,7 @@ jest.mock('../services/usageRecorderService', () => ({ ...jest.requireActual('..
 jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
 jest.mock('@slack/web-api', () => ({ WebClient: jest.fn() }));
 
-import { callConfig, eventsOf, installWorld, LIST, recordOf, setClock, skipReason, submitLead, world } from './helpers/hotLeadCallE2eWorld';
+import { callConfig, callConsentRecord, eventsOf, installWorld, LIST, recordOf, setClock, skipReason, submitLead, world } from './helpers/hotLeadCallE2eWorld';
 
 installWorld();
 
@@ -38,7 +38,7 @@ describe('call consent gate (no_call_consent)', () => {
     expect(world.provider.placedCalls).toEqual([]);
   });
 
-  it('has no record to retry: a later submission without consent is skipped again (one skip event) and still nothing is dialed', async () => {
+  it('a repeat submission without consent is skipped again (one skip event, not two) and still nothing is dialed; no call record exists to retry', async () => {
     await submitLead('lead-a', { consent: false });
     await submitLead('lead-a', { consent: false, submission: true });
     expect(eventsOf('lead-a')).toEqual(['call.skipped']);
@@ -46,10 +46,25 @@ describe('call consent gate (no_call_consent)', () => {
     expect(recordOf('lead-a')).toBeUndefined();
   });
 
+  it.each([
+    ['a record bound to ANOTHER number', { phoneDigits: '12125550199' }],
+    ['a record with no phoneDigits (pre-binding shape)', { phoneDigits: undefined }],
+  ])('%s is not consent', async (_n, over) => {
+    await submitLead('lead-a', { lead: { system: { callConsent: callConsentRecord(over) } } });
+    expect(skipReason('lead-a')).toEqual({ reason: 'no_call_consent' });
+    expect(world.provider.placedCalls).toEqual([]);
+  });
+
+  it('a lead whose phone changed after consenting is refused (the old record cannot be inherited)', async () => {
+    await submitLead('lead-a', { consent: false, lead: { system: { callConsent: callConsentRecord() } }, phone: '(212) 555-0199' });
+    expect(skipReason('lead-a')).toEqual({ reason: 'no_call_consent' });
+    expect(world.provider.placedCalls).toEqual([]);
+  });
+
   it('a repeat submission that brings consent (recorded before dispatch, as forward-lead does) calls the lead; the earlier skip stays on the timeline', async () => {
     await submitLead('lead-a', { consent: false });
     expect(world.provider.placedCalls).toEqual([]);
-    world.crm.lead(LIST, 'lead-a').system = { callConsent: { granted: true, text: 'x'.repeat(60) + ' call', capturedAt: new Date().toISOString(), source: 'form' } };
+    world.crm.lead(LIST, 'lead-a').system = { callConsent: callConsentRecord() };
     await submitLead('lead-a', { submission: true });
     expect(world.provider.placedCalls).toHaveLength(1);
     expect(eventsOf('lead-a')[0]).toBe('call.skipped');

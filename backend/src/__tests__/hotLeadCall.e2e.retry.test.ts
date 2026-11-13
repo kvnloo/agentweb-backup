@@ -264,7 +264,7 @@ describe('the due-retries sweep', () => {
     ['no_call_consent', 'the lead\'s call-consent record gone (ENG-2783)', () => { delete world.crm.lead(LIST, 'lead-a').system!.callConsent; }],
     ['not_entitled', 'a plan that lapsed', () => setHotLeadCallEntitledOverride(false)],
     ['duplicate_phone', 'another lead holding the number', () => world.limits.claims.set(phoneMarkerKey('org-a', LEAD_E164), { token: 'list-a#other#z', expiresAtS: FAR })],
-    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; }],
+    ['lead_phone_changed', 'the lead\'s phone replaced by a repeat submission', () => { world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199'); }],
   ] as Array<[string, string, () => unknown]>)('permanent refusal %s', (reason, label, arrange) => {
     it(`${label}: call.skipped ${reason}, nothing placed, the claim is kept and the retry is spent`, async () => {
       await deferred();

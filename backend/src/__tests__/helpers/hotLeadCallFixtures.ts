@@ -60,6 +60,7 @@ export function storedConfigFixture(extra: Record<string, unknown> = {}, team: H
  *  FakeCrm.addLead adds it to every lead by default; pass `{ consent: false }` for a lead that has none. */
 export const callConsentRecord = (over: Record<string, unknown> = {}) => ({
   granted: true,
+  phoneDigits: '12125550142', // the default test lead's number; FakeCrm.addLead sets the lead's own
   text: 'By checking this box and submitting, I agree that Acme Plumbing LLC may call me at the number above, including automated calls.',
   version: 'v1', capturedAt: '2026-10-19T10:00:00.000Z', pageUrl: 'https://acme.example/quote', ip: '203.0.113.9', userAgent: 'jest', source: 'form' as const, ...over,
 });

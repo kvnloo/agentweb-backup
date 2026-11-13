@@ -238,7 +238,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(recordOf('lead-a')?.leadPhoneMac).toBe(leadPhoneMacOf('org-a', LEAD_E164)); // stored by the orchestrator when the call passed the gates
     const call = twilioCall(placedCall());
     await call.memberAnswers();
-    world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199';
+    world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199');
     const reply = await call.memberPresses('1');
     expect(reply.body).not.toContain('<Dial');
     expect(sayText(reply.body)).toBe('We could not reach the lead. Their details are in your lead alert.');

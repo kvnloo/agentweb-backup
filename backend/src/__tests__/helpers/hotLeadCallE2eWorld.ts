@@ -8,6 +8,7 @@
  *   '../services/usageRecorderService' -> real module with recordVendorUsage: jest.fn()
  *   '../services/leadNotificationLookup', '@slack/web-api' -> jest.fn() stand-ins
  */
+export { callConsentRecord } from './hotLeadCallFixtures';
 import { WebClient } from '@slack/web-api';
 import * as queue from '../../services/asyncJobQueue';
 import { recordVendorUsage } from '../../services/usageRecorderService';
@@ -256,4 +257,3 @@ function expectNoPhoneNumberAnywhere(): void {
     }
   }
 }
-export { callConsentRecord } from './hotLeadCallFixtures';
