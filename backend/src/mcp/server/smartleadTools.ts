@@ -52,7 +52,7 @@ export function withConnectionChoices(err: any): any {
   const choices = Array.isArray(err?.details) ? err.details.filter((c: any) => c && typeof c.accountId === 'string') : [];
   if (choices.length === 0) return err;
   // A teammate who shares a connection names it: keep control characters and line breaks out of what an agent reads.
-  const clean = (v: unknown, n: number) => String(v).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+  const clean = (v: unknown, n: number) => String(v).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
   const list = choices.map((c: any) => `${clean(c.accountId, 80)}${c.accountName ? ` (${clean(c.accountName, 60)})` : ''}${c.shared ? ', shared by a teammate' : ''}`).join('; ');
   return new Error(`${err.message} Available connections: ${list}. Call again with accountId set to one of them.`);
 }
