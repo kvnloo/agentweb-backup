@@ -8,8 +8,11 @@
  *     toolkit gateways record mcp_write_executed, so every such event is a Zoma write.
  *   - first successful ad: the first Zoma-created campaign (CONFIRMED CAMPAIGN CREATE through
  *     Zoma) whose go-live was approved through Zoma (CONFIRMED UPDATE status=ACTIVE on the
- *     campaign or one of its ad sets/ads), AND whose provider read-back is effective_status
- *     ACTIVE, AND which has >= 1 impression. Recorded write-once on the user row
+ *     campaign or one of its ad sets/ads), AND which the provider reports delivered >= 1
+ *     impression on or after the approval day. Delivery after approval is the provider's own
+ *     proof the campaign was ACTIVE after go-live, so a campaign paused right after its first
+ *     impression still counts; one that is now in review, rejected or deleted does not.
+ *     Impressions before the approval day never count. Recorded write-once on the user row
  *     (`zomaFirstAdLive`) only after that provider check passes; never inferred.
  *   - team/test accounts (our domains, admins, fixtures — journeyProductBackfill.accountFlag)
  *     are listed but flagged and excluded from every summary count.
@@ -58,7 +61,10 @@ export interface FirstAdLive {
   approvedAt: string;
   campaignId: string;
   platform: 'meta';
-  effectiveStatus: 'ACTIVE';
+  /** Campaign effective_status at verification: ACTIVE, or PAUSED once it already delivered. */
+  effectiveStatus: string;
+  /** Impressions counted from this date (UTC, approval day - 1 for account-timezone slack). */
+  impressionsSince?: string;
   impressions: number;
 }
 
@@ -149,7 +155,7 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
     activeWindowDays: ACTIVE_WINDOW_DAYS,
     definitions: {
       active: 'Non-team/test account with at least one provider-confirmed Zoma create, edit, pause or go-live approval in the last 7 days.',
-      firstSuccessfulAd: 'First Zoma-created campaign whose go-live was approved through Zoma, read back from the provider as ACTIVE with at least 1 impression.',
+      firstSuccessfulAd: 'First Zoma-created campaign whose go-live was approved through Zoma and which the provider reports delivered at least 1 impression after that approval (still ACTIVE, or paused since).',
       excluded: 'Team (our domains or admin) and test/fixture accounts are listed but never counted.',
     },
     summary: {
@@ -186,8 +192,8 @@ export interface FirstAdDeps {
   readCampaign(userId: string, campaignId: string): Promise<{ accountId: string; effectiveStatus?: string } | null>;
   /** Campaign of an approved ad set / ad (provider read); null when unresolvable. */
   campaignOf(userId: string, entityType: string, objectId: string): Promise<string | null>;
-  /** Lifetime impressions of a campaign. */
-  campaignImpressions(userId: string, accountId: string, campaignId: string): Promise<number>;
+  /** Impressions of a campaign between two dates (YYYY-MM-DD, inclusive). */
+  campaignImpressions(userId: string, accountId: string, campaignId: string, range: { since: string; until: string }): Promise<number>;
   /** Conditional write-once; false when a first ad is already recorded. */
   recordFirstAd(userId: string, record: FirstAdLive): Promise<boolean>;
   onFirstAd?(userId: string, record: FirstAdLive): Promise<void>;
@@ -196,6 +202,21 @@ export interface FirstAdDeps {
 
 export const FIRST_AD_LOOKBACK_DAYS = 60;
 const MAX_APPROVALS_CHECKED = 5;
+/** A delivered campaign may be paused (by the user, or by a first-impression safety stop). */
+const DELIVERED_STATUSES = new Set(['ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED']);
+const isoDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/**
+ * The insights window that may prove delivery after a go-live approval. Meta buckets insights
+ * by day in the ad account's timezone (UTC-12..UTC+14), so the window opens the UTC day before
+ * the approval (never earlier: older delivery is stale) and closes 12h behind now (never a day
+ * the account has not reached; the newest hours are picked up by a later check).
+ */
+export function postApprovalImpressionWindow(approvalTs: string, now: number): { since: string; until: string } {
+  const since = isoDay(Date.parse(approvalTs) - DAY_MS);
+  const until = isoDay(now - 12 * 60 * 60 * 1000);
+  return { since, until: until < since ? since : until };
+}
 /** Stay well inside the 60s proxy timeout; the rest is reported `deferred` for the next click. */
 const TIME_BUDGET_MS = 40_000;
 
@@ -241,14 +262,15 @@ export async function verifyZomaFirstAds(
       if (deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { best = { userId, outcome: 'deferred' }; break; }
       let attempt: FirstAdResult;
       try {
-        attempt = await checkApproval(deps, userId, approval, created);
+        attempt = await checkApproval(deps, userId, approval, created, now);
       } catch (error) {
         attempt = { userId, outcome: 'provider_error', error: error instanceof Error ? error.message.slice(0, 200) : 'unknown' };
       }
       if (attempt.outcome === 'verified') {
         const record: FirstAdLive = {
           at: new Date(now).toISOString(), approvedAt: approval.ts, campaignId: attempt.campaignId!,
-          platform: 'meta', effectiveStatus: 'ACTIVE', impressions: attempt.impressions!,
+          platform: 'meta', effectiveStatus: attempt.effectiveStatus!,
+          impressionsSince: postApprovalImpressionWindow(approval.ts, now).since, impressions: attempt.impressions!,
         };
         const wrote = await deps.recordFirstAd(userId, record);
         // The marker is the source of truth; a failed stage/event emit must not fail the check.
@@ -264,16 +286,22 @@ export async function verifyZomaFirstAds(
   return results;
 }
 
-async function checkApproval(deps: FirstAdDeps, userId: string, approval: ZomaWriteEvent, created: Set<string>): Promise<FirstAdResult> {
+async function checkApproval(
+  deps: FirstAdDeps, userId: string, approval: ZomaWriteEvent, created: Set<string>, now: number,
+): Promise<FirstAdResult> {
   const entity = String(approval.entityType ?? '').toUpperCase();
   const campaignId = entity === 'CAMPAIGN' ? approval.objectId! : await deps.campaignOf(userId, entity, approval.objectId!);
   if (!campaignId || !created.has(campaignId)) return { userId, outcome: 'not_zoma_created', ...(campaignId ? { campaignId } : {}) };
   const campaign = await deps.readCampaign(userId, campaignId);
   if (!campaign) return { userId, outcome: 'provider_error', campaignId, error: 'campaign not readable in any connected Meta account' };
-  if (campaign.effectiveStatus !== 'ACTIVE') return { userId, outcome: 'not_active', campaignId, effectiveStatus: campaign.effectiveStatus };
-  const impressions = await deps.campaignImpressions(userId, campaign.accountId, campaignId);
-  if (!(impressions >= 1)) return { userId, outcome: 'no_impressions', campaignId, effectiveStatus: 'ACTIVE', impressions };
-  return { userId, outcome: 'verified', campaignId, effectiveStatus: 'ACTIVE', impressions };
+  const effectiveStatus = campaign.effectiveStatus;
+  if (!effectiveStatus || !DELIVERED_STATUSES.has(effectiveStatus)) return { userId, outcome: 'not_active', campaignId, effectiveStatus };
+  const impressions = await deps.campaignImpressions(userId, campaign.accountId, campaignId, postApprovalImpressionWindow(approval.ts, now));
+  if (!(impressions >= 1)) {
+    // Paused without post-approval delivery never went live; ACTIVE without it is still waiting.
+    return { userId, outcome: effectiveStatus === 'ACTIVE' ? 'no_impressions' : 'not_active', campaignId, effectiveStatus, impressions };
+  }
+  return { userId, outcome: 'verified', campaignId, effectiveStatus, impressions };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -394,9 +422,9 @@ export function defaultFirstAdDeps(): FirstAdDeps {
       if (failure) throw failure;
       return null;
     },
-    async campaignImpressions(userId, accountId, campaignId) {
+    async campaignImpressions(userId, accountId, campaignId, range) {
       const res: any = await (await ams()).callMetaAdsInsightsApiWrapper(userId, {
-        account_id: accountId, object_type: 'campaign' as any, object_id: campaignId, fields: ['impressions'], date_preset: 'maximum',
+        account_id: accountId, object_type: 'campaign' as any, object_id: campaignId, fields: ['impressions'], time_range: range,
       });
       if (res?.success === false) throw new Error(String(res.error ?? 'insights read failed').slice(0, 200));
       const rows = Array.isArray(res?.data) ? res.data : [];
