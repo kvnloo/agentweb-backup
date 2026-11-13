@@ -9,14 +9,16 @@ Smartlead MCP tools).
 - Every caller-supplied id that goes into a self-call path is now escaped with `encodeURIComponent` (94 places across the MCP
   tools, Emma's tools and the coding agent; ids that were already escaped, such as `requireListId`, are left alone).
 - `mcpFetch` refuses, before sending anything, a path whose part before `?` does not start with `/api/` or contains a `.` or `..`
-  segment, an empty segment, a backslash, `#`, a control character, or an encoded dot, slash or backslash. A tool that forgets to
-  escape can no longer be steered.
+  segment, an empty segment or a percent-encoded dot (`%2e`, which URL normalisation turns into a dot segment), and any path with a
+  raw backslash, `#` or control character anywhere (query included). An escaped slash (`%2F`) stays allowed: Express keeps it inside
+  one path parameter, and ids with slashes (knowledge-base file keys, client names) need it. (An independent review caught that
+  refusing `%2F` broke `delete_knowledge_base_file`; there is now a test through the real tool.)
 
 **Also:** regenerated the MCP inventory snapshot, which main's ENG-2961 change (`manage_crm_sequence` external activation actions)
 had left stale; no tool definition changed here.
 
 **Testing:** `mcp.selfCallPath.test.ts` (the guard, mcpFetch sends nothing on a refused path, the reproduced `execute_task` value
-is refused, a `?` stays inside its id); breakage checks: removing the guard, the dot-segment rule or the escaping each fails a test.
+is escaped into one segment, a `?` stays inside its id, the real knowledge-base delete still works); breakage checks: removing the guard, the escaping, the `%2e` rule or the raw-`#` rule, or bringing back the `%2F` rule, each fails a test.
 MCP, tool and coding-agent suites pass (170 suites).
 
 **Rollback:** revert; no data, table or environment change.
