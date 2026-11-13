@@ -150,7 +150,7 @@ mcpToolRegistry.register({
       try {
         const session: any = await mcpFetch({
           method: 'GET',
-          path: `/api/agent-mode/session/${taskId}`,
+          path: `/api/agent-mode/session/${encodeURIComponent(taskId)}`,
           context: ctx(context),
         });
         const deck = session?.pendingApprovalDeck;

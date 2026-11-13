@@ -27,6 +27,9 @@ import { runLandingPagePageSpeedCheck } from "./landingPagePageSpeedCheck";
 import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+import { buildCallConsentNotice, CALL_CONSENT_NOTICE_VERSION } from "./voice/callConsent";
+import { registeredBusinessNameOf, type ConsentNameSources } from "./voice/callConsentName";
+export { registeredBusinessNameOf, type ConsentNameSources };
 // ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
 // Already a runtime dependency, not a devDependency.
 import * as ts from "typescript";
@@ -953,6 +956,9 @@ export async function resolveLandingPageLiveUrl(
 
 export interface BrandContext {
   brandName?: string;
+  /** ENG-2783: the name of the business that places the calls, for the call-consent notice (see registeredBusinessNameOf).
+   *  Absent = the prompt carries NO consent notice at all, so the page records no consent and triggers no calls. */
+  registeredBusinessName?: string;
   primaryColor?: string;
   primaryColorEnd?: string;
   isGradient?: boolean;
@@ -986,9 +992,13 @@ export interface BrandContext {
 export function buildBrandContextFromUser(
   user: any,
   brandGuidelinesOverride?: any,
+  /** ENG-2783: the caller's org, already loaded by the generation routes, for the consent notice's business name. */
+  org?: ConsentNameSources | null,
 ): BrandContext {
   const brandContext: BrandContext = {};
   if (!user) return brandContext;
+  const registeredBusinessName = registeredBusinessNameOf(org, user);
+  if (registeredBusinessName) brandContext.registeredBusinessName = registeredBusinessName;
 
   const bg: any = brandGuidelinesOverride ?? user.brandGuidelines;
   if (bg) {
@@ -1060,6 +1070,29 @@ export function extractTemplateOutline(fullHtml: string): string {
   }
 
   return sections.join('\n\n');
+}
+
+/**
+ * ENG-2783: the form's call-consent notice, for a lead capture form (the prompt always asks for a phone number). Included for EVERY
+ * such form whose business name is known: the prompt builder has no cheap, reliable signal that the org has hot-lead calling set up.
+ * With NO name the block is omitted entirely (returns ''): no placeholder ever reaches a page, the page records no consent and so
+ * triggers no calls until the notice is added.
+ */
+export function buildCallConsentInstructions(registeredBusinessName?: string): string {
+  const name = registeredBusinessName?.trim();
+  if (!name) return "";
+  const label = buildCallConsentNotice(name);
+  return (
+    `\n\nCALL CONSENT — REQUIRED WHENEVER THE FORM COLLECTS A PHONE NUMBER:\n` +
+    `1. Directly ABOVE the submit button add a checkbox that is UNCHECKED by default (never pre-checked, never hidden). ` +
+    `It is required before submit WHEN a phone number was entered, and optional otherwise.\n` +
+    `2. Its label is EXACTLY this text, word for word, in a single <label> next to the checkbox:\n` +
+    `   ${JSON.stringify(label)}\n` +
+    `   Keep it in ONE constant in the form file (const CALL_CONSENT_TEXT = ...) and render that same constant as the label and send it in the request.\n` +
+    `3. In the JSON body of the fetch('/api/capture', ...) call add ` +
+    `callConsent: { granted: <the checkbox state, a boolean>, text: CALL_CONSENT_TEXT, version: ${JSON.stringify(CALL_CONSENT_NOTICE_VERSION)} }. ` +
+    `Send it only with the checkbox state as the real boolean; never send granted: true when the box is not checked.`
+  );
 }
 
 /**
@@ -1156,6 +1189,8 @@ export function buildBrandEnrichedPrompt(
       `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
       `3. NEVER put absolute backend URLs in any client-side .tsx file.`
     );
+    const consentBlock = buildCallConsentInstructions(brand.registeredBusinessName);
+    if (consentBlock) parts.push(consentBlock);
   }
 
   // Both halves or neither: a conversion id without its label fires an event that
@@ -5369,6 +5404,9 @@ export async function POST(req: Request) {
     // bonus; the lead is the product. Never let the bonus cost the product.
     let visitorIp = "";
     let visitorUserAgent = "";
+    // ENG-2783: the page the form was on (the browser's Referer to THIS route), forwarded so the backend can record
+    // where call consent was given. The backend keeps host + path only and drops any query string.
+    let visitorPageUrl = "";
     try {
       const h = await headers();
       // x-vercel-forwarded-for FIRST. Vercel's docs: x-forwarded-for is overwritten by
@@ -5380,6 +5418,7 @@ export async function POST(req: Request) {
         .split(",")[0]
         .trim();
       visitorUserAgent = (h.get("user-agent") || "").trim();
+      visitorPageUrl = (h.get("referer") || "").trim();
     } catch {}
 
     const res = await fetch(FORWARD_URL, {
@@ -5397,6 +5436,7 @@ export async function POST(req: Request) {
         ...(fbc ? { fbc } : {}),
         ...(visitorIp ? { visitorIp } : {}),
         ...(visitorUserAgent ? { visitorUserAgent } : {}),
+        ...(visitorPageUrl ? { visitorPageUrl } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });

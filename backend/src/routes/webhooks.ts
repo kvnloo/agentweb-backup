@@ -28,6 +28,7 @@ import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { buildCallConsentRecord, consentPhoneDigits, pageUrlOf, parseCallConsent, type CallConsentRecord } from '../services/voice/callConsent';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
@@ -592,6 +593,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // what the value actually is: the VISITOR, not whoever made this request.
       visitorIp: declaredClientIp,
       visitorUserAgent: declaredClientUserAgent,
+      // ENG-2783: the call-consent notice the visitor agreed to, and the page it was on (declared by the capture
+      // route, which is the only place the Referer is knowable). Both are listed in HANDLED_TOP_LEVEL_KEYS below so
+      // they never become free-form custom fields, and neither is ever echoed in a response.
+      callConsent: rawCallConsent,
+      visitorPageUrl: declaredPageUrl,
     } = req.body;
 
     // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
@@ -720,6 +726,27 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (capturedClientIp) leadData.clientIp = capturedClientIp;
     if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
+    // ENG-2783: validate and stamp the call consent BEFORE any lead write, so a new lead is created with it already
+    // in the row and the call gates (which run from the create hook) can never see the lead without it. Anything
+    // that does not validate is ignored (never a 400: the lead is still created) with one warning of the reason code
+    // only; the lead then has no consent and the hot-lead call gate skips it (`no_call_consent`).
+    let callConsentRecord: CallConsentRecord | null = null;
+    const consentParse = parseCallConsent(rawCallConsent);
+    if (consentParse.ok && !consentPhoneDigits(normalizedPhone)) {
+      // Consent is for a number; with no usable phone in the same submission there is nothing to bind it to.
+      console.warn('[forward-lead] call consent ignored: no_phone');
+    } else if (consentParse.ok) {
+      callConsentRecord = buildCallConsentRecord(consentParse, {
+        phone: normalizedPhone,
+        pageUrl: pageUrlOf(req.headers['referer']) ?? pageUrlOf(req.headers['origin']) ?? pageUrlOf(declaredPageUrl),
+        ip: capturedClientIp,
+        userAgent: capturedUserAgent,
+      });
+      leadData.system = { callConsent: callConsentRecord };
+    } else if (consentParse.reason !== 'absent' && consentParse.reason !== 'unchecked') {
+      console.warn(`[forward-lead] call consent ignored: ${consentParse.reason}`);
+    }
+
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
     // nested under `customFields`) got a 201 and a visible lead row with the data gone.
@@ -749,6 +776,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // customFields as junk on every event. `sessionId` is deliberately NOT added: LPs
       // already post it (flat or in customFields) and read it back out of customFields.
       'sessionStartMs',
+      // ENG-2783: consumed above, never stored as free-form data.
+      'callConsent', 'visitorPageUrl',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -862,6 +891,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     let lead: any;
     let isNew = false;
     let isUpdated = false;
+    // ENG-2783: the phone the EXISTING lead held before this submission merged into it (consent binding, see below).
+    let consentBasePhone: unknown;
 
     // The one merge routine for an EXISTING lead. Two entry points reach it: the
     // getLeadByEmail hit at the top of this handler, and a createLead that lost a race to a
@@ -871,6 +902,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     const mergeIntoExistingLead = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
       // ENG-2123: a lead matched by PHONE (not email) only has its blanks filled, never overwritten.
       const fillBlanksOnly = opts.fillBlanksOnly === true;
+      consentBasePhone = existingLead.phone;
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -1154,6 +1186,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // that branch is the well-trodden email path and is not worth destabilising here.
           const normalizeAdopted = (value: any): string =>
             value === null || value === undefined ? '' : String(value).trim();
+          consentBasePhone = lead.phone;
           const adoptedUpdates: any = {};
           let adoptedChanged = false;
 
@@ -1218,6 +1251,32 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             isUpdated = true;
           }
         }
+      }
+    }
+
+    // ENG-2783: consent on a REPEAT submission. A new lead already carries it (written in the create input above). An
+    // existing lead that has none gets it recorded now, with a write that creates `system.callConsent` only if absent:
+    // the FIRST granted record is kept forever and a later one (same or different text) is IGNORED, not appended, so
+    // the proof of what the person first agreed to is never replaced. This runs before the dispatch below, which
+    // re-reads the lead consistently. A repeat submission DOES dispatch the call gates (notifyRepeatSubmission ->
+    // dispatchLeadCreated(..., submission)), and the only call-specific refusal that sticks is `has_record` (a call
+    // already happened), so a lead first skipped as `no_call_consent` and now resubmitting WITH consent is called by
+    // THAT submission, if every other gate passes. That is intended and visible: the earlier `call.skipped` stays on the
+    // timeline and the new `call.started` follows it. A failed write only warns: the lead is then skipped, never called.
+    // Phone binding. The record is consent for the number the visitor typed, and is only recorded on an existing lead when that
+    // number is the one the lead ALREADY held before this submission: otherwise anyone who knows a lead's email could tick the box
+    // with their own number and attach it to the lead. Can a resubmission CHANGE the stored phone? Yes: an email-matched merge
+    // overwrites a differing phone with the submitted one, a phone-matched merge (fillBlanksOnly) and the adopt path only fill blanks or
+    // overwrite on the same key. A changed phone never inherits an old record because the gate (hasCallConsent) requires the
+    // record's phoneDigits to equal the lead's CURRENT phone.
+    if (callConsentRecord && !isNew && lead?.leadId && !lead.system?.callConsent) {
+      if (!callConsentRecord.phoneDigits || consentPhoneDigits(consentBasePhone) !== callConsentRecord.phoneDigits) {
+        console.warn('[forward-lead] call consent ignored: phone_mismatch');
+      } else try {
+        const created = await crmDb.createLeadSystemRecordOnce(leadList.listId, lead.leadId, 'callConsent', callConsentRecord);
+        if (created) lead = { ...lead, system: { ...(lead.system || {}), callConsent: callConsentRecord } };
+      } catch (consentErr: unknown) {
+        console.warn(`[forward-lead] call consent not recorded on existing lead: ${consentErr instanceof Error ? consentErr.name : 'error'}`);
       }
     }
 

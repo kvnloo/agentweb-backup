@@ -196,7 +196,7 @@
  * `getSenderForLead` is bound off the singleton the same way.
  */
 import { suppressLeadSideEffects } from '../../utils/sessionList';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType, missingReviewDraftError } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
@@ -205,6 +205,7 @@ import { getCrmSenders } from './shared/crmSenders';
 import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DETAIL } from './brandMarketStrategy';
+import { brandMessagingContextFromGuidelines } from '../../services/brandMessagingContext';
 import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
@@ -2150,6 +2151,12 @@ export async function updateLeadStatus(
         savedDrafts.push('emailDraft');
       }
 
+      // ENG-2966: never put a lead in the review queue without a draft to review.
+      const draftError = missingReviewDraftError(status, { ...existingLead, ...updates });
+      if (draftError) {
+        return { success: false, message: 'No draft saved on this lead', error: draftError };
+      }
+
       await crmDb.updateLead(listId, leadId, updates);
 
       // Auto-create status change engagement
@@ -3003,9 +3010,12 @@ ${emailDraftFormat === 'text'
       const emailSummary = emailData
         ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
         : '';
+      // Same compact brand block as the CRM invite-note route (ENG-2967) — the
+      // full formattedContent above is sized for the email prompt, not a 300-char note.
+      const senderBrand = brandMessagingContextFromGuidelines(brandGuidelines);
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-Recipient: ${leadDesc}
+Recipient: ${leadDesc}${senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : ''}
 ${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 

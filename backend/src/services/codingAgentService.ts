@@ -158,7 +158,7 @@ async function refreshPreviewUrlForDraftBranchStrict(
   try {
     const data = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${context.pageId}/preview-url`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(context.pageId)}/preview-url`,
       queryParams: { branch: result.branch, ...(result.latestCommitSha ? { commitSha: result.latestCommitSha } : {}) },
       context: { userId: context.userId },
     });
@@ -202,7 +202,7 @@ async function getCurrentCommitSha(context: CodingAgentContext): Promise<string 
     const queryParams: Record<string, string> = branch !== 'main' ? { branch } : {};
     const data = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${context.pageId}/commits`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(context.pageId)}/commits`,
       queryParams,
       context: { userId: context.userId },
     });
@@ -1145,7 +1145,7 @@ async function commitStagedFiles(context: CodingAgentContext, workspace: EditWor
   if (errors.length) throw new Error(`Syntax check failed; nothing committed. Fix staged files and retry check_deployment:\n${errors.join('\n')}`);
   throwIfAborted(context.abortSignal);
   const result = await mcpFetch({
-    method: 'PUT', path: `/api/landing-pages/v0/generated/${context.pageId}/update-files`,
+    method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(context.pageId)}/update-files`,
     body: { files, commit_message: `Coding agent: update ${files.length} file(s)`,
       ...(context.draftBranch ? { branch: context.draftBranch } : {}) },
     context: { userId: context.userId },
@@ -1222,7 +1222,7 @@ async function executeTool(
   workspace: EditWorkspace = newEditWorkspace()
 ): Promise<string | ToolImageResult> {
   throwIfAborted(context.abortSignal);
-  const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
+  const basePath = `/api/landing-pages/v0/generated/${encodeURIComponent(context.pageId)}`;
   const branch = context.draftBranch || "main";
   const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
 

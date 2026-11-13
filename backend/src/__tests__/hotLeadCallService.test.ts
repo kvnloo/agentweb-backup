@@ -14,6 +14,8 @@ jest.mock('../services/asyncJobQueue', () => ({
   startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 jest.mock('../services/emailService', () => ({ emailService: { sendEmail: jest.fn(), escapeHtml: (t: string) => t } }));
+/** A lead's consent record bound to ITS number (ENG-2783): a lead copy with another phone must carry consent for that phone. */
+const consentFor = (phone: string) => ({ callConsent: callConsentRecord({ phoneDigits: phone.replace(/\D/g, '').replace(/^(\d{10})$/, '1$1') }) });
 const callerless = { on: false };
 jest.mock('../services/voice/hotLeadCallContext', () => ({
   resolveHotLeadCallContext: async (listId: string) => {
@@ -39,7 +41,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
-import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
+import { teamMember, callRecord, callConsentRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const MEMBER_PHONE = '+14155550100';
@@ -78,7 +80,7 @@ beforeEach(() => {
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
   process.env.JWT_SECRET = 'test-secret';
-  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' } };
+  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' }, system: { callConsent: callConsentRecord() } };
   org = { orgId: 'org-a', hotLeadCall: config };
   mock(crmDb.getLeadListById).mockResolvedValue({ listId: 'list-a', userId: 'owner-a' });
   mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });
@@ -266,11 +268,11 @@ describe('team routing', () => {
     lead = { ...lead, leadId: 'lead-1' };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-1' }));
     store.record = null; // the fake holds one record at a time
-    lead = { ...lead, leadId: 'lead-2', phone: '+12125550143' };
+    lead = { ...lead, leadId: 'lead-2', phone: '+12125550143', system: consentFor('+12125550143') };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-2' }));
     expect(placedTo()).toEqual([MEMBER_PHONE, SECOND_PHONE]);
     store.record = null;
-    lead = { ...lead, leadId: 'lead-3', phone: '+12125550144' };
+    lead = { ...lead, leadId: 'lead-3', phone: '+12125550144', system: consentFor('+12125550144') };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-3' }));
     expect(placedTo()).toHaveLength(2);
     expect(store.events.at(-1)).toEqual({ type: 'call.skipped', detail: { reason: 'member_cooldown' } });
@@ -554,7 +556,7 @@ describe('abuse limits (reservation)', () => {
   const FIRST = '(212) 555-0142';
   // A new lead row, same list: the record store is per lead, so reset it.
   const submit = async (leadId: string, phone: string, overrides: Record<string, unknown> = {}) => {
-    lead = { ...lead, leadId, phone, createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId, phone, system: consentFor(phone), createdAt: new Date().toISOString() };
     store.record = null;
     store.events = [];
     const before = provider.placedCalls.length;
@@ -628,7 +630,7 @@ describe('abuse limits (reservation)', () => {
     later(2);
     store.record = null;
     store.events = [];
-    lead = { ...lead, leadId: 'l2', phone: '+12125550142', createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId: 'l2', phone: '+12125550142', system: consentFor('+12125550142'), createdAt: new Date().toISOString() };
     await processHotLeadCallJob(jobOf({ leadId: 'l2' }));
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'org_hourly_cap' } }]);
@@ -713,7 +715,7 @@ describe('abuse limits (reservation)', () => {
   it('a burst of 100 simultaneous leads dials once (the cooldown) and never more than the cap', async () => {
     org.hotLeadCall = { ...config, maxCallsPerHour: 3, memberCooldownMinutes: 1 };
     const created = new Set<string>();
-    mock(crmDb.getLeadById).mockImplementation(async (_l: string, id: string) => ({ ...lead, leadId: id, phone: `+1212555${String(1000 + Number(id.slice(1)))}` }));
+    mock(crmDb.getLeadById).mockImplementation(async (_l: string, id: string) => ({ ...lead, leadId: id, phone: `+1212555${String(1000 + Number(id.slice(1)))}`, system: consentFor(`+1212555${String(1000 + Number(id.slice(1)))}`) }));
     setLeadCallStoreForTests({
       get: async () => null,
       create: async (_l, id) => { if (created.has(id)) return false; created.add(id); return true; },
@@ -968,7 +970,7 @@ describe('the call record of the first attempt', () => {
 
 describe('monthly cap and its owner notices (ENG-2783)', () => {
   const submit = async (n: number) => {
-    lead = { ...lead, leadId: `m${n}`, phone: `+1212555${String(1000 + n)}`, createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId: `m${n}`, phone: `+1212555${String(1000 + n)}`, system: consentFor(`+1212555${String(1000 + n)}`), createdAt: new Date().toISOString() };
     store.record = null;
     store.events = [];
     const before = provider.placedCalls.length;

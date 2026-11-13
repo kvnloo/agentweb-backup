@@ -349,13 +349,15 @@ export class McpOAuthService {
     }).promise();
   }
 
-  async takePendingAuthorization(clientId: string, codeChallenge: string): Promise<PendingAuthorizationAttribution | null> {
+  async takePendingAuthorization(clientId: string, codeChallenge: string, preserveForRetry = false): Promise<PendingAuthorizationAttribution | null> {
     const code = pendingAuthorizationKey(clientId, codeChallenge);
     const result = await dynamodb.get({ TableName: this.codesTable, Key: { code } }).promise();
     const item = result.Item;
     if (!item || item.kind !== 'pending_authorization' || !isJourneyProduct(item.product) ||
         !Number.isFinite(item.expiresAt) || item.expiresAt <= Math.floor(Date.now() / 1000)) return null;
-    await dynamodb.delete({ TableName: this.codesTable, Key: { code } }).promise().catch(() => undefined);
+    // Admission can refuse consent. Keep the product hint for an identical retry;
+    // it expires via the existing DynamoDB TTL and cannot be redeemed as a code.
+    if (!preserveForRetry) await dynamodb.delete({ TableName: this.codesTable, Key: { code } }).promise().catch(() => undefined);
     const confidence: AttributionConfidence =
       item.attributionConfidence === 'explicit' || item.attributionConfidence === 'inferred' ? item.attributionConfidence : 'unknown';
     const ref = validateRef(item.ref);

@@ -61,7 +61,7 @@ import {
 } from '../services/voice/callFinalisation';
 import {
   bridgeTwiml, connectTwiml, hangupTwiml, inboundMemberScreenTwiml, inboundNobodyTwiml, inboundRingTwiml, inboundUnavailableTwiml,
-  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
+  isE164, leadDeclinedTwiml, leadDeferredMemberTwiml, leadDeferredTwiml, leadOptedOutMemberTwiml, leadOptedOutTwiml, leadOtherKeyTwiml, leadPhoneChangedTwiml, leadScreenTwiml, leadUnreachableTwiml, memberPromptTwiml,
 } from '../services/voice/twiml';
 import { recordCallUsage } from '../services/voice/voiceUsage';
 import {
@@ -554,13 +554,18 @@ router.post('/screen-result', guarded(async (_req, res, q, body) => {
   const decided = await store.get(q.listId, q.leadId);
   const accepted = decided?.lastSequence?.[marker] !== undefined && !LEAD_REFUSALS.has(decided.outcome ?? '');
   if (decided?.outcome === 'lead_opted_out') {
-    // The goodbye names the business: without a live config there is nothing to name, so the leg just ends.
+    // The goodbye names the business and gives the org number (64.1200(b)(2)): without a live config there is nothing to say, so the leg just ends.
     const ctx = await resolveHotLeadCallContext(q.listId);
-    return sendXml(res, ctx ? leadOptedOutTwiml(ctx.config.announcedName) : hangupTwiml());
+    return sendXml(res, ctx && isE164(ctx.config.twilioNumber) ? leadOptedOutTwiml(ctx.config.announcedName, ctx.config.twilioNumber) : hangupTwiml());
   }
   if (body.Digits === '2' && decided?.outcome === 'lead_deferred') {
     const ctx = await resolveHotLeadCallContext(q.listId);
-    return sendXml(res, ctx ? leadDeferredTwiml(ctx.config.announcedName) : hangupTwiml());
+    return sendXml(res, ctx && isE164(ctx.config.twilioNumber) ? leadDeferredTwiml(ctx.config.announcedName, ctx.config.twilioNumber) : hangupTwiml());
+  }
+  if (body.Digits !== undefined && body.Digits !== '1' && body.Digits !== '3' && decided?.outcome === 'lead_declined') {
+    // Any other key declines; the lead may have cut the prompt short before the number, so it is said here.
+    const ctx = await resolveHotLeadCallContext(q.listId);
+    return sendXml(res, ctx && isE164(ctx.config.twilioNumber) ? leadOtherKeyTwiml(ctx.config.twilioNumber) : hangupTwiml());
   }
   // An empty response ends the screening leg normally, so Twilio bridges the calls.
   sendXml(res, accepted ? bridgeTwiml() : hangupTwiml());

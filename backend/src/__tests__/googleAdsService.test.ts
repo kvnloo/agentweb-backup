@@ -1863,6 +1863,8 @@ describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', ()
 describe('setDeviceBidAdjustments (ENG-2036)', () => {
   it('updates the campaign device criteria bid_modifier in one atomic mutation', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'CAMPAIGN',
       customerId: '1234567890',
@@ -1872,7 +1874,7 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
         { device: 'TABLET', bidModifier: 0 },
       ],
     });
-    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3); // mutate + one read-back per criterion (ENG-2398)
     const [url, body] = mockAxiosPost.mock.calls[0];
     expect(url).toMatch(/campaignCriteria:mutate$/);
     expect(body.operations).toEqual([
@@ -1883,7 +1885,8 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
 
   it('creates ad-group device bid modifiers', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1234567890/adGroupBidModifiers/77~30000' }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.25 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'AD_GROUP',
       customerId: '1234567890',
@@ -1901,7 +1904,12 @@ describe('setDeviceBidAdjustments (ENG-2036)', () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [
       { adGroupBidModifier: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', device: { type: 'MOBILE' } } },
     ] } });
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001' },
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30002' },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 0.5 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.1 } }] } });
     await service.setDeviceBidAdjustments('user-123', {
       scope: 'AD_GROUP',
       customerId: '1234567890',

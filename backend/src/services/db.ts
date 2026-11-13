@@ -6666,6 +6666,9 @@ export const crmDb = {
     /** ENG-926 §B: client user-agent at capture (Meta `client_user_agent`). Paired with
      *  clientIp; Meta treats the two together as a match signal. */
     clientUserAgent?: string;
+    /** ENG-2783: CRM-internal sidecar written in the creation put (so it exists before any post-create hook reads the
+     *  row). Used for `system.callConsent`, which the hot-lead call gate must see on the very first pass. */
+    system?: Record<string, unknown>;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -6854,6 +6857,9 @@ export const crmDb = {
       }
       if (leadData.clientUserAgent) {
         item.clientUserAgent = leadData.clientUserAgent;
+      }
+      if (leadData.system && Object.keys(leadData.system).length > 0) {
+        item.system = leadData.system;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;

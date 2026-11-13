@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { statusAfterReviewedSend } from '../utils/leadSchema';
+import { statusAfterReviewedSend, missingReviewDraftError, REVIEW_DRAFT_STATUS } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
@@ -279,6 +279,7 @@ import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchCo
 import { randomUUID } from 'crypto';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
+import { brandMessagingContextFromGuidelines } from '../services/brandMessagingContext';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -2239,6 +2240,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const { listId } = req.params;
     const leadData = req.body;
 
+    // ENG-2966: a lead cannot be created straight into review without a draft (also MCP add).
+    const createDraftError = missingReviewDraftError(leadData?.status, leadData);
+    if (createDraftError) {
+      return res.status(400).json({ message: createDraftError });
+    }
+
     // Attribution — accept the same `attribution` / legacy `utm` shape as the
     // public forward-lead endpoint so the CRM "quick add" flow preserves source
     // data when a rep pastes in a lead they got from a tracked link.
@@ -2340,6 +2347,17 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 
     if (!Array.isArray(leads) || leads.length === 0) {
       return res.status(400).json({ message: 'leads must be a non-empty array' });
+    }
+
+    // ENG-2966: reject the import when any row would land in review without a draft.
+    const draftlessRows = leads
+      .map((lead: any, index: number) => (missingReviewDraftError(lead?.status, lead) ? index : -1))
+      .filter((index: number) => index >= 0);
+    if (draftlessRows.length > 0) {
+      return res.status(400).json({
+        message: `Rows ${draftlessRows.join(', ')} set status "${REVIEW_DRAFT_STATUS}" without a saved draft. Import them with another status, or include the draft.`,
+        rows: draftlessRows,
+      });
     }
 
     const list = await crmDb.getLeadListById(listId);
@@ -3023,6 +3041,22 @@ const updateLeadHandler = async (req: Request, res: Response) => {
     }
 
     const updateData = updates;
+
+    // ENG-2966: moving a lead INTO review requires a draft on it after this write.
+    // Also re-checked when a lead already in review has its draft edited/cleared, so the
+    // write cannot leave an empty queue row; untouched legacy review rows stay editable.
+    const touchesDraft = !!updates && ('emailDraft' in updates || 'messageDraft' in updates);
+    if (updates?.status === REVIEW_DRAFT_STATUS || touchesDraft) {
+      const before = await crmDb.getLeadById(listId, leadId);
+      const after = before ? { ...before, ...updates } : null;
+      const entering = !!before && before.status !== REVIEW_DRAFT_STATUS && updates?.status === REVIEW_DRAFT_STATUS;
+      const draftError = after && (entering || touchesDraft)
+        ? missingReviewDraftError(after.status, after)
+        : null;
+      if (draftError) {
+        return res.status(400).json({ message: draftError });
+      }
+    }
 
     // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
     const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);
@@ -5546,11 +5580,10 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const { agentModeService } = await import('../services/agentModeService');
 
-    // Get brand guidelines for context
-    const brandGuidelines = await agentModeService.readBrandGuidelines(userId);
-    const brandContext = brandGuidelines?.exists && brandGuidelines?.content
-      ? `\nSender context: ${String(brandGuidelines.content).slice(0, 500)}`
-      : '';
+    // Sender brand context. readBrandGuidelines returns { exists, brandData,
+    // formattedContent } — the old `.content` read was always undefined, so the
+    // note never saw the sender's brand (ENG-2967).
+    const senderBrand = brandMessagingContextFromGuidelines(await agentModeService.readBrandGuidelines(userId));
 
     const firstName = (lead as any).firstName || '';
     const lastName = (lead as any).lastName || '';
@@ -5561,7 +5594,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
     const notesLine = notes ? `\nWhat we know about them: ${notes.slice(0, 300)}` : '';
-    const senderContext = brandContext ? `\nSender context: ${brandContext.replace('\nSender context: ', '').slice(0, 400)}` : '';
+    const senderContext = senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : '';
 
     const prompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 

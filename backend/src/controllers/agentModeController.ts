@@ -1,4 +1,6 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import { personOnlyApprovalsIn, personOnlyRefusal } from '../services/personOnlyApprovals';
+
 import {
   acquireInteractiveGenerationSlot,
   buildTooManyRunsBody,
@@ -203,6 +205,11 @@ import {
   type ModelBackupSource,
   type PolicyModelDecision,
 } from '../services/llmUsagePolicyService';
+
+/** Where the person approves: the chat the card is in. */
+function approvalChatUrl(sessionId: string): string {
+  return `${(process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro').replace(/\/$/, '')}/agent-mode/${encodeURIComponent(sessionId)}`;
+}
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
@@ -11322,7 +11329,23 @@ export const agentModeController = {
         if (!session.pendingApprovalDeck) {
           return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
         }
-        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        // ENG-2962: an MCP tool answering on someone's behalf (a self-call) may not approve an action that only a person may approve:
+        // a Smartlead push or release, a hot-lead call, a CRM sequence activation or a paused Meta bundle. Declining stays allowed.
+        if ((req as AuthenticatedRequest).isSelfCall === true) {
+          const blocked = personOnlyApprovalsIn(session.pendingApprovalDeck, deckAnswer.answers);
+          if (blocked.length > 0) {
+            console.warn(JSON.stringify({ event: 'approval_needs_person', sessionId, actions: blocked.map(b => b.action) }));
+            return res.status(403).json({ error: personOnlyRefusal(approvalChatUrl(sessionId)), code: 'APPROVAL_NEEDS_PERSON' });
+          }
+        }
+        const result = await agentModeService.submitApprovalDeckAnswers(
+          sessionId, deckAnswer.deckId, deckAnswer.answers, 'user',
+          { refusePersonOnlyApprovals: (req as AuthenticatedRequest).isSelfCall === true },
+        );
+        if (result.outcome === 'needs_person') {
+          console.warn(JSON.stringify({ event: 'approval_needs_person', sessionId, actions: result.actions, stage: 'submit' }));
+          return res.status(403).json({ error: personOnlyRefusal(approvalChatUrl(sessionId)), code: 'APPROVAL_NEEDS_PERSON' });
+        }
         if (result.outcome === 'invalid') {
           return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
         }
@@ -13165,6 +13188,10 @@ export const agentModeController = {
           return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
         }
         const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        if (result.outcome === 'needs_person') {
+          // Not reachable (the option is only set for MCP self-calls); fail closed if it ever is.
+          return res.status(403).json({ error: 'This shared link cannot approve this decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+        }
         if (result.outcome === 'invalid') {
           return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
         }

@@ -360,7 +360,7 @@ function callingHoursProblems(raw: unknown, errors: Errors): void {
 function scalarProblems(body: Record<string, unknown>, errors: Errors): void {
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') errors.enabled = 'enabled must be true or false';
   if (body.announcedName !== undefined && !announcedNameOf(body.announcedName)) {
-    errors.announcedName = `Use 1 to ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters: letters, digits, spaces and . , & ' - only`;
+    errors.announcedName = `Enter the business's registered (legal) name: it is the name the lead hears as the caller. Use 1 to ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters: letters, digits, spaces and . , & ' - only`;
   }
   if (body.callingHours !== undefined) callingHoursProblems(body.callingHours, errors);
   for (const field of HOT_LEAD_CALL_LIMIT_FIELDS) {
@@ -455,7 +455,7 @@ export async function applyHotLeadCallSettings(
   const team = body.team === undefined ? current?.team : buildTeam(body.team, current, errors);
   if (!current) {
     if (body.team === undefined) errors.team = 'Add at least one person';
-    if (body.announcedName === undefined) errors.announcedName = 'Enter the business name callers will hear';
+    if (body.announcedName === undefined) errors.announcedName = 'Enter the business\'s registered (legal) name: it is the name the lead hears as the caller';
   }
   // A value above the owner maximum is refused unless it is the very value already stored (a round trip of the read-out).
   const month = body.maxCallsPerMonth;

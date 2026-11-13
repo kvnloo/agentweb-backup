@@ -72,7 +72,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     await call.leadStatus('in-progress', 2);
     expect(recordOf('lead-a')).toMatchObject({ state: 'bridging', leadCallSid: 'CA00000002' });
     const screening = await call.leadAnswers();
-    expect(sayText(screening.body)).toBe('This is an automated call from Smith & Sons about the enquiry you sent us. To reach a person at Smith & Sons, call 4 1 5, 5 5 5, 0 1 1 1. Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls.');
+    expect(sayText(screening.body)).toBe("Hi, this is an automated call from Smith & Sons. To stop these calls at any time, press 3. We're calling about the enquiry you sent us. Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later. You can also call us on 4 1 5, 5 5 5, 0 1 1 1.");
     expect((await call.leadPresses('1')).body).toBe('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     expect(recordOf('lead-a')).toMatchObject({ state: 'connected', leadCallSid: 'CA00000002' });
     expect((await call.dialEnds('completed', { DialCallDuration: '125' })).body).toContain('<Hangup/>');
@@ -98,7 +98,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(world.postMessage).toHaveBeenCalledTimes(1);
     expect(world.postMessage.mock.calls[0][0]).toMatchObject({ channel: 'C123' });
     expect(world.crm.callsTo('claimLeadStepOnce')).toBe(1);
-    expect(Object.keys(world.crm.lead(LIST, 'lead-a').system ?? {}).sort()).toEqual(['hot_lead_call', expect.stringMatching(/^leadNotification_/)]);
+    expect(Object.keys(world.crm.lead(LIST, 'lead-a').system ?? {}).sort()).toEqual(['callConsent', 'hot_lead_call', expect.stringMatching(/^leadNotification_/)]);
     expect(mock(queue.enqueueJob).mock.calls.map(([source]) => source).sort()).toEqual(['hot_lead_call', 'org_lead_notification']);
   });
 
@@ -170,7 +170,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     await call.leadStatus('in-progress', 2);
     await call.leadAnswers();
     const goodbye = await call.leadPresses('3');
-    expect(sayText(goodbye.body)).toBe('Understood. Smith & Sons will not call this number again. Goodbye.');
+    expect(sayText(goodbye.body)).toBe('Smith & Sons will not call this number again. You can reach us on 4 1 5, 5 5 5, 0 1 1 1. Goodbye.');
     expect(goodbye.body).not.toContain('<Response/>');
     const told = await call.dialEnds('completed', { DialBridged: 'false' });
     expect(sayText(told.body)).toBe('The lead asked not to be called again. Their details are in your lead alert.');
@@ -238,7 +238,7 @@ describe('a hot lead rings the member and, on 1, bridges the lead', () => {
     expect(recordOf('lead-a')?.leadPhoneMac).toBe(leadPhoneMacOf('org-a', LEAD_E164)); // stored by the orchestrator when the call passed the gates
     const call = twilioCall(placedCall());
     await call.memberAnswers();
-    world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199';
+    world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199');
     const reply = await call.memberPresses('1');
     expect(reply.body).not.toContain('<Dial');
     expect(sayText(reply.body)).toBe('We could not reach the lead. Their details are in your lead alert.');
