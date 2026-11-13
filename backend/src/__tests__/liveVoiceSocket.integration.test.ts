@@ -6,6 +6,12 @@
  * live:start handler, effective-user resolution, ownership guard, event
  * delivery, and socket-local ownership state are real.
  */
+// ENG-2957: voice now checks the account's allowance at start and after each turn; these tests are about other rules.
+jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
+  checkTokenUsage: jest.fn(async () => ({ allowed: true, month: '2026-11' })),
+}));
+
 
 import http from 'http';
 import { AddressInfo } from 'net';

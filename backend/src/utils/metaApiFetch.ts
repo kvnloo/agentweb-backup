@@ -1,3 +1,4 @@
+import { inMetaToolkitBackoffContext, toolkitMetaFetch } from './metaToolkitBackoff';
 /**
  * Utility functions for fetching data from Meta (Facebook) Graph API
  * with retry logic and pagination support
@@ -33,6 +34,7 @@ export const META_GRAPH_TIMEOUT_MS = 15_000;
  * @returns Response object
  */
 export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: number = 1000): Promise<Response> => {
+  if (inMetaToolkitBackoffContext()) return toolkitMetaFetch(url);
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url);

@@ -7,6 +7,15 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({ isReady: jest.fn().mockReturnValue(true) })),
 }));
 jest.mock('axios');
+// ENG-2915: uploadMetaAdsImage downloads through the SSRF-pinned fetch. Route it to the
+// mocked axios.get so these tests keep controlling the downloaded bytes without real DNS.
+jest.mock('../utils/ssrfGuard', () => ({
+  ...jest.requireActual('../utils/ssrfGuard'),
+  fetchBufferFollowingRedirects: jest.fn(async (url: string) => {
+    const res = await jest.requireMock('axios').get(url);
+    return { buffer: Buffer.from(res.data), contentType: '', finalUrl: url };
+  }),
+}));
 jest.mock('../services/slackService', () => ({}));
 jest.mock('../services/agentMode/adsLearning', () => ({ recordCreativeLearningReceipt: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/metaService', () => ({

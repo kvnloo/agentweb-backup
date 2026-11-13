@@ -27,6 +27,8 @@ import {
   handleMetaToolkitCall,
 } from '../mcp/metaToolkitGateway';
 
+import { fetchWithRetry } from '../utils/metaApiFetch';
+
 const NOW = Date.parse('2026-10-05T00:00:00Z');
 
 function metaAccount(adAccountId: string, extra: Record<string, unknown> = {}) {
@@ -55,6 +57,27 @@ const call = (deps: MetaToolkitGatewayDeps, extra: Record<string, unknown> = {})
   handleMetaToolkitCall({ authorization: 'Bearer aw_good', toolName: 'list_meta_ads_campaigns', args: {}, ...extra }, deps);
 
 describe('ENG-2283 Meta Toolkit gateway', () => {
+  it.each(['passthrough', 'retry', 'cap', 'write'])('ENG-2977 gateway bounded BUC: %s', async mode => {
+    const original = global.fetch;
+    const mocked = jest.fn().mockImplementation(async () => {
+      const high = mode !== 'passthrough' && (mode !== 'retry' || mocked.mock.calls.length === 1);
+      const res: any = { ok: true, status: 200,
+        headers: { get: () => JSON.stringify({ '111': [{ total_time: high ? 95 : 1, estimated_time_to_regain_access: 2 }] }) },
+        json: async () => ({ success: true }), clone: () => res };
+      return res;
+    });
+    global.fetch = mocked;
+    const sleep = jest.fn().mockResolvedValue(undefined);
+    const execute = jest.fn(async () => (await fetchWithRetry('https://graph.facebook.com/v25.0/act_111/campaigns')).json());
+    const deps = makeDeps({ execute: execute as any, executeWrite: execute, sleep });
+    try {
+      const result = await call(deps, mode === 'write' ? { toolName: 'call_meta_marketing_api', args: { entity_type: 'CAMPAIGN', action: 'CREATE' } } : {});
+      expect(result).toMatchObject(mode === 'cap' || mode === 'write' ? { success: false, rate_limited: true, estimated_time_to_regain_access: 2 } : { success: true });
+      expect(mocked).toHaveBeenCalledTimes(mode === 'retry' || mode === 'cap' ? 2 : 1);
+      expect(sleep).toHaveBeenCalledTimes(mode === 'retry' || mode === 'cap' ? 1 : 0);
+      if (mode === 'cap' || mode === 'write') expect(deps.recordUsage).not.toHaveBeenCalled();
+    } finally { global.fetch = original; }
+  });
   it('rejects a call with no token (401) and meters nothing', async () => {
     const deps = makeDeps();
     await expect(call(deps, { authorization: undefined })).rejects.toMatchObject({ status: 401 });
@@ -115,7 +138,11 @@ describe('ENG-2283 Meta Toolkit gateway', () => {
   });
 
   it('accepts an MCP OAuth token and meters with the oauth client', async () => {
-    const deps = makeDeps({ validateOAuthToken: jest.fn().mockResolvedValue({ userId: 'user-2', clientId: 'claude' }) });
+    const deps = makeDeps({
+      validateOAuthToken: jest.fn().mockResolvedValue({ userId: 'user-2', clientId: 'claude' }),
+      // ENG-2747: a non-Databricks OAuth client.
+      getOAuthClientRedirectUris: jest.fn().mockResolvedValue(['https://claude.ai/api/mcp/auth_callback']),
+    });
     await call(deps, { authorization: 'Bearer oauth-token', args: { account_id: 'act_111' } });
     expect(deps.recordUsage).toHaveBeenCalledTimes(1);
     expect(deps.recordUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-2', authMethod: 'oauth', clientId: 'claude' }));

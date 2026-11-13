@@ -1,3 +1,5 @@
+import { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
+export { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
 import {
   normaliseUserDataField,
   NormalisableUserDataField,
@@ -123,27 +125,33 @@ export interface MetaAdsAdCreativeParams {
   // the destination link at delivery time. Must be carried over on a creative swap, otherwise a
   // link_url update silently strips the ad's tracking parameters.
   url_tags?: string;
+  // ENG-2915 multi-variant (Advantage+ / dynamic) creative: several text and media options in ONE
+  // creative via asset_feed_spec; Meta picks the combination per placement/person. Present ⇒ the
+  // singular body/title/description/image_hash/video_id are not used (see validateMultiVariantCreative).
+  headlines?: string[];
+  bodies?: string[];
+  descriptions?: string[];
+  image_hashes?: string[];
+  video_ids?: string[];
+  // video_id → thumbnail URL. asset_feed_spec.videos needs a thumbnail per video.
+  video_thumbnails?: Record<string, string>;
 }
+
+/** ENG-2915: Meta's asset_feed_spec ceilings for a multi-variant creative. */
+export const MULTI_VARIANT_LIMITS = {
+  texts: 5,
+  media: 10,
+  headlineChars: 255,
+  descriptionChars: 255,
+  bodyChars: 2200,
+} as const;
+export const MULTI_VARIANT_KEYS = ['headlines', 'bodies', 'descriptions', 'image_hashes', 'video_ids'] as const;
 
 export interface MetaAdsAdParams {
   name: string;
   adset_id: string;
   creative_id: string;
   status?: string;
-}
-
-/**
- * Meta's real, dynamic Business Use Case (BUC) rate-limit signal — returned on
- * every Marketing API response (CAPI included) via the `X-Business-Use-Case-Usage`
- * header, NOT a fixed numeric limit Meta documents anywhere. Percentages of the
- * ad account's rolling hourly allowance used; `estimatedMinutesToRegainAccess`
- * only appears once actually throttled (a metric at/over 100).
- */
-export interface CapiUsage {
-  callCountPct: number;
-  totalTimePct: number;
-  totalCpuTimePct: number;
-  estimatedMinutesToRegainAccess?: number;
 }
 
 /**
@@ -292,37 +300,6 @@ export interface MetaOAuthConnectionHealth {
   grantedPermissions: string[];
   declinedRequiredPermissions: string[];
   permissionsError?: string;
-}
-
-/**
- * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
- * header is a JSON object keyed by ad account id, each value an array with one
- * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
- * no fixed number), so this is the only real signal for how close an account
- * is to being throttled. Never throws: a missing header (every existing mocked
- * test response lacks `.headers` entirely) or a malformed value is inconclusive,
- * not an error — returns `undefined` rather than guessing.
- */
-function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) => string | null } }): CapiUsage | undefined {
-  try {
-    const raw = response.headers?.get?.('x-business-use-case-usage');
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw);
-    const firstAccountEntries = Object.values(parsed)[0] as any[] | undefined;
-    const entry = firstAccountEntries?.[0];
-    if (!entry) return undefined;
-    return {
-      callCountPct: Number(entry.call_count) || 0,
-      totalTimePct: Number(entry.total_time) || 0,
-      totalCpuTimePct: Number(entry.total_cputime) || 0,
-      estimatedMinutesToRegainAccess:
-        entry.estimated_time_to_regain_access !== undefined
-          ? Number(entry.estimated_time_to_regain_access)
-          : undefined,
-    };
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -642,6 +619,10 @@ export class MetaService {
    */
   public static validateCreativeParams(action: string, params: Partial<MetaAdsAdCreativeParams>): void {
     if (action !== 'CREATE') return;
+    if (MetaService.isMultiVariantCreative(params)) {
+      MetaService.validateMultiVariantCreative(params);
+      return;
+    }
 
     // name, page_id, body are required for all creative types
     for (const field of ['name', 'page_id', 'body'] as Array<keyof MetaAdsAdCreativeParams>) {
@@ -713,6 +694,106 @@ export class MetaService {
         'for image provide image_hash or image_url.'
       );
     }
+  }
+
+  /** ENG-2915: any multi-variant list present ⇒ the creative is built from asset_feed_spec. */
+  public static isMultiVariantCreative(params: Partial<MetaAdsAdCreativeParams> | undefined | null): boolean {
+    return !!params && MULTI_VARIANT_KEYS.some((k) => (params as any)[k] !== undefined && (params as any)[k] !== null);
+  }
+
+  /**
+   * ENG-2915: validate a multi-variant creative and fold any singular field into its list, so the
+   * builder sees one shape. Throws a descriptive Error naming the offending field.
+   */
+  public static normalizeMultiVariantCreative(
+    params: Partial<MetaAdsAdCreativeParams>,
+    opts: { requireThumbnails?: boolean } = {},
+  ): {
+    headlines: string[]; bodies: string[]; descriptions: string[]; image_hashes: string[]; video_ids: string[];
+  } {
+    const p: any = params;
+    for (const field of ['name', 'page_id', 'link_url'] as const) {
+      if (!p[field]) throw new Error(`Multi-variant ad creative CREATE requires "${field}".`);
+    }
+    for (const field of ['carousel_cards', 'placement_assets', 'image_url'] as const) {
+      if (p[field] !== undefined && p[field] !== null && p[field] !== '') {
+        throw new Error(
+          `Multi-variant ad creative CREATE cannot use "${field}". ` +
+          'Upload each image with AD_CREATIVE UPLOAD_IMAGE and pass the hashes in image_hashes; carousel and placement creatives are separate creatives.',
+        );
+      }
+    }
+    const pairs: Array<[string, string]> = [
+      ['headlines', 'title'], ['bodies', 'body'], ['descriptions', 'description'], ['image_hashes', 'image_hash'], ['video_ids', 'video_id'],
+    ];
+    const out: any = {};
+    for (const [list, single] of pairs) {
+      const hasList = p[list] !== undefined && p[list] !== null;
+      const hasSingle = p[single] !== undefined && p[single] !== null && p[single] !== '';
+      if (hasList && hasSingle) {
+        throw new Error(`Multi-variant ad creative CREATE: pass either "${list}" or "${single}", not both (put every option in "${list}").`);
+      }
+      const raw = hasList ? p[list] : hasSingle ? [p[single]] : [];
+      if (!Array.isArray(raw)) throw new Error(`Multi-variant ad creative CREATE: "${list}" must be an array.`);
+      const values = raw.map((v: unknown, i: number) => {
+        if (typeof v !== 'string' || !v.trim()) throw new Error(`Multi-variant ad creative CREATE: ${list}[${i}] must be a non-empty string.`);
+        return v.trim();
+      });
+      if (new Set(values).size !== values.length) throw new Error(`Multi-variant ad creative CREATE: "${list}" has duplicate entries.`);
+      out[list] = values;
+    }
+    const L = MULTI_VARIANT_LIMITS;
+    const textRules: Array<[string, number, boolean]> = [
+      ['headlines', L.headlineChars, true], ['bodies', L.bodyChars, true], ['descriptions', L.descriptionChars, false],
+    ];
+    for (const [list, maxChars, required] of textRules) {
+      const values: string[] = out[list];
+      if (required && values.length === 0) throw new Error(`Multi-variant ad creative CREATE requires at least one entry in "${list}".`);
+      if (values.length > L.texts) throw new Error(`Multi-variant ad creative CREATE: "${list}" has ${values.length} entries; the maximum is ${L.texts}.`);
+      values.forEach((v, i) => {
+        if (v.length > maxChars) throw new Error(`Multi-variant ad creative CREATE: ${list}[${i}] is ${v.length} characters; the maximum is ${maxChars}.`);
+      });
+    }
+    for (const list of ['image_hashes', 'video_ids'] as const) {
+      if (out[list].length > L.media) throw new Error(`Multi-variant ad creative CREATE: "${list}" has ${out[list].length} entries; the maximum is ${L.media}.`);
+    }
+    if (out.image_hashes.length + out.video_ids.length === 0) {
+      throw new Error('Multi-variant ad creative CREATE needs media: at least one entry in "image_hashes" or "video_ids".');
+    }
+    out.video_ids.forEach((id: string, i: number) => {
+      if (!/^\d+$/.test(id)) throw new Error(`Multi-variant ad creative CREATE: video_ids[${i}] must be a Meta video id.`);
+      if (opts.requireThumbnails !== false && !p.video_thumbnails?.[id]) {
+        throw new Error(`Multi-variant ad creative CREATE: video ${id} has no thumbnail (video_thumbnails["${id}"]). Wait until the video is processed.`);
+      }
+    });
+    if (p.call_to_action_type !== undefined && !/^[A-Z_]+$/.test(String(p.call_to_action_type))) {
+      throw new Error('Multi-variant ad creative CREATE: "call_to_action_type" must be a Meta CTA type such as LEARN_MORE or SHOP_NOW.');
+    }
+    return out;
+  }
+
+  public static validateMultiVariantCreative(params: Partial<MetaAdsAdCreativeParams>): void {
+    MetaService.normalizeMultiVariantCreative(params);
+  }
+
+  /**
+   * ENG-2915: the asset_feed_spec for a multi-variant creative. Text-only variation keeps a
+   * single format; images AND videos together use Meta's flexible AUTOMATIC_FORMAT.
+   */
+  public static buildMultiVariantAssetFeedSpec(params: MetaAdsAdCreativeParams): any {
+    const v = MetaService.normalizeMultiVariantCreative(params);
+    const spec: any = {
+      bodies: v.bodies.map((text) => ({ text })),
+      titles: v.headlines.map((text) => ({ text })),
+      link_urls: [{ website_url: params.link_url }],
+      ad_formats: [v.image_hashes.length && v.video_ids.length ? 'AUTOMATIC_FORMAT' : v.video_ids.length ? 'SINGLE_VIDEO' : 'SINGLE_IMAGE'],
+      optimization_type: 'DEGREES_OF_FREEDOM',
+    };
+    if (v.descriptions.length) spec.descriptions = v.descriptions.map((text) => ({ text }));
+    if (v.image_hashes.length) spec.images = v.image_hashes.map((hash) => ({ hash }));
+    if (v.video_ids.length) spec.videos = v.video_ids.map((video_id) => ({ video_id, thumbnail_url: params.video_thumbnails![video_id] }));
+    if (params.call_to_action_type) spec.call_to_action_types = [params.call_to_action_type];
+    return spec;
   }
 
   /**
@@ -1928,10 +2009,28 @@ export class MetaService {
 
       // Media source: at least one must be provided
       const hasMedia = params.image_hash || params.image_url || params.video_id ||
+        MetaService.isMultiVariantCreative(params) ||
         (params.carousel_cards && params.carousel_cards.length > 0) ||
         (params.placement_assets && params.placement_assets.length > 0);
       if (!hasMedia) {
         throw new Error('Creative requires at least one media source: image_hash, image_url, video_id, carousel_cards, or placement_assets.');
+      }
+
+      // MULTI-VARIANT CREATIVE (ENG-2915): several headlines/bodies/descriptions/media in one
+      // asset_feed_spec. Checked first: its media lives in image_hashes/video_ids, not image_hash.
+      if (MetaService.isMultiVariantCreative(params)) {
+        const objectStorySpec: any = { page_id: params.page_id };
+        if (params.instagram_user_id) objectStorySpec.instagram_user_id = params.instagram_user_id;
+        const creativeParams: any = {
+          [AdCreative.Fields.name]: params.name,
+          [AdCreative.Fields.object_story_spec]: objectStorySpec,
+          asset_feed_spec: MetaService.buildMultiVariantAssetFeedSpec(params),
+        };
+        const urlTags = MetaService.resolveUrlTags(params);
+        if (urlTags) creativeParams.url_tags = urlTags;
+        this.log(`Creating multi-variant ad creative in account: ${adAccountId}`, creativeParams);
+        const creative = await account.createAdCreative([], creativeParams);
+        return creative._data;
       }
 
       // PLACEMENT-CUSTOMIZED IMAGE CREATIVE (asset_feed_spec) — different image per placement

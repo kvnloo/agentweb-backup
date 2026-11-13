@@ -2,10 +2,26 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { getPostsForUser, getSocialAccountIds, generateEngagementMemory } from '../services/socialPostsService';
-import { userDb, scheduleDb, socialEngagementTrackingDb } from '../services/db';
+import { userDb, scheduleDb, socialEngagementTrackingDb, orgDb } from '../services/db';
+import { getWorkspaceSocialPosts, findWorkspaceAccountOwner } from '../utils/workspaceSocialPosts';
+import type { WorkspaceCaller } from '../utils/workspaceAssets';
 import { getEngagementMemory, saveEngagementMemory, EngagementMemory } from '../services/connectedAccountsDb';
 
 const router = Router();
+
+// ENG-2968: social posts are org-wide. Resolve the caller's org for fan-out;
+// any lookup failure degrades to the caller's own posts.
+async function socialCallerFor(userId: string, user?: any): Promise<WorkspaceCaller> {
+  try {
+    const u = user !== undefined ? user : await userDb.getUserById(userId);
+    return { userId, orgId: u?.orgId || undefined };
+  } catch (err) {
+    console.error('[ENG-2968] getUserById failed; falling back to own posts:', err);
+    return { userId };
+  }
+}
+
+const getOrgMembers = (orgId: string) => (orgDb as any).getOrgMembers(orgId);
 
 // In-memory per-user/per-account cooldown for on-demand force_reload refreshes.
 // force_reload bypasses the 24h cache and hits the shared LinkedIn API quota, so a
@@ -128,7 +144,20 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
       forceReloadAccountIds = eligibleAccountIds;
     }
 
-    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload, forceReloadAccountIds });
+    const ownUserId = userId;
+    const fetchOwn = () =>
+      getPostsForUser(ownUserId, { accountId, limit, includeMetrics, forceReload, forceReloadAccountIds });
+    const caller = await socialCallerFor(ownUserId);
+    if (!caller.orgId) {
+      return res.json(await fetchOwn());
+    }
+    // Teammates' posts are never force-reloaded by the caller (their quota
+    // cooldown is theirs), always served from cache.
+    const result = await getWorkspaceSocialPosts(caller, {
+      getOrgMembers,
+      fetchOwn,
+      fetchForMember: (memberId) => getPostsForUser(memberId, { accountId, limit, includeMetrics, forceReload: false }),
+    });
     return res.json(result);
   } catch (error) {
     if (userId) {
@@ -363,10 +392,19 @@ router.get('/social-posts/activity/account/:accountId', authenticateToken, async
     // Verify the account belongs to this user
     const user = await userDb.getUserById(userId);
     const owns = (user?.connected_accounts || []).some((a: any) => a.account_id === accountId);
-    if (!owns) return res.status(403).json({ error: 'Account does not belong to this user' });
+    let ownerId = userId;
+    if (!owns) {
+      // ENG-2968 AC2: a same-org teammate's account is readable; cross-org stays 403.
+      const owner = await findWorkspaceAccountOwner(await socialCallerFor(userId, user ?? null), accountId, {
+        getOrgMembers,
+        getConnectedAccounts: async (id) => (await userDb.getUserById(id))?.connected_accounts || [],
+      });
+      if (!owner) return res.status(403).json({ error: 'Account does not belong to this user' });
+      ownerId = owner.userId;
+    }
 
     const records = await socialEngagementTrackingDb.getEngagementsByAccount(accountId);
-    const activities = await enrichActivities(records, userId);
+    const activities = await enrichActivities(records, ownerId);
 
     return res.json({ activities });
   } catch (error) {
@@ -405,10 +443,19 @@ router.get('/social-posts/memory/:accountId', authenticateToken, async (req: Req
     // Verify account belongs to user
     const user = await userDb.getUserById(userId);
     const account = (user?.connected_accounts || []).find((a: any) => a.account_id === accountId);
-    if (!account) return res.status(404).json({ error: 'Account not found' });
+    let ownerId = userId;
+    if (!account) {
+      // ENG-2968 AC2: read-only view of a same-org teammate's memory; edits stay owner-only.
+      const owner = await findWorkspaceAccountOwner(await socialCallerFor(userId, user ?? null), accountId, {
+        getOrgMembers,
+        getConnectedAccounts: async (id) => (await userDb.getUserById(id))?.connected_accounts || [],
+      });
+      if (!owner) return res.status(404).json({ error: 'Account not found' });
+      ownerId = owner.userId;
+    }
 
-    const memory = await getEngagementMemory(userId, accountId);
-    return res.json({ memory });
+    const memory = await getEngagementMemory(ownerId, accountId);
+    return res.json({ memory, canModify: ownerId === userId });
   } catch (error) {
     console.error('[SocialPosts/Memory GET] Error:', error);
     return res.status(500).json({ error: 'Failed to fetch engagement memory' });

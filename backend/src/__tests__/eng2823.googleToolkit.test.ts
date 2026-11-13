@@ -30,7 +30,7 @@ import {
 } from '../mcp/googleToolkitWrites';
 import { handleMetaToolkitCall, MetaToolkitAuthError, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
-import { assertZomaWriteReady, getZomaReadiness, ZomaNotReadyError } from '../mcp/zomaOnboarding';
+import { assertZomaWriteReady, formatZomaStatus, getZomaReadiness, ZomaNotReadyError } from '../mcp/zomaOnboarding';
 import { GOOGLE_ADS_PROVIDER, META_PROVIDER, resolveProviderAccount } from '../mcp/zomaProviders';
 
 const NOW = Date.parse('2026-11-05T00:00:00Z');
@@ -247,7 +247,8 @@ describe('ENG-2823 Google toolkit manifest and reads', () => {
 
   it('refuses everything outside the curated surface', () => {
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'REMOVE' })).toThrow(MetaToolkitRefusal);
-    expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'KEYWORD', action: 'ADD' })).toThrow(MetaToolkitRefusal);
+    // ENG-2928 moved KEYWORD ADD into the guarded surface; campaign-level asset attach stays out.
+    expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN_ASSET', action: 'ATTACH' })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'LIST', client_id: 'x' })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('call_google_ads_api', { entity_type: 'CAMPAIGN', action: 'UPDATE', override_tracking_check: true })).toThrow(MetaToolkitRefusal);
     expect(() => assertGoogleToolkitCall('send_email', {})).toThrow(MetaToolkitRefusal);
@@ -376,11 +377,26 @@ describe('ENG-2823 providers and setup status', () => {
     expect(neither.next_step).toContain('https://accounts.google.example/connect');
   });
 
-  it('flag off: no Google section and no Google link minted', async () => {
-    const d = onboardingDeps([metaAccount()], false);
+  it('flag off (ENG-2973): Google is explicitly unavailable, no Google link minted, no Google line rendered', async () => {
+    const d = onboardingDeps([metaAccount(), googleAccount()], false);
     const r = await getZomaReadiness('u1', d);
-    expect(r.google_ads).toBeUndefined();
+    expect(r.google_ads).toEqual({ available: false, ready: false, accounts: [], writes_enabled: false, reason: 'google_ads_provider_disabled' });
+    expect(r.next_step).toBeNull();
     expect(d.buildGoogleAdsConnectUrl).not.toHaveBeenCalled();
+    expect(formatZomaStatus(r)).not.toContain('Google Ads');
+
+    const none = onboardingDeps([], false);
+    const empty = await getZomaReadiness('u1', none);
+    expect(empty.google_ads.available).toBe(false);
+    expect(empty.next_step).not.toContain('Google');
+    expect(none.buildGoogleAdsConnectUrl).not.toHaveBeenCalled();
+  });
+
+  it('flag on (ENG-2973): google_ads carries available: true and no disabled reason', async () => {
+    const r = await getZomaReadiness('u1', onboardingDeps([googleAccount()], true));
+    expect(r.google_ads.available).toBe(true);
+    expect(r.google_ads.reason).toBeUndefined();
+    expect(formatZomaStatus(r)).toContain('Google Ads account connected');
   });
 
   it('write readiness is per platform', async () => {
