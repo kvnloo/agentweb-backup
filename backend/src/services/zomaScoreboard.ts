@@ -168,7 +168,7 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
 
 export type FirstAdOutcome =
   | 'verified' | 'already_recorded' | 'no_go_live_approval' | 'not_zoma_created'
-  | 'not_active' | 'no_impressions' | 'provider_error';
+  | 'not_active' | 'no_impressions' | 'provider_error' | 'deferred';
 
 export interface FirstAdResult {
   userId: string;
@@ -195,16 +195,20 @@ export interface FirstAdDeps {
 }
 
 export const FIRST_AD_LOOKBACK_DAYS = 60;
-const MAX_APPROVALS_CHECKED = 10;
+const MAX_APPROVALS_CHECKED = 5;
+/** Stay well inside the 60s proxy timeout; the rest is reported `deferred` for the next click. */
+const TIME_BUDGET_MS = 40_000;
 
 /**
  * Check every user with a Zoma go-live approval (CONFIRMED UPDATE status=ACTIVE) and no recorded
  * first ad. A campaign only counts if this user created it through Zoma (CONFIRMED CAMPAIGN
- * CREATE) within the lookback. Bounded: at most `maxUsers` users, 10 approvals per user.
+ * CREATE) within the lookback. Bounded: at most `maxUsers` provider-checked users (already
+ * recorded users are skipped without using a slot), 5 approvals per user, and a 40s budget;
+ * whatever is left is returned as `deferred`.
  */
 export async function verifyZomaFirstAds(
   deps: FirstAdDeps,
-  opts: { userId?: string; maxUsers?: number; lookbackDays?: number } = {},
+  opts: { userId?: string; maxUsers?: number; lookbackDays?: number; timeBudgetMs?: number } = {},
 ): Promise<FirstAdResult[]> {
   const now = deps.now();
   const events = (await deps.listWriteEvents(
@@ -220,9 +224,13 @@ export async function verifyZomaFirstAds(
   if (opts.userId && !approvalsByUser.has(opts.userId)) return [{ userId: opts.userId, outcome: 'no_go_live_approval' }];
 
   const results: FirstAdResult[] = [];
-  for (const [userId, approvals] of [...approvalsByUser].slice(0, opts.maxUsers ?? 25)) {
+  const maxUsers = opts.maxUsers ?? 10;
+  let checked = 0;
+  for (const [userId, approvals] of approvalsByUser) {
     const user = await deps.getUser(userId);
     if (user?.zomaFirstAdLive) { results.push({ userId, outcome: 'already_recorded', campaignId: user.zomaFirstAdLive.campaignId }); continue; }
+    if (checked >= maxUsers || deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { results.push({ userId, outcome: 'deferred' }); continue; }
+    checked += 1;
     const created = new Set(events
       .filter((e) => e.userId === userId && e.entityType === 'CAMPAIGN' && String(e.action).toUpperCase() === 'CREATE' && e.objectId)
       .map((e) => e.objectId as string));
@@ -242,7 +250,9 @@ export async function verifyZomaFirstAds(
           platform: 'meta', effectiveStatus: 'ACTIVE', impressions: attempt.impressions!,
         };
         const wrote = await deps.recordFirstAd(userId, record);
-        if (wrote) await deps.onFirstAd?.(userId, record);
+        // The marker is the source of truth; a failed stage/event emit must not fail the check.
+        if (wrote) await deps.onFirstAd?.(userId, record).catch((error) =>
+          console.warn('[zoma-scoreboard] ad_live milestone failed (ignored):', error instanceof Error ? error.message : error));
         best = wrote ? attempt : { ...attempt, outcome: 'already_recorded' };
         break;
       }
@@ -342,7 +352,7 @@ async function metaAdAccountIds(userId: string): Promise<string[]> {
   const { META_PROVIDER } = await import('../mcp/zomaProviders');
   const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
   const ids = accounts.filter((a) => isMetaAdAccount(a)).flatMap((a) => META_PROVIDER.accountIds(a));
-  return [...new Set(ids)].slice(0, 10);
+  return [...new Set(ids)].slice(0, 5);
 }
 
 export function defaultFirstAdDeps(): FirstAdDeps {
