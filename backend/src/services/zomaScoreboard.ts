@@ -8,9 +8,15 @@
  *     toolkit gateways record mcp_write_executed, so every such event is a Zoma write.
  *   - first successful ad: the first Zoma-created campaign (CONFIRMED CAMPAIGN CREATE through
  *     Zoma) whose go-live was approved through Zoma (CONFIRMED UPDATE status=ACTIVE on the
- *     campaign or one of its ad sets/ads), AND whose provider read-back is effective_status
- *     ACTIVE, AND which has >= 1 impression. Recorded write-once on the user row
- *     (`zomaFirstAdLive`) only after that provider check passes; never inferred.
+ *     campaign or one of its ad sets/ads), AND whose LIFETIME provider impressions are >= 1,
+ *     AND which has provider evidence of being ACTIVE at/after that approval OR of delivering.
+ *     The CONFIRMED approval event is itself an ACTIVE read-back taken right after the write
+ *     (metaToolkitWrites verify(): read-back status must equal the approved ACTIVE), and lifetime
+ *     impressions >= 1 is delivery. Current status is not a condition: a campaign paused since
+ *     (e.g. by the first-impression safety stop) still counts. Lifetime impressions carry no
+ *     timestamp, so nothing here claims WHEN delivery happened relative to the approval.
+ *     Recorded write-once on the user row (`zomaFirstAdLive`) only after that provider check
+ *     passes; never inferred. See isFirstSuccessfulAd for the exact predicate.
  *   - team/test accounts (our domains, admins, fixtures — journeyProductBackfill.accountFlag)
  *     are listed but flagged and excluded from every summary count.
  *
@@ -58,7 +64,14 @@ export interface FirstAdLive {
   approvedAt: string;
   campaignId: string;
   platform: 'meta';
-  effectiveStatus: 'ACTIVE';
+  /** Campaign effective_status when verified (informational; paused is allowed). */
+  effectiveStatus?: string;
+  /** The approved entity whose post-write read-back was status ACTIVE (CONFIRMED approval). */
+  approvedEntity?: { type: string; id: string };
+  /** Which ACTIVE-or-delivered evidence held (lifetime delivery is always present when recorded). */
+  activationEvidence?: FirstAdEvidence[];
+  /** Impressions are the campaign's lifetime total (Meta date_preset=maximum), not a window. */
+  impressionsScope?: 'lifetime';
   impressions: number;
 }
 
@@ -149,7 +162,7 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
     activeWindowDays: ACTIVE_WINDOW_DAYS,
     definitions: {
       active: 'Non-team/test account with at least one provider-confirmed Zoma create, edit, pause or go-live approval in the last 7 days.',
-      firstSuccessfulAd: 'First Zoma-created campaign whose go-live was approved through Zoma, read back from the provider as ACTIVE with at least 1 impression.',
+      firstSuccessfulAd: 'First Zoma-created campaign whose go-live was approved through Zoma, with at least 1 lifetime impression and provider evidence it was ACTIVE at/after that approval or delivered (paused since still counts).',
       excluded: 'Team (our domains or admin) and test/fixture accounts are listed but never counted.',
     },
     summary: {
@@ -168,7 +181,45 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
 
 export type FirstAdOutcome =
   | 'verified' | 'already_recorded' | 'no_go_live_approval' | 'not_zoma_created'
-  | 'not_active' | 'no_impressions' | 'provider_error' | 'deferred';
+  | 'no_impressions' | 'provider_error' | 'deferred';
+
+export type FirstAdEvidence = 'approval_read_back_active' | 'provider_active_now' | 'delivered';
+
+/** Facts gathered for one approved campaign; the predicate below is the whole definition. */
+export interface FirstAdFacts {
+  /** A CONFIRMED CAMPAIGN CREATE through Zoma for this campaign. */
+  zomaCreated: boolean;
+  /** A CONFIRMED UPDATE status=ACTIVE through Zoma on the campaign or one of its ad sets/ads. */
+  approvedThroughZoma: boolean;
+  /** That approval's post-write provider read-back returned status ACTIVE (CONFIRMED verdict). */
+  approvalReadBackActive: boolean;
+  /** Campaign effective_status read now (after the approval). */
+  currentEffectiveStatus?: string;
+  /** Lifetime impressions reported by the provider. */
+  lifetimeImpressions: number;
+}
+
+/** ACTIVE/delivery evidence that holds for these facts (empty when none). */
+export function firstAdEvidence(f: FirstAdFacts): FirstAdEvidence[] {
+  const out: FirstAdEvidence[] = [];
+  if (f.approvalReadBackActive) out.push('approval_read_back_active');
+  if (f.currentEffectiveStatus === 'ACTIVE') out.push('provider_active_now');
+  if (f.lifetimeImpressions >= 1) out.push('delivered');
+  return out;
+}
+
+/**
+ * The exact first-ad predicate:
+ *   lifetimeImpressions >= 1
+ *   AND zomaCreated AND approvedThroughZoma
+ *   AND (provider ACTIVE read-back at/after approval OR delivered)
+ * Current status (ACTIVE, PAUSED, ...) is deliberately not a condition.
+ */
+export function isFirstSuccessfulAd(f: FirstAdFacts): boolean {
+  const activeAtOrAfterApproval = f.approvalReadBackActive || f.currentEffectiveStatus === 'ACTIVE';
+  const delivered = f.lifetimeImpressions >= 1;
+  return f.lifetimeImpressions >= 1 && f.zomaCreated && f.approvedThroughZoma && (activeAtOrAfterApproval || delivered);
+}
 
 export interface FirstAdResult {
   userId: string;
@@ -176,6 +227,8 @@ export interface FirstAdResult {
   campaignId?: string;
   effectiveStatus?: string;
   impressions?: number;
+  /** On `verified`: the ACTIVE-or-delivered evidence that held. */
+  evidence?: FirstAdEvidence[];
   error?: string;
 }
 
@@ -235,7 +288,7 @@ export async function verifyZomaFirstAds(
       .filter((e) => e.userId === userId && e.entityType === 'CAMPAIGN' && String(e.action).toUpperCase() === 'CREATE' && e.objectId)
       .map((e) => e.objectId as string));
     let best: FirstAdResult = { userId, outcome: 'not_zoma_created' };
-    const rank: FirstAdOutcome[] = ['not_zoma_created', 'provider_error', 'not_active', 'no_impressions'];
+    const rank: FirstAdOutcome[] = ['not_zoma_created', 'provider_error', 'no_impressions'];
     // Oldest approval first: the FIRST successful ad.
     for (const approval of approvals.sort((a, b) => a.ts.localeCompare(b.ts)).slice(0, MAX_APPROVALS_CHECKED)) {
       if (deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { best = { userId, outcome: 'deferred' }; break; }
@@ -248,7 +301,10 @@ export async function verifyZomaFirstAds(
       if (attempt.outcome === 'verified') {
         const record: FirstAdLive = {
           at: new Date(now).toISOString(), approvedAt: approval.ts, campaignId: attempt.campaignId!,
-          platform: 'meta', effectiveStatus: 'ACTIVE', impressions: attempt.impressions!,
+          platform: 'meta',
+          ...(attempt.effectiveStatus ? { effectiveStatus: attempt.effectiveStatus } : {}),
+          approvedEntity: { type: String(approval.entityType ?? '').toUpperCase(), id: approval.objectId! },
+          activationEvidence: attempt.evidence!, impressionsScope: 'lifetime', impressions: attempt.impressions!,
         };
         const wrote = await deps.recordFirstAd(userId, record);
         // The marker is the source of truth; a failed stage/event emit must not fail the check.
@@ -264,16 +320,28 @@ export async function verifyZomaFirstAds(
   return results;
 }
 
-async function checkApproval(deps: FirstAdDeps, userId: string, approval: ZomaWriteEvent, created: Set<string>): Promise<FirstAdResult> {
+async function checkApproval(
+  deps: FirstAdDeps, userId: string, approval: ZomaWriteEvent, created: Set<string>,
+): Promise<FirstAdResult> {
   const entity = String(approval.entityType ?? '').toUpperCase();
   const campaignId = entity === 'CAMPAIGN' ? approval.objectId! : await deps.campaignOf(userId, entity, approval.objectId!);
   if (!campaignId || !created.has(campaignId)) return { userId, outcome: 'not_zoma_created', ...(campaignId ? { campaignId } : {}) };
   const campaign = await deps.readCampaign(userId, campaignId);
   if (!campaign) return { userId, outcome: 'provider_error', campaignId, error: 'campaign not readable in any connected Meta account' };
-  if (campaign.effectiveStatus !== 'ACTIVE') return { userId, outcome: 'not_active', campaignId, effectiveStatus: campaign.effectiveStatus };
   const impressions = await deps.campaignImpressions(userId, campaign.accountId, campaignId);
-  if (!(impressions >= 1)) return { userId, outcome: 'no_impressions', campaignId, effectiveStatus: 'ACTIVE', impressions };
-  return { userId, outcome: 'verified', campaignId, effectiveStatus: 'ACTIVE', impressions };
+  // One event proves both: a Zoma UPDATE status=ACTIVE whose post-write read-back was status
+  // ACTIVE (verification CONFIRMED; metaToolkitWrites verify()). Callers pass only these.
+  const confirmedApproval = classifyZomaWrite(approval) === 'approve' && isSuccessfulWrite(approval);
+  const facts: FirstAdFacts = {
+    zomaCreated: true,
+    approvedThroughZoma: confirmedApproval,
+    approvalReadBackActive: confirmedApproval,
+    currentEffectiveStatus: campaign.effectiveStatus,
+    lifetimeImpressions: Number.isFinite(impressions) ? impressions : 0,
+  };
+  const result = { userId, campaignId, effectiveStatus: campaign.effectiveStatus, impressions: facts.lifetimeImpressions };
+  if (!isFirstSuccessfulAd(facts)) return { ...result, outcome: 'no_impressions' };
+  return { ...result, outcome: 'verified', evidence: firstAdEvidence(facts) };
 }
 
 // ---------------------------------------------------------------------------------------------
