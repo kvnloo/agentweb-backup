@@ -3265,12 +3265,22 @@ export class AgentModeService {
     // resolveScheduledPublishAuthorization derived it (an override supplied by a
     // caller elsewhere carries no reason, so this falls back to the pre-existing,
     // genuine-hold text — see getScheduledSessionOverride's default).
+    // ENG-2975 (Opslane run 1932): the scheduled-run dispatcher supplies an
+    // override built by resolveSchedulePublishAuthorization, which carries no
+    // reason — so every real scheduled run fell through to the generic withheld
+    // text and never reached the not_granted grant instructions. Derive only the
+    // REASON from the live record here; `authorized` still comes from the single
+    // resolved value above, so the prompt/checker agreement (ENG-827) is unchanged.
+    let withholdReason: PublishAuthorizationWithholdReason | undefined =
+      (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason;
+    if (isUnattendedRun === true && publishAuthorization.authorized === false && withholdReason === undefined && publishAuthorizationOverride) {
+      const live = await this.resolveScheduledPublishAuthorization(currentSession);
+      if (live.authorized === false) withholdReason = live.reason;
+    }
     const sessionTypeLabel = getScheduledSessionOverride(
       currentSession?.sessionType,
       publishAuthorized,
-      isUnattendedRun === true
-        ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
-        : undefined
+      isUnattendedRun === true ? withholdReason : undefined
     );
     const messages: any[] = [
       { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }

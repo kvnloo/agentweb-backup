@@ -103,3 +103,37 @@ describe('ENG-827 — the fallback read still fails closed when no override is s
     expect(result.authorized).toBe(false);
   });
 });
+
+describe('ENG-2975 — an override without a reason still reaches the accurate withheld text', () => {
+  // Opslane run 1932: real scheduled runs pass an override built by
+  // resolveSchedulePublishAuthorization (no `reason`), so the prompt fell back to the
+  // generic withheld text and never showed the not_granted grant instructions.
+  it('derives the reason from the live schedule when the override omits it', () => {
+    const src = read('../services/agentModeService.ts');
+    const at = src.indexOf('ENG-2975 (Opslane run 1932)');
+    expect(at).toBeGreaterThan(-1);
+    const block = src.slice(at, at + 1600);
+    expect(block).toMatch(/withholdReason === undefined && publishAuthorizationOverride/);
+    expect(block).toMatch(/await this\.resolveScheduledPublishAuthorization\(currentSession\)/);
+    expect(block).toMatch(/isUnattendedRun === true \? withholdReason : undefined/);
+  });
+
+  it('the live resolver reports not_granted for a never-granted schedule', async () => {
+    jest.resetModules();
+    jest.doMock('../services/db', () => ({
+      scheduleDb: {
+        getScheduleById: jest.fn().mockResolvedValue({
+          scheduleId: 'abc-123', requirePublishApproval: false, autopublishAuthorized: undefined,
+        }),
+      },
+      userDb: { getUserById: jest.fn() },
+      chatDb: { getChatSession: jest.fn() },
+    }));
+    const { agentModeService } = require('../services/agentModeService');
+    const result = await (agentModeService as any).resolveScheduledPublishAuthorization({
+      sessionType: 'scheduled', sessionId: 's1', pageIdentifier: 'scheduled-chat|scheduleId:abc-123',
+    });
+    expect(result.authorized).toBe(false);
+    expect(result.reason).toBe('not_granted');
+  });
+});
