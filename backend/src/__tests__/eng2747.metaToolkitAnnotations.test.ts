@@ -47,7 +47,7 @@ const MIXED = ['call_meta_marketing_api', 'zoma_custom_audiences', 'call_google_
 // Not read-only, but narrower than the conservative default.
 const NON_DESTRUCTIVE_WRITES = ['zoma_status', 'zoma_prepare_upload'];
 // Read-only but not in the shared read set (no outside call).
-const LOCAL_READS = ['ads_get_errors', 'zoma_usage'];
+const LOCAL_READS = ['ads_get_errors', 'ads_get_help_article', 'zoma_usage'];
 
 function allAdvertised(): Advertised[] {
   return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]) as Advertised[];

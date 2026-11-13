@@ -29,6 +29,9 @@ import {
   type AttributionConfidence,
   type JourneyProduct,
 } from '../../services/journeyAttribution';
+import { admitZomaAuthorizationSignup } from '../../services/zomaAuthorizationAdmission';
+import { waitlistedResponse } from '../../services/zomaAdmission';
+import { mintZomaSignupIntent } from '../../services/zomaSignupIntent';
 import { trackJourney } from '../../services/journeyTracking';
 import { noteProductUse, noteSignup, zomaMilestone } from '../../services/journeyMilestones';
 
@@ -101,6 +104,18 @@ function attributeConsentSignup(
     },
     { requireSignupSource: MCP_CONSENT_SIGNUP_SOURCE },
   );
+}
+
+async function allowZomaSignupAuthorization(product: JourneyProduct, userId: string, res: Response): Promise<boolean> {
+  if (product !== 'zoma') return true;
+  try {
+    if (await admitZomaAuthorizationSignup(userId) === 'approved') return true;
+    res.status(202).json(waitlistedResponse);
+  } catch (error) {
+    console.error('[MCP-OAuth] Zoma admission unavailable:', error);
+    res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
+  }
+  return false;
 }
 
 export function setupMcpOAuth(app: express.Express) {
@@ -263,6 +278,7 @@ export function setupMcpOAuth(app: express.Express) {
     if (process.env.MCP_OAUTH_SKIP_CONSENT === 'true') {
       const { user } = await getUserFromToken(req);
       if (user) {
+        if (!await allowZomaSignupAuthorization(attribution.product, user.userId, res)) return;
         const clientType = classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri });
         const { code } = await mcpOAuthService.createAuthorizationCode({
           clientId: client_id,
@@ -298,6 +314,9 @@ export function setupMcpOAuth(app: express.Express) {
     consentUrl.searchParams.set('utm_source', 'mcp');
     consentUrl.searchParams.set('utm_medium', classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }));
     consentUrl.searchParams.set('mcp_client_id', client_id);
+    // The deployed consent page forwards this signed intent to /api/auth/register.
+    // Never infer Zoma from the generic signupSource=mcp marker (Emma shares it).
+    if (attribution.product === 'zoma') consentUrl.searchParams.set('mcp_signup_intent', mintZomaSignupIntent());
 
     return res.redirect(302, consentUrl.toString());
   });
@@ -345,11 +364,12 @@ export function setupMcpOAuth(app: express.Express) {
     const userId = (req as any).user.userId;
     let pending: Awaited<ReturnType<typeof mcpOAuthService.takePendingAuthorization>> = null;
     try {
-      pending = await mcpOAuthService.takePendingAuthorization(client_id, code_challenge);
+      pending = await mcpOAuthService.takePendingAuthorization(client_id, code_challenge, true);
     } catch (error) {
       console.error('[MCP-OAuth] Failed to read authorization attribution (ignored):', error);
     }
     const attribution = pending ?? authorizationAttribution(client_id, undefined);
+    if (!await allowZomaSignupAuthorization(attribution.product, userId, res)) return;
     const { code } = await mcpOAuthService.createAuthorizationCode({
       clientId: client_id,
       userId,

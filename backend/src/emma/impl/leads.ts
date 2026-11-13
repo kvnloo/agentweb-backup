@@ -196,7 +196,7 @@
  * `getSenderForLead` is bound off the singleton the same way.
  */
 import { suppressLeadSideEffects } from '../../utils/sessionList';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType, missingReviewDraftError } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
@@ -2149,6 +2149,12 @@ export async function updateLeadStatus(
         };
         updates.emailDraftFormat = 'text';
         savedDrafts.push('emailDraft');
+      }
+
+      // ENG-2966: never put a lead in the review queue without a draft to review.
+      const draftError = missingReviewDraftError(status, { ...existingLead, ...updates });
+      if (draftError) {
+        return { success: false, message: 'No draft saved on this lead', error: draftError };
       }
 
       await crmDb.updateLead(listId, leadId, updates);

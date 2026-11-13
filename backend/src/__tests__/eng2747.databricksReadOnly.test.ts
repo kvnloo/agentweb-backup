@@ -94,7 +94,7 @@ describe('ENG-2747 Databricks host detection', () => {
 describe('ENG-2747 Databricks allowed calls', () => {
   it('allows verified reads and the onboarding/local tools', () => {
     for (const name of READ_ONLY_TOOLKIT_TOOLS) expect(isDatabricksAllowedCall(name, {})).toBe(true);
-    for (const name of ['zoma_status', 'zoma_usage', 'ads_get_errors']) expect(isDatabricksAllowedCall(name, {})).toBe(true);
+    for (const name of ['zoma_status', 'zoma_usage', 'ads_get_errors', 'ads_get_help_article']) expect(isDatabricksAllowedCall(name, {})).toBe(true);
   });
 
   it('allows call_meta_marketing_api only for read actions without confirm or preview_token', () => {

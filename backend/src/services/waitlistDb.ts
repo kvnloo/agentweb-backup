@@ -38,6 +38,8 @@ export interface WaitlistEntry {
   monthlyMarketingSpend?: string;
   businessArea?: string;
   marketingChannels?: string[];
+  /** ENG-2881 Zoma admission decision; written only by services/zomaAdmission. */
+  zomaStatus?: 'waitlisted' | 'approved' | 'rejected';
 }
 
 // Helper function to handle DynamoDB errors
@@ -49,6 +51,23 @@ const handleDynamoDbError = (error: any, operation: string) => {
     );
   }
   throw error;
+};
+
+const CAPACITY_COUNTER_EMAIL = '__zoma_free_capacity__';
+
+export const isCapacityCounterEmail = (email: string): boolean =>
+  email.toLowerCase() === CAPACITY_COUNTER_EMAIL;
+
+export class WaitlistCapacityCounterError extends Error {
+  readonly statusCode = 409;
+  constructor() {
+    super('Capacity counter cannot be modified through waitlist CRUD.');
+    this.name = 'WaitlistCapacityCounterError';
+  }
+}
+
+const assertNotCapacityCounter = (email: string): void => {
+  if (isCapacityCounterEmail(email)) throw new WaitlistCapacityCounterError();
 };
 
 export const waitlistDb = {
@@ -110,7 +129,8 @@ export const waitlistDb = {
 
       const result = await dynamodb.scan(params).promise();
       return {
-        items: result.Items || [],
+        // The Zoma capacity counter shares the table but is not an applicant.
+        items: (result.Items || []).filter((item) => !isCapacityCounterEmail(String(item.email ?? ''))),
         lastEvaluatedKey: result.LastEvaluatedKey,
       };
     } catch (error) {
@@ -120,6 +140,7 @@ export const waitlistDb = {
   },
 
   async updateStatus(email: string, status: string, invitedAt?: string) {
+    assertNotCapacityCounter(email);
     const params = {
       TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
@@ -146,6 +167,7 @@ export const waitlistDb = {
   },
 
   async updateSupportNote(email: string, supportNote: string) {
+    assertNotCapacityCounter(email);
     const params = {
       TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
@@ -167,7 +189,20 @@ export const waitlistDb = {
   },
 
   async updateDetails(email: string, details: Partial<WaitlistEntry>) {
-    const { email: _email, joinedAt: _joinedAt, ...writableDetails } = details;
+    assertNotCapacityCounter(email);
+    // approvedCount belongs to the free-plan capacity counter only; never writable via CRUD.
+    const {
+      email: _email,
+      joinedAt: _joinedAt,
+      approvedCount: _approvedCount,
+      // Admission decisions move only through zomaAdmission (counter + decision in one transaction).
+      zomaStatus: _zomaStatus,
+      approvedBy: _approvedBy,
+      approvedAt: _approvedAt,
+      rejectedBy: _rejectedBy,
+      rejectedAt: _rejectedAt,
+      ...writableDetails
+    } = details as Partial<WaitlistEntry> & Record<'approvedCount' | 'approvedBy' | 'approvedAt' | 'rejectedBy' | 'rejectedAt', unknown>;
 
     if (Object.keys(writableDetails).length === 0) {
       return this.getByEmail(email.toLowerCase());
@@ -215,18 +250,30 @@ export const waitlistDb = {
 
   async deleteByEmail(
     email: string
-  ): Promise<{ success: boolean; message?: string }> {
+  ): Promise<{ success: boolean; conflict?: boolean; message?: string }> {
+    if (isCapacityCounterEmail(email)) {
+      return { success: false, conflict: true, message: 'Capacity counter cannot be deleted through waitlist CRUD.' };
+    }
     const params = {
       TableName: `${TABLE_PREFIX}AW-Waitlist`,
       Key: {
         email: email.toLowerCase(),
       },
+      // Admission decisions are durable idempotency records, not disposable leads.
+      ConditionExpression: 'attribute_not_exists(zomaStatus)',
     };
 
     try {
       await dynamodb.delete(params).promise();
       return { success: true };
     } catch (error) {
+      if ((error as { code?: string })?.code === 'ConditionalCheckFailedException') {
+        return {
+          success: false,
+          conflict: true,
+          message: `Waitlist entry for ${email} has an admission decision and is kept as an admission record.`,
+        };
+      }
       // It's useful to log the error and return a more specific message if needed
       console.error(`Error deleting waitlist entry for ${email}:`, error);
       // Using handleDynamoError or a similar centralized error handler is good practice

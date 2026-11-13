@@ -26,7 +26,9 @@ import { isMetaEventSourceTool, META_EVENT_SOURCE_TOOL_DEFINITIONS } from './met
 import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
+import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } from './metaToolkitExperimentWrites';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
+import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -120,6 +122,9 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...metaTools,
     ...SIGNAL_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...EXPERIMENT_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-2980: experiment eligibility + A/B / lift writes (writes are preview → confirm).
+    ...META_EXPERIMENT_WRITE_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    JSON.parse(JSON.stringify(HELP_ARTICLE_DEFINITION)),
     ...DIAGNOSTICS_READ_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_HEALTH_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_CATALOG_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
@@ -136,7 +141,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

@@ -192,7 +192,7 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
   try {
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/crm/lists/${listId}/leads`,
+      path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`,
       context: c,
       body: leadPayload,
     });

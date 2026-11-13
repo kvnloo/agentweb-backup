@@ -3,9 +3,9 @@
 When a landing-page form lead arrives with a phone number, AgentWeb phones a
 member of the business's team from a Twilio number the org owns and says "New
 lead from <business name>. Are you available to take the call now? Press 1." On
-`1` it dials the lead, who hears "This is an automated call from <business name>
-about the enquiry you sent us. To reach a person at <business name>, call <the org's number>.
-Press 1 to be connected now, press 2 if you are not available and we will call you again later, or press 3 to stop these calls." and must press 1 as well; only then
+`1` it dials the lead, who hears "Hi, this is an automated call from <business name>. To stop these calls at any time, press 3.
+We're calling about the enquiry you sent us. Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later.
+You can also call us on <the org's number>." and must press 1 as well; only then
 are the two calls bridged. A 2 schedules one [retry](#press-2-and-the-retry) about an hour later. The number is spoken digit by digit in 3-3-4 groups; calling it rings the team through the
 [inbound callback](#inbound-callbacks) path. Pressing 3 puts the number on the org's [do-not-call list](#do-not-call-list). Which member is rung depends on the
 team's priority order and weekly availability windows (see [Who is rung](#who-is-rung)). The outcome and every step are written to the lead's timeline.
@@ -69,7 +69,7 @@ sequenceDiagram
   LeadPhone-->>Tw: answers
   Tw->>App: POST /status leg=lead CallStatus=in-progress (remembers the lead sid, no state change)
   Tw->>App: POST /screen (runs on the lead's leg, before the bridge)
-  App-->>Tw: Gather 1 digit: "This is an automated call from <business> ... call <number>. Press 1 ... press 2 if you are not available ... or press 3 to stop"
+  App-->>Tw: Gather 1 digit: "Hi, this is an automated call from <business>. To stop these calls at any time, press 3. ... Press 1 ... or press 2 ... You can also call us on <number>."
   LeadPhone->>Tw: presses 1
   Tw->>App: POST /screen-result Digits=1
   App-->>Tw: empty Response - Twilio bridges the two calls
@@ -85,8 +85,8 @@ Branches (all end in `finished` once every leg that was dialed is metered):
 | Situation | Webhook that decides | Outcome | Timeline events after `call.initiated` |
 | --- | --- | --- | --- |
 | Member presses 1, lead answers and presses 1 | `/gather`, `/screen`, `/screen-result` | `completed` | `call.member_answered`, `call.connected`, `call.completed` |
-| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "Understood. <business> will not call this number again. Goodbye."; the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
-| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
+| Lead answers and presses 3 | `/screen-result` | `lead_opted_out`; the lead hears "<business> will not call this number again. You can reach us on <the org's number>. Goodbye." and the call ends (`<Hangup/>`, no further prompt); the member hears "The lead asked not to be called again. Their details are in your lead alert."; no other member is tried; the stop is written first (see [Do-not-call list](#do-not-call-list)) | `call.member_answered`, `call.lead_declined` (`reason: opted_out`), `call.completed` |
+| Lead answers and presses 2 (not available now) | `/screen-result` | `lead_deferred`; the lead hears "Okay. <business> will call you again later. You can reach us on <the org's number>. Goodbye."; the member hears "The lead is not available right now. We will try again later."; no other member is tried; one retry is scheduled (see [Press 2 and the retry](#press-2-and-the-retry)). Option 2 is only spoken when a retry can happen (the lead's first call, retries on); on the retry call, with retries switched off or the kill switch off, or when no retry can be scheduled, a 2 is an ordinary `lead_declined` (bare hangup for the lead, the usual "did not confirm" for the member) | `call.member_answered`, `call.lead_declined` (`reason: not_available_now`, or `not_available_no_retry` for the plain decline), `call.completed` |
 | Lead answers but presses another key, says nothing or hangs up | `/screen-result` (a key) or `/dial` (`completed` with `DialBridged=false`) | `lead_declined`; the member hears "The lead did not confirm. Their details are in your lead alert." and no other member is tried | `call.member_answered`, `call.lead_declined`, `call.completed` |
 | Member presses another digit, hangs up on or ignores the prompt, or never picks up (no-answer, busy, failed, canceled) | member `/status` terminal | `member_declined` / `member_no_answer` for the attempt; the record moves to `between_attempts` and the next-attempt request runs (see [Who is rung](#who-is-rung)) | `call.member_declined` or `call.member_no_answer`, then `call.completed` only when no further attempt is queued |
 | Member presses 1, lead does not answer | `/dial` with `no-answer`, `busy` or `failed` | `lead_no_answer` | `call.member_answered`, `call.lead_no_answer`, `call.completed` |
@@ -453,7 +453,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
-| `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. |
+| `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. It must be the business's registered (legal) name: it is the name the lead hears as the caller and the name in the consent notice (47 CFR 64.1200(b)(1)). The setup tool description and the owner-facing validation messages say so; validation itself is unchanged (it cannot check that a name is the registered one). |
 | `callingHours` | `{ start, end, timezone }`, `HH:MM` 24h, `start != end`, defaults 08:00 / 21:00. It is the window in which calls ARE allowed, in the org's IANA `Area/Location` timezone (UTC, abbreviations and `Etc/` refused). `start > end` wraps past midnight. Start inclusive, end exclusive, minute granularity. This is the ORG's clock and its default 08:00-21:00 is not what a lead experiences: the lead's own local hours are a separate, fixed gate (10:00-18:00 lead-local, in practice about 13:00-18:00 Eastern for most US numbers; see [Lead-local hours](#lead-local-hours)), so a call needs both windows open. Required to enable. Member windows are read on this same clock. |
 | `allowedCountries` | non-empty subset of `["US","CA"]` (default both); the lead's number must resolve to one of them. |
 
@@ -849,6 +849,7 @@ No new table or index. The feature writes:
 | `vendor_rate_overrides` | AW-Settings item | admin Vendor Rates tab |
 | `system.hot_lead_call` (call record: `state`, `jobKey`, `startedAt`, `updatedAt`, `attemptNo`, `memberId`, `triedMemberIds`, `leadPhoneMac` (keyed HMAC of the lead's phone, see Org config), `claimToken` (random id of the writer that took an exclusive step, see Writes that commit and then report an error), `memberCallSid`, `leadCallSid`, `outcome`, `meteredLegs` (`member:<attempt>` and `lead`), `lastSequence`; ENG-2783: `deferral` `{dueAt, count}`, `retryClaimToken`, `retryClaimedAt`, see [Press 2 and the retry](#press-2-and-the-retry)) | on the lead row (AW-Leads), no phone number | orchestrator and webhooks |
 | Lead contact status (`contactStatus: do-not-contact`, `contactStatusReason: opted-out`, `contactStatusNote`, `unsubscribedFromGroupEmail`) | existing fields on the lead row (AW-Leads), written by `/screen-result` when the lead presses 3 (a new writer of an existing mechanism) | webhooks (`crmDb.updateLead`) |
+| `system.callConsent` (ENG-2783: `granted`, `text`, `version?`, `capturedAt`, `pageUrl?`, `ip?`, `userAgent?`, `source`, `note?`; see [Call consent](#call-consent-eng-2783)) | `system` map on the lead row | forward-lead (create input, or `createLeadSystemRecordOnce` for an existing lead); operators for a back-fill |
 | Timeline events `call.*` | the lead's `engagements` list | `LeadCallStore.addEvent` |
 | `hlc#phone#<hmac>`, `hlc#cool#<orgId>#<memberId>`, `hlc#cap#h#<orgId>#<UTC hour>`, `hlc#cap#d#<orgId>#<local date>`, `hlc#cap#m#<orgId>#<YYYY-MM>`, platform-wide `hlc#cap#g#<UTC date>` (ENG-2783, TTL 2 days) with alert claims `hlc#notify#g80#<UTC date>` / `hlc#notify#g100#<UTC date>`, inbound: `hlc#cap#ih#<orgId>#<UTC hour>`, `hlc#cap#id#<orgId>#<local date>`, `hlc#in#p#h#<hmac>#<UTC hour>`, `hlc#in#p#d#<hmac>#<local date>`, `hlc#in#c#<CallSid>`, do-not-call: `hlc#dnc#<hmac of org and number>` (ENG-2783, about 10 years) | existing table `AW-MCPSessions` (partition key `sessionId`, attribute `ttl`) | limit store |
 
@@ -951,7 +952,7 @@ Rules the code enforces:
 
 ## Abuse limits and their known limits
 
-Gates run cheapest first (ids, phone, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
+Gates run cheapest first (ids, phone, call consent, org calling hours, lead-local hours, team availability, age). Stateless gates run at dispatch and again in the job;
 the limits that count run once, just before the record is created, and are given
 back if the record is not created:
 
@@ -959,7 +960,7 @@ back if the record is not created:
    not a smoke-test lead, not a progressive-capture draft, has a phone.
 2. Skip gates with a `call.skipped` event (a press-2 [retry](#press-2-and-the-retry) runs the same gates, bypassing only `too_old` and the "lead already has a call record" short-circuit, and can additionally skip with `retry_expired` or `lead_phone_changed`): `no_caller_number`, `unsafe_id` (list
    or lead id outside `[A-Za-z0-9_.:-]{1,200}`, which the webhooks would
-   reject), `invalid_phone`, `country_not_allowed` (also every Canadian number), `outside_calling_hours`,
+   reject), `invalid_phone`, `country_not_allowed` (also every Canadian number), `no_call_consent` (ENG-2783: the lead has no `system.callConsent.granted === true`; it sits right after the id and phone gates and BEFORE every hours gate, so a lead without consent is recorded as `no_call_consent` at any hour, and a lead WITH consent outside the lead window still gets `outside_lead_hours`; see [Call consent](#call-consent-eng-2783)), `outside_calling_hours`,
    `outside_lead_hours` (the lead's own local time is outside the lead window, 10:00-18:00, see [Lead-local hours](#lead-local-hours)),
    `no_one_available` (inside the calling hours, but no verified member has an
    open window), `too_old`, then `not_entitled` (the org owner's subscription tier does not
@@ -1380,11 +1381,176 @@ delete. A 404 from Twilio counts as already released. Reconcile any such log lin
 | Symptom | Likely cause |
 | --- | --- |
 | Member is called but hears "application error" | The `/owner` fetch failed: `BACKEND_URL` wrong or unreachable (check scheme and host), or credentials could not be loaded (503), or the signature failed (401). Twilio's call log shows the webhook response. |
-| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown`, `platform_daily_cap` (the platform-wide daily ceiling was reached; see [Platform-wide daily ceiling](#platform-wide-daily-ceiling)) and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
+| Calls never placed, timeline shows `call.skipped` | The `reason` names the gate. `no_call_consent` ("The lead did not agree to be called (the form had no call-consent notice)": the form had no notice, the box was not ticked, or the lead predates the feature; expected, see [Call consent](#call-consent-eng-2783)), `outside_calling_hours`, `outside_lead_hours`, `no_one_available`, `duplicate_phone`, `do_not_call` (the lead or the number pressed 3 or is do-not-contact; see [Do-not-call list](#do-not-call-list)), `member_cooldown`, `platform_daily_cap` (the platform-wide daily ceiling was reached; see [Platform-wide daily ceiling](#platform-wide-daily-ceiling)) and `org_monthly_cap` are expected behavior (`org_monthly_cap`: the org used its monthly allowance; calls resume on the 1st, the owner was emailed, the Slack alert went out). An `outside_lead_hours` lead is not retried or deferred (the job runs once) EXCEPT a press-2 retry, which can itself skip with that reason when it is refused at run time; a `retry_expired` skip means a press-2 retry could not run within six hours of its FIRST due time (`deferral.firstDueAt`, or no open minute was left); the lead window is 10:00-18:00 lead-local, about 13:00-18:00 Eastern for most US numbers, so a lead that arrives in the evening or morning is simply not called. |
 | No event and no call | Kill switch off, org disabled or config invalid, lead not `form_fill`, smoke-test lead, draft lead, or no phone: all silent by design. |
 | `call.skipped` `limits_unavailable` | `AW-MCPSessions` missing, IAM denied, or throttled. Fails closed. |
 | `no owner to bill for list` in logs | The list owner could not be resolved; the leg was not metered and `/status` answers 500. |
 | Slack alert arrives but no call | Expected whenever any gate refuses; the two paths are independent. |
+
+## Call consent (ENG-2783)
+
+An automated call (computer-generated voice) to a mobile needs the person's prior express consent (47 CFR 64.1200, FCC 24-17), the caller must be able to
+PROVE it (the exact text shown, when, on which page, from which address) and keep the record for at least 4 years (the owner chose 5). Before this
+change nothing recorded consent and no gate checked it. Decision (Option A): consent is RECORDED at form submission and a lead is auto-called ONLY if it carries a
+consent record. A lead without one is skipped with a visible reason.
+
+### Wire format
+
+`POST /api/webhooks/forward-lead` (and its alias `/api/leads/public/:listId`) accepts an optional body field:
+
+```json
+{ "callConsent": { "granted": true, "text": "<the exact notice text shown>", "version": "v1" } }
+```
+
+It is accepted only when ALL hold: `granted` is the boolean `true` (not the string `"true"`); `text` is a string of 40 to 1000 characters after trimming
+that contains the word "call" (case-insensitive, word start: "calls" and "calling" match, "recall" does not) AND the whole word "automated" (case-insensitive; the artificial-voice authorisation is the legally load-bearing part) and does NOT contain a placeholder (any bracketed text that includes the word "name", or `REGISTERED BUSINESS NAME` in any case or spacing);
+`version`, if present, matches `[A-Za-z0-9._-]{1,32}`. Anything else is IGNORED: the lead is still created (never a 400), nothing is stored, and ONE
+`console.warn` of the reason code only (`[forward-lead] call consent ignored: <reason>`, with no text, phone or email) is written. Reason codes: `not_object`, `not_granted`, `bad_text`,
+`text_too_short`, `text_too_long`, `text_no_call_word`, `text_no_automated_word`, `placeholder_name`, `bad_version`, and `no_phone` (a valid consent with no usable phone in the same submission: nothing to bind it to). A missing field and `granted: false` (an unticked box) are the normal cases and do not warn.
+The field is a handled key: it is never stored as a custom field or in `notes`, and never echoed in a response. The generated capture route also forwards the page the form was on as
+`visitorPageUrl` (its Referer), another handled key.
+
+Code: `services/voice/callConsent.ts` (parse, record, notice text), `routes/webhooks.ts` (forward-lead).
+
+### Stored shape
+
+On the lead row, in the existing `system` map (no new table, no new index): `system.callConsent`
+
+```
+{ granted: true, text, version?, phoneDigits, capturedAt, pageUrl?, ip?, userAgent?, source: 'form' | 'operator', note? }
+```
+
+- `phoneDigits`: the E.164 digits of the number the visitor submitted (`toE164(raw, 'US')`, the same normaliser `callableLeadPhone` uses). **Consent is bound to this number**: `hasCallConsent(lead)` requires `granted === true` AND `phoneDigits` equal to the normalised CURRENT `lead.phone`. A record without `phoneDigits`, or a lead without a phone, is not consent, and a lead whose phone changes can never inherit an old record.
+
+- `capturedAt`: the SERVER's ISO time, never supplied by the client.
+- `pageUrl`: the request's `Referer` (else `Origin`, else the capture route's `visitorPageUrl`), reduced to `scheme://host/path` (no query string, fragment or credentials), at most 300 characters.
+- `ip`: the same resolved visitor address the lead already keeps as `clientIp` (a forwarding server's own address is never used); absent when it cannot be determined.
+- `userAgent`: at most 300 characters. `source` is always `form` for a captured record.
+
+It is written in the CREATE input of the lead (`crmDb.createLead(..., { system: { callConsent } })`), in the same put as the row, so it exists before the call gates (which run from the create hook) can read the lead.
+That covers a brand-new lead (email or phone-only, the phone-dedupe separate-row path and the deterministic-id path).
+
+Repeat submissions:
+
+- An EXISTING lead (same email or same phone) that has no `system.callConsent` AND whose stored phone (before this submission's merge) is the same number as the submitted one gets it recorded by `crmDb.createLeadSystemRecordOnce(..., 'callConsent', record)`, a conditional write that
+  creates the key only if absent (never a full-map `system` overwrite, which would clobber the call record). This runs BEFORE the repeat submission's dispatch.
+- A repeat submission DOES dispatch the call gates (`dispatchLeadCreated(..., submission)`); the only call-specific refusal that sticks is `has_record` (a call already happened).
+  So a lead first skipped as `no_call_consent` that submits again WITH consent IS called by that second submission (if every other gate passes, including `too_old`, measured from the new submission). The earlier `call.skipped` stays on the timeline.
+- If the submission carries a DIFFERENT phone, nothing is recorded and one warning `call consent ignored: phone_mismatch` is logged (reason only). This stops anyone who knows a lead's email from attaching a ticked box for their own number to that lead.
+  A resubmission CAN change the stored phone (an email-matched merge overwrites a differing phone with the submitted one; a phone-matched merge only fills blanks); the phone binding of the gate is what guarantees an old record never covers the new number. A lead that consented with number A and later gets number B is therefore skipped as `no_call_consent`, and because the first record wins it cannot record a second one (known gap below).
+- The FIRST granted record is kept forever. A later one, with the same or a different text, is IGNORED (not appended; no history array). Reason: the proof of what the person first agreed to must never be replaced, and a bounded history adds a read-modify-write on a hot row for no gain.
+- An idempotent replay (same `submissionId`, ENG-2837) returns the original response before anything is written: no second lead write, no second consent write.
+- Session-tracker lists: `upsertSessionLead` spreads `leadData` (including `system`) into `createLead`, so a consent record passes through on create; those lists suppress side effects and never dispatch the call. A session-list lead that did reach the gate without a record is skipped, which is intended. The repeat-submission consent write does not apply to the session upsert path.
+- Re-check paths: the consent gate lives only in `SKIP_GATES`, which only `reviewWhy` runs (dispatch, the job, the press-2 retry), always on a lead loaded by `getLeadById` with its full `system` map. The `/gather` and bridge re-checks (`twilioVoiceWebhook.ts`) and the stuck sweep do not re-evaluate `SKIP_GATES`; a call already placed is not re-gated.
+- `/api/leads/public/:listId` (`routes/publicLeadAlias.ts`) only moves the path id into `body.listId` and rewrites the URL to `/api/webhooks/forward-lead`, so it is the same handler (a test posts consent through the alias).
+
+### The gate and who sees what
+
+`no_call_consent` in `SKIP_GATES` (`services/hotLeadCallService.ts`): stateless, one field read, refuses unless `lead.system.callConsent.granted === true`. It runs in every pass,
+including the press-2 retry (same `review()`), and is in `PERMANENT_REFUSALS`: a retry for a lead whose consent is absent is refused, recorded and spent, never looped.
+It records `call.skipped` `{ reason: 'no_call_consent' }` like the other gates (one per reason per lead, 5 skip events at most) and the Slack lead alert still goes out.
+Owner-visible wording: "The lead did not agree to be called (the form had no call-consent notice)". No code maps reasons to labels today (the timeline shows the raw code), so this wording is
+used in this document; any future label table must use it.
+
+- The owner/operator sees the `call.skipped` event with `no_call_consent` on the lead timeline, and `system.callConsent` (text, time, page, ip, user agent) on the row.
+- The lead sees only the notice on the form. Nothing about consent is returned by any API response.
+
+### Approved notice text (v1)
+
+> By checking this box and submitting, I agree that **<REGISTERED BUSINESS NAME>** may call me at the number above about my enquiry, including automated calls that use a computer-generated voice. Agreeing is not a condition of purchase. I can stop calls at any time by pressing 3 on a call.
+
+Requirements for the form: an UNCHECKED checkbox (never pre-checked) directly above the submit button, required before submit WHEN a phone number was entered, and the request carries
+`callConsent: { granted: <checkbox state>, text: <the exact label text shown>, version: 'v1' }`. The generator prompt (`buildCallConsentInstructions` in `services/v0Service.ts`) instructs the AI site builder to do this for
+every lead capture form (the prompt always asks for a phone number). It is included for EVERY such form, not only for orgs with hot-lead calling: the prompt builder has no cheap, reliable signal that the org has calling set up or entitled
+(that needs a DB read in a hot path), and a notice on a form whose org never calls is harmless.
+
+### The registered-name rule (READ THIS)
+
+The name in the notice must be the REGISTERED LEGAL NAME of the business that places the calls. The platform has no field for a registered name, so the generator uses, in this order, data the generation routes
+already load (no new read): the org's hot-lead-call `announcedName` if configured, else the account's `companyName`, else the org's `name` (`registeredBusinessNameOf` in `services/v0Service.ts`). A candidate containing brackets, quotes or angle brackets is skipped.
+Those are the best available names, not verified legal names: the owner must check that the name printed in the notice is the registered one.
+When NO name is known the prompt carries NO consent block at all (no placeholder text anywhere): such a page has no checkbox, records no consent and therefore does not trigger calls until the notice is added.
+The server still rejects any consent text that contains a placeholder (bracketed text including the word "name", or `REGISTERED BUSINESS NAME` in any case or spacing).
+
+### Existing landing pages
+
+Nothing was changed on pages that already exist. Their forms have no notice, send no `callConsent`, and therefore their leads are skipped with `no_call_consent` (no calls) until the page is regenerated or
+edited to carry the notice. This is intended and is the main go-live step: update each lander before expecting calls from it. New capture routes also forward `visitorPageUrl`; old ones do not, so `pageUrl` falls back to the Referer header, which a server-side forwarder does not send (the field is then absent).
+
+### Retention (owner rule: 5 years)
+
+Consent records must be kept at least 5 years after the last call to that lead. Findings of the ENG-2783 review (no deletion code was changed):
+
+- No TTL: `AW-Leads` rows have no TTL attribute in code (only `ATTEMPT_USAGE` and `SMARTLEAD_PUSH_RUNS` get one, in `ensureCriticalTables.ts`), and the lead row builder sets no expiry. The live table's TTL setting was NOT checked (no AWS access): confirm it is off.
+- No purge, anonymise or erasure job touches leads. No GDPR/erasure code path exists for lead rows.
+- Every path that deletes a lead or a whole lead list (each also deletes the consent record with it; the rule must be applied by whoever uses them):
+  `crmDb.deleteLead` via `DELETE /api/crm/lists/:listId/leads/:leadId` and the bulk delete in `routes/crm.ts`; Emma tools in `emma/impl/leads.ts` (bulk delete, filtered delete, trim to limit);
+  `routes/crmWebhook.ts` (HubSpot deletion events); `utils/attioPersonWebhookEvent.ts` (Attio deletion events); `crmDb.deleteLeadGuarded` in `sessionRowCleanupService.ts` (session lists only);
+  `landingPageSmokeTest.ts` (its own synthetic leads); `crmDb.deleteLeadList` via `DELETE /api/crm/lists/:listId`, `routes/orgMemberRemoval.ts` (member/org removal) and `sessionTrackingService.ts` (empty list rollback).
+- Consequence: a customer who deletes a lead, a list or their org deletes the proof. If the lead was ever called, an operator must export `system.callConsent` (and the call record) first. A copy to a durable store is a follow-up, not built.
+
+### Back-filling consent given another way
+
+A lead who gave consent outside the form (for example on a phone call or in a signed document) can be made callable by an OPERATOR writing the same shape with `source: 'operator'` and a `note` saying how and when it was given. The operator calls
+`crmDb.createLeadSystemRecordOnce(listId, leadId, 'callConsent', { granted: true, text: <the wording the person agreed to, 40-1000 characters incl. "call" and "automated">, phoneDigits: <E.164 digits of the number to call>, capturedAt: <ISO time of the real consent>, source: 'operator', note })`.
+No script, Emma tool or UI exists for this today; it is a hand-run data write and an owner/operator decision per lead, with the evidence in hand. A lead that ALREADY has a `callConsent` cannot be back-filled this way (the first record wins; the write is refused),
+including a stale record bound to an old number: fixing that needs a deliberate data edit by the owner.
+
+### Risk statements (what the record proves)
+
+- A client can FORGE the text: the capture route forwards `...body`, so anyone who can POST to the endpoint can send any `callConsent` with a plausible text, and a bot can send `granted: true` for a number it does not own.
+  The record proves what the submitting client CLAIMED and when and from which address our server saw it; it does NOT prove that the owner of the number saw the notice or ticked a box. The server validates the shape (granted is the boolean true, length, the word "call", no placeholder), not the truth.
+- It does not prove the text matches what the page displayed (the AI-built form is not tested for that), nor that the person was the subscriber of the number.
+- `ip` is the visitor address the platform capture route declares and the backend accepts under its existing guarded path; a forwarder's own address is never recorded, so `ip` may be absent.
+- A ticked box for V's own phone number submitted with V's email is recorded: that proves a FORM SUBMISSION carrying that number, not that the submitter owns the number.
+- The third-party-called risk in [Compliance and third parties](#compliance-and-third-parties) remains: a person can type someone else's number and tick the box.
+
+### Known gaps
+
+- The record is a self-assertion by the form: no proof of number ownership, no OTP or double opt-in.
+- The public endpoint has no per-IP or per-phone submission limiter. What limits harm: the per-org hourly/daily/monthly caps, the calling hours, one call per lead, the press-3 stop and the do-not-call mark.
+- The notice goes on every generated capture form, whether or not the org has hot-lead calling.
+- `pageUrl` is client-declared when no Referer header is present (the capture route's `visitorPageUrl` is forwarded by the platform, but a direct caller can send any value).
+- A lead whose number changed after consenting cannot record a new consent (first record wins).
+- Release note: `routes/crmPublic.ts` creates `form_fill` leads without consent, so those leads no longer trigger calls.
+- Follow-ups: OTP or double opt-in, a per-IP limiter, and an "add the notice to my existing landing page" tool.
+
+### Open items (not decided here)
+
+- Telemarketing versus informational: whether a call that offers to connect a team member about an enquiry is "telemarketing" (written consent, stricter rules) or informational (prior express consent) is a legal question for the owner's counsel; the notice is written to the stricter reading.
+- State laws: Florida, Oklahoma, Maryland, Washington and Texas have their own telemarketing or auto-dialler rules (hours, consent form, registration); not reviewed.
+- Voicemail: what is spoken when a lead's voicemail answers is not covered by this consent work.
+- A durable copy of consent evidence outside the lead row (see Retention).
+- A source for the registered legal name, and a way to show the owner which of their landers carry the notice.
+
+## Compliance basis of the script
+
+The lead prompt (`screenPromptCopy` in `services/voice/twiml.ts`) is written against 47 CFR 64.1200(b) for artificial-voice calls:
+
+- (b)(1): the call must clearly say at the START who is responsible for it, using the business's registered name. The prompt opens with
+  "Hi, this is an automated call from <announcedName>." `announcedName` must therefore be the registered (legal) name (see the config table).
+- (b)(3): an automated key-press opt-out must be offered within 2 seconds of that identification, and pressing it must record the number as
+  do-not-call and END THE CALL IMMEDIATELY. The next sentence is "To stop these calls at any time, press 3." Press 3 is accepted during the
+  prompt (the `<Say>` is nested in the `<Gather>`), writes the [do-not-call marker](#do-not-call-list) and the lead's contact status, then plays the
+  one-line goodbye and `<Hangup/>`; nothing else is asked.
+- (b)(2): the callback number must be stated during or after the message. It is the prompt's LAST sentence ("You can also call us on <number>"), so it
+  is met by the prompt when it is played to the end. A lead who presses a key earlier interrupts the `<Say>` and never hears that sentence (the owner
+  accepted this order), so the number is stated in the reply to each key press that ends the call or does not connect the lead to a person: press 3
+  ("... You can reach us on <number>. Goodbye."), press 2 ("Okay. <business> will call you again later. You can reach us on <number>. Goodbye.") and any
+  other key ("You can reach us on <number>. Goodbye."). Press 1 connects the lead to a person, who speaks, so it has no such reply. No input (the
+  Gather times out after the whole prompt was played) gets "We did not get your answer. Goodbye."; the number was already heard. The number is the
+  org's Twilio number, read from the live org context (`ctx.config.twilioNumber`) the handler already resolves; without a live context or a valid
+  number the leg simply hangs up. The lead-facing terminal copies are exactly these; the other copies (`leadUnreachable`, `leadPhoneChanged`,
+  `leadDeclined`, the member-side opt-out/deferral lines) are played to the team member, not the lead.
+- Revocation: the prompt does NOT designate an exclusive revocation method. It says only "To stop these calls at any time, press 3", with no
+  exclusivity language. Under 64.1200(a)(10)/(11) operators therefore MUST keep honouring a revocation made by any reasonable means (email, a reply,
+  telling staff, the lead's own words) within 10 business days. The platform only handles press 3 itself, so operators do the others by a data write
+  (do-not-call marker / lead contact status) or by telling support. Designating press 3 as the exclusive method from 2026-11-25 (FCC 26-67) would
+  need clear and conspicuous wording on the call, and is NOT done. There is no date-dependent behaviour in the code.
+
+KNOWN OPEN ITEM (voicemail): the prompt may be played to a lead's voicemail box, because there is no answering-machine detection. The rules want a
+toll-free opt-out number on messages left on voicemail, and the org number is a local one. A follow-up should add machine detection and hang up
+without leaving a message.
 
 ## Compliance and third parties
 
@@ -1406,9 +1572,9 @@ Mitigations to decide before general availability (none of them is built):
 - CAPTCHA or honeypot enforcement on the lander endpoint.
 - A spoken disclosure to the lead (for example about recording) before the
   bridge. The screening prompt (`/screen`) is the place for it; today it names the business, gives the org's
-  number to call back, and offers press 1 (connect), press 2 (call again later) or press 3 (stop).
+  number to call back, and offers press 3 (stop, said first), press 1 (connect) and press 2 (call again later). See [Compliance basis of the script](#compliance-basis-of-the-script).
 - Requiring a name or an email besides the phone number.
-- Consent text on the landers.
+- Consent text on the landers: BUILT in ENG-2783 for NEW forms, see [Call consent](#call-consent-eng-2783). Existing landers have no notice, so their leads are not called until the page is regenerated.
 
 ## Go-live checklist
 
@@ -1418,6 +1584,10 @@ on anywhere.
 1. Compliance sign-off: consent and disclosure for automated calls
    to team members and for connecting leads, call recording stance (nothing is
    recorded by this feature), regional restrictions.
+1. Consent text on the landers (ENG-2783): the notice below is on every lander that will feed hot-lead calls, with the
+   REGISTERED legal business name in place of `[REGISTERED BUSINESS NAME]`; a test lead that ticks the box shows `system.callConsent` on its row
+   and is called, one that does not shows `call.skipped` `no_call_consent`; the retention rule (5 years) is accepted by the owner; the open items listed under
+   [Call consent](#call-consent-eng-2783) are decided.
 2. Twilio account: production credentials in `prod/AgentWeb/Twilio`, billing and
    spend limits set, Voice Geographic Permissions allow US and Canada, no other
    restriction on outbound calls (see "to confirm with Twilio").
@@ -1530,6 +1700,7 @@ Twilio's documentation and encoded in tests with synthetic payloads:
 - The member leg's REST `statusCallbackEvent: ['completed']` delivering exactly
   one completed callback with `CallDuration`, including for no-answer (assumed
   `0`).
+- Voicemail on the lead's leg: see the KNOWN OPEN ITEM in [Compliance basis of the script](#compliance-basis-of-the-script).
 - Voicemail: the member's voicemail answering the call. The prompt would play to
   the mailbox; there is no answering-machine detection and "press 1" will not be
   pressed, so it ends as `member_declined` after the Gather times out, and the
@@ -1623,8 +1794,7 @@ the 2 is an ordinary decline: `lead_declined`, event reason `not_available_no_re
 Nothing is promised that cannot happen.
 
 **Max one retry.** The retry keeps the record's `deferral`. `/screen-result` defers only a record that has none, so a 2 on the retry call is the plain decline above.
-**Prompt variants.** `/screen` speaks the three-option prompt ("Press 1 to be connected now, press 2 if you are not available and we will call you again later, or
-press 3 to stop these calls.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it is "Press 1 to be connected now, or press 3 to stop these calls."
+**Prompt variants.** `/screen` speaks the press-2 option ("... Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later. You can also call us on <number>.") only on the lead's first call with retries on. On the retry call, and whenever `HOT_LEAD_CALL_RETRY` is off, it reads "Press 1 and we'll connect you to a person now. You can also call us on <number>." In both variants the caller is named first and "To stop these calls at any time, press 3." follows at once"
 (`canDefer` in `leadScreenTwiml`). If the eligibility check itself throws (a failed lead or org read), `/screen` logs one warning (`retry eligibility unavailable, option 2 not offered: <error name>`) and serves the two-option prompt rather than hanging up on the lead.
 
 **The due-retries cron.** The job queue has no run-after, so `cron/hotLeadCallRetryCron.ts` (armed in `server.ts`, every 5 minutes) calls
@@ -1648,7 +1818,7 @@ the next day's 13:00 ET as its first due time (the press-time schedule, above), 
    `deferral.dueAt` is moved to it with a conditional write (`LeadCallStore.rescheduleRetry`, only while no claim is there, `firstDueAt` kept) and the run stops (`rescheduled`).
 3. Claim: a conditional write of `retryClaimToken`/`retryClaimedAt` only while none is there (`LeadCallStore.claimRetry`). Exactly one run or instance wins, however many overlap.
    After the claim only a PERMANENT refusal spends the retry; a transient one gives the claim back (see the table below). The `retry_expired` note is always written as its own event (the per-lead 5-skip cap and the one-per-reason dedupe cannot swallow it).
-4. Every gate of a new lead through the same `review()`/`SKIP_GATES` with the retry flag: ids, phone, org calling hours, lead window, `no_one_available`, entitlement, `do_not_call`;
+4. Every gate of a new lead through the same `review()`/`SKIP_GATES` with the retry flag: ids, phone, call consent, org calling hours, lead window, `no_one_available`, entitlement, `do_not_call`;
    each refusal is a `call.skipped` with its reason. The `too_old` gate and the "lead already has a call record" short-circuit are the only things ignored (age is counted from the
    deferral and the expiry above). The lead's phone must still match the record's `leadPhoneMac`, else `lead_phone_changed`.
 5. A FRESH slot (`reserveCallSlot` with `retry`): the hourly, daily and monthly counters are taken afresh (the cap notices apply as usual). The 24h phone marker the lead's own first call took is
@@ -1665,7 +1835,7 @@ The transient-refusal release keeps its +15 minute floor (a refused cap or a bus
 
 | Class | Reasons | What happens |
 | --- | --- | --- |
-| Permanent (spends the retry) | `lead_missing`, `ctx_missing`, `lead_phone_changed`, `do_not_call`, `not_entitled`, `duplicate_phone` (another lead holds the number), `smoke_test`, `draft_lead`, `invalid_phone`, `country_not_allowed`, `unsafe_id`, `not_form_fill`, `has_record`, `retry_expired` | `call.skipped` where one applies; the claim stays; log `[hotLeadCall] retry dropped after claim <reason> <orgId>` |
+| Permanent (spends the retry) | `lead_missing`, `ctx_missing`, `lead_phone_changed`, `do_not_call`, `not_entitled`, `duplicate_phone` (another lead holds the number), `smoke_test`, `draft_lead`, `invalid_phone`, `country_not_allowed`, `no_call_consent`, `unsafe_id`, `not_form_fill`, `has_record`, `retry_expired` | `call.skipped` where one applies; the claim stays; log `[hotLeadCall] retry dropped after claim <reason> <orgId>` |
 | Transient (everything else) | `no_one_available`, `member_cooldown`, `org_hourly_cap`, `org_daily_cap`, `org_monthly_cap`, `platform_daily_cap`, `outside_calling_hours`, `outside_lead_hours`, `limits_unavailable`, `credentials_unavailable`, `disabled`, `no_caller_number`, a thrown error (`error`), any reason not listed above | the claim is given back with `LeadCallStore.releaseRetryClaim` (conditional on `retryClaimToken` being THIS run's token and the record still `finished`; a stale token cannot release a newer claim): `retryClaimToken` and `retryClaimedAt` are removed and `deferral.dueAt` becomes now + 15 minutes, or the next minute both windows are open if later; log `[hotLeadCall] retry rescheduled after claim <reason> <orgId>`; the run returns `rescheduled`. For a thrown error the claim is given back first and the error then goes on to the sweep (`failed`) |
 | Expiry | a transient refusal when the new due time would pass `deferral.firstDueAt` + 6 hours | `call.skipped` `retry_expired`, the retry is spent |
 
