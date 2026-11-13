@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { statusAfterReviewedSend } from '../utils/leadSchema';
+import { statusAfterReviewedSend, missingReviewDraftError, REVIEW_DRAFT_STATUS } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
@@ -3024,6 +3024,17 @@ const updateLeadHandler = async (req: Request, res: Response) => {
     }
 
     const updateData = updates;
+
+    // ENG-2966: moving a lead INTO review requires a draft on it after this write.
+    if (updates?.status === REVIEW_DRAFT_STATUS) {
+      const before = await crmDb.getLeadById(listId, leadId);
+      const draftError = before && before.status !== REVIEW_DRAFT_STATUS
+        ? missingReviewDraftError(updates.status, { ...before, ...updates })
+        : null;
+      if (draftError) {
+        return res.status(400).json({ message: draftError });
+      }
+    }
 
     // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
     const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);

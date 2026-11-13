@@ -309,3 +309,35 @@ describe('contact-suppression audit on the lead route (ENG-2157)', () => {
     for (const kw of ['clicked', 'replied', 'received']) expect(text).not.toContain(kw);
   });
 });
+
+describe('review status requires a persisted draft on the lead route (ENG-2966)', () => {
+  it('refuses a move into pending_review when the lead has no draft — 400, no write, no engagement', async () => {
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'new' });
+    const { res } = await call({ status: 'pending_review' }, {}, 'patch');
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+    expect(crmDb.addLeadEngagement).not.toHaveBeenCalled();
+  });
+  it('refuses when the same request clears the only draft', async () => {
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'new', messageDraft: { content: 'Hola' } });
+    const { res } = await call({ status: 'pending_review', messageDraft: null });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+  it('allows the move when the lead already has a draft, or the request writes one', async () => {
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'new', messageDraft: { content: 'Hola' } });
+    await call({ status: 'pending_review' });
+    expect(sentToDb()).toEqual({ status: 'pending_review' });
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'new' });
+    await call({ status: 'pending_review', emailDraft: { subject: 'S', textContent: 'B' } });
+    expect(sentToDb().status).toBe('pending_review');
+  });
+  it('does not touch writes that leave an existing pending_review lead in place, or other statuses', async () => {
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'pending_review' });
+    const a = await call({ status: 'pending_review', notes: 'x' });
+    expect(a.res.status).not.toHaveBeenCalledWith(400);
+    asMockFn(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', status: 'new' });
+    const b = await call({ status: 'contacted' });
+    expect(b.res.status).not.toHaveBeenCalledWith(400);
+  });
+});
