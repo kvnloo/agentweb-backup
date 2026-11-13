@@ -7,6 +7,7 @@ import { getSecret } from '../utils/secretsManager';
 import { getS3ObjectAsString } from '../utils/s3Utils';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { toolResultError } from '../utils/toolResultError';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
 jest.mock('@google/generative-ai', () => ({ GoogleGenerativeAI: jest.fn().mockImplementation(() => ({})) }));
@@ -45,12 +46,35 @@ describe('ENG-1889 perform_data_analysis structured failures', () => {
     expect(telemetryClass(r)).toBe('not_found');
   });
 
-  it('unfetchable file URL -> not_found with the URL named', async () => {
-    get.mockRejectedValueOnce(new Error('Request failed with status code 403'));
+  it('unfetchable file URL (network error) -> not_found with the URL named', async () => {
+    get.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND example.com'));
     const r = await performDataAnalysis(['https://example.com/x.csv'], 'sum clicks', 'u1');
     expect(r.errorClass).toBe('not_found');
     expect(r.message).toContain('https://example.com/x.csv');
     expect(telemetryClass(r)).toBe('not_found');
+  });
+
+  // ENG-2993: a dead/expired caller URL (HTTP 4xx) is a bad argument, not an
+  // account/config fault — it filed a phantom "resolve the account" cluster.
+  it.each([
+    ['axios response 404', Object.assign(new Error('Request failed with status code 404'), { response: { status: 404 } })],
+    ['message-only 404', new Error('Request failed with status code 404')],
+    ['presigned 403', Object.assign(new Error('Request failed with status code 403'), { response: { status: 403 } })],
+  ])('dead file URL (%s) -> invalid_args, never config', async (_label, err) => {
+    get.mockRejectedValueOnce(err);
+    const r = await performDataAnalysis(['https://example.com/gone.csv'], 'sum clicks', 'u1');
+    expect(r.success).toBe(false);
+    expect(r.errorClass).toBe('invalid_args');
+    expect(r.message).toContain('https://example.com/gone.csv');
+    expect(r.message).toMatch(/re-run the tool that produced the data/);
+    expect(telemetryClass(r)).toBe('invalid_args');
+    expect(classifyToolFailureType(telemetryClass(r), r.message)).not.toBe('config');
+  });
+
+  it('rate-limited file host (429) is not reclassified as a bad argument', async () => {
+    get.mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 429'), { response: { status: 429 } }));
+    const r = await performDataAnalysis(['https://example.com/x.csv'], 'sum clicks', 'u1');
+    expect(r.errorClass).not.toBe('invalid_args');
   });
 
   it('upstream execution failure (Gemini 500) -> upstream_5xx with actionable message', async () => {
