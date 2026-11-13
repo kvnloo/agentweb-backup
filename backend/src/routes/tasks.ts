@@ -1642,8 +1642,19 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
       }
     }
 
-    // Decode the file key (it's URL encoded)
-    const decodedKey = decodeURIComponent(fileKey);
+    // ENG-2986: only a file that is listed on THIS task may be deleted. The key used to come straight from the URL, so anyone who could
+    // edit their own task could delete any object in the bucket (another account's file) by naming its key. Express has already decoded
+    // the param once; older clients also sent it double-encoded, so both forms are matched against the listed keys, and the LISTED key
+    // is what reaches storage (never the URL text).
+    const listedFiles: any[] = Array.isArray((task as any).knowledgeBaseFiles) ? (task as any).knowledgeBaseFiles : [];
+    let secondDecode: string | undefined;
+    try { secondDecode = decodeURIComponent(fileKey); } catch { secondDecode = undefined; }
+    const listed = listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === fileKey)
+      ?? (secondDecode !== undefined ? listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === secondDecode) : undefined);
+    if (!listed) {
+      return res.status(404).json({ message: 'File not found in this knowledge base' });
+    }
+    const decodedKey: string = listed.key;
     if (decodedKey.startsWith(S3_KEY_PREFIX)) {
       try {
         await s3
