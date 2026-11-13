@@ -27,7 +27,8 @@ import { runLandingPagePageSpeedCheck } from "./landingPagePageSpeedCheck";
 import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
-import { buildCallConsentNotice, CALL_CONSENT_NAME_PLACEHOLDER, CALL_CONSENT_NOTICE_VERSION } from "./voice/callConsent";
+import { buildCallConsentNotice, CALL_CONSENT_NOTICE_VERSION } from "./voice/callConsent";
+import { announcedNameOf } from "./hotLeadCallConfig";
 // ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
 // Already a runtime dependency, not a devDependency.
 import * as ts from "typescript";
@@ -954,9 +955,8 @@ export async function resolveLandingPageLiveUrl(
 
 export interface BrandContext {
   brandName?: string;
-  /** ENG-2783: the REGISTERED LEGAL name of the business that places the calls, for the call-consent notice. Nothing
-   *  populates it yet (brandName is a marketing name, not a legal one), so the notice carries a placeholder the owner
-   *  must replace. */
+  /** ENG-2783: the name of the business that places the calls, for the call-consent notice (see registeredBusinessNameOf).
+   *  Absent = the prompt carries NO consent notice at all, so the page records no consent and triggers no calls. */
   registeredBusinessName?: string;
   primaryColor?: string;
   primaryColorEnd?: string;
@@ -991,9 +991,13 @@ export interface BrandContext {
 export function buildBrandContextFromUser(
   user: any,
   brandGuidelinesOverride?: any,
+  /** ENG-2783: the caller's org, already loaded by the generation routes, for the consent notice's business name. */
+  org?: ConsentNameSources | null,
 ): BrandContext {
   const brandContext: BrandContext = {};
   if (!user) return brandContext;
+  const registeredBusinessName = registeredBusinessNameOf(org, user);
+  if (registeredBusinessName) brandContext.registeredBusinessName = registeredBusinessName;
 
   const bg: any = brandGuidelinesOverride ?? user.brandGuidelines;
   if (bg) {
@@ -1068,13 +1072,28 @@ export function extractTemplateOutline(fullHtml: string): string {
 }
 
 /**
- * ENG-2783: the form's call-consent notice. Included for EVERY lead capture form (the prompt always asks for a phone
- * number): the prompt builder has no cheap, reliable signal that the org has hot-lead calling set up, and a notice on a
- * form whose org never calls is harmless. The business name must be the registered legal name; with none known the
- * builder leaves a single placeholder constant for the owner, and text that still carries it is never accepted as consent.
+ * ENG-2783: the name to print in the call-consent notice, from data the generation routes already loaded (no new read):
+ * the org's hot-lead-call `announcedName` if configured, else the account's company name, else the org's name, else
+ * undefined. A candidate with brackets, quotes or backslashes is skipped (it could be mistaken for a placeholder or break the prompt).
+ */
+export interface ConsentNameSources { name?: string; hotLeadCall?: { announcedName?: unknown } }
+export function registeredBusinessNameOf(org?: ConsentNameSources | null, user?: { companyName?: string } | null): string | undefined {
+  const usable = (v: unknown): string | undefined => {
+    const t = typeof v === "string" ? v.trim() : "";
+    return t && t.length <= 100 && !/[[\]"\\<>{}\n\r]/.test(t) ? t : undefined;
+  };
+  return usable(announcedNameOf(org?.hotLeadCall?.announcedName)) ?? usable(user?.companyName) ?? usable(org?.name);
+}
+
+/**
+ * ENG-2783: the form's call-consent notice, for a lead capture form (the prompt always asks for a phone number). Included for EVERY
+ * such form whose business name is known: the prompt builder has no cheap, reliable signal that the org has hot-lead calling set up.
+ * With NO name the block is omitted entirely (returns ''): no placeholder ever reaches a page, the page records no consent and so
+ * triggers no calls until the notice is added.
  */
 export function buildCallConsentInstructions(registeredBusinessName?: string): string {
-  const name = registeredBusinessName?.trim() || CALL_CONSENT_NAME_PLACEHOLDER;
+  const name = registeredBusinessName?.trim();
+  if (!name) return "";
   const label = buildCallConsentNotice(name);
   return (
     `\n\nCALL CONSENT — REQUIRED WHENEVER THE FORM COLLECTS A PHONE NUMBER:\n` +
@@ -1083,11 +1102,7 @@ export function buildCallConsentInstructions(registeredBusinessName?: string): s
     `2. Its label is EXACTLY this text, word for word, in a single <label> next to the checkbox:\n` +
     `   ${JSON.stringify(label)}\n` +
     `   Keep it in ONE constant in the form file (const CALL_CONSENT_TEXT = ...) and render that same constant as the label and send it in the request.\n` +
-    (registeredBusinessName?.trim()
-      ? ''
-      : `3. The text contains the placeholder ${CALL_CONSENT_NAME_PLACEHOLDER} on purpose: it stands for the registered legal name of the business, which is not known yet. ` +
-        `Leave the placeholder EXACTLY as written, do NOT invent or substitute a business name, and do not shorten the text. The site owner replaces it.\n`) +
-    `${registeredBusinessName?.trim() ? '3' : '4'}. In the JSON body of the fetch('/api/capture', ...) call add ` +
+    `3. In the JSON body of the fetch('/api/capture', ...) call add ` +
     `callConsent: { granted: <the checkbox state, a boolean>, text: CALL_CONSENT_TEXT, version: ${JSON.stringify(CALL_CONSENT_NOTICE_VERSION)} }. ` +
     `Send it only with the checkbox state as the real boolean; never send granted: true when the box is not checked.`
   );
@@ -1187,7 +1202,8 @@ export function buildBrandEnrichedPrompt(
       `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
       `3. NEVER put absolute backend URLs in any client-side .tsx file.`
     );
-    parts.push(buildCallConsentInstructions(brand.registeredBusinessName));
+    const consentBlock = buildCallConsentInstructions(brand.registeredBusinessName);
+    if (consentBlock) parts.push(consentBlock);
   }
 
   // Both halves or neither: a conversion id without its label fires an event that
