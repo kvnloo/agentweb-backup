@@ -40,6 +40,8 @@ jest.mock('../services/db', () => ({
       emailDraft: { subject: 'Surety bonds', htmlContent: '<p>hi</p>' },
     })),
     updateLead: jest.fn(async () => undefined),
+    claimLeadEmailDraft: jest.fn(async () => true),
+    restoreLeadEmailDraft: jest.fn(async () => true),
     addEngagement: jest.fn(async () => undefined),
   },
   userDb: {

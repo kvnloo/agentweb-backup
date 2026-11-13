@@ -2559,6 +2559,18 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         };
       }
 
+      // ENG-2984: claim the draft atomically before the provider call. Two concurrent
+      // invocations both read the same draft above; only the one whose conditional
+      // REMOVE succeeds may send, so the lead gets at most one email.
+      const claimed = await crmDb.claimLeadEmailDraft(listId, leadId, draft);
+      if (!claimed) {
+        return {
+          success: false,
+          message: 'Email draft already sent or changed',
+          error: 'This draft is already being sent (or was changed) by another request, so it was not sent again. Check the lead before retrying.',
+        };
+      }
+
       try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
@@ -2570,13 +2582,19 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         });
         emailId = sendResult.messageId;
       } catch (error) {
+        // The send did not go out: put the draft back so the user can retry (best effort).
+        try {
+          await crmDb.restoreLeadEmailDraft(listId, leadId, draft);
+        } catch (restoreError) {
+          console.error('AgentMode: failed to restore email draft after send failure (ENG-2984):', restoreError);
+        }
         if (error instanceof SenderDailyLimitExceededError) {
           return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
         throw error;
       }
 
-      // Clear the draft after successful send
+      // Draft was already removed by the claim; this keeps the lead's updatedAt bump as before.
       await crmDb.updateLead(listId, leadId, { emailDraft: null });
 
       return {

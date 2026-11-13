@@ -11180,6 +11180,50 @@ export const crmDb = {
   },
 
   /**
+   * ENG-2984: atomically claims a lead's stored email draft for sending by removing it ONLY while
+   * it still equals `expectedDraft`. Of two concurrent senders reading the same draft exactly one
+   * wins; the loser gets false and must not send. Touches nothing but `emailDraft` (no updatedAt,
+   * so no GSI re-projection).
+   */
+  async claimLeadEmailDraft(listId: string, leadId: string, expectedDraft: Record<string, unknown>): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'REMOVE emailDraft',
+        ConditionExpression: 'emailDraft = :expected',
+        ExpressionAttributeValues: { ':expected': expectedDraft },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'claimLeadEmailDraft');
+      throw err;
+    }
+  },
+
+  /**
+   * ENG-2984: puts a claimed draft back after a failed send, but only if no new draft was
+   * written meanwhile (and the lead still exists). Returns whether it was restored.
+   */
+  async restoreLeadEmailDraft(listId: string, leadId: string, draft: Record<string, unknown>): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        Key: { listId, leadId },
+        UpdateExpression: 'SET emailDraft = :draft',
+        ConditionExpression: 'attribute_exists(leadId) AND attribute_not_exists(emailDraft)',
+        ExpressionAttributeValues: { ':draft': draft },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (isConditionalFailure(err)) return false;
+      handleDynamoDbError(err, 'restoreLeadEmailDraft');
+      throw err;
+    }
+  },
+
+  /**
    * Conditional patch of the object record at `lead.system[key]`, applied in ONE UpdateItem. Returns
    * false (nothing written) when ANY condition fails, so a replayed or out-of-order caller is a clean
    * no-op rather than a partial write:

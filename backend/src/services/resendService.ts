@@ -1,4 +1,5 @@
 import { Resend } from 'resend';
+import { createHash, randomUUID } from 'crypto';
 import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
@@ -50,11 +51,54 @@ interface ResendSendParams {
   replyTo?: string;
   /** ENG-2367: extra headers (e.g. List-Unsubscribe). */
   headers?: Record<string, string>;
+  /** ENG-2984: tenant scope for the idempotency key; defaults to `from`. */
+  tenantId?: string;
+  /**
+   * ENG-2984: caller-supplied intent/step (e.g. `drip:<seqId>:<step>`). Two sends with the same
+   * tenant, recipients, content and intent share one Idempotency-Key, so Resend delivers once.
+   * Omitted → a fresh per-call nonce: retries of THIS call still reuse one key, but separate
+   * calls with identical content are not merged (unchanged behaviour for callers without one).
+   */
+  idempotencyIntent?: string;
+}
+
+/** Internal: params after sendEmail has fixed the key, so queue + retries reuse it. */
+type KeyedResendSendParams = ResendSendParams & { idempotencyKey: string };
+
+const sortedList = (v?: string | string[]) =>
+  (Array.isArray(v) ? v : v ? [v] : []).map((a) => a.trim().toLowerCase()).sort();
+
+/**
+ * ENG-2984: deterministic Resend Idempotency-Key from (tenant, recipients, content hash, intent).
+ * Pure — identical inputs always give the same key; any content difference gives a different one.
+ */
+export function buildResendIdempotencyKey(params: ResendSendParams & { idempotencyIntent: string }): string {
+  const contentHash = createHash('sha256')
+    .update(JSON.stringify([
+      params.from,
+      params.subject,
+      params.html ?? '',
+      params.text ?? '',
+      params.inReplyTo ?? '',
+      params.replyTo ?? '',
+      params.headers ? Object.keys(params.headers).sort().map((k) => [k, params.headers![k]]) : [],
+    ]))
+    .digest('hex');
+  const digest = createHash('sha256')
+    .update(JSON.stringify([
+      params.tenantId ?? params.from,
+      sortedList(params.to),
+      sortedList(params.cc),
+      contentHash,
+      params.idempotencyIntent,
+    ]))
+    .digest('hex');
+  return `aw-send-${digest}`;
 }
 
 interface QueuedEmailSend {
   id: number;
-  params: ResendSendParams;
+  params: KeyedResendSendParams;
   resolve: (value: any) => void;
   reject: (error: any) => void;
 }
@@ -232,7 +276,7 @@ class ResendService {
     }
   }
 
-  private enqueueSend(params: ResendSendParams): Promise<any> {
+  private enqueueSend(params: KeyedResendSendParams): Promise<any> {
     return new Promise((resolve, reject) => {
       const queueItem: QueuedEmailSend = {
         id: ++this.queueItemId,
@@ -255,8 +299,9 @@ class ResendService {
     cc,
     inReplyTo,
     replyTo,
-    headers
-  }: ResendSendParams) {
+    headers,
+    idempotencyKey
+  }: KeyedResendSendParams) {
     await this.initializeResend();
 
     if (!this.resend) {
@@ -308,7 +353,9 @@ class ResendService {
 
     const result = await this.retryWithBackoff(
       async () => {
-        const { data, error } = await this.resend!.emails.send(emailOptions);
+        // ENG-2984: the same key on every attempt — a timeout whose request actually landed is
+        // replayed by Resend instead of delivered twice.
+        const { data, error } = await this.resend!.emails.send(emailOptions, { idempotencyKey });
         
         if (error) {
           const resendError: any = this.toErrorWithMetadata(error);
@@ -332,7 +379,16 @@ class ResendService {
    * non-retryable API error, or exhausted retries. Never resolves `null`
    * for a failed send; a resolved promise means Resend accepted the email.
    */
-  async sendEmail(params: ResendSendParams) {
+  async sendEmail(rawParams: ResendSendParams) {
+    // ENG-2984: fix the Idempotency-Key once, from the caller's original params, before the
+    // queue/retry machinery so every attempt of this send carries the same key.
+    const params: KeyedResendSendParams = {
+      ...rawParams,
+      idempotencyKey: buildResendIdempotencyKey({
+        ...rawParams,
+        idempotencyIntent: rawParams.idempotencyIntent ?? `call:${randomUUID()}`,
+      }),
+    };
     // ENG-1215: the single chokepoint every send funnels through — this method,
     // `sendSystemEmail` (which delegates here), and all 28 direct callers in
     // emailService. Guarding here rather than at each call site is the whole
