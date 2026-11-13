@@ -21,11 +21,11 @@ describe('estimateEnrichmentCost (ENG-2716)', () => {
     expect(e.breakdownUsd.apollo).toBeCloseTo(0.45, 2);
   });
 
-  // Oct 30 - Nov 3: one list, 146 emailless contacts that all had a name and company; 60 broker requests; $37.30 booked.
-  it('backtest: a 146-contact list of broker-eligible emailless leads quotes within 5% of the $37.30 booked', () => {
+  // 2026-11-03: one list, 146 emailless contacts that all had a name and company; 60 broker requests; $37.19 booked.
+  it('backtest: a 146-contact list of broker-eligible emailless leads quotes within 5% of the $37.19 booked', () => {
     const e = estimateEnrichmentCost('l', 146, { emaillessCount: 146, brokerEligibleCount: 146, fieldCount: 10 });
-    expect(e.totalUsd).toBeGreaterThan(37.3 * 0.95);
-    expect(e.totalUsd).toBeLessThan(37.3 * 1.05);
+    expect(e.totalUsd).toBeGreaterThan(37.19 * 0.95);
+    expect(e.totalUsd).toBeLessThan(37.19 * 1.05);
     expect(e.breakdownUsd.apollo).toBeCloseTo(60 * 0.445, 1);
   });
 

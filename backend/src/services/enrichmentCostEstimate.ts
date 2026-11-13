@@ -15,12 +15,12 @@ import { getAllocatedRate } from '../utils/vendorRateCard';
 /**
  * Recalibrated 2026-11-12 (ENG-2720) against what prod actually booked. Customer runs since the 2026-11-04 changes
  * (prod logs `runEnrichment DONE` joined to the `AW-UsageRecords` ledger by user and day; test accounts excluded):
- * 118 contacts, 5 customers, $8.09 booked, $0.0686 per contact; the previous constants quoted ~$14.8 for those runs
- * (+83%), mostly from the Apollo line. The Apollo broker (group tier 3.5a / resolver 6.5) only fires for a lead with
+ * 118 contacts, 5 customers, $8.09 booked, $0.0686 per contact; the previous constants quoted $14.4-14.8 for those runs
+ * (+78% to +83% depending on the field count), about 60% of it from the Apollo line. The Apollo broker (group tier 3.5a / resolver 6.5) only fires for a lead with
  * no email that has a first and last name plus a company or domain, so the line is now priced on those leads:
  * prod logs Oct 29 - Nov 12 show 60 of 146 such leads firing it on one list (41%) and 1 of 30 emailless leads
- * without a name on another (3.3%). Backtest of the new constants: Nov 4+ runs $8.20 vs $8.09 booked (+1%); the
- * Oct 30 - Nov 3 list with 146 eligible leads $36.9 vs $37.3 booked (-1%). The calibration rests on few lists;
+ * without a name on another (3.3%). Backtest of the new constants: Nov 4+ runs $8.25 vs $8.09 booked (+2%); the
+ * 11-03 list with 146 eligible leads $36.9 vs $37.19 booked (-1%). The calibration rests on few lists;
  * re-check it against the ledger as more runs land.
  */
 export const ENRICHMENT_COST_RATES_USD = {
