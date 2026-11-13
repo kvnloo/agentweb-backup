@@ -156,7 +156,7 @@ export type ApprovalQuestionInput = { kind: string; priceText: string } & (
 function questionText(input: ApprovalQuestionInput): string {
   switch (input.action) {
     case 'provision':
-      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released.${input.coveredByAddon ? ' This rent is covered by the $70 per month hot lead calls add-on, so it is not charged to you separately.' : ' Calls placed from it are also billed per minute.'}`;
+      return `Buy a phone number${input.areaCode ? ` in area code ${input.areaCode}` : ''} for hot lead calls? It costs ${input.priceText}, charged now and every month until the number is released.${input.coveredByAddon ? ' The $70 per month hot lead calls add-on includes one calling number, so this rent is part of that price.' : ' Calls placed from it are also billed per minute.'}`;
     case 'release':
       return `Release the hot lead caller number${input.number ? ` ${input.number}` : ''}? Calling is turned off, the number goes back to the phone provider and cannot be recovered, and a new one may be a different number that costs ${input.priceText}.`;
     case 'enable': {

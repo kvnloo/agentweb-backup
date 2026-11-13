@@ -514,7 +514,7 @@ export async function applyHotLeadCallSettings(
       condition: unchangedSince({ hotLeadCall: previousRaw, ...(verification ? { hotLeadCallVerification: org.hotLeadCallVerification } : {}) }),
     });
   } catch (err) {
-    if (isConditionalFailure(err)) throw new ConflictError('The settings were changed by someone else. Reload them and try again.');
+    if (isConditionalFailure(err)) throw new ConflictError(`The settings were changed by someone else. Reload them and try again.${addOnBought ? ' The hot lead calls add-on is already active on your subscription and will not be charged again.' : ''}`);
     throw err;
   }
   return { dto: toDto({ hotLeadCall: next }, next, entitled && (addOnBought || await isHotLeadCallBillingActive(org))), config: next };

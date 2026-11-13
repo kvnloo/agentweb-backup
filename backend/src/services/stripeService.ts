@@ -1564,6 +1564,8 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             subscriptionType: updateData.subscriptionType,
             subscription_status: updateData.subscription_status,
           });
+          // The deleted subscription may have carried the hot lead calls add-on: judge it from the surviving one.
+          await mirrorHotLeadCallBilling(user, activeSub);
           console.log(
             `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
           );
