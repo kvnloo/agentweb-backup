@@ -1407,6 +1407,24 @@ createTestAccount().then(async () => {
         console.error('[outlookBounceMonitorCron] Failed to initialize:', error);
       }
 
+      // Gmail Bounce Monitor (ENG-2981) — parity with Resend/Outlook auto-DNC for
+      // Gmail-connected senders: polls DSNs, flags permanent 5.x bounces DNC, and
+      // records email.bounced events. Runs every 15 minutes.
+      try {
+        const { runGmailBounceMonitor } = await import('./cron/gmailBounceMonitorCron');
+        const GMAIL_BOUNCE_MONITOR_INTERVAL_MS = 15 * 60 * 1000;
+        cronJobRegistry.track('gmailBounceMonitorCron', runGmailBounceMonitor())
+          .catch(e => console.error('[gmailBounceMonitorCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('gmailBounceMonitorCron', runGmailBounceMonitor())
+            .catch(e => console.error('[gmailBounceMonitorCron] Error:', e));
+        }, GMAIL_BOUNCE_MONITOR_INTERVAL_MS);
+        console.log('[gmailBounceMonitorCron] Initialized — running every 15 minutes');
+      } catch (error) {
+        console.error('[gmailBounceMonitorCron] Failed to initialize:', error);
+      }
+
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
       // Notion oncall task per day grouped by stage. The cron itself is well-
       // designed but the broader telemetry pipeline (incl. per-event UI Error

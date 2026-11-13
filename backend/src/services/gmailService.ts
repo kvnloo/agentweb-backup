@@ -277,6 +277,37 @@ export class GmailService implements IEmailService {
   }
 
   /**
+   * ENG-2981: raw RFC 822 source of messages matching a Gmail query, for the
+   * bounce monitor — DSN delivery-status parts (Final-Recipient, Status) are
+   * not exposed by extractBody, so the monitor parses the raw source itself.
+   */
+  async listRawMessages(
+    userId: string,
+    accountId: string,
+    query: string,
+    maxResults = 100,
+  ): Promise<Array<{ id: string; receivedAt?: string; raw: string }>> {
+    const gmail = await this.getGmailClient(userId, accountId);
+    const listData = await this.withQuotaRetry(() =>
+      gmail.users.messages.list({ userId: 'me', q: query, maxResults })
+    );
+    const out: Array<{ id: string; receivedAt?: string; raw: string }> = [];
+    for (const m of listData.data.messages || []) {
+      if (!m.id) continue;
+      const id = m.id;
+      const detail = await this.withQuotaRetry(() =>
+        gmail.users.messages.get({ userId: 'me', id, format: 'raw' })
+      );
+      out.push({
+        id,
+        receivedAt: this.receivedAtIso(detail.data.internalDate),
+        raw: detail.data.raw ? this.decodeBase64Url(detail.data.raw) : '',
+      });
+    }
+    return out;
+  }
+
+  /**
    * Get the full content of a specific email by ID
    */
   async getEmail(userId: string, accountId: string, messageId: string): Promise<EmailDetail> {

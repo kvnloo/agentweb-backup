@@ -171,6 +171,9 @@ export interface GmailConfig extends BaseOAuthConfig {
   display_name?: string;   // User's display name from Google profile
   picture_url?: string;    // Profile picture URL
   granted_scopes: string[]; // Actual scopes granted (may differ from requested)
+  // Watermark for gmailBounceMonitorCron (ENG-2981) — the latest DSN internalDate
+  // scanned, so each run only looks at bounce mail since the previous one.
+  lastBounceCheckAt?: string;
 }
 
 /**
