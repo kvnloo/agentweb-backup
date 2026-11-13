@@ -28,6 +28,7 @@ import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { buildCallConsentRecord, pageUrlOf, parseCallConsent, type CallConsentRecord } from '../services/voice/callConsent';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
@@ -592,6 +593,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // what the value actually is: the VISITOR, not whoever made this request.
       visitorIp: declaredClientIp,
       visitorUserAgent: declaredClientUserAgent,
+      // ENG-2783: the call-consent notice the visitor agreed to, and the page it was on (declared by the capture
+      // route, which is the only place the Referer is knowable). Both are listed in HANDLED_TOP_LEVEL_KEYS below so
+      // they never become free-form custom fields, and neither is ever echoed in a response.
+      callConsent: rawCallConsent,
+      visitorPageUrl: declaredPageUrl,
     } = req.body;
 
     // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
@@ -720,6 +726,23 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (capturedClientIp) leadData.clientIp = capturedClientIp;
     if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
+    // ENG-2783: validate and stamp the call consent BEFORE any lead write, so a new lead is created with it already
+    // in the row and the call gates (which run from the create hook) can never see the lead without it. Anything
+    // that does not validate is ignored (never a 400: the lead is still created) with one warning of the reason code
+    // only; the lead then has no consent and the hot-lead call gate skips it (`no_call_consent`).
+    let callConsentRecord: CallConsentRecord | null = null;
+    const consentParse = parseCallConsent(rawCallConsent);
+    if (consentParse.ok) {
+      callConsentRecord = buildCallConsentRecord(consentParse, {
+        pageUrl: pageUrlOf(req.headers['referer']) ?? pageUrlOf(req.headers['origin']) ?? pageUrlOf(declaredPageUrl),
+        ip: capturedClientIp,
+        userAgent: capturedUserAgent,
+      });
+      leadData.system = { callConsent: callConsentRecord };
+    } else if (consentParse.reason !== 'absent') {
+      console.warn(`[forward-lead] call consent ignored: ${consentParse.reason}`);
+    }
+
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
     // nested under `customFields`) got a 201 and a visible lead row with the data gone.
@@ -749,6 +772,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // customFields as junk on every event. `sessionId` is deliberately NOT added: LPs
       // already post it (flat or in customFields) and read it back out of customFields.
       'sessionStartMs',
+      // ENG-2783: consumed above, never stored as free-form data.
+      'callConsent', 'visitorPageUrl',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -1218,6 +1243,24 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             isUpdated = true;
           }
         }
+      }
+    }
+
+    // ENG-2783: consent on a REPEAT submission. A new lead already carries it (written in the create input above). An
+    // existing lead that has none gets it recorded now, with a write that creates `system.callConsent` only if absent:
+    // the FIRST granted record is kept forever and a later one (same or different text) is IGNORED, not appended, so
+    // the proof of what the person first agreed to is never replaced. This runs before the dispatch below, which
+    // re-reads the lead consistently. A repeat submission DOES dispatch the call gates (notifyRepeatSubmission ->
+    // dispatchLeadCreated(..., submission)), and the only call-specific refusal that sticks is `has_record` (a call
+    // already happened), so a lead first skipped as `no_call_consent` and now resubmitting WITH consent is called by
+    // THAT submission, if every other gate passes. That is intended and visible: the earlier `call.skipped` stays on the
+    // timeline and the new `call.started` follows it. A failed write only warns: the lead is then skipped, never called.
+    if (callConsentRecord && !isNew && lead?.leadId && !lead.system?.callConsent) {
+      try {
+        const created = await crmDb.createLeadSystemRecordOnce(leadList.listId, lead.leadId, 'callConsent', callConsentRecord as unknown as Record<string, unknown>);
+        if (created) lead = { ...lead, system: { ...(lead.system || {}), callConsent: callConsentRecord } };
+      } catch (consentErr: unknown) {
+        console.warn(`[forward-lead] call consent not recorded on existing lead: ${consentErr instanceof Error ? consentErr.name : 'error'}`);
       }
     }
 
