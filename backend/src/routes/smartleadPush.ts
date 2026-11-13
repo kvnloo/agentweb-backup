@@ -10,7 +10,9 @@ import { scrubSmartleadSecrets } from '../services/smartleadService';
  */
 const router = express.Router();
 
-const perUser = (req: any) => String(req.user?.userId ?? 'anonymous');
+// An agent over MCP (a self-call, marked from the signed token; a header would be spoofable) has its own bucket, so a looping agent
+// cannot lock the person out of the approval dialog.
+const perUser = (req: any) => `${String(req.user?.userId ?? 'anonymous')}:${req.isSelfCall === true ? 'agent' : 'ui'}`;
 const limiter = (limit: number, message: string) =>
   rateLimit({ windowMs: 15 * 60 * 1000, limit, standardHeaders: true, legacyHeaders: false, keyGenerator: perUser, validate: { keyGeneratorIpFallback: false }, message: { error: message, code: 'rate_limited' } });
 

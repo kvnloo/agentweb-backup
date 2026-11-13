@@ -4,6 +4,7 @@ import request from 'supertest';
 jest.mock('../../middleware/auth', () => ({
   authenticateToken: jest.fn((req: any, _res: any, next: any) => {
     req.user = { userId: req.headers['x-test-user'] || 'user-123' };
+    req.isSelfCall = req.headers['x-test-self-call'] === '1';
     next();
   }),
 }));
@@ -51,6 +52,16 @@ describe('Smartlead push routes (ENG-673)', () => {
     const res = await request(app()).get(`${base}/campaigns/${id}/stats`).set('x-test-user', user());
     expect(res.status).toBe(400);
     expect(svc.campaignStats).not.toHaveBeenCalled();
+  });
+
+  it('an agent (self-call) and the person have separate rate-limit buckets: a looping agent cannot lock the person out', async () => {
+    svc.campaigns.mockResolvedValue({ ok: true, connection: {}, campaigns: [] });
+    const u = user();
+    let last = 0;
+    for (let i = 0; i < 31; i++) last = (await request(app()).get(`${base}/campaigns`).set('x-test-user', u).set('x-test-self-call', '1')).status;
+    expect(last).toBe(429); // the agent's bucket (30 per 15 minutes) is spent
+    const person = await request(app()).get(`${base}/campaigns`).set('x-test-user', u);
+    expect(person.status).toBe(200); // the person's bucket is untouched
   });
 
   it('ignores a user id in the body on start too', async () => {

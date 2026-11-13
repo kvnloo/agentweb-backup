@@ -53,7 +53,7 @@ export function listedToolNames(): string[] {
 const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
   'email:read': ['read_email', 'list_connected_accounts'],
   // list_lead_lists gives the listId a preview needs.
-  'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status', 'list_lead_lists'],
+  'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status'],
   // A runId comes from get_smartlead_push_status, which needs smartlead:read: agents get both scopes.
   'smartlead:control': ['pause_smartlead_push', 'cancel_smartlead_push'],
 };
@@ -63,6 +63,10 @@ export function getListedToolDefinitions(grantedScopes?: string[]): any[] {
   const listed = new Set(listedToolNames());
   for (const scope of grantedScopes ?? []) {
     for (const name of SCOPE_LISTED_TOOL_NAMES[scope] ?? []) listed.add(name);
+  }
+  // A Smartlead agent needs a listId for a preview: list_lead_lists (a read) is listed with smartlead:read only when the key can call it.
+  if ((grantedScopes ?? []).includes('smartlead:read') && (grantedScopes ?? []).some(s => s === 'tools:read' || s === 'tools:execute')) {
+    listed.add('list_lead_lists');
   }
   return mcpToolRegistry.getToolDefinitions().filter((d: any) => listed.has(d.name));
 }
