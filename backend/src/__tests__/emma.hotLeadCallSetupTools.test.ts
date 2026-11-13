@@ -1211,9 +1211,9 @@ describe('hot lead calls add-on (ENG-2783)', () => {
     await call();
     expect(addHotLeadCallBilling).not.toHaveBeenCalled();
   });
-  it('the number card says the rent is covered by the $70', async () => {
+  it('the number card says the rent is part of the $70 price', async () => {
     org.hotLeadCall = configured({ verified: true });
     const halt = (await run('provision_hot_lead_call_number', {}, attended())) as Halt;
-    expect(card(halt).question).toContain('covered by the $70 per month hot lead calls add-on');
+    expect(card(halt).question).toContain('this rent is part of that price');
   });
 });
