@@ -1,4 +1,5 @@
 import { addCompanionTools } from './agentMode/companionTools';
+import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -15606,6 +15607,51 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return executeExperimentRead(name, args, credentials);
   }
 
+  /**
+   * ENG-2980: account-bound Graph call for the experiment write tools. GET reads a numeric
+   * node or the account's own ad_studies edge; POST creates on the account's ad_studies edge
+   * or updates a numeric study node. metaToolkitExperimentWrites proves campaign and study
+   * ownership before calling. `outcomeUnknown` marks a failure without a definite Meta answer.
+   */
+  public async toolkitMetaExperimentGraph(
+    userId: string, account_id: string, method: 'GET' | 'POST', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+\/ad_studies|\d+)$/.test(path)) throw new Error('Unsupported experiment path.');
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      // Meta creates ad studies only on a Business or User ad_studies edge; the ad-account edge
+      // is read-only. Create on the account's owning business (else the token's user). The
+      // study's campaigns still come from this account and the write path reads it back.
+      let target = path;
+      if (method === 'POST' && path.startsWith('act_')) {
+        const { data: acct } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path.split('/')[0]}`, {
+          params: { fields: 'business{id}', access_token: accessToken }, timeout: 30_000,
+        });
+        const businessId = acct?.business?.id ? String(acct.business.id) : '';
+        target = /^\d+$/.test(businessId) ? `${businessId}/ad_studies` : 'me/ad_studies';
+      }
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${target}`,
+        params: { ...(method === 'GET' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
   public async readToolkitMetaActivityLog(userId: string, args: any) {
     const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
@@ -16724,8 +16770,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
+    /**
+     * ENG-2962: set when the answer came from an MCP tool acting on someone's behalf (a self-call). It may not approve a card only a
+     * person may approve; decided here, on the very deck the answers are applied to (the write below is conditional on that deck
+     * still awaiting), not on an earlier read in the route.
+     */
+    options?: { refusePersonOnlyApprovals?: boolean },
   ): Promise<
     | { outcome: 'invalid'; reason: string }
+    | { outcome: 'needs_person'; actions: string[] }
     | { outcome: 'conflict' }
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
@@ -16746,6 +16799,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outcome: 'invalid',
         reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
       };
+    }
+
+    if (options?.refusePersonOnlyApprovals) {
+      const blocked = personOnlyApprovalsIn(deck, inboundAnswers);
+      if (blocked.length > 0) return { outcome: 'needs_person', actions: blocked.map(b => b.action) };
     }
 
     let answered: PendingApprovalDeck;

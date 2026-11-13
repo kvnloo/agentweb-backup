@@ -678,6 +678,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       callerOrg
         ? await resolveOrgProfileField(caller, callerOrg, "brandGuidelines")
         : undefined,
+      callerOrg,
     );
     const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
 
@@ -1117,6 +1118,7 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     const brandContext = buildBrandContextFromUser(
       user,
       org ? await resolveOrgProfileField(user, org, "brandGuidelines") : undefined,
+      org,
     );
 
     // ENG-326 AC-3: duplicating re-generates the page — same gate as

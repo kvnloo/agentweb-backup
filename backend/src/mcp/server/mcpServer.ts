@@ -24,7 +24,7 @@ import { validateRef } from '../../services/journeyAttribution';
 export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
-import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findScopeDenial } from './apiKeyScopes';
+import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findApiKeyOnlyToolCallForNonKey, findScopeDenial } from './apiKeyScopes';
 import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
@@ -318,6 +318,21 @@ export function setupMcpServer(
           error: {
             code: -32003,
             message: `Forbidden: API key lacks scope '${denial.requiredScope}' required for tool '${denial.tool}'. Create a key with that scope at https://agentweb.pro (Settings > API Keys).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
+    }
+    // Smartlead tools and other `apiKeyOnly` tools: only an aw_ key holding the scope (checked above) may call them. Every other
+    // external caller, OAuth included, is refused here on the request's own auth method.
+    if ((req as any)._mcpIsInternal !== true && (req as any)._mcpAuthMethod !== 'api_key') {
+      const denial = findApiKeyOnlyToolCallForNonKey(req.body, (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: tool '${denial.tool}' needs an AgentWeb API key that holds the '${denial.requiredScope}' scope (Settings > API Keys at https://agentweb.pro).`,
           },
           id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
         });

@@ -12,6 +12,8 @@ import {
   applyHotLeadCallSettings, canonicalJson, getHotLeadCallSettings, hotLeadCallRevisionOf, storedHotLeadCallConfig, type HotLeadCallSettingsDto,
 } from '../services/hotLeadCallSettingsService';
 import { callRateText } from '../services/voice/numberProvisioning';
+import { isHotLeadCallBillingActive, isHotLeadCallBillingRequired } from '../services/voice/hotLeadCallEntitlement';
+import { addHotLeadCallBilling, HOT_LEAD_CALL_ADDON_PRICE_TEXT } from '../services/hotLeadCallBillingService';
 
 // A member created from chat with a bare phone has no schedule of their own, so they are available whenever the calling hours are open.
 const ALWAYS_AVAILABLE: HotLeadCallWindow = { days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '24:00' };
@@ -99,7 +101,7 @@ emmaToolRegistry.register({
   name: 'update_hot_lead_call_settings',
   definition: {
     name: 'update_hot_lead_call_settings',
-    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs a team (or memberPhone) and announcedName. With one team member, memberPhone and memberName edit that member (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported). For several people send team: the FULL list in priority order (first is called first); it replaces the stored team, people left out are removed, an entry with an id edits that person (their phone is kept when omitted), an entry without an id is a new person and needs a phone, and each person needs 1 to ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows read in the calling-hours timezone. At most ${HOT_LEAD_CALL_MAX_TEAM_SIZE} people. Changing a person’s phone clears their verification (and turns calling off if nobody verified is left) until the system re-verifies it. maxAttemptsPerLead (1-5, default 3) is how many people are tried for one lead. maxCallsPerHour and maxCallsPerDay count leads that get a call: a lead uses one slot however many people are tried for it. maxCallsPerMonth (1-200, default 200) is the same per calendar month; higher monthly limits are set by AgentWeb support. enabled:true is refused until a team member's phone is verified, a caller number is assigned and calling hours are set, and when the organization's plan does not include hot lead calls. Once it can work, the user must approve turning calling on: the first call stops with an approval card that says who will be phoned and what calls cost, and calling is turned on only when you call this tool again with the same arguments after they clicked approve (approval lasts 15 minutes and works once; do not ask for it in text). Turning calling off and every other change need no approval. Verification and the caller number are managed by the system and cannot be set here. callingHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight). Leads are also called only 10:00-18:00 their own time (so in practice about 13:00-18:00 Eastern for most US numbers); Canadian numbers are not called. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters. In a scheduled or otherwise unattended run, anything that raises a limit, widens the calling hours, turns calling on or edits the team is refused; ask in an interactive chat.`,
+    description: `Change your organization’s hot lead auto-call settings (org owners/admins only). Only the fields you send change; everything else is kept. The first save needs a team (or memberPhone) and announcedName. With one team member, memberPhone and memberName edit that member (US or Canada only, no extension; Puerto Rico, Guam and other territories are not supported). For several people send team: the FULL list in priority order (first is called first); it replaces the stored team, people left out are removed, an entry with an id edits that person (their phone is kept when omitted), an entry without an id is a new person and needs a phone, and each person needs 1 to ${HOT_LEAD_CALL_MAX_WINDOWS_PER_MEMBER} availability windows read in the calling-hours timezone. At most ${HOT_LEAD_CALL_MAX_TEAM_SIZE} people. Changing a person’s phone clears their verification (and turns calling off if nobody verified is left) until the system re-verifies it. maxAttemptsPerLead (1-5, default 3) is how many people are tried for one lead. maxCallsPerHour and maxCallsPerDay count leads that get a call: a lead uses one slot however many people are tried for it. maxCallsPerMonth (1-200, default 150) is the same per calendar month; higher monthly limits are set by AgentWeb support. enabled:true is refused until a team member's phone is verified, a caller number is assigned and calling hours are set, and when the organization's plan does not include hot lead calls. Once it can work, the user must approve turning calling on: the first call stops with an approval card that says who will be phoned and what calls cost, and calling is turned on only when you call this tool again with the same arguments after they clicked approve (approval lasts 15 minutes and works once; do not ask for it in text). When the organization must pay for the hot lead calls add-on ($70 per month, includes one calling number and 150 lead calls per month) the same card states that price and the add-on is added to the owner's subscription only after approval; if that fails nothing is turned on. Turning calling off (it does not cancel the add-on) and every other change need no approval. Verification and the caller number are managed by the system and cannot be set here. callingHours is the window in which calls ARE allowed (24h HH:MM in the given timezone, default 08:00-21:00; start later than end wraps past midnight). Leads are also called only 10:00-18:00 their own time (so in practice about 13:00-18:00 Eastern for most US numbers); Canadian numbers are not called. timezone must be an IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused; letter case is normalised). leadTypes must contain at least one type (default form_fill). announcedName is read aloud on the call as the caller and is the name in the consent notice, so it must be the business's registered (legal) name, not a brand or nickname: letters, digits, spaces and . , & ' - only, max ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters. In a scheduled or otherwise unattended run, anything that raises a limit, widens the calling hours, turns calling on or edits the team is refused; ask in an interactive chat.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -123,7 +125,7 @@ emmaToolRegistry.register({
         },
         leadTypes: { type: 'array', items: { type: 'string', enum: [...LEAD_ORIGINS] }, uniqueItems: true, minItems: 1, maxItems: LEAD_ORIGINS.length },
         ...Object.fromEntries(HOT_LEAD_CALL_LIMIT_FIELDS.map(f => [f, { type: 'integer', minimum: HOT_LEAD_CALL_LIMITS[f].min, maximum: f === 'maxCallsPerMonth' ? HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH : HOT_LEAD_CALL_LIMITS[f].max }])),
-        announcedName: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_ANNOUNCED_NAME_MAX },
+        announcedName: { type: 'string', minLength: 1, maxLength: HOT_LEAD_CALL_ANNOUNCED_NAME_MAX, description: 'The business\'s registered (legal) name: the name the lead hears as the caller and the name in the consent notice.' },
         callingHours: {
           type: 'object',
           properties: { start: { type: 'string', pattern: HHMM.source }, end: { type: 'string', pattern: HHMM.source }, timezone: { type: 'string', description: 'An IANA Area/Location name such as America/Chicago (UTC, abbreviations and Etc/ zones are refused).' } },
@@ -157,19 +159,25 @@ emmaToolRegistry.register({
     // The tool edits the copy it just read; the service's conditional write is what catches a concurrent editor.
     // Turning calling on is the one change that waits for a person's approval; the portal's own click covers REST.
     const requireEnableApproval = async (next: HotLeadCallConfig) => {
+      // With billing required and the add-on not active, the card quotes the flat price (part of the approved digest)
+      // and the add-on is bought only after the approval, just before the settings write below.
+      const needsAddon = isHotLeadCallBillingRequired() && !await isHotLeadCallBillingActive(org);
       const halt = await requireApproval({
         org,
         context,
-        priceText: callRateText(),
+        priceText: needsAddon ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
         target: canonicalJson(patch),
         card: {
           action: 'enable',
           number: next.twilioNumber && maskPhone(next.twilioNumber),
           members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
           limits: next,
+          addon: needsAddon,
         },
       });
       if (halt) throw new ApprovalHalt(halt);
+      // Throws a plain message when Stripe refuses; the settings are then not written and calling stays off.
+      if (needsAddon) await addHotLeadCallBilling(org.orgId);
     };
     try {
       const { dto, config } = await applyHotLeadCallSettings(org, caller, { ...body, _revision: hotLeadCallRevisionOf(org.hotLeadCall) }, requireEnableApproval);

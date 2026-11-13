@@ -451,7 +451,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     // Solo user: the shared projection (unit-tested in services.v0Service
     // .test.ts) gets the caller record and NO org override…
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, undefined);
+    // ENG-2783: the third argument is the caller's org (null for a solo user), used only for the consent notice's business name.
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, undefined, null);
     // …and its result reaches generation untouched.
     expect(mockGenerateLandingPage.mock.calls[0][3]).toBe(projected);
   });
@@ -499,7 +500,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
     };
     const userRecord = { userId: "test-user-id", orgId: "org-1", orgRole: "owner" };
     mockGetUserById.mockResolvedValue(userRecord);
-    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand });
+    const orgRecord = { orgId: "org-1", brandGuidelines: orgBrand };
+    mockGetOrgById.mockResolvedValue(orgRecord);
     mockBuildBrandContextFromUser.mockReturnValue({
       brandName: "OrgBrand",
       logoUrl: "https://s3/org/logo.png",
@@ -511,7 +513,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
       .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
+    // ENG-2783: plus the org record itself (third argument), for the consent notice's business name.
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand, orgRecord);
   });
 
   it("SUCCESS: template_id provided → loads and extracts template from settings", async () => {
@@ -2124,7 +2127,8 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     };
     const userRecord = { userId: "test-user-id", orgId: "org-1", orgRole: "owner" };
     mockGetUserById.mockResolvedValue(userRecord);
-    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand });
+    const orgRecord = { orgId: "org-1", brandGuidelines: orgBrand };
+    mockGetOrgById.mockResolvedValue(orgRecord);
     const projected = { brandName: "OrgBrand", logoUrl: "https://s3/org/logo.png" };
     mockBuildBrandContextFromUser.mockReturnValue(projected);
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
@@ -2134,7 +2138,7 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
       .send({ name: "Copy" });
 
     expect(res.status).toBe(201);
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand, orgRecord); // ENG-2783: org passed as 3rd arg
     expect(mockGenerateLandingPage.mock.calls[0][3]).toBe(projected);
   });
 
@@ -3467,5 +3471,49 @@ describe("PUT /generated/:id/update-files (ENG-497)", () => {
 
     expect(res.status).toBe(400);
     expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+});
+
+
+// ENG-2783: where the consent notice's business name comes from, through the REAL projection, for BOTH generation routes.
+// announcedName > account companyName > org name > none (no registeredBusinessName, so the prompt carries no notice).
+describe("call-consent business name reaches generation (ENG-2783)", () => {
+  const orgBrand = { brandData: { brandName: "OrgBrand" }, attachments: [{ type: "logo", url: "https://s3/org/logo.png" }] };
+  const cases: Array<[string, { org: Record<string, unknown>; user: Record<string, unknown> }, string | undefined]> = [
+    ["the hot-lead-call announcedName wins", { org: { name: "Org Name", hotLeadCall: { announcedName: "Announced Plumbing" } }, user: { companyName: "Account Co" } }, "Announced Plumbing"],
+    ["else the account companyName", { org: { name: "Org Name" }, user: { companyName: "Account Co" } }, "Account Co"],
+    ["else the org name", { org: { name: "Org Name" }, user: {} }, "Org Name"],
+    ["else none (argument absent)", { org: {}, user: {} }, undefined],
+  ];
+  const setup = (c: { org: Record<string, unknown>; user: Record<string, unknown> }) => {
+    // The real v0Service cannot load in this suite (aws-sdk is mocked away), so the projection is a stand-in that adds the
+    // business name through the REAL light helper; what is proven here is that each route passes the right user and org to it.
+    const { registeredBusinessNameOf } = jest.requireActual("../services/voice/callConsentName");
+    mockBuildBrandContextFromUser.mockImplementation((user: any, _brand: unknown, org: any) => {
+      const name = registeredBusinessNameOf(org, user);
+      return { brandName: "OrgBrand", logoUrl: "https://s3/org/logo.png", ...(name ? { registeredBusinessName: name } : {}) };
+    });
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id", orgId: "org-1", orgRole: "owner", ...c.user });
+    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand, ...c.org });
+  };
+
+  it.each(cases)("generate: %s", async (_n, c, expected) => {
+    setup(c);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+    const res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Create a page", lead_list_id: "list-1" });
+    expect(res.status).toBe(201);
+    const brand = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brand.registeredBusinessName).toBe(expected);
+    expect("registeredBusinessName" in brand).toBe(expected !== undefined);
+  });
+
+  it.each(cases)("duplicate: %s", async (_n, c, expected) => {
+    setup(c);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+    const res = await request(app).post("/api/landing-pages/v0/generated/page-1/duplicate").send({ name: "Copy" });
+    expect(res.status).toBe(201);
+    const brand = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brand.registeredBusinessName).toBe(expected);
+    expect("registeredBusinessName" in brand).toBe(expected !== undefined);
   });
 });

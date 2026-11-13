@@ -34,6 +34,7 @@ import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './z
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
+import { EXPERIMENT_WRITE_KIND, isMetaExperimentWrite, isMetaExperimentWriteTool, runMetaExperimentWriteTool } from './metaToolkitExperimentWrites';
 import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
 import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
@@ -114,6 +115,8 @@ export interface MetaToolkitGatewayDeps {
   runCatalogWriteTool?: typeof runMetaCatalogWriteTool;
   /** ENG-2927 catalog event sources; defaults to runMetaEventSourceTool. */
   runEventSourceTool?: typeof runMetaEventSourceTool;
+  /** ENG-2980 experiment eligibility + A/B / lift writes; defaults to runMetaExperimentWriteTool. */
+  runExperimentWriteTool?: typeof runMetaExperimentWriteTool;
   /** ENG-2926 catalog create/update, feeds, upload sessions, feed rules; defaults to runMetaCatalogFeedTool. */
   runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
@@ -397,7 +400,8 @@ export async function handleMetaToolkitCall(
       ? isAudienceWriteRequest(args)
       : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
         || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
-        || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName),
+        || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
+        || isMetaExperimentWrite(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors' || request.toolName === 'ads_get_help_article') {
@@ -408,7 +412,8 @@ export async function handleMetaToolkitCall(
   const metaWrite = audienceTool ? isAudienceWriteRequest(args)
     : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
       || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
-      || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName);
+      || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
+        || isMetaExperimentWrite(request.toolName);
   return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
@@ -468,6 +473,15 @@ export async function handleMetaToolkitCall(
     const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(pages);
+  }
+
+  // ENG-2980: experiment eligibility (read) + preview-confirmed A/B and lift writes.
+  if (isMetaExperimentWriteTool(request.toolName)) {
+    const result: any = await (deps.runExperimentWriteTool ?? runMetaExperimentWriteTool)(request.toolName, caller.userId, accountId, args);
+    const kind = EXPERIMENT_WRITE_KIND[request.toolName];
+    if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
+    await meter('meta');
+    return stripCredentials(result);
   }
 
   // ENG-2919: read-only experiment (ad study) tools; tools:read scope, no write metering.

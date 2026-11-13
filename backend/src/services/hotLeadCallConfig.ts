@@ -34,13 +34,13 @@ export const HOT_LEAD_CALL_LIMITS = {
   maxCallsPerDay: { default: 20, min: 1, max: 100 },
   // Leads that get a call in one org-local calendar month (ENG-2783). Stored values up to `max` are valid (an operator
   // raises a customer's limit by a data write); owner-level routes may only set up to HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH.
-  maxCallsPerMonth: { default: 200, min: 1, max: 2000 },
+  maxCallsPerMonth: { default: 150, min: 1, max: 2000 },
   memberCooldownMinutes: { default: 2, min: 1, max: 60 },
   /** Calls placed for one lead (each to a different team member) before giving up. */
   maxAttemptsPerLead: { default: 3, min: 1, max: 5 },
 } as const;
-/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set: the default. Higher values are an operator's data write. */
-export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = HOT_LEAD_CALL_LIMITS.maxCallsPerMonth.default;
+/** The highest maxCallsPerMonth an owner (Emma tool, REST PUT) may set. Independent of the default (150, the included allowance): an owner may raise it to 200. Higher values are an operator's data write. */
+export const HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH = 200;
 /**
  * Platform-wide ceiling (ENG-2783): leads that get a call per UTC day across ALL orgs. It bounds Twilio spend when a bug, an
  * abusive org or a spike gets past the per-org caps. 300 is a conservative starting value chosen by the builder (about

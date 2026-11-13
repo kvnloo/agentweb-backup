@@ -22,6 +22,14 @@
 export const API_KEY_SCOPE_READ = 'tools:read';
 export const API_KEY_SCOPE_EXECUTE = 'tools:execute';
 export const API_KEY_SCOPE_EMAIL_READ = 'email:read';
+/**
+ * Smartlead over MCP (ENG-673 follow-on, for the Hermes agents). Opt-in like email:read, and for `aw_` keys only: a signed-in OAuth
+ * client (including marketplace clients) does not get them. `smartlead:read` reads the user's own campaigns, their numbers, a push
+ * preview and push progress; `smartlead:control` pauses or cancels a push (stop actions only). Starting, resuming or releasing a push is
+ * never offered over MCP: a person approves those in the portal.
+ */
+export const API_KEY_SCOPE_SMARTLEAD_READ = 'smartlead:read';
+export const API_KEY_SCOPE_SMARTLEAD_CONTROL = 'smartlead:control';
 export const DEFAULT_API_KEY_SCOPES = [API_KEY_SCOPE_READ, API_KEY_SCOPE_EXECUTE];
 
 export function effectiveApiKeyScopes(scopes: unknown): string[] {
@@ -33,7 +41,7 @@ export interface ScopeDenial {
   requiredScope: string;
 }
 
-type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string } | undefined;
+type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string; apiKeyOnly?: boolean } | undefined;
 
 export function requiredScopeForTool(name: string, lookup: ToolLookup): string {
   const tool = lookup(name);
@@ -65,6 +73,21 @@ export function findApiKeyOnlyToolCall(body: unknown, lookup: ToolLookup): Scope
     const tool = String((message as any)?.params?.name ?? '');
     const requiredScope = lookup(tool)?.requiredScope;
     if (requiredScope && isOptInScope(requiredScope)) return { tool, requiredScope };
+  }
+  return null;
+}
+
+/**
+ * For any external caller that is not an `aw_` key (OAuth included): the first tools/call that targets an `apiKeyOnly` tool. Checked on
+ * the request's own auth method, so an OAuth request cannot borrow a session that a key opened.
+ */
+export function findApiKeyOnlyToolCallForNonKey(body: unknown, lookup: ToolLookup): ScopeDenial | null {
+  const messages = Array.isArray(body) ? body : [body];
+  for (const message of messages) {
+    if ((message as any)?.method !== 'tools/call') continue;
+    const tool = String((message as any)?.params?.name ?? '');
+    const handler = lookup(tool);
+    if (handler?.apiKeyOnly) return { tool, requiredScope: handler.requiredScope ?? '' };
   }
   return null;
 }

@@ -327,7 +327,7 @@ describe('ClickUp Auth Routes', () => {
         .get('/api/oauth/clickup/status')
         .expect(200);
 
-      expect(response.body).toEqual({ connected: true, workspaces: [] });
+      expect(response.body).toEqual({ connected: true, workspaces: [], scope: 'solo' });
     });
 
     it('should return connected with workspaces on valid token', async () => {
@@ -349,6 +349,7 @@ describe('ClickUp Auth Routes', () => {
       expect(response.body).toEqual({
         connected: true,
         workspaces: [{ id: 'ws-1', name: 'Workspace 1', avatar: null }],
+        scope: 'solo',
       });
       expect(mockAxiosGet).toHaveBeenCalledWith(
         'https://api.clickup.com/api/v2/team',
@@ -362,13 +363,13 @@ describe('ClickUp Auth Routes', () => {
         secrets: { clickup_access_token: 'encrypted-token' },
       });
       mockDecryptPassword.mockReturnValue({ password: 'expired-token' });
-      mockAxiosGet.mockRejectedValue(new Error('Request failed with status code 401'));
+      mockAxiosGet.mockRejectedValue(Object.assign(new Error('Request failed with status code 401'), { response: { status: 401 } }));
 
       const response = await request(app)
         .get('/api/oauth/clickup/status')
         .expect(200);
 
-      expect(response.body).toEqual({ connected: false, workspaces: [] });
+      expect(response.body).toEqual({ connected: false, workspaces: [], reason: 'invalid_token' });
     });
   });
 

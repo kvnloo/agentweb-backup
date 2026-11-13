@@ -2040,7 +2040,47 @@ export class GoogleAdsService {
       }
     }
     const { resource, operations } = buildDeviceBidAdjustmentOperations(params, existing);
-    await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
+    const res = await this.mutate(params.customerId, accessToken, resource, operations, loginCustomerId);
+    await this.verifyDeviceBidModifiersReadBack(params, operations, res, accessToken, loginCustomerId);
+  }
+
+  /**
+   * ENG-2398: prove every device bid modifier landed. Read each targeted criterion / ad-group
+   * bid modifier back and compare bid_modifier numerically (proto3 JSON omits a 0 value, so a
+   * missing field reads as 0 — that is the -100% "exclude device" case). Any mismatch or
+   * missing resource throws GoogleAdsReadBackError, never a silent success.
+   */
+  private async verifyDeviceBidModifiersReadBack(
+    params: NormalizedDeviceBidAdjustments,
+    operations: any[],
+    mutateResult: any,
+    accessToken: string,
+    loginCustomerId?: string,
+  ): Promise<void> {
+    const entity = params.scope === 'CAMPAIGN' ? 'campaign_criterion' : 'ad_group_bid_modifier';
+    const rowKey = params.scope === 'CAMPAIGN' ? 'campaignCriterion' : 'adGroupBidModifier';
+    const results: any[] = mutateResult?.results ?? [];
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      const resourceName: string | undefined = op.update?.resourceName ?? results[i]?.resourceName;
+      const expected = Number(op.update?.bidModifier ?? op.create?.bidModifier);
+      if (!resourceName || !this.isValidGoogleAdsResourceName(resourceName)) {
+        throw new GoogleAdsReadBackError(resourceName ?? '<missing resource name>', ['<invalid resource name>']);
+      }
+      const rows = await this.search(
+        params.customerId, accessToken,
+        `SELECT ${entity}.resource_name, ${entity}.bid_modifier FROM ${entity} WHERE ${entity}.resource_name = '${resourceName}'`,
+        loginCustomerId,
+      );
+      const row = rows[0]?.[rowKey];
+      if (!row) throw new GoogleAdsReadBackError(resourceName, [`<${entity} not found on read-back>`]);
+      const actual = Number(row.bidModifier ?? 0);
+      if (!Number.isFinite(actual) || Math.abs(actual - expected) > 1e-6) {
+        const err = new GoogleAdsReadBackError(resourceName, ['bid_modifier']);
+        console.error('[GoogleAds] read-back mismatch', { code: err.code, resource: resourceName, fields: ['bid_modifier'] });
+        throw err;
+      }
+    }
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
@@ -2560,6 +2600,10 @@ export class GoogleAdsService {
       update: { resourceName: assetGroupResourceName, finalUrls: retaggedUrls },
       updateMask: 'final_urls',
     }], loginCustomerId);
+    // ENG-2398: prove the full array landed (final_urls replaces the whole array).
+    await this.verifyFieldsReadBack(customerId, accessToken, 'asset_group', assetGroupResourceName, {
+      finalUrls: { gaql: 'final_urls', value: retaggedUrls },
+    }, loginCustomerId);
     return { success: true };
   }
 

@@ -241,6 +241,22 @@ describe('updateHotLeadCallSettings: field errors by position', () => {
     table.org.hotLeadCall = stored({ enabled: false });
     expect((await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), enabled: true })).enabled).toBe(true);
   });
+  describe('the paid add-on (HOT_LEAD_CALL_BILLING_REQUIRED) on the portal save, which has no purchase hook', () => {
+    afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+    it('refuses turning calling on while required and not active, with the way to subscribe', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      table.org.hotLeadCall = stored({ enabled: false });
+      await expect(updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), enabled: true })).rejects.toThrow(/add-on/);
+      expect((table.org.hotLeadCall as { enabled: boolean }).enabled).toBe(false);
+    });
+    it('allows it once the add-on is active, and always allows saving without turning calling on', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      table.org.hotLeadCall = stored({ enabled: false });
+      expect((await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), maxAttemptsPerLead: 2 })).enabled).toBe(false);
+      table.org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: 'x' };
+      expect((await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), enabled: true })).enabled).toBe(true);
+    });
+  });
   it('does not require calling hours until calling is enabled', async () => {
     delete table.org.hotLeadCall;
     const dto = await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), team: [member()], announcedName: 'New Co', maxAttemptsPerLead: 2 });
@@ -400,8 +416,9 @@ describe('previewHotLeadCallSettings', () => {
 // ---- ENG-2783: monthly cap on the owner routes ------------------------------------------------------------------
 
 describe('maxCallsPerMonth on the owner routes', () => {
-  it('shows the default of 200 for a config stored without the field', async () => {
-    expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(200);
+  it('shows the default of 150 for a config stored without the field', async () => {
+    delete (table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth;
+    expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(150);
   });
   it.each([1, 150, 200])('accepts %i', async value => {
     expect((await put({ maxCallsPerMonth: value })).maxCallsPerMonth).toBe(value);

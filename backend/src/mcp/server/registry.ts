@@ -77,6 +77,12 @@ export interface McpToolHandler {
    * anonymous) outright. In-process callers (externalMcp unset) are unaffected.
    */
   requiredScope?: string;
+  /**
+   * When true (with `requiredScope`), only an `aw_` key holding that scope may call the tool from outside: a signed-in OAuth client is
+   * refused too, although OAuth otherwise gets every opt-in scope (OAuth parity, 2026-10-31). For tools that act on a customer's
+   * third-party account (Smartlead), where the customer decides which agent may do so by minting a scoped key.
+   */
+  apiKeyOnly?: boolean;
 }
 
 export { isAnonymousUserId } from '../anonymousToolAccess';
@@ -170,6 +176,11 @@ export class McpToolRegistry {
       );
     }
 
+    if (handler.apiKeyOnly && context?.externalMcp === true && context?.authMethod !== 'api_key') {
+      throw new Error(
+        `Tool ${name} needs an AgentWeb API key that holds the '${handler.requiredScope ?? 'required'}' scope.`
+      );
+    }
     // ENG-822: refuse account-scoped tools in an anonymous session BEFORE the
     // handler runs. Catching the downstream lookup failure would still burn the
     // round trip and still surface as an error; this turns a broken-looking
