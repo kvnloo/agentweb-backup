@@ -80,13 +80,15 @@ app.use(express.json({ limit: '50mb' }));
 app.use('/api/crm', router);
 
 const LIST = { listId: 'victim-list', userId: 'victim' };
-const cfgFields = Array.from({ length: 10 }, (_, i) => ({ name: `f${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
+// The first field is the email column (a saved config that requests an email can reach the Apollo broker).
+const cfgFields = Array.from({ length: 10 }, (_, i) => ({ name: i === 0 ? 'email' : `f${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockUser.userId = 'attacker';
   mockGetLeadList.mockResolvedValue(LIST);
-  mockGetLeads.mockResolvedValue({ items: [{ leadId: 'a', email: '' }, { leadId: 'b', email: 'a@acme.com' }], lastEvaluatedKey: undefined });
+  // Named leads with a company: an emailless one can reach the Apollo broker (the estimate prices only those at the full rate).
+  mockGetLeads.mockResolvedValue({ items: [{ leadId: 'a', email: '', firstName: 'Ada', lastName: 'Lovelace', company: 'Acme' }, { leadId: 'b', email: 'a@acme.com', firstName: 'Bo', lastName: 'Ng', company: 'Acme' }], lastEvaluatedKey: undefined });
   mockCheck.mockResolvedValue({ allowed: true, month: '2026-11', costAllowance: 80, costUsed: 5 });
   mockGetCfg.mockResolvedValue({ isDefault: false, config: { fields: cfgFields, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
   mockRun.mockResolvedValue({ processed: 0, durationMs: 1 });
@@ -217,10 +219,10 @@ describe('input handling', () => {
   });
   it('blank and placeholder-domain emails count as no email (the resolver ignores them), real ones do not', async () => {
     mockGetLeads.mockResolvedValue({ items: [
-      { leadId: 'real', email: 'jane@acme.com' },
-      { leadId: 'blank', email: '   ' },
-      { leadId: 'placeholder', email: 'x@example.com' },
-      { leadId: 'missing' },
+      { leadId: 'real', email: 'jane@acme.com', firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+      { leadId: 'blank', email: '   ', firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+      { leadId: 'placeholder', email: 'x@example.com', firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+      { leadId: 'missing', firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
     ], lastEvaluatedKey: undefined });
     const pct = async (id: string) => (await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({ leadIds: [id] })).body.estimatedPercentOfAllowance;
     const [real, blank, placeholder, missing] = [await pct('real'), await pct('blank'), await pct('placeholder'), await pct('missing')];
@@ -244,7 +246,7 @@ describe('input handling', () => {
     expect(a.body.confirmationToken).toBe(b.body.confirmationToken);
   });
   it('quotes the reference config when none is saved (isDefault), not the default config it was handed', async () => {
-    const wide = Array.from({ length: 40 }, (_, i) => ({ name: `w${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
+    const wide = Array.from({ length: 40 }, (_, i) => ({ name: i === 0 ? 'email' : `w${i}`, type: 'string', instruction: '', include: true, overwritePolicy: 'fill_if_empty' }));
     const pct = async () => (await request(app).post('/api/crm/lists/victim-list/leads/enrich-v3/estimate').send({})).body.estimatedPercentOfAllowance;
     mockGetCfg.mockResolvedValue({ isDefault: false, config: { fields: wide, globalOverwriteDefault: 'fill_if_empty', schemaVersion: 1 } });
     const saved40 = await pct();
