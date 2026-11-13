@@ -1205,6 +1205,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
         const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
           status: args.status,
+          // ENG-2979: RSA content edits (headlines/descriptions/final_url), read back by the service.
+          ...(Array.isArray(args.headlines) ? { headlines: args.headlines } : {}),
+          ...(Array.isArray(args.descriptions) ? { descriptions: args.descriptions } : {}),
+          ...(typeof args.final_url === 'string' ? { finalUrl: args.final_url } : {}),
         });
         if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
         return { success: true, message: 'Ad updated' };

@@ -11,7 +11,7 @@
  *   - call_google_ads_api guarded writes (googleToolkitWrites.ts): BUDGET CREATE/UPDATE,
  *     CAMPAIGN CREATE (PMax with brand)/UPDATE status|name, AD_GROUP CREATE/UPDATE status|name+cpc_bid (ENG-2959),
  *     CAMPAIGN_CONVERSION_GOAL UPDATE; ENG-2928: KEYWORD ADD/UPDATE status/REMOVE/ADD_NEGATIVE,
- *     AD CREATE (responsive search)/UPDATE status, ASSET_GROUP CREATE/UPDATE status.
+ *     AD CREATE (responsive search)/UPDATE status|RSA content (ENG-2979), ASSET_GROUP CREATE/UPDATE status.
  *   - call_google_ads_api direct (non-spending) write: ASSET UPLOAD — no preview token, but the
  *     same write gate, key scope, read-back and metering.
  * Everything else (other REMOVEs, display ads, campaign assets/criteria, conversions, client_id,
@@ -91,7 +91,7 @@ const GOOGLE_ADS_API_DESCRIPTION =
   'A shared budget (explicitly_shared) caps every campaign attached to it; the preview names how many. ' +
   'KEYWORD ADD (ad_group_resource_name, keywords[{text, matchType BROAD|PHRASE|EXACT}]) / UPDATE (criterion_resource_name, status) / REMOVE (criterion_resource_name) / ' +
   'ADD_NEGATIVE (keywords, and exactly one of ad_group_resource_name or campaign_resource_name). ' +
-  'AD CREATE responsive search ad (ad_group_resource_name, headlines 3-15 of <=30 chars, descriptions 2-4 of <=90 chars, final_url https) / UPDATE (ad_resource_name, status). ' +
+  'AD CREATE responsive search ad (ad_group_resource_name, headlines 3-15 of <=30 chars, descriptions 2-4 of <=90 chars, final_url https) / UPDATE (ad_resource_name, and either status alone or any of headlines / descriptions / final_url for a responsive search ad; the preview shows current vs new). ' +
   'Performance Max end to end: ASSET UPLOAD the logo (asset_type LOGO) and images → BUDGET CREATE → CAMPAIGN CREATE type PERFORMANCE_MAX with brand_business_name (<=25 chars) + brand_logo_asset_resource_name → ' +
   'ASSET_GROUP CREATE (name, campaign_resource_name, final_url, headlines 3-15 <=30, long_headlines 1-5 <=90, descriptions 2-5 <=90 with one <=60, square_image_assets, landscape_image_assets, logo_assets?, video_assets?) → ' +
   'ASSET_GROUP UPDATE status=ENABLED and CAMPAIGN UPDATE status=ENABLED. ' +
