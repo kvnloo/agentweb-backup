@@ -28,7 +28,8 @@ import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudg
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 import { buildCallConsentNotice, CALL_CONSENT_NOTICE_VERSION } from "./voice/callConsent";
-import { announcedNameOf } from "./hotLeadCallConfig";
+import { registeredBusinessNameOf, type ConsentNameSources } from "./voice/callConsentName";
+export { registeredBusinessNameOf, type ConsentNameSources };
 // ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
 // Already a runtime dependency, not a devDependency.
 import * as ts from "typescript";
@@ -1069,20 +1070,6 @@ export function extractTemplateOutline(fullHtml: string): string {
   }
 
   return sections.join('\n\n');
-}
-
-/**
- * ENG-2783: the name to print in the call-consent notice, from data the generation routes already loaded (no new read):
- * the org's hot-lead-call `announcedName` if configured, else the account's company name, else the org's name, else
- * undefined. A candidate with brackets, quotes or backslashes is skipped (it could be mistaken for a placeholder or break the prompt).
- */
-export interface ConsentNameSources { name?: string; hotLeadCall?: { announcedName?: unknown } }
-export function registeredBusinessNameOf(org?: ConsentNameSources | null, user?: { companyName?: string } | null): string | undefined {
-  const usable = (v: unknown): string | undefined => {
-    const t = typeof v === "string" ? v.trim() : "";
-    return t && t.length <= 100 && !/[[\]"\\<>{}\n\r]/.test(t) ? t : undefined;
-  };
-  return usable(announcedNameOf(org?.hotLeadCall?.announcedName)) ?? usable(user?.companyName) ?? usable(org?.name);
 }
 
 /**
