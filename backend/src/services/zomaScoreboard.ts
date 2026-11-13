@@ -238,6 +238,7 @@ export async function verifyZomaFirstAds(
     const rank: FirstAdOutcome[] = ['not_zoma_created', 'provider_error', 'not_active', 'no_impressions'];
     // Oldest approval first: the FIRST successful ad.
     for (const approval of approvals.sort((a, b) => a.ts.localeCompare(b.ts)).slice(0, MAX_APPROVALS_CHECKED)) {
+      if (deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { best = { userId, outcome: 'deferred' }; break; }
       let attempt: FirstAdResult;
       try {
         attempt = await checkApproval(deps, userId, approval, created);
@@ -369,20 +370,28 @@ export function defaultFirstAdDeps(): FirstAdDeps {
       return null;
     },
     async campaignOf(userId, entityType, objectId) {
+      // A failed provider read is not "no parent": surface it (provider_error) when nothing resolved.
       const service = await ams();
+      let failure: unknown;
       for (const accountId of await metaAdAccountIds(userId)) {
-        if (entityType === 'AD_SET') {
-          const node: any = await service.readBackMetaWriteTarget(userId, accountId, 'AD_SET', objectId).catch(() => null);
-          if (node?.campaign_id) return String(node.campaign_id);
-        } else if (entityType === 'AD') {
-          // Ad-level insights carry campaign_id; an ad with no delivery has no row (and no impressions).
-          const res: any = await service.callMetaAdsInsightsApiWrapper(userId, {
-            account_id: accountId, object_type: 'ad' as any, object_id: objectId, fields: ['campaign_id', 'impressions'], date_preset: 'maximum',
-          }).catch(() => null);
-          const row = Array.isArray(res?.data) ? res.data.find((r: any) => r?.campaign_id) : undefined;
-          if (row) return String(row.campaign_id);
+        try {
+          if (entityType === 'AD_SET') {
+            const node: any = await service.readBackMetaWriteTarget(userId, accountId, 'AD_SET', objectId);
+            if (node?.campaign_id) return String(node.campaign_id);
+          } else if (entityType === 'AD') {
+            // Ad-level insights carry campaign_id; an ad with no delivery has no row (and no impressions).
+            const res: any = await service.callMetaAdsInsightsApiWrapper(userId, {
+              account_id: accountId, object_type: 'ad' as any, object_id: objectId, fields: ['campaign_id', 'impressions'], date_preset: 'maximum',
+            });
+            if (res?.success === false) throw new Error(String(res.error ?? 'insights read failed').slice(0, 200));
+            const row = Array.isArray(res?.data) ? res.data.find((r: any) => r?.campaign_id) : undefined;
+            if (row) return String(row.campaign_id);
+          }
+        } catch (error) {
+          failure = error;
         }
       }
+      if (failure) throw failure;
       return null;
     },
     async campaignImpressions(userId, accountId, campaignId) {
