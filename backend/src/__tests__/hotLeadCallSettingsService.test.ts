@@ -400,8 +400,9 @@ describe('previewHotLeadCallSettings', () => {
 // ---- ENG-2783: monthly cap on the owner routes ------------------------------------------------------------------
 
 describe('maxCallsPerMonth on the owner routes', () => {
-  it('shows the default of 200 for a config stored without the field', async () => {
-    expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(200);
+  it('shows the default of 150 for a config stored without the field', async () => {
+    delete (table.org.hotLeadCall as Record<string, unknown>).maxCallsPerMonth;
+    expect((await getHotLeadCallSettings(org(), OWNER)).maxCallsPerMonth).toBe(150);
   });
   it.each([1, 150, 200])('accepts %i', async value => {
     expect((await put({ maxCallsPerMonth: value })).maxCallsPerMonth).toBe(value);
