@@ -23,6 +23,8 @@ jest.mock('../utils/scheduledPublishConsentGuard', () => ({
 }));
 jest.mock('../services/evaluationPolicy', () => ({ enforceEvaluationTool: jest.fn().mockResolvedValue(undefined) }));
 
+import officialInventory from './__fixtures__/officialMetaAdsMcpTools.json';
+
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { GOOGLE_TOOLKIT_TOOL_NAMES } from '../mcp/googleToolkitManifest';
 import { ZOMA_META_PARITY_MATRIX, formatParitySummary } from '../mcp/zomaMetaParityMatrix';
@@ -49,6 +51,14 @@ describe('ENG-2950 Zoma ↔ Meta Ads MCP parity matrix', () => {
       }
     }
     expect(problems).toEqual([]);
+  });
+
+  it('covers exactly the 88 tool names published across the seven official categories', () => {
+    const official = officialInventory.categories.flatMap((category) => category.tools);
+    expect(officialInventory.categories).toHaveLength(7);
+    expect(new Set(official).size).toBe(88);
+    expect([...new Set(ZOMA_META_PARITY_MATRIX.map((row) => row.metaTool))].sort())
+      .toEqual([...new Set(official)].sort());
   });
 
   it('no Meta tool name appears twice', () => {
