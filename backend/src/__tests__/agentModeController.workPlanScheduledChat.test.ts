@@ -315,6 +315,18 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       },
     );
 
+    it.each(['reason=no_key; token=private-secret', ['reason=no_key', 'private-secret'], `reason=no_key ${'private-secret'.repeat(1000)}`])(
+      'does not forward raw prerequisite notes into failure diagnostics: %j', async notes => {
+        const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'pending', notes }] };
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Unavailable.', workPlan } as any);
+        const verified = await runVerifiedChat({ sessionId: mockSession.sessionId, userId: mockUserId,
+          startingMessage: 'Extract guests', keywords: [], requiredFunctions: [], isUnattendedRun: true });
+        expect(verified.workPlanBlockReason).toBe('1 Extract guests: reason=no_key');
+        expect(verified.workPlanBlockReason).not.toContain('private-secret');
+      },
+    );
+
     it('scores keyword evidence without crediting a terminal blocked plan as success', async () => {
       const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes: 'reason=no_key' }] };
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
