@@ -4863,6 +4863,7 @@ type RunVerifiedChatResult = {
   workPlanCompleted: boolean;
   // ENG-2854: why a failed run stopped when it was not a requirements miss.
   terminationReason?: 'iteration_limit';
+  workPlanBlockReason?: string;
   // ENG-396: set when a headless turn left an unanswered blocking question. The
   // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
@@ -5447,6 +5448,27 @@ async function runVerifiedChatInner(
     return null;
   };
 
+  // ENG-2998: no runnable steps remain. Stop unattended pressing without
+  // crediting blocked prerequisites as completion; pending/transient work retries.
+  const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
+    const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
+    if (!isUnattendedRun || !steps.some((s: any) => s.status === 'blocked') ||
+        !steps.every((s: any) => ['blocked', 'completed', 'skipped'].includes(s.status))) return null;
+    const functionStatus = requiredFunctions.map(f => {
+      const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
+      return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
+    });
+    return {
+      success: false, content: allContent, toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)), keywordMisses: remainingKeywords,
+      functionCallMatches: functionStatus.filter(f => f.met).map(f => f.functionName),
+      functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
+      functionStatus, attempts: attempt, workPlanCompleted: false,
+      workPlanBlockReason: steps.filter((s: any) => s.status === 'blocked')
+        .map((s: any) => `${s.title || s.stepCount}: ${s.notes || 'blocked'}`).join('; '),
+    };
+  };
+
   while (attempt < maxAttempts) {
     attempt++;
 
@@ -5598,6 +5620,8 @@ async function runVerifiedChatInner(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
+        const blockedContinuation = stopForBlockedPlan(continuationResponse.workPlan);
+        if (blockedContinuation) return blockedContinuation;
         // Re-evaluate the gate against the continuation's own output. Pass the
         // whole run's accumulated tool-call objects (name + arguments + result) so a
         // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
@@ -5754,6 +5778,9 @@ async function runVerifiedChatInner(
       // Check work plan status
       const workPlan = response.workPlan;
       const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
+
+      const blockedPlanResult = stopForBlockedPlan(workPlan);
+      if (blockedPlanResult) return blockedPlanResult;
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];

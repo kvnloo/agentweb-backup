@@ -233,6 +233,32 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       );
     });
 
+    it.each([
+      ['all blocked', ['blocked', 'blocked', 'blocked']],
+      ['completed then blocked', ['completed', 'blocked']],
+      ['skipped then blocked', ['skipped', 'blocked']],
+    ])('stops a terminal %s plan without pressing unavailable prerequisites twenty times', async (_name, statuses) => {
+      // Sanitized ENG-2998 trace: no_key prevented guest extraction; downstream
+      // steps were blocked too. These are not valid zero-result completions.
+      const workPlan = {
+        autocomplete: true,
+        title: 'Guest extraction fixture',
+        steps: statuses.map((status, i) => ({
+          stepCount: i + 1, title: `Step ${i + 1}`, status,
+          notes: status === 'blocked' ? 'connected=false; nothing_pulled=true; reason=no_key' : '',
+        })),
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse, workPlan,
+        content: 'Guest extraction blocked: no_key. No outreach sent.',
+      } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+      expect(JSON.stringify(result)).toContain('no_key');
+    });
+
     it('auto-converges an unattended run when a deferred (pending) step finishes on a later attempt', async () => {
       // Models the media-generation time-budget deferral on a scheduled (unattended) run:
       // a long image step leaves step 2 pending for the first couple of attempts (budget

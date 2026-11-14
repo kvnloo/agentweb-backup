@@ -11,6 +11,7 @@ export interface ScheduledRunFailureSignals {
   functionCallMisses?: string[];
   keywordMisses?: string[];
   workPlanCompleted?: boolean;
+  workPlanBlockReason?: string;
   deferredUnresolved?: boolean;
   parkedUnnotifiable?: boolean;
   publishHeldForApproval?: boolean;
@@ -54,6 +55,8 @@ export function describeScheduledRunFailureReasons(
   // ENG-2854: the step limit is the cause; the unfinished plan is its consequence.
   if (run.terminationReason === 'iteration_limit') {
     reasons.push('stopped at the iteration (step) limit; resumable report saved, not auto-retried');
+  } else if (run.workPlanBlockReason) {
+    reasons.push(`work plan blocked: ${run.workPlanBlockReason}`);
   } else if (run.workPlanCompleted === false) reasons.push('work plan not completed');
 
   const hasMisses = (run.functionCallMisses?.length ?? 0) > 0 || (run.keywordMisses?.length ?? 0) > 0;
