@@ -259,6 +259,27 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(JSON.stringify(result)).toContain('no_key');
     });
 
+    it('fails when the completion-gate continuation discovers a blocked prerequisite', async () => {
+      const donePlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'completed' }] };
+      const blockedPlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'blocked', notes: 'reason=no_key' }] };
+      let calls = 0;
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession, workPlan: calls >= 2 ? blockedPlan : donePlan,
+      } as any));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        calls++;
+        return {
+          ...mockResponse, toolCalls: [],
+          content: calls === 1 ? 'Event 1 done. I did not complete Step 3 for Events 2 and 3.' : 'Guest extraction blocked: no_key.',
+          workPlan: calls >= 2 ? blockedPlan : donePlan,
+        } as any;
+      });
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 2 });
+      expect(JSON.stringify(result)).toContain('no_key');
+    });
+
     it('auto-converges an unattended run when a deferred (pending) step finishes on a later attempt', async () => {
       // Models the media-generation time-budget deferral on a scheduled (unattended) run:
       // a long image step leaves step 2 pending for the first couple of attempts (budget
