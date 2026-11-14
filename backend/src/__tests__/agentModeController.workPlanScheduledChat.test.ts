@@ -304,7 +304,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(result).toMatchObject({ status: 'success', passed: true, attempt: 2 });
     });
 
-    it.each(['Blocked', ' BLOCKED '])('stops a terminal prerequisite with normalized status %s', async (status) => {
+    it.each(['Blocked', ' BLOCKED ', 'pending', ' PENDING ', 'Pending'])('stops a terminal prerequisite with normalized status %s', async (status) => {
       const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status, notes: 'reason=no_key' }] };
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest extraction blocked: reason=no_key.', workPlan } as any);
