@@ -47,7 +47,12 @@ export async function getLoopHealthReport(
       const learning = getLearningStore(manifest.learningImpl);
       const history = await learning.queryHistory({ loopId: manifest.loopId });
       loops.push(computeLoopHealth(manifest, history, now));
-    } catch {
+    } catch (err) {
+      // Only known SDK codes are safe diagnostics; messages/stacks may carry secrets.
+      const cause = err instanceof Error && [
+        'ResourceNotFoundException', 'AccessDeniedException', 'ThrottlingException',
+      ].includes(err.name) ? err.name : 'unknown';
+      console.error('[loopHealth] learning history unavailable', { loopId: manifest.loopId, cause });
       loops.push({
         loopId: manifest.loopId,
         displayName: manifest.displayName,

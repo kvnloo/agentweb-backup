@@ -162,6 +162,26 @@ describe('getLoopHealthReport', () => {
     expect(JSON.stringify(report)).not.toContain('secret-fixture');
   });
 
+  it.each(['ResourceNotFoundException', 'AccessDeniedException', 'ThrottlingException', 'secret-name'])(
+    'logs a bounded cause and loop identity without leaking error details (%s)', async (name) => {
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const store = learningStore();
+      const error = new Error('secret-fixture');
+      error.name = name;
+      (store.queryHistory as jest.Mock).mockRejectedValue(error);
+      registerWith(manifest('bad'), store);
+      await getLoopHealthReport(clock);
+      expect(log).toHaveBeenCalledWith('[loopHealth] learning history unavailable', {
+        loopId: 'bad', cause: name === 'secret-name' ? 'unknown' : name,
+      });
+      expect(JSON.stringify(log.mock.calls)).not.toContain('secret-fixture');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('secret-name');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('returns an empty loops array when nothing is registered', async () => {
     const report = await getLoopHealthReport(clock);
     expect(report.loops).toEqual([]);
