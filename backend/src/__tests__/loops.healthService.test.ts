@@ -26,6 +26,18 @@ import type {
 import { asLoopId, asMutationId, asRunId } from '../loops/core/types';
 import type { ClockPort } from '../loops/core/ports';
 import { getLoopHealthReport } from '../loops/health/loopHealthService';
+import loopHealthRouter from '../routes/loopHealth';
+import type { Request, Response, NextFunction } from 'express';
+
+// Invoke the real /health handler without opening a local HTTP server.
+async function readHealthRoute() {
+  const route = loopHealthRouter.stack.find((layer: { route?: { path: string } }) => layer.route?.path === '/health');
+  if (!route?.route) throw new Error('health route missing');
+  const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+  await route.route.stack[0].handle({} as Request, res as unknown as Response, jest.fn() as NextFunction);
+  expect(res.status).toHaveBeenCalledWith(200);
+  return res.json.mock.calls[0][0];
+}
 
 const NOW = new Date('2026-06-09T18:00:00Z');
 const clock: ClockPort = { now: () => NOW };
@@ -127,11 +139,27 @@ describe('getLoopHealthReport', () => {
 
     expect(report.loops).toHaveLength(2);
     const good = report.loops.find((l) => l.loopId === 'good');
-    const bad = report.loops.find((l) => l.loopId === 'bad') as (typeof report.loops)[number] & {
-      error?: string;
-    };
+    const bad = report.loops.find((l) => l.loopId === 'bad');
     expect(good?.state).toBe('learned');
-    expect(bad?.error).toContain('dynamo unavailable');
+    expect(bad?.state).toBe('unavailable');
+    expect(bad?.counts).toBeNull();
+    expect(bad).toMatchObject({ error: 'learning_history_unavailable', lastActivityAt: null, lastOutcome: null });
+    expect(JSON.stringify(report)).not.toContain('dynamo unavailable');
+  });
+
+  it.each([false, true])('preserves unknown observations through the route (paused=%s)', async (paused) => {
+    const failed = manifest('bad', paused);
+    failed.pauseReason = 'maintenance';
+    const store = learningStore();
+    (store.queryHistory as jest.Mock).mockRejectedValue({ token: 'secret-fixture', toString: () => 'secret-fixture' });
+    registerWith(failed, store);
+    registerWith(manifest('good'), learningStore([improvedRecord('good')]));
+    registerWith(manifest('empty'), learningStore());
+    const report = await readHealthRoute();
+    expect(report.loops[0]).toMatchObject({ state: 'unavailable', counts: null, paused, pauseReason: 'maintenance', error: 'learning_history_unavailable' });
+    expect(report.loops[1]).toMatchObject({ state: 'learned', counts: { total: 1, improved: 1 } });
+    expect(report.loops[2]).toMatchObject({ state: 'empty', counts: { total: 0 } });
+    expect(JSON.stringify(report)).not.toContain('secret-fixture');
   });
 
   it('returns an empty loops array when nothing is registered', async () => {
