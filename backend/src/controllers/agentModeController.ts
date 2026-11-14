@@ -5665,6 +5665,14 @@ async function runVerifiedChatInner(
             `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
           );
         }
+        // A transient/unknown blocked continuation is not completion. Re-enter
+        // the existing bounded work-plan retry path, never credit unfinished work.
+        if (continuationResponse.workPlan && !workPlanCompletedWithoutDebt(
+          continuationResponse.workPlan, continuationResponse.calledFunctions
+        )) {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
         // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
           success: true,
