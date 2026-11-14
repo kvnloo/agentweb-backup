@@ -21,6 +21,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionWorkPlan: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -278,6 +279,41 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
     });
+
+    it.each(['reason=no_key', 'connected=false; reason=no_key', 'reason: no_key'])(
+      'stops from the real schema-valid status writer: %s', async (notes) => {
+        const { setWorkPlanStatus } = await import('../emma/impl/workPlans');
+        const session = {
+          ...mockSession,
+          workPlan: { steps: [{ stepCount: 1, title: 'Extract guests', status: 'pending' }] },
+        };
+        mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+        mockChatbotDb.updateSessionWorkPlan.mockImplementation(async (_id, plan) => {
+          session.workPlan = plan as any;
+          return undefined as any;
+        });
+
+        const written = await setWorkPlanStatus([
+          { stepCount: 1, status: 'pending', notes },
+        ], mockSession.sessionId);
+        expect(written.success).toBe(true);
+        expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+        expect(session.workPlan.steps[0]).toMatchObject({ status: 'pending', notes });
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Guest extraction unavailable.', workPlan: session.workPlan,
+        } as any);
+
+        const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+        expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        const verified = await runVerifiedChat({
+          sessionId: mockSession.sessionId, userId: mockUserId, startingMessage: 'Extract guests',
+          keywords: [], requiredFunctions: [], isUnattendedRun: true,
+        });
+        expect(verified.workPlanBlockReason).toContain('1 Extract guests:');
+        expect(verified.workPlanBlockReason).toContain('no_key');
+      },
+    );
 
     it('scores keyword evidence without crediting a terminal blocked plan as success', async () => {
       const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes: 'reason=no_key' }] };
