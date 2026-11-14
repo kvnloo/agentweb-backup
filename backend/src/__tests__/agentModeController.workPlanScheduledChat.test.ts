@@ -297,6 +297,12 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
           { stepCount: 1, status: 'pending', notes },
         ], mockSession.sessionId);
         expect(written.success).toBe(true);
+        // A repeated status-only update must not erase the prerequisite before
+        // the scheduler reads the real producer's persisted plan.
+        const retried = await setWorkPlanStatus([
+          { stepCount: 1, status: 'pending' },
+        ], mockSession.sessionId);
+        expect(retried.success).toBe(true);
         expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
         expect(session.workPlan.steps[0]).toMatchObject({ status: 'pending', notes });
         mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
