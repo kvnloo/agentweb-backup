@@ -5474,7 +5474,7 @@ async function runVerifiedChatInner(
       functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
       functionStatus, attempts: attempt, workPlanCompleted: false,
       workPlanBlockReason: blockedSteps
-        .map((s: any) => `${s.title || s.stepCount}: ${notesOf(s) || 'blocked'}`).join('; '),
+        .map((s: any) => `${s.stepCount}${s.title ? ` ${s.title}` : ''}: ${notesOf(s) || 'blocked'}`).join('; '),
     };
   };
 

@@ -111,7 +111,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat, runVerifiedChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -244,7 +244,7 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
         autocomplete: true,
         title: 'Guest extraction fixture',
         steps: statuses.map((status, i) => ({
-          stepCount: i + 1, title: `Step ${i + 1}`, status,
+          stepCount: i + 1, title: 'Repeated step', status,
           notes: status === 'blocked' ? 'connected=false; nothing_pulled=true; reason=no_key' : '',
         })),
       };
@@ -257,6 +257,13 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
       expect(JSON.stringify(result)).toContain('no_key');
+      const verified = await runVerifiedChat({
+        sessionId: mockSession.sessionId, userId: mockUserId, startingMessage: 'Extract guests',
+        keywords: [], requiredFunctions: [], isUnattendedRun: true,
+      });
+      statuses.forEach((status, i) => {
+        if (status === 'blocked') expect(verified.workPlanBlockReason).toContain(`${i + 1} Repeated step:`);
+      });
     });
 
     it.each([
