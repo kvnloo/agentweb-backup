@@ -5466,7 +5466,8 @@ async function runVerifiedChatInner(
     });
     return {
       success: false, content: allContent, toolCalls: allToolCalls,
-      keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)), keywordMisses: remainingKeywords,
+      keywordMatches: keywords.filter(k => allContent.toLowerCase().includes(k.toLowerCase())),
+      keywordMisses: keywords.filter(k => !allContent.toLowerCase().includes(k.toLowerCase())),
       functionCallMatches: functionStatus.filter(f => f.met).map(f => f.functionName),
       functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
       functionStatus, attempts: attempt, workPlanCompleted: false,

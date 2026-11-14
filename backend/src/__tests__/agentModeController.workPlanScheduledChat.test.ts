@@ -259,6 +259,15 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(JSON.stringify(result)).toContain('no_key');
     });
 
+    it('scores keyword evidence without crediting a terminal blocked plan as success', async () => {
+      const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes: 'reason=no_key' }] };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest REPORT blocked: reason=no_key.', workPlan } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: ['report', 'absent'], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1, keywordMatches: ['report'], keywordMisses: ['absent'] });
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+    });
+
     it.each(['Tool returned 429 rate limited, retry', 'Temporary timeout; retry', 'Blocked; cause unknown'])('retries a blocked step without a proven terminal prerequisite: %s', async (notes) => {
       const blockedPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes }] };
       const completedPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'completed' }] };
