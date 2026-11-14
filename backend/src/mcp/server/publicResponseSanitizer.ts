@@ -59,22 +59,34 @@ function isPrivateKey(key: string, toolName: string): boolean {
 }
 
 export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
+  // Bound total traversal, not just depth: shared graphs can expand exponentially.
+  const ancestors = new WeakSet<object>();
+  let remaining = 10000;
+  function visit(value: any, depth: number): any {
   // Never return an unvisited subtree, including encoded JSON or cyclic input.
-  if (depth > 32) return null;
+  if (depth > 32 || --remaining < 0) return null;
   if (typeof value === 'string') {
     const trimmed = value.trimStart();
-    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('"')) return value;
     let parsed: unknown;
     try { parsed = JSON.parse(value); } catch { return value; }
-    const stripped = stripInternalIds(parsed, depth + 1, toolName);
+    const stripped = visit(parsed, depth + 1);
     return JSON.stringify(stripped) === JSON.stringify(parsed)
       ? value : JSON.stringify(stripped, null, 2);
   }
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map((v) => stripInternalIds(v, depth + 1, toolName));
-  return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !isPrivateKey(key, toolName))
-    .map(([key, entry]) => [key, stripInternalIds(entry, depth + 1, toolName)]));
+  if (ancestors.has(value)) return null;
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return value.map((v) => visit(v, depth + 1));
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !isPrivateKey(key, toolName))
+      .map(([key, entry]) => [key, visit(entry, depth + 1)]));
+  } finally {
+    ancestors.delete(value);
+  }
+  }
+  return visit(value, depth);
 }
 
 export function shouldSanitizePublicResponse(

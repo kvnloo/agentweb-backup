@@ -74,6 +74,28 @@ describe('ENG-3001 recursive output boundary', () => {
     expect(JSON.stringify(sanitize(cycle))).not.toContain('cycle-secret');
   });
 
+  it('bounds branching shared graphs and cuts active cycles immediately', () => {
+    let reads = 0;
+    let graph: any = { name: 'safe', traceId: 'secret' };
+    for (let i = 0; i < 28; i++) {
+      const child = graph;
+      graph = { get a() { reads++; return child; }, get b() { reads++; return child; } };
+    }
+    expect(JSON.stringify(sanitize(graph))).not.toContain('secret');
+    expect(reads).toBeLessThan(20000);
+    const cycle: any = { name: 'safe' };
+    cycle.a = cycle;
+    cycle.b = cycle;
+    expect(sanitize(cycle)).toEqual({ name: 'safe', a: null, b: null });
+  });
+
+  it('sanitizes multiply encoded JSON while preserving clean encoded prose', () => {
+    const encoded = JSON.stringify(JSON.stringify({ sessionId: 'secret', runId: 'secret', name: 'safe' }));
+    expect(JSON.parse(JSON.parse(sanitize(encoded)))).toEqual({ name: 'safe' });
+    const prose = JSON.stringify('ordinary prose');
+    expect(sanitize(prose)).toBe(prose);
+  });
+
   it('preserves clean JSON formatting, non-JSON prose and ordinary resource handles', () => {
     const text = ' { "name" : "kept" } ';
     expect(sanitize({ text, id: 'resource', campaignId: 'campaign', deckId: 'deck', itemId: 'item' }))
