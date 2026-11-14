@@ -56,7 +56,7 @@ process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test_fake';
 process.env.STRIPE_STARTER_PRICE_ID = 'price_starter_test';
 process.env.STRIPE_COMPLETE_PRICE_ID = 'price_complete_test';
 
-import { handleSubscriptionUpdated, resolveSubscriptionTypeForPrice } from '../services/stripeService';
+import { handleSubscriptionDeleted, handleSubscriptionUpdated, resolveSubscriptionTypeForPrice } from '../services/stripeService';
 
 function makeSub(price: any, metadata: Record<string, string> = {}) {
   return {
@@ -189,6 +189,24 @@ describe('resolveSubscriptionTypeForPrice', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     await expect(resolveSubscriptionTypeForPrice({ id: 'price_unknown' })).resolves.toBeNull();
     warn.mockRestore();
+  });
+});
+
+describe('handleSubscriptionDeleted — surviving custom subscription', () => {
+  it.each(['active', 'trialing'])('retries lookup failure without canceling a surviving %s subscription', async (status) => {
+    const survivor = { ...makeSub({ id: 'price_custom', product: 'prod_failure' }), id: 'sub_survivor', status };
+    mockStripe.subscriptions.list.mockImplementation(async (params: any) => ({ data: params.status === status ? [survivor] : [] }));
+    mockStripe.products.retrieve.mockRejectedValueOnce(new Error('product unavailable'));
+    await expect(handleSubscriptionDeleted({ ...makeSub({ id: 'price_starter_test' }), status: 'canceled' })).rejects.toThrow('product unavailable');
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
+  it('does not swallow a write failure after finding a surviving subscription', async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [makeSub({ id: 'price_max', metadata: { plan: 'Max' } })] });
+    mockUpdateUser.mockRejectedValueOnce(new Error('write unavailable'));
+    await expect(handleSubscriptionDeleted(makeSub({ id: 'price_starter_test' }))).rejects.toThrow('write unavailable');
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser.mock.calls[0][1].subscriptionType).toBe('Max');
   });
 });
 

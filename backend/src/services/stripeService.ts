@@ -1520,6 +1520,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 
   // Check if the customer still has another active or trialing subscription.
   // This happens during downgrades: old sub is canceled, new (cheaper) sub is created.
+  let survivingSubscriptionFound = false;
   if (customerId) {
     try {
       const s = getStripeOrThrow();
@@ -1531,6 +1532,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
         });
         if (remaining.data.length > 0) {
           const activeSub = remaining.data[0];
+          survivingSubscriptionFound = true;
           console.log(
             `[STRIPE] Subscription ${subscription.id} deleted, but customer ${customerId} still has ${status} subscription ${activeSub.id} — treating as downgrade, not cancellation`
           );
@@ -1583,6 +1585,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
         }
       }
     } catch (err: any) {
+      // Once Stripe confirmed a survivor, lookup/write failures must retry the
+      // webhook, never fall through and revoke that subscription's paid access.
+      if (survivingSubscriptionFound) throw err;
       console.error(`[STRIPE] Error checking remaining subscriptions for ${customerId}:`, err.message);
       // Fall through to cancel — safer to cancel than to leave in a stale state
     }
