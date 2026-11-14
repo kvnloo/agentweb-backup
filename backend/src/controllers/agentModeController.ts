@@ -4911,6 +4911,11 @@ type RunVerifiedChatResult = {
   sendPressExhausted?: boolean;
 };
 
+// Read-only normalization shared by completion and blocked-plan retry decisions.
+function workPlanStepStatus(step: any): string {
+  return typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
+}
+
 // ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
 // outstanding debt from a removed step's required function call that never
 // genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
@@ -4922,7 +4927,7 @@ type RunVerifiedChatResult = {
 // breaks any of them that happen to exercise this retry loop.
 function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
   if (!workPlan || !Array.isArray(workPlan.steps)) return true;
-  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  const allStepsTerminal = workPlan.steps.every((s: any) => ['completed', 'skipped'].includes(workPlanStepStatus(s)));
   if (!allStepsTerminal) return false;
   const called = calledFunctions || {};
   const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
@@ -5452,15 +5457,14 @@ async function runVerifiedChatInner(
   // crediting blocked prerequisites as completion; pending/transient work retries.
   const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
     const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
-    const statusOf = (step: any): string => typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
     const notesOf = (step: any): string => typeof step?.notes === 'string' ? step.notes
       : Array.isArray(step?.notes) ? step.notes.filter((note: unknown) => typeof note === 'string').join('; ') : '';
-    const blockedSteps = steps.filter((s: any) => statusOf(s) === 'blocked');
+    const blockedSteps = steps.filter((s: any) => workPlanStepStatus(s) === 'blocked');
     // A blocked status alone does not establish non-retryability (429, timeouts,
     // or unspecified causes). Only the recorded missing-key prerequisite is
     // proven terminal here; preserve the bounded retry path for everything else.
     if (!isUnattendedRun || blockedSteps.length === 0 ||
-        !steps.every((s: any) => ['blocked', 'completed', 'skipped'].includes(statusOf(s))) ||
+        !steps.every((s: any) => ['blocked', 'completed', 'skipped'].includes(workPlanStepStatus(s))) ||
         !blockedSteps.every((s: any) => /\breason\s*[:=]\s*no_key\b/i.test(notesOf(s)))) return null;
     const functionStatus = requiredFunctions.map(f => {
       const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);

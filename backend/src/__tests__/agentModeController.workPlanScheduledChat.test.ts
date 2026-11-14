@@ -314,6 +314,40 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(JSON.stringify(result)).toContain('no_key');
     });
 
+    it.each(['completed', ' COMPLETED ', 'skipped', '\tSkipped\n'])(
+      'completes a terminal plan with normalized status %j without mutating it', async (status) => {
+        const step = Object.freeze({ stepCount: 1, title: 'Inspect guests', status });
+        const workPlan = Object.freeze({ steps: Object.freeze([step]) });
+        mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Guest report.', toolCalls: [], workPlan,
+        } as any);
+
+        const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+
+        expect(result).toMatchObject({ status: 'success', passed: true, attempt: 1 });
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        expect(workPlan.steps[0].status).toBe(status);
+      },
+    );
+
+    it('does not waive required-function debt for normalized terminal statuses', async () => {
+      const workPlan = {
+        steps: [{ stepCount: 1, title: 'Inspect guests', status: ' COMPLETED ' },
+          { stepCount: 2, title: 'Optional work', status: ' SKIPPED ' }],
+        pendingRequiredFunctionCalls: ['list_html_templates'],
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan, calledFunctions: {} } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse, content: 'Guest report.', toolCalls: [], workPlan, calledFunctions: {},
+      } as any);
+
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 20 });
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+    });
+
     it('fails when the completion-gate continuation discovers a blocked prerequisite', async () => {
       const donePlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'completed' }] };
       const blockedPlan = { steps: [{ stepCount: 1, title: 'Inspect guests', status: 'blocked', notes: 'reason=no_key' }] };
