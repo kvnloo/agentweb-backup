@@ -259,6 +259,19 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       expect(JSON.stringify(result)).toContain('no_key');
     });
 
+    it.each([
+      ['reason: no_key'],
+      [['connected=false', 'nothing_pulled=true', 'reason=no_key']],
+      [['connected=false', null, 'reason: no_key']],
+    ])('stops missing-key prerequisites across observed note shapes: %j', async (notes) => {
+      const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes }] };
+      mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({ ...mockResponse, content: 'Guest extraction blocked.', workPlan } as any);
+      const result = await runScheduledChat({ ...baseSchedule, keywords: [], requiredFunctionCalls: [] }, mockUserId, true);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 'failure', passed: false, attempt: 1 });
+    });
+
     it('scores keyword evidence without crediting a terminal blocked plan as success', async () => {
       const workPlan = { steps: [{ stepCount: 1, title: 'Extract guests', status: 'blocked', notes: 'reason=no_key' }] };
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, workPlan } as any);

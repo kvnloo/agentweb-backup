@@ -5453,13 +5453,15 @@ async function runVerifiedChatInner(
   const stopForBlockedPlan = (workPlan: any): RunVerifiedChatResult | null => {
     const steps = Array.isArray(workPlan?.steps) ? workPlan.steps : [];
     const statusOf = (step: any): string => typeof step?.status === 'string' ? step.status.trim().toLowerCase() : '';
+    const notesOf = (step: any): string => typeof step?.notes === 'string' ? step.notes
+      : Array.isArray(step?.notes) ? step.notes.filter((note: unknown) => typeof note === 'string').join('; ') : '';
     const blockedSteps = steps.filter((s: any) => statusOf(s) === 'blocked');
     // A blocked status alone does not establish non-retryability (429, timeouts,
     // or unspecified causes). Only the recorded missing-key prerequisite is
     // proven terminal here; preserve the bounded retry path for everything else.
     if (!isUnattendedRun || blockedSteps.length === 0 ||
         !steps.every((s: any) => ['blocked', 'completed', 'skipped'].includes(statusOf(s))) ||
-        !blockedSteps.every((s: any) => typeof s.notes === 'string' && /\breason\s*=\s*no_key\b/i.test(s.notes))) return null;
+        !blockedSteps.every((s: any) => /\breason\s*[:=]\s*no_key\b/i.test(notesOf(s)))) return null;
     const functionStatus = requiredFunctions.map(f => {
       const actualCount = countCallsForRequirement(f.functionName, allActualFunctionCallsForReporting);
       return { functionName: f.functionName, requiredCount: f.minCount, actualCount, met: actualCount >= f.minCount };
@@ -5472,7 +5474,7 @@ async function runVerifiedChatInner(
       functionCallMisses: functionStatus.filter(f => !f.met).map(f => f.functionName),
       functionStatus, attempts: attempt, workPlanCompleted: false,
       workPlanBlockReason: blockedSteps
-        .map((s: any) => `${s.title || s.stepCount}: ${s.notes || 'blocked'}`).join('; '),
+        .map((s: any) => `${s.title || s.stepCount}: ${notesOf(s) || 'blocked'}`).join('; '),
     };
   };
 
