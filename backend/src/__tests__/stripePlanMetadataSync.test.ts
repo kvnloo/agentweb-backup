@@ -34,6 +34,7 @@ const KNOWN_TIERS: Record<string, any> = {
   Max: { allowedPages: ['max'], allowedSkills: ['*'] },
   'Super Premium': { allowedPages: ['*'], allowedSkills: ['*'] },
   Free: { allowedPages: ['/'], allowedSkills: [] },
+  Sandbox: { allowedPages: ['*'], allowedSkills: ['*'] },
 };
 const mockGetTierConfig = jest.fn(async (name: string) => KNOWN_TIERS[name] ?? null);
 
@@ -117,6 +118,39 @@ describe('resolveSubscriptionTypeForPrice', () => {
       resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Super Premium' } }),
     ).resolves.toBeNull();
     warn.mockRestore();
+  });
+
+  it('never grants the administrator-only Sandbox tier from price or product metadata', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'Sandbox' } })).resolves.toBeNull();
+      await expect(resolveSubscriptionTypeForPrice({ id: 'price_c', product: { metadata: { plan: 'Sandbox' } } })).resolves.toBeNull();
+      expect(mockGetTierConfig).not.toHaveBeenCalledWith('Sandbox');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not log account-controlled metadata when the plan is unmappable', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'private@example.com' } });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('private@example.com');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Unmapped price price_c'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not log account-controlled metadata when tier lookup throws', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockGetTierConfig.mockRejectedValueOnce(new Error('lookup unavailable'));
+    try {
+      await resolveSubscriptionTypeForPrice({ id: 'price_c', metadata: { plan: 'private@example.com' } });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('private@example.com');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('retrieves an unexpanded product to read its plan label', async () => {

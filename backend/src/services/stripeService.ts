@@ -2249,7 +2249,7 @@ export function deriveSubscriptionTypeFromPriceId(priceId: string): string | nul
 
 /** Tiers that must never be granted from Stripe metadata: internal-only tiers,
  * and Free (a billed subscription can never resolve to the unpaid tier). */
-const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'Free']);
+const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'Free', 'Sandbox']);
 
 // Hard wall-clock cap on the product lookup (ENG-2724), above Stripe's 5s idle timeout.
 const PRODUCT_LOOKUP_DEADLINE_MS = 6000;
@@ -2278,8 +2278,8 @@ export async function resolveSubscriptionTypeForPrice(
     if (!plan || METADATA_PLAN_DENYLIST.has(plan)) return null;
     try {
       if (await getTierConfig(plan)) return plan;
-    } catch (err) {
-      console.warn(`[STRIPE] Tier lookup failed for metadata plan "${plan}" (price ${priceId}):`, err);
+    } catch {
+      console.warn(`[STRIPE] Tier lookup failed for metadata plan (price ${priceId})`);
     }
     return null;
   };
@@ -2319,13 +2319,9 @@ export async function resolveSubscriptionTypeForPrice(
   // what is billed and can be a stale label (e.g. a contract customer moved to
   // an unlabelled custom price would be downgraded by a leftover plan label).
 
-  const candidates = [price?.metadata?.plan, product?.metadata?.plan]
-    .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-    .map((v) => v.trim());
-
   console.warn(
     `[STRIPE] Unmapped price ${priceId} on subscription ${subscription?.id ?? 'unknown'}: ` +
-    `no env mapping and no valid metadata.plan (candidates: ${JSON.stringify(candidates)}). Tier not synced.`
+    'no env mapping and no valid metadata.plan. Tier not synced.'
   );
   return null;
 }

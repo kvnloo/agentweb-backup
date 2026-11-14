@@ -61,8 +61,13 @@ jest.mock('../middleware/auth', () => ({
   AuthenticatedRequest: {},
 }));
 
+jest.mock('../services/leadImportFollowups', () => ({
+  applyLeadImportFollowups: jest.fn().mockResolvedValue({ inheritedDoNotContact: [], doNotContactCheckFailed: 0 }),
+}));
+
 import { Request, Response } from 'express';
 import { crmDb } from '../services/db';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
 import router from '../routes/crm';
 
 function findRouteHandler(path: string, method: 'post' | 'get' | 'put' | 'delete') {
@@ -260,6 +265,23 @@ describe('CSV Import Wizard endpoints', () => {
       expect(res.status).toHaveBeenCalledWith(400);
       const msg = res.json.mock.calls[0][0].message;
       expect(msg.toLowerCase()).toContain('email');
+    });
+
+    // ENG-2996 AC1/AC3: CSV-created leads are validated + checked against the owner's DNC leads.
+    it('runs import follow-ups for created leads', async () => {
+      const created = [{ leadId: 'n1', email: 'jane@x.com', sourceIndex: 0 }];
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({ successCount: 1, newCount: 1, errorCount: 0, errors: [], created });
+      (applyLeadImportFollowups as jest.Mock).mockResolvedValueOnce({ inheritedDoNotContact: ['n1'], doNotContactCheckFailed: 0 });
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from('Email\njane@x.com\n'), originalname: 'l.csv' } as any,
+        body: {},
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+      expect(applyLeadImportFollowups).toHaveBeenCalledWith('l1', 'u1', created, expect.objectContaining({ validate: true }));
+      expect(res.json.mock.calls[0][0].inheritedDoNotContact).toBe(1);
     });
 
     it('skips columns marked as "skip"', async () => {
