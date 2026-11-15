@@ -538,6 +538,15 @@ export async function addLeadsToList(
     }
   }
 
+// Preserve stored evidence only: missing suppression values must not imply active.
+function projectLeadSuppression(lead: Record<string, any>): Record<string, any> {
+  const fields = ['contactStatus', 'contactStatusReason', 'contactStatusNote',
+    'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
+    'unsubscribedFromGroupEmail', 'unsubscribedFromGroupEmailAt'];
+  return Object.fromEntries(fields.filter(field => lead[field] !== undefined)
+    .map(field => [field, lead[field]]));
+}
+
 export async function getLeads(listId: string, userId: string, options: {
     search?: string;
     icpOnly?: boolean;
@@ -688,6 +697,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
           ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
@@ -1026,6 +1036,7 @@ export async function searchLeads(
             // reads a lead with no attribution in it and reports a BLOCK on a
             // correctly-attributed lead.
             ...projectLeadAttribution(entry.lead),
+            ...projectLeadSuppression(entry.lead),
           };
         }),
         matchCount: matchingLeads.length,
@@ -1226,6 +1237,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
           // entirely when it does not. Never an empty object: that would report
           // "capture ran and found nothing" for a lead capture never touched.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
         },
         engagementSummary: {
           total: engagementCount.total,
