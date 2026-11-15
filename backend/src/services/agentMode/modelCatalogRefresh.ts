@@ -1,6 +1,6 @@
 import { LLM_MODEL_REGISTRY, LLMModelConfig, ModelProvider } from './llmModelRegistry';
 import { MODEL_PRICING, ModelPrice, costScoreFromPrice } from '../../utils/llmPricing';
-import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
+import { REASONING_EFFORTS, ReasoningEffort, resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { blendedPrice, inferFamily, supersession } from './modelSupersession';
 import { PriceOverride, priceOverrideReports, summarizePriceOverrides } from './catalogReview';
 
@@ -24,6 +24,12 @@ function rate(value: unknown): number | undefined {
   // Avoid binary scaling noise causing a price-book diff on unchanged quotes.
   const n = Number((Number(value) * 1e6).toPrecision(15));
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+/** OpenRouter's `reasoning.supported_efforts`, all-or-nothing: one unknown value drops the whole list. */
+function supportedEfforts(reasoning: unknown): ReasoningEffort[] | undefined {
+  const efforts = object(reasoning)?.supported_efforts;
+  if (!Array.isArray(efforts) || efforts.length === 0) return;
+  return efforts.every(e => (REASONING_EFFORTS as readonly unknown[]).includes(e)) ? efforts as ReasoningEffort[] : undefined;
 }
 export interface CatalogCandidate {
   id: string; config: LLMModelConfig; price: ModelPrice;
@@ -78,6 +84,7 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
     if (invalidCache) continue;
     const id = `openrouter/${row.id}`;
     const inputs = architecture?.input_modalities;
+    const efforts = supportedEfforts(row?.reasoning);
     result.set(id, { id, price, listing: {
       priceOverrides: summarizePriceOverrides(p),
       acceptsImages: Array.isArray(inputs) && inputs.includes('image'),
@@ -91,6 +98,8 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
       adminOnly: true,
       provider, family: inferFamily(id), supportsTemperature: params.includes('temperature'),
       supportsTools: true, supportsToolChoice: params.includes('tool_choice'),
+      // Capability snapshot only: no reasoningEffort default, so callLLM still sends no `reasoning` param.
+      ...(efforts ? { supportedReasoningEfforts: efforts } : {}),
       // Vision stays opt-in until the describe_image path is verified.
       ...(provider === 'google' || provider === 'openai' ? { maxTools: 128 } : {}),
     } });
@@ -216,7 +225,9 @@ export async function refreshModelCatalog(options: {
     reports.push(...priceOverrideReports(model.id, model.listing.priceOverrides));
     const todo = ['description and tier (placeholders now)'];
     if (model.listing.acceptsImages) todo.push('accepts images (supportsVision left opt-in)');
-    if (model.listing.supportsReasoningEffort) todo.push('supports reasoning_effort (supportedReasoningEfforts not set; its Artificial Analysis score may be measured at a higher effort than the default)');
+    if (model.listing.supportsReasoningEffort) todo.push(model.config.supportedReasoningEfforts
+      ? 'supports reasoning_effort (supportedReasoningEfforts captured from OpenRouter; its Artificial Analysis score may be measured at a higher effort than the default)'
+      : 'supports reasoning_effort (supportedReasoningEfforts not set; its Artificial Analysis score may be measured at a higher effort than the default)');
     reports.push(`ℹ️ BEFORE CUSTOMER EXPOSURE: ${model.id} — set ${todo.join('; ')}.`);
   }
   for (const [id, config] of Object.entries(next)) {
