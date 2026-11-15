@@ -143,7 +143,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       const rawResult = await mcpToolRegistry.execute(name, toolArgs, context);
       // ENG-2335: public (external, non-admin) responses never carry internal IDs.
       const result = shouldSanitizePublicResponse(name, toolArgs, context)
-        ? sanitizePublicToolResult(rawResult)
+        ? sanitizePublicToolResult(rawResult, name)
         : rawResult;
       if (context.externalMcp && effectiveUserId) {
         // ENG-2906: this server is the Emma /mcp surface.
