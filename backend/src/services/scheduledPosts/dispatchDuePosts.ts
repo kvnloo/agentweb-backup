@@ -64,8 +64,11 @@ export async function dispatchDuePosts(deps: {
         if (t.ok && t.changed) await repo.save(t.record);
         summary.fired.push(current.id);
       } else {
-        // Failure transition (ENG-2519) not yet merged: leave the record unchanged and report.
-        summary.failed.push(current.id);
+        const t = transition(current, { type: 'markAttemptFailed', now, error: result.error, retryable: result.retryable });
+        if (!t.ok) throw new Error(t.message);
+        if (t.changed) await repo.save(t.record);
+        if (t.record.status === 'pending') summary.retried.push(current.id);
+        else summary.failed.push(current.id);
         summary.errors.push({ id: current.id, error: result.error });
       }
     } catch (err) {
