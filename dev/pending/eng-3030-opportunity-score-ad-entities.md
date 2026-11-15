@@ -1,0 +1,8 @@
+## ENG-3030: Zoma ads_get_opportunity_score + ads_get_ad_entities parity (2026-11-15)
+
+- `ads_get_opportunity_score` is a third tool in `backend/src/mcp/metaToolkitHealth.ts`. It makes two Graph reads on the caller's own account: `act_<id>?fields=opportunity_score` and `act_<id>/recommendations`. Because it is in `META_HEALTH_TOOL_NAMES`, the manifest, the v1 guard and the gateway branch pick it up with no further wiring. The only other edits are the read-only annotation and the `recommendations` edge in `readToolkitMetaAccountGraph`'s allow-list.
+- Source for the endpoint: Meta's Performance Recommendations API (developers.facebook.com/documentation/ads-commerce/marketing-api/overview/performance-recommendations), read through Meta's own `facebookincubator/catalogue-of-api-solutions` write-up. `recommendation_content` (lift_estimate, body) is omitted unless requested in `fields`.
+- `recommendation_signature` is not requested or returned. It is the perishable handle for Meta's apply call, and Zoma has no apply path.
+- The exact response shape of the account-level `recommendations` edge was not confirmed against a live account. The summarizer accepts both a flat list and the grouped per-account shape the business-level edge uses. A missing score is returned as null with a note, never 0.
+- `ads_get_ad_entities` got no new tool. `call_meta_marketing_api` LIST on CAMPAIGN / AD_SET / AD already returns each entity with `status` and `effective_status`. Known difference: AD LIST leaves out DELETED and ARCHIVED ads on purpose (`NON_LIVE_AD_STATUSES` in `metaService.ts`).
+- Unlike the two older health tools, this one refuses unknown or malformed arguments in the runner itself, before any Graph read, rather than relying on the advertised schema.

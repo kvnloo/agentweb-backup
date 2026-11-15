@@ -9,6 +9,10 @@
  *   meta_account_health   account_status, disable_reason, spend cap / amount spent (major units)
  *   meta_learning_phase   per ad set learning_stage_info (LEARNING / SUCCESS / FAIL)
  *
+ * ENG-3030 (slice 2) adds one Meta-parity read on the same account node:
+ *
+ *   ads_get_opportunity_score   Meta's 0-100 opportunity score and its recommendations
+ *
  * Reads only: no preview, no write gate, no new storage. The ad account is resolved by the
  * gateway with the same ownership rule as every other toolkit call, and Graph reads go
  * through the account's own `act_<id>` node/edge, so a caller cannot read a foreign account.
@@ -18,7 +22,7 @@
 
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 
-export const META_HEALTH_TOOL_NAMES = ['meta_account_health', 'meta_learning_phase'] as const;
+export const META_HEALTH_TOOL_NAMES = ['meta_account_health', 'meta_learning_phase', 'ads_get_opportunity_score'] as const;
 export type MetaHealthToolName = (typeof META_HEALTH_TOOL_NAMES)[number];
 
 export function isMetaHealthTool(name: string): name is MetaHealthToolName {
@@ -49,6 +53,22 @@ export const META_HEALTH_TOOL_DEFINITIONS = [
         account_id: { type: 'string', description: 'Optional Meta ad account id; defaults to the only connected account.' },
         campaign_id: { type: 'string', description: 'Optional: only ad sets of this campaign.' },
         include_inactive: { type: 'boolean', description: 'Include paused/archived ad sets (default false: delivering ad sets only).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'ads_get_opportunity_score',
+    description:
+      "Read-only: Meta's opportunity score for the ad account (0-100, how closely the account follows Meta's own performance recommendations) " +
+      'and the recommendations behind it. Each recommendation has its type, the campaigns / ad sets / ads it applies to (object_ids), ' +
+      "Meta's estimated score gain (opportunity_score_lift), Meta's explanation when it gives one, and an Ads Manager link. " +
+      'These are Meta suggestions, not instructions: this tool applies nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: { type: 'string', description: 'Optional Meta ad account id; defaults to the only connected account.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum recommendations to return (default 50).' },
       },
       additionalProperties: false,
     },
@@ -156,9 +176,78 @@ export function summarizeLearningPhase(adSets: any[]) {
   };
 }
 
+/**
+ * ENG-3030. Meta Performance Recommendations API:
+ * https://developers.facebook.com/documentation/ads-commerce/marketing-api/overview/performance-recommendations
+ *   act_<id>?fields=opportunity_score         the 0-100 score
+ *   act_<id>/recommendations                  the recommendations; recommendation_content
+ *                                             (lift_estimate, body) is omitted unless requested
+ * recommendation_signature (the perishable apply handle) is deliberately not requested:
+ * Zoma has no apply path, so it would be an unusable write credential in a read result.
+ */
+export const OPPORTUNITY_SCORE_FIELDS = 'opportunity_score';
+export const RECOMMENDATION_FIELDS = 'type,object_ids,opportunity_score_lift,recommendation_content,url';
+export const DEFAULT_RECOMMENDATIONS = 50;
+export const MAX_RECOMMENDATIONS = 100;
+const OPPORTUNITY_SCORE_ARGS = new Set(['account_id', 'limit']);
+
+function finiteOrNull(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Throws before any Graph read when an argument is unknown or malformed; returns the limit. */
+export function parseOpportunityScoreArgs(args: any): number {
+  if (args !== undefined && args !== null && (typeof args !== 'object' || Array.isArray(args))) {
+    throw new MetaToolkitRefusal('Arguments must be an object.');
+  }
+  const unknown = Object.keys(args ?? {}).filter((k) => !OPPORTUNITY_SCORE_ARGS.has(k));
+  if (unknown.length) throw new MetaToolkitRefusal(`Unknown argument(s): ${unknown.join(', ')}. Allowed: account_id, limit.`);
+  if (args?.limit === undefined) return DEFAULT_RECOMMENDATIONS;
+  if (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > MAX_RECOMMENDATIONS) {
+    throw new MetaToolkitRefusal(`limit must be an integer from 1 to ${MAX_RECOMMENDATIONS}.`);
+  }
+  return args.limit;
+}
+
+export function summarizeOpportunityScore(accountId: string, account: any, edge: any, limit: number) {
+  const data: any[] = Array.isArray(edge?.data) ? edge.data : [];
+  // The business-level edge groups rows per account ({ opportunity_score, recommendations: [...] });
+  // accept that shape on the account edge too, so either is read rather than silently dropped.
+  const flat = data.flatMap((row) => (Array.isArray(row?.recommendations) ? row.recommendations : [row]))
+    .filter((row) => row && typeof row === 'object' && !Array.isArray(row));
+  const all = flat.map((r) => {
+    const content = r.recommendation_content && typeof r.recommendation_content === 'object' ? r.recommendation_content : {};
+    const lift = finiteOrNull(r.opportunity_score_lift ?? content.opportunity_score_lift);
+    return {
+      type: typeof r.type === 'string' ? r.type : 'UNKNOWN',
+      object_ids: Array.isArray(r.object_ids) ? r.object_ids.map((id: unknown) => String(id)) : [],
+      opportunity_score_lift: lift,
+      ...(content.lift_estimate !== undefined && content.lift_estimate !== null ? { lift_estimate: String(content.lift_estimate) } : {}),
+      ...(typeof content.body === 'string' && content.body ? { body: content.body } : {}),
+      ...(typeof r.url === 'string' && r.url ? { url: r.url } : {}),
+    };
+  });
+  const recommendations = all.slice(0, limit);
+  const groupedScore = data.find((row) => row && typeof row === 'object' && row.opportunity_score !== undefined)?.opportunity_score;
+  const score = finiteOrNull(account?.opportunity_score ?? groupedScore);
+  const truncated = all.length > limit || Boolean(edge?.paging?.next);
+  return {
+    account_id: accountId,
+    opportunity_score: score,
+    recommendations,
+    summary: { returned: recommendations.length },
+    ...(score === null ? { note: 'Meta returned no opportunity score for this ad account (it is not available on every account).' } : {}),
+    ...(truncated ? { truncated: true, truncated_note: `Only the first ${recommendations.length} recommendations are returned; Meta has more.` } : {}),
+  };
+}
+
+export type MetaHealthEdge = '' | 'adsets' | 'recommendations';
+
 export interface MetaHealthDeps {
   /** GET act_<accountId> (path '') or an act_<accountId>/<edge>, ownership-scoped by the account node. */
-  readAccountGraph: (userId: string, accountId: string, edge: '' | 'adsets', params: Record<string, string>) => Promise<any>;
+  readAccountGraph: (userId: string, accountId: string, edge: MetaHealthEdge, params: Record<string, string>) => Promise<any>;
 }
 
 const defaultDeps: MetaHealthDeps = {
@@ -178,13 +267,20 @@ export async function runMetaHealthTool(
   deps: MetaHealthDeps = defaultDeps,
 ) {
   // Graph errors are re-thrown as a refusal with Meta's own message only (never the request).
-  const read = async (edge: '' | 'adsets', params: Record<string, string>) => {
+  const read = async (edge: MetaHealthEdge, params: Record<string, string>) => {
     try {
       return await deps.readAccountGraph(userId, accountId, edge, params);
     } catch (error: any) {
-      throw new MetaToolkitRefusal(`Could not read ${edge ? 'ad sets' : 'the ad account'} from Meta: ${error?.metaError?.message || error?.message || 'Meta request failed'}.`);
+      const what = edge === 'adsets' ? 'ad sets' : edge === 'recommendations' ? 'recommendations' : 'the ad account';
+      throw new MetaToolkitRefusal(`Could not read ${what} from Meta: ${error?.metaError?.message || error?.message || 'Meta request failed'}.`);
     }
   };
+  if (name === 'ads_get_opportunity_score') {
+    const limit = parseOpportunityScoreArgs(args);
+    const account = await read('', { fields: OPPORTUNITY_SCORE_FIELDS });
+    const edge = await read('recommendations', { fields: RECOMMENDATION_FIELDS, limit: String(limit) });
+    return summarizeOpportunityScore(accountId, account, edge, limit);
+  }
   if (name === 'meta_account_health') {
     return summarizeAccountHealth(await read('', { fields: ACCOUNT_FIELDS }));
   }

@@ -73,6 +73,7 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_account_get_activity_logs',
   'meta_account_health',
   'meta_learning_phase',
+  'ads_get_opportunity_score',
   // Meta: catalogs, feeds, event sources (read tools only)
   'meta_list_catalogs',
   'meta_list_products',
