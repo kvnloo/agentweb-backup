@@ -62,4 +62,21 @@ check "OUT file written" '[ -s "${WORKDIR}/note.txt" ]'
 out="$(DATE=2026-10-20 OUT="${WORKDIR}/empty.txt" bash "${SCRIPT}")"; rc=$?
 check "empty day: exit 0, no draft, no file" '[ "${rc}" = 0 ] && [ -z "${out}" ] && [ ! -e "${WORKDIR}/empty.txt" ]'
 
+# Verifier regression: compound headings are structure, not rollout summaries.
+for heading in '## What / why' '## SUMMARY & HOW:' '## What, Why'; do
+  jq --arg heading "${heading}" '.[0].body = ($heading + "\nPaces Meta budgets across the day.")' \
+    "${MOCK_PRS}" >"${WORKDIR}/compound.json"
+  cp "${WORKDIR}/compound.json" "${MOCK_PRS}"
+  out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+  check "compound heading skipped: ${heading}" 'grep -q "^  Paces Meta budgets across the day.$" <<<"${out}"'
+done
+
+# Do not discard substantive summaries merely because they start with a heading word.
+for summary in 'Summary of the fix' 'What changed: retries now stop' 'Why this matters'; do
+  jq --arg summary "${summary}" '.[0].body = $summary' "${MOCK_PRS}" >"${WORKDIR}/substantive.json"
+  cp "${WORKDIR}/substantive.json" "${MOCK_PRS}"
+  out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+  check "substantive summary retained: ${summary}" 'grep -Fq "  ${summary}" <<<"${out}"'
+done
+
 exit "${FAILED}"
