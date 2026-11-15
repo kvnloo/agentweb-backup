@@ -1,3 +1,16 @@
+## ENG-3029: frontier monitor uploads the first Artificial Analysis response page as an artifact (2026-11-15)
+
+- Step 1 of 2. The `Frontier monitor and model catalog` workflow sets `AA_FIRST_PAGE_CAPTURE_PATH`; `fetchArtificialAnalysisModels` then writes the parsed body of page 1 to that path, and the workflow uploads it as artifact `artificial-analysis-first-page` (14 days).
+- The file is the response body only: no request, no headers, no key. A body that contains the key is not written. A capture failure goes to stderr and never fails the read. Without the env var nothing is written, so no other caller changes.
+- Not done yet: replacing the jest fixture (`artificialAnalysisLanguageModelsFree.json` is still the documented example). That needs the artifact from a real run after this merges; ENG-3029 stays open for it.
+
+## ENG-3021: No-inference readback routes for get_leads and get_lead_details (2026-11-15)
+
+- `POST /api/emma/leads` `{ list_id, limit?, cursor?, status?, search?, include_all_fields? }` and `POST /api/emma/lead-details` `{ list_id, lead_id }` call the same handlers as Emma's `get_leads` and `get_lead_details` tools (`backend/src/emma/impl/leads.ts`). No model run.
+- Read-only. The caller is always the authenticated user; identity fields in the body are ignored and the handlers enforce list access.
+- Both are `metered` in `EMMA_ROUTE_BUDGET`, like `POST /search-leads`.
+- Purpose: a post-merge verifier can read stored `contactStatus` and unsubscribe evidence through all three lead projections with a fixture token.
+
 ## ENG-3037: failure-cluster loop treats the "<X> not connected" wording as never-connected (2026-11-15)
 
 - `isNeverConnectedMessage` in `backend/src/loops/instances/agent-mode/failureRuleSet.ts` matched only "No <X> account connected" (ENG-2943). The other wording of the same precondition was counted as a dispatchable `config` failure and could file an Auto oncall row with nothing to act on (the google_drive cluster on ENG-2788).
