@@ -7,6 +7,8 @@
  * Mocked Graph only: no live Meta call.
  */
 jest.mock('axios');
+// The insights report is polled every 10 s; the wait is not what is under test.
+jest.mock('../services/agentMode/sandboxPolling', () => ({ sandboxAwarePollDelayMs: () => 0 }));
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     listMetaAdsCampaignsNew: jest.fn(),
@@ -70,21 +72,30 @@ describe('ENG-3031 ads_insights_auction_ranking_benchmarks → call_meta_ads_ins
     for (const f of RANKING_FIELDS) expect(ALLOWED_INSIGHTS_FIELDS).toContain(f);
   });
 
-  it('the insights call sends the three ranking fields to Graph at ad level (none dropped)', async () => {
+  it('the insights call sends the three ranking fields to Graph at ad level and returns what Meta answers for them', async () => {
     const post = axios.post as jest.Mock;
+    const get = axios.get as jest.Mock;
     post.mockReset();
-    // Stop right after the submit: only the request Graph would receive is under test.
-    post.mockRejectedValue(new Error('stop after submit'));
+    get.mockReset();
+    post.mockResolvedValue({ data: { report_run_id: 'run-1' } });
+    const metaRow = { ad_id: '555', quality_ranking: 'ABOVE_AVERAGE', engagement_rate_ranking: 'AVERAGE', conversion_rate_ranking: 'BELOW_AVERAGE_35' };
+    get
+      .mockResolvedValueOnce({ data: { async_status: 'Job Completed' } })
+      .mockResolvedValueOnce({ data: { data: [metaRow] } });
     const getMetaCredentials = jest.fn().mockResolvedValue({ accountId: '111', accessToken: 'tok' });
-    await callMetaAdsInsightsApiWrapper(
+
+    const result: any = await callMetaAdsInsightsApiWrapper(
       'user-1',
       { object_type: 'account', level: 'ad', date_preset: 'last_7d', fields: ['ad_id', ...RANKING_FIELDS] } as any,
       { getMetaCredentials },
-    ).catch(() => undefined);
+    );
+
     expect(post).toHaveBeenCalledTimes(1);
     const [url, body] = post.mock.calls[0];
     expect(url).toMatch(/\/act_111\/insights$/);
     expect(body.level).toBe('ad');
     expect(String(body.fields).split(',')).toEqual(['ad_id', ...RANKING_FIELDS]);
+    expect(result.success).toBe(true);
+    expect(result.data).toEqual([metaRow]);
   });
 });
