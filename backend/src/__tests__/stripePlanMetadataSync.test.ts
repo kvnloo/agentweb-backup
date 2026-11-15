@@ -235,4 +235,36 @@ describe('handleSubscriptionUpdated — Max/custom price', () => {
     expect(updates.current_period_end).toBeDefined();
     expect(updates.subscriptionType).toBeUndefined();
   });
+
+  it('does not keep a paid tier when a cancellation landed during the product lookup', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockStripe.products.retrieve.mockResolvedValueOnce({ id: 'prod_max', metadata: { plan: 'Max' } });
+    // The stored row was canceled while the lookup ran: DynamoDB refuses the conditional tier write.
+    mockUpdateUser
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' }));
+    await expect(handleSubscriptionUpdated(makeSub({ id: 'price_custom', product: 'prod_max' }))).resolves.toBeUndefined();
+    expect(mockUpdateUser).toHaveBeenCalledTimes(2);
+    const [, tierWrite, options] = mockUpdateUser.mock.calls[1];
+    expect(tierWrite.subscriptionType).toBe('Max');
+    expect(options.condition.expression).toContain('NOT (#storedStatus IN (:endedCanceled, :endedExpired))');
+    expect(options.condition.names).toEqual({ '#storedStatus': 'subscription_status' });
+    expect(options.condition.values).toEqual({ ':endedCanceled': 'canceled', ':endedExpired': 'incomplete_expired' });
+    const { syncUserUpdateToLeadList } = jest.requireMock('../services/crmAutoSyncService');
+    expect(syncUserUpdateToLeadList).toHaveBeenCalledWith('p@example.com', { subscriptionType: undefined, subscription_status: undefined });
+    warn.mockRestore();
+  });
+
+  it('guards every tier write for a live event, and the first status write stays unconditional', async () => {
+    await handleSubscriptionUpdated(makeSub({ id: 'price_max_custom', metadata: { plan: 'Max' } }));
+    expect(mockUpdateUser.mock.calls[0][2]).toBeUndefined();
+    expect(mockUpdateUser.mock.calls[1][2]?.condition).toBeDefined();
+  });
+
+  it('errors for retry when the tier write fails for any other reason', async () => {
+    mockUpdateUser.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('write unavailable'));
+    await expect(
+      handleSubscriptionUpdated(makeSub({ id: 'price_max_custom', metadata: { plan: 'Max' } })),
+    ).rejects.toThrow('write unavailable');
+  });
 });

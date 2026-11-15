@@ -1310,8 +1310,39 @@ export async function handleSubscriptionUpdated(
   }
 
   if (Object.keys(tierUpdate).length) {
-    await userDb.updateUser(user.userId, tierUpdate);
-    Object.assign(updateData, tierUpdate);
+    // ENG-2724: the tier lookup above can wait on Stripe for seconds. If a
+    // cancellation for this customer was handled in that window, its Free
+    // reset is already stored, and writing this event's paid tier now would
+    // leave a canceled customer on that tier. The write is therefore
+    // conditional on the stored status not having ended (checked by DynamoDB
+    // in the same operation as the write), unless this event itself reports
+    // an ended status.
+    const guardEndedStatus = !ENDED_SUBSCRIPTION_STATUSES.has(effectiveStatus);
+    try {
+      await userDb.updateUser(
+        user.userId,
+        tierUpdate,
+        guardEndedStatus
+          ? {
+              condition: {
+                expression:
+                  'attribute_not_exists(#storedStatus) OR NOT (#storedStatus IN (:endedCanceled, :endedExpired))',
+                names: { '#storedStatus': 'subscription_status' },
+                values: { ':endedCanceled': 'canceled', ':endedExpired': 'incomplete_expired' },
+              },
+            }
+          : undefined
+      );
+      Object.assign(updateData, tierUpdate);
+    } catch (err: any) {
+      if (!guardEndedStatus || err?.code !== 'ConditionalCheckFailedException') throw err;
+      console.warn(
+        `[STRIPE] Skipping tier sync for user ${user.userId}: subscription ended while ${subscription.id} was being updated`
+      );
+      // Report nothing to the lead list for this event: the cancellation
+      // that won has already synced the final state.
+      delete updateData.subscription_status;
+    }
   }
   syncUserUpdateToLeadList(user.email, {
     subscriptionType: updateData.subscriptionType,
