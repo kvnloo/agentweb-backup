@@ -554,6 +554,60 @@ events_show_recoverable_abort() {
   return 1
 }
 
+# True when EB's own event log shows that the rollout this script started has
+# finished (ENG-3039).
+#
+# verify_deployment needs this for one state only: Updating, on OUR version.
+# That is what a rollout in flight looks like, and it is also what the
+# environment looks like when our rollout finished and somebody else's update
+# (an environment-variable change, a managed platform update) began before the
+# next poll. On 2026-11-06 the gap between the two was eight seconds, the second
+# update ran 27 minutes, and the deploy was reported failed 22 minutes after
+# the release was serving.
+#
+# The proof is an ordered pair inside the window since update-environment was
+# accepted: "Environment update is starting." and, after it, EB's
+# application-version completion line. Order matters. The window is anchored to
+# the runner's clock, so a runner a few seconds behind EB can pull in the
+# PREVIOUS deploy's completion line; that line has no start before it in the
+# window and is ignored. A configuration update logs a different completion
+# line, so it cannot satisfy this either.
+#
+# Anything short of that proof, including an unreadable event log, returns
+# false and verify_deployment carries on exactly as before.
+rollout_logged_complete() {
+  [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 1
+
+  local since out
+  since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -z "${since}" ] && return 1
+
+  if ! out=$(aws elasticbeanstalk describe-events \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --severity INFO \
+    --start-time "${since}" \
+    --max-items 200 \
+    --query 'Events[].[Message]' \
+    --output text 2>&1); then
+    log "[events] could not read EB events to check whether the rollout finished (non-fatal, status polling continues). AWS reported: ${out}"
+    return 1
+  fi
+
+  # EB returns newest first; walk oldest first.
+  awk '
+    { lines[NR] = $0 }
+    END {
+      started = 0
+      for (i = NR; i >= 1; i--) {
+        if (index(lines[i], "Environment update is starting.")) started = 1
+        else if (started && index(lines[i], "New application version was deployed to running EC2 instances.")) exit 0
+      }
+      exit 1
+    }
+  ' <<<"${out}"
+}
+
 # Creates the application version. A genuine failure fails the job; the single
 # tolerated case is the version already existing (a re-run of the same commit),
 # which is logged with the reason AWS gave.
@@ -768,6 +822,20 @@ verify_deployment() {
         log "Environment left the Ready/${EB_VERSION_LABEL} state; restarting the health settle window."
         ready_since=0
       fi
+    fi
+
+    # ENG-3039: Updating on our version is either our rollout still running or
+    # a later update that began after ours finished. Only EB's event log tells
+    # them apart, and only instance and target health prove the release is
+    # serving. Both must hold; otherwise keep polling against the same budget.
+    if [ "${EB_STATUS}" = "Updating" ] && [ "${EB_CURRENT_VERSION}" = "${EB_VERSION_LABEL}" ] \
+      && rollout_logged_complete; then
+      underlying_health_verdict
+      if [ "${EB_HEALTH_VERDICT}" = "LAGGING" ]; then
+        log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' is running version '${EB_VERSION_LABEL}': Elastic Beanstalk logged this rollout as complete, every instance is Ok and every load-balancer target is healthy. The environment reads Updating because of a later update that this deploy did not start; this deploy does not wait for it."
+        return 0
+      fi
+      log "[verify] EB logged the rollout of '${EB_VERSION_LABEL}' as complete and a later update is in progress, but instance/target health is not proven yet (${EB_UNHEALTHY_DETAIL:-no detail available}); still polling."
     fi
 
     if run_budget_exhausted; then

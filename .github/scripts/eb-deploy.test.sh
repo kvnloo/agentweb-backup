@@ -130,6 +130,27 @@ case "$operation" in
     # ENG-837: ERROR-severity events are how an ASYNCHRONOUS EB rejection
     # becomes visible. Fixtures: `events` (message text, one per line),
     # `events_exit` (simulate an API/IAM failure).
+    #
+    # ENG-3039: a `--severity INFO` call is the rollout-completion scan, served
+    # from its own fixtures (`info_events`, one message per line NEWEST FIRST
+    # as EB returns them, and `info_events_exit`) so the ERROR scan above keeps
+    # reading exactly what it always read.
+    case "$all_args" in
+      *'--severity INFO'*)
+        code=0
+        [ -f "${MOCK_DIR}/info_events_exit" ] && code=$(cat "${MOCK_DIR}/info_events_exit")
+        if [ "$code" != "0" ]; then
+          printf 'mock aws: simulated describe-events (INFO) failure\n' >&2
+          exit "$code"
+        fi
+        if [ -f "${MOCK_DIR}/info_events" ]; then
+          cat "${MOCK_DIR}/info_events"
+        else
+          printf 'None\n'
+        fi
+        exit 0
+        ;;
+    esac
     code=0
     [ -f "${MOCK_DIR}/events_exit" ] && code=$(cat "${MOCK_DIR}/events_exit")
     if [ "$code" != "0" ]; then
@@ -1355,6 +1376,120 @@ else
     "${probe_record:-<nothing>}"
   TESTS_FAILED=$(( TESTS_FAILED + 1 ))
 fi
+
+# ---------------------------------------------------------------------------
+# ENG-3039 -- a later update that this deploy did not start must not turn an
+# applied release into a failed deploy.
+#
+# Production, 2026-11-06, run 42150471207 (merge of #3910). Elastic Beanstalk
+# finished rolling out backend-20261106-pr3910 at 02:53:52Z. Eight seconds
+# later, at 02:54:00Z, an environment-variable change made outside this
+# workflow (CloudTrail: UpdateEnvironment with optionSettings, a different
+# principal) started a second Immutable update that ran until 03:21:06Z. The
+# environment was Ready for less time than one 15s poll, so every poll read
+# `Status=Updating Health=Green Version=backend-20261106-pr3910` and the run
+# failed at 03:16Z with "did not come up Ready ... within the overall deploy
+# budget of 2700s" -- 22 minutes after the release was serving.
+#
+# The fixtures below are that sequence: the status line the run logged on every
+# poll, and the INFO events EB recorded for the window, newest first.
+# ---------------------------------------------------------------------------
+
+printf '\nENG-3039: a later foreign update does not fail an applied release\n'
+
+EB_ROLLOUT_DONE='New application version was deployed to running EC2 instances.'
+
+# Newest first, as describe-events returns them.
+set_rollout_then_foreign_update() {
+  local dir="$1"
+  {
+    printf '%s\n' 'Created temporary auto scaling group awseb-e-x-immutable-stack-AWSEBAutoScalingGroup-kuBocPpTarbW.'
+    printf '%s\n' 'Immutable deployment policy enabled. Launching one instance with the new settings to verify health.'
+    printf '%s\n' 'Environment update is starting.'
+    printf '%s\n' 'Environment update completed successfully.'
+    printf '%s\n' "${EB_ROLLOUT_DONE}"
+    printf '%s\n' 'Deployment succeeded. Terminating old instances and temporary Auto Scaling group.'
+    printf '%s\n' 'Environment update is starting.'
+  } >"${dir}/info_events"
+}
+
+# The 11-06 replay: rollout logged complete, instances and targets healthy,
+# environment Updating on OUR version because of someone else's update.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+set_rollout_then_foreign_update "$M"
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: the 2026-11-06 sequence is a success, not a budget timeout' 0 \
+  'SUCCESS: environment'
+check 'ENG-3039: the success says a later update is still running' 0 \
+  'a later update that this deploy did not start'
+
+# A failed deploy must still fail. Each case below removes one leg of the proof.
+
+# No completion event: this is an ordinary rollout still in flight (or stuck).
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+{
+  printf '%s\n' 'Deployment succeeded. Terminating old instances and temporary Auto Scaling group.'
+  printf '%s\n' 'Environment update is starting.'
+} >"$M/info_events"
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: Updating with no rollout-complete event still fails on the budget' 1 \
+  'did not come up Ready'
+
+# Completion logged but an instance is not Ok: not proven serving, keep failing.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+set_rollout_then_foreign_update "$M"
+set_healthy_underlying "$M"
+printf 'i-0d6a42c54cfc58bd7\tSevere\n' >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: rollout complete but an instance not Ok still fails' 1 \
+  'did not come up Ready'
+
+# A completion event with no "update is starting" before it belongs to the
+# PREVIOUS deploy (runner clock a few seconds behind EB's). It proves nothing
+# about this rollout.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+{
+  printf '%s\n' 'Immutable deployment policy enabled. Launching one instance with the new settings to verify health.'
+  printf '%s\n' 'Environment update is starting.'
+  printf '%s\n' 'Environment update completed successfully.'
+  printf '%s\n' "${EB_ROLLOUT_DONE}"
+} >"$M/info_events"
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: a completion event from the previous deploy is not accepted' 1 \
+  'did not come up Ready'
+
+# The environment is Updating on ANOTHER version: the event log is irrelevant.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|old-version'
+set_rollout_then_foreign_update "$M"
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: Updating on another version is never a success' 1 \
+  'did not come up Ready'
+
+# An unreadable event log cannot be read as proof.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+printf '255' >"$M/info_events_exit"
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: an unreadable event log is not proof of a rollout' 1 \
+  'did not come up Ready'
+
+# And the ordinary path is untouched: Ready on our version succeeds as before,
+# without claiming a later update.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3039: a normal deploy still succeeds through the Ready path' 0 \
+  "is Ready, running version 'backend-20260729-pr2216'"
 
 # ---------------------------------------------------------------------------
 
