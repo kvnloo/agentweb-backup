@@ -6,7 +6,7 @@ process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
  *  4. Before a create or activate row counts as covered: the path creates every entity
  *     PAUSED, and activation goes through the write guard (its own preview + token).
  *     Proven here per entity, because eng2303 only exercises CAMPAIGN.
- *  The two read rows (ads_get_ad_accounts, ads_get_field_context) stay gaps, owned by ENG-3040.
+ *  ads_get_field_context stays a gap, owned by ENG-3040 (ads_get_ad_accounts is its own read tool since ENG-3040).
  */
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 jest.mock('../mcp/zomaOnboarding', () => {
@@ -109,17 +109,15 @@ describe('ENG-3034 Campaign-management parity rows', () => {
     expect(mma.description).toContain('activating (status=ACTIVE) is its own separate preview and approval');
   });
 
-  it('the two read rows stay gaps owned by ENG-3040 (no tool is advertised under those names)', () => {
+  it('ads_get_field_context stays a gap owned by ENG-3040 (ads_get_ad_accounts moved to eng3040.adAccounts.test.ts)', () => {
     const names = new Set(getMetaToolkitManifest().map((d: any) => d.name));
-    for (const name of ['ads_get_ad_accounts', 'ads_get_field_context']) {
-      expect(row(name)).toMatchObject({ status: 'gap', owner: 'ENG-3040' });
-      expect(names.has(name)).toBe(false);
-    }
+    expect(row('ads_get_field_context')).toMatchObject({ status: 'gap', owner: 'ENG-3040' });
+    expect(names.has('ads_get_field_context')).toBe(false);
   });
 
-  it('Campaign management totals: 6 covered, 2 gaps', () => {
+  it('Campaign management totals: 7 covered, 1 gap', () => {
     const cm = summarizeParity().find((r: any) => r.category === 'Campaign management');
-    expect(cm).toMatchObject({ covered: 6, gap: 2 });
+    expect(cm).toMatchObject({ covered: 7, gap: 1 });
   });
 
   describe.each(ENTITIES)('%s through the write guard', (entity) => {

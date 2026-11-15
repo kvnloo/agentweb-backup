@@ -64,9 +64,9 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   // ENG-2913 — base discovery/lifecycle names are part of the official inventory.
   // ENG-3034: create and activate are the guarded call_meta_marketing_api writes
   // (always created PAUSED; status=ACTIVE is its own preview and approval), proven
-  // per entity in eng3034.campaignManagementParity.test.ts. The two read rows are
-  // still gaps, owned by ENG-3040.
-  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts', 'ENG-3040'),
+  // per entity in eng3034.campaignManagementParity.test.ts. ENG-3040: ads_get_ad_accounts is
+  // its own read tool (connected accounts only); ads_get_field_context is still a gap.
+  same(EDITS, 'ENG-2913', 'ads_get_ad_accounts'),
   covered(EDITS, 'ENG-2913', 'ads_create_campaign', { tool: MMA, action: 'CREATE', entityType: 'CAMPAIGN' }),
   covered(EDITS, 'ENG-2913', 'ads_create_ad_set', { tool: MMA, action: 'CREATE', entityType: 'AD_SET' }),
   covered(EDITS, 'ENG-2913', 'ads_create_ad', { tool: MMA, action: 'CREATE', entityType: 'AD' }),

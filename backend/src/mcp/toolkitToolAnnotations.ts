@@ -96,6 +96,8 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_get_ig_accounts',
   'ads_get_ig_media',
   'ads_library_search',
+  // ENG-3040: one GET of each connected account's own act_<id> node
+  'ads_get_ad_accounts',
   // Google Ads
   'call_google_ads_reporting_api',
 ]);

@@ -25,6 +25,7 @@ import { isMetaCatalogFeedTool, META_CATALOG_FEED_TOOL_DEFINITIONS } from './met
 import { isMetaEventSourceTool, META_EVENT_SOURCE_TOOL_DEFINITIONS } from './metaToolkitEventSources';
 import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
+import { AD_ACCOUNTS_TOOL_DEFINITION, AD_ACCOUNTS_TOOL_NAME } from './metaToolkitAdAccounts';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } from './metaToolkitExperimentWrites';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
@@ -135,13 +136,15 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     // ENG-2926: catalog create/update, feeds, upload sessions, feed rules (deletes are preview → confirm).
     ...META_CATALOG_FEED_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-3040: read-only list of the connected ad accounts (handled by the gateway, before account resolution).
+    JSON.parse(JSON.stringify(AD_ACCOUNTS_TOOL_DEFINITION)),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
   ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name) || name === AD_ACCOUNTS_TOOL_NAME) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

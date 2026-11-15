@@ -39,6 +39,7 @@ import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite,
 import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
+import { AD_ACCOUNTS_TOOL_NAME, runMetaAdAccountsTool } from './metaToolkitAdAccounts';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
@@ -121,6 +122,8 @@ export interface MetaToolkitGatewayDeps {
   runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
   runPagesTool?: typeof runMetaPagesTool;
+  /** ENG-3040 read-only ads_get_ad_accounts; defaults to runMetaAdAccountsTool. */
+  runAdAccountsTool?: typeof runMetaAdAccountsTool;
   /** zoma_prepare_upload; defaults to prepareZomaUpload. */
   prepareUpload?: (userId: string, args: any) => Promise<any>;
   /** ENG-2914 zoma_custom_audiences; defaults to executeMetaToolkitAudience. */
@@ -408,6 +411,22 @@ export async function handleMetaToolkitCall(
     const result = request.toolName === 'ads_get_errors' ? explainMetaError(args) : getMetaHelpArticles(args);
     await meter('meta');
     return result;
+  }
+  // ENG-3040: lists the caller's connected (own + org-shared) usable Meta ad accounts. It runs
+  // before account resolution on purpose: with several accounts connected every other tool
+  // answers "pass account_id", and this is how a caller finds the ids. It takes no account
+  // argument, so it cannot be pointed at an account the caller has not connected.
+  if (request.toolName === AD_ACCOUNTS_TOOL_NAME) {
+    return withMetaToolkitBackoff(false, deps.sleep, async () => {
+      const now = deps.now();
+      const connected = (await deps.listAccounts(caller.userId))
+        .filter((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now))
+        .map((a) => ({ accountId: META_PROVIDER.accountIds(a)[0], name: (a as any).account_name, currency: (a.config as any)?.currency }))
+        .filter((a) => !!a.accountId);
+      const result = await (deps.runAdAccountsTool ?? runMetaAdAccountsTool)(caller.userId, connected, args);
+      await meter('meta');
+      return stripCredentials(result);
+    });
   }
   const metaWrite = audienceTool ? isAudienceWriteRequest(args)
     : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
