@@ -3,6 +3,16 @@ name: Build
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # ENG-3038: the dev.md consolidation PR is opened with GITHUB_TOKEN, which
+  # cannot start a pull_request run, so dev-md-fragments.yml dispatches this
+  # workflow on that PR's branch instead. Only that branch is honoured: its
+  # diff is held to dev.md plus removed fragments by the fragment guard, so
+  # there is nothing to build and the path filter is not consulted. A dispatch
+  # on any other ref fails `Detect changed projects`, so it cannot stand in for
+  # a PR's real run. That job's `if:` is deliberately untouched (merge-evidence
+  # pins it): a dispatch has no pull_request payload, and GitHub's loose
+  # equality reads `null == false` as true, so the job runs.
+  workflow_dispatch:
 
 # Product test suites run on Atem only when they protect a retained invariant or
 # a reproduced regression. GitHub Actions proves buildability and CI/deploy
@@ -28,11 +38,17 @@ jobs:
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
       remotion: ${{ steps.filter.outputs.remotion }}
     steps:
+      - name: Refuse a dispatch off the consolidation branch
+        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'automation/dev-md-consolidate'
+        run: |
+          echo "Build is dispatched only on automation/dev-md-consolidate (ENG-3038); open a pull request instead." >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
       - id: filter
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
