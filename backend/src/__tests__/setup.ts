@@ -85,8 +85,15 @@ if (typeof realFetch === 'function') {
 export {};
 
 // Keep the pre-Dynamo route characterizations unchanged while mocking their new I/O.
-if (/[\\/](hubspotAuth|fathomAuth)\.test\.ts$/.test(expect.getState().testPath || '')) {
+if (/[\\/](hubspotAuth|fathomAuth|googleAdsAuth|youtubeAuth)\.test\.ts$/.test(expect.getState().testPath || '')) {
   jest.doMock('../services/db', () => ({
+    oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
+  }));
+}
+// googleDriveAuth also reads userDb/orgDb, so only the session store is replaced.
+if (/[\\/]googleDriveAuth\.test\.ts$/.test(expect.getState().testPath || '')) {
+  jest.doMock('../services/db', () => ({
+    ...jest.requireActual('../services/db'),
     oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
   }));
 }

@@ -7,6 +7,7 @@ import { createAccount } from '../services/connectedAccountsDb';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 import { userDb, orgDb } from '../services/db';
 import { canInOrg } from '../services/orgAuthz';
 import { getAccountByPlatform } from '../services/connectedAccountsDb';
@@ -15,8 +16,6 @@ import { buildDriveAccessInventory, browseDrive, clampDrivePageSize, isValidDriv
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 interface StatePayload {
@@ -39,7 +38,7 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   }
 };
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
     refresh_token?: string;
@@ -51,34 +50,7 @@ interface TokenSession {
     name: string;
     picture?: string;
   };
-  userId: string;
-  expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], profile: TokenSession['profile']): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, profile, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'profile'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId);
-  return { tokens: session.tokens, profile: session.profile };
-};
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -175,11 +147,12 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       picture?: string;
     };
 
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeOAuthFlowSession<TokenSession>('google_drive', {
       userId,
-      { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
-      { email, name, picture }
-    );
+      tokens: { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
+      profile: { email, name, picture },
+      expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
+    });
 
     res.json({ success: true, profile: { email, name, picture }, grantedScopes, tokenSessionId });
   } catch (error: any) {
@@ -198,12 +171,11 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await consumeOAuthFlowSession<TokenSession>('google_drive', tokenSessionId, userId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
     const { tokens, profile } = session;
 
     const account = await createAccount(userId, 'google_drive', {

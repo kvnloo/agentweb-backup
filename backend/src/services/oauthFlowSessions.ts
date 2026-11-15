@@ -13,7 +13,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isStrings = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every(item => typeof item === 'string');
 
-// Validate both provider payloads at the shared persistence boundary before route use.
+// Validate every provider payload at the shared persistence boundary before route use.
 function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'], userId: string): boolean {
   if (!isRecord(value) || value.userId !== userId ||
       typeof value.expires !== 'number' || !Number.isFinite(value.expires) || value.expires <= Date.now() ||
@@ -23,6 +23,16 @@ function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'
       typeof tokens.expires_in !== 'number' || !Number.isFinite(tokens.expires_in) ||
       (tokens.refresh_token !== undefined && typeof tokens.refresh_token !== 'string')) return false;
   if (provider === 'fathom') return true;
+  if (provider === 'google_ads') {
+    return Array.isArray(value.connectableLeaves) &&
+      value.connectableLeaves.every(leaf => isRecord(leaf) && typeof leaf.customerId === 'string');
+  }
+  if (provider === 'google_drive' || provider === 'youtube') {
+    if (!isStrings(tokens.granted_scopes) || !isRecord(value.profile)) return false;
+    return provider === 'google_drive'
+      ? typeof value.profile.email === 'string'
+      : isRecord(value.channel) && typeof value.channel.id === 'string';
+  }
   return isRecord(value.hubInfo) && typeof value.hubInfo.hub_id === 'number' &&
     Number.isFinite(value.hubInfo.hub_id) && typeof value.hubInfo.hub_domain === 'string' &&
     typeof value.hubInfo.user === 'string' && (value.accountType === 'crm' || value.accountType === 'marketing') &&

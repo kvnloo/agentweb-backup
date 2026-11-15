@@ -7,12 +7,11 @@ import { createAccount } from '../services/connectedAccountsDb';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // ── State JWT ──────────────────────────────────────────────────────────────
@@ -39,7 +38,7 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
 
 // ── Token session store (server-side, one-time use) ────────────────────────
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
     refresh_token?: string;
@@ -58,39 +57,7 @@ interface TokenSession {
     name: string;
     picture?: string;
   };
-  userId: string;
-  expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (
-  userId: string,
-  tokens: TokenSession['tokens'],
-  channel: TokenSession['channel'],
-  profile: TokenSession['profile']
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, channel, profile, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'channel' | 'profile'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return { tokens: session.tokens, channel: session.channel, profile: session.profile };
-};
 
 // ── GET /init — build Google authorization URL with YouTube scopes ──────
 
@@ -223,12 +190,13 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     };
 
     // Store tokens server-side (never expose to frontend)
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeOAuthFlowSession<TokenSession>('youtube', {
       userId,
-      { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
-      channelInfo,
-      { email, name, picture }
-    );
+      tokens: { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
+      channel: channelInfo,
+      profile: { email, name, picture },
+      expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
+    });
 
     res.json({
       success: true,
@@ -254,12 +222,11 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await consumeOAuthFlowSession<TokenSession>('youtube', tokenSessionId, userId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
     const { tokens, channel, profile } = session;
 
     const account = await createAccount(userId, 'youtube', {
