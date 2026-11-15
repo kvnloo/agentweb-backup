@@ -1,0 +1,6 @@
+## ENG-3037: failure-cluster loop treats the "<X> not connected" wording as never-connected (2026-11-15)
+
+- `isNeverConnectedMessage` in `backend/src/loops/instances/agent-mode/failureRuleSet.ts` matched only "No <X> account connected" (ENG-2943). The other wording of the same precondition was counted as a dispatchable `config` failure and could file an Auto oncall row with nothing to act on (the google_drive cluster on ENG-2788).
+- Added an allow-list, not a general "not connected" pattern. Included, each throw site read and reached only when no connected-account row is found: Google Drive (`googleDriveAccess.ts`), HubSpot (`hubspotService.ts`, no own and no shared account), Attio (`attioService.ts`), Gmail and Outlook (`getAccountById` returns nothing for the requested account id).
+- Left as `config` on purpose, because a connected account can produce them: LinkedIn Ads in `adsApis.getLinkedInAdsCredentials` (the filter also drops a row with no `access_token`), bare "ClickUp not connected" / "Foreplay not connected" (`getAccessToken` returns null when a stored token fails to decrypt), and messages naming one specific account.
+- A new integration using this wording is not excluded until its name is added to the allow-list.
