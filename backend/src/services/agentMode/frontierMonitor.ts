@@ -1,5 +1,5 @@
 import { LLM_MODEL_REGISTRY, LLMModelConfig } from './llmModelRegistry';
-import { parseOpenRouter, refreshScores } from './modelCatalogRefresh';
+import { aaCreator, fetchArtificialAnalysisModels, parseOpenRouter, refreshScores } from './modelCatalogRefresh';
 import { inferFamily } from './modelSupersession';
 import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { OPENROUTER_PROVIDER_PREFERENCES } from './openRouterRequestParams';
@@ -34,9 +34,9 @@ export function detectFrontier(catalog: unknown, aa: unknown | undefined, regist
   const all = Object.fromEntries(candidates.map(m => [m.id, m.config]));
   const scoreResult = refreshScores(all, aa, new Date(now).toISOString().slice(0, 10));
   const ranked = aa === undefined ? [] : rows(aa).flatMap(value => {
-    const row = object(value), creator = object(row?.model_creator);
+    const row = object(value);
     const score = object(row?.evaluations)?.artificial_analysis_intelligence_index;
-    return typeof row?.slug === 'string' && typeof creator?.slug === 'string'
+    return typeof row?.slug === 'string' && aaCreator(row) !== undefined
       && typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 100 ? [score] : [];
   }).sort((a, b) => b - a);
   const cutoff = ranked[Math.min(topN, ranked.length) - 1] ?? Infinity;
@@ -73,6 +73,28 @@ export function detectFrontier(catalog: unknown, aa: unknown | undefined, regist
   return { additions: additions.sort(), alerts, reports: aa === undefined
     ? ['Artificial Analysis unavailable: ARTIFICIAL_ANALYSIS_API_KEY not set; top-N detection skipped.']
     : scoreResult.reports };
+}
+
+const AA_KEY_ABSENT = /^Artificial Analysis (?:unavailable|skipped): ARTIFICIAL_ANALYSIS_API_KEY /;
+
+/**
+ * One Artificial Analysis read for the daily run. No key: no request, `aa` undefined.
+ * Key present and the read fails: `aa` undefined and `error` names the failure, which
+ * the caller must treat as a degraded run.
+ */
+export async function readArtificialAnalysis(apiKey: string | undefined, request: typeof fetch = fetch): Promise<{ aa?: unknown; error: string }> {
+  if (!apiKey) return { error: '' };
+  try { return { aa: await fetchArtificialAnalysisModels(apiKey, request), error: '' }; }
+  catch (error) { return { error: `Artificial Analysis failed: ${error instanceof Error ? error.message : 'fetch failed'}` }; }
+}
+
+/**
+ * The pure steps report "key not set / missing" whenever they get no payload. After a
+ * failed keyed read that is false (ENG-3026): the caller drops those lines and reports
+ * the failure instead.
+ */
+export function withoutAaKeyAbsent(reports: readonly string[]): string[] {
+  return reports.filter(line => !AA_KEY_ABSENT.test(line));
 }
 
 export function parseEndpointProviders(payload: unknown) {
