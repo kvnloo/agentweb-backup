@@ -62,14 +62,17 @@ const DIA = 'Diagnostics & help';
 
 export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   // ENG-2913 — base discovery/lifecycle names are part of the official inventory.
-  // Keep conservative gaps until each complete operation contract is proven.
-  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts'),
-  gap(EDITS, 'ENG-2913', 'ads_create_campaign'),
-  gap(EDITS, 'ENG-2913', 'ads_create_ad_set'),
-  gap(EDITS, 'ENG-2913', 'ads_create_ad'),
-  gap(EDITS, 'ENG-2913', 'ads_activate_entity'),
+  // ENG-3034: create and activate are the guarded call_meta_marketing_api writes
+  // (always created PAUSED; status=ACTIVE is its own preview and approval), proven
+  // per entity in eng3034.campaignManagementParity.test.ts. The two read rows are
+  // still gaps, owned by ENG-3040.
+  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts', 'ENG-3040'),
+  covered(EDITS, 'ENG-2913', 'ads_create_campaign', { tool: MMA, action: 'CREATE', entityType: 'CAMPAIGN' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad_set', { tool: MMA, action: 'CREATE', entityType: 'AD_SET' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad', { tool: MMA, action: 'CREATE', entityType: 'AD' }),
+  covered(EDITS, 'ENG-2913', 'ads_activate_entity', { tool: MMA, action: 'UPDATE' }),
   covered(EDITS, 'ENG-2913', 'ads_update_entity', { tool: MMA, action: 'UPDATE' }),
-  gap(EDITS, 'ENG-2913', 'ads_get_field_context'),
+  gap(EDITS, 'ENG-2913', 'ads_get_field_context', 'ENG-3040'),
   covered(EDITS, 'ENG-2913', 'ads_get_ad_preview', { tool: MMA, action: 'PREVIEW', entityType: 'AD' }),
 
   // ENG-2914
