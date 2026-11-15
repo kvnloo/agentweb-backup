@@ -39,6 +39,25 @@ describe('Artificial Analysis read (ENG-3026)', () => {
     await expect(fetchArtificialAnalysisModels('k', endless as unknown as typeof fetch)).rejects.toThrow(/pages/);
     const malformed = jest.fn(async () => json({ tier: 'free' }));
     await expect(fetchArtificialAnalysisModels('k', malformed as unknown as typeof fetch)).rejects.toThrow();
+    // A page with rows but no pagination block is not proof the list ended.
+    const noPagination = jest.fn(async () => json({ data: documented.data }));
+    await expect(fetchArtificialAnalysisModels('k', noPagination as unknown as typeof fetch)).rejects.toThrow(/has_more/);
+  });
+
+  it('flags, as a review warning, a feed whose index major version differs from labelled registry scores', async () => {
+    const last = { ...documented, pagination: { ...documented.pagination, has_more: false } };
+    const payload = await fetchArtificialAnalysisModels('k', (async () => json(last)) as unknown as typeof fetch);
+    expect(payload.intelligence_index_version).toBe(5);
+    const v4 = { ...registry, 'openrouter/x-ai/grok-4.6': { ...config, provider: 'xai' as const,
+      qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.6, high' } };
+    const line = refreshScores(v4, payload, '2026-11-15').reports.find(r => r.includes('AA INDEX VERSION'));
+    expect(line).toContain('v5');
+    expect(line).toContain('openrouter/x-ai/grok-4.6');
+    expect(classifyReport(line!)).toBe('warning');
+    const v5 = { ...registry, 'openrouter/x-ai/grok-4.6': { ...config, provider: 'xai' as const,
+      qualityScoreSource: 'Artificial Analysis Intelligence Index v5.0, snapshot 2026-11-15, Grok 4.6' } };
+    expect(refreshScores(v5, payload, '2026-11-15').reports.some(r => r.includes('AA INDEX VERSION'))).toBe(false);
+    expect(refreshScores(v4, { data: documented.data }, '2026-11-15').reports.some(r => r.includes('AA INDEX VERSION'))).toBe(false);
   });
 
   it('AC2: scores a model from the documented row shape, where model_creator has a name but no slug', () => {

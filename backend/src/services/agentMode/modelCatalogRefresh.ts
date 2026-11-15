@@ -131,15 +131,23 @@ export const AA_MODELS_URL = 'https://artificialanalysis.ai/api/v2/language/mode
 /** 200 rows per page upstream; a list that outgrows this is an error, never a silent partial read. */
 const AA_MAX_PAGES = 25;
 
-/** Reads every page and returns them as one `{ data }` payload. Throws on any failed or malformed page. */
-export async function fetchArtificialAnalysisModels(apiKey: string, request: typeof fetch = fetch): Promise<{ data: unknown[] }> {
+/**
+ * Reads every page and returns them as one payload, keeping the feed's
+ * `intelligence_index_version`. Throws on any failed or malformed page: the list ends
+ * only on an explicit `has_more: false`, never on a missing pagination block.
+ */
+export async function fetchArtificialAnalysisModels(apiKey: string, request: typeof fetch = fetch): Promise<{ data: unknown[]; intelligence_index_version?: unknown }> {
   const data: unknown[] = [];
+  let version: unknown;
   for (let page = 1; page <= AA_MAX_PAGES; page++) {
     const response = await request(`${AA_MODELS_URL}?page=${page}`, { headers: { 'x-api-key': apiKey }, signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw new Error(`artificialanalysis.ai: HTTP ${response.status}`);
     const body = await response.json() as unknown;
     data.push(...rows(body));
-    if (object(object(body)?.pagination)?.has_more !== true) return { data };
+    if (page === 1) version = object(body)?.intelligence_index_version;
+    const hasMore = object(object(body)?.pagination)?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error('artificialanalysis.ai: page without pagination.has_more');
+    if (!hasMore) return { data, ...(version === undefined ? {} : { intelligence_index_version: version }) };
   }
   throw new Error(`artificialanalysis.ai: more than ${AA_MAX_PAGES} pages`);
 }
@@ -162,6 +170,17 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
   const reports: string[] = [];
   if (payload === undefined) return { changes, reports: ['Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.'] };
   const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  // Artificial Analysis says scores are comparable only within one Intelligence Index
+  // major version. This does not decide a migration; it makes the mix a review item.
+  const feedVersion = object(payload)?.intelligence_index_version;
+  const feedMajor = typeof feedVersion === 'number' || typeof feedVersion === 'string' ? /^\d+/.exec(String(feedVersion))?.[0] : undefined;
+  if (feedMajor) {
+    const other = Object.entries(registry).filter(([, config]) => {
+      const labelled = /Intelligence Index v(\d+)/.exec(config.qualityScoreSource ?? '')?.[1];
+      return labelled !== undefined && labelled !== feedMajor;
+    }).map(([id]) => id);
+    if (other.length) reports.push(`⚠️ AA INDEX VERSION: the feed is Intelligence Index v${feedVersion}, but ${other.length} registry score(s) are labelled with a different major version (${other.slice(0, 3).join(', ')}${other.length > 3 ? ', ...' : ''}). Scores are not comparable across major versions.`);
+  }
   const scores = rows(payload).flatMap(value => {
     const row = object(value), creator = aaCreator(row), evaluations = object(row?.evaluations);
     const score = evaluations?.artificial_analysis_intelligence_index;
