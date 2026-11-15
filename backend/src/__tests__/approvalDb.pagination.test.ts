@@ -2,7 +2,7 @@ const mockQuery = jest.fn();
 jest.mock('aws-sdk', () => ({
   __esModule: true,
   default: { DynamoDB: { DocumentClient: jest.fn().mockImplementation(() => ({
-    query: (params: any) => ({ promise: () => mockQuery(params) }),
+    query: (params: unknown) => ({ promise: () => mockQuery(params) }),
   })) } },
 }));
 
@@ -44,7 +44,7 @@ it('does not fetch another page when the first page satisfies the limit', async 
 });
 
 it('keeps page-two approvals visible while excluding foreign-org members', async () => {
-  mockQuery.mockImplementation(async (p: any) => {
+  mockQuery.mockImplementation(async (p: { ExpressionAttributeValues: Record<string, string>; ExclusiveStartKey?: unknown }) => {
     const id = p.ExpressionAttributeValues[':userId'];
     if (!p.ExclusiveStartKey) return { Items: [], LastEvaluatedKey: { assetUrl: id } };
     return { Items: [{ assetUrl: `${id}/old.png`, status: 'approved' }] };
