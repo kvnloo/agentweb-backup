@@ -96,7 +96,7 @@ export interface SocialPlatformAdapter {
    * @param commentary - Optional text to add alongside the repost
    * @param userId - Optional user ID for token refresh capability
    */
-  deletePost?(account: ConnectedAccount, postUrn: string, userId?: string): Promise<PostResult>;
+  deletePost?(account: ConnectedAccount, postUrn: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
   createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**

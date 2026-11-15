@@ -675,7 +675,7 @@ export async function linkedinDeletePost(userId: string, accountId: string, post
     const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
     if (withdrawnNow) return withdrawnNow;
 
-    const result = await adapter.deletePost(account, postUrn, userId);
+    const result = await adapter.deletePost(account, postUrn, userId, toolContext?.assertPublishStillAuthorized);
     if (result.success !== true) return { success: false, message: result.message };
 
     const { deletePost: removeStoredPost } = await import('../../services/linkedInPostsDb');

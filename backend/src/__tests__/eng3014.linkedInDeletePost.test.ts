@@ -173,6 +173,41 @@ describe('ENG-3014 linkedin delete_post', () => {
     expect(removeStored).not.toHaveBeenCalled();
   });
 
+  it('does not delete when publish consent is withdrawn during the authorship read', async () => {
+    getAccount.mockResolvedValue(company);
+    mockHttp.get.mockResolvedValueOnce({ data: { author: company.account_id } });
+    // First read (entry check) still authorized; withdrawn by the time the DELETE is due.
+    const assertPublishStillAuthorized = jest.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue({ error: 'Publish authorization was withdrawn.' });
+
+    const result = await linkedinDeletePost('user-1', company.account_id, 'urn:li:share:1', { assertPublishStillAuthorized });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/withdrawn/);
+    expect(mockHttp.delete).not.toHaveBeenCalled();
+    expect(removeStored).not.toHaveBeenCalled();
+  });
+
+  it('re-reads consent before a fresh-token retry of the delete and stops if withdrawn', async () => {
+    const { LinkedInAdapter } = jest.requireActual('../services/adapters/linkedInAdapter');
+    const adapter = new LinkedInAdapter();
+    jest.spyOn(adapter as any, 'getValidToken').mockResolvedValue({ token: TOKEN, isFresh: true });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void) => { fn(); return 0; }) as any);
+    getPostById.mockResolvedValue({ accountId: company.account_id });
+    mockHttp.delete.mockRejectedValue(Object.assign(new Error('unauthorized'), { response: { status: 401 } }));
+    const assertStillAuthorized = jest.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue({ error: 'Publish authorization was withdrawn.' });
+
+    const result = await adapter.deletePost(company, 'urn:li:share:1', 'user-1', assertStillAuthorized);
+    (global.setTimeout as unknown as jest.SpyInstance).mockRestore();
+
+    expect(result).toEqual({ success: false, message: 'Publish authorization was withdrawn.' });
+    expect(mockHttp.delete).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects a non-post URN before any lookup', async () => {
     getAccount.mockResolvedValue(company);
     const result = await linkedinDeletePost('user-1', company.account_id, 'urn:li:activity:1');

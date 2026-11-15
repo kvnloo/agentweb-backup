@@ -387,7 +387,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
    * returns not-found — LinkedIn's 2xx on the delete is not treated as proof.
    * The access token never leaves this method.
    */
-  async deletePost(account: ConnectedAccount, postUrn: string, userId?: string): Promise<PostResult> {
+  async deletePost(account: ConnectedAccount, postUrn: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const authorUrn = account.account_id;
     if (!/^urn:li:(share|ugcPost):[A-Za-z0-9_-]+$/.test(postUrn)) {
       return { success: false, message: 'post_urn must be a urn:li:share: or urn:li:ugcPost: URN to delete a post' };
@@ -416,9 +416,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (live.author !== authorUrn) return { success: false, message: refused };
     }
 
+    // The token refresh and authorship read above are network round-trips taken on a
+    // consent decision read before them. Re-read it right before the DELETE, and
+    // again before any fresh-token retry, since the delete cannot be undone.
+    const withdrawn = await assertStillAuthorized?.();
+    if (withdrawn) return { success: false, message: withdrawn.error };
+
     try {
-      await retryIfFreshToken401(isFresh, () => linkedInService.deletePost(token, postUrn));
+      await retryIfFreshToken401(
+        isFresh,
+        () => linkedInService.deletePost(token, postUrn),
+        undefined,
+        recheckConsentBeforeRetry(assertStillAuthorized),
+      );
     } catch (error: any) {
+      if (isPublishConsentWithdrawn(error)) return { success: false, message: error.message };
       const status = error?.response?.status;
       return { success: false, message: `LinkedIn refused the delete${status ? ` (HTTP ${status})` : ''}. The post was not deleted.` };
     }
