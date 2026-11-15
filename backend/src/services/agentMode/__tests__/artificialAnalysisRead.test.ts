@@ -103,3 +103,61 @@ describe('Artificial Analysis read (ENG-3026)', () => {
     expect(verdict.eligible).toBe(false);
   });
 });
+
+describe('Artificial Analysis first-page capture (ENG-3029)', () => {
+  const fs = jest.requireActual('fs') as typeof import('fs');
+  const os = jest.requireActual('os') as typeof import('os');
+  const pathLib = jest.requireActual('path') as typeof import('path');
+  const KEY = 'aa_test_key_0123456789';
+  let dir: string;
+  let file: string;
+  const first = { ...documented, pagination: { ...documented.pagination, has_more: true } };
+  const last = { ...documented, pagination: { ...documented.pagination, page: 2, has_more: false },
+    data: [{ ...documented.data[0], slug: 'second-page-only' }] };
+  const twoPages = () => jest.fn(async (url: string) => json(url.endsWith('page=1') ? first : last));
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(pathLib.join(os.tmpdir(), 'aa-capture-'));
+    file = pathLib.join(dir, 'first-page.json');
+  });
+  afterEach(() => {
+    delete process.env.AA_FIRST_PAGE_CAPTURE_PATH;
+    fs.rmSync(dir, { recursive: true, force: true });
+    jest.restoreAllMocks();
+  });
+
+  it('writes nothing unless the capture path is set', async () => {
+    await fetchArtificialAnalysisModels(KEY, twoPages() as unknown as typeof fetch);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('writes the first page body only: no later page, no header name, no key', async () => {
+    process.env.AA_FIRST_PAGE_CAPTURE_PATH = file;
+    const payload = await fetchArtificialAnalysisModels(KEY, twoPages() as unknown as typeof fetch);
+    expect(payload.data).toHaveLength(2);
+    const text = fs.readFileSync(file, 'utf8');
+    expect(JSON.parse(text)).toEqual(first);
+    expect(text).not.toContain('second-page-only');
+    expect(text).not.toContain(KEY);
+    expect(text.toLowerCase()).not.toContain('x-api-key');
+  });
+
+  it('does not write a body that echoes the key, and still returns the models', async () => {
+    process.env.AA_FIRST_PAGE_CAPTURE_PATH = file;
+    const stderr = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const echo = { ...documented, pagination: { ...documented.pagination, has_more: false }, debug: { key: KEY } };
+    const payload = await fetchArtificialAnalysisModels(KEY, (async () => json(echo)) as unknown as typeof fetch);
+    expect(payload.data).toHaveLength(documented.data.length);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('first page not captured'));
+    expect(stderr.mock.calls.flat().join(' ')).not.toContain(KEY);
+  });
+
+  it('an unwritable capture path does not fail the read', async () => {
+    process.env.AA_FIRST_PAGE_CAPTURE_PATH = pathLib.join(dir, 'missing-dir', 'first-page.json');
+    const stderr = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const payload = await fetchArtificialAnalysisModels(KEY, twoPages() as unknown as typeof fetch);
+    expect(payload.data).toHaveLength(2);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('first page not captured'));
+  });
+});
