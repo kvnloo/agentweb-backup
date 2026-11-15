@@ -56,7 +56,9 @@ process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test_fake';
 process.env.STRIPE_STARTER_PRICE_ID = 'price_starter_test';
 process.env.STRIPE_COMPLETE_PRICE_ID = 'price_complete_test';
 
-import { handleSubscriptionDeleted, handleSubscriptionUpdated, resolveSubscriptionTypeForPrice } from '../services/stripeService';
+process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID = 'prod_seat';
+
+import { handleSubscriptionDeleted, handleSubscriptionUpdated, reconcileStripeUser, resolveSubscriptionTypeForPrice } from '../services/stripeService';
 
 function makeSub(price: any, metadata: Record<string, string> = {}) {
   return {
@@ -210,7 +212,86 @@ describe('handleSubscriptionDeleted — surviving custom subscription', () => {
   });
 });
 
+describe('handleSubscriptionDeleted — surviving subscription races and seat items', () => {
+  const NOT_ENDED = 'NOT (#storedStatus IN (:endedCanceled, :endedExpired))';
+
+  it('makes the survivor write conditional on the stored status not having ended, and retries when refused', async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [makeSub({ id: 'price_max', metadata: { plan: 'Max' } })] });
+    // The survivor was itself canceled while its tier was being resolved.
+    mockUpdateUser.mockRejectedValueOnce(Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' }));
+    await expect(handleSubscriptionDeleted(makeSub({ id: 'price_starter_test' }))).rejects.toThrow('The conditional request failed');
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser.mock.calls[0][2]?.condition?.expression).toContain(NOT_ENDED);
+    const { syncUserUpdateToLeadList } = jest.requireMock('../services/crmAutoSyncService');
+    expect(syncUserUpdateToLeadList).not.toHaveBeenCalled();
+  });
+
+  it('still repairs a row already stored as canceled when Stripe has a live survivor', async () => {
+    mockScanWithFilter.mockResolvedValue([
+      { userId: 'u1', email: 'p@example.com', stripe_customer_id: 'cus_x', subscriptionType: 'Free', subscription_status: 'canceled' },
+    ]);
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [makeSub({ id: 'price_max', metadata: { plan: 'Max' } })] });
+    await handleSubscriptionDeleted(makeSub({ id: 'price_starter_test' }));
+    expect(mockUpdateUser.mock.calls[0][1].subscriptionType).toBe('Max');
+    expect(mockUpdateUser.mock.calls[0][2]).toBeUndefined();
+  });
+
+  it('reads the tier from the base plan when an extra-seat item sorts first', async () => {
+    const survivor = makeSub({ id: 'price_max', metadata: { plan: 'Max' } });
+    survivor.items.data = [
+      { id: 'si_seat', price: { id: 'price_seat', product: 'prod_seat' } },
+      { id: 'si_plan', price: { id: 'price_max', metadata: { plan: 'Max' } } },
+    ] as any;
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [survivor] });
+    await handleSubscriptionDeleted(makeSub({ id: 'price_starter_test' }));
+    expect(mockUpdateUser.mock.calls[0][1].subscriptionType).toBe('Max');
+    expect(mockStripe.products.retrieve).not.toHaveBeenCalled();
+  });
+});
+
+describe('reconcileStripeUser — Max/custom price', () => {
+  const user = { userId: 'u1', email: 'p@example.com', stripe_customer_id: 'cus_x', subscriptionType: 'Free', subscription_status: 'canceled' };
+
+  it('does not grant a metadata tier from a canceled subscription', async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({
+      data: [{ ...makeSub({ id: 'price_max', metadata: { plan: 'Max' } }), status: 'canceled' }],
+    });
+    const updates = await reconcileStripeUser({ ...user });
+    expect(updates?.subscriptionType).toBeUndefined();
+    expect(updates?.allowedPages).toBeUndefined();
+  });
+
+  it('syncs a metadata tier from a live subscription', async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [makeSub({ id: 'price_max', metadata: { plan: 'Max' } })] });
+    const updates = await reconcileStripeUser({ ...user });
+    expect(updates?.subscriptionType).toBe('Max');
+    expect(updates?.subscription_status).toBe('active');
+  });
+
+  it('reads the tier from the base plan when an extra-seat item sorts first', async () => {
+    const sub = makeSub({ id: 'price_max', metadata: { plan: 'Max' } });
+    sub.items.data = [
+      { id: 'si_seat', price: { id: 'price_seat', product: 'prod_seat' } },
+      { id: 'si_plan', price: { id: 'price_max', metadata: { plan: 'Max' } } },
+    ] as any;
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    const updates = await reconcileStripeUser({ ...user });
+    expect(updates?.subscriptionType).toBe('Max');
+  });
+});
+
 describe('handleSubscriptionUpdated — Max/custom price', () => {
+  it('does not grant a metadata tier from an event whose own status has ended', async () => {
+    await handleSubscriptionUpdated({ ...makeSub({ id: 'price_max_custom', metadata: { plan: 'Max' } }), status: 'canceled' });
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser.mock.calls[0][1].subscriptionType).toBeUndefined();
+  });
+
+  it('keeps the env-mapped tier sync for an ended event, as on main', async () => {
+    await handleSubscriptionUpdated({ ...makeSub({ id: 'price_complete_test' }), status: 'canceled' });
+    expect(mockUpdateUser.mock.calls[1][1].subscriptionType).toBeDefined();
+  });
+
   it('syncs subscriptionType and tier config from price metadata.plan', async () => {
     await handleSubscriptionUpdated(makeSub({ id: 'price_max_custom', metadata: { plan: 'Max' } }));
     const updates = Object.assign({}, ...mockUpdateUser.mock.calls.map((c: any[]) => c[1]));

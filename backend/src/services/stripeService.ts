@@ -1298,7 +1298,7 @@ export async function handleSubscriptionUpdated(
     ? findBasePlanItem(subscription)?.price
     : undefined;
   if (basePlanPrice?.id) {
-    const newType = await resolveSubscriptionTypeForPrice(basePlanPrice, subscription);
+    const newType = await resolveTierForSubscription(basePlanPrice, subscription);
     if (newType) {
       tierUpdate.subscriptionType = newType;
       const tierConfig = await getTierConfig(newType);
@@ -1323,14 +1323,7 @@ export async function handleSubscriptionUpdated(
         user.userId,
         tierUpdate,
         guardEndedStatus
-          ? {
-              condition: {
-                expression:
-                  'attribute_not_exists(#storedStatus) OR NOT (#storedStatus IN (:endedCanceled, :endedExpired))',
-                names: { '#storedStatus': 'subscription_status' },
-                values: { ':endedCanceled': 'canceled', ':endedExpired': 'incomplete_expired' },
-              },
-            }
+          ? { condition: STORED_STATUS_NOT_ENDED_CONDITION }
           : undefined
       );
       Object.assign(updateData, tierUpdate);
@@ -1392,6 +1385,28 @@ const LIVE_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['active', 'tria
  * here — paying their invoice is what activates them.
  */
 const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * ENG-2724: `userDb.updateUser` condition for a write that follows a Stripe
+ * lookup. DynamoDB refuses it when a cancellation was stored in the meantime.
+ */
+const STORED_STATUS_NOT_ENDED_CONDITION = {
+  expression: 'attribute_not_exists(#storedStatus) OR NOT (#storedStatus IN (:endedCanceled, :endedExpired))',
+  names: { '#storedStatus': 'subscription_status' },
+  values: { ':endedCanceled': 'canceled', ':endedExpired': 'incomplete_expired' },
+};
+
+/**
+ * ENG-2724: tier for a subscription's base price. A subscription that has
+ * ended keeps the env-only mapping it had before `plan` metadata was read, so
+ * metadata never grants a paid tier from a canceled subscription.
+ */
+async function resolveTierForSubscription(price: any, subscription: any): Promise<string | null> {
+  if (ENDED_SUBSCRIPTION_STATUSES.has(subscription?.status)) {
+    return price?.id ? deriveSubscriptionTypeFromPriceId(price.id) : null;
+  }
+  return resolveSubscriptionTypeForPrice(price, subscription);
+}
 
 /**
  * The customer's live subscription (discounts expanded), or null. Same pick as
@@ -1574,16 +1589,12 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             stripe_subscription_id: activeSub.id,
           };
 
-          // Derive tier from the remaining subscription's price.
-          //
-          // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone
-          // by the seat-billing (ENG-2243..2246) correctness review as
-          // low-risk: this only sets subscriptionType/allowedPages, and a
-          // seat item sorting first here would just skip that sync rather
-          // than corrupt billing state. See findBasePlanItem's doc comment
-          // for why position-based lookup is otherwise unsafe once a seat
-          // item can coexist on the same subscription.
-          const activePrice = activeSub.items?.data?.[0]?.price;
+          // Derive tier from the remaining subscription's base plan price
+          // (findBasePlanItem: an extra-seat item can sort first, and its
+          // price carries no tier).
+          const activePrice = activeSub.items?.data?.length
+            ? findBasePlanItem(activeSub)?.price
+            : undefined;
           if (activePrice?.id) {
             const newType = await resolveSubscriptionTypeForPrice(activePrice, activeSub);
             if (newType) {
@@ -1602,7 +1613,20 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             updateData.current_period_end = activeSubPeriodEndIso;
           }
 
-          await userDb.updateUser(user.userId, updateData);
+          // ENG-2724: the tier lookup above can wait on Stripe. If the survivor
+          // was itself canceled in that window, its Free reset is already
+          // stored and this write would restore paid access. DynamoDB refuses
+          // the write in that case; the error propagates so Stripe redelivers
+          // and the retry re-reads the customer's live subscriptions. A row
+          // that was already stored as ended when this event arrived is not
+          // guarded, so a live survivor still repairs it.
+          await userDb.updateUser(
+            user.userId,
+            updateData,
+            ENDED_SUBSCRIPTION_STATUSES.has(user.subscription_status)
+              ? undefined
+              : { condition: STORED_STATUS_NOT_ENDED_CONDITION }
+          );
           syncUserUpdateToLeadList(user.email, {
             subscriptionType: updateData.subscriptionType,
             subscription_status: updateData.subscription_status,
@@ -2487,17 +2511,10 @@ export async function reconcileStripeUser(
     hasPaymentMethod = methods.data.length > 0;
   }
 
-  // Derive tier.
-  //
-  // NOTE: still `items.data[0]`, not `findBasePlanItem`. Same hazard class as
-  // syncSubscriptionFromStripe above (not one of the sites the seat-billing
-  // ENG-2243..2246 correctness review named, but identical in kind): a seat
-  // item sorting first here would just leave this admin-triggered
-  // reconciliation skipping a tier overwrite rather than corrupting billing
-  // state. See findBasePlanItem's doc comment before reusing this pattern
-  // anywhere a subscription's items can include a seat line item.
-  const basePrice = sub.items?.data?.[0]?.price;
-  const derivedType = basePrice?.id ? await resolveSubscriptionTypeForPrice(basePrice, sub) : null;
+  // Derive tier from the base plan price (findBasePlanItem: an extra-seat
+  // item can sort first, and its price carries no tier).
+  const basePrice = sub.items?.data?.length ? findBasePlanItem(sub)?.price : undefined;
+  const derivedType = basePrice?.id ? await resolveTierForSubscription(basePrice, sub) : null;
 
   // Build updates only for fields that are wrong
   const updates: Record<string, any> = {};
