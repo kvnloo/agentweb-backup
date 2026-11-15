@@ -1,3 +1,25 @@
+## ENG-3037: failure-cluster loop treats the "<X> not connected" wording as never-connected (2026-11-15)
+
+- `isNeverConnectedMessage` in `backend/src/loops/instances/agent-mode/failureRuleSet.ts` matched only "No <X> account connected" (ENG-2943). The other wording of the same precondition was counted as a dispatchable `config` failure and could file an Auto oncall row with nothing to act on (the google_drive cluster on ENG-2788).
+- Added an allow-list, not a general "not connected" pattern. Included, each throw site read and reached only when no connected-account row is found: Google Drive (`googleDriveAccess.ts`), HubSpot (`hubspotService.ts`, no own and no shared account), Attio (`attioService.ts`), Gmail and Outlook (`getAccountById` returns nothing for the requested account id).
+- Left as `config` on purpose, because a connected account can produce them: LinkedIn Ads in `adsApis.getLinkedInAdsCredentials` (the filter also drops a row with no `access_token`), bare "ClickUp not connected" / "Foreplay not connected" (`getAccessToken` returns null when a stored token fails to decrypt), and messages naming one specific account.
+- A new integration using this wording is not excluded until its name is added to the allow-list.
+
+## ENG-3034: four base Campaign-management parity rows proven covered; two read rows split to ENG-3040 (2026-11-15)
+
+- `ads_create_campaign`, `ads_create_ad_set`, `ads_create_ad` map to `call_meta_marketing_api` CREATE on CAMPAIGN / AD_SET / AD; `ads_activate_entity` maps to its guarded UPDATE (status=ACTIVE). Matrix data and one test file only; no tool, description or runtime path changed.
+- `eng2303.metaToolkitWrites.test.ts` only exercised CAMPAIGN. `eng3034.campaignManagementParity.test.ts` now proves, for each of the three entities, that CREATE is dispatched PAUSED, that any other status on create is refused before preview, that a create which reads back ACTIVE is MISMATCH, and that activation needs its own preview token (a CREATE token does not activate).
+- `ads_get_ad_accounts` and `ads_get_field_context` stay `gap`, owner ENG-3040. `zoma_status` lists connected ad accounts but nobody has compared that with what Meta's tool returns; no operation was found for field context.
+- Totals from `summarizeParity`: covered 71 / gap 14 / n/a 3 (of 88). Main was 67 / 18 / 3.
+
+## ENG-3031: the four ads_insights_* Meta parity rows (2026-11-15)
+
+- No code path changed. `backend/src/mcp/zomaMetaParityMatrix.ts` re-labels four rows and `eng3031.insightsParityRows.test.ts` pins them.
+- `ads_insights_advertiser_context`, `ads_insights_anomaly_signal`, `ads_insights_industry_benchmark` are `not_applicable`. Checked on 2026-11-15 under developers.facebook.com/documentation/ads-commerce/marketing-api/reference: `ad-account` (fields and edges), `ad-account/insights`, `ad-campaign-group/insights`, `ad-campaign/insights`. None has an advertiser-context, anomaly or industry-benchmark field or edge. The only "benchmark" name on the insights pages is `marketing_messages_read_rate_benchmark`, which is about marketing messages. These three look like values Meta computes inside its own MCP server. No tool was added and no substitute score is computed.
+- `ads_insights_auction_ranking_benchmarks` is `covered` by `call_meta_ads_insights_api`. Meta's public auction comparison is the three ad relevance diagnostics (`quality_ranking`, `engagement_rate_ranking`, `conversion_rate_ranking`; Meta Business Help article 403110480493160). They are on `ALLOWED_INSIGHTS_FIELDS` and the test shows the insights call sends them to Graph at `level=ad`.
+- Limits of that check: I did not find an ad-level insights reference page (the URLs I tried returned an empty shell), and the three ranking fields are not listed on the account, campaign or ad set insights reference pages that did load. Nothing here was run against a live account. If Meta's tool returns more than these three rankings (third-party write-ups mention CTR and CPM against competitors), the row overstates coverage and should go back to `gap`.
+- The row now uses a `notApplicable(...)` helper; these are the first `not_applicable` rows in the matrix.
+
 ## ENG-3026: Frontier monitor reads the current Artificial Analysis endpoint (2026-11-15)
 
 - Artificial Analysis retired `/api/v2/data/*` on 2026-11-04 (HTTP 410). The monitor and the catalog refresh now read `GET /api/v2/language/models/free` (`AA_MODELS_URL` in `backend/src/services/agentMode/modelCatalogRefresh.ts`), which any key tier may call. Docs: https://artificialanalysis.ai/data-api/docs.
