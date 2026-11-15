@@ -378,6 +378,63 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
+  /**
+   * ENG-3014: delete a post this connected account authored, then prove it is gone.
+   *
+   * Authorship is settled BEFORE any write. A stored row naming a different author
+   * refuses with no LinkedIn call at all; with no stored row the post is read and its
+   * `author` must equal this account's URN. Success is reported only after a readback
+   * returns not-found — LinkedIn's 2xx on the delete is not treated as proof.
+   * The access token never leaves this method.
+   */
+  async deletePost(account: ConnectedAccount, postUrn: string, userId?: string): Promise<PostResult> {
+    const authorUrn = account.account_id;
+    if (!/^urn:li:(share|ugcPost):[A-Za-z0-9_-]+$/.test(postUrn)) {
+      return { success: false, message: 'post_urn must be a urn:li:share: or urn:li:ugcPost: URN to delete a post' };
+    }
+    const refused = 'This post was not authored by the selected LinkedIn account, so it cannot be deleted with it.';
+
+    const { getPostById } = await import('../linkedInPostsDb');
+    const ownerIds = Array.from(new Set([userId, (account as any).userId].filter((id): id is string => !!id)));
+    let storedAuthor: string | undefined;
+    for (const id of ownerIds) {
+      const stored = await getPostById(id, postUrn).catch(() => null);
+      if (stored?.accountId) { storedAuthor = stored.accountId; break; }
+    }
+    if (storedAuthor && storedAuthor !== authorUrn) return { success: false, message: refused };
+
+    const { token, isFresh } = await this.getValidToken(account, userId);
+
+    if (!storedAuthor) {
+      let live: { exists: boolean; author?: string };
+      try {
+        live = await retryIfFreshToken401(isFresh, () => linkedInService.getPostAuthor(token, postUrn));
+      } catch (error: any) {
+        return { success: false, message: `Could not confirm this account authored the post (LinkedIn returned ${error?.response?.status ?? 'an error'}), so it was not deleted.` };
+      }
+      if (!live.exists) return { success: false, message: 'LinkedIn has no post with that URN (it may already be deleted). Nothing was deleted.' };
+      if (live.author !== authorUrn) return { success: false, message: refused };
+    }
+
+    try {
+      await retryIfFreshToken401(isFresh, () => linkedInService.deletePost(token, postUrn));
+    } catch (error: any) {
+      const status = error?.response?.status;
+      return { success: false, message: `LinkedIn refused the delete${status ? ` (HTTP ${status})` : ''}. The post was not deleted.` };
+    }
+
+    let readback: { exists: boolean };
+    try {
+      readback = await linkedInService.getPostAuthor(token, postUrn);
+    } catch (error: any) {
+      return { success: false, message: `The delete was sent but could not be verified (readback returned ${error?.response?.status ?? 'an error'}). Do not assume the post is gone — check it on LinkedIn.` };
+    }
+    if (readback.exists) {
+      return { success: false, message: 'LinkedIn accepted the delete but the post is still readable. It is NOT confirmed deleted — check it on LinkedIn.' };
+    }
+    return { success: true, message: 'Post deleted from LinkedIn (verified: LinkedIn no longer returns it).', postId: postUrn };
+  }
+
   async createReaction(account: ConnectedAccount, postUrn: string, reactionType: string, userId?: string): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const actorUrn = account.account_id; // The account creating the reaction
