@@ -8,7 +8,7 @@
  * Healthy tools and one-off blips produce nothing.
  */
 
-import { AgentFailureRuleSet } from '../loops/instances/agent-mode/failureRuleSet';
+import { AgentFailureRuleSet, isNeverConnectedMessage } from '../loops/instances/agent-mode/failureRuleSet';
 import {
   EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
@@ -237,5 +237,65 @@ describe('AgentFailureRuleSet — never-connected precondition (ENG-2943)', () =
   it('does not match missing-scope wording', async () => {
     const out = await rs.evaluate([...invoked('t', 5), ...fail('t', 4, 'Missing scope ads_management on connected account')], WINDOW);
     expect(out).toHaveLength(1);
+  });
+});
+
+describe('AgentFailureRuleSet — "<X> not connected" precondition wording (ENG-3037)', () => {
+  const rs = new AgentFailureRuleSet();
+  const fail = (tool: string, n: number, errorMessage: string) =>
+    Array.from({ length: n }, () => evt(EVT_TOOL_FAILED, tool, { errorClass: 'Error', failureType: 'config', errorMessage }));
+
+  // Exact strings thrown on main when NO connected-account row exists.
+  const GOOGLE_DRIVE = 'Google Drive not connected. Connect Google Drive in Settings → Connected Accounts.';
+  const NO_ROW_MESSAGES = [
+    GOOGLE_DRIVE,
+    'HubSpot account not connected. Please connect your HubSpot account in Settings.',
+    'Gmail account not connected. Please connect your Gmail account in Settings → Connected Accounts.',
+    'Outlook account not connected. Please connect your Microsoft 365 mailbox in Settings → Connected Accounts.',
+    'Attio account not connected. Please connect your Attio account in Settings.',
+  ];
+
+  it.each(NO_ROW_MESSAGES)('classifies "%s" as not_connected and files nothing', async (msg) => {
+    expect(isNeverConnectedMessage(msg)).toBe(true);
+    const out = await rs.evaluate([...invoked('t', 7), ...fail('t', 5, msg)], WINDOW);
+    expect(out).toHaveLength(0);
+  });
+
+  it('still matches when the message arrives wrapped by a caller prefix', () => {
+    expect(isNeverConnectedMessage(`Tool google_drive failed: ${GOOGLE_DRIVE}`)).toBe(true);
+  });
+
+  it('excludes the Google Drive precondition when mixed with real failures of the same tool', async () => {
+    const out = await rs.evaluate(
+      [...invoked('google_drive', 18), ...fail('google_drive', 5, GOOGLE_DRIVE), ...fail('google_drive', 4, 'invalid_grant: token expired or revoked')],
+      WINDOW,
+    );
+    expect(out).toHaveLength(1);
+    const p: any = out[0].payload;
+    expect(p.failureType).toBe('config');
+    expect(p.failures).toBe(4);
+    expect(p.directive).toContain('invalid_grant');
+    expect(JSON.stringify(out[0])).toContain('5 non-actionable excluded');
+  });
+
+  // Each of these can be produced by an account that IS connected (or names one
+  // specific configured account), so someone can act on it: it stays dispatchable.
+  it.each([
+    'invalid_grant: token expired or revoked',
+    'Google Drive authorization has expired or is not connected. Reconnect Google Drive in Settings → Connected Accounts, then retry.',
+    'Missing scope ads_management on connected account',
+    'LinkedIn Ads account "123" is not connected. Connect it in Settings before running the UTM audit.',
+    // adsApis.getLinkedInAdsCredentials also throws this for a connected row with no access_token.
+    'LinkedIn Ads account not connected. Please connect your LinkedIn Ads account in settings.',
+    // clickup/foreplay getAccessToken return null for a stored token that fails to decrypt.
+    'ClickUp not connected',
+    'Foreplay not connected',
+    'Account abc is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.',
+    'HubSpot account "42" not found. Please reconnect your account.',
+  ])('keeps "%s" dispatchable', async (msg) => {
+    expect(isNeverConnectedMessage(msg)).toBe(false);
+    const out = await rs.evaluate([...invoked('t', 7), ...fail('t', 5, msg)], WINDOW);
+    expect(out).toHaveLength(1);
+    expect((out[0].payload as any).failureType).toBe('config');
   });
 });
