@@ -33,7 +33,6 @@ import {
   summarizeOpportunityScore,
   parseOpportunityScoreArgs,
   isMetaHealthTool,
-  RECOMMENDATION_FIELDS,
 } from '../mcp/metaToolkitHealth';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
 import { getMetaToolkitManifest, assertMetaToolkitV1Call } from '../mcp/metaToolkitManifest';
@@ -44,17 +43,24 @@ import { sendMetaToolkitError } from '../routes/metaToolkit';
 
 const TOOL = 'ads_get_opportunity_score';
 
+// Shape of Meta's documented "Example ad account response": rows grouped under `recommendations`,
+// opportunity_score_lift inside recommendation_content.
 const RECS = {
   data: [
     {
-      type: 'ADVANTAGE_PLUS_AUDIENCE',
-      object_ids: [111, '222'],
-      opportunity_score_lift: '7',
-      recommendation_content: { lift_estimate: 'Up to 9% lower cost per result', body: 'Turn on Advantage+ audience.' },
-      url: 'https://adsmanager.facebook.com/x',
-      recommendation_signature: 'SIG-should-not-be-returned',
+      recommendations: [
+        {
+          recommendation_signature: 'SIG-should-not-be-returned',
+          recommendation_stage: 'mid_flight_recommendation',
+          recommendation_time: '2026-04-02T23:12:34+0000',
+          type: 'ADVANTAGE_PLUS_AUDIENCE',
+          object_ids: [111, '222'],
+          recommendation_content: { lift_estimate: 'Up to 9% lower cost per result', body: 'Turn on Advantage+ audience.', opportunity_score_lift: '7' },
+          url: 'https://adsmanager.facebook.com/x',
+        },
+        { type: 'CREATIVE_FATIGUE', object_ids: ['333'] },
+      ],
     },
-    { type: 'CREATIVE_FATIGUE', object_ids: ['333'] },
   ],
 };
 
@@ -65,8 +71,8 @@ describe('ENG-3030 ads_get_opportunity_score', () => {
       .mockResolvedValueOnce(RECS);
     const r: any = await runMetaHealthTool(TOOL, 'u', '9', { account_id: '9' }, { readAccountGraph });
     expect(readAccountGraph).toHaveBeenNthCalledWith(1, 'u', '9', '', { fields: 'opportunity_score' });
-    expect(readAccountGraph).toHaveBeenNthCalledWith(2, 'u', '9', 'recommendations', { fields: RECOMMENDATION_FIELDS, limit: '50' });
-    expect(RECOMMENDATION_FIELDS).not.toMatch(/signature/);
+    // The edge is documented with no fields / limit parameter; none is sent.
+    expect(readAccountGraph).toHaveBeenNthCalledWith(2, 'u', '9', 'recommendations', {});
     expect(r).toEqual({
       account_id: '9',
       opportunity_score: 62,
@@ -89,13 +95,17 @@ describe('ENG-3030 ads_get_opportunity_score', () => {
     expect(r.recommendations).toEqual([]);
   });
 
-  it('reads the grouped per-account shape and marks a truncated list', () => {
-    const grouped = { data: [{ opportunity_score: 40, recommendations: [{ type: 'A' }, { type: 'B' }, { type: 'C' }] }] };
+  it('applies limit itself, marks a truncated list, and reads a top-level lift and a flat list too', () => {
+    const grouped = { data: [{ opportunity_score: 40, recommendations: [{ type: 'A', opportunity_score_lift: '26' }, { type: 'B' }, { type: 'C' }] }] };
     const r = summarizeOpportunityScore('9', {}, grouped, 2);
     expect(r.opportunity_score).toBe(40);
     expect(r.recommendations.map((x) => x.type)).toEqual(['A', 'B']);
+    expect(r.recommendations[0].opportunity_score_lift).toBe(26);
     expect(r.truncated).toBe(true);
-    expect(summarizeOpportunityScore('9', {}, { data: [{ type: 'A' }], paging: { next: 'https://x?access_token=T' } }, 50).truncated).toBe(true);
+    const flat = summarizeOpportunityScore('9', {}, { data: [{ type: 'A' }], paging: { next: 'https://x?access_token=T' } }, 50);
+    expect(flat.recommendations.map((x) => x.type)).toEqual(['A']);
+    expect(flat.truncated).toBe(true);
+    expect(JSON.stringify(flat)).not.toMatch(/access_token/);
   });
 
   it('tolerates malformed rows from Meta instead of throwing', () => {

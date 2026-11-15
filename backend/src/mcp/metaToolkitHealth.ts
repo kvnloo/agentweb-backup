@@ -177,16 +177,17 @@ export function summarizeLearningPhase(adSets: any[]) {
 }
 
 /**
- * ENG-3030. Meta Performance Recommendations API:
+ * ENG-3030. Meta "Opportunity Score and Recommendations":
  * https://developers.facebook.com/documentation/ads-commerce/marketing-api/overview/performance-recommendations
- *   act_<id>?fields=opportunity_score         the 0-100 score
- *   act_<id>/recommendations                  the recommendations; recommendation_content
- *                                             (lift_estimate, body) is omitted unless requested
- * recommendation_signature (the perishable apply handle) is deliberately not requested:
- * Zoma has no apply path, so it would be an unusable write credential in a read result.
+ *   act_<id>?fields=opportunity_score   "provided as a field of an ad account", 0-100
+ *   act_<id>/recommendations            documented with no fields / limit parameter; answers
+ *                                       { data: [{ recommendations: [...] }] }
+ * The edge is called exactly as documented (no parameters) and `limit` is applied here.
+ * recommendation_signature (the perishable handle for Meta's apply call) comes back in that
+ * response and is deliberately not passed on: Zoma has no apply path, so it would be an
+ * unusable write handle in a read result.
  */
 export const OPPORTUNITY_SCORE_FIELDS = 'opportunity_score';
-export const RECOMMENDATION_FIELDS = 'type,object_ids,opportunity_score_lift,recommendation_content,url';
 export const DEFAULT_RECOMMENDATIONS = 50;
 export const MAX_RECOMMENDATIONS = 100;
 const OPPORTUNITY_SCORE_ARGS = new Set(['account_id', 'limit']);
@@ -213,8 +214,8 @@ export function parseOpportunityScoreArgs(args: any): number {
 
 export function summarizeOpportunityScore(accountId: string, account: any, edge: any, limit: number) {
   const data: any[] = Array.isArray(edge?.data) ? edge.data : [];
-  // The business-level edge groups rows per account ({ opportunity_score, recommendations: [...] });
-  // accept that shape on the account edge too, so either is read rather than silently dropped.
+  // Documented shape is grouped ({ recommendations: [...] } per row; the business-level edge adds
+  // opportunity_score to the row). A flat list is accepted too rather than silently dropped.
   const flat = data.flatMap((row) => (Array.isArray(row?.recommendations) ? row.recommendations : [row]))
     .filter((row) => row && typeof row === 'object' && !Array.isArray(row));
   const all = flat.map((r) => {
@@ -278,7 +279,7 @@ export async function runMetaHealthTool(
   if (name === 'ads_get_opportunity_score') {
     const limit = parseOpportunityScoreArgs(args);
     const account = await read('', { fields: OPPORTUNITY_SCORE_FIELDS });
-    const edge = await read('recommendations', { fields: RECOMMENDATION_FIELDS, limit: String(limit) });
+    const edge = await read('recommendations', {});
     return summarizeOpportunityScore(accountId, account, edge, limit);
   }
   if (name === 'meta_account_health') {
