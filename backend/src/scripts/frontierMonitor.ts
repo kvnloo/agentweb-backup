@@ -1,7 +1,7 @@
 /** Daily read-only discovery; --write prepares code for the existing draft-PR workflow. */
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildReviewArtifacts, byokCoverage, detectFrontier, fetchJson, renderCoverage, upstreamId } from '../services/agentMode/frontierMonitor';
+import { buildReviewArtifacts, byokCoverage, detectFrontier, fetchJson, readArtificialAnalysis, renderCoverage, upstreamId, withoutAaKeyAbsent } from '../services/agentMode/frontierMonitor';
 import { classifyExistingChanges, endpointPriceReport } from '../services/agentMode/catalogReview';
 import { blendedPrice } from '../services/agentMode/modelSupersession';
 import { LLM_MODEL_REGISTRY, LLMModelConfig } from '../services/agentMode/llmModelRegistry';
@@ -12,14 +12,12 @@ async function main() {
   const date = new Date().toISOString().slice(0, 10);
   const catalog = await fetchJson('https://openrouter.ai/api/v1/models');
   const apiKey = process.env.ARTIFICIAL_ANALYSIS_API_KEY;
-  let aa: unknown, aaError = '';
-  try {
-    aa = apiKey ? await fetchJson('https://artificialanalysis.ai/api/v2/data/llms/models', fetch, { 'x-api-key': apiKey }) : undefined;
-  } catch (error) { aaError = `Artificial Analysis failed: ${error instanceof Error ? error.message : 'fetch failed'}`; }
+  const { aa, error: aaError } = await readArtificialAnalysis(apiKey);
   const detection = detectFrontier(catalog, aa, undefined, Date.now(), Number(process.env.FRONTIER_TOP_N ?? 10));
-  if (aaError) detection.reports.push(aaError);
+  if (aaError) detection.reports = [...withoutAaKeyAbsent(detection.reports), aaError];
   // Reuse the same source snapshots for detection and refresh (no second fetch).
   const plan = await refreshModelCatalog({ catalog, aa, aaApiKey: '', additionIds: detection.additions, date });
+  if (aaError) plan.reports = withoutAaKeyAbsent(plan.reports);
   const proposedRegistry: Record<string, Readonly<LLMModelConfig>> = { ...LLM_MODEL_REGISTRY };
   for (const id of plan.additions) proposedRegistry[id] = plan.registryChanges[id] as LLMModelConfig;
   const coverage = await byokCoverage(proposedRegistry);

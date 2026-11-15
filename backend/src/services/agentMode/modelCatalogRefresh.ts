@@ -121,8 +121,41 @@ const AA_SLUG_OVERRIDES: Readonly<Record<string, string>> = {
   'openrouter/deepseek/deepseek-v4-pro-0813': 'deepseek-v4-pro',
 };
 
+/**
+ * Artificial Analysis language-model list. The legacy /api/v2/data/llms/models path
+ * returns 410 since 2026-11-04 (ENG-3026); the documented replacement that every key
+ * tier may call is the Free-shape list. Docs: https://artificialanalysis.ai/data-api/docs
+ * (migration table: https://artificialanalysis.ai/data-api/migrate-v2-data).
+ */
+export const AA_MODELS_URL = 'https://artificialanalysis.ai/api/v2/language/models/free';
+/** 200 rows per page upstream; a list that outgrows this is an error, never a silent partial read. */
+const AA_MAX_PAGES = 25;
+
+/** Reads every page and returns them as one `{ data }` payload. Throws on any failed or malformed page. */
+export async function fetchArtificialAnalysisModels(apiKey: string, request: typeof fetch = fetch): Promise<{ data: unknown[] }> {
+  const data: unknown[] = [];
+  for (let page = 1; page <= AA_MAX_PAGES; page++) {
+    const response = await request(`${AA_MODELS_URL}?page=${page}`, { headers: { 'x-api-key': apiKey }, signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`artificialanalysis.ai: HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    data.push(...rows(body));
+    if (object(object(body)?.pagination)?.has_more !== true) return { data };
+  }
+  throw new Error(`artificialanalysis.ai: more than ${AA_MAX_PAGES} pages`);
+}
+
+/**
+ * The model's lab as a comparable string. The retired endpoint sent `model_creator.slug`;
+ * the current one sends only `id` (a UUID) and `name`, so the name is the fallback.
+ */
+export function aaCreator(row: Record<string, unknown> | undefined): string | undefined {
+  const creator = object(row?.model_creator);
+  const value = typeof creator?.slug === 'string' ? creator.slug : creator?.name;
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
 /** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
- * Source: https://artificialanalysis.ai/api-reference
+ * Source: https://artificialanalysis.ai/data-api/docs
  */
 export function refreshScores(registry: Registry, payload: unknown | undefined, date: string) {
   const changes: Record<string, Partial<LLMModelConfig>> = {};
@@ -130,11 +163,11 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
   if (payload === undefined) return { changes, reports: ['Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.'] };
   const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
   const scores = rows(payload).flatMap(value => {
-    const row = object(value), creator = object(row?.model_creator), evaluations = object(row?.evaluations);
+    const row = object(value), creator = aaCreator(row), evaluations = object(row?.evaluations);
     const score = evaluations?.artificial_analysis_intelligence_index;
-    if (!row || typeof row.slug !== 'string' || typeof creator?.slug !== 'string'
+    if (!row || typeof row.slug !== 'string' || creator === undefined
       || typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) return [];
-    return [{ slug: row.slug, provider: normalize(creator.slug), score,
+    return [{ slug: row.slug, provider: normalize(creator), score,
       name: typeof row.name === 'string' ? row.name : row.slug }];
   });
   for (const [id, config] of Object.entries(registry)) {
@@ -175,7 +208,7 @@ export async function refreshModelCatalog(options: {
     return res.json() as Promise<unknown>;
   };
   const catalog = options.catalog ?? await get('https://openrouter.ai/api/v1/models');
-  const aa = options.aa ?? (apiKey ? await get('https://artificialanalysis.ai/api/v2/data/llms/models', { 'x-api-key': apiKey }) : undefined);
+  const aa = options.aa ?? (apiKey ? await fetchArtificialAnalysisModels(apiKey, request) : undefined);
   const additions = discoverNewModels(catalog, registry, options.additionIds)
     .filter(m => !options.additionIds || options.additionIds.includes(m.id));
   const next: Record<string, Readonly<LLMModelConfig>> = { ...registry };
