@@ -21,7 +21,7 @@ import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { parseWithImagesQuery, applyWithImagesQuery } from '../utils/withImagesQuery';
 import { approvalDb } from '../services/approvalDb';
-import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, WorkspaceCaller } from '../utils/workspaceAssets';
+import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, scopeCallerToCreativesSharing, WorkspaceCaller } from '../utils/workspaceAssets';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -2666,7 +2666,11 @@ function addCachedHtmlReportsToResult(
 async function workspaceCallerFor(userId: string): Promise<WorkspaceCaller> {
   try {
     const user = await userDb.getUserById(userId);
-    return { userId, orgId: user?.orgId || undefined };
+    // ENG-2834: the org's `creatives` share toggle (default on) gates the fan-out.
+    return scopeCallerToCreativesSharing(
+      { userId, orgId: user?.orgId || undefined },
+      { getOrg: (orgId) => orgDb.getOrgById(orgId) },
+    );
   } catch (err) {
     console.error('[ENG-2874] getUserById failed; falling back to own assets:', err);
     return { userId };

@@ -983,6 +983,8 @@ export interface OrgShareSettings {
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
   crm?: { enabled: boolean; editors: string[] };
+  // ENG-2834: absent on orgs that never saved it; the runtime defaults it on.
+  creatives?: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };

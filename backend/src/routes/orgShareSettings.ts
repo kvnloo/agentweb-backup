@@ -80,6 +80,9 @@ router.patch("/", async (req, res) => {
       if (incoming.crm === undefined) {
         incoming.crm = org?.shareSettings?.crm ?? { enabled: true, editors: [] };
       }
+      if (incoming.creatives === undefined) {
+        incoming.creatives = org?.shareSettings?.creatives ?? { enabled: true, editors: [] };
+      }
     }
     const validated = validateSettings(incoming);
     if ("error" in validated) return res.status(400).json({ message: validated.error });

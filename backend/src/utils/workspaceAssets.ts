@@ -3,6 +3,9 @@
 // own. Pure helpers with injected deps so the cross-org guarantees are unit
 // testable without DynamoDB.
 
+import { isFeatureEffectivelyEnabled } from '../services/orgShareService';
+import type { OrgLike } from '../services/orgShareService';
+
 export interface WorkspaceCaller {
   userId: string;
   orgId?: string;
@@ -18,6 +21,28 @@ export interface WorkspaceMember {
 
 export interface WorkspaceMemberDeps {
   getOrgMembers: (orgId: string) => Promise<WorkspaceMember[]>;
+}
+
+/**
+ * ENG-2834: apply the org's `creatives` share toggle (default on) to a caller.
+ * When the org has turned it off, or the org row is missing or unreadable, the
+ * caller is returned without an orgId, which every helper below treats as
+ * "own assets only". A failed lookup must narrow visibility, never widen it.
+ */
+export async function scopeCallerToCreativesSharing(
+  caller: WorkspaceCaller,
+  deps: { getOrg: (orgId: string) => Promise<OrgLike | null | undefined> },
+): Promise<WorkspaceCaller> {
+  if (!caller.orgId) return caller;
+  const self: WorkspaceCaller = { userId: caller.userId };
+  try {
+    const org = await deps.getOrg(caller.orgId);
+    if (!org) return self;
+    return isFeatureEffectivelyEnabled(caller, org, 'creatives') ? caller : self;
+  } catch (err) {
+    console.error('[ENG-2834] org lookup failed; falling back to own assets:', err);
+    return self;
+  }
 }
 
 export interface CreatorAttribution {

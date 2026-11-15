@@ -3,14 +3,17 @@ import type { OrgRole } from "./orgAuthz";
 import { can } from "./orgAuthz";
 
 export type ToggleableFeature =
-  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics" | "crm";
+  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics" | "crm" | "creatives";
 export type AlwaysOnFeature = "brandGuidelines" | "marketingStrategy";
 export type Feature = ToggleableFeature | AlwaysOnFeature;
 
 // Features that have user-owned data items needing transfer/delete on member
 // removal. Funnels are no longer a separate share-setting (gated by analytics),
 // but their items still need ownership cleanup.
-export type OwnedFeature = ToggleableFeature | "funnels";
+// Creatives (generated images/videos/reports) live inside the member's own task
+// executions and chat sessions: there is no standalone item to transfer or
+// delete on member removal, so they are excluded from ownership cleanup.
+export type OwnedFeature = Exclude<ToggleableFeature, "creatives"> | "funnels";
 
 const ALWAYS_ON: ReadonlySet<Feature> = new Set<Feature>(["brandGuidelines", "marketingStrategy"]);
 
@@ -22,7 +25,9 @@ export function isAlwaysOnFeature(f: Feature): boolean { return ALWAYS_ON.has(f)
 // the whole org; when off, each member only sees their own. This makes
 // skills/workPlans behave as "personal items, optionally shared org-wide"
 // rather than "org-managed items gated to an editor list".
-const MEMBER_OWNED: ReadonlySet<Feature> = new Set<Feature>(["skills", "workPlans"]);
+// Creatives (ENG-2834) follow the same model: the toggle only governs whether
+// each member's generated assets fan out to the whole org.
+const MEMBER_OWNED: ReadonlySet<Feature> = new Set<Feature>(["skills", "workPlans", "creatives"]);
 
 export function isMemberOwnedFeature(f: Feature): boolean { return MEMBER_OWNED.has(f); }
 
@@ -52,6 +57,7 @@ const DEFAULT_ENABLED: Readonly<Record<ToggleableFeature, boolean>> = {
   skills: true,
   analytics: true,
   crm: true,
+  creatives: true,
 };
 
 // The effective `enabled` default for a feature when no explicit value exists.
@@ -70,6 +76,7 @@ export function defaultShareSettings(): {
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
   crm: { enabled: boolean; editors: string[] };
+  creatives: { enabled: boolean; editors: string[] };
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
 } {
@@ -81,6 +88,7 @@ export function defaultShareSettings(): {
     skills:            { enabled: DEFAULT_ENABLED.skills,        editors: [] },
     analytics:         { enabled: DEFAULT_ENABLED.analytics,     editors: [] },
     crm:               { enabled: DEFAULT_ENABLED.crm,           editors: [] },
+    creatives:         { enabled: DEFAULT_ENABLED.creatives,     editors: [] },
     brandGuidelines:   { editors: [] },
     marketingStrategy: { editors: [] },
   };
@@ -208,13 +216,14 @@ export const ORG_ITEMS_CAP     = 2000;
 export const RESPONSE_CAP      = 1000;
 
 export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
-  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics", "crm",
+  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics", "crm", "creatives",
 ];
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",
 ];
 export const OWNED_FEATURES: ReadonlyArray<OwnedFeature> = [
-  ...TOGGLEABLE_FEATURES, "funnels",
+  ...TOGGLEABLE_FEATURES.filter((f): f is Exclude<ToggleableFeature, "creatives"> => f !== "creatives"),
+  "funnels",
 ];
 
 export interface ListOrgVisibleArgs<T> {
