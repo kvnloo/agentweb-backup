@@ -691,6 +691,24 @@ set_slack_response "$M" ''
 run_alert "$M"
 check 'AC4: an empty Slack response body fails the step' 1 'delivery cannot be confirmed'
 
+# Whitespace and JSON streams are not a single response/secret object.
+for invalid in '   ' '{} {}'; do
+  M=$(new_mock_dir)
+  set_slack_response "$M" "$invalid"
+  run_alert "$M"
+  check 'AC4: whitespace/JSON-stream response fails validation' 1 'delivery cannot be confirmed'
+
+  M=$(new_mock_dir)
+  set_secret_string "$M" "$invalid"
+  run_alert "$M"
+  if [ "$invalid" = '   ' ]; then
+    check 'AC4: whitespace secret fails before JSON validation' 1 'returned an empty SecretString'
+  else
+    check 'AC4: JSON-stream secret fails validation' 1 'is not a JSON object'
+  fi
+  check_nothing_posted 'AC4: invalid secret never reaches Slack'
+done
+
 # Misconfiguration fails closed rather than posting a half-formed alert.
 M=$(new_mock_dir)
 run_alert "$M" REPO=''
