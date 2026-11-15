@@ -137,6 +137,7 @@ case "$operation" in
     # reading exactly what it always read.
     case "$all_args" in
       *'--severity INFO'*)
+        printf '%s\n' "$all_args" >"${MOCK_DIR}/info_events_args"
         code=0
         [ -f "${MOCK_DIR}/info_events_exit" ] && code=$(cat "${MOCK_DIR}/info_events_exit")
         if [ "$code" != "0" ]; then
@@ -1424,6 +1425,20 @@ check 'ENG-3039: the 2026-11-06 sequence is a success, not a budget timeout' 0 \
   'SUCCESS: environment'
 check 'ENG-3039: the success says a later update is still running' 0 \
   'a later update that this deploy did not start'
+
+# The event window must open before the accept stamp, or EB's own "update is
+# starting" line (stamped while the request is still being handled, a second
+# before the CLI returned on 11-06) falls outside it. The harness clock starts
+# at 0, so a window that looks back lands in 1969 and one that does not lands
+# in 1970.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if grep -qF -- '--start-time 1969-12-31T23:59:' "$M/info_events_args" 2>/dev/null; then
+  pass 'ENG-3039: the event window opens before the accept stamp'
+else
+  printf '  FAIL ENG-3039: event window did not look back before the accept stamp: %s\n' \
+    "$(cat "$M/info_events_args" 2>/dev/null || echo '<no INFO describe-events call>')"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
 
 # A failed deploy must still fail. Each case below removes one leg of the proof.
 

@@ -77,6 +77,7 @@ EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
 EB_ABORT_MAX_RETRIES="${EB_ABORT_MAX_RETRIES:-1}"
+EB_ROLLOUT_EVENT_LOOKBACK_SECONDS="${EB_ROLLOUT_EVENT_LOOKBACK_SECONDS:-60}"
 EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
 EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS:-120}"
 EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS="${EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS:-30}"
@@ -578,9 +579,18 @@ events_show_recoverable_abort() {
 rollout_logged_complete() {
   [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 1
 
-  local since out
-  since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-    || date -u -d "@${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  # The window opens EB_ROLLOUT_EVENT_LOOKBACK_SECONDS before the accept stamp,
+  # not at it. EB_UPDATE_ACCEPTED_AT is taken when the CLI call RETURNS, and EB
+  # writes "Environment update is starting." while it is still handling the
+  # request: on 2026-11-06 that event is stamped 02:30:51.661Z and CloudTrail
+  # records the UpdateEnvironment call at 02:30:52Z. A window opening at the
+  # accept stamp drops our own start line and the ordered pair can never match.
+  # Looking back is safe because the pair is ordered: anything the wider window
+  # pulls in from the previous deploy sits before our start line.
+  local since out from
+  from=$(( EB_UPDATE_ACCEPTED_AT - EB_ROLLOUT_EVENT_LOOKBACK_SECONDS ))
+  since="$(date -u -r "${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
   [ -z "${since}" ] && return 1
 
   if ! out=$(aws elasticbeanstalk describe-events \
