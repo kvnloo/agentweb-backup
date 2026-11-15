@@ -90,6 +90,20 @@ function recheckConsentBeforeRetry(assertStillAuthorized: AssertStillAuthorized 
   };
 }
 
+// ENG-3003: media_urls are uploaded through LinkedIn's image pipeline only. A video sent that way
+// is accepted and returns a share URN, then LinkedIn drops the post asynchronously.
+const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'];
+export function isVideoUrl(url: string): boolean {
+  let path: string;
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    path = url.split(/[?#]/)[0];
+  }
+  path = path.toLowerCase();
+  return VIDEO_EXTENSIONS.some(ext => path.endsWith(ext));
+}
+
 export class LinkedInAdapter implements SocialPlatformAdapter {
 
   /**
@@ -170,7 +184,14 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
-
+    const videoUrls = (mediaUrls || []).filter(isVideoUrl);
+    if (videoUrls.length > 0) {
+      return {
+        success: false,
+        message: 'LinkedIn video posts are not supported yet: media_urls on LinkedIn accept images only, and a video would be dropped by LinkedIn after being accepted. '
+          + 'Video upload is currently supported for YouTube only. Nothing was posted - post the text with an image, or upload the video to LinkedIn manually.',
+      };
+    }
 
     try {
       // Get valid token (refreshes if expired)
