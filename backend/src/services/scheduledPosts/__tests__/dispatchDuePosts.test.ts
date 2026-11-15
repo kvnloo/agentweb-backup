@@ -125,6 +125,15 @@ describe('dispatchDuePosts (ENG-2520)', () => {
     expect(s.skipped).toEqual(['x', 'y']);
   });
 
+  it('skips a retry moved into the future between listing and the fresh read', async () => {
+    const { repo, saves } = fakeRepo([rec('retry', -10)], { retry: rec('retry', retryBackoffMs(1)) });
+    const { publisher, calls } = fakePublisher();
+    const summary = await dispatchDuePosts({ repo, publisher, now: NOW });
+    expect(calls).toEqual([]);
+    expect(saves).toEqual([]);
+    expect(summary).toEqual({ fired: [], failed: [], retried: [], skipped: ['retry'], errors: [] });
+  });
+
   it('publishes oldest-first, exactly once each', async () => {
     const { repo, saves } = fakeRepo([rec('late', -1), rec('early', -100), rec('mid', -50)]);
     const { publisher, calls } = fakePublisher();

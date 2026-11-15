@@ -49,7 +49,7 @@ export async function dispatchDuePosts(deps: {
   for (const candidate of due) {
     try {
       const current = await repo.get(candidate.id);
-      if (!current || current.status !== 'pending') {
+      if (!current || current.status !== 'pending' || current.publishAt.getTime() > now.getTime()) {
         summary.skipped.push(candidate.id);
         continue;
       }
