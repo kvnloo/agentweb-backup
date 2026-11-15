@@ -98,6 +98,25 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('createPost', () => {
+    it('ENG-3003: refuses video media_urls instead of sending them through the image pipeline', async () => {
+      const result = await adapter.createPost(
+        mockCompanyAccount, 'Event recap', ['https://cdn.example.com/clips/event.MP4?X-Amz-Signature=abc'], 'user-1',
+      );
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/video/i);
+      expect(result.message).toMatch(/nothing was posted/i);
+      expect(mockLinkedInService.uploadImageFromUrl).not.toHaveBeenCalled();
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3003: still uploads image media_urls', async () => {
+      mockLinkedInService.uploadImageFromUrl.mockResolvedValue('urn:li:image:1');
+      mockLinkedInService.createPost.mockResolvedValue('urn:li:share:1');
+      const result = await adapter.createPost(mockCompanyAccount, 'Photo', ['https://cdn.example.com/a.png'], 'user-1');
+      expect(result.success).toBe(true);
+      expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(1);
+    });
+
     it('ENG-428: draft mode passes draft option, skips posts cache, claims no public URL', async () => {
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:draft9');
       const result = await adapter.createPost(mockPersonalAccount, 'Draft post', undefined, 'user-1', undefined, { draft: true });
