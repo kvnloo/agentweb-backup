@@ -669,6 +669,54 @@ describe('CRM Group Email Endpoints', () => {
       expect(response.skippedUndeliverable).toBe(1);
     });
 
+    describe('ENG-2996 — opt-in excludeUnvalidated', () => {
+      const mixedLeads = [
+        { leadId: '1', email: 'good@acmecorp.com', customFields: { email_validation: { status: 'deliverable' } } },
+        { leadId: '2', email: 'never@acmecorp.com' },
+        { leadId: '3', email: 'unknown@acmecorp.com', customFields: { email_validation: { status: 'unknown' } } },
+        { leadId: '4', email: 'risky@acmecorp.com', customFields: { email_validation: { status: 'risky' } } },
+      ];
+      const sendBody = { senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>' };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mixedLeads, lastEvaluatedKey: undefined });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      });
+
+      it('sends only validated-deliverable leads when excludeUnvalidated=true, reporting the rest', async () => {
+        mockReq.body = { ...sendBody, excludeUnvalidated: true };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+        expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].to).toBe('good@acmecorp.com');
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(1);
+        expect(response.skippedUnvalidated).toBe(3);
+      });
+
+      it('default (no flag) is unchanged: unvalidated, unknown and risky leads are still sent', async () => {
+        mockReq.body = { ...sendBody };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(4);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(4);
+        expect(response).not.toHaveProperty('skippedUnvalidated');
+      });
+
+      it('preview honors the same flag so its eligible count matches the send', async () => {
+        mockReq.body = { excludeUnvalidated: true };
+        const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+        await handler!(mockReq, mockRes);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.eligibleLeads).toBe(1);
+        expect(response.unvalidatedCount).toBe(3);
+      });
+    });
+
     // ENG-1194 code review: malformed-syntax/test-domain rows must never be
     // overridable via includeUndeliverable or includeUndeliverableEmails — a
     // provider rejects them regardless of caller intent, which is exactly the

@@ -30,3 +30,22 @@ describe('sanitizeMcpToolSchema — ENG-2162', () => {
     expect(sanitizeMcpToolSchema('playwright_browser_network_requests', undefined)).toBeUndefined();
   });
 });
+
+describe('sanitizeMcpToolSchema — ENG-2994', () => {
+  it('drops level from required for playwright_browser_console_messages, keeping the property', () => {
+    const schema = {
+      type: 'object',
+      required: ['level'],
+      properties: { level: { type: 'string', enum: ['error', 'warning', 'info', 'debug'] } },
+    };
+    const out = sanitizeMcpToolSchema('playwright_browser_console_messages', schema);
+    expect(out.required).toEqual([]);
+    expect(out.properties.level.enum).toContain('error');
+    expect(schema.required).toEqual(['level']);
+  });
+
+  it('relaxes the unprefixed server names the Playwright MCP server actually reports', () => {
+    expect(sanitizeMcpToolSchema('browser_console_messages', { type: 'object', properties: { level: { type: 'string' } }, required: ['level'] }).required).toEqual([]);
+    expect(sanitizeMcpToolSchema('browser_network_requests', { type: 'object', required: ['requestBody', 'requestHeaders'] }).required).toEqual([]);
+  });
+});

@@ -6,11 +6,9 @@
  * `eng2950.zomaMetaParityMatrix.test.ts` checks every mapping against the advertised
  * Zoma manifest, so a row cannot point at a tool or action that does not exist.
  *
- * Source of Meta tool names: the "Meta parity:" lists in ENG-2912's category children
- * (ENG-2913..2921). ENG-2918 abbreviates its 31 catalog tools; those rows use the labels
- * exactly as written there, expanded only where the issue writes "create/update/list/delete".
- * The epic cites 88 Meta tools; the research file it references was not on disk, so rows
- * beyond the child lists must be added when that list is recovered (see ENG-2950).
+ * Official names are pinned in the seven-category documentation snapshot
+ * `__tests__/__fixtures__/officialMetaAdsMcpTools.json`. The exact-set test
+ * rejects missing names and abbreviated catalog aliases.
  *
  * Pure data. No provider calls, no persistence, no change to tool behavior or scopes.
  */
@@ -57,7 +55,13 @@ const PG = 'Pages, Instagram & Ad Library';
 const DIA = 'Diagnostics & help';
 
 export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
-  // ENG-2913
+  // ENG-2913 — base discovery/lifecycle names are part of the official inventory.
+  // Keep conservative gaps until each complete operation contract is proven.
+  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts'),
+  gap(EDITS, 'ENG-2913', 'ads_create_campaign'),
+  gap(EDITS, 'ENG-2913', 'ads_create_ad_set'),
+  gap(EDITS, 'ENG-2913', 'ads_create_ad'),
+  gap(EDITS, 'ENG-2913', 'ads_activate_entity'),
   covered(EDITS, 'ENG-2913', 'ads_update_entity', { tool: MMA, action: 'UPDATE' }),
   gap(EDITS, 'ENG-2913', 'ads_get_field_context'),
   covered(EDITS, 'ENG-2913', 'ads_get_ad_preview', { tool: MMA, action: 'PREVIEW', entityType: 'AD' }),
@@ -102,38 +106,38 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   gap(SIG, 'ENG-2917', 'ads_pixel_parameter_delete'),
   same(SIG, 'ENG-2917', 'ads_get_customconversions'),
 
-  // ENG-2918 (labels as written in the issue)
+  // ENG-2918 (canonical official Meta tool names)
   covered(CAT, 'ENG-2918', 'ads_catalog_create', { tool: 'meta_catalog_create' }),
-  covered(CAT, 'ENG-2918', 'update_catalog', { tool: 'meta_catalog_update' }),
-  covered(CAT, 'ENG-2918', 'list_catalogs', { tool: 'meta_list_catalogs' }),
-  covered(CAT, 'ENG-2918', 'list_dpa_eligible_catalogs', { tool: 'meta_list_dpa_eligible_catalogs' }),
-  covered(CAT, 'ENG-2918', 'get_diagnostics', { tool: 'meta_get_catalog_diagnostics' }),
-  covered(CAT, 'ENG-2918', 'get_dynamic_ads_health', { tool: 'meta_get_dynamic_ads_health' }),
-  covered(CAT, 'ENG-2918', 'get_data_sources', { tool: 'meta_get_catalog_data_sources' }),
-  covered(CAT, 'ENG-2918', 'list_products', { tool: 'meta_list_products' }),
-  covered(CAT, 'ENG-2918', 'product_create', { tool: 'meta_product_create' }),
-  covered(CAT, 'ENG-2918', 'update_product', { tool: 'meta_update_product' }),
-  covered(CAT, 'ENG-2918', 'delete_product', { tool: 'meta_delete_product' }),
-  covered(CAT, 'ENG-2918', 'get_suggested_filter', { tool: 'meta_get_suggested_filter' }),
-  covered(CAT, 'ENG-2918', 'product_set_create', { tool: 'meta_product_set_create' }),
-  covered(CAT, 'ENG-2918', 'product_set_update', { tool: 'meta_product_set_update' }),
-  covered(CAT, 'ENG-2918', 'product_set_list', { tool: 'meta_list_product_sets' }),
-  covered(CAT, 'ENG-2918', 'product_set_delete', { tool: 'meta_product_set_delete' }),
-  covered(CAT, 'ENG-2918', 'product_feed_create', { tool: 'meta_product_feed_create' }),
-  covered(CAT, 'ENG-2918', 'product_feed_update', { tool: 'meta_product_feed_update' }),
-  covered(CAT, 'ENG-2918', 'product_feed_list', { tool: 'meta_list_product_feeds' }),
-  covered(CAT, 'ENG-2918', 'product_feed_delete', { tool: 'meta_product_feed_delete' }),
-  covered(CAT, 'ENG-2918', 'feed_upload_session_create', { tool: 'meta_feed_upload_create' }),
-  covered(CAT, 'ENG-2918', 'feed_upload_session_get', { tool: 'meta_feed_upload_get' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_create', { tool: 'meta_feed_rule_create' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_get', { tool: 'meta_feed_rule_get' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_delete', { tool: 'meta_feed_rule_delete' }),
-  covered(CAT, 'ENG-2918', 'event_source_get', { tool: 'meta_event_source_get' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_catalogs', { tool: 'meta_event_source_get_catalogs' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_health', { tool: 'meta_event_source_get_health' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_recommendations', { tool: 'meta_event_source_get_recommendations' }),
-  covered(CAT, 'ENG-2918', 'event_source_connect', { tool: 'meta_event_source_connect' }),
-  covered(CAT, 'ENG-2918', 'event_source_disconnect', { tool: 'meta_event_source_disconnect' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_catalog', { tool: 'meta_catalog_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_catalogs', { tool: 'meta_list_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_dpa_eligible_catalogs', { tool: 'meta_list_dpa_eligible_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_diagnostics', { tool: 'meta_get_catalog_diagnostics' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_dynamic_ads_health', { tool: 'meta_get_dynamic_ads_health' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_data_sources', { tool: 'meta_get_catalog_data_sources' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_products', { tool: 'meta_list_products' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_create', { tool: 'meta_product_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product', { tool: 'meta_update_product' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_delete_product', { tool: 'meta_delete_product' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_suggested_filter', { tool: 'meta_get_suggested_filter' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_set', { tool: 'meta_product_set_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product_set', { tool: 'meta_product_set_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_product_sets', { tool: 'meta_list_product_sets' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_set_delete', { tool: 'meta_product_set_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_feed', { tool: 'meta_product_feed_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product_feed', { tool: 'meta_product_feed_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_product_feeds', { tool: 'meta_list_product_feeds' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_feed_delete', { tool: 'meta_product_feed_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_feed_upload_session', { tool: 'meta_feed_upload_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_product_feed_upload_sessions', { tool: 'meta_feed_upload_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_feed_rule', { tool: 'meta_feed_rule_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_feed_rules', { tool: 'meta_feed_rule_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_feed_delete_rule', { tool: 'meta_feed_rule_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get', { tool: 'meta_event_source_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_catalogs', { tool: 'meta_event_source_get_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_health', { tool: 'meta_event_source_get_health' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_recommendations', { tool: 'meta_event_source_get_recommendations' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_connect', { tool: 'meta_event_source_connect' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_disconnect', { tool: 'meta_event_source_disconnect' }),
 
   // ENG-2919
   same(EXP, 'ENG-2919', 'ads_experiment_list_tests'),

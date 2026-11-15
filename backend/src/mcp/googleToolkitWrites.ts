@@ -119,8 +119,10 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   if (!row) return null;
   if (kind === 'campaign_conversion_goal') {
     const g = row.campaignConversionGoal;
-    return g?.resourceName && typeof g.biddable === 'boolean'
-      ? { resourceName: g.resourceName, campaign: g.campaign, name: row.campaign?.name, category: g.category, origin: g.origin, biddable: g.biddable } : null;
+    // ENG-2995: Google Ads REST (proto3 JSON) omits `false` booleans, so a non-biddable goal
+    // arrives with no `biddable` field. The query selects it, so absent means false.
+    if (!g?.resourceName || (g.biddable !== undefined && typeof g.biddable !== 'boolean')) return null;
+    return { resourceName: g.resourceName, campaign: g.campaign, name: row.campaign?.name, category: g.category, origin: g.origin, biddable: g.biddable === true };
   }
   if (kind === 'budget') {
     const b = row.campaignBudget;
