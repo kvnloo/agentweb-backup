@@ -207,7 +207,7 @@ load_slack_secret() {
     fail "the Slack alert secret '${SLACK_SECRET_ID}' has no SecretString (the AWS CLI returned 'None'). A binary or empty secret cannot carry the bot token."
   fi
 
-  if ! jq -e 'type == "object"' "${WORKDIR}/secret.json" >/dev/null 2>&1; then
+  if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "${WORKDIR}/secret.json" >/dev/null 2>&1; then
     fail "the Slack alert secret '${SLACK_SECRET_ID}' is not a JSON object; it must contain botToken and deployAlertChannel. Its contents are deliberately not printed."
   fi
 
@@ -426,7 +426,7 @@ CURLCFG
     fail "the Slack chat.postMessage request failed at the network level (curl exit ${rc}), so a failed production deploy went unannounced. curl reported: $(head_of_file "${WORKDIR}/curl.err" 300)"
   fi
 
-  if [ ! -s "${WORKDIR}/response.json" ] || ! jq -e 'type == "object"' "${WORKDIR}/response.json" >/dev/null 2>&1; then
+  if [ ! -s "${WORKDIR}/response.json" ] || ! jq -e -s 'length == 1 and (.[0] | type == "object")' "${WORKDIR}/response.json" >/dev/null 2>&1; then
     fail "Slack answered HTTP ${http_code} with a body that is not a JSON object, so delivery cannot be confirmed. Body: $(head_of_file "${WORKDIR}/response.json" 300)"
   fi
 
