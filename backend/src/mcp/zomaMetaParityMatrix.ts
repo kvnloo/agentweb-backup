@@ -79,8 +79,8 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   covered(CRE, 'ENG-2915', 'ads_create_creative', { tool: MMA, action: 'CREATE', entityType: 'AD_CREATIVE' }),
   covered(CRE, 'ENG-2915', 'ads_get_creatives', { tool: MMA, action: 'LIST', entityType: 'AD_CREATIVE' }),
   covered(CRE, 'ENG-2915', 'ads_get_creative_ads', { tool: MMA, action: 'LIST', entityType: 'AD' }),
-  gap(CRE, 'ENG-2915', 'ads_get_ad_images'),
-  gap(CRE, 'ENG-2915', 'ads_get_ad_videos'),
+  same(CRE, 'ENG-3032', 'ads_get_ad_images'),
+  same(CRE, 'ENG-3032', 'ads_get_ad_videos'),
 
   // ENG-2916
   gap(REP, 'ENG-2916', 'ads_get_opportunity_score'),

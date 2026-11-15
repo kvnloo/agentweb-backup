@@ -73,6 +73,9 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_account_get_activity_logs',
   'meta_account_health',
   'meta_learning_phase',
+  // Meta: creative asset libraries (ENG-3032)
+  'ads_get_ad_images',
+  'ads_get_ad_videos',
   // Meta: catalogs, feeds, event sources (read tools only)
   'meta_list_catalogs',
   'meta_list_products',

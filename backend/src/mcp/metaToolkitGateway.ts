@@ -33,6 +33,7 @@ import { runZomaTool, ZomaNotReadyError } from './zomaOnboarding';
 import { googleToolkitEnabled, META_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
+import { isMetaAssetLibraryTool, runMetaAssetLibraryTool } from './metaToolkitAssetLibrary';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
 import { EXPERIMENT_WRITE_KIND, isMetaExperimentWrite, isMetaExperimentWriteTool, runMetaExperimentWriteTool } from './metaToolkitExperimentWrites';
 import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
@@ -109,6 +110,8 @@ export interface MetaToolkitGatewayDeps {
   executeLifecycle?: (userId: string, args: any) => Promise<any>;
   /** ENG-2916 read-only health tools; defaults to runMetaHealthTool. */
   runHealthTool?: typeof runMetaHealthTool;
+  /** ENG-3032 read-only image / video library lists; defaults to runMetaAssetLibraryTool. */
+  runAssetLibraryTool?: typeof runMetaAssetLibraryTool;
   /** ENG-2918 read-only catalog tools; defaults to runMetaCatalogTool. */
   runCatalogTool?: typeof runMetaCatalogTool;
   /** ENG-2925 catalog product / product-set writes; defaults to runMetaCatalogWriteTool. */
@@ -431,6 +434,13 @@ export async function handleMetaToolkitCall(
     const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta');
     return stripCredentials(health);
+  }
+
+  // ENG-3032: read-only image / video library lists on the resolved (owned) account.
+  if (isMetaAssetLibraryTool(request.toolName)) {
+    const library = await (deps.runAssetLibraryTool ?? runMetaAssetLibraryTool)(request.toolName, caller.userId, accountId, args);
+    await meter('meta');
+    return stripCredentials(library);
   }
 
   // ENG-2918: read-only catalog tools, scoped to the resolved account's business catalogs.

@@ -20,6 +20,7 @@ import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
+import { isMetaAssetLibraryTool, META_ASSET_LIBRARY_TOOL_DEFINITIONS } from './metaToolkitAssetLibrary';
 import { isMetaCatalogTool, META_CATALOG_TOOL_DEFINITIONS } from './metaToolkitCatalogs';
 import { isMetaCatalogFeedTool, META_CATALOG_FEED_TOOL_DEFINITIONS } from './metaToolkitCatalogFeeds';
 import { isMetaEventSourceTool, META_EVENT_SOURCE_TOOL_DEFINITIONS } from './metaToolkitEventSources';
@@ -135,13 +136,15 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     // ENG-2926: catalog create/update, feeds, upload sessions, feed rules (deletes are preview → confirm).
     ...META_CATALOG_FEED_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-3032: read-only image / video library lists.
+    ...META_ASSET_LIBRARY_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
   ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name)) return;
+  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name) || isMetaAssetLibraryTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

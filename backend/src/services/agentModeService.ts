@@ -15771,12 +15771,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
   /**
    * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
-   * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
+   * edges ('adsets'; ENG-3032 adds 'adimages' and 'advideos'). Ownership comes from the
+   * act_<id> path plus getMetaCredentials.
    */
   public async readToolkitMetaAccountGraph(
-    userId: string, account_id: string, edge: '' | 'adsets', params: Record<string, string>,
+    userId: string, account_id: string, edge: '' | 'adsets' | 'adimages' | 'advideos', params: Record<string, string>,
   ): Promise<any> {
-    if (edge !== '' && edge !== 'adsets') throw new Error(`Unsupported account edge: ${edge}`);
+    if (!['', 'adsets', 'adimages', 'advideos'].includes(edge)) throw new Error(`Unsupported account edge: ${edge}`);
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     const path = `act_${accountId.replace(/^act_/, '')}${edge ? `/${edge}` : ''}`;
