@@ -58,19 +58,28 @@ function isPrivateKey(key: string, toolName: string): boolean {
   return false;
 }
 
+/**
+ * Object/array nesting budget. It bounds recursion, it is not a data-shape rule: the MCP envelope
+ * and the tool's own payload wrapper spend ~8 levels before stored customer data starts, so the
+ * old 32 nulled legitimate stored values from about level 25. Deeper than this is still null.
+ */
+const MAX_DEPTH = 128;
+
 export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
   // Bound total traversal, not just depth: shared graphs can expand exponentially.
   const ancestors = new WeakSet<object>();
   let remaining = 10000;
   function visit(value: any, depth: number): any {
   // Never return an unvisited subtree, including encoded JSON or cyclic input.
-  if (depth > 32 || --remaining < 0) return null;
+  if (depth > MAX_DEPTH || --remaining < 0) return null;
   if (typeof value === 'string') {
     const trimmed = value.trimStart();
     if (!trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('"')) return value;
     let parsed: unknown;
-    try { parsed = JSON.parse(value); } catch { return value; }
-    const stripped = visit(parsed, depth + 1);
+    // Not JSON: plain text, returned as-is. Any other parser failure is unvisited data: fail closed.
+    try { parsed = JSON.parse(value); } catch (err) { return err instanceof SyntaxError ? value : null; }
+    // Encoded text is not structure: only object/array nesting spends the depth budget.
+    const stripped = visit(parsed, depth);
     return JSON.stringify(stripped) === JSON.stringify(parsed)
       ? value : JSON.stringify(stripped, null, 2);
   }

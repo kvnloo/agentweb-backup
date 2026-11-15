@@ -74,6 +74,28 @@ describe('ENG-3001 recursive output boundary', () => {
     expect(JSON.stringify(sanitize(cycle))).not.toContain('cycle-secret');
   });
 
+  it('returns legitimately deep stored data complete inside a real MCP envelope', () => {
+    let deep: unknown = { leaf: 'DEEP_LEAF_MARKER', traceId: 'deep-secret' };
+    for (let i = 0; i < 40; i++) deep = { child: deep };
+    const payload = { success: true, brand_guidelines: { brandData: { valueProposition: deep } } };
+    const out = sanitize({ content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload });
+    let node = JSON.parse(out.content[0].text).brand_guidelines.brandData.valueProposition;
+    let structured = out.structuredContent.brand_guidelines.brandData.valueProposition;
+    for (let i = 0; i < 40; i++) { node = node.child; structured = structured.child; }
+    expect(node).toEqual({ leaf: 'DEEP_LEAF_MARKER' });
+    expect(structured).toEqual({ leaf: 'DEEP_LEAF_MARKER' });
+  });
+
+  it('fails closed past the nesting budget instead of returning unvisited data', () => {
+    let input: unknown = { traceId: 'deep-secret', name: 'over-budget' };
+    for (let i = 0; i < 300; i++) input = { child: input };
+    for (const out of [JSON.stringify(sanitize(input)), sanitize(JSON.stringify(input)) as string]) {
+      expect(out).not.toContain('deep-secret');
+      expect(out).not.toContain('over-budget');
+      expect(out).toContain('null');
+    }
+  });
+
   it('bounds branching shared graphs and cuts active cycles immediately', () => {
     let reads = 0;
     let graph: any = { name: 'safe', traceId: 'secret' };
