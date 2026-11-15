@@ -43,6 +43,12 @@ const covered = (category: string, source: string, metaTool: string, zoma: ZomaO
 const gap = (category: string, source: string, metaTool: string, owner = source): ParityRow =>
   ({ metaTool, category, source, status: 'gap', owner });
 const same = (category: string, source: string, name: string): ParityRow => covered(category, source, name, { tool: name });
+const notApplicable = (category: string, source: string, metaTool: string, reason: string): ParityRow =>
+  ({ metaTool, category, source, status: 'not_applicable', reason });
+
+/** ENG-3031: what was checked before a Reporting row was marked not_applicable. */
+const NO_PUBLIC_INSIGHTS_ENDPOINT =
+  'No public Graph endpoint or field: not in the Ad Account reference (fields and edges) or the Ad Account / Campaign / Ad Set Insights references, checked 2026-11-15.';
 
 const EDITS = 'Campaign management';
 const AUDS = 'Audiences';
@@ -84,10 +90,15 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
 
   // ENG-2916
   same(REP, 'ENG-3030', 'ads_get_opportunity_score'),
-  gap(REP, 'ENG-2916', 'ads_insights_advertiser_context'),
-  gap(REP, 'ENG-2916', 'ads_insights_anomaly_signal'),
-  gap(REP, 'ENG-2916', 'ads_insights_auction_ranking_benchmarks'),
-  gap(REP, 'ENG-2916', 'ads_insights_industry_benchmark'),
+  // ENG-3031: these three are computed inside Meta's own MCP server. No public Marketing API
+  // endpoint or field was found for them, and a substitute score of our own is out of scope.
+  notApplicable(REP, 'ENG-3031', 'ads_insights_advertiser_context', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_anomaly_signal', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  // ENG-3031: Meta's public auction comparison is the three ad relevance diagnostics, which
+  // call_meta_ads_insights_api already accepts as fields (quality_ranking,
+  // engagement_rate_ranking, conversion_rate_ranking). eng3031 test pins that.
+  covered(REP, 'ENG-3031', 'ads_insights_auction_ranking_benchmarks', { tool: 'call_meta_ads_insights_api' }),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_industry_benchmark', NO_PUBLIC_INSIGHTS_ENDPOINT),
   covered(REP, 'ENG-2916', 'ads_insights_performance_trend', { tool: 'call_meta_ads_insights_api' }),
   // ENG-3030: no new tool. LIST on CAMPAIGN / AD_SET / AD already returns each entity with
   // status + effective_status (eng3030 test pins all three entity types to the manifest).
