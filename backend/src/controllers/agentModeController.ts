@@ -1,4 +1,6 @@
 import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
+import { personOnlyApprovalsIn, personOnlyRefusal } from '../services/personOnlyApprovals';
+
 import {
   acquireInteractiveGenerationSlot,
   buildTooManyRunsBody,
@@ -141,7 +143,7 @@ import {
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
   hasPersistedMediaBudgetDeferral,
-  hasUnresolvedMediaDeferral,
+  hasUnresolvedMediaDeferral, lastUserTurnWasShareVisitor,
 } from '../utils/timeoutContinuation';
 import { MEDIA_GEN_TOOLS, mediaGenProducedAsset } from '../services/agentMode/core/toolDispatch';
 import {
@@ -203,6 +205,11 @@ import {
   type ModelBackupSource,
   type PolicyModelDecision,
 } from '../services/llmUsagePolicyService';
+
+/** Where the person approves: the chat the card is in. */
+function approvalChatUrl(sessionId: string): string {
+  return `${(process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro').replace(/\/$/, '')}/agent-mode/${encodeURIComponent(sessionId)}`;
+}
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
@@ -1979,6 +1986,9 @@ async function scheduleAutoMediaContinuation(
   // carried through every round (never re-derived from the session's kind): an owner who reopened a scheduled chat is
   // attended; a headless starter passes true.
   isUnattendedRun: boolean,
+  // ENG-2816: whether the request being continued came from a share-link visitor. Carried through every round like
+  // isUnattendedRun: dropping it would run the follow-up with the owner's full tool set over a visitor's request.
+  isInteractiveShare: boolean = false,
 ): Promise<void> {
   if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
     console.error(
@@ -2075,7 +2085,7 @@ async function scheduleAutoMediaContinuation(
       userId,
       llmModel,
       undefined, // attachments
-      undefined, // isInteractiveShare
+      isInteractiveShare || undefined, // isInteractiveShare (ENG-2816: kept for a visitor's request, see the parameter)
       undefined, // pageContext
       undefined, // isDelegatedAccess
       undefined, // ishareSenderInfo
@@ -2184,7 +2194,7 @@ async function scheduleAutoMediaContinuation(
         // (the try/catch above now guards its one known throw point), but every
         // fire-and-forget call site catches defensively anyway, so a future,
         // unanticipated throw logs instead of becoming an unhandled rejection.
-        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun).catch((chainErr) =>
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1, isUnattendedRun, isInteractiveShare).catch((chainErr) =>
           console.error(`AgentMode: media auto-continuation chain failed for session ${sessionId}:`, chainErr),
         );
       }
@@ -10954,6 +10964,8 @@ export const agentModeController = {
           session.llmModel || agentModeService.default_model,
           1,
           false, // the genuine owner is viewing the chat (genuineOwnerView): attended
+          // ENG-2816: the owner opening the chat must not turn a visitor's deferred request into an owner-powered one.
+          lastUserTurnWasShareVisitor(session.messages),
         ).catch((err) =>
           console.error(`AgentMode: media auto-continuation (durability backstop) failed for session ${session.sessionId}:`, err),
         ));
@@ -11317,7 +11329,23 @@ export const agentModeController = {
         if (!session.pendingApprovalDeck) {
           return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
         }
-        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        // ENG-2962: an MCP tool answering on someone's behalf (a self-call) may not approve an action that only a person may approve:
+        // a Smartlead push or release, a hot-lead call, a CRM sequence activation or a paused Meta bundle. Declining stays allowed.
+        if ((req as AuthenticatedRequest).isSelfCall === true) {
+          const blocked = personOnlyApprovalsIn(session.pendingApprovalDeck, deckAnswer.answers);
+          if (blocked.length > 0) {
+            console.warn(JSON.stringify({ event: 'approval_needs_person', sessionId, actions: blocked.map(b => b.action) }));
+            return res.status(403).json({ error: personOnlyRefusal(approvalChatUrl(sessionId)), code: 'APPROVAL_NEEDS_PERSON' });
+          }
+        }
+        const result = await agentModeService.submitApprovalDeckAnswers(
+          sessionId, deckAnswer.deckId, deckAnswer.answers, 'user',
+          { refusePersonOnlyApprovals: (req as AuthenticatedRequest).isSelfCall === true },
+        );
+        if (result.outcome === 'needs_person') {
+          console.warn(JSON.stringify({ event: 'approval_needs_person', sessionId, actions: result.actions, stage: 'submit' }));
+          return res.status(403).json({ error: personOnlyRefusal(approvalChatUrl(sessionId)), code: 'APPROVAL_NEEDS_PERSON' });
+        }
         if (result.outcome === 'invalid') {
           return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
         }
@@ -12495,6 +12523,21 @@ export const agentModeController = {
     }
   },
 
+  /**
+   * GET /public/voice-model: the live-voice model behind the chat's voice button, or null when none is served. The model
+   * lists never carry it (they feed text pickers), and the model-switch routes keep refusing it: voice mode is a
+   * client-side mode, the chat's stored model is never changed to it (ENG-2957).
+   */
+  async getPublicVoiceModel(req: Request, res: Response) {
+    try {
+      const { user } = await getUserFromToken(req);
+      res.json({ voiceModel: agentModeService.getVoiceModelFor(user?.isAdmin === true) });
+    } catch (error) {
+      console.error('AgentMode: Get voice model error:', error);
+      res.status(500).json({ error: 'Failed to get voice model' });
+    }
+  },
+
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -13006,6 +13049,9 @@ export const agentModeController = {
   async generateSharedResponse(req: Request, res: Response) {
     // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
     let sharedTurnStartMs = Date.now();
+    // ENG-2816: whether this turn is a visitor's (the default until the owner is recognised), declared out here so the catch's
+    // timeout auto-continuation, which cannot see the try's locals, carries the same answer.
+    let sharedTurnIsVisitor = true;
     // ENG-971: see generateResponse — calledFunctions is session-cumulative, so the
     // error path needs this turn's starting point to attribute successes correctly.
     let turnStartCalledFunctions: Record<string, number> | null = null;
@@ -13142,6 +13188,10 @@ export const agentModeController = {
           return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
         }
         const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        if (result.outcome === 'needs_person') {
+          // Not reachable (the option is only set for MCP self-calls); fail closed if it ever is.
+          return res.status(403).json({ error: 'This shared link cannot approve this decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+        }
         if (result.outcome === 'invalid') {
           return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
         }
@@ -13291,6 +13341,7 @@ export const agentModeController = {
       // colleague, a delegate or service token, a bad token) stays a visitor, as before. Decided last, after every
       // link, lock, usage and model check, so it can never stand in for any of them.
       const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
+      sharedTurnIsVisitor = !viewerIsOwner;
       if (viewerIsOwner) {
         // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
         console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
@@ -13428,7 +13479,7 @@ export const agentModeController = {
             if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
               const continuationUserId = timedOutSession!.userId;
               const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
-              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1, false).catch((err) =>
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1, false, sharedTurnIsVisitor).catch((err) =>
                 console.error(`AgentMode: media auto-continuation (ishare whole-turn timeout) failed for session ${shareId}:`, err),
               ));
             }

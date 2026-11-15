@@ -105,6 +105,8 @@ describe('ENG-2865 toolkit aw_ key scopes', () => {
 
   it('OAuth callers are not affected', async () => {
     const { deps, raw, authorization } = makeDeps(undefined, 'oauth');
+    // ENG-2747: a non-Databricks OAuth client (its redirect URIs are looked up per call).
+    deps.getOAuthClientRedirectUris = jest.fn().mockResolvedValue(['https://claude.ai/api/mcp/auth_callback']);
     await handleMetaToolkitCall({ authorization, ...write }, deps);
     expect(raw.executeWrite).toHaveBeenCalledTimes(1);
   });

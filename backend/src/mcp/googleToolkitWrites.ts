@@ -3,9 +3,10 @@
  * ENG-2303 guarded-write flow; Meta's is metaToolkitWrites.ts).
  *
  * Allowed: BUDGET CREATE/UPDATE (amount), CAMPAIGN CREATE (PMax with its brand business name +
- * logo) / UPDATE status, AD_GROUP CREATE / UPDATE status, CAMPAIGN_CONVERSION_GOAL UPDATE.
+ * logo) / UPDATE status or name, AD_GROUP CREATE / UPDATE status or name+cpc_bid (ENG-2959),
+ * CAMPAIGN_CONVERSION_GOAL UPDATE.
  * ENG-2928: KEYWORD ADD / UPDATE status / REMOVE / ADD_NEGATIVE (ad group or campaign level),
- * AD CREATE (RESPONSIVE_SEARCH_AD) / UPDATE status, ASSET_GROUP CREATE / UPDATE status, and
+ * AD CREATE (RESPONSIVE_SEARCH_AD) / UPDATE status or RSA content (ENG-2979), ASSET_GROUP CREATE / UPDATE status, and
  * ASSET UPLOAD (image/logo from https or a staged file, text, YouTube video).
  * Everything else stays refused by googleToolkitManifest.assertGoogleToolkitCall.
  *
@@ -37,7 +38,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { resolveZomaImageUrl } from './metaToolkitCreatives';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
 } from './zomaWriteGuard';
 
 export type GoogleReadKind =
@@ -48,9 +49,9 @@ export type GoogleReadKind =
 
 export interface GoogleBudgetState { resourceName: string; name?: string; amountMicros: number; explicitlyShared: boolean; referenceCount: number; status?: string }
 export interface GoogleCampaignState { resourceName: string; name?: string; status: string; budget?: string; channelType?: string }
-export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string }
+export interface GoogleAdGroupState { resourceName: string; name?: string; status: string; campaign?: string; cpcBidMicros?: number }
 export interface GoogleKeywordState { resourceName: string; text: string; matchType: string; status?: string; negative: boolean; adGroup?: string }
-export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[] }
+export interface GoogleAdState { resourceName: string; status: string; type?: string; adGroup?: string; finalUrls?: string[]; headlines?: string[]; descriptions?: string[] }
 export interface GoogleAssetState { resourceName: string; name?: string; type: string; text?: string }
 export interface GoogleAssetGroupState { resourceName: string; name?: string; status: string; campaign?: string; finalUrls?: string[] }
 export interface GoogleCampaignBrand { businessName?: string; logoAssets: string[] }
@@ -65,7 +66,7 @@ export interface GoogleToolkitWriteDeps {
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
 }
 
 /**
@@ -96,9 +97,9 @@ const GAQL: Record<GoogleReadKind, string> = {
   campaign_conversion_goal: 'SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.campaign, campaign_conversion_goal.category, campaign_conversion_goal.origin, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.resource_name = ',
   budget: 'SELECT campaign_budget.resource_name, campaign_budget.name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count, campaign_budget.status FROM campaign_budget WHERE campaign_budget.resource_name = ',
   campaign: 'SELECT campaign.resource_name, campaign.name, campaign.status, campaign.campaign_budget, campaign.advertising_channel_type FROM campaign WHERE campaign.resource_name = ',
-  ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign FROM ad_group WHERE ad_group.resource_name = ',
+  ad_group: 'SELECT ad_group.resource_name, ad_group.name, ad_group.status, ad_group.campaign, ad_group.cpc_bid_micros FROM ad_group WHERE ad_group.resource_name = ',
   keyword: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.resource_name = `,
-  ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
+  ad: 'SELECT ad_group_ad.resource_name, ad_group_ad.status, ad_group_ad.ad_group, ad_group_ad.ad.type, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.resource_name = ',
   asset: 'SELECT asset.resource_name, asset.name, asset.type, asset.text_asset.text FROM asset WHERE asset.resource_name = ',
   asset_group: 'SELECT asset_group.resource_name, asset_group.name, asset_group.status, asset_group.campaign, asset_group.final_urls FROM asset_group WHERE asset_group.resource_name = ',
   ad_group_keywords: `SELECT ${KEYWORD_FIELDS} FROM ad_group_criterion WHERE ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED' AND ad_group_criterion.ad_group = `,
@@ -118,8 +119,10 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   if (!row) return null;
   if (kind === 'campaign_conversion_goal') {
     const g = row.campaignConversionGoal;
-    return g?.resourceName && typeof g.biddable === 'boolean'
-      ? { resourceName: g.resourceName, campaign: g.campaign, name: row.campaign?.name, category: g.category, origin: g.origin, biddable: g.biddable } : null;
+    // ENG-2995: Google Ads REST (proto3 JSON) omits `false` booleans, so a non-biddable goal
+    // arrives with no `biddable` field. The query selects it, so absent means false.
+    if (!g?.resourceName || (g.biddable !== undefined && typeof g.biddable !== 'boolean')) return null;
+    return { resourceName: g.resourceName, campaign: g.campaign, name: row.campaign?.name, category: g.category, origin: g.origin, biddable: g.biddable === true };
   }
   if (kind === 'budget') {
     const b = row.campaignBudget;
@@ -145,7 +148,8 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
   }
   if (kind === 'ad') {
     const a = row.adGroupAd;
-    return a?.resourceName ? ({ resourceName: a.resourceName, status: a.status, type: a.ad?.type, adGroup: a.adGroup, finalUrls: a.ad?.finalUrls } as GoogleAdState) : null;
+    return a?.resourceName ? ({ resourceName: a.resourceName, status: a.status, type: a.ad?.type, adGroup: a.adGroup, finalUrls: a.ad?.finalUrls,
+      headlines: a.ad?.responsiveSearchAd?.headlines?.map((h: any) => h.text), descriptions: a.ad?.responsiveSearchAd?.descriptions?.map((d: any) => d.text) } as GoogleAdState) : null;
   }
   if (kind === 'asset') {
     const a = row.asset;
@@ -156,7 +160,10 @@ export function mapGoogleReadRow(kind: GoogleReadKind, row: any): any | null {
     return g?.resourceName ? ({ resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign, finalUrls: g.finalUrls } as GoogleAssetGroupState) : null;
   }
   const g = row.adGroup;
-  return g?.resourceName ? ({ resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign } as GoogleAdGroupState) : null;
+  return g?.resourceName ? ({
+    resourceName: g.resourceName, name: g.name, status: g.status, campaign: g.campaign,
+    ...(g.cpcBidMicros !== undefined && g.cpcBidMicros !== null ? { cpcBidMicros: Number(g.cpcBidMicros) } : {}),
+  } as GoogleAdGroupState) : null;
 }
 
 /** Multi-row reads: keyword lists, and a campaign's brand (business name + logos). */
@@ -186,7 +193,7 @@ const defaultDeps: GoogleToolkitWriteDeps = {
   spendCeilingPolicy: () => googleSpendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
 };
 
 function currencyDigits(currency: string): number {
@@ -235,6 +242,10 @@ interface ValidatedWrite {
   parent?: { kind: GoogleReadKind; resourceName: string };
   budgetMicros?: number;
   expectedStatus?: 'ENABLED' | 'PAUSED';
+  /** ENG-2959: CAMPAIGN / AD_GROUP non-status UPDATE — the values the read-back must show. */
+  expectedEdit?: { name?: string; cpcBidMicros?: number };
+  /** ENG-2979: AD UPDATE responsive search ad content — the values the read-back must show. */
+  expectedAdContent?: { headlines?: string[]; descriptions?: string[]; finalUrl?: string };
   /** KEYWORD ADD / ADD_NEGATIVE: what the read-back of the parent's keyword list must contain. */
   keywords?: ToolkitKeyword[];
   /** Keyword list read before (duplicates) and after (read-back) the write. */
@@ -264,15 +275,15 @@ const ALLOWED: Record<string, string[]> = {
   'BUDGET CREATE': ['name', 'amount', 'explicitly_shared'],
   'BUDGET UPDATE': ['budget_resource_name', 'amount'],
   'CAMPAIGN CREATE': ['name', 'type', 'budget_resource_name', 'bidding_strategy', 'bidding_strategy_resource_name', 'bidding_strategy_target', 'cpc_bid_ceiling', 'location_target_ids', 'status', 'brand_business_name', 'brand_logo_asset_resource_name'],
-  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status'],
+  'CAMPAIGN UPDATE': ['campaign_resource_name', 'status', 'name'],
   'AD_GROUP CREATE': ['name', 'campaign_resource_name', 'type', 'cpc_bid', 'status'],
-  'AD_GROUP UPDATE': ['ad_group_resource_name', 'status'],
+  'AD_GROUP UPDATE': ['ad_group_resource_name', 'status', 'name', 'cpc_bid'],
   'KEYWORD ADD': ['ad_group_resource_name', 'keywords', 'status'],
   'KEYWORD UPDATE': ['criterion_resource_name', 'status'],
   'KEYWORD REMOVE': ['criterion_resource_name'],
   'KEYWORD ADD_NEGATIVE': ['keywords', 'ad_group_resource_name', 'campaign_resource_name'],
   'AD CREATE': ['ad_group_resource_name', 'type', 'headlines', 'descriptions', 'final_url', 'status'],
-  'AD UPDATE': ['ad_resource_name', 'status'],
+  'AD UPDATE': ['ad_resource_name', 'status', 'headlines', 'descriptions', 'final_url'],
   'ASSET UPLOAD': ['asset_type', 'name', 'data'],
   'ASSET_GROUP CREATE': ['name', 'campaign_resource_name', 'final_url', 'headlines', 'long_headlines', 'descriptions', 'square_image_assets', 'landscape_image_assets', 'logo_assets', 'video_assets', 'status'],
   'ASSET_GROUP UPDATE': ['asset_group_resource_name', 'status'],
@@ -369,6 +380,25 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     need(args.status === 'ENABLED' || args.status === 'PAUSED', 'status must be ENABLED or PAUSED.');
     return { dispatchArgs: { ...base, [field]: rn, status: args.status }, target: { kind, resourceName: rn }, expectedStatus: args.status };
   };
+  /** ENG-2959: CAMPAIGN UPDATE (status | name) and AD_GROUP UPDATE (status | name and/or cpc_bid). */
+  const statusOrEdit = (kind: 'campaign' | 'ad_group', field: string): ValidatedWrite => {
+    const edits = kind === 'campaign' ? ['name'] : ['name', 'cpc_bid'];
+    const present = edits.filter((k) => args[k] !== undefined);
+    if (args.status !== undefined) {
+      need(!present.length, `status must be sent alone. Change ${present.join(' / ')} in a separate ${op} preview and approval.`);
+      return statusOnly(kind, field);
+    }
+    need(present.length > 0, `${op} requires status${kind === 'campaign' ? ' or name' : ', name or cpc_bid'}.`);
+    const rn = resource(kind, field);
+    const dispatchArgs: Record<string, unknown> = { ...base, [field]: rn };
+    const expectedEdit: { name?: string; cpcBidMicros?: number } = {};
+    if (args.name !== undefined) {
+      need(nonBlank(args.name) && chars(args.name.trim()) <= 255, 'name must be a non-empty string of at most 255 characters.');
+      dispatchArgs.name = expectedEdit.name = (args.name as string).trim();
+    }
+    if (args.cpc_bid !== undefined) dispatchArgs.cpc_bid_micros = expectedEdit.cpcBidMicros = positiveMicros(args.cpc_bid, currency, 'cpc_bid');
+    return { dispatchArgs, target: { kind, resourceName: rn }, expectedEdit };
+  };
 
   switch (op) {
     case 'CAMPAIGN_CONVERSION_GOAL UPDATE': {
@@ -426,7 +456,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
       };
     }
     case 'CAMPAIGN UPDATE':
-      return statusOnly('campaign', 'campaign_resource_name');
+      return statusOrEdit('campaign', 'campaign_resource_name');
     case 'AD_GROUP CREATE': {
       createdPaused();
       need(nonBlank(args.name), 'AD_GROUP CREATE requires name.');
@@ -487,8 +517,22 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
         expectedStatus: 'PAUSED',
       };
     }
-    case 'AD UPDATE':
-      return statusOnly('ad', 'ad_resource_name');
+    case 'AD UPDATE': {
+      // ENG-2979: status | responsive search ad content (headlines / descriptions / final_url).
+      const present = ['headlines', 'descriptions', 'final_url'].filter((k) => args[k] !== undefined);
+      if (args.status !== undefined) {
+        need(!present.length, `status must be sent alone. Change ${present.join(' / ')} in a separate AD UPDATE preview and approval.`);
+        return statusOnly('ad', 'ad_resource_name');
+      }
+      need(present.length > 0, 'AD UPDATE requires status, or headlines / descriptions / final_url (responsive search ads only).');
+      const rn = resource('ad', 'ad_resource_name');
+      const dispatchArgs: Record<string, unknown> = { ...base, ad_resource_name: rn };
+      const expectedAdContent: NonNullable<ValidatedWrite['expectedAdContent']> = {};
+      if (args.headlines !== undefined) dispatchArgs.headlines = expectedAdContent.headlines = texts('headlines', GOOGLE_TEXT_LIMITS.rsaHeadlines);
+      if (args.descriptions !== undefined) dispatchArgs.descriptions = expectedAdContent.descriptions = texts('descriptions', GOOGLE_TEXT_LIMITS.rsaDescriptions);
+      if (args.final_url !== undefined) dispatchArgs.final_url = expectedAdContent.finalUrl = httpsUrl('final_url');
+      return { dispatchArgs, target: { kind: 'ad', resourceName: rn }, expectedAdContent };
+    }
     case 'ASSET UPLOAD': {
       need(['IMAGE', 'LOGO', 'TEXT', 'VIDEO'].includes(args.asset_type), 'asset_type must be IMAGE, LOGO, TEXT or VIDEO.');
       need(nonBlank(args.data), 'data is required: an https image URL or zoma_prepare_upload file_url (IMAGE/LOGO), the text (TEXT), or a YouTube video id (VIDEO).');
@@ -527,7 +571,7 @@ export function validateGoogleWriteShape(args: any, currency: string): Validated
     case 'ASSET_GROUP UPDATE':
       return statusOnly('asset_group', 'asset_group_resource_name');
     default:
-      return statusOnly('ad_group', 'ad_group_resource_name');
+      return statusOrEdit('ad_group', 'ad_group_resource_name');
   }
 }
 
@@ -576,6 +620,27 @@ function verify(validated: ValidatedWrite, entity: string, readBack: any | null)
     if (readBack.amountMicros !== validated.budgetMicros) return 'MISMATCH';
     const shared = validated.dispatchArgs.explicitly_shared;
     if (shared !== undefined && readBack.explicitlyShared !== shared) return 'MISMATCH';
+    return 'CONFIRMED';
+  }
+  if (validated.expectedAdContent) {
+    const e = validated.expectedAdContent;
+    const same = (a: unknown, b: string[]) => Array.isArray(a) && JSON.stringify(a) === JSON.stringify(b);
+    if (readBack.type !== 'RESPONSIVE_SEARCH_AD') return 'MISMATCH';
+    if (e.headlines && !Array.isArray(readBack.headlines)) return 'UNCONFIRMED';
+    if (e.descriptions && !Array.isArray(readBack.descriptions)) return 'UNCONFIRMED';
+    if (e.finalUrl !== undefined && !Array.isArray(readBack.finalUrls)) return 'UNCONFIRMED';
+    if (e.headlines && !same(readBack.headlines, e.headlines)) return 'MISMATCH';
+    if (e.descriptions && !same(readBack.descriptions, e.descriptions)) return 'MISMATCH';
+    if (e.finalUrl !== undefined && !same(readBack.finalUrls, [e.finalUrl])) return 'MISMATCH';
+    return 'CONFIRMED';
+  }
+  if (validated.expectedEdit) {
+    const e = validated.expectedEdit;
+    if (e.name !== undefined && readBack.name !== e.name) return 'MISMATCH';
+    if (e.cpcBidMicros !== undefined) {
+      if (!Number.isFinite(readBack.cpcBidMicros)) return 'UNCONFIRMED';
+      if (readBack.cpcBidMicros !== e.cpcBidMicros) return 'MISMATCH';
+    }
     return 'CONFIRMED';
   }
   if (readBack.status !== validated.expectedStatus) return 'MISMATCH';
@@ -764,7 +829,7 @@ export async function executeGoogleToolkitWrite(
     lines.push(`Create a responsive search ad in ad group "${adGroup.name ?? adGroup.resourceName}" (ad group is ${adGroup.status}) → ${d.final_url}`);
     lines.push(`Headlines (${(d.headlines as string[]).length}): ${(d.headlines as string[]).map((h) => `"${h}"`).join(' | ')}`);
     lines.push(`Descriptions (${(d.descriptions as string[]).length}): ${(d.descriptions as string[]).map((h) => `"${h}"`).join(' | ')}`);
-    lines.push('Headlines, descriptions and the final URL cannot be edited after creation (to change them, create a new ad).');
+    lines.push('Headlines, descriptions and the final URL can be changed later with AD UPDATE (its own preview and approval).');
   } else if (op === 'ASSET_GROUP CREATE') {
     const campaign = await readParent<GoogleCampaignState>('Campaign');
     if (campaign.channelType !== 'PERFORMANCE_MAX') {
@@ -794,7 +859,28 @@ export async function executeGoogleToolkitWrite(
       throw new MetaToolkitRefusal('Negative keywords have no status to change. Use KEYWORD REMOVE to stop excluding it. Nothing was sent.');
     }
     state = { prior };
-    lines.push(`${noun} ${kind === 'keyword' ? keywordLabel(prior) : `"${prior.name ?? prior.resourceName}"`}: ${prior.status} → ${validated.expectedStatus}.`);
+    if (validated.expectedAdContent) {
+      // ENG-2979: only responsive search ads are editable; current vs new, status untouched.
+      if (prior.type !== 'RESPONSIVE_SEARCH_AD') {
+        throw new MetaToolkitRefusal(`Ad ${prior.resourceName} is a ${prior.type ?? 'unknown type'} ad. Only RESPONSIVE_SEARCH_AD headlines, descriptions and final URL can be edited here. Nothing was sent.`);
+      }
+      const e = validated.expectedAdContent;
+      const list = (v: unknown) => (Array.isArray(v) && v.length ? (v as string[]).map((t) => `"${t}"`).join(' | ') : '(none)');
+      lines.push(`Responsive search ad ${prior.resourceName} (status ${prior.status}, unchanged):`);
+      if (e.headlines) lines.push(`Headlines: ${list(prior.headlines)} → ${list(e.headlines)}.`);
+      if (e.descriptions) lines.push(`Descriptions: ${list(prior.descriptions)} → ${list(e.descriptions)}.`);
+      if (e.finalUrl !== undefined) lines.push(`Final URL: ${prior.finalUrls?.[0] ?? '(none)'} → ${e.finalUrl}.`);
+      lines.push('Edited ads go back through Google policy review; the ad may stop serving until it is approved again.');
+    } else if (validated.expectedEdit) {
+      // ENG-2959: rename / ad-group max CPC — current vs new, status untouched.
+      const e = validated.expectedEdit;
+      lines.push(`${noun} "${prior.name ?? prior.resourceName}" (status ${prior.status}, unchanged):`);
+      if (e.name !== undefined) lines.push(`Name: "${prior.name ?? ''}" → "${e.name}".`);
+      if (e.cpcBidMicros !== undefined) {
+        const cur = Number.isFinite(prior.cpcBidMicros) ? `${formatMicros(prior.cpcBidMicros, currency)} (= ${prior.cpcBidMicros} micros)` : 'not set';
+        lines.push(`Max CPC: ${cur} → ${formatMicros(e.cpcBidMicros, currency)} (= ${e.cpcBidMicros} micros).`);
+      }
+    } else lines.push(`${noun} ${kind === 'keyword' ? keywordLabel(prior) : `"${prior.name ?? prior.resourceName}"`}: ${prior.status} → ${validated.expectedStatus}.`);
     // Enabling starts spend at the campaign's budget, so the preview names that budget and
     // the ceiling applies to it — otherwise a budget set above the ceiling outside Zoma
     // (or before the ceiling existed) could be switched on here (Hardening, ENG-2823).
@@ -864,7 +950,7 @@ export async function executeGoogleToolkitWrite(
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Google Ads state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+  if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
     throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');
   }
 

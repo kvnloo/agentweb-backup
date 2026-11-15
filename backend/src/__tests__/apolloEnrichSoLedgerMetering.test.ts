@@ -132,6 +132,21 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     delete process.env.BACKEND_URL;
   });
 
+  it('sends a basic match, with no webhook URL, when the webhook secret cannot be resolved (ENG-2803)', async () => {
+    const { getApolloWebhookSecret } = jest.requireMock('../utils/secretsManager');
+    getApolloWebhookSecret.mockRejectedValueOnce(new Error('APOLLO_WEBHOOK_SECRET is not set'));
+    mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+
+    await getApolloService().findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER, runWaterfall: true });
+
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body).not.toHaveProperty('run_waterfall_email');
+    expect(body).not.toHaveProperty('webhook_url');
+    expect(mockRecordVendorUsage.mock.calls[0][0].operation).toBe('email_reveal');
+    delete process.env.BACKEND_URL;
+  });
+
   it('a basic (non-waterfall) findEmail records email_reveal', async () => {
     mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
     await getApolloService().findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER });

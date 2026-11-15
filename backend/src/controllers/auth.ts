@@ -1,4 +1,6 @@
 import { Request, Response } from "express";
+import { isZomaSignup } from '../services/zomaSignupIntent';
+import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -165,14 +167,26 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    if (zomaAdmissionEnabled() && req.body.signupIntent !== undefined && !isZomaSignup(req.body)) {
+      return res.status(400).json({ code: 'invalid_signup_intent', message: 'Please try again later.' });
+    }
+    if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
+      try {
+        if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
+      } catch (error) {
+        console.error('Zoma admission unavailable', error);
+        return res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
+      }
+    }
+
     // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
     const finalRoles =
       reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
         ? reqRoles
         : ["customer"];
 
-    // Check waitlist status only for non-free users (feature-flagged via SKIP_WAITLIST_CHECK)
-    const skipWaitlist = process.env.SKIP_WAITLIST_CHECK === 'true';
+    // Legacy waitlist metadata is separate from Zoma admission; SKIP_WAITLIST_CHECK
+    // must not bypass the capacity gate above.
     let waitlistEntry = null;
     let stripe_customer_id = undefined;
     let companyNameFromWaitlist = undefined;
@@ -478,6 +492,9 @@ export const googleCallback = async (
         code: "personal_email_not_allowed",
       }, null);
     }
+
+    // Google registration has no Zoma product intent; these are Emma portal signups.
+    // Zoma setup/MCP registers on the consent page with a product-scoped signup intent.
 
     if (!user) {
       if (portalOrigin === "genius") {

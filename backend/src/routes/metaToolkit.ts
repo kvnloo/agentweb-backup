@@ -17,6 +17,8 @@ import {
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
+import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 import { validateRef } from '../services/journeyAttribution';
@@ -41,10 +43,17 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
 function toolkitManifest() {
-  if (!googleToolkitEnabled()) return getMetaToolkitManifest();
+  // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
+  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return [...getMetaToolkitManifest(), ...getGoogleToolkitManifest()];
+  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+}
+
+/** ENG-2747 (option B): Databricks-origin callers see only the tools they may call. */
+function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
+  const tools = toolkitManifest();
+  return caller?.databricksOrigin ? databricksToolView(tools) : tools;
 }
 
 const router = Router();
@@ -69,8 +78,8 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 
 router.get('/tools', async (req: Request, res: Response) => {
   try {
-    await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: toolkitManifest() });
+    const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
+    return res.json({ tools: toolsFor(caller) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -157,9 +166,10 @@ router.post('/mcp', async (req: Request, res: Response) => {
         });
       case 'ping':
         return rpcResult(res, id, {});
-      case 'tools/list':
-        await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: toolkitManifest() });
+      case 'tools/list': {
+        const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
+        return rpcResult(res, id, { tools: toolsFor(caller) });
+      }
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');

@@ -41,6 +41,7 @@ import {
 import { fetchTopPages } from './webContentFetcher';
 import { agentModeService } from './agentModeService';
 import { createLLMService } from '../utils/llmService';
+import { CHEAP_DEFAULT_MODEL, FALLBACK_MODEL } from './enrichmentMappingLlm';
 import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
@@ -93,8 +94,6 @@ export function parseWebSearchParams(raw: string | undefined): Record<string, st
   return Object.keys(out).length ? out : undefined;
 }
 const WEB_SEARCH_PARAMS = parseWebSearchParams(process.env.CRM_ENRICH_V3_WEB_SEARCH_PARAMS);
-const CHEAP_DEFAULT_MODEL = 'openrouter/openai/gpt-5.6-luna';
-const FALLBACK_MODEL = 'gpt-5.5';
 const isOpenAiModel = (model: string) => /^(gpt-|openai\/|openrouter\/openai\/)/.test(model);
 function makeEnrichLLM(model: string, temperature: number | null) {
   return createLLMService(model, temperature, undefined, {

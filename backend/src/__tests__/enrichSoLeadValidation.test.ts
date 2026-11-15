@@ -19,13 +19,24 @@ jest.mock('../services/enrichSoService', () => ({
 import {
   validateLeadEmailInBackground,
   validateLeadsInBackground,
+  isEnrichSoCreditsExhausted,
+  isEnrichSoCreditsRecentlyExhausted,
+  setEnrichSoCreditsAlertSink,
+  __resetEnrichSoCreditsStateForTesting,
+  ENRICHSO_CREDITS_EXHAUSTED,
+  ENRICHSO_CREDITS_EXHAUSTED_USER_MESSAGE,
 } from '../services/enrichSoLeadValidation';
+import { startEmailJob, getJob, __resetJobsForTesting } from '../services/emailJobTracker';
 import { crmDb } from '../services/db';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 
+const alertSink = jest.fn();
+
 beforeEach(() => {
   jest.clearAllMocks();
+  __resetEnrichSoCreditsStateForTesting();
+  setEnrichSoCreditsAlertSink(alertSink);
 });
 
 describe('validateLeadEmailInBackground', () => {
@@ -283,5 +294,71 @@ describe('validateLeadsInBackground — autoDncOnFailure plumbed', () => {
     await validateLeadsInBackground('L1', [{ leadId: 'LD1', email: 'a@b.com' }]);
 
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
+  });
+});
+
+// ─── ENG-2983: 402 / out-of-credits is surfaced, not swallowed ──────────────
+
+function axiosErr(status: number): any {
+  const e: any = new Error(`Request failed with status code ${status}`);
+  e.response = { status };
+  return e;
+}
+
+describe('ENG-2983 enrich.so credit exhaustion', () => {
+  let errSpy: jest.SpyInstance;
+  beforeEach(() => {
+    errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    __resetJobsForTesting();
+  });
+  afterEach(() => errSpy.mockRestore());
+
+  it('classifies 402 (incl. cached plain-Error rethrow) but not 5xx/429', () => {
+    expect(isEnrichSoCreditsExhausted(axiosErr(402))).toBe(true);
+    expect(isEnrichSoCreditsExhausted(new Error('Request failed with status code 402'))).toBe(true);
+    expect(isEnrichSoCreditsExhausted(new Error('Insufficient credits'))).toBe(true);
+    expect(isEnrichSoCreditsExhausted(axiosErr(503))).toBe(false);
+    expect(isEnrichSoCreditsExhausted(axiosErr(429))).toBe(false);
+  });
+
+  it('402: logs at error level with the stable class, alerts once, returns null (no throw)', async () => {
+    mockEnrichSo.validateEmail.mockRejectedValue(axiosErr(402));
+    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeNull();
+    await expect(validateLeadEmailInBackground('L1', 'LD2', 'c@d.com')).resolves.toBeNull();
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes(ENRICHSO_CREDITS_EXHAUSTED))).toBe(true);
+    expect(alertSink).toHaveBeenCalledTimes(1); // deduped, not per-lead
+    expect(alertSink.mock.calls[0][0].errorClass).toBe(ENRICHSO_CREDITS_EXHAUSTED);
+    expect(isEnrichSoCreditsRecentlyExhausted()).toBe(true);
+    expect(mockCrmDb.setLeadEmailValidation).not.toHaveBeenCalled();
+  });
+
+  it('transient 5xx: no alert, no credits latch, still returns null', async () => {
+    mockEnrichSo.validateEmail.mockRejectedValue(axiosErr(503));
+    await expect(validateLeadEmailInBackground('L1', 'LD1', 'a@b.com')).resolves.toBeNull();
+    expect(alertSink).not.toHaveBeenCalled();
+    expect(isEnrichSoCreditsRecentlyExhausted()).toBe(false);
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes(ENRICHSO_CREDITS_EXHAUSTED))).toBe(false);
+  });
+
+  it('bulk job: 402 stops further calls and completes the job with an explicit error', async () => {
+    mockEnrichSo.validateEmail.mockRejectedValue(axiosErr(402));
+    const leads = Array.from({ length: 30 }, (_, i) => ({ leadId: `LD${i}`, email: `x${i}@b.com` }));
+    const job = startEmailJob({ kind: 'validate', listId: 'L1', userId: 'u1', total: leads.length });
+    await validateLeadsInBackground('L1', leads, 'u1', job.jobId);
+    const state = getJob(job.jobId)!;
+    expect(state.status).toBe('error');
+    expect(state.errorMessage).toBe(ENRICHSO_CREDITS_EXHAUSTED_USER_MESSAGE);
+    // at most one in-flight call per concurrency runner, not all 30
+    expect(mockEnrichSo.validateEmail.mock.calls.length).toBeLessThan(leads.length);
+    expect(alertSink).toHaveBeenCalledTimes(1);
+  });
+
+  it('bulk job: transient 5xx keeps going and completes without error', async () => {
+    mockEnrichSo.validateEmail.mockRejectedValue(axiosErr(500));
+    const leads = [{ leadId: 'A', email: 'a@b.com' }, { leadId: 'B', email: 'c@d.com' }];
+    const job = startEmailJob({ kind: 'validate', listId: 'L1', userId: 'u1', total: 2 });
+    await validateLeadsInBackground('L1', leads, 'u1', job.jobId);
+    expect(getJob(job.jobId)!.status).toBe('completed');
+    expect(mockEnrichSo.validateEmail).toHaveBeenCalledTimes(2);
   });
 });

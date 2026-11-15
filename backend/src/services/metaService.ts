@@ -1,3 +1,5 @@
+import { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
+export { parseBusinessUseCaseUsage, type CapiUsage } from '../utils/metaBusinessUsage';
 import {
   normaliseUserDataField,
   NormalisableUserDataField,
@@ -153,20 +155,6 @@ export interface MetaAdsAdParams {
 }
 
 /**
- * Meta's real, dynamic Business Use Case (BUC) rate-limit signal — returned on
- * every Marketing API response (CAPI included) via the `X-Business-Use-Case-Usage`
- * header, NOT a fixed numeric limit Meta documents anywhere. Percentages of the
- * ad account's rolling hourly allowance used; `estimatedMinutesToRegainAccess`
- * only appears once actually throttled (a metric at/over 100).
- */
-export interface CapiUsage {
-  callCountPct: number;
-  totalTimePct: number;
-  totalCpuTimePct: number;
-  estimatedMinutesToRegainAccess?: number;
-}
-
-/**
  * Meta's default page on the list edges is 25 records. Asking for a larger page fetches the
  * same data in fewer round trips — it does not fetch more data, and it is not what bounds the
  * read; `META_LIST_MAX_PAGES` is.
@@ -312,37 +300,6 @@ export interface MetaOAuthConnectionHealth {
   grantedPermissions: string[];
   declinedRequiredPermissions: string[];
   permissionsError?: string;
-}
-
-/**
- * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
- * header is a JSON object keyed by ad account id, each value an array with one
- * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
- * no fixed number), so this is the only real signal for how close an account
- * is to being throttled. Never throws: a missing header (every existing mocked
- * test response lacks `.headers` entirely) or a malformed value is inconclusive,
- * not an error — returns `undefined` rather than guessing.
- */
-function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) => string | null } }): CapiUsage | undefined {
-  try {
-    const raw = response.headers?.get?.('x-business-use-case-usage');
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw);
-    const firstAccountEntries = Object.values(parsed)[0] as any[] | undefined;
-    const entry = firstAccountEntries?.[0];
-    if (!entry) return undefined;
-    return {
-      callCountPct: Number(entry.call_count) || 0,
-      totalTimePct: Number(entry.total_time) || 0,
-      totalCpuTimePct: Number(entry.total_cputime) || 0,
-      estimatedMinutesToRegainAccess:
-        entry.estimated_time_to_regain_access !== undefined
-          ? Number(entry.estimated_time_to_regain_access)
-          : undefined,
-    };
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -2968,18 +2925,41 @@ export class MetaService {
   public async getAdCampaignIdForAccount(accessToken: string, adAccountId: string, adId: string): Promise<string | undefined> {
     try {
       this.initApi(accessToken);
-      const result = await MetaService.withReadDeadline(
-        () => new Ad(adId).get(['id', 'campaign_id', 'account_id']),
-        'ad parent campaign',
+      return MetaService.ownedParentCampaignId(
+        await MetaService.withReadDeadline(
+          () => new Ad(adId).get(['id', 'campaign_id', 'account_id']),
+          'ad parent campaign',
+        ),
+        adAccountId,
       );
-      const data: any = (result as any)?._data ?? result;
-      const selectedAccountId = String(adAccountId).trim().replace(/^act_/, '');
-      const ownerAccountId = String(data?.account_id ?? '').trim().replace(/^act_/, '');
-      if (!selectedAccountId || !ownerAccountId || ownerAccountId !== selectedAccountId) return undefined;
-      return typeof data?.campaign_id === 'string' && data.campaign_id ? data.campaign_id : undefined;
     } catch (error) {
       return this.handleError(error, 'getAdCampaignIdForAccount') as never;
     }
+  }
+
+  /** Same contract as getAdCampaignIdForAccount, for an ad set's parent campaign. */
+  public async getAdSetCampaignIdForAccount(accessToken: string, adAccountId: string, adSetId: string): Promise<string | undefined> {
+    try {
+      this.initApi(accessToken);
+      return MetaService.ownedParentCampaignId(
+        await MetaService.withReadDeadline(
+          () => new AdSet(adSetId).get(['id', 'campaign_id', 'account_id']),
+          'ad set parent campaign',
+        ),
+        adAccountId,
+      );
+    } catch (error) {
+      return this.handleError(error, 'getAdSetCampaignIdForAccount') as never;
+    }
+  }
+
+  /** The node's campaign_id, only when the node belongs to the selected ad account. */
+  private static ownedParentCampaignId(result: unknown, adAccountId: string): string | undefined {
+    const data: any = (result as any)?._data ?? result;
+    const selectedAccountId = String(adAccountId).trim().replace(/^act_/, '');
+    const ownerAccountId = String(data?.account_id ?? '').trim().replace(/^act_/, '');
+    if (!selectedAccountId || !ownerAccountId || ownerAccountId !== selectedAccountId) return undefined;
+    return typeof data?.campaign_id === 'string' && data.campaign_id ? data.campaign_id : undefined;
   }
 
   /**

@@ -649,6 +649,31 @@ if [ "${opslane_hung}" -gt 0 ]; then
   log "ignored ${opslane_hung} Opslane check-run(s) still running after ${OPSLANE_STALE_MINUTES}m: Opslane is not required, and a hung advisory run is not a verdict"
 fi
 
+# Pass 5b — NAME AN OPSLANE CARRY-FORWARD FAILURE (ENG-2944, child of ENG-2749).
+# Opslane re-posts the previous head's `failure` as a 0s check-run
+# (started_at == completed_at) instead of re-testing the new head (ENG-2767).
+# Diagnostic only: the run is NOT dropped and still blocks exactly as before;
+# whether it should block is the parent's open decision. The distinct line
+# stops callers from update-branch churn hoping for a fresh run.
+OPSLANE_CF_SECONDS="${MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS:-2}"
+if ! grep -qE '^[0-9]+$' <<<"${OPSLANE_CF_SECONDS}"; then
+  hard_fail "MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS must be a whole number of seconds, got '${OPSLANE_CF_SECONDS}'"
+fi
+# shellcheck disable=SC2016 # $max is a jq variable
+if ! opslane_cf="$(printf '%s' "${runs_json}" | jq -r --argjson max "${OPSLANE_CF_SECONDS}" '
+  .check_runs[]
+  | select((.app.slug // "") == "opslane" and .name == "Opslane"
+      and (.status // "") == "completed" and .conclusion == "failure"
+      and (.started_at // "") != "" and (.completed_at // "") != ""
+      and ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) <= $max)
+  | "\(.id // "unknown") \(.details_url // .html_url // "no-url")"' 2>/dev/null)"; then
+  hard_fail "failed to identify Opslane carry-forward check-runs at ${head_sha}"
+fi
+while IFS= read -r cf_line; do
+  [ -n "${cf_line}" ] || continue
+  log "OPSLANE_CARRY_FORWARD: ${cf_line} — not a re-test of ${head_sha}; see ENG-2749"
+done <<<"${opslane_cf}"
+
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"

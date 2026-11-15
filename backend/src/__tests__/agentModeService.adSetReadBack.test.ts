@@ -191,6 +191,74 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
     ]);
   });
 
+  it('treats an equivalent end_time in the account timezone as applied, not overridden (ENG-01 live run)', async () => {
+    // Exact shape from the ENG-01 production run: requested in UTC with microseconds,
+    // Meta echoed the same instant in the account's Pacific timezone at whole seconds.
+    (metaService.getAdSet as jest.Mock).mockResolvedValue({
+      id: 'adset_new',
+      name: 'Ad Set',
+      status: 'PAUSED',
+      bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+      daily_budget: '1000',
+      start_time: '2026-11-13T08:44:56-0800',
+      end_time: '2026-11-15T08:44:56-0800'
+    });
+
+    const result = await service.createMetaAdsAdSet('user123', {
+      ...baseAdSetParams,
+      start_time: '2026-11-13T16:44:56Z',
+      end_time: '2026-11-15T16:44:56.157085+00:00'
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.readBackMismatch).toBeUndefined();
+    expect(result.readBackMismatches).toEqual([]);
+    expect(String(result.message)).not.toMatch(/did not apply|nobody chose|is live/);
+  });
+
+  it('still reports a schedule Meta moved to a different instant', async () => {
+    // This case sends no start_time, so createMetaAdsAdSet starts the schedule at now() and rejects
+    // an end_time that is not after it. The fixture end_time is 2026-11-15T16:44:56Z, so the case
+    // began failing at that wall-clock moment. Pin now() to before the fixture window.
+    jest.useFakeTimers({ now: new Date('2026-11-13T16:44:56Z'), doNotFake: ['nextTick', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask', 'performance', 'hrtime'] });
+    try {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({
+        id: 'adset_new',
+        name: 'Ad Set',
+        status: 'PAUSED',
+        bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        daily_budget: '1000',
+        end_time: '2026-11-15T09:44:56-0800' // one hour later than requested
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        end_time: '2026-11-15T16:44:56.157085+00:00'
+      });
+
+      expect(result.readBackMismatch).toBe(true);
+      expect(result.readBackMismatches).toEqual([
+        { parameter: 'end_time', requested: '2026-11-15T16:44:56.157085+00:00', applied: '2026-11-15T09:44:56-0800' }
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('never calls a PAUSED mismatched ad set live; an ACTIVE one is told to be reviewed or paused', async () => {
+    const mismatched = { id: 'adset_new', name: 'Ad Set', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', daily_budget: '5000' };
+
+    (metaService.getAdSet as jest.Mock).mockResolvedValue({ ...mismatched, status: 'PAUSED' });
+    const paused = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
+    expect(paused.readBackMismatch).toBe(true);
+    expect(String(paused.message)).not.toMatch(/is live|nobody chose/);
+    expect(String(paused.message)).toMatch(/status PAUSED and is not delivering/);
+
+    (metaService.getAdSet as jest.Mock).mockResolvedValue({ ...mismatched, status: 'ACTIVE' });
+    const active = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
+    expect(String(active.message)).toMatch(/It is ACTIVE with settings that differ from the request — review or pause it/);
+  });
+
   it('does not claim a verified write when the read-back itself failed', async () => {
     (metaService.getAdSet as jest.Mock).mockRejectedValue(new Error('Meta unreachable'));
 

@@ -25,6 +25,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { FakeVoiceProvider } from './helpers/fakeVoiceProvider';
 import { setVoiceProviderForTests } from '../services/voice/voiceProvider';
 import { setLeadCallStoreForTests } from '../services/voice/leadCallStore';
+import { callConsentRecord } from './helpers/hotLeadCallFixtures';
 import { FakeLimitStore } from './helpers/fakeLimitStore';
 import { setLimitStoreForTests } from '../services/voice/limitStore';
 import { cooldownKey } from '../services/voice/hotLeadCallLimits';
@@ -92,7 +93,7 @@ beforeEach(() => {
   setLeadCallStoreForTests(store);
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
-  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T20:58:00.000Z', customFields: { stage: 'complete' } };
+  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T20:58:00.000Z', customFields: { stage: 'complete' }, system: { callConsent: callConsentRecord() } };
   org = { orgId: 'org-a', hotLeadCall: baseConfig };
   mock(crmDb.getLeadListById).mockResolvedValue({ listId: 'list-a', userId: 'owner-a' });
   mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });

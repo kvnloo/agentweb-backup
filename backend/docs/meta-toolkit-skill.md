@@ -68,7 +68,7 @@ Use this when the user has creatives made elsewhere (Higgsfield, Midjourney, Can
 For a batch, upload each file (step 1–2) or pass public URLs straight to `BULK_CREATE`, then create one ad per creative. Tell the user what was created and leave everything paused.
 
 ## Writes (CAMPAIGN, AD_SET, AD)
-Allowed: CREATE, and UPDATE of these fields. Not available: DELETE and custom audiences. Creatives are covered above.
+Allowed: CREATE, UPDATE of these fields, ARCHIVE, DELETE and COPY. Creatives are covered above; custom audiences are below.
 - CAMPAIGN: `status`, `daily_budget`/`lifetime_budget`, `bid_strategy`, `spend_cap`.
 - AD_SET: `status`, budgets, `bid_amount`, `bid_strategy`, `targeting` (full spec, replaces the current one, so it must include the locations, e.g. `geo_locations: {countries: ["US"]}`; use `excluded_custom_audiences: [{id}]` to exclude audiences), `start_time`, `end_time` (ISO 8601).
 - AD: `status`, `name`, `creative_id` (swap in an existing creative; to change ad copy, create a new creative first, then swap it in).
@@ -85,6 +85,29 @@ Rules:
 - Budgets are in MAJOR units of the ad account currency (50 = $50.00; for TWD/JPY, 500 = NT$500 / ¥500). The preview echoes the converted amount — read it back to the user.
 - A write is done only when the result says `verification: CONFIRMED`. `UNCONFIRMED` or `MISMATCH` is not success: tell the user and check the entity before retrying.
 - If a write is refused for a missing payment method or Meta connection, call `zoma_status` and relay its link.
+
+### Archive, delete, copy
+Pass the entity's id (`campaign_id`, `ad_set_id` or `ad_id`); same preview and approval flow as above.
+- `ARCHIVE` stops delivery and keeps the entity and its history. Prefer it over `DELETE`.
+- `DELETE` cannot be undone. Say so to the user before asking for approval.
+- Both are refused when the entity spent in the last 24 hours (or Zoma could not check). Pause it first; only if the user explicitly accepts stopping it while it spends, repeat with `confirm_recent_spend: true` (it is part of the previewed call).
+- `COPY` duplicates the entity, always PAUSED. `params.deep_copy: true` also copies a campaign's ad sets and ads (or an ad set's ads). Put an ad set copy into another campaign with `params.campaign_id`, an ad copy into another ad set with `params.adset_id`. The result's `id` is the new copy.
+
+## Custom audiences (`zoma_custom_audiences`)
+Reads (no preview): `LIST`; `GET` with `audience_id`; `LIST_AD_SETS` with `audience_id` (ad sets that include or exclude it, and whether they are active).
+
+Writes use the same two-call preview and approval flow as other writes (call without `confirm`, show the preview, repeat with `confirm: true` and the `preview_token`):
+- `CREATE` with `params.name` and a `source`:
+  - `{"type": "customer_list"}` — optionally with `params.emails` / `params.phones` as the first members.
+  - `{"type": "website", "pixel_id": "…", "retention_days": 30, "url_contains": "/thank-you"}` (or `event_name: "Purchase"`; up to 180 days).
+  - `{"type": "engagement", "source_type": "page" | "ig_business", "source_id": "…", "retention_days": 365}`.
+  - `{"type": "lookalike", "origin_audience_id": "…", "country": "US", "ratio_percent": 1}` (1–10%).
+- `UPDATE` with `audience_id` and `params.name`, `params.description` or `params.rule` (website/engagement audiences).
+- `ADD_USERS` / `REMOVE_USERS` with `audience_id` and `params.emails` / `params.phones` as plain text (phones with country code). Zoma normalizes and hashes them before sending; raw values are never stored or logged. Large lists are batched automatically (up to 100,000 per call).
+- `DELETE` with `audience_id`. Refused while an active ad set uses the audience; repeat with `confirm_in_use: true` only if the user explicitly wants it deleted anyway.
+- `EXCLUDE_CUSTOMERS` — keep prospecting ads away from existing customers in one call: `ad_set_ids` plus either `params.emails` / `params.phones` (Zoma creates or reuses a customer list named `params.name`, default "Existing customers (Zoma)") or an existing `audience_id`. The preview shows each ad set's `excluded_custom_audiences` before → after. Nothing else about the ad sets changes.
+
+If a result says `TERMS_NOT_ACCEPTED`, give the user `terms_url` (Meta's Custom Audience Terms for that ad account), wait until they accept, then retry the same request. Audiences never spend on their own; ads that use them are created PAUSED through `AD CREATE` as usual.
 
 ## Google Ads (when enabled for the account)
 `call_google_ads_api` uses the same two-call preview → `confirm: true` + `preview_token` flow and the same `verification: CONFIRMED` rule. Keywords, ads and asset groups are always created PAUSED; enabling each is its own UPDATE `status: ENABLED` preview.

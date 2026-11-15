@@ -30,7 +30,7 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { readBusinessCatalogs } from './metaToolkitCatalogs';
 import { targetingApplied } from './metaToolkitWrites';
 import {
-  consumePreviewToken, previewFingerprint, previewResponse, previewTokenMatches,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches,
   rememberTokenOutcome, replayTokenOutcome, type WriteVerification,
 } from './zomaWriteGuard';
 
@@ -171,7 +171,7 @@ export interface MetaCatalogWriteDeps {
   writeGraph: (userId: string, accountId: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>) => Promise<any>;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
   tokenOutcomes: Map<string, { exp: number; outcome: any }>;
 }
 
@@ -182,7 +182,7 @@ const defaultDeps: MetaCatalogWriteDeps = {
   writeGraph: async (userId, accountId, method, path, params) => (await ams()).writeToolkitMetaCatalogGraph(userId, accountId, method, path, params),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
   tokenOutcomes: new Map(),
 };
 
@@ -527,7 +527,7 @@ export async function runMetaCatalogWriteTool(
           note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Meta state changed). Nothing was sent. Show this new preview and get approval again.',
         };
       }
-      if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+      if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
         const replay = replayTokenOutcome(deps.tokenOutcomes, previewToken, now);
         if (replay) return replay;
         throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview for another change.');

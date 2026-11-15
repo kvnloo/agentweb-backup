@@ -290,6 +290,14 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
   return 'upstream_5xx';
 }
 
+/** ENG-2993: HTTP status of a failed file download (axios response, else message). */
+function downloadHttpStatus(error: unknown): number | undefined {
+  const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
+  if (typeof status === 'number') return status;
+  const m = error instanceof Error ? /status code (\d{3})\b/.exec(error.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
 /**
  * Public entry point. Validates argument types against the declared tool
  * schema (file_urls: string[]; analysis_instruction: string — no stricter
@@ -575,6 +583,18 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
 
       } catch (error) {
         console.error(`Error processing file ${fileUrl}:`, error);
+        // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
+        // the model passed a dead, expired, or non-public link. There is no
+        // account to repair, so it must not cluster as not_found -> `config`.
+        const httpStatus = downloadHttpStatus(error);
+        if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) {
+          return {
+            success: false,
+            message: `Failed to download or process file: ${fileUrl} returned HTTP ${httpStatus} — the URL does not exist, has expired, or is not publicly readable. This is a bad file_urls value, not a tool fault: re-run the tool that produced the data and pass its fresh URL or tool-responses S3 key, or put the data inline in analysis_instruction.`,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            errorClass: 'invalid_args',
+          };
+        }
         return {
           success: false,
           message: `Failed to download or process file: ${fileUrl}`,

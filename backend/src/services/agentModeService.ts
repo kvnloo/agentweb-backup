@@ -1,4 +1,5 @@
 import { addCompanionTools } from './agentMode/companionTools';
+import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -11,6 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -40,6 +42,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -1254,6 +1257,22 @@ export function titleFromUserMessage(message: string): string {
   return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
+/**
+ * The closing sentence of an ad-set read-back mismatch, worded from the status
+ * Meta actually reported. A PAUSED ad set is not delivering, so telling the user
+ * it "is live" was false; an ACTIVE or unknown status still says to pause it.
+ */
+export function describeMismatchedAdSetState(status: unknown): string {
+  const s = typeof status === 'string' ? status.toUpperCase() : '';
+  if (s === 'PAUSED' || s === 'ARCHIVED' || s === 'DELETED') {
+    return `It exists with status ${s} and is not delivering — review these settings in Ads Manager before activating it.`;
+  }
+  if (s === 'ACTIVE') {
+    return 'It is ACTIVE with settings that differ from the request — review or pause it in Ads Manager.';
+  }
+  return 'Its delivery status could not be confirmed — review it in Ads Manager and pause it if it is delivering.';
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-2103 (F2): dataAnalysisConsistencyCache (and its two bound constants)
@@ -2354,6 +2373,19 @@ export class AgentModeService {
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * The live-voice model behind the chat's voice button, or null when none is served to this user (ENG-2957). Voice mode
+   * is a client-side mode: the chat's stored model is never switched to it, and isModelSelectableBy keeps refusing it as
+   * a text pick. Same internal/adminOnly gates as the picker; the first live registry entry wins.
+   */
+  getVoiceModelFor(isAdmin: boolean): string | null {
+    for (const id of Object.keys(this.llmModels)) {
+      const config = this.llmModels[id];
+      if (config.isLive && !config.internalOnly && (isAdmin || !config.adminOnly)) return id;
+    }
+    return null;
   }
 
   /**
@@ -4380,6 +4412,21 @@ export class AgentModeService {
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
+
+        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
+        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        recordSessionBreakerShadowTurn({
+          sessionId,
+          userId,
+          billingUserId,
+          isScheduled: isScheduledSession,
+          costUsd: () => {
+            const usage: any = (response as any)?.usage;
+            if (!usage) return 0;
+            if (typeof usage.cost === 'number') return usage.cost;
+            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+          },
+        });
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
@@ -9805,8 +9852,11 @@ export class AgentModeService {
     // an explicit `false` (attended) must survive distinctly from `undefined`
     // (caller has not resolved a value, fall back to session.sessionType).
     isUnattendedRun?: boolean;
+    // ENG-2816: the restriction the calling principal runs under (a share-link visitor), enforced again in executeTool.
+    restrictionProfile?: RestrictionProfileId;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
+    if (input.restrictionProfile) toolOptions.restrictionProfile = input.restrictionProfile;
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
@@ -9976,6 +10026,11 @@ export class AgentModeService {
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
+    // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
+    // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
+    // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    if (restricted) throw new ToolRestrictionDenied(restricted);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -12834,6 +12889,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Meta returns monetary fields as strings; compare stringified so
       // 1000 and "1000" are the same value and not a fake mismatch.
       const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      // Schedule fields are instants, not strings: Meta echoes them back in the
+      // ad account's timezone at whole-second precision (requested
+      // 16:44:56.157+00:00 is stored as 08:44:56-0800). Compare the instant at
+      // second resolution so an equivalent time is never reported as overridden.
+      const sameInstant = (requested: string | null, applied: string | null) => {
+        if (requested === null || applied === null) return false;
+        const r = Date.parse(requested);
+        const a = Date.parse(applied);
+        return Number.isFinite(r) && Number.isFinite(a) && Math.floor(r / 1000) === Math.floor(a / 1000);
+      };
+      const isScheduleField = (parameter: string) => parameter === 'start_time' || parameter === 'end_time';
       const readBackMismatches = expected
         .filter(([, requested]) => requested !== undefined)
         .map(([parameter, requested]) => ({
@@ -12841,7 +12907,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           requested: asComparable(requested),
           applied: asComparable(readBack?.[parameter])
         }))
-        .filter(m => m.requested !== m.applied);
+        .filter(m => m.requested !== m.applied &&
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -12857,7 +12924,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} ${describeMismatchedAdSetState(readBack?.status ?? adSet?.status)}`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
@@ -15568,6 +15635,51 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return executeExperimentRead(name, args, credentials);
   }
 
+  /**
+   * ENG-2980: account-bound Graph call for the experiment write tools. GET reads a numeric
+   * node or the account's own ad_studies edge; POST creates on the account's ad_studies edge
+   * or updates a numeric study node. metaToolkitExperimentWrites proves campaign and study
+   * ownership before calling. `outcomeUnknown` marks a failure without a definite Meta answer.
+   */
+  public async toolkitMetaExperimentGraph(
+    userId: string, account_id: string, method: 'GET' | 'POST', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+\/ad_studies|\d+)$/.test(path)) throw new Error('Unsupported experiment path.');
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      // Meta creates ad studies only on a Business or User ad_studies edge; the ad-account edge
+      // is read-only. Create on the account's owning business (else the token's user). The
+      // study's campaigns still come from this account and the write path reads it back.
+      let target = path;
+      if (method === 'POST' && path.startsWith('act_')) {
+        const { data: acct } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path.split('/')[0]}`, {
+          params: { fields: 'business{id}', access_token: accessToken }, timeout: 30_000,
+        });
+        const businessId = acct?.business?.id ? String(acct.business.id) : '';
+        target = /^\d+$/.test(businessId) ? `${businessId}/ad_studies` : 'me/ad_studies';
+      }
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${target}`,
+        params: { ...(method === 'GET' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
   public async readToolkitMetaActivityLog(userId: string, args: any) {
     const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
@@ -15618,6 +15730,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
       ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
     };
+  }
+
+  /** ENG-2922: resolved account + token for the toolkit's ARCHIVE/DELETE/COPY seam (mcp/metaToolkitLifecycle.ts). */
+  public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return { accountId, accessToken };
+  }
+
+  /**
+   * ENG-2914 Zoma custom audiences: one Graph call with the caller's credentials for the
+   * selected ad account. `{account}` in the path becomes act_<id>. Callers (mcp/metaToolkitAudiences)
+   * build the path from validated numeric ids and check node ownership themselves. Errors are
+   * re-thrown as a plain Error with only Meta's error fields: the axios error carries the access
+   * token in its config, so it must never reach a caller or a log.
+   */
+  public async toolkitMetaGraphRequest(
+    userId: string, account_id: string, method: 'GET' | 'POST' | 'DELETE', path: string, params: Record<string, any> = {},
+  ): Promise<any> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const url = `https://graph.facebook.com/${apiVersion}/${path.replace('{account}', `act_${accountId.replace(/^act_/, '')}`)}`;
+    try {
+      const { data } = method === 'GET'
+        ? await axios.get(url, { params: { ...params, access_token: accessToken }, timeout: 30_000 })
+        : method === 'POST'
+          ? await axios.post(url, params, { params: { access_token: accessToken }, timeout: 30_000 })
+          : await axios.delete(url, { params: { access_token: accessToken }, data: params, timeout: 30_000 });
+      return data;
+    } catch (error: any) {
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta
+        ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message, error_user_msg: meta.error_user_msg }
+        : null;
+      wrapped.status = error?.response?.status;
+      throw wrapped;
+    }
   }
 
   /**
@@ -15765,6 +15914,37 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
   }
 
+  /**
+   * ENG-2942: account-scoped reads behind the toolkit's optimisation-event check. Both go
+   * through the signals read path, which binds every pixel read to the selected account.
+   */
+  public async toolkitMetaConversionLookup(userId: string, account_id: string) {
+    const credentials = await this.getMetaCredentials(userId, account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    const { eventNamesFromStats } = await import('../mcp/metaToolkitConversionGate');
+    const read = async (name: string, args: any) => {
+      const body: any = await executeSignalsRead(name, args, credentials);
+      if (body?.success === false) throw new Error(body.message || 'Meta read failed');
+      return body;
+    };
+    return {
+      listCustomConversions: async () => {
+        const all: any[] = [];
+        let after: string | undefined;
+        for (let pages = 0; pages < 20; pages += 1) {
+          const body = await read('ads_get_customconversions', after ? { after } : {});
+          all.push(...(Array.isArray(body?.data) ? body.data : []));
+          const next = body?.paging?.has_next ? body?.paging?.cursors?.after : undefined;
+          if (typeof next !== 'string' || !next) break;
+          after = next;
+        }
+        return all;
+      },
+      listPixelEventNames: async (pixelId: string) =>
+        eventNamesFromStats(await read('ads_get_dataset_stats', { pixel_id: pixelId, aggregation: 'event' })),
+    };
+  }
+
   /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
   public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15870,7 +16050,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
-      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // ENG-1636: an AD (or AD_SET) status flip usually arrives with only its own id, but the gate needs
       // the parent campaign to scope its tracking checks — and blocked such calls with
       // "no campaign was identified" even though Meta carries campaign_id on the ad
       // object. Resolve the parent instead of refusing a call whose campaign is one
@@ -15881,6 +16061,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         entityType: entity_type,
         campaignId: campaign_id,
         adId: ad_id,
+        adSetId: ad_set_id,
         accessToken: gateCreds.accessToken,
         accountId: gateCreds.accountId,
         resolver: metaService,
@@ -16618,8 +16799,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
+    /**
+     * ENG-2962: set when the answer came from an MCP tool acting on someone's behalf (a self-call). It may not approve a card only a
+     * person may approve; decided here, on the very deck the answers are applied to (the write below is conditional on that deck
+     * still awaiting), not on an earlier read in the route.
+     */
+    options?: { refusePersonOnlyApprovals?: boolean },
   ): Promise<
     | { outcome: 'invalid'; reason: string }
+    | { outcome: 'needs_person'; actions: string[] }
     | { outcome: 'conflict' }
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
@@ -16640,6 +16828,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outcome: 'invalid',
         reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
       };
+    }
+
+    if (options?.refusePersonOnlyApprovals) {
+      const blocked = personOnlyApprovalsIn(deck, inboundAnswers);
+      if (blocked.length > 0) return { outcome: 'needs_person', actions: blocked.map(b => b.action) };
     }
 
     let answered: PendingApprovalDeck;
@@ -17014,7 +17207,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
-      console.error('AgentMode: Error managing custom audiences:', error);
+      // ENG-2914: never log the error object. A Meta SDK error carries the request (URL with the
+      // access token, and for user uploads the hashed member payload); log Meta's fields only.
+      console.error('AgentMode: Error managing custom audiences:', {
+        message: error?.message,
+        code: error?.structuredError?.code,
+        error_subcode: error?.structuredError?.error_subcode,
+      });
       // Meta's raw error.message (e.g. "Permissions error") is often too terse to
       // act on. metaService.handleError attaches a structuredError with Meta's own
       // consumer-facing error_user_msg (e.g. the exact accept-terms URL for

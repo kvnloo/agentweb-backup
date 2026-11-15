@@ -153,7 +153,12 @@ function evaluatePixelCapiBroken(accountId: string, trackingSummary: any): Cause
   if (pixelAlert) {
     return { cause: 'pixel_capi_broken', verdict: 'supported', evidence: pixelAlert.message ?? pixelAlert.subject };
   }
-  if (typeof trackingSummary?.healthy === 'number' || typeof trackingSummary?.blackouts === 'number') {
+  // Zero counters also describe failed or unperformed observations. Only a complete,
+  // positively healthy account sweep can exclude a tracking failure.
+  if (Number.isInteger(trackingSummary?.healthy) && trackingSummary.healthy > 0
+    && trackingSummary.accountsChecked === trackingSummary.healthy
+    && ['blackouts', 'tokenErrors', 'fetchErrors', 'unclassifiable', 'idle', 'optimisationAlerts']
+      .every(key => trackingSummary[key] === 0)) {
     return {
       cause: 'pixel_capi_broken',
       verdict: 'ruled_out',
@@ -166,7 +171,7 @@ function evaluatePixelCapiBroken(accountId: string, trackingSummary: any): Cause
 function evaluateLandingPageUnreachable(accountId: string, trackingSummary: any): CauseEvaluation {
   const destinationAlerts = trackingSummary?.destinationAlerts ?? 0;
   const destinationOk = trackingSummary?.destinationOk ?? 0;
-  const destinationUnverifiable = trackingSummary?.destinationUnverifiable ?? 0;
+  const destinationUnverifiable = trackingSummary?.destinationUnverifiable;
   if (destinationAlerts > 0) {
     const alerts: any[] = trackingSummary?.capturedAlerts ?? [];
     const destAlert = alerts.find(a => a?.context?.['Ad Account'] === accountId && a?.context?.['Alert Class'] === DESTINATION_ALERT_CLASS);
@@ -222,14 +227,14 @@ function evaluateDemandVsVariance(report: { campaigns: CampaignVolumeReport[] } 
     ];
   }
   const normalCampaign = report.campaigns.find(c => c.status === 'normal');
-  if (normalCampaign) {
+  if (normalCampaign && report.campaigns.every(c => c.status === 'normal')) {
     return [
       { cause: 'genuine_demand_drop', verdict: 'ruled_out', evidence: `no campaign is below its own historical floor: ${normalCampaign.reason}` },
       { cause: 'normal_variance', verdict: 'supported', evidence: normalCampaign.reason },
     ];
   }
   return [
-    { cause: 'genuine_demand_drop', verdict: 'unchecked', evidence: 'every campaign has insufficient history to judge variance' },
-    { cause: 'normal_variance', verdict: 'unchecked', evidence: 'every campaign has insufficient history to judge variance' },
+    { cause: 'genuine_demand_drop', verdict: 'unchecked', evidence: 'not every campaign has sufficient history to judge variance' },
+    { cause: 'normal_variance', verdict: 'unchecked', evidence: 'not every campaign has sufficient history to judge variance' },
   ];
 }

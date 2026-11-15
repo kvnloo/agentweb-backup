@@ -34,14 +34,29 @@ note="$(jq -r --arg cut "${last_deploy}" '
   def skip: (.author.login | test("dependabot"))
     or (.title | test("^(chore|docs)(\\(|:|!)"; "i"))
     or docs_only;
-  def summary: ((.body // "") | split("\n")
-    | map(gsub("^[#>*\\- ]+"; "") | gsub("\\*\\*|`"; "") | gsub("\\s+$"; ""))
-    | map(select(length > 0 and (test("^(Summary|What|Why|How|Closes|Fixes|Refs)\\b:?$|^(Closes|Fixes|Refs)\\b"; "i") | not)))
-    | .[0] // "") | .[0:200];
+  # A summary is the first sentence of prose. Markdown headings, the Reviewer-First
+  # "Risk: ... | Priority: ..." header, bare heading words, issue links and HTML
+  # comments are structure. When the body has a "What this fixes" section, the
+  # sentence under it is the summary: the section before it describes the bug.
+  def clean: gsub("^[#>*\\- ]+"; "") | gsub("\\*\\*|`"; "") | gsub("\\s+$"; "");
+  def structural: test("^\\s*#{1,6}(\\s|$)") or test("^\\s*<!--")
+    or (clean | (length == 0
+      or test("^(summary|what|why|how)(\\s*[/&,]\\s*(summary|what|why|how))*:?$|^(Closes|Fixes|Refs)\\b|^Risk:\\s|^Linear[- ]issue\\b"; "i")));
+  def first_prose: [ .[] | select(structural | not) | clean ][0];
+  def summary: ((.body // "") | split("\n") | map(sub("\\r$"; ""))) as $lines
+    | ($lines | map(test("^\\s*#{1,6}\\s*what this fixes"; "i")) | index(true)) as $fix
+    | ((if $fix == null then null else ($lines[$fix + 1:] | first_prose) end)
+       // ($lines | first_prose) // "") | .[0:200];
+  # Issue id: the title names the issue the PR belongs to; failing that a "Linear-Issue:" /
+  # "Linear issue" line does; a bare mention in the body may be an unrelated issue.
+  def eng_id: ([.title | match("ENG-[0-9]+"; "g").string][0])
+    // ([(.body // "") | match("linear[- ]issue:?[ \\t*#]*\\r?\\n?[ \\t]*(ENG-[0-9]+)"; "gi").captures[0].string][0])
+    // ([(.body // "") | match("ENG-[0-9]+"; "g").string][0])
+    // "no ENG id";
   [ .[] | select(.mergedAt <= $cut) | select(skip | not) ]
   | sort_by(.mergedAt)
   | map("- " + .title
-        + " (" + ((.title + " " + (.body // "")) | [match("ENG-[0-9]+"; "g").string][0] // "no ENG id")
+        + " (" + eng_id
         + ", @" + .author.login + ", #" + (.number | tostring) + ")"
         + (summary as $s | if $s == "" then "" else "\n  " + $s end))
   | join("\n")' <<<"${prs}")"

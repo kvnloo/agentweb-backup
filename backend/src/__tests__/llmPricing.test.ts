@@ -11,6 +11,7 @@ import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
   LLM_PRICE_BOOK_VERSION,
+  LIVE_MODALITY_PRICES,
   LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
@@ -48,7 +49,7 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
   const fingerprint = () =>
     require('crypto')
       .createHash('sha256')
-      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP, LIVE_MODALITY_PRICES }))
       .digest('hex')
       .slice(0, 16);
 
@@ -59,11 +60,23 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-10-12',
-      // + gemini-omni-1.1-flash video entry: additive only (no existing price moved),
-      // so events already stamped 2026-10-08 still re-derive exactly.
-      // + deprecated alias key openrouter/qwen/qwen3.8-max (same $2/$6 as -0902): additive.
-      fingerprint: '65453682d3ff3985',
+      version: '2026-11-15',
+      // Sonnet 5.5 cache reads corrected from $0.20/M to the provider's $0.10/M.
+      fingerprint: '669a45de042e3931',
+    });
+  });
+});
+
+// Model-upgrade audit 2026-11-15: OpenRouter's anthropic/claude-sonnet-5.5 record lists
+// input_cache_read 0.0000001/token = $0.10/1M (5% of input, the same generation cut as
+// Opus 5.5's $0.20 on a $4 input). The book had $0.20 — 2x the provider rate.
+describe('Claude Sonnet 5.5 price (model-upgrade audit 2026-11-15)', () => {
+  it('matches the provider-published rates, including the 5%-of-input cache read', () => {
+    expect(MODEL_PRICING['openrouter/anthropic/claude-sonnet-5.5']).toEqual({
+      inPerM: 2,
+      outPerM: 10,
+      cacheReadPerM: 0.1,
+      cacheWritePerM: 2.5,
     });
   });
 });

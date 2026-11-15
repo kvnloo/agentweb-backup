@@ -12,6 +12,11 @@ const mockSyncNewUserToLeadList = jest.fn();
 const mockOnUserRegistered = jest.fn();
 const mockSendTeamIntroductionEmail = jest.fn();
 const mockJwtSign = jest.fn();
+const mockAdmitZoma = jest.fn();
+jest.mock('../services/zomaAdmission', () => ({
+  ...jest.requireActual('../services/zomaAdmission'),
+  admitZomaSignup: (...args: unknown[]) => mockAdmitZoma(...args),
+}));
 
 jest.mock('../services/db', () => ({
   userDb: {
@@ -67,7 +72,7 @@ jest.mock('jsonwebtoken', () => ({
   sign: (...args: unknown[]) => mockJwtSign(...args),
 }));
 
-import { register } from '../controllers/auth';
+import { register, googleCallback } from '../controllers/auth';
 
 const app = express();
 app.use(express.json());
@@ -76,7 +81,7 @@ app.post('/register', register);
 const registerRequest = (email = 'ghost@unresolvable.test') =>
   request(app)
     .post('/register')
-    .send({ email, password: 'ValidPass123!' });
+    .send({ email, password: 'ValidPass123!', signupProduct: 'zoma' });
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -95,6 +100,65 @@ beforeEach(() => {
   mockOnUserRegistered.mockResolvedValue(undefined);
   mockSendTeamIntroductionEmail.mockResolvedValue(undefined);
   mockJwtSign.mockReturnValue('signed.jwt');
+});
+
+describe('ENG-2881 registration admission boundary', () => {
+  beforeEach(() => { process.env.ZOMA_WAITLIST_ENABLED = 'true'; });
+  afterEach(() => { delete process.env.ZOMA_WAITLIST_ENABLED; });
+  it.each(['emma_web', 'emma_mcp', undefined])('does not gate %s signup even when capacity is unavailable', async (signupProduct) => {
+    mockAdmitZoma.mockRejectedValue(new Error('counter unavailable'));
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupProduct });
+    expect(r.status).toBe(201);
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+  });
+  it('Zoma setup/MCP signed intent reserves a seat without signupProduct', async () => {
+    const { mintZomaSignupIntent } = require('../services/zomaSignupIntent');
+    mockAdmitZoma.mockResolvedValue('approved');
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupSource: 'mcp', signupIntent: mintZomaSignupIntent() });
+    expect(r.status).toBe(201);
+    expect(mockAdmitZoma).toHaveBeenCalledWith('ghost@unresolvable.test');
+  });
+  it('does not reclassify an invalid Zoma intent as an Emma signup', async () => {
+    const r = await request(app).post('/register').send({ email: 'ghost@unresolvable.test', password: 'ValidPass123!', signupIntent: 'expired-or-tampered' });
+    expect(r.status).toBe(400);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+  it('approved registration creates an account with access', async () => {
+    mockAdmitZoma.mockResolvedValue('approved');
+    const r = await registerRequest();
+    expect(r.status).toBe(201);
+    expect(r.body.token).toBe('signed.jwt');
+    expect(mockCreateUser).toHaveBeenCalled();
+  });
+  it('overflow returns waitlist shape without creating account or token', async () => {
+    mockAdmitZoma.mockResolvedValue('waitlisted');
+    const r = await registerRequest();
+    expect(r.status).toBe(202);
+    expect(r.body).toEqual({ code: 'waitlisted', status: 'waitlisted', message: expect.any(String) });
+    expect(mockCreateUser).not.toHaveBeenCalled();
+    expect(mockJwtSign).not.toHaveBeenCalled();
+  });
+  it('OAuth signups on Emma portals never consult Zoma capacity', async () => {
+    mockAdmitZoma.mockRejectedValue(new Error('counter unavailable'));
+    for (const state of ['customer', 'genius', 'partner']) {
+      const done = jest.fn();
+      await googleCallback({ query: { state } } as any, '', '', { emails: [{ value: 'ghost@unresolvable.test' }] } as any, done);
+      expect(done).toHaveBeenCalledWith(null, expect.objectContaining({ userId: 'persisted-user' }));
+    }
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+  });
+  it('existing OAuth accounts bypass admission and remain enabled', async () => {
+    mockGetUserByEmail.mockResolvedValue({ userId: 'existing', email: 'ghost@unresolvable.test', roles: ['customer'] });
+    const done = jest.fn();
+    await googleCallback({ query: { state: 'customer' } } as any, '', '', { emails: [{ value: 'ghost@unresolvable.test' }] } as any, done);
+    expect(mockAdmitZoma).not.toHaveBeenCalled();
+    expect(done).toHaveBeenCalledWith(null, expect.objectContaining({ userId: 'existing' }));
+  });
+  it('admission outage fails closed', async () => {
+    mockAdmitZoma.mockRejectedValue(new Error('unavailable'));
+    expect((await registerRequest()).status).toBe(503);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
 });
 
 describe('register persistence boundary', () => {

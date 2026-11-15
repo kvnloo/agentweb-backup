@@ -1,3 +1,0 @@
-## ENG-2897: update_sender_settings MCP tool (2026-11-10)
-
-New write MCP tool `update_sender_settings` sets the calling key owner's default email sender and/or default LinkedIn (unipile) sender. The sender id must be one of the caller's own configured senders and the LinkedIn account must be one the caller owns (org-shared teammate rows rejected); the sender list is re-posted unchanged and the response is the list_sender_settings read-back. Not callable with a tools:read key. Also classifies export_lead_list, list_lead_list_exports and inspect_client_usage in the annotation policy and refreshes the public tool inventory fixture, which was red on main.

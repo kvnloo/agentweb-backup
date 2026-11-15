@@ -196,7 +196,7 @@
  * `getSenderForLead` is bound off the singleton the same way.
  */
 import { suppressLeadSideEffects } from '../../utils/sessionList';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType, missingReviewDraftError } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
@@ -205,6 +205,7 @@ import { getCrmSenders } from './shared/crmSenders';
 import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DETAIL } from './brandMarketStrategy';
+import { brandMessagingContextFromGuidelines } from '../../services/brandMessagingContext';
 import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
@@ -368,6 +369,13 @@ export async function addLeadsToList(
         deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
       });
 
+      // ENG-2996: new rows inherit the owner's do-not-contact flags and get
+      // their emails validated, same as the portal's CSV/bulk import.
+      const { applyLeadImportFollowups } = await import('../../services/leadImportFollowups');
+      const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
+      });
+
       // ENG-1133: report the import row by row, not just in aggregate. A large
       // import can be cut off mid-way (the whole-turn cap fires between calls),
       // and "25 new lead(s) created" tells the next turn nothing about WHICH
@@ -512,6 +520,8 @@ export async function addLeadsToList(
         // Two counts of the same thing is exactly the "numbers don't add up"
         // the ticket is about, so there is now one (ENG-1133).
         reconciliation,
+        ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: followups.inheritedDoNotContact.length } : {}),
+        ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
         ...(unimportedRows.length > 0
           ? { ...resume, unimportedRowRanges }
@@ -527,6 +537,15 @@ export async function addLeadsToList(
       };
     }
   }
+
+// Preserve stored evidence only: missing suppression values must not imply active.
+function projectLeadSuppression(lead: Record<string, any>): Record<string, any> {
+  const fields = ['contactStatus', 'contactStatusReason', 'contactStatusNote',
+    'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
+    'unsubscribedFromGroupEmail', 'unsubscribedFromGroupEmailAt'];
+  return Object.fromEntries(fields.filter(field => lead[field] !== undefined)
+    .map(field => [field, lead[field]]));
+}
 
 export async function getLeads(listId: string, userId: string, options: {
     search?: string;
@@ -678,6 +697,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
           ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
@@ -1016,6 +1036,7 @@ export async function searchLeads(
             // reads a lead with no attribution in it and reports a BLOCK on a
             // correctly-attributed lead.
             ...projectLeadAttribution(entry.lead),
+            ...projectLeadSuppression(entry.lead),
           };
         }),
         matchCount: matchingLeads.length,
@@ -1216,6 +1237,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
           // entirely when it does not. Never an empty object: that would report
           // "capture ran and found nothing" for a lead capture never touched.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
         },
         engagementSummary: {
           total: engagementCount.total,
@@ -1607,6 +1629,29 @@ function foldEngagementSignal(
     }
   }
 
+/**
+ * ENG-2996: Emma suppresses a lead by moving its pipeline `status` to
+ * "do-not-contact" (any case/spacing). Send paths only read `contactStatus`, so
+ * the same write must set it too. A lead already unsubscribed/DNC keeps its
+ * existing contact status and reason.
+ */
+export function suppressionContactStatusUpdates(status: unknown, existingLead: any, userId: string): Record<string, any> {
+  if (typeof status !== 'string') return {};
+  const normalized = status.trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (normalized !== 'do-not-contact' && normalized !== 'dnc') return {};
+  if (existingLead?.contactStatus === 'do-not-contact' || existingLead?.contactStatus === 'unsubscribed') return {};
+  const now = new Date().toISOString();
+  return {
+    contactStatus: 'do-not-contact',
+    contactStatusReason: 'admin-flagged',
+    contactStatusNote: 'Set from pipeline status "do-not-contact"',
+    contactStatusUpdatedAt: now,
+    contactStatusUpdatedBy: userId,
+    unsubscribedFromGroupEmail: true,
+    unsubscribedFromGroupEmailAt: now,
+  };
+}
+
 export async function updateLead(listId: string, leadId: string, updates: Record<string, any>, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1652,6 +1697,9 @@ export async function updateLead(listId: string, leadId: string, updates: Record
           { source: 'agentMode.updateLead', listId, leadId },
         );
       }
+
+      // ENG-2996: a do-not-contact pipeline status is a suppression, not a label.
+      Object.assign(dbUpdates, suppressionContactStatusUpdates(dbUpdates.status, lead, userId));
 
       // Auto-create status change engagement if status changed
       if (dbUpdates.status !== undefined && (lead.status || null) !== dbUpdates.status) {
@@ -2112,7 +2160,9 @@ export async function updateLeadStatus(
       }
 
       const previousStatus = existingLead.status || null;
-      const updates: any = { status };
+      // ENG-2996: a do-not-contact pipeline status also sets contactStatus, which
+      // is what every send path (isDoNotContact / contactGuard) actually reads.
+      const updates: any = { status, ...suppressionContactStatusUpdates(status, existingLead, userId) };
       if (dealValue !== undefined) updates.dealValue = dealValue;
       if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
 
@@ -2148,6 +2198,12 @@ export async function updateLeadStatus(
         };
         updates.emailDraftFormat = 'text';
         savedDrafts.push('emailDraft');
+      }
+
+      // ENG-2966: never put a lead in the review queue without a draft to review.
+      const draftError = missingReviewDraftError(status, { ...existingLead, ...updates });
+      if (draftError) {
+        return { success: false, message: 'No draft saved on this lead', error: draftError };
       }
 
       await crmDb.updateLead(listId, leadId, updates);
@@ -3003,9 +3059,12 @@ ${emailDraftFormat === 'text'
       const emailSummary = emailData
         ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
         : '';
+      // Same compact brand block as the CRM invite-note route (ENG-2967) — the
+      // full formattedContent above is sized for the email prompt, not a 300-char note.
+      const senderBrand = brandMessagingContextFromGuidelines(brandGuidelines);
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-Recipient: ${leadDesc}
+Recipient: ${leadDesc}${senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : ''}
 ${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 

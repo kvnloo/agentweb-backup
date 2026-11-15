@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { isGenuineEngagementEvent } from '../services/leadEngagementSignals';
-import { statusAfterReviewedSend } from '../utils/leadSchema';
+import { statusAfterReviewedSend, missingReviewDraftError, REVIEW_DRAFT_STATUS } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
@@ -258,6 +258,11 @@ router.use(authenticateToken);
 // sub-router so they can be unit-tested without mocking all of crm.ts.
 import enrichSoSubRouter from './crmEnrichSo';
 import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
+
+/** ENG-2996: enrich.so validated this lead's email as deliverable. */
+const isValidatedDeliverable = (lead: any): boolean => lead?.customFields?.email_validation?.status === 'deliverable';
+
 router.use(enrichSoSubRouter);
 
 // Apollo people-enrichment routes (lookup-by-linkedin, reveal-phone, bulk
@@ -280,6 +285,7 @@ import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchCo
 import { randomUUID } from 'crypto';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
+import { brandMessagingContextFromGuidelines } from '../services/brandMessagingContext';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -2235,6 +2241,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const { listId } = req.params;
     const leadData = req.body;
 
+    // ENG-2966: a lead cannot be created straight into review without a draft (also MCP add).
+    const createDraftError = missingReviewDraftError(leadData?.status, leadData);
+    if (createDraftError) {
+      return res.status(400).json({ message: createDraftError });
+    }
+
     // Attribution — accept the same `attribution` / legacy `utm` shape as the
     // public forward-lead endpoint so the CRM "quick add" flow preserves source
     // data when a rep pastes in a lead they got from a tracked link.
@@ -2338,6 +2350,17 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return res.status(400).json({ message: 'leads must be a non-empty array' });
     }
 
+    // ENG-2966: reject the import when any row would land in review without a draft.
+    const draftlessRows = leads
+      .map((lead: any, index: number) => (missingReviewDraftError(lead?.status, lead) ? index : -1))
+      .filter((index: number) => index >= 0);
+    if (draftlessRows.length > 0) {
+      return res.status(400).json({
+        message: `Rows ${draftlessRows.join(', ')} set status "${REVIEW_DRAFT_STATUS}" without a saved draft. Import them with another status, or include the draft.`,
+        rows: draftlessRows,
+      });
+    }
+
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
@@ -2376,6 +2399,12 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
 
+    // ENG-2996: inherit the owner's do-not-contact flags (awaited, before any
+    // sequence enrolment) and validate the new emails in the background.
+    const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
+
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -2388,6 +2417,8 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       // nor merged, so without this the caller sees an unexplained gap between
       // `total` and what it can account for.
       anonymizedSkipped: result.anonymizedSkipped || 0,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: result.errors,
       total: leads.length,
     });
@@ -3020,6 +3051,22 @@ const updateLeadHandler = async (req: Request, res: Response) => {
 
     const updateData = updates;
 
+    // ENG-2966: moving a lead INTO review requires a draft on it after this write.
+    // Also re-checked when a lead already in review has its draft edited/cleared, so the
+    // write cannot leave an empty queue row; untouched legacy review rows stay editable.
+    const touchesDraft = !!updates && ('emailDraft' in updates || 'messageDraft' in updates);
+    if (updates?.status === REVIEW_DRAFT_STATUS || touchesDraft) {
+      const before = await crmDb.getLeadById(listId, leadId);
+      const after = before ? { ...before, ...updates } : null;
+      const entering = !!before && before.status !== REVIEW_DRAFT_STATUS && updates?.status === REVIEW_DRAFT_STATUS;
+      const draftError = after && (entering || touchesDraft)
+        ? missingReviewDraftError(after.status, after)
+        : null;
+      if (draftError) {
+        return res.status(400).json({ message: draftError });
+      }
+    }
+
     // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
     const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);
     const suppressionBefore = auditSuppression
@@ -3425,6 +3472,11 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
 
+    // ENG-2996: same import follow-ups as bulk-import (DNC inheritance + validation).
+    const followups = await applyLeadImportFollowups(listId, list.userId, results.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
+
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
@@ -3457,6 +3509,8 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       // otherwise the row count the user uploaded silently exceeds every
       // number reported back.
       anonymizedSkipped: csvAnonymizedSkipped,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: results.errors,
       message: `Imported ${results.successCount} leads`
         + (csvAlreadyPresent > 0 ? `, ${csvAlreadyPresent} already present and up to date` : '')
@@ -4005,6 +4059,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       const leadBatchSize = 100;
       let connectionsAnonymizedSkipped = 0;
+      const connectionsCreated: Array<{ leadId: string; email?: string }> = [];
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
@@ -4016,6 +4071,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         // error, so they must be carried separately or the connection count
         // the user sees silently under-reports what was submitted.
         connectionsAnonymizedSkipped += results.anonymizedSkipped || 0;
+        connectionsCreated.push(...(results.created ?? []));
         if (results.errors.length > 0) {
           connectionsErrors.push(...results.errors);
         }
@@ -4028,6 +4084,11 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       // Emit final progress
       emitProgress('Import complete!', 100);
 
+      // ENG-2996: same import follow-ups as bulk/CSV import (DNC inheritance + validation).
+      const followups = await applyLeadImportFollowups(listId, list.userId, connectionsCreated, {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
+      });
+
       if (connectionsSuccessCount > 0) {
         void autoEnrollListIntoSequences(userId, listId);
       }
@@ -4037,6 +4098,8 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         successCount: connectionsSuccessCount,
         errorCount: connectionsErrorCount,
         anonymizedSkipped: connectionsAnonymizedSkipped,
+        inheritedDoNotContact: followups.inheritedDoNotContact.length,
+        doNotContactCheckFailed: followups.doNotContactCheckFailed,
         errors: connectionsErrors,
         messagesImported: messagesSuccessCount,
         message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`
@@ -5542,11 +5605,10 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const { agentModeService } = await import('../services/agentModeService');
 
-    // Get brand guidelines for context
-    const brandGuidelines = await agentModeService.readBrandGuidelines(userId);
-    const brandContext = brandGuidelines?.exists && brandGuidelines?.content
-      ? `\nSender context: ${String(brandGuidelines.content).slice(0, 500)}`
-      : '';
+    // Sender brand context. readBrandGuidelines returns { exists, brandData,
+    // formattedContent } — the old `.content` read was always undefined, so the
+    // note never saw the sender's brand (ENG-2967).
+    const senderBrand = brandMessagingContextFromGuidelines(await agentModeService.readBrandGuidelines(userId));
 
     const firstName = (lead as any).firstName || '';
     const lastName = (lead as any).lastName || '';
@@ -5557,7 +5619,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
     const notesLine = notes ? `\nWhat we know about them: ${notes.slice(0, 300)}` : '';
-    const senderContext = brandContext ? `\nSender context: ${brandContext.replace('\nSender context: ', '').slice(0, 400)}` : '';
+    const senderContext = senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : '';
 
     const prompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
@@ -6995,7 +7057,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { leadIds } = req.body;
+    const { leadIds, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -7040,9 +7102,12 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own group email leaves it out (send, preview
     // and prepare all apply the same rule, or the preview would promise recipients the send does not make).
     const smartlead = leads.filter((l: any) => l.email && !isDoNotContact(l) && isPushedToSmartlead(l)).length;
-    const eligibleLeads = leads.filter((l: any) =>
+    const sendable = leads.filter((l: any) =>
       l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
-    ).length;
+    );
+    // ENG-2996: mirrors the send's opt-in excludeUnvalidated filter.
+    const unvalidatedCount = excludeUnvalidated === true ? sendable.filter((l: any) => !isValidatedDeliverable(l)).length : 0;
+    const eligibleLeads = sendable.length - unvalidatedCount;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
@@ -7061,6 +7126,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       undeliverableCount,
       riskyCount,
       invalidCount,
+      ...(excludeUnvalidated === true ? { unvalidatedCount } : {}),
       undeliverableEmails,
       riskyEmails,
       invalidEmails,
@@ -7336,7 +7402,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
+    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -7416,6 +7482,16 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUndeliverable = beforeCount - eligibleLeads.length;
     }
 
+    // ENG-2996: opt-in — send only to addresses enrich.so validated as
+    // deliverable (never-validated, unknown and risky are left out and counted).
+    // Default (flag absent) is unchanged.
+    let skippedUnvalidated = 0;
+    if (excludeUnvalidated === true) {
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter(isValidatedDeliverable);
+      skippedUnvalidated = beforeCount - eligibleLeads.length;
+    }
+
     // Apply dark-mode fix once before per-lead substitution.
     const sendHtml = injectColorSchemeMeta(htmlContent || '');
 
@@ -7457,6 +7533,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         skippedSmartlead,
         skippedMissingVars,
         skippedUndeliverable,
+        ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
         skippedInvalid,
         skippedNoEmail,
       };
@@ -7628,6 +7705,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedSmartlead,
       skippedMissingVars,
       skippedUndeliverable,
+      ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
       skippedInvalid,
       skippedNoEmail,
       skippedDueToLimit,

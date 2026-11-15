@@ -227,7 +227,7 @@ describe('ENG-2303 guarded Meta writes', () => {
 
   it('UPDATE is limited to status/budget fields and internal gate flags are refused', async () => {
     const deps = makeDeps();
-    await expect(executeMetaToolkitWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: '111', campaign_id: '1', params: { name: 'x' } }, deps))
+    await expect(executeMetaToolkitWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: '111', campaign_id: '1', params: { objective: 'OUTCOME_SALES' } }, deps))
       .rejects.toThrow(/can change only/);
     await expect(executeMetaToolkitWrite('u1', { entity_type: 'AD', action: 'UPDATE', account_id: '111', ad_id: '1', params: { daily_budget: 5 } }, deps))
       .rejects.toThrow(/can change only: status/);

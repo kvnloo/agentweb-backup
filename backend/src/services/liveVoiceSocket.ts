@@ -5,12 +5,75 @@ import {
   startLiveSession,
   type LiveToolProfile,
 } from './liveVoiceService';
+import { isSessionOwnerRequest } from './shareViewerIdentity';
+import type { RestrictionProfileId } from './toolRestrictionProfiles';
 
 interface LiveSocketPrincipal {
   userId?: string;
   delegateAccess?: {
     targetUserId?: string;
   };
+}
+
+export interface ConversableSocketAuth {
+  conversableToken?: unknown;
+  conversableSessionId?: unknown;
+  /** ENG-2816: the viewer's own login, when they are signed in; honoured only if it is the session owner's. */
+  viewerToken?: unknown;
+}
+
+export type ConversableSocketResult =
+  | { ok: true; data: { conversableSessionId: string; conversableUserId: string; conversableViewerIsOwner: boolean } }
+  | { ok: false; error: string };
+
+/**
+ * Authenticate an interactive-share (iShare) socket: the conversable token must match the session's share token and the
+ * share must be active. Extracted from the Socket.IO middleware in server.ts so it can be tested as it really runs.
+ *
+ * ENG-2816: the socket acts as the session owner either way, so the owner and a visitor look the same to every downstream
+ * check. `conversableViewerIsOwner` records which one this really is: true only when the portal also sent the viewer's own
+ * login (`viewerToken`) and it is the session owner's. Anything else, including a bad or missing `viewerToken`, is a
+ * visitor and never fails the connection.
+ */
+export async function authenticateConversableSocket(
+  auth: ConversableSocketAuth,
+  getSession: (sessionId: string) => Promise<any>,
+): Promise<ConversableSocketResult> {
+  try {
+    const conversableSessionId = String(auth.conversableSessionId);
+    const session = await getSession(conversableSessionId);
+    if (!session) return { ok: false, error: 'Session not found' };
+    const interactiveToken = session.interactiveShareMetadata?.token;
+    if (!interactiveToken || interactiveToken !== auth.conversableToken) {
+      return { ok: false, error: 'Invalid conversable token' };
+    }
+    if (!session.interactiveShareMetadata?.isActive) {
+      return { ok: false, error: 'Interactive share is not active' };
+    }
+    const viewerIsOwner =
+      typeof auth.viewerToken === 'string' && auth.viewerToken.length > 0
+        ? await isSessionOwnerRequest({ headers: { authorization: `Bearer ${auth.viewerToken}` } }, session.userId)
+        : false;
+    // Leaves a trace of the decision (no token): it is the only place voice decides owner versus visitor, and nothing else
+    // records it, so a production check can see which one a call was treated as.
+    console.log(`[ENG-2816] voice socket for share link ${conversableSessionId}: the viewer is ${viewerIsOwner ? 'the session owner' : 'a visitor'}`);
+    return {
+      ok: true,
+      data: { conversableSessionId, conversableUserId: session.userId, conversableViewerIsOwner: viewerIsOwner },
+    };
+  } catch {
+    return { ok: false, error: 'Conversable auth error' };
+  }
+}
+
+/**
+ * ENG-2816: the restriction a live voice session runs under. An interactive-share socket that is not the session owner's own
+ * logged-in view is a share-link visitor, and gets the same tool restrictions as a visitor in typed chat. Regular
+ * (signed-in) sockets are unrestricted, as before.
+ */
+export function getLiveRestrictionProfile(socket: Socket): RestrictionProfileId | undefined {
+  if (!socket.data.conversableSessionId) return undefined;
+  return socket.data.conversableViewerIsOwner === true ? undefined : 'share_visitor';
 }
 
 function getPendingLiveStarts(socket: Socket): Map<string, AbortController> {
@@ -89,6 +152,7 @@ export function registerLiveStartHandler(socket: Socket): void {
         userId,
         toolProfile,
         controller.signal,
+        getLiveRestrictionProfile(socket),
       );
 
       // Authorization and Gemini start both completed. Only now grant the
@@ -109,6 +173,8 @@ export function registerLiveStartHandler(socket: Socket): void {
       socket.emit('live:error', {
         sessionId,
         error: err?.message ?? 'Failed to start live session',
+        // ENG-2957: 'usage_paused' when the allowance refused the call.
+        ...(err?.code === 'usage_paused' ? { code: 'usage_paused' } : {}),
       });
     } finally {
       if (pendingStarts.get(sessionId) === controller) pendingStarts.delete(sessionId);

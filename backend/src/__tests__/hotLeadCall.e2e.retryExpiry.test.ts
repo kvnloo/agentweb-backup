@@ -38,6 +38,7 @@ beforeEach(() => {
 function seed(deferral: Record<string, unknown>): void {
   world.crm.addLead({ listId: LIST, leadId: 'lead-a', phone: LEAD_PHONE_AS_TYPED, firstName: 'J', email: 'a@example.com', createdAt: ago(30 * HOUR), customFields: { stage: 'complete' } });
   world.crm.lead(LIST, 'lead-a').system = {
+    ...world.crm.lead(LIST, 'lead-a').system,
     hot_lead_call: {
       state: 'finished', outcome: 'lead_deferred', jobKey: 'job-1', startedAt: ago(30 * HOUR), updatedAt: ago(7 * HOUR), attemptNo: 1, memberId: MEMBER_ID,
       triedMemberIds: [MEMBER_ID], meteredLegs: [], lastSequence: {}, leadPhoneMac: leadPhoneMacOf('org-a', LEAD_E164), deferral,

@@ -4,9 +4,10 @@
  *
  * Allowed: CAMPAIGN / AD_SET / AD  CREATE, and UPDATE of status (ACTIVE|PAUSED), budget, and
  * (ENG-2913) post-launch edits: CAMPAIGN bid_strategy/spend_cap, AD_SET bid_amount/
- * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id) + name. Every
+ * bid_strategy/targeting/start_time/end_time, AD creative swap (creative_id), and name on all three (ENG-2960). Every
  * UPDATE preview shows a before → after field diff and the read-back verifies every field.
- * Still excluded: DELETE, COPY_AD, RETAG_UTM, custom audiences/uploads, launch_*.
+ * Still excluded here: COPY_AD, RETAG_UTM, launch_*. ARCHIVE / DELETE / COPY are their own guarded
+ * path (ENG-2922, metaToolkitLifecycle.ts). Custom audiences are metaToolkitAudiences.ts (ENG-2914).
  * Creative assets (AD_CREATIVE UPLOAD_IMAGE / UPLOAD_VIDEO / CREATE) are metaToolkitCreatives.ts.
  *
  * Flow (preview → confirm, bound):
@@ -34,10 +35,11 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import {
-  consumePreviewToken, isOutcomeUnknownFailure, previewFingerprint, previewResponse, previewTokenMatches,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, isOutcomeUnknownFailure, previewFingerprint, previewResponse, previewTokenMatches,
   rememberTokenOutcome, replayTokenOutcome,
   PREVIEW_TOKEN_TTL_MS, type WriteVerification,
 } from './zomaWriteGuard';
@@ -46,8 +48,8 @@ export { GUARDED_WRITE_ENTITIES, GUARDED_WRITE_ACTIONS, isGuardedWriteRequest, P
 export type { WriteVerification };
 
 const UPDATE_FIELDS: Record<string, string[]> = {
-  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_strategy', 'spend_cap'],
-  AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time'],
+  CAMPAIGN: ['status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_strategy', 'spend_cap', 'name'],
+  AD_SET: ['status', 'daily_budget', 'lifetime_budget', 'bid_amount', 'bid_strategy', 'targeting', 'start_time', 'end_time', 'name'],
   AD: ['status', 'creative_id', 'name'],
 };
 // LOWEST_COST_WITH_MIN_ROAS is not offered: it needs a ROAS floor (bid_constraints) that no
@@ -81,10 +83,12 @@ export interface MetaToolkitWriteDeps {
   readBack: (userId: string, accountId: string, entity: string, id: string) => Promise<Record<string, any> | null>;
   /** ENG-2913: throws unless the creative belongs to the selected ad account (creative ids are global). */
   assertCreativeOwned: (userId: string, accountId: string, creativeId: string) => Promise<void>;
+  /** ENG-2942: account-scoped custom conversion / pixel event reads for AD_SET CREATE. */
+  conversionLookup?: (userId: string, accountId: string) => Promise<ConversionLookup>;
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
   secret: () => string;
   now: () => number;
-  consumedTokens: Map<string, number>;
+  consumedTokens: ConsumedTokens;
   /** ENG-2931: outcome per consumed preview token, replayed on a repeat confirm. */
   tokenOutcomes?: Map<string, { exp: number; outcome: any }>;
 }
@@ -116,10 +120,11 @@ const defaultDeps: MetaToolkitWriteDeps = {
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
   assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
+  conversionLookup: async (userId, accountId) => (await ams()).toolkitMetaConversionLookup(userId, accountId),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
-  consumedTokens: new Map(),
+  consumedTokens: defaultConsumedTokenStore,
   tokenOutcomes: new Map(),
 };
 
@@ -339,6 +344,11 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       throw new MetaToolkitRefusal(`Creative ${params.creative_id} was not found in ad account ${accountId}. Nothing was changed.`);
     }
   }
+  // ENG-2942: a custom conversion / custom pixel event is accepted only when the account has it.
+  if (entity === 'AD_SET' && action === 'CREATE' && params.promoted_object && deps.conversionLookup) {
+    const lookup = await deps.conversionLookup(userId, accountId);
+    await assertOptimisationEventConfigured(params.promoted_object, lookup);
+  }
   // A bid amount on an ad set that stays on the no-cap strategy is stored but unused by Meta.
   if (action === 'UPDATE' && entity === 'AD_SET' && params.bid_amount !== undefined && params.bid_strategy === undefined
     && prior?.bid_strategy === 'LOWEST_COST_WITHOUT_CAP') {
@@ -421,7 +431,7 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       note: 'The confirmation did not match a current preview (missing, expired, or the arguments or Meta state changed). Nothing was sent. Show this new preview and get approval again.',
     };
   }
-  if (!consumePreviewToken(deps.consumedTokens, previewToken, now)) {
+  if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
     // ENG-2931: a client that lost the answer and repeats the same confirm gets that outcome back.
     const replay = replayTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, now);
     if (replay) return replay;

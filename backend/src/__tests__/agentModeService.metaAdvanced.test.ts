@@ -474,6 +474,27 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
         expect(result.message).toBe('Successfully initiated user upload to audience audience_123');
       });
 
+      it('a failed upload logs Meta\'s error fields only, never the request URL token or hashed members (ENG-2914)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        const sdkError: any = Object.assign(new Error('Permissions error'), {
+          url: 'https://graph.facebook.com/v25.0/aud/users?access_token=SECRET_TOKEN',
+          config: { params: { access_token: 'SECRET_TOKEN' }, data: { payload: { data: [['HASHED_MEMBER']] } } },
+          structuredError: { code: 200, error_subcode: 1870090 },
+        });
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockRejectedValue(sdkError);
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        try {
+          const result = await agentModeService.manageMetaCustomAudiences('user123', 'UPLOAD_USERS', '123456789', { id: 'audience_123', schema: ['EMAIL'], payload: 'a@b.co' });
+          expect(result.success).toBe(false);
+          const logged = JSON.stringify(spy.mock.calls, (_k, v) => (v instanceof Error ? { ...v, message: v.message } : v));
+          expect(logged).toContain('Permissions error');
+          expect(logged).not.toContain('SECRET_TOKEN');
+          expect(logged).not.toContain('HASHED_MEMBER');
+        } finally {
+          spy.mockRestore();
+        }
+      });
+
       // ENG-600 known gap, now fixed: the naive split(',') parser mis-splits
       // any quoted field containing a comma (e.g. a phone value with an
       // extension, "555-5678, ext. 2"), silently corrupting column alignment

@@ -14,6 +14,8 @@ jest.mock('../services/asyncJobQueue', () => ({
   startHeartbeat: jest.fn(), registerProcessor: jest.fn(), clearFailedJob: jest.fn(),
 }));
 jest.mock('../services/emailService', () => ({ emailService: { sendEmail: jest.fn(), escapeHtml: (t: string) => t } }));
+/** A lead's consent record bound to ITS number (ENG-2783): a lead copy with another phone must carry consent for that phone. */
+const consentFor = (phone: string) => ({ callConsent: callConsentRecord({ phoneDigits: phone.replace(/\D/g, '').replace(/^(\d{10})$/, '1$1') }) });
 const callerless = { on: false };
 jest.mock('../services/voice/hotLeadCallContext', () => ({
   resolveHotLeadCallContext: async (listId: string) => {
@@ -39,7 +41,7 @@ import { setHotLeadCallEntitledOverride } from '../services/voice/hotLeadCallEnt
 import { FakeLeadCallStore } from './helpers/fakeLeadCallStore';
 import { leadPhoneMacOf } from '../services/voice/leadPhoneMac';
 import { dncKey, isNumberDoNotCall, markNumberDoNotCall } from '../services/voice/hotLeadCallDnc';
-import { teamMember, callRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
+import { teamMember, callRecord, callConsentRecord, MEMBER_ID } from './helpers/hotLeadCallFixtures';
 
 const mock = (fn: unknown) => fn as jest.Mock;
 const MEMBER_PHONE = '+14155550100';
@@ -78,7 +80,7 @@ beforeEach(() => {
   limits = new FakeLimitStore();
   setLimitStoreForTests(limits);
   process.env.JWT_SECRET = 'test-secret';
-  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' } };
+  lead = { listId: 'list-a', leadId: 'lead-a', phone: LEAD_PHONE, email: 'jane@example.com', createdAt: '2026-10-19T16:58:00.000Z', customFields: { stage: 'complete' }, system: { callConsent: callConsentRecord() } };
   org = { orgId: 'org-a', hotLeadCall: config };
   mock(crmDb.getLeadListById).mockResolvedValue({ listId: 'list-a', userId: 'owner-a' });
   mock(userDb.getUserById).mockResolvedValue({ userId: 'owner-a', orgId: 'org-a' });
@@ -266,11 +268,11 @@ describe('team routing', () => {
     lead = { ...lead, leadId: 'lead-1' };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-1' }));
     store.record = null; // the fake holds one record at a time
-    lead = { ...lead, leadId: 'lead-2', phone: '+12125550143' };
+    lead = { ...lead, leadId: 'lead-2', phone: '+12125550143', system: consentFor('+12125550143') };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-2' }));
     expect(placedTo()).toEqual([MEMBER_PHONE, SECOND_PHONE]);
     store.record = null;
-    lead = { ...lead, leadId: 'lead-3', phone: '+12125550144' };
+    lead = { ...lead, leadId: 'lead-3', phone: '+12125550144', system: consentFor('+12125550144') };
     await processHotLeadCallJob(jobOf({ leadId: 'lead-3' }));
     expect(placedTo()).toHaveLength(2);
     expect(store.events.at(-1)).toEqual({ type: 'call.skipped', detail: { reason: 'member_cooldown' } });
@@ -355,7 +357,7 @@ describe('processHotLeadCallJob', () => {
     store.record = callRecord({ state: 'dialing', jobKey: 'other-dispatch', claimToken: 'someone-elses' });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect({ counters: [...limits.counters.values()], claims: limits.claims.size }).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('goes on when a create that answers false actually committed this dispatch\'s own record (an SDK retry lost its response)', async () => {
@@ -367,7 +369,7 @@ describe('processHotLeadCallJob', () => {
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(1);
     expect(store.record).toMatchObject({ state: 'member_ringing', attemptNo: 1 });
-    expect([...limits.counters.values()]).toEqual([1, 1, 1]);
+    expect([...limits.counters.values()]).toEqual([1, 1, 1, 1]);
   });
 
   it.each([
@@ -554,7 +556,7 @@ describe('abuse limits (reservation)', () => {
   const FIRST = '(212) 555-0142';
   // A new lead row, same list: the record store is per lead, so reset it.
   const submit = async (leadId: string, phone: string, overrides: Record<string, unknown> = {}) => {
-    lead = { ...lead, leadId, phone, createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId, phone, system: consentFor(phone), createdAt: new Date().toISOString() };
     store.record = null;
     store.events = [];
     const before = provider.placedCalls.length;
@@ -566,7 +568,7 @@ describe('abuse limits (reservation)', () => {
 
   it('records a successful call against the phone marker, the cooldown and both counters', async () => {
     expect(await submit('l1', FIRST)).toBe('called');
-    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1, 1], claims: 2 });
   });
 
   it('refuses the same phone for 24h on a different lead row, then allows it again', async () => {
@@ -628,7 +630,7 @@ describe('abuse limits (reservation)', () => {
     later(2);
     store.record = null;
     store.events = [];
-    lead = { ...lead, leadId: 'l2', phone: '+12125550142', createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId: 'l2', phone: '+12125550142', system: consentFor('+12125550142'), createdAt: new Date().toISOString() };
     await processHotLeadCallJob(jobOf({ leadId: 'l2' }));
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'org_hourly_cap' } }]);
@@ -645,7 +647,7 @@ describe('abuse limits (reservation)', () => {
     later(2);
     expect(await submit('l2', '+12125550142')).toBe('org_hourly_cap');
     // l2's phone marker and cooldown claim were released; only l1's phone marker remains, and the counters did not move.
-    expect(slots().counters).toEqual([1, 1, 1]);
+    expect(slots().counters).toEqual([1, 1, 1, 1]);
     expect([...limits.claims.keys()].filter(k => k.startsWith('hlc#phone#'))).toHaveLength(1);
   });
 
@@ -653,19 +655,19 @@ describe('abuse limits (reservation)', () => {
     store.record = callRecord({ state: 'member_ringing', jobKey: 'old', startedAt: NOW, updatedAt: NOW });
     await processHotLeadCallJob(jobOf());
     expect(provider.placedCalls).toHaveLength(0);
-    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('gives every slot back when store.create throws', async () => {
     store.create = async () => { throw new Error('ddb down'); };
     await expect(processHotLeadCallJob(jobOf())).rejects.toThrow('ddb down');
-    expect(slots()).toEqual({ counters: [0, 0, 0], claims: 0 });
+    expect(slots()).toEqual({ counters: [0, 0, 0, 0], claims: 0 });
   });
 
   it('keeps the slots when the call is placed and then rejected (the lead\'s call is spent)', async () => {
     provider.failNextPlaceCall('no');
     await processHotLeadCallJob(jobOf());
-    expect(slots()).toEqual({ counters: [1, 1, 1], claims: 2 });
+    expect(slots()).toEqual({ counters: [1, 1, 1, 1], claims: 2 });
   });
 
   it('fails the job closed, dialing nothing and creating no record, and shows limits_unavailable on the lead', async () => {
@@ -713,7 +715,7 @@ describe('abuse limits (reservation)', () => {
   it('a burst of 100 simultaneous leads dials once (the cooldown) and never more than the cap', async () => {
     org.hotLeadCall = { ...config, maxCallsPerHour: 3, memberCooldownMinutes: 1 };
     const created = new Set<string>();
-    mock(crmDb.getLeadById).mockImplementation(async (_l: string, id: string) => ({ ...lead, leadId: id, phone: `+1212555${String(1000 + Number(id.slice(1)))}` }));
+    mock(crmDb.getLeadById).mockImplementation(async (_l: string, id: string) => ({ ...lead, leadId: id, phone: `+1212555${String(1000 + Number(id.slice(1)))}`, system: consentFor(`+1212555${String(1000 + Number(id.slice(1)))}`) }));
     setLeadCallStoreForTests({
       get: async () => null,
       create: async (_l, id) => { if (created.has(id)) return false; created.add(id); return true; },
@@ -825,6 +827,39 @@ describe('plan entitlement', () => {
     expect(provider.placedCalls).toHaveLength(0);
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
+  });
+
+  describe('the paid add-on (HOT_LEAD_CALL_BILLING_REQUIRED)', () => {
+    afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+
+    it('required and not active: skips with not_entitled before any record, even though the plan includes calls', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'past_due', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
+      expect(provider.placedCalls).toHaveLength(0);
+      expect(store.record).toBeNull();
+    });
+
+    it('required and the org has never bought it: skips with not_entitled', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'not_entitled' } }]);
+    });
+
+    it('required and active: calls as before', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(provider.placedCalls).toHaveLength(1);
+    });
+
+    it('not required (the default, also for any value but exactly "true"): never looks at the add-on', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'TRUE';
+      (org as Record<string, unknown>).hotLeadCallBilling = { itemId: 'si_1', status: 'canceled', updatedAt: 'x' };
+      await dispatchHotLeadCall('list-a', 'lead-a', 'form_fill');
+      expect(provider.placedCalls).toHaveLength(1);
+    });
   });
 
   it('reads the plan of the org’s billing owner, not of the list owner', async () => {
@@ -968,7 +1003,7 @@ describe('the call record of the first attempt', () => {
 
 describe('monthly cap and its owner notices (ENG-2783)', () => {
   const submit = async (n: number) => {
-    lead = { ...lead, leadId: `m${n}`, phone: `+1212555${String(1000 + n)}`, createdAt: new Date().toISOString() };
+    lead = { ...lead, leadId: `m${n}`, phone: `+1212555${String(1000 + n)}`, system: consentFor(`+1212555${String(1000 + n)}`), createdAt: new Date().toISOString() };
     store.record = null;
     store.events = [];
     const before = provider.placedCalls.length;
@@ -1008,7 +1043,7 @@ describe('monthly cap and its owner notices (ENG-2783)', () => {
     expect(await submit(3)).toBe('org_monthly_cap');
     expect(store.record).toBeNull();
     expect(store.events).toEqual([{ type: 'call.skipped', detail: { reason: 'org_monthly_cap' } }]);
-    expect([...limits.counters.entries()].map(([k, v]) => [k.split('#')[2], v]).sort()).toEqual([['d', 2], ['h', 2], ['m', 2]]);
+    expect([...limits.counters.entries()].map(([k, v]) => [k.split('#')[2], v]).sort()).toEqual([['d', 2], ['g', 2], ['h', 2], ['m', 2]]);
   });
 
   it('sends the 80% notice once at ceil(0.8 * cap) and the 100% notice once at the first refusal, with the approved copy', async () => {
