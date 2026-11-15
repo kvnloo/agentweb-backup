@@ -142,6 +142,9 @@ function creativeDeps(over: Partial<MetaToolkitCreativeDeps> = {}): MetaToolkitC
     presignGet: jest.fn(() => 'https://b/get'),
     headObject: jest.fn().mockResolvedValue({ key: 'k', contentLength: 2048, contentType: 'image/png' }),
     resolveHost: jest.fn().mockResolvedValue(['104.18.1.1']),
+    // ENG-2915 (7ddb78b5e) probes a public asset URL before the upload. Without this dep every
+    // UPLOAD_* case was refused at the probe and never reached the write it is here to verify.
+    probeUrl: jest.fn(async (url: string) => ({ finalUrl: url, status: 200, contentType: /\.mp4$/.test(url) ? 'video/mp4' : 'image/png', contentLength: 2048 })),
     uploadImage: jest.fn().mockResolvedValue({ success: true, image_hash: 'h' }),
     uploadVideo: jest.fn().mockResolvedValue({ success: true, video: { id: '998877' } }),
     videoStatus: jest.fn().mockResolvedValue({ status: 'ready' }),
