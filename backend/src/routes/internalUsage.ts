@@ -166,9 +166,9 @@ router.post(
       // charge event's DynamoDB sort key (eventId). DynamoDB sort keys are
       // capped at 1024 bytes -- an oversized reportId (a real UUID is ~36
       // chars, so anything past a generous multiple of that is not a
-      // legitimate engine value) would make recordLlmChargeEvent's PUT fail
+      // legitimate engine value) would make the charge-event write fail
       // validation, which the fail-open charging path swallows, silently
-      // omitting the batch from BOTH the counter and itemization. Rejecting
+      // omitting the batch from itemization. Rejecting
       // it here and falling through to the content+time-bucket fingerprint
       // (the same path an absent reportId already takes) keeps the batch
       // charged instead of silently dropped.
@@ -192,8 +192,7 @@ router.post(
       const callerIsAdmin = !!authReq.user.isAdmin;
       // ENG-1251 Greptile P1: captured ONCE and reused for both the ledger
       // row (below, via recordUsage's `date` override) and the charge
-      // event's occurredAt (below, via the charge event
-      // `occurredAt` override). Two independent `new Date()` calls a few
+      // event's occurredAt (below). Two independent `new Date()` calls a few
       // awaits apart can straddle a UTC-midnight boundary -- the ledger row
       // lands on one date, the charge event on the next -- and the
       // itemization reconciliation's (date, model, feature) key no longer
@@ -203,11 +202,10 @@ router.post(
 
       let accepted = 0;
       let skipped = 0;
-      // ENG-1134: quota charge, summed per (user, model, feature) across the
-      // batch rather than applied per record. A batch carries up to 500
-      // records and a per-user counter write would be a read-modify-write on one
-      // user row, so charging per record would mean hundreds of contended
-      // sequential writes for a single task run.
+      // ENG-1134: charge, summed per (user, model, feature) across the batch
+      // rather than written per record. A batch carries up to 500 records, so
+      // charging per record would mean hundreds of sequential ledger writes for
+      // a single task run.
       //
       // ENG-1251 Greptile P1: keyed by (userId, model, feature), not userId
       // alone. The itemization reconciliation (subscription.ts) matches a

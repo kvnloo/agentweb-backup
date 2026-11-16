@@ -78,8 +78,11 @@ import internalUsageRoutes from "../routes/internalUsage";
  * be asserted in -- [userId, tokens, cost (USD), { eventId, model, feature, occurredAt, calls }]
  * -- read from the atomic ledger + charge-event write that is now the only record of the charge.
  */
-function chargeCalls(): Array<[string, number, number, any]> {
-  return mockIncrementUsageWithChargeEvent.mock.calls.map(([, ev]: any[]) => [
+type ChargeAudit = { eventId: string; model: string; feature: string; occurredAt: string; calls: number };
+type ChargeEvent = ChargeAudit & { actingUserId: string; tokens: number; costMicroUsd: number };
+
+function chargeCalls(): Array<[string, number, number, ChargeAudit]> {
+  return mockIncrementUsageWithChargeEvent.mock.calls.map(([, ev]: [unknown, ChargeEvent]) => [
     ev.actingUserId,
     ev.tokens,
     ev.costMicroUsd / 1_000_000,

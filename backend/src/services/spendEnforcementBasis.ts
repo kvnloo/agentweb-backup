@@ -82,19 +82,17 @@ function excludedTiers(): Set<string> {
  */
 export const SPEND_PROJECTION_MAX_STALENESS_MIN_ENV = "AW_SPEND_PROJECTION_MAX_STALENESS_MIN";
 
-/**
- * ENG-2286 / ENG-1250 AC7 -- a MISSING or UNREADABLE projection never falls back to the
- * legacy `AW-Users.tokenUsage` counter (retired; no longer written). The ledger is the
- * only basis for an enforced subject:
- *   - no projection row  -> no spend recorded this month -> counts as $0. That is
- *     the ordinary state of an account's first request of a new month (the row is
- *     created by its first settled event).
- *   - read error         -> FAIL OPEN: admit, and log loudly. Availability over
- *     precision, the same posture as the rest of the metering path.
- *
- * Two other legacy fallbacks remain: the opt-in staleness guard (default off) and a
- * subject the mode flags leave dark or excludes by tier.
- */
+// ENG-2286 / ENG-1250 AC7 -- a MISSING or UNREADABLE projection never falls back to the
+// legacy `AW-Users.tokenUsage` counter (retired; no longer written). The ledger is the
+// only basis for an enforced subject:
+//   - no projection row  -> no spend recorded this month -> counts as $0. That is
+//     the ordinary state of an account's first request of a new month (the row is
+//     created by its first settled event).
+//   - read error         -> FAIL OPEN: admit, and log loudly. Availability over
+//     precision, the same posture as the rest of the metering path.
+//
+// Two other legacy fallbacks remain: the opt-in staleness guard (default off) and a
+// subject the mode flags leave dark or excludes by tier.
 
 /** Log a "no projection yet" subject once per process, not on every request. */
 const missingLogged = new Set<string>();

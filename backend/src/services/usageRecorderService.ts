@@ -55,7 +55,7 @@ export interface RecordUsageContext {
   taskId?: string;
   /**
    * ENG-1251: stable identity for THIS charge, used to dedupe a retried usage
-   * report against the per-user monthly cap (see llmChargeAuditDb.recordLlmChargeEvent).
+   * report against the monthly charge-event record (see llmChargeAuditDb.recordLlmChargeEvent).
    * Omit only when the caller genuinely has no natural per-call id — a retry
    * will then be double-charged, since a fresh one is minted each time.
    */
