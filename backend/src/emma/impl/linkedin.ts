@@ -416,7 +416,26 @@ function declaredErrorClass(error: any): { errorClass?: string } {
 }
 
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+export function normalizeCaption(text: string | undefined | null): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** ENG-3015: URN of a stored live post on this account whose caption matches exactly after whitespace normalisation. */
+export async function findLiveDuplicateCaption(accountId: string, content: string): Promise<string | null> {
+  const target = normalizeCaption(content);
+  if (!target) return null;
+  try {
+    const { getPostsByAccount } = await import('../../services/linkedInPostsDb');
+    const posts = await getPostsByAccount(accountId, 50);
+    const match = (posts || []).find((p: any) => p?.accountId === accountId && normalizeCaption(p?.content) === target);
+    return match ? String((match as any).postId) : null;
+  } catch (err) {
+    console.warn('[AgentMode] ENG-3015 duplicate-caption check skipped (non-fatal):', err);
+    return null;
+  }
+}
+
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -529,6 +548,21 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
       ? options.inReplyToPostId.trim() : undefined;
     if (inReplyToPostId && account.platform !== 'twitter') {
       return { success: false, message: `in_reply_to_post_id is only supported for X (Twitter) accounts, not ${account.platform}. Nothing was posted.` };
+    }
+    // ENG-3015: an interactive LinkedIn publish whose caption is already live on the
+    // same page/profile stops and asks for an explicit confirm (the tool re-calls with
+    // confirm_duplicate_caption=true). Read-only against the stored posts cache; a
+    // read failure never blocks the publish.
+    if (options?.duplicateCaptionGuard === true && account.platform === 'linkedin' && !saveAsDraft) {
+      const existing = await findLiveDuplicateCaption(account.account_id, content);
+      if (existing) {
+        return {
+          success: false,
+          duplicate_caption: true,
+          existing_post_urn: existing,
+          message: `Not posted: this caption is already live on this LinkedIn account (${existing}). Re-call with confirm_duplicate_caption=true only if the user confirms.`,
+        };
+      }
     }
     const result = inReplyToPostId
       ? await (adapter as any).createPost(
