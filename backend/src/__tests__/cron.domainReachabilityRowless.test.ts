@@ -129,6 +129,12 @@ describe("selectRowlessManagedHosts", () => {
     ];
     expect(selectRowlessManagedHosts([ROW], pages)).toEqual([]);
   });
+
+  it("leaves out a sandbox (eval_) user's page (ENG-1907)", () => {
+    expect(
+      selectRowlessManagedHosts([ROW], [{ ...PAGE_EXPIRED, id: "sandbox", userId: "eval_abc" }, PAGE_ANSWERS])
+    ).toEqual([{ pageId: "page-answers", host: "answers.agentwebforms.com" }]);
+  });
 });
 
 describe("runDomainReachabilitySweep, row-less managed hosts (ENG-3095)", () => {
