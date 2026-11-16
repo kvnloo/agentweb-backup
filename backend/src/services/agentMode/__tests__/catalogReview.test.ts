@@ -95,12 +95,12 @@ describe('smokeTestModel', () => {
     expect(body).not.toHaveProperty('temperature'); // supportsTemperature: false
   });
 
-  it('sends temperature when supported, and the Google-provider ignore list for Gemini', async () => {
+  it('sends temperature when supported, and no provider ignore list for Gemini', async () => {
     const request = jest.fn().mockResolvedValue(ok({ choices: [{ message: { content: 'OK' } }] }));
     await smokeTestModel('openrouter/google/gemini-3.5-flash-lite', { ...caps, supportsTemperature: true }, { apiKey: 'k', request: request as any });
     const body = JSON.parse(request.mock.calls[0][1].body);
     expect(body.temperature).toBe(0.7);
-    expect(body.provider.ignore).toEqual(['Google']);
+    expect(body.provider).not.toHaveProperty('ignore');
   });
 
   it('accepts a tool call with no text as a pass', async () => {

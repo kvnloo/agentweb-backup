@@ -79,4 +79,46 @@ for summary in 'Summary of the fix' 'What changed: retries now stop' 'Why this m
   check "substantive summary retained: ${summary}" 'grep -Fq "  ${summary}" <<<"${out}"'
 done
 
+# Post-merge verifier 2026-11-15: the Reviewer-First PR template opens with a
+# "## Risk: ... | Priority: ..." header and section headings. None of them is a summary.
+jq '.[0].body = "## Risk: Low | Priority: Medium\n\n## What was wrong (before)\nBudgets overspent before noon.\n\n## What this fixes (after)\nPaces Meta budgets across the day.\n\n## Linear issue\nENG-101"' \
+  "${MOCK_PRS}" >"${WORKDIR}/template.json"
+cp "${WORKDIR}/template.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "template: risk/priority header is not the summary" '! grep -q "^  Risk:" <<<"${out}"'
+check "template: section heading is not the summary" '! grep -qE "^  What (was wrong|this fixes)" <<<"${out}"'
+check "template: summary is the sentence under What this fixes" 'grep -q "^  Paces Meta budgets across the day.$" <<<"${out}"'
+
+# A markdown heading is structure whatever its words; without a "What this fixes"
+# section the first sentence under the headings is the summary.
+jq '.[0].body = "## Risk: Low | ENG-101\n### Context\nPaces Meta budgets across the day."' \
+  "${MOCK_PRS}" >"${WORKDIR}/heading.json"
+cp "${WORKDIR}/heading.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "any markdown heading skipped, first sentence kept" 'grep -q "^  Paces Meta budgets across the day.$" <<<"${out}" && ! grep -qE "^  (Risk|Context)" <<<"${out}"'
+
+# ENG id precedence: title, then a Linear-Issue / Linear issue line, then first mention.
+jq '.[1].title = "fix(models): prepare upgrade" | .[1].body = "Out of scope: ENG-1606 stays open.\nRetries GA4 sync on 429.\n\nLinear-Issue: ENG-3016"' \
+  "${MOCK_PRS}" >"${WORKDIR}/id.json"
+cp "${WORKDIR}/id.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "Linear-Issue line beats an earlier body mention" 'grep -q "prepare upgrade (ENG-3016, @harshmoney123, #12)" <<<"${out}"'
+check "Linear-Issue line is not the summary" '! grep -q "^  Linear-Issue" <<<"${out}"'
+
+jq '.[1].body = "Follow-up to ENG-1606.\nRetries GA4 sync on 429.\n\n## Linear issue\nENG-3016 (also in the PR title)"' \
+  "${MOCK_PRS}" >"${WORKDIR}/id2.json"
+cp "${WORKDIR}/id2.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "Linear issue heading form beats an earlier body mention" 'grep -q "prepare upgrade (ENG-3016, @harshmoney123, #12)" <<<"${out}"'
+
+jq '.[1].title = "fix(models): prepare upgrade (ENG-102)"' "${MOCK_PRS}" >"${WORKDIR}/id3.json"
+cp "${WORKDIR}/id3.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "title id beats the Linear issue line" 'grep -q "(ENG-102) (ENG-102, @harshmoney123, #12)" <<<"${out}"'
+
+jq '.[1].title = "fix(models): prepare upgrade" | .[1].body = "Follow-up to ENG-1606."' "${MOCK_PRS}" >"${WORKDIR}/id4.json"
+cp "${WORKDIR}/id4.json" "${MOCK_PRS}"
+out="$(DATE=2026-10-22 bash "${SCRIPT}")"
+check "no title id and no Linear issue line: first body mention" 'grep -q "prepare upgrade (ENG-1606, @harshmoney123, #12)" <<<"${out}"'
+
 exit "${FAILED}"

@@ -333,7 +333,8 @@ describe('emma/impl/books.ts (ENG-2103 F2 pilot)', () => {
       mockBookContentDb.createOrUpdateContent.mockResolvedValue({} as any);
       const generateJSONContent = mockLlmServiceReturning('Body.');
 
-      await books.generateBookContent('book-1', 'sec-1', undefined, 'desc', 'short', true, 'user-42', undefined, 'session-9');
+      // chap-1: ENG-2790 (ecde12f29) refuses a chapter-less generate on a section that has chapters.
+      await books.generateBookContent('book-1', 'sec-1', 'chap-1', 'desc', 'short', true, 'user-42', undefined, 'session-9');
 
       const usageContext = generateJSONContent.mock.calls[0][4];
       expect(usageContext).toEqual({ userId: 'user-42', sessionId: 'session-9', feature: 'content_gen' });
@@ -351,7 +352,7 @@ describe('emma/impl/books.ts (ENG-2103 F2 pilot)', () => {
 
       try {
         await books.generateBookContent(
-          'book-1', 'sec-1', undefined, 'desc', 'short', true, 'user-1', 'https://example.com/research.md', 'session-1'
+          'book-1', 'sec-1', 'chap-1', 'desc', 'short', true, 'user-1', 'https://example.com/research.md', 'session-1'
         );
       } finally {
         global.fetch = originalFetch;
