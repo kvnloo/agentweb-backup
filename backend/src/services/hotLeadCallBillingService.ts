@@ -30,6 +30,7 @@ export class HotLeadCallBillingError extends Error {
 const NOT_AVAILABLE = 'The hot lead calls add-on cannot be billed right now. Nothing was charged or turned on; please contact support.';
 const TRIAL_SUBSCRIPTION = 'The hot lead calls add-on can be added once your subscription has taken its first payment (it is in a trial now). Nothing was charged or turned on.';
 const NOT_MONTHLY = 'The hot lead calls add-on is billed monthly and can only be added to a monthly subscription. Nothing was charged or turned on; please contact support.';
+const PAID_NOT_SAVED = 'Your payment for the hot lead calls add-on went through, but we could not finish turning it on. Calling is still off. Try again in a moment: you will not be charged twice.';
 const NO_SUBSCRIPTION = 'The hot lead calls add-on is added to the organization owner’s paid subscription, and none is active. Subscribe to a plan first, then try again. Nothing was charged or turned on.';
 
 let _stripe: Stripe | null = null;
@@ -69,26 +70,43 @@ export function hotLeadCallBillingOf(
   }
 }
 
-/** Writes the mirror from a known-good live fact. Never throws: the Stripe change already happened. */
-async function writeMirror(orgId: string, live: { itemId: string; status: HotLeadCallBilling['status'] }): Promise<void> {
+/** Writes the mirror from a known-good live fact. Never throws; returns whether it was stored (the Stripe change already happened either way). */
+async function writeMirror(orgId: string, live: { itemId: string; status: HotLeadCallBilling['status'] }): Promise<boolean> {
   try {
     await orgDb.updateOrg(orgId, { hotLeadCallBilling: { ...live, updatedAt: new Date().toISOString() } });
+    return true;
   } catch (err) {
     console.error('[hotLeadCallBilling] mirror write failed', { orgId, type: err instanceof Error ? err.name : 'error' });
+    return false;
   }
+}
+
+function productIdOf(item: Stripe.SubscriptionItem): string | undefined {
+  const product = item.price?.product;
+  return typeof product === 'string' ? product : product?.id;
 }
 
 /** Keeps the earliest add-on item on the subscription and deletes the rest with a credit; returns the kept item id. */
 async function removeDuplicateItems(stripe: Stripe, subscriptionId: string, productId: string, orgId: string): Promise<string> {
   const fresh = await stripe.subscriptions.retrieve(subscriptionId);
   const items = fresh.items.data
-    .filter((i) => (typeof i.price?.product === 'string' ? i.price.product : i.price?.product?.id) === productId)
+    .filter((i) => productIdOf(i) === productId)
     .sort((a, b) => a.created - b.created || a.id.localeCompare(b.id));
   for (const extra of items.slice(1)) {
     await stripe.subscriptionItems.del(extra.id, { proration_behavior: 'always_invoice' });
     console.warn('[hotLeadCallBilling] removed a duplicate add-on item', { orgId });
   }
   return items[0].id;
+}
+
+/** removeDuplicateItems that logs a failure instead of throwing (the add-on is paid); the next add attempt retries it. */
+async function removeDuplicatesQuietly(stripe: Stripe, subscriptionId: string, productId: string, orgId: string, fallbackId: string): Promise<string> {
+  try {
+    return await removeDuplicateItems(stripe, subscriptionId, productId, orgId);
+  } catch (err) {
+    console.error('[hotLeadCallBilling] duplicate cleanup failed; it is retried on the next add', { orgId, type: (err as { type?: string })?.type ?? 'error' });
+    return fallbackId;
+  }
 }
 
 /**
@@ -124,8 +142,12 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
     const existing = findHotLeadCallItem(subscription, productId);
     if (existing) {
       // Paid already (for example a retry after the settings write failed): make sure entitlement can see it now.
-      await writeMirror(orgId, { itemId: existing.id, status: 'active' });
-      return { itemId: existing.id, alreadyPresent: true };
+      // A duplicate left by an earlier failed cleanup is retried here, so it cannot keep billing for good.
+      const keptId = subscription.items.data.filter((i) => productIdOf(i) === productId).length > 1
+        ? await removeDuplicatesQuietly(stripe, subscription.id, productId, orgId, existing.id)
+        : existing.id;
+      if (!await writeMirror(orgId, { itemId: keptId, status: 'active' })) throw new HotLeadCallBillingError(PAID_NOT_SAVED);
+      return { itemId: keptId, alreadyPresent: true };
     }
     if (subscription.items.data.some((i) => i.price?.recurring?.interval !== 'month')) {
       console.warn('[hotLeadCallBilling] add refused: subscription is not monthly', { orgId });
@@ -145,12 +167,10 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
     console.info('[hotLeadCallBilling] add-on added', { orgId, priceCents: HOT_LEAD_CALL_ADDON_PRICE_CENTS });
     // Two requests straddling a minute boundary can both pass the live check above and use different keys, so look again
     // and remove any extra item (credited), keeping the earliest one. A failure here is logged, never thrown: the add-on is paid.
-    const keptId = await removeDuplicateItems(stripe, subscription.id, productId, orgId).catch((err) => {
-      console.error('[hotLeadCallBilling] duplicate check failed', { orgId, type: (err as { type?: string })?.type ?? 'error' });
-      return item.id;
-    });
-    // Entitlement reads the mirror; do not wait for the webhook (it can lag or arrive out of order).
-    await writeMirror(orgId, { itemId: keptId, status: 'active' });
+    const keptId = await removeDuplicatesQuietly(stripe, subscription.id, productId, orgId, item.id);
+    // Entitlement reads the mirror; do not wait for the webhook (it can lag or arrive out of order). When it cannot be
+    // stored, calling must not turn on (dispatch would refuse it); the retry finds the paid item and writes the mirror.
+    if (!await writeMirror(orgId, { itemId: keptId, status: 'active' })) throw new HotLeadCallBillingError(PAID_NOT_SAVED);
     return { itemId: keptId, alreadyPresent: false };
   } catch (err) {
     if (err instanceof HotLeadCallBillingError) throw err;
@@ -161,14 +181,15 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
   }
 }
 
-async function retrieveLive(payload: Pick<Stripe.Subscription, 'items' | 'status'> & { id?: string }): Promise<Pick<Stripe.Subscription, 'items' | 'status'>> {
+/** The live subscription, or null when Stripe cannot be read: an event payload may be stale, so it never decides alone. */
+async function retrieveLive(payload: Pick<Stripe.Subscription, 'items' | 'status'> & { id?: string }): Promise<Pick<Stripe.Subscription, 'items' | 'status'> | null> {
   const stripe = getStripe();
   if (!stripe || !payload.id) return payload;
   try {
     return await stripe.subscriptions.retrieve(payload.id);
   } catch (err) {
-    console.warn('[hotLeadCallBilling] live subscription read failed; using the event payload', (err as { type?: string })?.type ?? 'error');
-    return payload;
+    console.error('[hotLeadCallBilling] live subscription read failed; the mirror is left unchanged', (err as { type?: string })?.type ?? 'error');
+    return null;
   }
 }
 
@@ -188,8 +209,9 @@ export async function mirrorHotLeadCallBilling(
     if (!org || org.ownerUserId !== user.userId) return;
     const stored = org.hotLeadCallBilling;
     // Decide from Stripe's current state, not the event payload: events can arrive late or out of order, and a stale one
-    // must not flip a paid add-on to canceled. The payload is the fallback when Stripe cannot be read.
+    // must not flip a paid add-on to canceled. When Stripe cannot be read the mirror is left unchanged.
     const liveSubscription = await retrieveLive(subscription);
+    if (!liveSubscription) return;
     const live = hotLeadCallBillingOf(liveSubscription, productId)
       ?? (stored && stored.status !== 'canceled' ? { itemId: stored.itemId, status: 'canceled' as const } : null);
     if (!live || (stored?.itemId === live.itemId && stored.status === live.status)) return;

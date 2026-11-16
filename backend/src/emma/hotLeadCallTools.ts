@@ -161,18 +161,20 @@ emmaToolRegistry.register({
     const requireEnableApproval = async (next: HotLeadCallConfig) => {
       // With billing required and the add-on not active, the card quotes the flat price (part of the approved digest)
       // and the add-on is bought only after the approval, just before the settings write below.
-      const needsAddon = isHotLeadCallBillingRequired() && !await isHotLeadCallBillingActive(org);
+      const billingRequired = isHotLeadCallBillingRequired();
+      const needsAddon = billingRequired && !await isHotLeadCallBillingActive(org);
       const halt = await requireApproval({
         org,
         context,
-        priceText: needsAddon ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
+        priceText: billingRequired ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
         target: canonicalJson(patch),
         card: {
           action: 'enable',
           number: next.twilioNumber && maskPhone(next.twilioNumber),
           members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
           limits: next,
-          addon: needsAddon,
+          addon: billingRequired,
+          purchase: needsAddon,
         },
       });
       if (halt) throw new ApprovalHalt(halt);
