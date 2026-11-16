@@ -21,7 +21,8 @@ quote counts the saved config merged with the list's current columns, so a colum
 saved counts there but not here (about 3% of the ratio per column).
 
 The per-contact quote has no term for the paid add-ons, so booked dollars here EXCLUDE them: the Apollo email search
-(`apollo:waterfall_email`, called `apollo:full_enrichment` until 2026-11-02; the same $0.445 request) and Enigma
+(`apollo:waterfall_email`, booked as `apollo:full_enrichment` until the ENG-2720 change reached prod, last seen in the
+ledger on 2026-11-03; the same $0.445 request) and Enigma
 (`enigma:*`, which the customer quote adds separately for card-revenue fields). They are shown in their own columns.
 
 Only the three rate constants (and referenceFieldCount) are read from backend/src/services/enrichmentCostEstimate.ts;
@@ -56,7 +57,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ESTIMATE_SRC = os.path.join(REPO, "backend", "src", "services", "enrichmentCostEstimate.ts")
 DEFAULT_LOG_GROUP = "/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log"
 LEDGER_FEATURES = ("crm_enrichment", "enrichment")
-EMAIL_SEARCH_MODELS = ("apollo:waterfall_email", "apollo:full_enrichment")  # same $0.445 request; the second is its name before 2026-11-02
+EMAIL_SEARCH_MODELS = ("apollo:waterfall_email", "apollo:full_enrichment")  # same $0.445 request; the second is its older ledger name (last seen 2026-11-03)
 ENIGMA_PREFIX = "enigma:"
 
 
@@ -80,13 +81,20 @@ def plural(n, word):
 
 def read_rate(name):
     """Read one numeric constant (a literal or simple arithmetic such as `(2.673 + 2.128) / 118`) from the source."""
+    where = os.path.relpath(ESTIMATE_SRC, REPO)
     with open(ESTIMATE_SRC, encoding="utf-8", errors="replace") as fh:
         src = fh.read(5_000_001)
     if len(src) > 5_000_000:
-        sys.exit("%s is unexpectedly large" % ESTIMATE_SRC)
-    m = re.search(r"^[ \t]*%s:\s*([0-9.+\-*/() ]+?),\s*(?://.*)?$" % re.escape(name), src, re.M)
+        sys.exit("%s is unexpectedly large" % where)
+    pattern = re.compile(r"[ \t]*%s:[ \t]*([0-9.+\-*/() ]+?),[ \t]*(?://.*)?" % re.escape(name))
+    m = None
+    for line in src.splitlines():
+        if len(line) <= 300:  # a constant line is short; skipping long lines keeps this linear on hostile input
+            m = pattern.fullmatch(line)
+            if m:
+                break
     if not m:
-        sys.exit("cannot find %s in %s: did the estimate change shape? Update this script." % (name, ESTIMATE_SRC))
+        sys.exit("cannot find %s in %s: did the estimate change shape? Update this script." % (name, where))
     val = _arith(m.group(1).strip(), name)
     if not (math.isfinite(val) and val > 0):
         sys.exit("%s must be a finite number above zero, got %s" % (name, short(val)))
@@ -124,7 +132,7 @@ class Aws:
             r = subprocess.run(self.base + list(args) + ["--output", "json"], capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=1800)
         except FileNotFoundError:
-            sys.exit("cannot run %s" % short(self.base[0]))
+            sys.exit("cannot run the --aws command (is the AWS CLI installed?)")
         except subprocess.TimeoutExpired:
             sys.exit("aws %s did not finish within 30 minutes (a credentials prompt, or a very wide --since)" % label)
         if r.returncode != 0:
@@ -161,9 +169,9 @@ def main():
         if getattr(a, flag) < 1:
             ap.error("--%s must be at least 1" % flag.replace("_", "-"))
     now = dt.datetime.now(dt.timezone.utc)
-    if not re.fullmatch(r"[A-Za-z0-9_./#-]+", a.log_group):  # the AWS CLI reads a file for values like file:///path
-        sys.exit("--log-group may only contain letters, digits and _ . / # -")
-    if not re.fullmatch(r"[a-z0-9-]+", a.region):
+    if not re.fullmatch(r"[A-Za-z0-9/][A-Za-z0-9_./#-]*", a.log_group):  # the AWS CLI reads a file for values like file:///path and takes a leading dash as a flag
+        sys.exit("--log-group must start with a letter, digit or / and contain only letters, digits and _ . / # -")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", a.region):
         sys.exit("--region must look like us-west-2")
     try:
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.since):  # ASCII only; strptime accepts 2026-11-5 and the ledger date filter is a string compare
@@ -192,12 +200,13 @@ def main():
         if len(entry) < 6:
             sys.exit("--exclude-user-ids entries must be at least 6 characters (the prefix printed in the table)")
     d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId, email, isAdmin")
+    users = [u for u in d.get("Items", []) if u.get("userId", {}).get("S")]
+    if not users:
+        sys.exit("the user table scan returned no accounts, so staff cannot be told from customers: refusing to continue")
     why = {"platform admins": set(), "test emails": set(), "internal domains": set(), "--exclude-user-ids": set()}
     matched_entries = set()
-    for u in d.get("Items", []):
-        uid = u.get("userId", {}).get("S")
-        if not uid:
-            continue
+    for u in users:
+        uid = u["userId"]["S"]
         em = (u.get("email", {}).get("S") or "").strip().lower()
         if u.get("isAdmin", {}).get("BOOL"):
             why["platform admins"].add(uid)
@@ -209,10 +218,11 @@ def main():
             if uid.startswith(entry):
                 why["--exclude-user-ids"].add(uid); matched_entries.add(entry)
     test_ids = set().union(*why.values())
-    for entry in id_entries:
+    for i, entry in enumerate(id_entries, 1):
         if entry not in matched_entries:
-            print("WARNING: no account matches --exclude-user-ids entry %s" % short(entry, 40))
-    print("excluded accounts: %d (%s; one account can match several rules)" % (len(test_ids), ", ".join("%s %d" % (k, len(v)) for k, v in why.items())))
+            print("WARNING: no account matches --exclude-user-ids entry number %d (%d characters)" % (i, len(entry)))
+    print("excluded accounts: %d of %d (%s; one account can match several rules)"
+          % (len(test_ids), len(users), ", ".join("%s %d" % (k, len(v)) for k, v in why.items())))
 
     start_ms = int(since_dt.timestamp() * 1000)
     groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups", [])
@@ -225,10 +235,15 @@ def main():
     ev = lambda pat: aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
                          "--filter-pattern", pat).get("events", [])
     starts = {}
+    odd_lines = 0
     for x in ev('"runEnrichment START"'):
         m = re.search(r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)", x["message"])
-        if m:
-            starts[m.group(4)] = (m.group(2), m.group(3), m.group(1))
+        if not m:
+            continue
+        if m.group(3) not in ("enrich", "preview") or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", m.group(2)):
+            odd_lines += 1  # only the fixed mode names and a plain id are ever copied into the table
+            continue
+        starts[m.group(4)] = (m.group(2), m.group(3), m.group(1))
     finished = {}
     for x in ev('"runEnrichment DONE"'):
         m = re.search(r"\[v3\] runEnrichment DONE runId=(\S+) processed=(\d+)", x["message"])
@@ -243,6 +258,8 @@ def main():
         runs.append(dict(uid=uid, day=day, mode=mode, p=processed, lid=lid))
     cust = [r for r in runs if r["uid"] not in test_ids]
     print("runs since %s: %d in the logs, %d from excluded accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
+    if odd_lines:
+        print("ignored %s with an unexpected mode or user id" % plural(odd_lines, "log line"))
     unfinished = sum(1 for rid, st in starts.items() if rid not in finished and st[0] not in test_ids)
     orphans = sum(1 for rid in finished if rid not in starts)
     print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
@@ -265,10 +282,19 @@ def main():
             "--projection-expression", "userId, #d, model, feature, callCount, costMicroUsd",
             "--filter-expression", "#d >= :s AND (feature = :a OR feature = :b)", "--expression-attribute-names", '{"#d":"date"}',
             "--expression-attribute-values", json.dumps({":s": {"S": a.since}, ":a": {"S": LEDGER_FEATURES[0]}, ":b": {"S": LEDGER_FEATURES[1]}}))
+    skipped_rows = 0
     for r in d.get("Items", []):
-        k = (r["userId"]["S"], r["date"]["S"])
-        led[k][r["model"]["S"]][0] += int(r["callCount"]["N"])
-        led[k][r["model"]["S"]][1] += int(r["costMicroUsd"]["N"])
+        try:
+            k = (r["userId"]["S"], r["date"]["S"])
+            calls, micro = int(r["callCount"]["N"]), int(r["costMicroUsd"]["N"])
+            model = r["model"]["S"]
+        except (KeyError, ValueError, TypeError):
+            skipped_rows += 1
+            continue
+        led[k][model][0] += calls
+        led[k][model][1] += micro
+    if skipped_rows:
+        print("skipped %s that did not have the expected fields" % plural(skipped_rows, "ledger row"))
 
     agg = collections.defaultdict(lambda: dict(p=0, fp=0, modes=collections.Counter()))
     for r in cust:
@@ -305,21 +331,21 @@ def main():
     share = max(by_account.values()) / tot_n
     print("  %d contacts from %s: booked $%.2f vs quote $%.2f (booked/quote = %.2f), paid add-ons excluded"
           % (tot_n, plural(len(by_account), "account"), tot_b, tot_q, ratio))
-    print("  the largest account supplies %d%% of the contacts; %d of them supplied at least %d contacts each"
-          % (round(100 * share), len(qualifying), a.min_customer_contacts))
+    print("  the largest account supplies %.1f%% of the contacts; %d of them supplied at least %d contacts each"
+          % (100 * share, len(qualifying), a.min_customer_contacts))
     short_of = []
     if tot_n < a.min_contacts:
         short_of.append("only %d contacts (need %d)" % (tot_n, a.min_contacts))
     if len(qualifying) < a.min_customers:
         short_of.append("only %s with at least %d contacts each (need %d)" % (plural(len(qualifying), "account"), a.min_customer_contacts, a.min_customers))
     if share > a.max_account_share:
-        short_of.append("one account supplies %d%% of the contacts (at most %d%% allowed)" % (round(100 * share), round(100 * a.max_account_share)))
+        short_of.append("one account supplies %.1f%% of the contacts (at most %g%% allowed)" % (100 * share, 100 * a.max_account_share))
     if short_of:
         print("  INSUFFICIENT DATA (%s): do NOT retune; run again later with the same --since." % "; ".join(short_of))
     elif abs(ratio - 1) > a.tolerance:
-        print("  DRIFT beyond +/-%d%%: retune ENRICHMENT_COST_RATES_USD in enrichmentCostEstimate.ts (see the runbook)." % round(a.tolerance * 100))
+        print("  DRIFT beyond +/-%g%%: retune ENRICHMENT_COST_RATES_USD in enrichmentCostEstimate.ts (see the runbook)." % (100 * a.tolerance))
     else:
-        print("  Within +/-%d%%: leave the constants alone." % round(a.tolerance * 100))
+        print("  Within +/-%g%%: leave the constants alone." % (100 * a.tolerance))
 
 
 if __name__ == "__main__":
