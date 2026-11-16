@@ -1375,4 +1375,73 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(prompt).toContain('Software');
     });
   });
+  // ENG-3067: the shadow claim check runs on both server-side draft paths and
+  // can neither change nor fail the draft.
+  describe('shadow claim check (ENG-3067)', () => {
+    const run = async () => {
+      const listId = 'list-shadow';
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId, name: 'L', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId, email: 'lead@example.com', firstName: 'John', linkedin: 'https://linkedin.com/in/john',
+      });
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+      mockReadBrandGuidelines.mockResolvedValue({ exists: true, brandData: { brandName: 'Acme' }, formattedContent: 'Acme' });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+      mockCreate.mockImplementation(async ({ messages }: any) => ({
+        choices: [{
+          message: {
+            content: String(messages[messages.length - 1].content).includes('LinkedIn connection request note')
+              ? JSON.stringify({ content: 'John, we cut onboarding by 70% last year.' })
+              : JSON.stringify({ subject: 'Idea', textContent: 'We cut reporting time by 40%.' }),
+          },
+        }],
+      }));
+      const result = await (agentModeService as any).updateEmailDraftForLead(listId, 'lead1', 'Draft it', 's1', 'user1', 'text');
+      return { result, saved: (crmDb.updateLead as jest.Mock).mock.calls.at(-1)?.[2] };
+    };
+    const strip = (v: any) => JSON.stringify(v, (k, val) => (k === 'createdAt' || k === 'updatedAt' ? undefined : val));
+    const shadowLines = (spy: jest.SpyInstance) => spy.mock.calls
+      .map(c => String(c[0]))
+      .filter(l => l.includes('outreach_claim_check_shadow'));
+
+    it('logs one count-only line per draft with the lead list id', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        const { result } = await run();
+        expect(result.success).toBe(true);
+        const lines = shadowLines(logSpy);
+        expect(lines.map(l => JSON.parse(l))).toEqual([
+          expect.objectContaining({ channel: 'email', listId: 'list-shadow', status: 'checked', unsupportedTotal: 1 }),
+          expect.objectContaining({ channel: 'linkedin_note', listId: 'list-shadow', status: 'checked', unsupportedTotal: 1 }),
+        ]);
+        for (const line of lines) {
+          expect(line).not.toContain('reporting');
+          expect(line).not.toContain('onboarding');
+        }
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    it('returns and saves the same drafts when the check blows up', async () => {
+      const quiet = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+      const ok = await run();
+      quiet.mockRestore();
+      const failing = jest.spyOn(console, 'log').mockImplementation((...args: any[]) => {
+        if (String(args[0]).includes('outreach_claim_check_shadow')) throw new Error('shadow check failed');
+      });
+      try {
+        const broken = await run();
+        expect(shadowLines(failing).length).toBeGreaterThan(0);
+        expect(broken.result.success).toBe(true);
+        expect(strip(broken.result)).toBe(strip(ok.result));
+        expect(strip(broken.saved)).toBe(strip(ok.saved));
+        expect(broken.saved.emailDraft.textContent).toBe('We cut reporting time by 40%.');
+      } finally {
+        failing.mockRestore();
+      }
+    });
+  });
 });
