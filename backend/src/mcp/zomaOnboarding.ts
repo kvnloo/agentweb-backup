@@ -18,6 +18,7 @@ import { stripeService, type UserPaymentMethod } from '../services/stripeService
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
+import { getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import {
   GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable,
   ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
@@ -38,6 +39,11 @@ export interface ZomaMetaAccountSummary {
   currency?: string;
   /** D4: only `granted_scopes` (from Meta's debug_token) is authoritative. */
   ads_management: 'granted' | 'missing' | 'unknown';
+  /**
+   * ENG-3078: present only when the stored Page probe (`has_meta_pages`) says no Facebook
+   * Page is accessible. Absent for granted and for never-probed, which must change nothing.
+   */
+  page_access?: 'missing';
 }
 
 export interface ZomaGoogleAdsAccountSummary {
@@ -116,7 +122,19 @@ function summarize(account: ConnectedAccount): ZomaMetaAccountSummary {
     name: (account as any).account_name,
     currency: cfg?.currency,
     ads_management: adsManagementScopeState(account),
+    ...(getMetaPagesAccessState(cfg) === 'missing' ? { page_access: 'missing' as const } : {}),
   };
+}
+
+/**
+ * ENG-3078: the same refusal text the ad write gate returns (emma/impl/adsApis.ts), one per
+ * distinct message, for usable Meta accounts whose Page access is confirmed missing.
+ */
+function metaPageProblem(accounts: ConnectedAccount[]): string | null {
+  const messages = accounts
+    .filter((a) => getMetaPagesAccessState(a.config as any) === 'missing')
+    .map((a) => getMetaAdsNoPagesMessage(a.config as any));
+  return messages.length ? [...new Set(messages)].join('\n') : null;
 }
 
 function usableAccounts(accounts: ConnectedAccount[], provider: ZomaProvider, now: number): ConnectedAccount[] {
@@ -238,7 +256,7 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
-  readiness.next_step = nextStep(payment, meta, readiness.google_ads);
+  readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? metaPageProblem(accounts);
   return readiness;
 }
 
