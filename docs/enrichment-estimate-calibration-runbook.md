@@ -38,7 +38,7 @@ to, so it confirms the fit, not the quote. A window that includes it is dominate
 Always read the per-line table before acting on the verdict.
 
 Expect it to take a while: the log search is the slow part, one combined search for both the START and DONE lines at
-roughly 30 seconds per log day (a 13-day `--since` took about 7 minutes on 2026-11-16; each AWS call has a 30-minute limit).
+roughly 30 seconds per log day (a 13-day `--since` took 6 to 9 minutes on four runs on 2026-11-16 and 48 minutes on a fifth, when AWS was slow; each AWS call has a 30-minute limit).
 It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs filter-log-events`, `dynamodb scan` and
 `dynamodb get-item`. It prints one line per account and day (6-character user id prefix, contacts, fields, booked dollars,
 dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. The mode and the user id come from
