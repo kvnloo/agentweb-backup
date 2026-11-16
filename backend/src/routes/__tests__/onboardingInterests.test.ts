@@ -27,6 +27,8 @@ jest.mock('../../services/db', () => ({
 jest.mock('../../controllers/auth', () => ({
   register: jest.fn((_req: any, res: any) => res.status(200).json({})),
   login: jest.fn((_req: any, res: any) => res.status(200).json({})),
+  // ENG-2686 (8dbfcac8d) added POST /logout; auth.ts fails to load if the stub omits it.
+  logout: jest.fn((_req: any, res: any) => res.status(204).end()),
   googleCallback: jest.fn(),
   forgotPassword: jest.fn((_req: any, res: any) => res.status(200).json({})),
   resetPassword: jest.fn((_req: any, res: any) => res.status(200).json({})),

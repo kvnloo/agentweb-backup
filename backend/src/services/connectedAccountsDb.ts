@@ -810,8 +810,9 @@ export type AccountConfigMutation =
  *
  * ENG-1873. `TransactionConflictException` means another request holds a
  * transaction on this item right now — on the users table that is, in practice,
- * `applyMonthlyChargeAtomic`, which `tokenUsageService` runs for each LLM
- * completion. A tool call executes the moment its completion returns, often
+ * the per-completion charge transaction that `tokenUsageService` used to run
+ * for each LLM completion (retired in ENG-2286; the retry stays as cheap
+ * insurance against any other writer). A tool call executes the moment its completion returns, often
  * while that completion's charge transaction is still committing, so the tool's
  * config write lost the race and was treated as fatal. AWS documents the error
  * as transient; `paymentHistoryDb` and `usageRecordDb` already classify it so.

@@ -511,6 +511,21 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     same requirement — calling one is not evidence the other's
   //     requirement was also satisfied. Not aliased; logged here so it
   //     isn't silently missed.
+  //   - get_lead_conversation_statuses -> get_lead_details / linkedin_outreach
+  //     (ENG-2811, 4c959218f): a new READ-ONLY batch audit tool whose
+  //     description says to use it instead of calling the per-lead tools once
+  //     per lead. Its execute() is leadsImpl.getLeadConversationStatuses, a
+  //     read. The redirect points AWAY from linkedin_outreach (the write-capable
+  //     tool) toward a read, and a schedule that requires linkedin_outreach is
+  //     not satisfied by a status read, so aliasing would credit a call that did
+  //     not send anything. Not aliased; logged here so it isn't silently missed.
+  //   - google_search_web -> you_search_web (ENG-1281, c66e91101): Google
+  //     Custom Search was retired and google_search_web is now a legacy alias
+  //     that returns the same You.com results. Both are READ-ONLY web searches
+  //     (search_ matches READ_ONLY_TOOL for you_search_web; google_search_web
+  //     runs the same executor), so a miss can only nudge toward a redundant
+  //     read, never a false-skip or a missed publish. Same disposition as
+  //     call_meta_ads_insights_api <-> get_meta_ads_metrics. Not aliased.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -548,7 +563,10 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'email -> send_email_from_sender',
         'generate_video -> compose_video',
         'get_deployment_status -> coding_agent',
+        'get_lead_conversation_statuses -> get_lead_details',
+        'get_lead_conversation_statuses -> linkedin_outreach',
         'get_meta_ads_metrics -> call_meta_ads_insights_api',
+        'google_search_web -> you_search_web',
         'list_knowledge_base_files -> materialize_knowledge_base_asset',
         'list_knowledge_base_files -> read_knowledge_base_files',
         'perform_deep_research -> create_blog_article',

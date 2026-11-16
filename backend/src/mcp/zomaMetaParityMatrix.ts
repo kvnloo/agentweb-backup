@@ -43,6 +43,16 @@ const covered = (category: string, source: string, metaTool: string, zoma: ZomaO
 const gap = (category: string, source: string, metaTool: string, owner = source): ParityRow =>
   ({ metaTool, category, source, status: 'gap', owner });
 const same = (category: string, source: string, name: string): ParityRow => covered(category, source, name, { tool: name });
+const notApplicable = (category: string, source: string, metaTool: string, reason: string): ParityRow =>
+  ({ metaTool, category, source, status: 'not_applicable', reason });
+
+/** ENG-3031: what was checked before a Reporting row was marked not_applicable. */
+const NO_PUBLIC_INSIGHTS_ENDPOINT =
+  'No public Graph endpoint or field: not in the Ad Account reference (fields and edges) or the Ad Account / Campaign / Ad Set Insights references, checked 2026-11-15.';
+
+/** ENG-3056: what was checked before the six pixel rule write rows were marked not_applicable. */
+const NO_PUBLIC_PIXEL_RULE_WRITE =
+  'No public Graph write: the Ads Pixel event_rules and extractors edge references each state that creating, updating and deleting cannot be performed on the endpoint, the Ad Pixel reference lists no other rule edge, and the rule nodes (CalibratorExistingRule, SignalsIWLExtractor) have no reference page, checked 2026-11-16.';
 
 const EDITS = 'Campaign management';
 const AUDS = 'Audiences';
@@ -56,14 +66,17 @@ const DIA = 'Diagnostics & help';
 
 export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   // ENG-2913 — base discovery/lifecycle names are part of the official inventory.
-  // Keep conservative gaps until each complete operation contract is proven.
-  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts'),
-  gap(EDITS, 'ENG-2913', 'ads_create_campaign'),
-  gap(EDITS, 'ENG-2913', 'ads_create_ad_set'),
-  gap(EDITS, 'ENG-2913', 'ads_create_ad'),
-  gap(EDITS, 'ENG-2913', 'ads_activate_entity'),
+  // ENG-3034: create and activate are the guarded call_meta_marketing_api writes
+  // (always created PAUSED; status=ACTIVE is its own preview and approval), proven
+  // per entity in eng3034.campaignManagementParity.test.ts. The two read rows are
+  // still gaps, owned by ENG-3040.
+  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts', 'ENG-3040'),
+  covered(EDITS, 'ENG-2913', 'ads_create_campaign', { tool: MMA, action: 'CREATE', entityType: 'CAMPAIGN' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad_set', { tool: MMA, action: 'CREATE', entityType: 'AD_SET' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad', { tool: MMA, action: 'CREATE', entityType: 'AD' }),
+  covered(EDITS, 'ENG-2913', 'ads_activate_entity', { tool: MMA, action: 'UPDATE' }),
   covered(EDITS, 'ENG-2913', 'ads_update_entity', { tool: MMA, action: 'UPDATE' }),
-  gap(EDITS, 'ENG-2913', 'ads_get_field_context'),
+  gap(EDITS, 'ENG-2913', 'ads_get_field_context', 'ENG-3040'),
   covered(EDITS, 'ENG-2913', 'ads_get_ad_preview', { tool: MMA, action: 'PREVIEW', entityType: 'AD' }),
 
   // ENG-2914
@@ -84,10 +97,15 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
 
   // ENG-2916
   gap(REP, 'ENG-2916', 'ads_get_opportunity_score'),
-  gap(REP, 'ENG-2916', 'ads_insights_advertiser_context'),
-  gap(REP, 'ENG-2916', 'ads_insights_anomaly_signal'),
-  gap(REP, 'ENG-2916', 'ads_insights_auction_ranking_benchmarks'),
-  gap(REP, 'ENG-2916', 'ads_insights_industry_benchmark'),
+  // ENG-3031: these three are computed inside Meta's own MCP server. No public Marketing API
+  // endpoint or field was found for them, and a substitute score of our own is out of scope.
+  notApplicable(REP, 'ENG-3031', 'ads_insights_advertiser_context', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_anomaly_signal', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  // ENG-3031: Meta's public auction comparison is the three ad relevance diagnostics, which
+  // call_meta_ads_insights_api already accepts as fields (quality_ranking,
+  // engagement_rate_ranking, conversion_rate_ranking). eng3031 test pins that.
+  covered(REP, 'ENG-3031', 'ads_insights_auction_ranking_benchmarks', { tool: 'call_meta_ads_insights_api' }),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_industry_benchmark', NO_PUBLIC_INSIGHTS_ENDPOINT),
   covered(REP, 'ENG-2916', 'ads_insights_performance_trend', { tool: 'call_meta_ads_insights_api' }),
   gap(REP, 'ENG-2916', 'ads_get_ad_entities'),
 
@@ -97,13 +115,13 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   same(SIG, 'ENG-2917', 'ads_get_dataset_stats'),
   covered(SIG, 'ENG-2917', 'ads_get_dataset_quality', { tool: MMA, action: 'GET_MATCH_QUALITY', entityType: 'DATASET' }),
   same(SIG, 'ENG-2917', 'ads_pixel_event_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   gap(SIG, 'ENG-2917', 'ads_pixel_parameter_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   same(SIG, 'ENG-2917', 'ads_get_customconversions'),
 
   // ENG-2918 (canonical official Meta tool names)
