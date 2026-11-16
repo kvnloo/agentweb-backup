@@ -36,7 +36,7 @@ export class LinkedInService {
       timeout: 15000, // 15 second timeout
       headers: {
         'X-Restli-Protocol-Version': '2.0.0',
-        'LinkedIn-Version': '202511',
+        'LinkedIn-Version': '202610', // 202511 sunsets 2026-11-16; 202610 is supported until 2027-10-15
         'Content-Type': 'application/json',
       },
     });
