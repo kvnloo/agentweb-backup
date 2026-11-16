@@ -182,6 +182,14 @@ export function aaCreator(row: Record<string, unknown> | undefined): string | un
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
+/**
+ * Lab names the current endpoint sends that no longer normalize to the registry provider.
+ * The retired endpoint sent a creator slug that did; the live response names Grok's lab
+ * "SpaceXAI" (seen in run 43771490745, ENG-3029), which left every `x-ai/*` entry unmatched.
+ * Only names seen in a live response belong here.
+ */
+const AA_CREATOR_ALIASES: Readonly<Record<string, string>> = { spacexai: 'xai' };
+
 /** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
  * Source: https://artificialanalysis.ai/data-api/docs
  */
@@ -206,7 +214,7 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
     const score = evaluations?.artificial_analysis_intelligence_index;
     if (!row || typeof row.slug !== 'string' || creator === undefined
       || typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) return [];
-    return [{ slug: row.slug, provider: normalize(creator), score,
+    return [{ slug: row.slug, provider: AA_CREATOR_ALIASES[normalize(creator)] ?? normalize(creator), score,
       name: typeof row.name === 'string' ? row.name : row.slug }];
   });
   for (const [id, config] of Object.entries(registry)) {
