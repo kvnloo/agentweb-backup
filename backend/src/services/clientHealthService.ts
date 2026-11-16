@@ -295,7 +295,43 @@ function buildPaymentInfo(user: any): PaymentInfo {
 const META_RECONNECT_INSTRUCTIONS =
   'Click Edit access, select all current and future Pages, approve all permissions.';
 
-function buildMetaConnectionHealth(account: AdConnectionAccount | undefined): MetaConnectionHealth | undefined {
+/** ENG-3079: longest the optimisation-event read may hold up a health check. */
+export const SELECTED_EVENT_READ_TIMEOUT_MS = 8_000;
+
+/**
+ * ENG-3079: is the event this client's ad sets optimise for arriving? A live read that reuses
+ * the tracking monitor's own fetch and verdict (metaOptimisationCoverage), so the window and
+ * the event matching are the monitor's. Nothing is stored. Never throws: a failed, slow or
+ * unusable read is `unknown`, never `missing`.
+ */
+export async function readSelectedEventState(
+  adAccountId: string,
+  accessToken: string,
+  timeoutMs: number = SELECTED_EVENT_READ_TIMEOUT_MS,
+): Promise<MetaConnectionHealth['selected_event']> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const { fetchOptimisationInputs, evaluateAccountOptimisationCoverage, selectedEventState } =
+      await import('./metaOptimisationCoverage');
+    const read = fetchOptimisationInputs(adAccountId, accessToken);
+    read.catch(() => undefined); // a rejection after the timeout must not go unhandled
+    const timedOut = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
+    const inputs = await Promise.race([read, timedOut]);
+    if (!inputs || inputs.status !== 'ok') return 'unknown';
+    return selectedEventState(evaluateAccountOptimisationCoverage(
+      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet, new Date().toISOString().slice(0, 10),
+    ));
+  } catch {
+    return 'unknown';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function buildMetaConnectionHealth(
+  account: AdConnectionAccount | undefined,
+  selectedEvent: MetaConnectionHealth['selected_event'] = 'unknown',
+): MetaConnectionHealth | undefined {
   if (!account) return undefined;
   const config = account.config ?? {};
   const declined = Array.isArray(config.declined_required_permissions)
@@ -327,7 +363,7 @@ function buildMetaConnectionHealth(account: AdConnectionAccount | undefined): Me
     page_access: pageAccess,
     ...(pageCount !== undefined ? { page_count: pageCount } : {}),
     ...(pageError ? { page_error: pageError } : {}),
-    selected_event: 'unknown',
+    selected_event: selectedEvent,
     reconnect_required: reconnectRequired,
     ...(reconnectRequired ? { reconnect_instructions: META_RECONNECT_INSTRUCTIONS } : {}),
   };
@@ -571,6 +607,8 @@ export async function assessClientHealth(
      * ticket exists to eliminate, just via a first-page API error instead of a wrong token source.
      */
     let campaignsComplete = !hasAds;
+    // ENG-3079: started beside the campaign reads and awaited once, below. Never rejects.
+    let selectedEventRead: Promise<MetaConnectionHealth['selected_event']> | undefined;
 
     if (hasAds) {
       try {
@@ -604,6 +642,9 @@ export async function assessClientHealth(
         }
         const apiVersion = process.env.META_API_VERSION || 'v25.0';
         const adAccountId = resolvedAdAccountId;
+        if (connectedMetaAccount && adAccountId && accessToken) {
+          selectedEventRead = readSelectedEventState(adAccountId, accessToken);
+        }
 
         // Current 14-day window and the prior 14-day window immediately preceding it, used as
         // the baseline for CTR-drop / CPM-rise fatigue checks. Fetched via the Graph API's
@@ -711,7 +752,7 @@ export async function assessClientHealth(
 
     const adConnection = classifyMetaAdConnection(connectedAccounts, client.adAccount, nowMs);
     const allPlatforms = classifyAdConnections(connectedAccounts, client.adAccount, nowMs);
-    const metaConnectionHealth = buildMetaConnectionHealth(connectedMetaAccount);
+    const metaConnectionHealth = buildMetaConnectionHealth(connectedMetaAccount, await selectedEventRead);
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
       connection: adConnection.connection,
