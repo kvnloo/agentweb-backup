@@ -39,7 +39,8 @@ Always read the per-line table before acting on the verdict.
 
 It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs filter-log-events`, `dynamodb scan` and
 `dynamodb get-item`. It prints one line per account and day (6-character user id prefix, contacts, fields, booked dollars,
-dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. It prints no email, lead or field
+dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. The mode and the user id come from
+log text, so only the modes `enrich` and `preview` and plain ids are accepted; other lines are ignored and counted. It prints no email, lead or field
 value. AWS error text is reduced to the error code and the operation (the full text can carry account names); run the same
 `aws` command by hand to read it.
 
@@ -69,7 +70,8 @@ written is the IAM role: run it with a read-only one. The script reads the three
   lookup): its person and company lookups cost about $0.094 a contact against the quote's $0.041 lookup term. Expect single
   runs above the quote.
 - The paid add-ons have no term in the per-contact quote, so they are excluded from the ratio and shown in their own
-  columns: the Apollo email search (`apollo:waterfall_email`, called `apollo:full_enrichment` until 2026-11-02, $0.445 a
+  columns: the Apollo email search (`apollo:waterfall_email`, booked as `apollo:full_enrichment` until the ENG-2720 change reached prod and last seen in the
+  ledger on 2026-11-03, $0.445 a
   request, hit or miss; the quote models it as a share of the emailless leads it can reach, `apolloEligibleRate` and
   `apolloOtherRate`) and Enigma (`enigma:*`, which the customer
   quote adds separately for card-revenue fields).
@@ -82,6 +84,10 @@ written is the IAM role: run it with a read-only one. The script reads the three
 - A run that straddles midnight UTC is split across days. A run that started before `--since` is not counted (the script
   reports how many, account unknown), and a customer run that started but never finished (still running or crashed) leaves
   its cost in the booked dollars with no contacts (also reported).
+- Contacts include preview-mode contacts (the 2026-11-03 "148 contacts" is 146 enrich plus 2 preview), and a lead that failed
+  still cost money but is not a contact (every customer run checked had `failed=0`).
+- If the user-table scan came back truncated, internal accounts would count as customers: the script refuses an empty scan
+  and prints how many accounts it read, so compare that with the table's size.
 - The gate counts accounts that each supplied at least `--min-customer-contacts` (default 10) contacts, and refuses a
   verdict when one account supplies more than `--max-account-share` (default 0.5) of the contacts; the verdict prints that
   share. Read the per-line table anyway.
@@ -94,18 +100,18 @@ written is the IAM role: run it with a read-only one. The script reads the three
   enrichment on 2026-11-05: the run started at 02:33:08 and finished at 02:34:17, processed 30 contacts and skipped 54
   leads that had no usable identity; the ledger shows 29 person lookups and the one $0.445 search. It is the single broker
   request in the 2026-11-13 recalibration sample.
-- **A real found-email callback has very likely been observed.** For that search, the placeholder in `AW-EnrichmentRawCache`
-  was created at 02:33:46.181 and stamped `completed` with a `verified` email status at 02:33:49.017, 2.8 seconds later,
-  while that customer's run was in progress. Our own simulated callbacks were all sent on 2026-11-04 in the Argusoft admin
-  test account, and nothing suggests a forged write on this row, but we cannot prove who called the webhook (anyone with the
-  callback secret could). We have not seen the payload itself (Apollo publishes no callback example) and did not trace
-  which code path wrote the lead's email.
+- **A real found-email callback was possibly observed, but this is not proof.** For that search, the placeholder in
+  `AW-EnrichmentRawCache` was created at 02:33:46.181 and stamped `completed` with a `verified` email status at 02:33:49.017,
+  2.8 seconds later, while that customer's run was in progress. That is much faster than every other callback stamp we have
+  (23 to 52 seconds), anyone holding the callback secret could have posted it, we have not seen the payload (Apollo
+  publishes no callback example), and we did not trace which code path wrote the lead's email. Our own simulated callbacks
+  were sent on 2026-11-04 in the Argusoft admin test account; none is known on this row. Treat the found-email path as
+  unproven until a callback whose payload has been seen.
 - **The seven placeholder rows that existed on 2026-11-16:** that one customer row; five in the Argusoft admin test account
   on 2026-11-04: four created by the live test at 16:14, of which two still show their callback stamps (23 and 28 seconds
   after creation, both empty) and two were overwritten at 16:20 by our own simulated callbacks (one `completed`, one
-  empty), and a fifth created at 17:32 after the secret was rotated and stamped empty 35 seconds later (our ENG-2801 notes
-  record all of these live-test callbacks as real); and one empty callback in the test account on 2026-11-12, stamped 52
-  seconds after creation.
+  empty), and a fifth created at 17:32 after the secret was rotated and stamped empty 35 seconds later; and one empty
+  callback in the test account on 2026-11-12, stamped 52 seconds after creation.
 - **Real people, name and company only, no LinkedIn:** 0 of 8 fired the search (3 founders on 2026-11-05, 5 people on
   2026-11-16): the ledger shows no email search for either test, and the tests' own results show Apollo's immediate match
   supplying the emails (the lead contents were not re-read for this runbook). The 5-person run booked $0.42 in total, about
@@ -139,5 +145,5 @@ accounts):
 |---|---|---|---|---|
 | 2026-11-13 | 118 contacts, 4 accounts as recorded then, since 2026-11-04 (one of them fired the paid email search), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
 | 2026-11-16 | 2026-11-03: one 148-contact customer list (the list the recalibration was fitted to); its 60 paid email searches ($26.70, booked under the old name `apollo:full_enrichment`) excluded | $10.49 | $10.38 (ratio 1.01) | confirms the fit, not the quote; a window that includes it is INSUFFICIENT because this list is 72% of the contacts |
-| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) was on a fresh list, its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
+| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) looks like a list with nothing cached (29 of its 30 contacts needed a paid person lookup; inferred, not measured), its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
 | 2026-11-16 | 7 contacts, 1 internal `agentweb.pro` account (excluded as non-customer by the current defaults), 2026-11-13 to 2026-11-16 | $0.48 | $0.49 (ratio 0.97) | no customer data in the window; nothing to retune |
