@@ -240,7 +240,11 @@ export class AgentFailureRuleSet
         if (traces.length < MAX_SAMPLE_TRACES && !traces.includes(ref)) traces.push(ref);
         stats.tracesByType.set(ft, traces);
         const at = e.ts instanceof Date ? e.ts.getTime() : NaN;
-        if (Number.isFinite(at)) stats.timesByType.set(ft, [...(stats.timesByType.get(ft) ?? []), at]);
+        if (Number.isFinite(at)) {
+          const times = stats.timesByType.get(ft) ?? [];
+          times.push(at);
+          stats.timesByType.set(ft, times);
+        }
       }
       byTool.set(toolName, stats);
     }
