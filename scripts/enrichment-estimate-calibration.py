@@ -59,9 +59,12 @@ DEFAULT_LOG_GROUP = "/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/w
 LEDGER_FEATURES = ("crm_enrichment", "enrichment")
 ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # list, user and run ids copied from log text must look like this
 MODES = ("enrich", "preview")
-MAX_MARKER_OFFSET = 100  # real log lines carry the "[v3] runEnrichment" marker within the first ~60 characters
-START_RE = re.compile(r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)")
-DONE_RE = re.compile(r"\[v3\] runEnrichment DONE runId=(\S+) processed=([0-9]{1,9})(?!\S)")
+# A real prod log line is: syslog prefix, optional "[Worker] ", then the marker (e.g. "Nov 13 11:42:30 ip-172-31-19-250 web[4828]:
+# [Worker] [v3] runEnrichment START ..."). Matching the whole prefix means text a user typed later in some other line cannot pass.
+LINE_PREFIX = r"[A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} \S{1,100} web\[[0-9]{1,7}\]: (?:\[Worker\] )?"
+START_RE = re.compile(LINE_PREFIX + r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)")
+DONE_RE = re.compile(LINE_PREFIX + r"\[v3\] runEnrichment DONE runId=(\S+) processed=([0-9]{1,9})(?!\S)")
+RUN_ID_RE = re.compile(r"runId=([A-Za-z0-9_-]{1,64})(?!\S)")
 EMAIL_SEARCH_MODELS = ("apollo:waterfall_email", "apollo:full_enrichment")  # same $0.445 request; the second is its older ledger name (last seen 2026-11-03)
 ENIGMA_PREFIX = "enigma:"
 
@@ -93,11 +96,22 @@ def read_rate(name):
         sys.exit("%s is unexpectedly large" % where)
     pattern = re.compile(r"[ \t]*%s:[ \t]*([0-9.+\-*/() ]+?),[ \t]*(?://.*)?" % re.escape(name))
     m = None
+    in_block = False
     for line in src.splitlines():
-        if len(line) <= 300:  # a constant line is short; skipping long lines keeps this linear on hostile input
-            m = pattern.fullmatch(line)
-            if m:
-                break
+        if len(line) > 300:  # a constant line is short; skipping long lines keeps this linear on hostile input
+            continue
+        stripped = line.lstrip()
+        if in_block:  # a decoy inside a block comment must not be read
+            in_block = "*/" not in stripped
+            continue
+        if stripped.startswith("/*"):
+            in_block = "*/" not in stripped[2:]
+            continue
+        if stripped.startswith("//"):
+            continue
+        m = pattern.fullmatch(line)
+        if m:
+            break
     if not m:
         sys.exit("cannot find %s in %s: did the estimate change shape? Update this script." % (name, where))
     val = _arith(m.group(1).strip(), name)
@@ -139,7 +153,7 @@ class Aws:
     def __call__(self, *args):
         label = " ".join(args[:2])
         try:
-            r = subprocess.run(self.base + list(args) + ["--output", "json"], capture_output=True, text=True,
+            r = subprocess.run(self.base + list(args) + ["--output", "json"], capture_output=True, text=True, errors="replace",
                                stdin=subprocess.DEVNULL, timeout=1800)
         except FileNotFoundError:
             sys.exit("cannot run the --aws command (is the AWS CLI installed?)")
@@ -191,6 +205,8 @@ def main():
         sys.exit("--since must be a real, zero-padded date, YYYY-MM-DD (for example 2026-11-05)")
     if since_dt.date() > now.date():
         sys.exit("--since %s is in the future" % a.since)
+    if since_dt.year < 2020:
+        sys.exit("--since %s is implausibly old (the logs do not go back that far)" % a.since)
 
     llm_field = read_rate("llmPerFieldPerLead")
     lookup = read_rate("lookupPerLead")
@@ -247,26 +263,35 @@ def main():
     starts, finished, ignored_ids = {}, {}, set()
     odd_lines = 0
     for x in events:
-        msg = x.get("message") or ""
-        ts = x.get("timestamp")
-        m = START_RE.search(msg)
+        msg = x.get("message") if isinstance(x, dict) else None
+        ts = x.get("timestamp") if isinstance(x, dict) else None
+        if not isinstance(msg, str):
+            odd_lines += 1
+            continue
+        m = START_RE.match(msg)
         if m:
             lid, uid, mode, rid = m.groups()
-            if m.start() > MAX_MARKER_OFFSET or mode not in MODES or not all(ID_RE.fullmatch(v) for v in (lid, uid, rid)):
+            if mode not in MODES or not all(ID_RE.fullmatch(v) for v in (lid, uid, rid)):
                 odd_lines += 1  # only the fixed mode names and plain ids are ever copied into the table
                 if ID_RE.fullmatch(rid):
                     ignored_ids.add(rid)
                 continue
             starts[rid] = (uid, mode, lid)
             continue
-        m = DONE_RE.search(msg)
+        m = DONE_RE.match(msg)
         if m:
             rid = m.group(1)
-            if m.start() > MAX_MARKER_OFFSET or not ID_RE.fullmatch(rid) or not isinstance(ts, int):
+            if not ID_RE.fullmatch(rid) or not isinstance(ts, int):
                 odd_lines += 1
                 continue
             if rid not in finished:  # a repeated DONE line must not count a run twice
                 finished[rid] = (int(m.group(2)), ts)
+            continue
+        if "runEnrichment START" in msg or "runEnrichment DONE" in msg:
+            odd_lines += 1  # mentions a run but is not a genuine line (wrong prefix, bad digits, unexpected format)
+            r = RUN_ID_RE.search(msg)
+            if r:
+                ignored_ids.add(r.group(1))  # so its other half is not reported as unfinished or as an orphan
     runs = []
     for rid, (processed, ts) in finished.items():
         if rid not in starts:
@@ -277,16 +302,19 @@ def main():
     cust = [r for r in runs if r["uid"] not in test_ids]
     print("runs since %s: %d in the logs, %d from excluded accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
     if odd_lines:
-        print("ignored %s with an unexpected mode or user id" % plural(odd_lines, "log line"))
-    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and st[0] not in test_ids)
+        print("ignored %s that were not genuine run lines (wrong line prefix, mode, id or digits)" % plural(odd_lines, "log line"))
+    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and rid not in ignored_ids and st[0] not in test_ids)
     orphans = sum(1 for rid in finished if rid not in starts and rid not in ignored_ids)
     print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
           "with no contacts), %s finished whose start is before --since (account unknown)" % (plural(unfinished, "run"), plural(orphans, "run")))
 
     fields = {}
+    gone = set()  # lists that no longer exist: DynamoDB returns no Item key at all (an existing list without a saved config returns Item: {})
     for lid in {r["lid"] for r in cust}:
         d = aws("dynamodb", "get-item", "--table-name", "AW-LeadLists", "--key", json.dumps({"listId": {"S": lid}}),
                 "--projection-expression", "enrichmentConfig")
+        if "Item" not in d:
+            gone.add(lid)
         cfg = d.get("Item", {}).get("enrichmentConfig", {}).get("M")
         if not cfg:
             fields[lid] = reference_fields  # the customer quote falls back to referenceFieldCount without a saved config
@@ -294,6 +322,8 @@ def main():
         inc = [x for x in cfg.get("fields", {}).get("L", []) if x.get("M", {}).get("include", {}).get("BOOL")]
         deps = sum(len(x["M"].get("smartDependencies", {}).get("L", [])) for x in inc)
         fields[lid] = max(1, len(inc) + deps)
+    if gone:
+        print("%s used by customer runs could not be found (counted with the reference field count, marked ? in the table)" % plural(len(gone), "list"))
 
     led = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))
     d = aws("dynamodb", "scan", "--table-name", "AW-UsageRecords", "--page-size", "1000",
@@ -314,10 +344,12 @@ def main():
     if skipped_rows:
         print("skipped %s that did not have the expected fields" % plural(skipped_rows, "ledger row"))
 
-    agg = collections.defaultdict(lambda: dict(p=0, fp=0, modes=collections.Counter()))
+    agg = collections.defaultdict(lambda: dict(p=0, fp=0, unknown=0, modes=collections.Counter()))
     for r in cust:
         g = agg[(r["uid"], r["day"])]
         g["p"] += r["p"]; g["fp"] += r["p"] * fields[r["lid"]]; g["modes"][r["mode"]] += r["p"]
+        if r["lid"] in gone:
+            g["unknown"] += r["p"]
 
     print("\n%-13s %-14s %8s %6s %8s %7s %10s %12s  %-22s %s" % ("user/day", "modes", "contacts", "fields", "booked$*", "$/ctc*", "quote$/ctc", "booked/quote", "email-search $ (calls)", "enigma $"))
     tot_b = tot_q = tot_n = 0
@@ -332,11 +364,13 @@ def main():
         total = (sum(v[1] for v in L.values()) - wf[1] - eg) / 1e6  # excludes the paid add-ons (own columns)
         flds = g["fp"] / n  # weighted by contacts
         q = flds * llm_field + lookup + web
-        print("%-13s %-14s %8d %6.1f %8.2f %7.3f %10.3f %12.2f  %-22s %.2f" % ("%s/%s" % (uid[:6], day[5:]), ",".join(g["modes"]), n, flds, total, total / n, q, total / n / q, "%.2f (%d)" % (wf[1] / 1e6, wf[0]), eg / 1e6))
+        print("%-13s %-14s %8d %6s %8.2f %7.3f %10.3f %12.2f  %-22s %.2f" % ("%s/%s" % (uid[:6], day[5:]), ",".join(g["modes"]), n, "%.1f%s" % (flds, "?" if g["unknown"] else ""), total, total / n, q, total / n / q, "%.2f (%d)" % (wf[1] / 1e6, wf[0]), eg / 1e6))
         if g["modes"].get("enrich", 0) > 0:
             tot_b += total; tot_q += q * n; tot_n += n; by_account[uid] += n
 
     print("\n* excluding the paid add-ons (the Apollo email search and Enigma), which are not part of the per-contact quote")
+    if gone:
+        print("? a list of that day no longer exists, so its field count is the reference count and not measured")
     print("\nVERDICT")
     if tot_n == 0:
         print("  No customer enrich-mode runs in the window: nothing to compare.")
