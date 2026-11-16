@@ -18,7 +18,7 @@ import { stripeService, type UserPaymentMethod } from '../services/stripeService
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
-import { getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
+import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import {
   GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable,
   ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
@@ -44,6 +44,31 @@ export interface ZomaMetaAccountSummary {
    * Page is accessible. Absent for granted and for never-probed, which must change nothing.
    */
   page_access?: 'missing';
+}
+
+/**
+ * ENG-3125: why a connected Meta ad account still cannot create ads — no Facebook Page the
+ * connection can use. Derived from the stored Page probe (ENG-2232), never from a live call.
+ */
+export type ZomaMetaPageBlockerReason = 'no_page_exists' | 'page_not_granted' | 'no_advertiser_role';
+
+export const META_CREATE_PAGE_URL = 'https://www.facebook.com/pages/create';
+export const META_BUSINESS_PAGES_SETTINGS_URL = 'https://business.facebook.com/settings/pages';
+
+export interface ZomaMetaPageBlocker {
+  type: 'meta_page_access';
+  reason: ZomaMetaPageBlockerReason;
+  /** Ad accounts (without act_) whose Page access is confirmed missing. */
+  account_ids: string[];
+  /** The Page this account's existing ads run under, when known. */
+  page_id?: string;
+  /** The canonical refusal text the ad write gate returns (ENG-3078). */
+  message: string;
+  /** Step-by-step instructions an agent can relay verbatim. */
+  steps: string[];
+  /** Fresh Meta connect link (auth_type=rerequest, so Meta re-offers Page selection). */
+  link?: string;
+  create_page_url?: string;
 }
 
 export interface ZomaGoogleAdsAccountSummary {
@@ -73,6 +98,12 @@ export interface ZomaReadiness {
   };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
+  /**
+   * ENG-3125: Meta is connected but ads will fail for lack of a usable Facebook Page. While
+   * set, setup is not complete: zoma_status never says "All set" and the device flow never
+   * issues its token or shows "You're set".
+   */
+  blocker: ZomaMetaPageBlocker | null;
   next_step: string | null;
 }
 
@@ -126,18 +157,92 @@ function summarize(account: ConnectedAccount): ZomaMetaAccountSummary {
   };
 }
 
+const declinedPagePermission = (cfg: any): boolean =>
+  Array.isArray(cfg?.declined_required_permissions) &&
+  cfg.declined_required_permissions.some((p: unknown) => typeof p === 'string' && p.startsWith('pages_'));
+
 /**
- * ENG-3078: the same refusal text the ad write gate returns (emma/impl/adsApis.ts), one per
- * distinct message, for usable Meta accounts whose Page access is confirmed missing.
+ * ENG-3125: classify a confirmed-missing Page state from what the connect/sweep probe stored.
+ *  - existing ads run under a Page this connection cannot reach:
+ *      the connection shares no Pages at all  -> page_not_granted (Page skipped on "Choose Pages")
+ *      it shares other Pages but not that one -> no_advertiser_role (no "Create ads" access to it)
+ *  - a pages_* permission was declined         -> page_not_granted
+ *  - zero Pages and no Page of record          -> no_page_exists
  */
-function metaPageProblem(accounts: ConnectedAccount[]): string | null {
-  const messages = accounts
-    .filter((a) => getMetaPagesAccessState(a.config as any) === 'missing')
-    .map((a) => getMetaAdsNoPagesMessage(a.config as any));
-  // ENG-3127: say plainly that reading/reporting still works; only ad creation is blocked.
-  return messages.length
-    ? `Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:\n${[...new Set(messages)].join('\n')}`
-    : null;
+export function classifyMetaPageBlocker(cfg: any): ZomaMetaPageBlockerReason {
+  const accessible = getAccessiblePageIds(cfg);
+  const pageCount = typeof cfg?.meta_page_count === 'number' ? cfg.meta_page_count : accessible?.length;
+  const existingPage = typeof cfg?.existing_ads_page_id === 'string' && cfg.existing_ads_page_id ? cfg.existing_ads_page_id : undefined;
+  if (existingPage) return (pageCount ?? 0) > 0 ? 'no_advertiser_role' : 'page_not_granted';
+  if (declinedPagePermission(cfg)) return 'page_not_granted';
+  if (pageCount === 0) return 'no_page_exists';
+  return 'page_not_granted';
+}
+
+/** ENG-3125: agent-relayable fix steps per reason. `link` is a fresh Meta connect link. */
+export function metaPageFixSteps(
+  reason: ZomaMetaPageBlockerReason,
+  opts: { link?: string; pageId?: string; connectText?: string } = {},
+): string[] {
+  const connectTail = opts.connectText ?? (opts.link
+    ? `open this Meta connect link and log in with the same Facebook account → ${opts.link}`
+    : 'ask me for a fresh Meta connect link, open it and log in with the same Facebook account.');
+  const connect = connectTail.charAt(0).toUpperCase() + connectTail.slice(1);
+  const page = opts.pageId ? `Facebook Page ${opts.pageId}` : 'the Facebook Page you advertise from';
+  const done = 'Tell me when it is done and I will re-check.';
+  if (reason === 'no_page_exists') {
+    return [
+      `Create a Facebook Page for the business (skip if you already have one) → ${META_CREATE_PAGE_URL}`,
+      connect,
+      'When Meta asks which Pages to share, select that Page (or all current and future Pages) and approve every requested permission.',
+      done,
+    ];
+  }
+  if (reason === 'page_not_granted') {
+    return [
+      connect,
+      'When Meta opens, choose Edit access (Edit settings) instead of continuing with the previous choices.',
+      `On the Pages step select ${page} — or all current and future Pages — then approve every requested permission.`,
+      done,
+    ];
+  }
+  return [
+    `This Facebook account does not have "Create ads" (Advertiser) access to ${page}.`,
+    `Ask whoever manages that Page to open Meta Business Settings → Pages → select the Page → Assign people, and give you the "Create ads" / Ads task (${META_BUSINESS_PAGES_SETTINGS_URL}). For a Page outside a Business portfolio: Page settings → Page access → Add new, with Ads task access.`,
+    `Once access is granted, ${connectTail}`,
+    `On the Pages step select ${page} and approve every requested permission.`,
+    done,
+  ];
+}
+
+/**
+ * ENG-3125 (was ENG-3078's plain message): a structured blocker for usable Meta accounts whose
+ * Page access is confirmed missing. Never-probed (unknown) and granted change nothing.
+ */
+export function metaPageBlocker(accounts: ConnectedAccount[], link?: string): ZomaMetaPageBlocker | null {
+  const missing = accounts.filter((a) => getMetaPagesAccessState(a.config as any) === 'missing');
+  if (missing.length === 0) return null;
+  const cfg: any = missing[0].config;
+  const reason = classifyMetaPageBlocker(cfg);
+  const pageId = typeof cfg?.existing_ads_page_id === 'string' && cfg.existing_ads_page_id ? cfg.existing_ads_page_id : undefined;
+  return {
+    type: 'meta_page_access',
+    reason,
+    account_ids: missing.map((a) => summarize(a).account_id),
+    ...(pageId ? { page_id: pageId } : {}),
+    message: [...new Set(missing.map((a) => getMetaAdsNoPagesMessage(a.config as any)))].join('\n'),
+    steps: metaPageFixSteps(reason, { link, pageId }),
+    ...(link ? { link } : {}),
+    ...(reason === 'no_page_exists' ? { create_page_url: META_CREATE_PAGE_URL } : {}),
+  };
+}
+
+/** ENG-3127: the Page step leads with the fact that reads still work; only ad creation is blocked. */
+export const META_PAGE_READS_OK = 'Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:';
+
+/** The blocker as zoma_status next_step text: reads-still-work lead, the canonical problem, then numbered steps. */
+export function formatMetaPageBlocker(b: ZomaMetaPageBlocker): string {
+  return [META_PAGE_READS_OK, b.message, '', 'To fix it:', ...b.steps.map((step, i) => `${i + 1}. ${step}`)].join('\n');
 }
 
 function usableAccounts(accounts: ConnectedAccount[], provider: ZomaProvider, now: number): ConnectedAccount[] {
@@ -235,8 +340,16 @@ export async function getZomaReadiness(
   if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
 
   const writes_enabled = payment.ready && meta.ready;
+  let blocker = metaPageBlocker(accounts);
+  if (blocker && mintLinks) {
+    try {
+      blocker = metaPageBlocker(accounts, await deps.buildMetaConnectUrl(userId));
+    } catch (error) {
+      console.error('[zoma] meta reconnect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
   const readiness: ZomaReadiness = {
-    email: user.email, payment, meta, writes_enabled, next_step: null,
+    email: user.email, payment, meta, writes_enabled, blocker, next_step: null,
     google_ads: { available: false, ready: false, accounts: [], writes_enabled: false, reason: 'google_ads_provider_disabled' },
   };
 
@@ -259,7 +372,7 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
-  readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? metaPageProblem(accounts);
+  readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   return readiness;
 }
 
@@ -292,6 +405,7 @@ export function formatZomaStatus(r: ZomaReadiness): string {
     `  ${box(r.meta.ready)} Meta ad account connected${
       r.meta.accounts.length ? ` (${r.meta.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})` : ''
     }${!r.meta.ready && r.google_ads.available && r.google_ads.ready && r.meta.link ? ` → ${r.meta.link}` : ''}`,
+    ...(r.blocker ? ['  [ ] Facebook Page usable for ads'] : []),
     ...(r.google_ads.available
       ? [`  ${box(r.google_ads.ready)} Google Ads account connected${
         r.google_ads.accounts.length
