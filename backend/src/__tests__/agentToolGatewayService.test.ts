@@ -458,6 +458,72 @@ describe('agentToolGatewayService', () => {
           expect(result.args).toEqual({ fields: fieldList });
         });
 
+        // ENG-3089: shape of the 11-08, 11-14 and 11-16 production failures — name present
+        // (or repaired), no `type`. Playwright MCP rejected it with invalid_value at fields[0].type.
+        it('fills a missing field type as textbox for a plain text value', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: {
+              fields: [
+                { name: 'Email', ref: 'e12', value: 'a@b.co' },
+                { ref: 'e13', value: 'Al' },
+                { name: 'Plan', type: 'combobox', ref: 'e14', value: 'Pro' },
+              ],
+            },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.repairs).toContain('fill_form:field.type');
+          expect((result.args as any).fields).toEqual([
+            { name: 'Email', type: 'textbox', ref: 'e12', value: 'a@b.co' },
+            { name: 'e13', type: 'textbox', ref: 'e13', value: 'Al' },
+            { name: 'Plan', type: 'combobox', ref: 'e14', value: 'Pro' },
+          ]);
+        });
+
+        it('does not guess a type for a boolean-looking value; says which types exist', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: [{ name: 'Subscribe', ref: 'e20', value: 'true' }] },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('invalid');
+          expect(result.repairs).not.toContain('fill_form:field.type');
+          if (result.status !== 'invalid') throw new Error('expected invalid');
+          expect(result.issues.map((i) => i.path)).toEqual(['$.fields[0].type']);
+          expect(result.modelMessage).toContain('one of textbox, checkbox, radio, combobox, slider');
+        });
+
+        it('rejects an unknown type instead of rewriting it', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: [{ name: 'Email', type: 'text', ref: 'e12', value: 'a@b.co' }] },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('invalid');
+          expect((result.args as any).fields[0].type).toBe('text');
+        });
+
+        // ENG-3089: shape of the 11-10 production failure — `selector` in place of `ref`.
+        // Nothing to repair from, so the model must be told the next step.
+        it('a field with no ref gets a snapshot-then-retry message, not a bare schema error', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_fill_form',
+            args: { fields: [{ selector: '#email', value: 'a@b.co' }, { name: 'Name', type: 'textbox', ref: 'e13', value: 'Al' }] },
+            inputSchema: fillFormSchema,
+            effect: 'internal_write',
+          });
+          expect(result.status).toBe('invalid');
+          if (result.status !== 'invalid') throw new Error('expected invalid');
+          expect(result.issues.map((i) => i.path)).toEqual(['$.fields[0].ref']);
+          expect(result.modelMessage).toContain('fields[0] has no "ref"');
+          expect(result.modelMessage).toContain('Call playwright_browser_snapshot');
+          expect(result.modelMessage).toContain('retry playwright_browser_fill_form using the ref');
+        });
+
         it('still rejects genuinely unknown arguments', () => {
           const result = validateAndRepairToolArgs({
             toolName: 'playwright_browser_fill_form',
