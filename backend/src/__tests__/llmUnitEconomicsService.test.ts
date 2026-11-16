@@ -403,6 +403,13 @@ describe('AC3 — target comparison (live hard threshold + overhead envelope)', 
     );
     expect(line).toBe('u1,"\'=HYPERLINK(""x""),y@x.com",Pro,220,15,20,0,235,230,5,true');
   });
+
+  it('prefixes an email that starts with a line feed so a spreadsheet cannot read it as a formula', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: '\n=1+1@x.com', subscriptionType: 'Pro' }]);
+    const csv = buildUnitEconomicsCsv(await buildUnitEconomicsReport('2026-09'));
+    expect(csv).toContain('"\'\n=1+1@x.com"');
+  });
 });
 
 describe('AC6 — customer-facing code never reaches the target or cost economics', () => {

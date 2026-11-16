@@ -416,7 +416,7 @@ export function buildUnitEconomicsCsv(report: UnitEconomicsReport): string {
   const esc = (v: unknown) => {
     let text = v === null || v === undefined ? '' : String(v);
     // Neutralise spreadsheet formula injection from user-controlled emails.
-    if (typeof v === 'string' && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    if (typeof v === 'string' && /^[=+\-@\t\r\n]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   const lines = [CSV_COLUMNS.map(([h]) => h).join(',')];

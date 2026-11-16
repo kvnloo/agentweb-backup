@@ -78,6 +78,12 @@ describe("GET /api/admin/usage/unit-economics", () => {
     expect(res.text).toContain("u1,a@x.com,Pro,220,15,20,0,235,230,5,true");
   });
 
+  it("rejects an unsupported or non-string format with 400, not 500", async () => {
+    expect((await get("month=2026-09&format=xml")).status).toBe(400);
+    expect((await get("month=2026-09&format[toString]=csv")).status).toBe(400);
+    expect((await get("month=2026-09&format=json")).status).toBe(200);
+  });
+
   it("rejects non-admins and a bad month", async () => {
     expect((await get("month=2026-09", nonAdminToken)).status).toBe(403);
     expect((await get("month=nope")).status).toBe(400);
