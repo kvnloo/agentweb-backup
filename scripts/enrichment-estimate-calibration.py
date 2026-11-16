@@ -98,17 +98,16 @@ def read_rate(name):
     m = None
     in_block = False
     for line in src.splitlines():
-        if len(line) > 300:  # a constant line is short; skipping long lines keeps this linear on hostile input
-            continue
         stripped = line.lstrip()
         if in_block:  # a decoy inside a block comment must not be read
             in_block = "*/" not in stripped
             continue
-        if stripped.startswith("/*"):
-            in_block = "*/" not in stripped[2:]
+        cut = stripped.find("/*")
+        if cut != -1 and "*/" not in stripped[cut + 2:]:
+            in_block = True  # a block comment opens here (anywhere in the line) and stays open
             continue
-        if stripped.startswith("//"):
-            continue
+        if stripped.startswith("/*") or stripped.startswith("//") or len(line) > 300:
+            continue  # a constant line is short; skipping long lines keeps this linear on hostile input
         m = pattern.fullmatch(line)
         if m:
             break
@@ -161,7 +160,13 @@ class Aws:
             sys.exit("aws %s did not finish within 30 minutes (a credentials prompt, or a very wide --since)" % label)
         if r.returncode != 0:
             sys.exit("aws %s failed: %s" % (label, aws_error_summary(r.stderr)))
-        return json.loads(r.stdout) if r.stdout.strip() else {}
+        try:
+            out = json.loads(r.stdout) if r.stdout.strip() else {}
+        except ValueError:
+            sys.exit("aws %s returned output that is not JSON" % label)
+        if not isinstance(out, dict):
+            sys.exit("aws %s returned an unexpected kind of output" % label)
+        return out
 
 
 def main():
@@ -226,7 +231,7 @@ def main():
         if len(entry) < 6:
             sys.exit("--exclude-user-ids entries must be at least 6 characters (the prefix printed in the table)")
     d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId, email, isAdmin")
-    users = [u for u in d.get("Items", []) if u.get("userId", {}).get("S")]
+    users = [u for u in d.get("Items") or [] if u.get("userId", {}).get("S")]
     if not users:
         sys.exit("the user table scan returned no accounts, so staff cannot be told from customers: refusing to continue")
     why = {"platform admins": set(), "test emails": set(), "internal domains": set(), "--exclude-user-ids": set()}
@@ -248,15 +253,17 @@ def main():
           % (len(test_ids), len(users), ", ".join("%s %d" % (k, len(v)) for k, v in why.items())))
 
     start_ms = int(since_dt.timestamp() * 1000)
-    groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups", [])
-    keep = next((g.get("retentionInDays") for g in groups if g.get("logGroupName") == a.log_group), None)
+    groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups") or []
+    keep = next((g.get("retentionInDays") for g in groups if isinstance(g, dict) and g.get("logGroupName") == a.log_group), None)
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+        keep = None
     oldest_day = (now - dt.timedelta(days=keep)).date() if keep else None
     if oldest_day and since_dt.date() <= oldest_day:
         print("WARNING: the log group keeps only %d days: runs before %s are already gone and %s itself is only partly covered, while the "
               "ledger counts whole days (that inflates the ratio). Start --since at %s for a clean result."
               % (keep, oldest_day.strftime("%Y-%m-%d"), oldest_day.strftime("%Y-%m-%d"), (oldest_day + dt.timedelta(days=1)).strftime("%Y-%m-%d")))
     events = aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
-                 "--filter-pattern", '?"runEnrichment START" ?"runEnrichment DONE"').get("events", [])
+                 "--filter-pattern", '?"runEnrichment START" ?"runEnrichment DONE"').get("events") or []
     starts, finished, ignored_ids = {}, {}, set()
     odd_lines = 0
     for x in events:
@@ -278,8 +285,10 @@ def main():
         m = DONE_RE.match(msg)
         if m:
             rid = m.group(1)
-            if not ID_RE.fullmatch(rid) or not isinstance(ts, int):
+            if not ID_RE.fullmatch(rid) or not isinstance(ts, int) or not 0 < ts < 10**14:
                 odd_lines += 1
+                if ID_RE.fullmatch(rid):
+                    ignored_ids.add(rid)
                 continue
             if rid not in finished:  # a repeated DONE line must not count a run twice
                 finished[rid] = (int(m.group(2)), ts)
@@ -338,7 +347,7 @@ def main():
             "--filter-expression", "#d >= :s AND (feature = :a OR feature = :b)", "--expression-attribute-names", '{"#d":"date"}',
             "--expression-attribute-values", json.dumps({":s": {"S": a.since}, ":a": {"S": LEDGER_FEATURES[0]}, ":b": {"S": LEDGER_FEATURES[1]}}))
     skipped_rows = 0
-    for r in d.get("Items", []):
+    for r in d.get("Items") or []:
         try:
             k = (r["userId"]["S"], r["date"]["S"])
             calls, micro = int(r["callCount"]["N"]), int(r["costMicroUsd"]["N"])
