@@ -37,6 +37,8 @@ to, so it confirms the fit, not the quote. A window that includes it is dominate
 (`--max-account-share`). Other things changed on 2026-11-04 (the ENG-2720 fixes), so still start after the last change.
 Always read the per-line table before acting on the verdict.
 
+Expect it to take a while: the log search is the slow part, one combined search for both the START and DONE lines at
+roughly 30 seconds per log day (a 13-day `--since` took about 7 minutes on 2026-11-16; each AWS call has a 30-minute limit).
 It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs filter-log-events`, `dynamodb scan` and
 `dynamodb get-item`. It prints one line per account and day (6-character user id prefix, contacts, fields, booked dollars,
 dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. The mode and the user id come from
@@ -61,7 +63,8 @@ written is the IAM role: run it with a read-only one. The script reads the three
   quote for leads that already have an email: `fields * 0.002 + lookupPerLead + webSearchPerLead`, where `fields` applies the
   customer quote's formula (included fields plus smart-field dependencies, at least 1; 10 when the list has no saved
   config) to the list's *saved* config. The quote also counts columns added to the list since the config was saved; this
-  check does not (about 3% of the ratio per column).
+  check does not (about 3% of the ratio per column: a reviewer estimated that the Nuerraa list, 12 saved fields and about 3
+  columns not in its saved config, would read about 1.56 instead of 1.68 on the quote's count).
 - Within +/-25% on enough data (all three conditions above): leave the constants alone.
 - Beyond that on enough data: retune `ENRICHMENT_COST_RATES_USD`, update the calibration paragraph in that file's header
   and the tests in `enrichmentCostEstimate.test.ts`, and ship it through the normal PR rules. Record the sample below.
@@ -104,9 +107,11 @@ written is the IAM role: run it with a read-only one. The script reads the three
   `AW-EnrichmentRawCache` was created at 02:33:46.181 and stamped `completed` with a `verified` email status at 02:33:49.017,
   2.8 seconds later, while that customer's run was in progress. That is much faster than every other callback stamp we have
   (23 to 52 seconds), anyone holding the callback secret could have posted it, we have not seen the payload (Apollo
-  publishes no callback example), and we did not trace which code path wrote the lead's email. Our own simulated callbacks
-  were sent on 2026-11-04 in the Argusoft admin test account; none is known on this row. Treat the found-email path as
-  unproven until a callback whose payload has been seen.
+  publishes no callback example). The lead carries no callback-written email provenance (`enrichmentMetadata.email`), and a
+  reviewer's count-only check found none on any emailed lead of that list; the webhook does not write to a lead that
+  already has an email, so the callback most likely wrote nothing and the lead probably already had an email (an inference,
+  not a trace of the write). Our own simulated callbacks were sent on 2026-11-04 in the Argusoft admin test account; none is
+  known on this row. Treat the found-email path as unproven until a callback whose payload has been seen.
 - **The seven placeholder rows that existed on 2026-11-16:** that one customer row; five in the Argusoft admin test account
   on 2026-11-04: four created by the live test at 16:14, of which two still show their callback stamps (23 and 28 seconds
   after creation, both empty) and two were overwritten at 16:20 by our own simulated callbacks (one `completed`, one
@@ -127,11 +132,11 @@ written is the IAM role: run it with a read-only one. The script reads the three
 Not building it yet, for these reasons, and to be revisited once this check has enough customer data (100 contacts from 3
 accounts):
 
-- There is no measured need. The only customer evidence on the paid email search is one search in the recalibration
-  sample, and 0 of 8 real name-and-company-only people fired it, so the case for adding quote-time cache lookups rests on
-  nothing yet.
-- The Apollo cache key for a name lookup is `apollo:name:<first>|<last>|<domain or normalised company>`
-  (`apolloCacheKeys.ts`). A quote-time lookup would have to rebuild the same key the run will use, and the domain a run
+- There is no measured need. Since 2026-11-04 the only customer evidence on the paid email search is one search in the
+  recalibration sample (before that, the 2026-11-03 list fired it for 60 of its 146 eligible leads, $26.70), and 0 of 8 real
+  name-and-company-only people fired it, so the case for adding quote-time cache lookups rests on little.
+- The Apollo cache key for a match lookup is `apollo:name:<first>|<last>|<domain or normalised company>` and for a find
+  lookup `apollo:find:<first>|<last>|<domain or company>` (`apolloCacheKeys.ts`). A quote-time lookup would have to rebuild the same key the run will use, and the domain a run
   uses can come from an earlier step, so a quote could miss entries the run would hit. We have not measured how often.
 - Which way it would move the number is unclear: cached lists would quote lower, lists with nothing cached higher, and the
   customer sample (58 contacts at 1.50 of quote) suggests it is the uncached side that is low. That is a calibration
@@ -146,4 +151,4 @@ accounts):
 | 2026-11-13 | 118 contacts, 4 accounts as recorded then, since 2026-11-04 (one of them fired the paid email search), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
 | 2026-11-16 | 2026-11-03: one 148-contact customer list (the list the recalibration was fitted to); its 60 paid email searches ($26.70, booked under the old name `apollo:full_enrichment`) excluded | $10.49 | $10.38 (ratio 1.01) | confirms the fit, not the quote; a window that includes it is INSUFFICIENT because this list is 72% of the contacts |
 | 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) looks like a list with nothing cached (29 of its 30 contacts needed a paid person lookup; inferred, not measured), its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
-| 2026-11-16 | 7 contacts, 1 internal `agentweb.pro` account (excluded as non-customer by the current defaults), 2026-11-13 to 2026-11-16 | $0.48 | $0.49 (ratio 0.97) | no customer data in the window; nothing to retune |
+| 2026-11-16 | 2026-11-13 to 2026-11-16: 12 runs in the logs, all from excluded accounts (an internal `agentweb.pro` user booked $0.48 for 7 contacts against a $0.49 quote, ratio 0.97; the rest is the test account) | | | no customer data in the window; nothing to retune |
