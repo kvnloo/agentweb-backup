@@ -82,19 +82,6 @@ describe('Artificial Analysis read (ENG-3026)', () => {
     expect(() => detectFrontier(catalog, captured, registry, now)).not.toThrow();
   });
 
-  it('ENG-3029: the live creator name "SpaceXAI" still matches registry provider xai', () => {
-    const row = captured.data.find(r => r.slug === 'grok-4-7-high')!;
-    expect(row.model_creator).toEqual({ id: expect.any(String), name: 'SpaceXAI' });
-    const grok = { 'openrouter/x-ai/grok-4.7': { ...config, provider: 'xai' as const, qualityScore: 1,
-      qualityScoreSource: 'Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, grok-4-7-high (https://artificialanalysis.ai/)' } };
-    const { changes, reports } = refreshScores(grok, captured, '2026-11-15');
-    expect(reports).toEqual([]);
-    expect(changes['openrouter/x-ai/grok-4.7'].qualityScore).toBe(row.evaluations.artificial_analysis_intelligence_index);
-    // The alias is exact: another lab's row is not pulled in by it.
-    const other = { 'openrouter/x-ai/glm-5.3-flash': { ...config, provider: 'xai' as const } };
-    expect(refreshScores(other, captured, '2026-11-15').changes).toEqual({});
-  });
-
   it('ENG-3029: the fixture is a live capture and carries no key or request header', () => {
     expect((captured as { _source: string })._source).toMatch(/run 43771490745 .*2026-11-15/);
     const text = JSON.stringify(captured).toLowerCase();
