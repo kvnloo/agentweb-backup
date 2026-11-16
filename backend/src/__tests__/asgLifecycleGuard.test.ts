@@ -309,7 +309,48 @@ describe('startAsgTerminationGuard', () => {
     expect(sleepImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('bounds lifecycle-action propagation retries to fifteen attempts', async () => {
+  it('ENG-3093: completes on the first attempt after the hook opens ten minutes in, and only after the drain returned', async () => {
+    const clock = makeClock();
+    const HOOK_OPENS_AT_MS = 10 * 60 * 1000;
+    let nowMs = 0;
+    let drainReturned = false;
+    const attemptTimes: number[] = [];
+    const sleepImpl = jest.fn(async (delayMs: number) => {
+      nowMs += delayMs;
+    });
+    const completeAction = jest.fn(async () => {
+      expect(drainReturned).toBe(true);
+      attemptTimes.push(nowMs);
+      if (nowMs < HOOK_OPENS_AT_MS) throw lifecycleActionNotReady();
+    });
+    const onTerminating = jest.fn(async () => {
+      drainReturned = true;
+    });
+
+    startAsgTerminationGuard(onTerminating, {
+      fetchImpl: makeFetch({
+        stateReplies: [{ status: 200, body: 'Terminated' }],
+        instanceId: 'i-dead',
+      }),
+      completeAction,
+      sleepImpl,
+      logger: silentLogger,
+      ...clock,
+    });
+    await clock.advance(CONFIRMING_READS_REQUIRED);
+
+    // Every attempt before the hook opened failed; the first one at or after it succeeded.
+    const last = attemptTimes[attemptTimes.length - 1];
+    expect(last).toBeGreaterThanOrEqual(HOOK_OPENS_AT_MS);
+    expect(last - HOOK_OPENS_AT_MS).toBeLessThan(15000);
+    expect(attemptTimes.filter((t) => t >= HOOK_OPENS_AT_MS)).toHaveLength(1);
+    expect(silentLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('lifecycle action completed')
+    );
+    expect(silentLogger.error).not.toHaveBeenCalled();
+  });
+
+  it('bounds lifecycle-action retries to twelve minutes, then logs the hook-timeout line', async () => {
     const clock = makeClock();
     const sleepImpl = jest.fn(async () => {});
     const completeAction = jest.fn(async () => {
@@ -330,8 +371,10 @@ describe('startAsgTerminationGuard', () => {
     await expect(clock.advance(CONFIRMING_READS_REQUIRED)).resolves.toBeUndefined();
 
     // This is a behavioral ceiling, intentionally not derived from production constants.
-    expect(completeAction).toHaveBeenCalledTimes(15);
-    expect(sleepImpl).toHaveBeenCalledTimes(14);
+    expect(completeAction).toHaveBeenCalledTimes(49);
+    expect(sleepImpl).toHaveBeenCalledTimes(48);
+    const waitedMs = (sleepImpl.mock.calls as unknown as number[][]).reduce((sum, [ms]) => sum + ms, 0);
+    expect(waitedMs).toBe(12 * 60 * 1000);
     expect(silentLogger.error).toHaveBeenCalledWith(
       expect.stringContaining('the hook will time out'),
       expect.objectContaining({ code: 'ValidationError' })

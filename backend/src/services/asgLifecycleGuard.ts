@@ -76,12 +76,15 @@ export const LIFECYCLE_POLL_INTERVAL_MS = 5000;
 export const CONFIRMING_READS_REQUIRED = 2;
 
 /**
- * AWS may expose `Terminating` through IMDS just before its lifecycle action becomes
- * queryable by CompleteLifecycleAction. Retry only that exact propagation race for
- * at most 14 seconds; every other error still takes the normal fail-safe path.
+ * ENG-3093: the termination hook only becomes answerable once the load balancer's
+ * 600 s connection draining has ended, about 10 minutes after termination starts.
+ * Until then CompleteLifecycleAction replies "No active Lifecycle Action found".
+ * Retry only that exact reply, every 15 seconds for at most 12 minutes (48 waits);
+ * every other error still takes the normal fail-safe path on the first attempt.
+ * The 12 minutes stay under runDrain's force-exit timer (drain ceiling + 3 min).
  */
-export const COMPLETION_MAX_ATTEMPTS = 15;
-export const COMPLETION_RETRY_DELAY_MS = 1000;
+export const COMPLETION_MAX_ATTEMPTS = 49;
+export const COMPLETION_RETRY_DELAY_MS = 15000;
 
 export interface AsgLifecycleGuardDeps {
   /** Injected in tests; defaults to global fetch. */
