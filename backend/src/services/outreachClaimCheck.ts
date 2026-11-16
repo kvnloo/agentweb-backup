@@ -183,6 +183,20 @@ function normalizeName(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+/**
+ * The lead record carries the previous `emailDraft` / `messageDraft`. Those are
+ * our own generated text, not facts about the recipient: left in, a regenerated
+ * draft that repeats an unsupported claim would excuse itself and count zero.
+ */
+const GENERATED_DRAFT_FIELDS = new Set(['emailDraft', 'messageDraft']);
+
+function withoutGeneratedDrafts(recipient: unknown): unknown {
+  if (!recipient || typeof recipient !== 'object' || Array.isArray(recipient)) return recipient;
+  return Object.fromEntries(
+    Object.entries(recipient as Record<string, unknown>).filter(([key]) => !GENERATED_DRAFT_FIELDS.has(key)),
+  );
+}
+
 export function findUnsupportedSenderClaims(input: OutreachClaimCheckInput): OutreachClaimCheckResult {
   const factsText = [plainText(input.facts?.brandData), plainText(input.facts?.marketStrategyText)]
     .filter(t => t.trim())
@@ -190,7 +204,7 @@ export function findUnsupportedSenderClaims(input: OutreachClaimCheckInput): Out
   if (!factsText.trim()) return { status: 'no_facts' };
 
   const draftText = [plainText(input.draft?.subject), plainText(input.draft?.body)].join('\n');
-  const recipientText = plainText(input.recipient);
+  const recipientText = plainText(withoutGeneratedDrafts(input.recipient));
 
   const knownKeys = new Set(
     [...extractNumericClaims(factsText), ...extractNumericClaims(recipientText)].map(c => c.key),

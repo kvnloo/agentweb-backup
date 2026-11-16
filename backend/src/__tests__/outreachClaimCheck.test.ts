@@ -28,6 +28,23 @@ describe('findUnsupportedSenderClaims', () => {
       .toEqual(['money:$5M', 'number_with_unit:250 employees', 'named_entity:Initech']);
   });
 
+  it('does not treat the lead\'s previous generated drafts as recipient facts', () => {
+    const draft = { body: 'We save 40% and $2k for 500 customers, and work with Initech' };
+    const recipient = {
+      company: 'Globex',
+      emailDraft: { subject: 'Hi', htmlContent: '<p>We save 40% and $2k for 500 customers, and work with Initech</p>' },
+      messageDraft: { content: 'We save 40% and $2k for 500 customers, and work with Initech' },
+    };
+    expect(texts(findUnsupportedSenderClaims({ draft, facts: facts({ brandName: 'Acme' }), recipient })))
+      .toEqual(['money:$2k', 'percentage:40%', 'number_with_unit:500 customers', 'named_entity:Initech']);
+    // Other lead fields still count as recipient evidence.
+    expect(texts(findUnsupportedSenderClaims({
+      draft: { body: 'With 250 employees at Globex, reporting gets heavy.' },
+      facts: facts({ brandName: 'Acme' }),
+      recipient: { ...recipient, customFields: { employees: 250 } },
+    }))).toEqual([]);
+  });
+
   it('AC3: money and percentage formats match each other', () => {
     for (const inFacts of ['$1,500', '1500 dollars', '$1.5k']) {
       for (const inDraft of ['$1,500', '1500 dollars', '$1.5k']) {
