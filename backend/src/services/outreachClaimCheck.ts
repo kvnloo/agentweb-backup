@@ -28,6 +28,8 @@ export interface UnsupportedClaim {
 
 export type OutreachClaimCheckResult =
   | { status: 'no_facts' }
+  /** Input over the work budget below; nothing was checked. */
+  | { status: 'skipped_oversize' }
   | { status: 'checked'; unsupported: UnsupportedClaim[] };
 
 export interface OutreachClaimCheckInput {
@@ -206,6 +208,18 @@ function withoutGeneratedDrafts(recipient: unknown): unknown {
   );
 }
 
+/**
+ * Work budget. The patterns are near-linear, but the name lookup below scans
+ * the facts and recipient text once per distinct draft name, so total work
+ * grows with both. Measured without a budget: 3,000 names against 10MB of
+ * facts and recipient text held the event loop for about 8 seconds. Real
+ * drafts are a few KB and name a handful of customers; anything past these
+ * limits is skipped (and logged as such) rather than measured.
+ */
+const MAX_DRAFT_CHARS = 100_000;
+const MAX_EVIDENCE_CHARS = 500_000;
+const MAX_DRAFT_NAMES = 50;
+
 export function findUnsupportedSenderClaims(input: OutreachClaimCheckInput): OutreachClaimCheckResult {
   const factsText = [plainText(input.facts?.brandData), plainText(input.facts?.marketStrategyText)]
     .filter(t => t.trim())
@@ -214,6 +228,9 @@ export function findUnsupportedSenderClaims(input: OutreachClaimCheckInput): Out
 
   const draftText = [plainText(input.draft?.subject), plainText(input.draft?.body)].join('\n');
   const recipientText = plainText(withoutGeneratedDrafts(input.recipient));
+  if (draftText.length > MAX_DRAFT_CHARS || factsText.length + recipientText.length > MAX_EVIDENCE_CHARS) {
+    return { status: 'skipped_oversize' };
+  }
 
   const knownKeys = new Set(
     [...extractNumericClaims(factsText), ...extractNumericClaims(recipientText)].map(c => c.key),
@@ -230,7 +247,7 @@ export function findUnsupportedSenderClaims(input: OutreachClaimCheckInput): Out
     seen.add(claim.key);
     unsupported.push({ kind: claim.kind, text: claim.text });
   }
-  for (const name of extractNamedEntities(draftText)) {
+  for (const name of extractNamedEntities(draftText).slice(0, MAX_DRAFT_NAMES)) {
     const normalized = normalizeName(name);
     const key = `name:${normalized}`;
     if (!normalized || seen.has(key) || knownNames.includes(` ${normalized} `)) continue;

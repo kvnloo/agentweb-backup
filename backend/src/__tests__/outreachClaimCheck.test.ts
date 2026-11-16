@@ -110,6 +110,41 @@ describe('findUnsupportedSenderClaims runtime on hostile input', () => {
     expect(result.status).toBe('checked');
     expect(Date.now() - started).toBeLessThan(1500);
   });
+
+  // Name lookup scans the evidence once per draft name, so the two sizes multiply.
+  const manyNames = (n: number) => Array.from({ length: n }, (_, i) => `We work with Zq${i}x Corp${i}.`).join(' ');
+  const filler = (chars: number) => 'lorem ipsum dolor sit amet zq '.repeat(Math.ceil(chars / 30));
+
+  it('stays fast with many draft names against the largest evidence it accepts', () => {
+    const started = Date.now();
+    const result = findUnsupportedSenderClaims({
+      draft: { body: manyNames(2000) },
+      facts: facts({ notes: filler(240_000) }),
+      recipient: { notes: filler(240_000) },
+    });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(result.status).toBe('checked');
+    // Only the first 50 draft names are looked up.
+    expect(texts(result).length).toBe(50);
+  });
+
+  it('skips instead of measuring when the facts and lead record exceed the budget', () => {
+    const started = Date.now();
+    const result = findUnsupportedSenderClaims({
+      draft: { body: manyNames(2000) },
+      facts: facts({ notes: filler(3_000_000) }),
+      recipient: { notes: filler(3_000_000) },
+    });
+    expect(result).toEqual({ status: 'skipped_oversize' });
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it('skips an oversize draft', () => {
+    expect(findUnsupportedSenderClaims({
+      draft: { body: filler(150_000) },
+      facts: facts({ brandName: 'Acme' }),
+    })).toEqual({ status: 'skipped_oversize' });
+  });
 });
 
 describe('logOutreachClaimCheckShadow', () => {
@@ -142,6 +177,11 @@ describe('logOutreachClaimCheckShadow', () => {
   it('logs no_facts with zero counts', () => {
     logOutreachClaimCheckShadow({ ...input(), facts: {} });
     expect(JSON.parse(String(logSpy.mock.calls[0][0]))).toMatchObject({ status: 'no_facts', unsupportedTotal: 0 });
+  });
+
+  it('logs skipped_oversize with zero counts', () => {
+    logOutreachClaimCheckShadow({ ...input(), draft: { body: 'x '.repeat(80_000) } });
+    expect(JSON.parse(String(logSpy.mock.calls[0][0]))).toMatchObject({ status: 'skipped_oversize', unsupportedTotal: 0 });
   });
 
   it('AC5: a throwing check never propagates, returns synchronously, and leaves the draft untouched', () => {
