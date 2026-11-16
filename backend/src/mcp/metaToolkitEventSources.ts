@@ -7,6 +7,7 @@
  *   meta_event_source_get_recommendations  READ: what to fix so a catalog's events match its products
  *   meta_event_source_connect              connect a pixel to a catalog     (preview → confirm)
  *   meta_event_source_disconnect           disconnect a pixel from a catalog (preview → confirm)
+ *   meta_send_test_event                   ENG-3060: one Conversions API event with a test_event_code (preview → confirm)
  *
  * Ownership: a catalog id must be in the account business's catalog set (readBusinessCatalogs,
  * as in ENG-2918/2925). A pixel id must be one of the resolved ad account's own pixels
@@ -16,8 +17,9 @@
  * catalog's current connections; the confirm repeats the call with that token. Every write is
  * read back from the catalog's external_event_sources edge; only CONFIRMED is success.
  */
+import { createHash } from 'crypto';
 import { getJwtSecret } from '../config/jwt';
-import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { MetaToolkitForbidden, MetaToolkitRefusal } from './metaToolkitErrors';
 import { readBusinessCatalogs } from './metaToolkitCatalogs';
 import {
   consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches,
@@ -27,6 +29,7 @@ import {
 export const META_EVENT_SOURCE_TOOL_NAMES = [
   'meta_event_source_get', 'meta_event_source_get_catalogs', 'meta_event_source_get_health',
   'meta_event_source_get_recommendations', 'meta_event_source_connect', 'meta_event_source_disconnect',
+  'meta_send_test_event',
 ] as const;
 export type MetaEventSourceToolName = (typeof META_EVENT_SOURCE_TOOL_NAMES)[number];
 
@@ -35,7 +38,8 @@ export function isMetaEventSourceTool(name: string): name is MetaEventSourceTool
 }
 
 /** Entity + action of the tools that change Meta state (write scope + write metering). */
-export const EVENT_SOURCE_WRITE_KIND: Partial<Record<MetaEventSourceToolName, { entityType: 'CATALOG_EVENT_SOURCE'; action: 'CREATE' | 'DELETE' }>> = {
+export const EVENT_SOURCE_WRITE_KIND: Partial<Record<MetaEventSourceToolName, { entityType: 'CATALOG_EVENT_SOURCE' | 'DATASET_TEST_EVENT'; action: 'CREATE' | 'DELETE' }>> = {
+  meta_send_test_event: { entityType: 'DATASET_TEST_EVENT', action: 'CREATE' },
   meta_event_source_connect: { entityType: 'CATALOG_EVENT_SOURCE', action: 'CREATE' },
   meta_event_source_disconnect: { entityType: 'CATALOG_EVENT_SOURCE', action: 'DELETE' },
 };
@@ -87,10 +91,85 @@ export const META_EVENT_SOURCE_TOOL_DEFINITIONS = [
     description: 'Disconnect a pixel of this ad account from a business catalog. Catalog ads lose that pixel\'s event matching. Two calls: PREVIEW + preview_token, then confirm=true with the token. Verified by read-back.',
     inputSchema: { type: 'object', properties: { ...ACCOUNT_PROP, ...CATALOG_PROP, ...PIXEL_PROP, ...CONFIRM_PROPS }, required: ['catalog_id', 'pixel_id'], additionalProperties: false },
   },
+  {
+    // ENG-3060. The name and description are model-facing copy awaiting approval (see the PR).
+    name: 'meta_send_test_event',
+    description: 'Send one Conversions API test event to a dataset (pixel) of this ad account, to check that server events arrive. Requires the test_event_code shown in Events Manager > Test Events. Meta does not drop test events: they count toward targeting and ads measurement. Email, phone and external_id are hashed before sending. Two calls: PREVIEW + preview_token, then confirm=true with the token. Returns what Meta answered (events_received, fbtrace_id, messages); it does not check that the event shows in Events Manager.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...ACCOUNT_PROP, ...PIXEL_PROP,
+        test_event_code: { type: 'string', description: 'Required. The code from Events Manager > Test Events (for example TEST12345).' },
+        event_name: { type: 'string', description: 'Standard or custom event name, for example Purchase or Lead.' },
+        action_source: { type: 'string', enum: ['website', 'app', 'email', 'phone_call', 'chat', 'physical_store', 'system_generated', 'business_messaging', 'other'], description: 'Where the conversion happened.' },
+        event_source_url: { type: 'string', description: 'Page URL of the event. Required when action_source is website.' },
+        event_id: { type: 'string', description: 'Optional id Meta uses to deduplicate against the same browser event.' },
+        user_data: {
+          type: 'object',
+          description: 'At least one field. email, phone (with country code) and external_id are hashed (SHA-256) before sending; the others are sent as given, as Meta requires.',
+          properties: {
+            email: { type: 'string' }, phone: { type: 'string' }, external_id: { type: 'string' },
+            client_ip_address: { type: 'string' }, client_user_agent: { type: 'string' }, fbc: { type: 'string' }, fbp: { type: 'string' },
+          },
+          additionalProperties: false,
+        },
+        custom_data: {
+          type: 'object',
+          properties: { value: { type: 'number' }, currency: { type: 'string', description: 'ISO 4217 code, for example USD.' } },
+          additionalProperties: false,
+        },
+        ...CONFIRM_PROPS,
+      },
+      required: ['pixel_id', 'test_event_code', 'event_name', 'action_source', 'user_data'],
+      additionalProperties: false,
+    },
+  },
 ];
+
+const ACTION_SOURCES = ['website', 'app', 'email', 'phone_call', 'chat', 'physical_store', 'system_generated', 'business_messaging', 'other'];
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+const shortText = (v: unknown, max: number) => (typeof v === 'string' && v.trim() !== '' && v.length <= max ? v.trim() : null);
+
+/**
+ * Build the Conversions API user_data from the caller's fields. Meta's customer information
+ * parameters: em = trim + lowercase, ph = digits only without leading zeros, both SHA-256
+ * (hashing required); external_id hashing recommended; client_ip_address, client_user_agent,
+ * fbc and fbp must not be hashed. A value that is already a SHA-256 hex digest is sent as is.
+ */
+function capiUserData(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new MetaToolkitRefusal('user_data must be an object with at least one field.');
+  const input = raw as Record<string, unknown>;
+  assertOnlyKeys(input, ['email', 'phone', 'external_id', 'client_ip_address', 'client_user_agent', 'fbc', 'fbp']);
+  const out: Record<string, unknown> = {};
+  const hashed = (key: string, normalize: (v: string) => string | null) => {
+    if (input[key] === undefined) return null;
+    const v = shortText(input[key], 320);
+    if (!v) throw new MetaToolkitRefusal(`user_data.${key} must be a non-empty string.`);
+    if (SHA256_RE.test(v.toLowerCase())) return [v.toLowerCase()];
+    const normalized = normalize(v);
+    if (!normalized) throw new MetaToolkitRefusal(`user_data.${key} is not a valid value. Nothing was sent.`);
+    return [sha256(normalized)];
+  };
+  const em = hashed('email', (v) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v.toLowerCase() : null));
+  const ph = hashed('phone', (v) => { const d = v.replace(/\D/g, '').replace(/^0+/, ''); return d.length >= 7 && d.length <= 15 ? d : null; });
+  const externalId = hashed('external_id', (v) => v);
+  if (em) out.em = em;
+  if (ph) out.ph = ph;
+  if (externalId) out.external_id = externalId;
+  for (const key of ['client_ip_address', 'client_user_agent', 'fbc', 'fbp']) {
+    if (input[key] === undefined) continue;
+    const v = shortText(input[key], 1024);
+    if (!v) throw new MetaToolkitRefusal(`user_data.${key} must be a non-empty string.`);
+    out[key] = v;
+  }
+  if (Object.keys(out).length === 0) throw new MetaToolkitRefusal('user_data needs at least one field (email, phone, external_id, client_ip_address + client_user_agent, fbc or fbp).');
+  return out;
+}
 
 const READ_PATH_RE = /^(act_\d+(\/adspixels)?|\d+(\/(owned_product_catalogs|client_product_catalogs|external_event_sources|diagnostics|stats))?)$/;
 const WRITE_PATH_RE = /^\d+\/external_event_sources$/;
+const TEST_EVENT_PATH_RE = /^\d+\/events$/;
 
 export interface MetaEventSourceDeps {
   readGraph: (userId: string, accountId: string, path: string, params: Record<string, string>) => Promise<any>;
@@ -170,6 +249,93 @@ export async function runMetaEventSourceTool(
     }
   };
   const account = `act_${String(accountId).replace(/^act_/, '')}`;
+
+  // ENG-3060: a test event needs the account's own pixel, not a Business portfolio or catalog.
+  if (name === 'meta_send_test_event') {
+    assertOnlyKeys(args, ['account_id', 'pixel_id', 'test_event_code', 'event_name', 'action_source', 'event_source_url', 'event_id', 'user_data', 'custom_data']);
+    // Checked first, before any Graph request: without the code this would be a production event.
+    const code = shortText(args.test_event_code, 64);
+    if (!code || !/^[A-Za-z0-9_-]+$/.test(code)) throw new MetaToolkitRefusal('test_event_code is required (the code from Events Manager > Test Events). Nothing was sent.');
+    const eventName = shortText(args.event_name, 100);
+    if (!eventName) throw new MetaToolkitRefusal('event_name is required.');
+    if (!ACTION_SOURCES.includes(args.action_source)) throw new MetaToolkitRefusal(`action_source must be one of: ${ACTION_SOURCES.join(', ')}.`);
+    const url = args.event_source_url === undefined ? null : shortText(args.event_source_url, 2000);
+    if (args.event_source_url !== undefined && !(url && /^https?:\/\//i.test(url))) throw new MetaToolkitRefusal('event_source_url must be an http(s) URL.');
+    if (args.action_source === 'website' && !url) throw new MetaToolkitRefusal('event_source_url is required when action_source is website.');
+    const eventId = args.event_id === undefined ? null : shortText(args.event_id, 200);
+    if (args.event_id !== undefined && !eventId) throw new MetaToolkitRefusal('event_id must be a non-empty string.');
+    const userData = capiUserData(args.user_data);
+    let customData: Record<string, unknown> | null = null;
+    if (args.custom_data !== undefined) {
+      if (!args.custom_data || typeof args.custom_data !== 'object' || Array.isArray(args.custom_data)) throw new MetaToolkitRefusal('custom_data must be an object.');
+      assertOnlyKeys(args.custom_data, ['value', 'currency']);
+      const { value, currency } = args.custom_data;
+      if (value !== undefined && !(typeof value === 'number' && Number.isFinite(value) && value >= 0)) throw new MetaToolkitRefusal('custom_data.value must be a number of 0 or more.');
+      if (currency !== undefined && !/^[A-Za-z]{3}$/.test(String(currency))) throw new MetaToolkitRefusal('custom_data.currency must be a 3-letter ISO code.');
+      customData = { ...(value !== undefined ? { value } : {}), ...(currency !== undefined ? { currency: String(currency).toUpperCase() } : {}) };
+    }
+
+    const pixelId = String(args.pixel_id ?? '');
+    if (!numericId(pixelId)) throw new MetaToolkitRefusal('pixel_id must be a numeric Meta pixel / dataset id.');
+    const pixels = list(await read(`${account}/adspixels`, { fields: PIXEL_FIELDS, limit: '100' }));
+    if (!pixels.some((p: any) => String(p?.id) === pixelId)) throw new MetaToolkitForbidden(`Dataset ${pixelId} is not a dataset of this ad account. Nothing was sent.`);
+
+    const event = {
+      event_name: eventName, action_source: args.action_source,
+      ...(url ? { event_source_url: url } : {}), ...(eventId ? { event_id: eventId } : {}),
+      user_data: userData, ...(customData && Object.keys(customData).length ? { custom_data: customData } : {}),
+    };
+    const fingerprint = previewFingerprint({ userId, tool: name, accountId, pixelId, code, event });
+    const now = deps.now();
+    const secret = deps.secret();
+    const previewText = [
+      'PREVIEW — nothing has been sent yet.',
+      `Send one "${eventName}" event (${args.action_source}) to dataset ${pixelId} with test_event_code ${code}.`,
+      `User data fields: ${Object.keys(userData).join(', ')} (email, phone and external_id are sent hashed).`,
+      'Meta: events sent with test_event_code are not dropped. They flow into Events Manager and are used for targeting and ads measurement. A test Purchase can count as a conversion.',
+    ].join('\n');
+    const freshPreview = () => previewResponse({ secret, userId, now, fingerprint, preview: previewText });
+    if (confirm !== true) return freshPreview();
+    if (!previewTokenMatches(previewToken, secret, userId, fingerprint, now)) {
+      return {
+        ...freshPreview(),
+        status: 'PREVIEW_MISMATCH',
+        note: 'The confirmation did not match a current preview (missing, expired, or the arguments changed). Nothing was sent. Show this new preview and get approval again.',
+      };
+    }
+    if (!(await consumeToken(deps.consumedTokens, previewToken, now))) {
+      const replay = replayTokenOutcome(deps.tokenOutcomes, previewToken, now);
+      if (replay) return replay;
+      throw new MetaToolkitRefusal('This preview_token was already used. Run a new preview to send another test event.');
+    }
+    const outcome = await (async () => {
+      const path = `${pixelId}/events`;
+      if (!TEST_EVENT_PATH_RE.test(path)) throw new MetaToolkitRefusal('Unsupported test event write.');
+      let res: any;
+      try {
+        res = await deps.writeGraph(userId, accountId, 'POST', path, {
+          data: JSON.stringify([{ ...event, event_time: Math.floor(now / 1000) }]), test_event_code: code,
+        });
+      } catch (error: any) {
+        const unknown = error?.outcomeUnknown === true || (error?.outcomeUnknown === undefined && !error?.metaError);
+        return unknown
+          ? { success: false, verification: 'UNCONFIRMED' as WriteVerification, id: pixelId, message: `UNCONFIRMED: the test event send failed without a definite answer from Meta (${metaMessage(error)}). It may or may not have been received; check Events Manager > Test Events before retrying.` }
+          : { status: 'FAILED', success: false, id: pixelId, meta_error: error?.metaError ?? null, message: `Meta refused the test event: ${metaMessage(error)}.` };
+      }
+      const received = Number(res?.events_received);
+      const ok = Number.isFinite(received) && received >= 1;
+      // There is no Graph read for a single received event, so Meta's own receipt count is the
+      // only evidence. CONFIRMED here means "Meta answered events_received >= 1", nothing more.
+      return {
+        success: ok, verification: (ok ? 'CONFIRMED' : 'MISMATCH') as WriteVerification, id: pixelId, test_event_code: code,
+        events_received: Number.isFinite(received) ? received : null, fbtrace_id: res?.fbtrace_id ?? null, messages: Array.isArray(res?.messages) ? res.messages : [],
+        message: ok
+          ? `Meta answered events_received=${received}. This does not show that the event is visible in Events Manager; look in Events Manager > Test Events for code ${code}.`
+          : 'Meta answered without an events_received count. Do not report this as received; check Events Manager > Test Events.',
+      };
+    })();
+    return rememberTokenOutcome(deps.tokenOutcomes, previewToken, outcome);
+  }
 
   // get_health reads the business best-effort, after the pixel's firing state (which needs no business).
   let catalogs = new Map<string, any>();
