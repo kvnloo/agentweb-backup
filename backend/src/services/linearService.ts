@@ -379,6 +379,8 @@ export interface OpenIssue {
   title: string;
   /** Issue body — carries the structured Session/Schedule IDs the auto-issue dedup gate matches on. */
   description: string;
+  /** ISO creation time. ENG-3088: the baseline for "is any failure newer than the filing". */
+  createdAt?: string;
 }
 
 /**
@@ -427,13 +429,13 @@ export async function listOpenIssuesByLabel(labelName: string, limit = OPEN_ISSU
             state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
             labels: { name: { eq: $label } }
           }
-        ) { nodes { id identifier title description } pageInfo { hasNextPage endCursor } }
+        ) { nodes { id identifier title description createdAt } pageInfo { hasNextPage endCursor } }
       }`,
       { team: TEAM_KEY, label: labelName, limit: pageSize, after },
     );
     const nodes = data?.issues?.nodes || [];
     for (const n of nodes) {
-      out.push({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' });
+      out.push({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '', createdAt: n.createdAt || undefined });
     }
     const pageInfo = data?.issues?.pageInfo;
     if (!pageInfo?.hasNextPage || !pageInfo?.endCursor || nodes.length === 0) break;
@@ -513,7 +515,7 @@ export async function findMostRecentClosedIssueByLabel(
             state: { type: { eq: "completed" } },
             labels: { name: { eq: $label } }
           }
-        ) { nodes { id identifier title description archivedAt } pageInfo { hasNextPage endCursor } }
+        ) { nodes { id identifier title description createdAt archivedAt } pageInfo { hasNextPage endCursor } }
       }`,
       { team: TEAM_KEY, label: labelName, limit: pageSize, after },
     );
@@ -521,7 +523,7 @@ export async function findMostRecentClosedIssueByLabel(
     scanned += nodes.length;
     const candidate = nodes
       .filter((n) => !n.archivedAt)
-      .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+      .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '', createdAt: n.createdAt || undefined }))
       .find(isMatch);
     if (candidate) return candidate;
     const pageInfo = data?.issues?.pageInfo;
