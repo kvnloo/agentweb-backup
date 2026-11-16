@@ -80,4 +80,4 @@ check shows the quote is persistently off by more than the tolerance.
 | Date | Sample | Booked | Quote | Result |
 |---|---|---|---|---|
 | 2026-11-13 | 118 contacts, 4 customers, since 2026-11-04 (every lead had an email), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
-| 2026-11-16 | 7 contacts, 1 customer, 2026-11-13 to 2026-11-16 | $0.48 | $0.39 | insufficient data, no change |
+| 2026-11-16 | 7 contacts, 1 customer, 2026-11-13 to 2026-11-16 | $0.48 | $0.49 (ratio 0.97) | insufficient data, no change |
