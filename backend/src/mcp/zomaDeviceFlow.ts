@@ -9,8 +9,13 @@
  *      Meta connect, Meta's callback finishes SERVER-SIDE for the setup's user
  *      (completeMetaConnect — never the browser's portal session), then straight to Stripe
  *      setup-mode Checkout, whose success_url is Zoma's "you're set" page. Done steps are skipped.
+ *   2c. ENG-3128: before Meta, the browser is asked "How familiar are you with ads?"
+ *      (answerAdsExperience). runs_ads -> Meta -> payment; new_to_ads -> a setup guide, then
+ *      Meta -> payment; not_interested -> a thank-you page and nothing else (no token).
  *   3. pollSetup          POST /api/zoma/setup/poll     -> RFC errors until bound, then
- *      next_step from getZomaReadiness (connect_meta | add_payment | fix_meta_page | complete). On complete
+ *      next_step from getZomaReadiness (ads_experience | connect_meta | add_payment |
+ *      not_interested | fix_meta_page | complete). The poll body may carry `ads_experience` so an agent can
+ *      ask the question in chat. On complete
  *      a per-user Zoma token is issued exactly once; only its hash is stored.
  *   4. validateZomaToken  used by the Meta Toolkit gateway for `zoma_` bearers.
  *   5. revokeZomaToken    POST /api/zoma/token/revoke
@@ -33,6 +38,16 @@ import {
 } from './zomaOnboarding';
 import { DynamoZomaDeviceStore, type ZomaDeviceRecord, type ZomaDeviceStore, type ZomaLinkStep } from './zomaDeviceStore';
 import { logZomaSetup } from './zomaSetupLog';
+import {
+  defaultAdsExperienceStore,
+  parseZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_OPTIONS,
+  ZOMA_ADS_EXPERIENCE_QUESTION,
+  ZOMA_ADS_EXPERIENCE_VALUES,
+  ZOMA_NEW_TO_ADS_STEPS,
+  ZOMA_NOT_INTERESTED_MESSAGE,
+  type ZomaAdsExperience,
+} from './zomaAdsExperience';
 import {
   defaultZomaLinkCodec,
   ZOMA_CONTINUE_PATH,
@@ -62,7 +77,8 @@ const USER_CODE_LENGTH = 8;
 /** ENG-3125: Meta is connected but no Facebook Page is usable for ads — guided fix, no stored link. */
 export type ZomaBlockerStep = 'fix_meta_page';
 const META_LINK_UNAVAILABLE = 'Could not create the Meta connect link right now; poll again for a fresh one.';
-export type ZomaNextStep = 'sign_in' | ZomaLinkStep | ZomaBlockerStep | 'complete';
+export type ZomaNextStep = 'sign_in' | 'ads_experience' | ZomaLinkStep | ZomaBlockerStep | 'not_interested' | 'complete';
+export const ZOMA_ADS_EXPERIENCE_PATH = '/api/zoma/ads-experience';
 
 export interface ZomaDeviceFlowDeps {
   store: ZomaDeviceStore;
@@ -83,6 +99,8 @@ export interface ZomaDeviceFlowDeps {
   finalizeMeta: (userId: string, code: string) => Promise<MetaFinalizeResult>;
   connectAdAccounts: (userId: string, accounts: MetaAdAccountSelection[], tokenSessionId: string) => Promise<void>;
   getCheckoutSession: (sessionId: string) => Promise<{ status?: string | null; userId?: string } | null>;
+  /** ENG-3128: persist the "How familiar are you with ads?" answer on the user row. */
+  saveAdsExperience: (userId: string, answer: ZomaAdsExperience) => Promise<void>;
 }
 
 let defaultStore: ZomaDeviceStore | undefined;
@@ -133,6 +151,7 @@ export const defaultZomaDeviceFlowDeps: ZomaDeviceFlowDeps = {
     const session: any = await stripeService.getCheckoutSession(sessionId);
     return session ? { status: session.status, userId: session.metadata?.userId } : null;
   },
+  saveAdsExperience: (userId, answer) => defaultAdsExperienceStore.save(userId, answer, new Date().toISOString()),
 };
 
 /**
@@ -317,8 +336,16 @@ export interface ZomaPickerAccount {
 
 export type BrowserStep =
   | { kind: 'redirect'; url: string }
-  | { kind: 'page'; status: number; title: string; message: string; retryUrl?: string; retryLabel?: string; steps?: string[]; done?: boolean }
-  | { kind: 'pick_account'; action: string; token: string; accounts: ZomaPickerAccount[]; message?: string };
+  | {
+      kind: 'page'; status: number; title: string; message: string; retryUrl?: string; done?: boolean;
+      /** ENG-3128: ordered instructions (the new-to-ads setup guide) and a label for the retry link. */
+      steps?: readonly string[]; retryLabel?: string;
+    }
+  | { kind: 'pick_account'; action: string; token: string; accounts: ZomaPickerAccount[]; message?: string }
+  | {
+      kind: 'ask_ads_experience'; action: string; token: string; question: string;
+      options: ReadonlyArray<{ value: ZomaAdsExperience; label: string }>; message?: string;
+    };
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
 
@@ -333,6 +360,14 @@ const DONE_PAGE: PageStep = {
   status: 200,
   title: "You're set",
   message: 'Zoma is connected. Return to your agent — it will finish setup on its own.',
+  done: true,
+};
+
+const THANK_YOU_PAGE: PageStep = {
+  kind: 'page',
+  status: 200,
+  title: 'Thanks for stopping by',
+  message: ZOMA_NOT_INTERESTED_MESSAGE,
   done: true,
 };
 
@@ -411,6 +446,8 @@ export async function continueInBrowser(deviceId: string, deps: ZomaDeviceFlowDe
   const device = journeyDevice(raw, deps.now());
   if (!device) return EXPIRED_PAGE;
   const state = await deps.readiness(device.userId);
+  if (!state.ads_experience) return askAdsExperience(deps, device.deviceId);
+  if (state.ads_experience === 'not_interested') return THANK_YOU_PAGE;
   if (!state.meta.ready) {
     const url = await deps.mintMetaLink(device.userId, device.deviceId);
     await track(deps, device.deviceId, device.userId, 'meta_redirect', 'ok');
@@ -425,6 +462,61 @@ export async function continueInBrowser(deviceId: string, deps: ZomaDeviceFlowDe
   }
   if (state.blocker) return metaPageBlockedPage(deps, device, state.blocker);
   return DONE_PAGE;
+}
+
+function askAdsExperience(deps: ZomaDeviceFlowDeps, deviceId: string, message?: string): BrowserStep {
+  return {
+    kind: 'ask_ads_experience',
+    action: ZOMA_ADS_EXPERIENCE_PATH,
+    token: deps.links.sign({ purpose: 'continue', zoma: deviceId }, ZOMA_ONBOARDING_WINDOW_SEC),
+    question: ZOMA_ADS_EXPERIENCE_QUESTION,
+    options: ZOMA_ADS_EXPERIENCE_OPTIONS,
+    ...(message ? { message } : {}),
+  };
+}
+
+/** Save the answer and say what happens next. Shared by the browser form and the agent's poll. */
+async function recordAdsExperience(
+  deps: ZomaDeviceFlowDeps,
+  device: ZomaDeviceRecord & { userId: string },
+  answer: ZomaAdsExperience,
+): Promise<void> {
+  await deps.saveAdsExperience(device.userId, answer);
+  await track(deps, device.deviceId, device.userId, 'ads_experience', answer);
+}
+
+/**
+ * POST /api/zoma/ads-experience — the "How familiar are you with ads?" form.
+ *   runs_ads        -> straight on to the next unfinished step (Meta, then payment)
+ *   new_to_ads      -> the ad-account setup guide, with a link onward to connecting
+ *   not_interested  -> thank-you; nothing further
+ */
+export async function answerAdsExperience(
+  params: { t?: unknown; answer?: unknown },
+  deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
+): Promise<BrowserStep> {
+  const claims = deps.links.verify(params.t, 'continue');
+  const device = claims ? journeyDevice(await deps.store.getDevice(claims.zoma), deps.now()) : null;
+  if (!claims || !device) {
+    logZomaSetup({ step: 'ads_experience', outcome: 'rejected', reason: 'invalid_link' });
+    return EXPIRED_PAGE;
+  }
+  const answer = parseZomaAdsExperience(params.answer);
+  if (!answer) return askAdsExperience(deps, device.deviceId, 'Choose one of the options.');
+  await recordAdsExperience(deps, device, answer);
+  if (answer === 'not_interested') return THANK_YOU_PAGE;
+  if (answer === 'new_to_ads') {
+    return {
+      kind: 'page',
+      status: 200,
+      title: 'Set up your ad accounts',
+      message: 'Running ads needs an ad account. Set these up first (each takes a few minutes), then come back and connect them.',
+      steps: ZOMA_NEW_TO_ADS_STEPS,
+      retryUrl: continueLink(deps, device.deviceId),
+      retryLabel: "I've set these up — connect my ad accounts",
+    };
+  }
+  return continueInBrowser(device.deviceId, deps);
 }
 
 /** GET /api/zoma/continue?t= — resume the journey from a signed link (retry buttons, Stripe cancel). */
@@ -599,7 +691,15 @@ export type PollResult =
   | { status: 400; body: { error: 'authorization_pending'; error_description: string; next_step: 'sign_in'; link: string; interval: number } }
   | { status: 400; body: { error: 'slow_down'; error_description: string; interval: number } }
   | { status: 400; body: { error: 'expired_token' | 'access_denied' | 'invalid_grant' | 'invalid_request'; error_description: string } }
-  | { status: 200; body: { next_step: ZomaLinkStep; link?: string; message?: string; interval: number } }
+  | { status: 200; body: { next_step: ZomaLinkStep; link?: string; message?: string; guide?: readonly string[]; interval: number } }
+  | {
+      status: 200;
+      body: {
+        next_step: 'ads_experience'; question: string;
+        options: ReadonlyArray<{ value: ZomaAdsExperience; label: string }>; message: string; interval: number;
+      };
+    }
+  | { status: 200; body: { next_step: 'not_interested'; message: string } }
   | {
       status: 200;
       body: {
@@ -625,11 +725,22 @@ const rfcError = (error: 'expired_token' | 'access_denied' | 'invalid_grant' | '
 /** Poll outcome used to trace state changes only (not every poll). */
 const pollOutcomeOf = (r: PollResult) => ('error' in r.body ? r.body.error : r.body.next_step);
 
-export async function pollSetup(rawDeviceCode: unknown, deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps): Promise<PollResult> {
+export async function pollSetup(
+  rawDeviceCode: unknown,
+  deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
+  opts: { adsExperience?: unknown } = {},
+): Promise<PollResult> {
   if (typeof rawDeviceCode !== 'string' || !rawDeviceCode) return rfcError('invalid_request', 'device_code is required.');
   const device = await deps.store.getDevice(sha256(rawDeviceCode));
   if (!device) return rfcError('invalid_grant', 'Unknown device_code. Start Zoma setup again.');
-  const result = await pollDevice(device, deps);
+  // ENG-3128: the agent asked "How familiar are you with ads?" in chat and sends the answer here.
+  let answer: ZomaAdsExperience | undefined;
+  if (opts.adsExperience !== undefined) {
+    const parsed = parseZomaAdsExperience(opts.adsExperience);
+    if (!parsed) return rfcError('invalid_request', `ads_experience must be one of: ${ZOMA_ADS_EXPERIENCE_VALUES.join(', ')}.`);
+    answer = parsed;
+  }
+  const result = await pollDevice(device, deps, answer);
   const outcome = pollOutcomeOf(result);
   if (outcome !== 'slow_down' && outcome !== device.lastPollOutcome) {
     await track(deps, device.deviceId, device.userId, 'poll', outcome, undefined, { pollOutcome: outcome });
@@ -638,7 +749,7 @@ export async function pollSetup(rawDeviceCode: unknown, deps: ZomaDeviceFlowDeps
   return result;
 }
 
-async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): Promise<PollResult> {
+async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps, answer?: ZomaAdsExperience): Promise<PollResult> {
   const now = deps.now();
   if (device.expiresAt <= now) return rfcError('expired_token', 'This setup code has expired. Start Zoma setup again.');
   if (device.status === 'issued') return rfcError('invalid_grant', 'A Zoma token was already issued for this device_code; it is shown only once.');
@@ -665,7 +776,24 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
   // status === 'approved': onboarding steps, derived live from zomaOnboarding. The links are the
   // same ones the browser journey uses, so an agent can re-send one if the user drops off.
   const userId = device.userId;
+  if (answer) await recordAdsExperience(deps, { ...device, userId }, answer);
   const state = await deps.readiness(userId);
+  if (!state.ads_experience) {
+    return {
+      status: 200,
+      body: {
+        next_step: 'ads_experience',
+        question: ZOMA_ADS_EXPERIENCE_QUESTION,
+        options: ZOMA_ADS_EXPERIENCE_OPTIONS,
+        message: `Ask the user "${ZOMA_ADS_EXPERIENCE_QUESTION}" and poll again with ads_experience set to the value of their answer.`,
+        interval: device.intervalSec,
+      },
+    };
+  }
+  // A friend must never be issued a token or sent through setup.
+  if (state.ads_experience === 'not_interested') {
+    return { status: 200, body: { next_step: 'not_interested', message: ZOMA_NOT_INTERESTED_MESSAGE } };
+  }
   // Same order as zoma_status: connect Meta, payment, then the Page blocker (ENG-3125).
   const step: ZomaNextStep = !state.meta.ready ? 'connect_meta' : !state.payment.ready ? 'add_payment' : state.blocker ? 'fix_meta_page' : 'complete';
 
@@ -697,6 +825,7 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
     if (state.payment.error && step === 'add_payment') {
       return { status: 200, body: { next_step: step, message: state.payment.error, interval: device.intervalSec } };
     }
+    const guide = step === 'connect_meta' && state.ads_experience === 'new_to_ads' ? { guide: ZOMA_NEW_TO_ADS_STEPS } : {};
     let link: string | undefined;
     try {
       // Meta links are cheap signed URLs (state expires in 10 min), so mint fresh per poll;
@@ -710,6 +839,7 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
       body: {
         next_step: step,
         ...(link ? { link } : { message: 'Could not create the link right now; keep polling.' }),
+        ...guide,
         interval: device.intervalSec,
       },
     };
