@@ -81,7 +81,7 @@ describe('LinkedInService', () => {
         timeout: 15000,
         headers: {
           'X-Restli-Protocol-Version': '2.0.0',
-          'LinkedIn-Version': '202511',
+          'LinkedIn-Version': '202610',
           'Content-Type': 'application/json',
         },
       });
