@@ -360,36 +360,65 @@ describe('decideStorageAccess: when a lookup fails', () => {
   });
 });
 
-describe('StorageAccessLookups: how many records one request may look up', () => {
+describe('StorageAccessLookups: how many missing records one request may look up', () => {
   beforeEach(() => {
     getUser.mockReset();
     getUser.mockImplementation(async (id: string) => users[id]);
+    getTask.mockReset();
+    getExecution.mockReset();
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
   afterEach(() => jest.restoreAllMocks());
 
-  it('looks up at most 20 distinct records; the rest count as not found, with one log line for the request', async () => {
+  it('reads at most 10 records that turn out not to exist; later ones are not read, count as not found, mark the request failed, and are logged once', async () => {
     const lookups = new StorageAccessLookups();
-    const found = await Promise.all(Array.from({ length: 30 }, (_, i) => lookups.user(`ghost-${i}`)));
-    expect(getUser).toHaveBeenCalledTimes(StorageAccessLookups.MAX_DISTINCT_LOOKUPS);
+    const found: unknown[] = [];
+    for (let i = 0; i < 30; i++) found.push(await lookups.user(`ghost-${i}`));
+    expect(getUser).toHaveBeenCalledTimes(StorageAccessLookups.MAX_MISSES);
     expect(found.every((u) => u === null)).toBe(true);
+    expect(lookups.failed).toBe(true);
     expect((console.warn as jest.Mock).mock.calls.filter((c) => String(c[0]).includes('storage_access_lookup_limit'))).toHaveLength(1);
   });
 
-  it('asking again for a record already looked up costs nothing and does not count', async () => {
+  it('records that exist do not count, so a long legitimate batch is not cut', async () => {
+    const many: Record<string, any> = {};
+    for (let i = 0; i < 60; i++) many[`u${i}`] = { userId: `u${i}`, orgId: 'orgA', orgRole: 'member' };
+    getUser.mockImplementation(async (id: string) => many[id]);
     const lookups = new StorageAccessLookups();
-    for (let round = 0; round < 5; round++) for (let i = 0; i < 20; i++) await lookups.user(i === 0 ? 'me' : `ghost-${i}`);
-    expect(getUser).toHaveBeenCalledTimes(20);
-    expect(await lookups.user('me')).toMatchObject({ userId: 'me' }); // the first twenty keep working however often they are asked
+    for (let i = 0; i < 60; i++) expect(await lookups.user(`u${i}`)).toMatchObject({ userId: `u${i}` });
+    expect(getUser).toHaveBeenCalledTimes(60);
+    expect(lookups.failed).toBe(false);
   });
 
-  it('a batch naming 50 made-up owners refuses them all without 50 reads, and still allows the caller\'s own files and records inside the limit', async () => {
+  it('asking again for a record already looked up costs nothing, and the first ten misses keep their answer', async () => {
     const lookups = new StorageAccessLookups();
-    const keys = Array.from({ length: 50 }, (_, i) => `users/ghost${i}/files/1/abc/a.png`);
-    const decisions = await Promise.all(keys.map((key) => decideStorageAccess(ME, key, 'read', lookups)));
+    for (let round = 0; round < 5; round++) for (let i = 0; i < 10; i++) await lookups.user(`ghost-${i}`);
+    expect(getUser).toHaveBeenCalledTimes(10);
+    expect(lookups.failed).toBe(false); // the limit is reached, not exceeded
+  });
+
+  it('a batch naming 50 made-up owners refuses them all without 50 reads, and still allows the caller\'s own files', async () => {
+    const lookups = new StorageAccessLookups();
+    const decisions = [];
+    for (let i = 0; i < 50; i++) decisions.push(await decideStorageAccess(ME, `users/ghost${i}/files/1/abc/a.png`, 'read', lookups));
     expect(decisions.every((d) => !d.allow)).toBe(true);
-    expect(getUser.mock.calls.length).toBeLessThanOrEqual(StorageAccessLookups.MAX_DISTINCT_LOOKUPS);
+    expect(getUser.mock.calls.length).toBeLessThanOrEqual(StorageAccessLookups.MAX_MISSES + 1); // the caller's own record may be read once too
     expect((await decideStorageAccess(ME, 'users/me/files/1/abc/mine.png', 'read', lookups)).allow).toBe(true); // no lookup needed for one's own key
+  });
+
+  it('once the limit is reached an execution file is refused, not decided by falling back to its task (that would skip the check that the execution belongs to the task)', async () => {
+    getTask.mockResolvedValue({ taskId: 't-me', userId: 'me' });
+    getExecution.mockResolvedValue({ userId: 'mate', taskId: 'someone-elses-task' }); // a victim's execution, named under my own task
+    // without the limit the check is real: the execution does not belong to the task in the key
+    expect((await decideStorageAccess(ME, 'tasks/t-me/executions/e-victim/1-a.png', 'read', new StorageAccessLookups())).allow).toBe(false);
+    // with the limit reached first, the execution is not even looked up, and the answer is still a refusal
+    const lookups = new StorageAccessLookups();
+    for (let i = 0; i < 12; i++) await decideStorageAccess(ME, `users/ghost${i}/files/1/abc/a.png`, 'read', lookups);
+    getExecution.mockClear();
+    const decision = await decideStorageAccess(ME, 'tasks/t-me/executions/e-victim/1-a.png', 'read', lookups);
+    expect(decision.allow).toBe(false);
+    expect(decision.reason).toBe('lookup_failed');
+    expect(getExecution).not.toHaveBeenCalled();
   });
 });
 

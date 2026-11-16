@@ -285,14 +285,15 @@ describe('the per-connection limit on the confirm page and its button', () => {
     const getFromOneConnection = () => request(app).get(`/api/tasks/${TASK}/subscribers/confirm`).query({ token: 'nope' }).set('X-Forwarded-For', '203.0.113.201');
     for (let i = 0; i < 300; i++) expect((await getFromOneConnection()).status).toBe(400);
     (taskDb.getTaskById as jest.Mock).mockClear();
-    const limited = await getFromOneConnection();
+    // a link that is valid: without the limit this request would read the task and show the Confirm button
+    const limited = await request(app).get(`/api/tasks/${TASK}/subscribers/confirm`).query({ token: signConfirmToken(TASK, EMAIL) }).set('X-Forwarded-For', '203.0.113.201');
     expect(limited.status).toBe(429);
     expect(limited.type).toBe('text/html');
     expect(limited.text).toContain('Too many requests');
     expect(limited.headers['cache-control']).toBe('no-store');
     expect(limited.headers['referrer-policy']).toBe('same-origin');
     // the button's POST shares the same counter, and nothing was read for either
-    const press = await request(app).post(`/api/tasks/${TASK}/subscribers/confirm`).type('form').send({ token: 'nope' }).set('X-Forwarded-For', '203.0.113.201');
+    const press = await request(app).post(`/api/tasks/${TASK}/subscribers/confirm`).type('form').send({ token: signConfirmToken(TASK, EMAIL) }).set('X-Forwarded-For', '203.0.113.201');
     expect(press.status).toBe(429);
     expect(taskDb.getTaskById).not.toHaveBeenCalled();
     // another connection is unaffected
