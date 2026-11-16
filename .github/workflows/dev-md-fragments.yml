@@ -9,6 +9,14 @@ name: dev.md fragments
 #   consolidate  (push to main) folds pending fragments into dev.md newest
 #                first, deletes them, and opens/updates a single PR on
 #                automation/dev-md-consolidate.
+#
+# ENG-3038: the consolidation PR is opened and force-updated with this
+# workflow's GITHUB_TOKEN, and GitHub starts no workflow for an event made by
+# that token, so its `pull_request` runs carry zero jobs and the PR has no CI
+# evidence. `workflow_dispatch` is one of the two events that token MAY start,
+# so the consolidate job dispatches this workflow (guard) and Build on the
+# automation branch after it opens or updates the PR. Check runs are keyed on
+# the commit, so they land on the PR's head like any other.
 
 on:
   pull_request:
@@ -25,7 +33,9 @@ permissions:
 jobs:
   guard:
     name: dev.md fragment guard
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name == 'automation/dev-md-consolidate')
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
@@ -36,7 +46,7 @@ jobs:
       # judges it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
           persist-credentials: false
       - name: Reject direct dev.md edits
         env:
@@ -49,18 +59,38 @@ jobs:
             echo "Base ref predates the ENG-809 guard; nothing to enforce yet."
             exit 0
           fi
+          if [ -z "${PR_NUMBER}" ]; then
+            # Dispatched on the automation branch (ENG-3038): judge the open
+            # consolidation PR, and only if this run's commit is its head, so
+            # the result cannot land on a commit it did not evaluate.
+            HEAD_REF="${GITHUB_REF_NAME}"
+            pr="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${HEAD_REF}" --state open \
+              --json number,headRefOid --jq '.[0] | "\(.number) \(.headRefOid)"')"
+            read -r PR_NUMBER pr_head <<<"${pr}"
+            if [ -z "${PR_NUMBER}" ] || [ "${PR_NUMBER}" = "null" ]; then
+              echo "DEV_MD_GUARD_FAILED: no open pull request on ${HEAD_REF} to judge" >&2
+              exit 1
+            fi
+            if [ "${pr_head}" != "${GITHUB_SHA}" ]; then
+              echo "DEV_MD_GUARD_FAILED: #${PR_NUMBER} head ${pr_head} is not this run's commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
           gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
             --jq '.[] | "\(.status)\t\(.filename)"' > /tmp/pr-files.tsv
           cut -f2 /tmp/pr-files.tsv | bash .github/scripts/dev-md-guard.sh "${HEAD_REF}" /tmp/pr-files.tsv
 
   consolidate:
     name: Consolidate dev.md fragments
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name != 'automation/dev-md-consolidate')
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     concurrency:
       group: dev-md-consolidate
       cancel-in-progress: false
@@ -71,15 +101,19 @@ jobs:
       - name: Fold pending fragments into dev.md
         run: bash .github/scripts/dev-md-consolidate.sh .
       - uses: peter-evans/create-pull-request@v8
+        id: cpr
         with:
           branch: automation/dev-md-consolidate
           base: main
           author: deploy <deploy@agentweb.pro>
           committer: deploy <deploy@agentweb.pro>
-          title: 'docs(dev.md): consolidate pending fragments (ENG-809)'
+          # ENG-3062: no issue id in the title or body. Linear links a PR to
+          # any issue id it finds there and moves that issue with the PR, so
+          # every consolidation run reopened the issue it named.
+          title: 'docs(dev.md): consolidate pending fragments'
           commit-message: 'docs(dev.md): consolidate pending fragments'
           body: |
-            Automated by `.github/workflows/dev-md-fragments.yml` (ENG-809).
+            Automated by `.github/workflows/dev-md-fragments.yml`.
 
             Folds every `dev/pending/*.md` fragment on `main` into `dev.md`
             (newest first) and deletes the fragments. The consolidation script
@@ -88,3 +122,13 @@ jobs:
 
             Docs-only; the `dev.md fragment guard` allows this branch only when
             every change is `dev.md` or a removed fragment.
+      # ENG-3038: start the checks the PR event could not. Not on `closed` or
+      # `none`: there is no new head to prove.
+      - name: Run the guard and Build on the consolidation PR head
+        if: steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run dev-md-fragments.yml --repo "${GITHUB_REPOSITORY}" --ref automation/dev-md-consolidate
+          gh workflow run tests.yml --repo "${GITHUB_REPOSITORY}" --ref automation/dev-md-consolidate

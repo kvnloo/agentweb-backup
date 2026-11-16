@@ -61,7 +61,9 @@ describe('POST /api/oauth/linkedin-outreach/save-account', () => {
     expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
       'user-123',
       'unipile',
-      expect.objectContaining({ account_id: 'acc-new-1', account_name: 'Test User' })
+      expect.objectContaining({ account_id: 'acc-new-1', account_name: 'Test User' }),
+      // ENG-2686 (784605843): the route tells the store whether Unipile confirmed the account.
+      { providerVerified: true }
     );
   });
 
@@ -82,7 +84,9 @@ describe('POST /api/oauth/linkedin-outreach/save-account', () => {
     expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
       'user-123',
       'unipile',
-      expect.objectContaining({ account_id: 'acc-new-1', account_name: 'LinkedIn Account' })
+      expect.objectContaining({ account_id: 'acc-new-1', account_name: 'LinkedIn Account' }),
+      // Every getAccount retry failed, so the account is saved as not provider-verified.
+      { providerVerified: false }
     );
     // getAccount called 3 times (maxRetries)
     expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(3);
@@ -112,7 +116,8 @@ describe('POST /api/oauth/linkedin-outreach/save-account', () => {
     expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
       'user-123',
       'unipile',
-      expect.objectContaining({ account_name: 'Shawn Zulfiqar' })
+      expect.objectContaining({ account_name: 'Shawn Zulfiqar' }),
+      { providerVerified: true }
     );
     expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(2);
     jest.restoreAllMocks();
@@ -133,7 +138,8 @@ describe('POST /api/oauth/linkedin-outreach/save-account', () => {
     expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
       'user-123',
       'unipile',
-      expect.objectContaining({ account_name: 'Jane Doe' })
+      expect.objectContaining({ account_name: 'Jane Doe' }),
+      { providerVerified: true }
     );
     expect(linkedInOutreachService.getAccount).toHaveBeenCalledTimes(2);
     jest.restoreAllMocks();

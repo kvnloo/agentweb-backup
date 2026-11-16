@@ -1,3 +1,478 @@
+## ENG-3062: consolidation PR title no longer names an issue (2026-11-16)
+
+The dev.md consolidation workflow titled every PR `... (ENG-809)`. Linear links
+a PR to an issue id in its title, so each run moved ENG-809 to In Progress and
+then Merged, long after it was verified. The title and body now carry no issue
+id; the body still names the workflow file. Do not put an issue id in the title
+or body of any recurring bot PR.
+
+## ENG-3056: six pixel rule write rows in the Zoma parity matrix are not applicable (2026-11-16)
+
+`backend/src/mcp/zomaMetaParityMatrix.ts` no longer lists `ads_pixel_event_create/update/delete` and
+`ads_pixel_parameter_create/update/delete` as gaps. They are `not_applicable`: Meta's public Marketing API
+reference documents no write for pixel event rules or parameter extractors.
+
+Checked 2026-11-16 (v25.0 reference):
+
+- `ads-pixel/event_rules`: read only. Creating, updating and deleting each say "You can't perform this operation on this endpoint."
+- `ads-pixel/extractors`: read only, same three statements.
+- `ads-pixel` (Ad Pixel): no other rule or parameter edge. Its own update takes pixel settings only, and it has no delete.
+- No reference page exists for the rule nodes `CalibratorExistingRule` or `SignalsIWLExtractor`.
+
+Meta's own Ads MCP server lists these six tools. How it performs them is not in the public reference.
+No tool, handler or Meta call was added. `ads_pixel_parameter_read` stays a gap (ENG-3055); the public
+`extractors` read exists for it.
+
+## ENG-3029: Grok creator alias rolled back; the entry below this one is partly wrong (2026-11-16)
+
+- Correction to the ENG-3029 entry dated 2026-11-16 ("Grok rows match again"): the `SpaceXAI` -> `xai` alias in `refreshScores` (`AA_CREATOR_ALIASES`) was merged in #4095 and removed the same day in #4097. Grok rows do not match. The live fixture from that entry is unchanged.
+- Why: with the alias, monitor workflow run 43787084872 matched `grok-4.7` and proposed 46.4 -> 35.5 from the feed while `grok-4.6` stayed unmatched at 44.3, and the "Grok 4.7 supersedes 4.6" invariant failed the run. The feed is Intelligence Index v5; the registry's older scores are on an earlier scale.
+- Do not re-add the alias before the score-scale mix is decided (ENG-3054).
+
+## ENG-3029: Artificial Analysis jest fixture is now a live capture; Grok rows match again (2026-11-16)
+
+- Step 2 of 2. `backend/src/services/agentMode/__tests__/fixtures/artificialAnalysisLanguageModelsFree.json` is no longer the documented example. It is 7 rows, verbatim, from the first response page uploaded by workflow run 43771490745 (2026-11-15). The rows cover: scored and unscored, `performance_v3` null and present, cost block null and present, all-null pricing, an integer score.
+- The live rows showed one parser defect. The current endpoint names Grok's lab `SpaceXAI`; the retired one sent a slug that normalized to `xai`. Every `x-ai/*` registry entry therefore reported "AA unmatched" and kept its old score. `refreshScores` now maps that one creator name to `xai` (`AA_CREATOR_ALIASES` in `modelCatalogRefresh.ts`).
+- Not changed: `Alibaba` (registry provider `qwen`) and `Kimi` (`moonshot`) also do not match by name. Those entries carry hand-picked variant scores and did not match on the old endpoint either, so matching them is a separate decision.
+- The fixture is one trimmed page of four. Rows on pages 2 to 4 were never captured.
+
+## ENG-3048: the agent run store is ON in production and on staging (2026-11-15)
+
+Correction to three older entries. They say `AGENT_RUN_STORE` is unset in production. That is no longer true.
+
+- ENG-2773 (2026-11-01): "Dark: active only with `AGENT_RUN_STORE=true` (unset in production)".
+- ENG-112 (2026-10-08): "The run store is OFF in production today (`AGENT_RUN_STORE` unset), so only the in-process layer is live there."
+- ENG-110 (2026-10-13), accepted risk: "AW-AgentRuns / AGENT_RUN_STORE is not provisioned".
+
+Read from Elastic Beanstalk on 2026-11-15: `Agentweb-backend-env-prod-3` has `AGENT_RUN_STORE=true`. So in production the `idem#` submit locks (session create, plan session, chat branch, interactive submit) and the `run#` records are live. The ENG-112 note about a 409 `DUPLICATE_SUBMIT` on a retry that lands on another instance describes real production behaviour, not a dark path. The same stale sentence is in a comment at `backend/src/services/agentMode/chatBranching.ts:659`; it was not changed here.
+
+Staging now matches. `AGENT_RUN_STORE=true` was set as an environment property on `Agentweb-backend-env-1` (the environment `staging-backend.yml` deploys, `NODE_ENV=development`) on 2026-11-16 UTC. It is an EB property, not repo config: no file in the repo owns staging environment variables, and `.github/scripts/staging-env-override.sh` is for temporary overrides only. Rollback: remove the property from the environment (the app restarts).
+
+Things to know when testing on staging:
+
+- Table is `Dev-AW-AgentRuns` (us-west-2), hash key `pk`.
+- TTL is disabled on `Dev-AW-AgentRuns` (enabled on `ttl` in production). Locks still expire, because `claimIdempotency` treats an expired row as free. Rows are never deleted on dev, so the table only grows. Enabling TTL is a retention decision tracked on ENG-3050.
+- The backend reaches DynamoDB with the `aw_backend_user` access key from the environment, not the instance role.
+- Session create with a repeated `idempotencyKey` now returns the first session with `idempotentReplay: true` (200) instead of a second session (201). Checked on staging 2026-11-16 00:26Z: before the change two calls with one key gave two sessions; after it they gave one session and one `idem#` row.
+
+## ENG-3039: eb-deploy.sh no longer fails an applied release because a later update is running (2026-11-15)
+
+- Cause of the 2026-11-06 false failure (run 42150471207): EB finished rolling out `backend-20261106-pr3910` at 02:53:52Z; at 02:54:00Z an environment-variable change made outside the workflow (CloudTrail `UpdateEnvironment` with `optionSettings`, principal `harsha-swarm`) started a second Immutable update that ran to 03:21:06Z. The environment was Ready for less than one 15s poll, so the script only ever saw `Updating` on the expected version and failed on the 2700s budget, 22 minutes after the release was serving.
+- `verify_deployment` now treats `Status=Updating` on the expected version as success only when both hold: EB's INFO events since `update-environment` was accepted show "Environment update is starting." followed by "New application version was deployed to running EC2 instances.", and `underlying_health_verdict` reports every instance Ok and every target healthy. Anything less keeps polling against the same budget, so a rollout that is stuck still fails.
+- The 2026-11-13 failure (run 43424274684) was a correct verdict and is unchanged: the script arrived one minute into a manual configuration update that took 1474s, against a 1200s settle cap. Measured Immutable update durations in the two windows: 1381s, 1626s, 1405s, 1474s. The budgets in `deploy.yml` are not changed here.
+- Both foreign updates were environment-variable changes on prod made while a deploy was in flight. Each one costs a full Immutable replacement (23 to 27 minutes) and blocks the next deploy for that long.
+
+## ENG-3038: consolidate PRs had no CI because GITHUB_TOKEN events start no workflows (2026-11-15)
+
+- Cause: `dev-md-fragments.yml` opens and force-updates the `automation/dev-md-consolidate` PR with the workflow's own `GITHUB_TOKEN`. GitHub starts no workflow for an event made by that token, so every `pull_request` run on that PR (actor `github-actions[bot]`) has zero jobs: `failure` on the opened pair (43755763117 / 43755763155), `action_required` on later updates (43761230507 / 43761230577).
+- The 11 checks on #4075 came from a manual close and reopen by a user token (runs 43756441782 / 43756441791), not from the workflow.
+- Fix: `workflow_dispatch` is an event `GITHUB_TOKEN` may start. After the consolidate job creates or updates the PR it dispatches `dev-md-fragments.yml` (guard) and `tests.yml` (Build) on the automation branch. Check runs are keyed on the commit, so `merge-evidence.sh` reads them at the PR head.
+- The dispatched guard looks the PR up by branch and fails unless the PR head equals the run's commit. Build honours a dispatch only on `automation/dev-md-consolidate`; on any other ref `Detect changed projects` fails.
+- Manual `workflow_dispatch` of `dev-md-fragments.yml` on `main` still consolidates; on the automation branch it now runs the guard instead.
+- Not provable before merge: the first consolidate PR opened after this lands is the proof.
+
+## ENG-3029: frontier monitor uploads the first Artificial Analysis response page as an artifact (2026-11-15)
+
+- Step 1 of 2. The `Frontier monitor and model catalog` workflow sets `AA_FIRST_PAGE_CAPTURE_PATH`; `fetchArtificialAnalysisModels` then writes the parsed body of page 1 to that path, and the workflow uploads it as artifact `artificial-analysis-first-page` (14 days).
+- The file is the response body only: no request, no headers, no key. A body that contains the key is not written. A capture failure goes to stderr and never fails the read. Without the env var nothing is written, so no other caller changes.
+- Not done yet: replacing the jest fixture (`artificialAnalysisLanguageModelsFree.json` is still the documented example). That needs the artifact from a real run after this merges; ENG-3029 stays open for it.
+
+## ENG-3021: No-inference readback routes for get_leads and get_lead_details (2026-11-15)
+
+- `POST /api/emma/leads` `{ list_id, limit?, cursor?, status?, search?, include_all_fields? }` and `POST /api/emma/lead-details` `{ list_id, lead_id }` call the same handlers as Emma's `get_leads` and `get_lead_details` tools (`backend/src/emma/impl/leads.ts`). No model run.
+- Read-only. The caller is always the authenticated user; identity fields in the body are ignored and the handlers enforce list access.
+- Both are `metered` in `EMMA_ROUTE_BUDGET`, like `POST /search-leads`.
+- Purpose: a post-merge verifier can read stored `contactStatus` and unsubscribe evidence through all three lead projections with a fixture token.
+
+## ENG-3037: failure-cluster loop treats the "<X> not connected" wording as never-connected (2026-11-15)
+
+- `isNeverConnectedMessage` in `backend/src/loops/instances/agent-mode/failureRuleSet.ts` matched only "No <X> account connected" (ENG-2943). The other wording of the same precondition was counted as a dispatchable `config` failure and could file an Auto oncall row with nothing to act on (the google_drive cluster on ENG-2788).
+- Added an allow-list, not a general "not connected" pattern. Included, each throw site read and reached only when no connected-account row is found: Google Drive (`googleDriveAccess.ts`), HubSpot (`hubspotService.ts`, no own and no shared account), Attio (`attioService.ts`), Gmail and Outlook (`getAccountById` returns nothing for the requested account id).
+- Left as `config` on purpose, because a connected account can produce them: LinkedIn Ads in `adsApis.getLinkedInAdsCredentials` (the filter also drops a row with no `access_token`), bare "ClickUp not connected" / "Foreplay not connected" (`getAccessToken` returns null when a stored token fails to decrypt), and messages naming one specific account.
+- A new integration using this wording is not excluded until its name is added to the allow-list.
+
+## ENG-3034: four base Campaign-management parity rows proven covered; two read rows split to ENG-3040 (2026-11-15)
+
+- `ads_create_campaign`, `ads_create_ad_set`, `ads_create_ad` map to `call_meta_marketing_api` CREATE on CAMPAIGN / AD_SET / AD; `ads_activate_entity` maps to its guarded UPDATE (status=ACTIVE). Matrix data and one test file only; no tool, description or runtime path changed.
+- `eng2303.metaToolkitWrites.test.ts` only exercised CAMPAIGN. `eng3034.campaignManagementParity.test.ts` now proves, for each of the three entities, that CREATE is dispatched PAUSED, that any other status on create is refused before preview, that a create which reads back ACTIVE is MISMATCH, and that activation needs its own preview token (a CREATE token does not activate).
+- `ads_get_ad_accounts` and `ads_get_field_context` stay `gap`, owner ENG-3040. `zoma_status` lists connected ad accounts but nobody has compared that with what Meta's tool returns; no operation was found for field context.
+- Totals from `summarizeParity`: covered 71 / gap 14 / n/a 3 (of 88). Main was 67 / 18 / 3.
+
+## ENG-3031: the four ads_insights_* Meta parity rows (2026-11-15)
+
+- No code path changed. `backend/src/mcp/zomaMetaParityMatrix.ts` re-labels four rows and `eng3031.insightsParityRows.test.ts` pins them.
+- `ads_insights_advertiser_context`, `ads_insights_anomaly_signal`, `ads_insights_industry_benchmark` are `not_applicable`. Checked on 2026-11-15 under developers.facebook.com/documentation/ads-commerce/marketing-api/reference: `ad-account` (fields and edges), `ad-account/insights`, `ad-campaign-group/insights`, `ad-campaign/insights`. None has an advertiser-context, anomaly or industry-benchmark field or edge. The only "benchmark" name on the insights pages is `marketing_messages_read_rate_benchmark`, which is about marketing messages. These three look like values Meta computes inside its own MCP server. No tool was added and no substitute score is computed.
+- `ads_insights_auction_ranking_benchmarks` is `covered` by `call_meta_ads_insights_api`. Meta's public auction comparison is the three ad relevance diagnostics (`quality_ranking`, `engagement_rate_ranking`, `conversion_rate_ranking`; Meta Business Help article 403110480493160). They are on `ALLOWED_INSIGHTS_FIELDS` and the test shows the insights call sends them to Graph at `level=ad`.
+- Limits of that check: I did not find an ad-level insights reference page (the URLs I tried returned an empty shell), and the three ranking fields are not listed on the account, campaign or ad set insights reference pages that did load. Nothing here was run against a live account. If Meta's tool returns more than these three rankings (third-party write-ups mention CTR and CPM against competitors), the row overstates coverage and should go back to `gap`.
+- The row now uses a `notApplicable(...)` helper; these are the first `not_applicable` rows in the matrix.
+
+## ENG-3026: Frontier monitor reads the current Artificial Analysis endpoint (2026-11-15)
+
+- Artificial Analysis retired `/api/v2/data/*` on 2026-11-04 (HTTP 410). The monitor and the catalog refresh now read `GET /api/v2/language/models/free` (`AA_MODELS_URL` in `backend/src/services/agentMode/modelCatalogRefresh.ts`), which any key tier may call. Docs: https://artificialanalysis.ai/data-api/docs.
+- The list is paginated (200 rows per page). `fetchArtificialAnalysisModels` reads every page and throws rather than return a partial list.
+- `model_creator` no longer has a `slug`, only `id` and `name`. Lab matching falls back to the normalised name (`aaCreator`). Labs whose name does not normalise to the OpenRouter prefix or the registry `provider` report "AA unmatched; score unchanged".
+- A failed keyed read reports `Artificial Analysis failed: ...` only. The "ARTIFICIAL_ANALYSIS_API_KEY not set / is missing" lines appear only when the key is absent.
+- The feed carries `intelligence_index_version`. When its major version differs from registry scores labelled `Intelligence Index v<n>`, the refresh emits an `AA INDEX VERSION` warning, which blocks the refresh PR auto-merge verdict until a human decides how to re-baseline.
+- The jest fixture is the documented example from the published OpenAPI spec, not a live capture.
+
+## ENG-837: Reject empty or streamed deploy-alert JSON (2026-11-15)
+
+Deploy-failure notification validates exactly one JSON object at both external JSON boundaries (Secrets Manager secret and Slack response). jq 1.6 can exit zero on whitespace-only input; slurping and checking object count keeps the delivery diagnosis accurate. No credential, deploy policy, or production data changed.
+
+## ENG-3018: metaToolkitBackoff no longer throws at import under a mocked axios (2026-11-15)
+
+`backend/src/utils/metaToolkitBackoff.ts` installs its interceptors on the default axios client at module load (ENG-2977). Any Jest suite that mocks axios with a factory lacking `interceptors` failed to load, because `agentModeService.ts` imports the module through `metaApiFetch.ts`. Twenty suites were red on `main` for this one reason. The module-load install is now skipped when the default client has no interceptor managers. `attachMetaToolkitBackoff(client)` itself is unchanged and still throws on a client without interceptors, so the explicit toolkit client in `metaToolkitLifecycle.ts` cannot silently lose its backoff. When a suite fails to load with `reading 'request'` at import, look for a module-load side effect on a mocked dependency before editing the suite's mocks.
+
+## ENG-3012: Read every workspace approval page (2026-11-15)
+
+- Existing per-user approval reader follows UserApprovalsIndex continuation keys, retaining newest-first order and a total explicit limit across pages.
+- Empty intermediate pages continue. Workspace member resolution, authorization, table/index/model and writes are unchanged; Slack's existing unlimited reader also receives complete results.
+- Regression evidence: four failures/two passes before fix; 31/31 across pagination, undo, workspace and task-query fixtures after; scoped TypeScript passes. No live AWS/provider/browser calls.
+- Rollback: revert this code change. Parent ENG-2874 retains full live workspace/creator QA.
+
+## ENG-3011: Apply scheduled-post failure lifecycle in dispatcher (2026-11-15)
+
+The injected scheduled-post dispatcher now saves the existing markAttemptFailed lifecycle transition when publishing fails or throws. Retryable failures consume their attempt budget and wait for the existing backoff; permanent and exhausted failures become terminal. Dispatch summaries distinguish saved retries from failures. No scheduler, production caller, persistence implementation, or tool activation is added; ENG-2501's storage gate remains unchanged.
+
+Verification: reproduced six failing dispatcher regressions before implementation; all nine scheduledPosts suites (118 tests), backend production build, full typecheck, and scoped ESLint pass. Regression coverage includes early retry ticks, attempt exhaustion, permanent failures, publisher throws, mixed-success batches, save failures, and stable idempotency keys.
+
+## ENG-3009: Canonical 88-tool Meta parity inventory (2026-11-14)
+
+Recovered the seven official documentation-table snapshots from ENG-2950's preserved residual. The offline inventory now checks the exact set of 88 unique tool names, replaces abbreviated catalog aliases, and records the five missing campaign/discovery operations as owned gaps. Current-main implemented experiment mappings are preserved. No runtime tools, provider calls, scopes, persistence or customer-facing copy changed.
+
+## ENG-3007: preserve suppression evidence in lead reads (2026-11-14)
+
+Lead detail, browse and search responses now preserve existing contact status,
+reason, note, update provenance and group-email suppression fields. Missing values
+remain absent; no active state is inferred. Existing access and redaction checks
+are unchanged. Response projection only; no persistence or send-path changes.
+
+## ENG-3005: Distinguish unreadable loop history from empty history (2026-11-14)
+
+Loop health reports now return a typed `unavailable` entry with unknown (`null`) counts when a learning-store read fails. A fixed error code replaces raw exception details. Successfully read loops retain their existing lifecycle states and counts, even alongside a failing loop. No persistence or authorization changes.
+
+## ENG-3004: Preserve uncertainty in incomplete tracking diagnoses (2026-11-14)
+
+- Pixel/CAPI failure is ruled out only by a positively healthy, complete account-scoped sweep; token/fetch errors, unclassifiable/idle observations, missing counters and empty sweeps remain unchecked. Matching positive alerts retain precedence.
+- Destination evidence no longer defaults missing unverifiable counts to zero; mixed normal/insufficient-history campaign reports no longer dismiss demand/variance uncertainty.
+- Verification: mocked diagnosis and discrimination suites (44 tests), backend typecheck and production build passed on Atem. No live-account mutation or persistence change. Rollback: revert this change; post-deploy admin read should confirm inaccessible tracking remains unchecked.
+
+## ENG-3001: Close recursive public MCP sanitizer gaps (2026-11-14)
+
+Public MCP results now traverse structured content, envelope siblings, arrays and JSON-encoded text through one sanitizer. Over-budget nesting becomes null instead of returning unvisited data. The nesting budget is 128 object/array levels (encoded text spends none), so stored data of ordinary depth survives the MCP envelope; a non-syntax JSON parser failure also returns null. Session/run/request exceptions are scoped by tool purpose; admin/internal/delegated output remains unchanged. Regression fixtures exercise the registered CallTool boundary for API-key and OAuth callers.
+
+The related MCP registry suite exposed six existing Smartlead registrations missing deterministic classification; reproduced on unmodified main, then classified their read/stop handlers without changing enforcement.
+
+## ENG-2996: CRM import validation + suppression enforcement (2026-11-13)
+
+- **Import follow-ups** (`backend/src/services/leadImportFollowups.ts`): bulk-import, CSV import,
+  LinkedIn-connections import and Emma `add_leads_to_list` now pass the leads `batchCreateLeads`
+  *created* to `applyLeadImportFollowups`. It (1) awaits do-not-contact inheritance: a new lead
+  whose email belongs to an existing DNC/unsubscribed lead of the **same owner** (lead `userId`, or
+  its list's owner) is flagged `contactStatus: 'do-not-contact'` before sequence auto-enrolment
+  runs. A failed lookup is counted (`doNotContactCheckFailed` in the response), not read as clear;
+  (2) fires `validateLeadEmailInBackground` once per distinct address (concurrency 8). Session lists
+  skip validation (ENG-2311 side-effect policy). Merged/already-present rows are not touched.
+- **Emma suppression**: `update_lead` / `update_lead_status` with pipeline status
+  "do-not-contact" (any case/spacing, or "dnc") now also set `contactStatus` +
+  `unsubscribedFromGroupEmail`, which is what `isDoNotContact` and `contactGuard.blockedRecipients`
+  read. An already unsubscribed/DNC lead keeps its existing status and reason.
+- **Group send/preview `excludeUnvalidated: true`** (opt-in): only leads whose
+  `customFields.email_validation.status === 'deliverable'` are sent; never-validated, unknown and
+  risky are reported as `skippedUnvalidated` / `unvalidatedCount`. Absent flag = unchanged
+  behaviour and unchanged response shape.
+- **Not done**: enrich.so credit balance in the admin view. The repo has no enrich.so
+  balance/credits API client (`enrichSoService` only exposes validate/find/reverse-lookup), so
+  per the issue this was skipped.
+- No schema, migration or backfill. Existing leads imported before this change are not
+  retroactively re-flagged.
+
+## ENG-2995: Campaign conversion goal UPDATE no longer refuses non-biddable goals as not found (2026-11-13)
+
+Google Ads REST omits `biddable` when false; the MCP toolkit read mapper now treats an omitted field as false instead of a missing row.
+
+## ENG-2994: Relax over-strict `level` on playwright_browser_console_messages (2026-11-13)
+
+- `utils/mcpToolSchemaSanitizer.ts` drops `level` from the ingested schema `required` list; Playwright MCP defaults it server-side. Removes pre-execution "Missing required argument level" rejects (4/17 calls). Rollback: revert the one-line map entry.
+
+## ENG-2993: perform_data_analysis dead file URLs classify as invalid_args, not config (2026-11-13)
+
+- An HTTP 4xx (except 429) when downloading a caller-supplied `file_urls` entry now returns `errorClass: 'invalid_args'` with guidance to re-run the producing tool or inline the data.
+- Previously it fell to `not_found`, which `classifyToolFailureType` maps to `config`, so the failure-cluster loop filed "resolve the account" issues for model-supplied dead links.
+- Network errors and 429s keep their existing classes.
+
+## ENG-2989: adding or removing a task's email subscribers needs the task owner or an admin (2026-11-13)
+
+Three routes only required a login: `DELETE /api/tasks/:taskId/subscribers/:email`, and `POST` and `DELETE /api/auth/tasks/:taskId/subscribers[/:email]`
+(legacy duplicates on the auth router; the portals use the tasks-router routes). Any signed-in user could remove a subscriber from, or
+add an arbitrary address to (so AgentWeb would email it), someone else's task. Reproduced on the test environment: user B removed A's
+subscriber (204) and added an address to A's task through the auth router (201). `POST /api/tasks/:taskId/subscribers` already had the
+check and refused B (403).
+
+**Fix:** one shared check, `services/taskSubscriberAccess.ts` (the task's owner or an admin, the rule the tasks-router add route always
+had), used by all three routes: 401 without a caller or user record, 404 for an unknown task, 403 for anyone else. The portals' own calls
+(task owners, admins in the partner portal) are unaffected. The auth-router routes have no callers in the repos; kept, not deleted.
+
+**Also gated (review):** `GET /api/auth/tasks/:taskId/subscribers` returned the full subscriber records (emails, imported fields, email
+history) to any signed-in user; it now needs the task's owner or an admin too.
+
+**Not changed, filed separately (they are public, unauthenticated endpoints, a different kind of fix):** `GET /api/tasks/:taskId/subscribers`
+returns the same full records to anyone who has the task id; `POST /:taskId/subscribers/join` adds any address without a task-exists
+check, double opt-in or rate limit (and sends a welcome email from the owner's account); `POST /:taskId/resubscribe` undoes an
+unsubscribe from just a task id and email.
+
+**Testing:** `taskSubscriberDelete.test.ts` and `authTaskSubscribers.test.ts` (stranger refused on each route, including the subscriber list, and nothing changed, owner
+and admin allowed, unknown task, helper cases); the first set fails on the old routes; breakage checks on the helper and each route.
+
+**Rollback:** revert; no data, table or environment change.
+
+## ENG-2986: knowledge-base file delete only deletes a file listed on that task (2026-11-13)
+
+`DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey` used the key from the URL directly. Anyone who could edit one of their own
+tasks could delete any object in the knowledge-base storage (GCS or S3) by naming its key, including another account's file.
+Reproduced on the test environment: user B called the route on B's own task with user A's file key; A's file was deleted from storage
+(it read as "not found") while still listed on A's task.
+
+**Fix:** the key must be one of the files listed on the task named in the URL (matched as Express decoded it, or after one more decode for
+older double-encoded clients); the LISTED key is what reaches storage. Anything else is a 404 and nothing is touched. Admins are held to
+the same rule. The portal and the `delete_knowledge_base_file` MCP tool only send listed keys, so they are unaffected; deleting the same file
+twice now answers 404 the second time (it used to answer 200 and touch storage again). A listed key containing a literal `%` no longer
+gets decoded into a different key.
+
+**Sibling route (found by the independent review, reproduced on env1):** `DELETE /api/tasks/:taskId/attachments/:key` only checked that
+the caller owns the task, then sent the URL key to S3: user B deleted user A's attachment object through B's own task (A's object
+went from 200 to gone). It now requires the key to be listed in that task's `attachments` (404 otherwise).
+
+**Not changed:** the `lead-volume-monitor` and client-health routes decode an already-decoded param, so a client name containing `%`
+returns 500 (separate, low severity).
+
+**Testing:** `knowledgeBaseFileDelete.test.ts` (foreign GCS and S3 keys refused, admin held to the rule, listed GCS and S3 files still
+deleted under their own key, `%` key, traversal and lookalike keys, double delete, non-editor still 403); the first six fail on the old
+route. Existing KB suites pass.
+
+**Rollback:** revert; no data, table or environment change. Orphaned storage objects that were never listed on a task can no longer be
+deleted through this route (they were never reachable from the product).
+
+## ENG-2980: Zoma Meta experiment writes — eligibility, A/B create/update, lift create (2026-11-13)
+
+- New `backend/src/mcp/metaToolkitExperimentWrites.ts`: `ads_experiment_check_eligibility` (read-only), `ads_experiment_abtest_create_test`, `ads_experiment_abtest_update_test`, `ads_experiment_lift_create_test` via the shared Zoma preview+confirm guard, account ownership for campaigns and study ids, future start_time (default +24h), field-by-field read-back.
+- `agentModeService.toolkitMetaExperimentGraph` (allow-listed `act_<id>/ad_studies` + numeric node). Parity matrix rows flipped to covered.
+
+## ENG-2966: Require persisted draft before review status (2026-11-13)
+
+- A lead could be put in `pending_review` (the AI-draft review queue, ENG-2361) with no draft
+  on it, so the Pending Review filter listed leads with nothing to approve.
+- New pure helpers in `backend/src/utils/leadSchema.ts`: `hasPersistedDraftForChannel(lead, channel?)`
+  (email = `emailDraft.subject` + `textContent`/`htmlContent`; linkedin = `messageDraft.content`;
+  no channel = either) and `missingReviewDraftError(status, lead)`.
+- `update_lead_status` (`emma/impl/leads.ts`) checks the lead as it would be after the write
+  (stored drafts + drafts passed in the same call) and returns a tool error telling the agent to
+  create the draft first; nothing is written.
+- `PUT/PATCH /api/crm/lists/:listId/leads/:leadId` returns 400 for a move INTO `pending_review`
+  without a draft (including a request that clears the only draft). Writes on a lead already in
+  `pending_review`, and every other status, are unchanged.
+- No other server path sets `pending_review` on a lead (bulk-contact-status only sets `contactStatus`).
+- No backfill: existing draftless `pending_review` leads are left as-is (ENG-2966 item 2+).
+
+## ENG-2783: Lead call script: say who is calling, offer press 3 straight away (2026-11-13)
+
+- Why: 47 CFR 64.1200(b)(1) and (b)(3) want the caller named first and a key-press opt-out offered within 2 seconds, with the press ending the call.
+  Press 3 used to come last in the lead prompt.
+- Wording change (`backend/src/services/voice/twiml.ts`, `screenPromptCopy`; owner-approved wording B, exact strings): "Hi, this is an automated call from <name>. To stop these
+  calls at any time, press 3. We're calling about the enquiry you sent us. Press 1 and we'll connect you to a person now, or press 2 and we'll call you again later. You can also call us on <number>."
+  (press 2 clause dropped when a retry cannot happen). The callback number is now last, so a lead who presses early never hears it; accepted by the owner. Apostrophes are written as &apos; like all copy. Digit handling, Gather and timeouts are unchanged.
+- 64.1200(b)(2): the callback number is the prompt's last sentence, so key-press replies now state it: press 3 ("<name> will not call this number again. You can reach us on <number>. Goodbye."),
+  press 2 ("Okay. <name> will call you again later. You can reach us on <number>. Goodbye."), any other key ("You can reach us on <number>. Goodbye."); press 1 connects to a person (unchanged).
+  The number comes from the org context those handlers already resolve (no new read). The prompt does NOT designate press 3 as the exclusive revocation method: operators must still honour any reasonable
+  revocation within 10 business days (64.1200(a)(10)/(11)); exclusivity from 2026-11-25 is not claimed.
+- Press-3 goodbye shortened from "Understood. <name> will not call this number again. Goodbye." to "<name> will not call this number again. Goodbye."; it is followed by `<Hangup/>` only.
+- Emma `update_hot_lead_call_settings` description and the `announcedName` field, and the owner-facing validation messages (`hotLeadCallSettingsService.ts`), now say announcedName
+  must be the business's registered (legal) name. No validation change.
+- Docs: `backend/docs/integrations/hot-lead-call.md` (new "Compliance basis of the script", including the known open voicemail item: no machine detection, no toll-free number on voicemail).
+- Tests: prompt-text assertions (changed twice, the owner picked wording B over the first wording) updated in twiml.test.ts, twilioVoiceWebhook.test.ts, hotLeadCall.e2e.test.ts, hotLeadCall.e2e.retry.test.ts; new exact-string, order and press-3 Hangup tests.
+- NOT verified: how Twilio's TTS speaks the text, and barge-in timing (whether press 3 lands within 2 seconds of the name). It was seen working with a robot that pressed digits
+  during the prompt on 2026-11-12, but the audio was not heard by a person.
+
+## ENG-2783: hot-lead call monthly default lowered to 150 (2026-11-13)
+
+The default `maxCallsPerMonth` for a hot-lead-call org is now 150 (was 200). It is the allowance in the plan price (100 included calls plus headroom).
+Orgs with a stored value keep it; an org with no stored value now reads 150. Owners may still set 1 to 200 themselves (the owner ceiling is its own constant,
+no longer derived from the default); 201 to 2000 stays an operator write. No data migration. To revert, set the default back to 200 in `hotLeadCallConfig.ts`.
+
+## ENG-2783: Record call consent on the lead and only auto-call leads who gave it (2026-11-13)
+
+- Why: an artificial-voice call to a mobile needs the person's prior express consent (47 CFR 64.1200, FCC 24-17), provable (exact text, time, page, IP) and kept at least 4 years (owner chose 5). Nothing recorded it and no gate checked it. Owner decision (Option A): record consent at form submission; auto-call only leads that carry it.
+- New persisted field (owner approved in chat 2026-11-13): `system.callConsent = { granted: true, text, version?, phoneDigits, capturedAt, pageUrl?, ip?, userAgent?, source: 'form' | 'operator', note? }` on `AW-Leads` rows, inside the existing `system` map. No new table or index.
+- New skip reason `no_call_consent` (hot-lead call gate, `services/hotLeadCallService.ts`): stateless, placed right after the id and phone gates and before the hours gates, so it shows at any hour; in `PERMANENT_REFUSALS` so a press-2 retry for a lead without consent is refused and spent. Owner wording: "The lead did not agree to be called (the form had no call-consent notice)".
+- Wire format: optional `callConsent: { granted: true, text, version? }` on `POST /api/webhooks/forward-lead` (and the public alias). Accepted only for boolean `true`, text 40-1000 chars containing "call", no `[REGISTERED BUSINESS NAME]` placeholder, version `[A-Za-z0-9._-]{1,32}`. Invalid is ignored with ONE warn (reason code only), never a 400. Handled keys `callConsent` and `visitorPageUrl` are not stored as custom fields and never echoed.
+- Written in the create input (`createLead` now accepts `system`), so it exists before the gates run. Existing lead resubmitting: `createLeadSystemRecordOnce` (first record wins, later ones ignored, no history); that repeat submission also dispatches the call gates, so a lead skipped for no consent and resubmitting WITH consent is called then. Idempotent replay writes nothing.
+- Consent is bound to the phone: `phoneDigits` (E.164 digits of the submitted number) must equal the lead's current normalised phone (`hasCallConsent`); an existing lead only records consent when the submitted phone equals its stored phone (else `phone_mismatch`, reason only). Text must also contain the word "automated"; `granted: false` is treated as absent (no warning).
+- Generator prompt (`v0Service.ts`, `buildCallConsentInstructions`) adds the unchecked consent checkbox with the approved text to every lead capture form whose business name is known (org `announcedName`, else account `companyName`, else org `name`, all already loaded by the generation routes). With no name the notice block is omitted entirely (no placeholder reaches a page; such pages record no consent, so no calls). No cheap org-has-calling signal exists at prompt time, so it is for every form with a name. The platform capture route now also forwards `visitorPageUrl` (Referer).
+- `routes/crmPublic.ts` creates `form_fill` leads without consent: they no longer trigger calls (release note). `/api/leads/public/:listId` is the same handler (alias test added). Known gaps (self-assertion, no per-IP limiter, stale-number consent cannot be re-recorded) are listed in the docs.
+- Existing landing pages are unchanged: no notice, no consent, no calls until regenerated.
+- Retention: no TTL or purge/anonymise/erasure path touches lead rows in code; lead-deleting paths are listed in `backend/docs/integrations/hot-lead-call.md` (Call consent, Retention). Owner rule: keep consent at least 5 years after the last call to that lead. Live table TTL setting NOT checked.
+- NOT verified: never run against real DynamoDB (the `system` write in the create put and `createLeadSystemRecordOnce` are tested only by pinning the request shape with a mocked SDK; the real `db.createLead` hook-to-gate path is tested with an in-memory stand-in for `createLead`); the AI site builder's generated form behaviour (checkbox, label text, request body) is not tested; a real browser Referer through the Vercel capture route is not tested.
+- Open: telemarketing vs informational, state laws (FL, OK, MD, WA, TX), voicemail, durable evidence copy.
+
+## ENG-2783: hot-lead call $70 add-on billing (2026-11-13)
+
+- Why: hot lead calls cost AgentWeb Twilio money and nothing was charged. Decision: a flat $70 per month per organization (one calling number and 150 lead calls per month included, number rent folded in), as one item on the org owner's existing Stripe subscription. Calls above the configured monthly limit are not priced (the limit stops them); the spend ledger and plan-pool enforcement are unchanged; no trial; monthly only.
+- New module `services/hotLeadCallBillingService.ts`: `addHotLeadCallBilling(orgId)` reads the owner's live Stripe subscription, finds the item by `STRIPE_HOT_LEAD_CALL_PRODUCT_ID`, creates it once (`price_data` usd 7000 monthly, `always_invoice`, `error_if_incomplete`, idempotency key) and refuses with a plain message without an active subscription, without the env var, or on a Stripe error. `mirrorHotLeadCallBilling` is called from `handleSubscriptionUpdated` and `handleSubscriptionDeleted`.
+- New persisted field (needs Harsha before merge, data-plane gate): `Organization.hotLeadCallBilling = { itemId, status: 'active'|'past_due'|'canceled', updatedAt }`, written only by the webhook. No new table or index.
+- Kill switch `HOT_LEAD_CALL_BILLING_REQUIRED`: only the exact value `true` makes billing required. Unset (default) = no behaviour change for any org. When required, dispatch, retries, callbacks and the read-out need the plan feature AND an active add-on (`not_entitled` otherwise); setup steps and the decision to turn on check the plan only.
+- Purchase: the `update_hot_lead_call_settings` enable card states "$70 per month, includes one calling number and 150 lead calls per month, billed to your subscription" (in the digest). The item is added after approval, just before the settings write; a Stripe failure leaves calling off. The number card states the real rent and that it is part of the $70 price. REST enable with billing required and no add-on is refused with a "subscribe" message.
+- Not built: a cancel tool (Stripe cannot remove one item at period end without a subscription schedule, which is larger than the small path wanted). Cancel by removing the item in Stripe; the webhook mirrors it.
+- Env: `STRIPE_HOT_LEAD_CALL_PRODUCT_ID` (new), `HOT_LEAD_CALL_BILLING_REQUIRED` (new). Docs: `backend/docs/integrations/hot-lead-call.md`, "Billing add-on".
+- NOT verified: never run against Stripe (test or live); the proration and `error_if_incomplete` behaviour on a real Pro/Max subscription; the webhook payload carrying `items` for subscription.updated in production (assumed, as for seats); nothing was created in Stripe.
+
+- Review fixes: the mirror is written at once after the charge and decided from Stripe's live state (not the event payload); a deleted subscription with a surviving one mirrors from the survivor; trial and non-monthly subscriptions are refused; a duplicate item from a racing request is removed with a credit.
+
+## ENG-2398: Google Ads read-back for device bid modifiers and asset-group retag (2026-11-13)
+
+- `setDeviceBidAdjustments` reads back each campaign criterion / ad-group bid modifier and throws `GoogleAdsReadBackError` (`bid_modifier`) on mismatch or missing row; proto3-omitted 0 treated as 0 (-100% exclusion).
+- `retagAssetGroupUtm` reads back `asset_group.final_urls` after the full-array write.
+- Coverage guard: both removed from EXEMPT; classified `updateResponsiveSearchAdContent` (verified) and `updateConversionGoalBiddable` (drift-returned exemption), which had made the guard red on main.
+
+## Smartlead tools for outside agents over MCP (ENG-673 follow-on) (2026-11-12)
+
+Customer-facing agents (the Hermes agents: Yugo, Hue, Remy) now work in Slack and reach Emma through her MCP server. Until now none
+of the Smartlead tools were on MCP. This adds the read and stop tools, on the user's own Smartlead connection.
+
+**On MCP (same names and checks as Emma's tools):**
+- `smartlead:read`: `list_smartlead_campaigns`, `get_smartlead_campaign_stats`, `preview_smartlead_push`, `get_smartlead_push_status`.
+- `smartlead:control`: `pause_smartlead_push`, `cancel_smartlead_push` (stop actions: nobody receives more email).
+
+**Not on MCP:** `start_smartlead_push`, `resume_smartlead_push`, `release_leads_from_smartlead`. They send email to real people (or let
+AgentWeb's own senders email contacts again). In Emma's chat a product-built approval card stands in for the portal's lawful-basis and
+"already sending" ticks; an MCP agent has no card, so it would approve its own send. The preview returns a link to the list
+(`/crm?listId=`) and the steps (the list's settings menu, Push to Smartlead) where the person who owns the account approves. The signed
+preview token and fingerprint never reach the agent (the result is an allowlist).
+
+**Who may call them:** only an `aw_` key that explicitly holds the scope. New registry flag `apiKeyOnly`: a signed-in OAuth client is
+refused (OAuth otherwise gets every opt-in scope, OAuth parity 2026-10-31), so marketplace OAuth clients (Databricks, ENG-2747) do not
+gain them; default keys do not hold the scopes; anonymous callers are refused. The scopes cannot be granted from a delegated
+(admin-as-customer) session, like `email:read`. tools/list shows the tools only to a key holding the scope (plus `list_lead_lists` for
+`smartlead:read`, for the listId).
+
+**How:** each tool self-calls the portal's own route (`/api/crm/smartlead-push/...`), so the per-user rate limits, the kill switch and
+every push rule apply unchanged. New route `GET /campaigns/:campaignId/stats` (its own per-user limiter; Emma reads the service
+directly). Argument checks and result shapes moved from `emma/smartleadPushTools.ts` into `services/smartleadPushToolShared.ts` so both
+use one copy (no behaviour change for Emma). Each MCP call logs one `mcp_smartlead` line (tool, user, key id, outcome; no contact data).
+
+**Review follow-ups (independent review of 6106c7d49):** the HTTP layer now refuses these tools on the request's own auth method, so an
+OAuth request cannot borrow a session a key opened; `emma_search_tools` shows them only to a key that may call them; `list_lead_lists`
+is marked read-only (it is a GET) so a key with `smartlead:read` can find a listId; `smartlead:control` no longer lists
+`get_smartlead_push_status` (needs `smartlead:read`); when several Smartlead connections are available the error now names them so the
+agent can pass `accountId` (mcpFetch keeps the route's `details`); ids made only of dots are refused; wording says "someone with
+access to this list". Two older holes the review found are fixed separately (ENG-2962: agents approving Emma's cards; ENG-2963:
+unescaped ids in self-call paths).
+
+**Second review round:** `client_id` on `list_lead_lists` (another account's lists, admin-only) needs `tools:execute` again for an `aw_` key,
+since the tool became read-only; the portal's Smartlead routes keep separate rate-limit buckets for agents (self-calls) and people, so
+a looping agent cannot lock a person out of the approval dialog; `list_lead_lists` is listed for `smartlead:read` only when the key
+also holds `tools:read`; connection names shown to an agent are stripped of control characters and line breaks; approval wording says
+"edit access to this list".
+
+**Testing:** `mcp.smartleadTools.test.ts` (which tools exist, scopes, OAuth and anonymous refusals, tools/list, each route call, the
+preview allowlist, argument checks), stats route cases in `routes/__tests__/smartleadPush.test.ts`, key-creation cases in
+`agentApi.routes.test.ts`, regenerated MCP inventory (six tools added, none changed).
+
+**Rollback:** revert; no table, IAM or environment change.
+
+## ENG-2963: MCP tools can no longer be steered to other routes through their arguments (2026-11-12)
+
+Tools on Emma's MCP server call the REST API on the caller's behalf (`mcpFetch`), and many built the URL path from caller
+arguments without escaping them. Reproduced on the test environment: `execute_task` with `task_id: "../agent-mode/sessions?"`
+created a chat instead of running a task; the same trick could resume a paused Smartlead push (found by the review of the
+Smartlead MCP tools).
+
+**Fix**
+- Every caller-supplied id that goes into a self-call path is now escaped with `encodeURIComponent` (94 places across the MCP
+  tools, Emma's tools and the coding agent; ids that were already escaped, such as `requireListId`, are left alone).
+- `mcpFetch` refuses, before sending anything, a path whose part before `?` does not start with `/api/` or contains a `.` or `..`
+  segment, an empty segment or a percent-encoded dot (`%2e`, which URL normalisation turns into a dot segment), and any path with a
+  raw backslash, `#` or control character anywhere (query included). An escaped slash (`%2F`) stays allowed: Express keeps it inside
+  one path parameter, and ids with slashes (knowledge-base file keys, client names) need it. (An independent review caught that
+  refusing `%2F` broke `delete_knowledge_base_file`; there is now a test through the real tool.)
+
+**Also:** regenerated the MCP inventory snapshot, which main's ENG-2961 change (`manage_crm_sequence` external activation actions)
+had left stale; no tool definition changed here.
+
+**Testing:** `mcp.selfCallPath.test.ts` (the guard, mcpFetch sends nothing on a refused path, the reproduced `execute_task` value
+is escaped into one segment, a `?` stays inside its id, the real knowledge-base delete still works); breakage checks: removing the guard, the escaping, the `%2e` rule or the raw-`#` rule, or bringing back the `%2F` rule, each fails a test.
+MCP, tool and coding-agent suites pass (170 suites).
+
+**Rollback:** revert; no data, table or environment change.
+
+## ENG-2962: an agent on Emma's MCP server can no longer approve Emma's own approval cards (2026-11-12)
+
+Some of Emma's actions reach real people and their gates require a person's approval (`answeredBy === 'user'`, delegation
+refused): adding or releasing contacts in Smartlead, hot-lead calls, CRM sequence activation, and paused Meta campaign bundles.
+An outside agent with a default API key could open a chat, ask for the action, and answer the card itself with
+`emma_answer_question_deck`: the answer reached `/api/agent-mode/generate` as a self-call and was recorded as the user's.
+Reproduced on the test environment: the agent approved a Smartlead release card and the release ran (nothing changed only
+because the contact had never been pushed). Found by the review of the Smartlead MCP tools.
+
+**Fix**
+- `authenticateToken` marks a request made with a self-call token (`_svc`, minted only by `mcpFetch`) as `isSelfCall`.
+- `generateResponse` refuses (403 `APPROVAL_NEEDS_PERSON`) a self-call deck answer that would approve one of those cards, with a
+  message telling the person to approve on the card in AgentWeb (the chat link). The decision is made twice: early in the route
+  (fast path) and again inside `submitApprovalDeckAnswers` on the deck it actually applies (the write is conditional on that deck still
+  awaiting), because the route's first read of the session can lag behind (review finding). Declining,
+  commenting and answering any other card (plan choices, Meta write decks) through MCP still work.
+- `services/personOnlyApprovals.ts` says which cards are person-only (the three reserved card kinds and the paused-bundle write).
+
+**Testing:** route tests (each card kind refused for a self-call; decline allowed; other cards allowed; a person still approves),
+auth test (self-call tokens marked, app logins not), helper tests; breakage checks: removing the route check, the auth flag, a card
+kind or the per-item match each fails a test. Related suites pass; `linkedInOutreachAuth.saveAccount` and
+`agentModeController.conditionalSkip` fail on main already.
+
+**Not changed (and not claimed):** the share-link route (a visitor is a person), and `manage_crm_sequence`'s external activation pair
+(ENG-2961, another session): an `aw_` key can still activate a CRM sequence through `external_activation_preview` then
+`external_activate_confirm`, because the approver is a string the caller supplies and the digest is computed by the caller (the
+review read this from the code; not reproduced). That is ENG-2961's design for a human approving in Slack through an agent; whether it
+needs a verifiable approver (a signature from the Slack bridge, or a server-side approval record) is an owner decision. So this change
+closes the approval-card path for CRM sequences, not that one. Also noted by the review, not changed here: the person-only list is a
+prefix denylist kept in two places (`emma/tools.ts` `RESERVED_QUESTION_KIND_PREFIXES` lacks the CRM activation kind), and delegate
+tokens minted in `adminClientScope.ts` are not flagged `isSelfCall` (none reaches `/generate` today).
+
+**Rollback:** revert; no data, table or environment change.
+
+## ENG-2935: ClickUp connected by an org owner but invisible to teammates (2026-11-12)
+
+**Symptom:** XCures owner (agentwebintegration@xcures.com) sees ClickUp as connected; the rest of the org doesn't.
+
+**Root cause:** `getAccessToken` prefers `org.secrets.clickup_access_token` and falls back to the caller's personal token. XCures' org record has no ClickUp secret; the owner's token lives only in his user `secrets`. Nothing promotes a personal token to the org (org create / `joinOrg` don't; only the one-shot `migrate-clickup-to-org.ts` did, and not for this org). The UI also hid Connect (status said connected via the fallback), and Disconnect only cleared the already-empty org secret, so the owner could not repair it.
+
+**Code fix:** Sharing is explicit, never silent (copying a token org-wide lets every member read and act through Emma as that person). `GET /api/oauth/clickup/status` is read-only and reports `scope` (`solo|org|personal`) and `canShare`; a lookup failure there degrades to no scope instead of "disconnected". New `POST /api/oauth/clickup/share-with-org` lets an org admin/KB editor share their own verified personal token, via a conditional write (`orgDb.setOrgSecretIfAbsent`) so it never overwrites. Org-admin Disconnect also clears the caller's personal token (idempotent, retry-safe, says so if only half completed). Status failures carry `reason` (`invalid_token` vs `unavailable`). KnowledgeBase page: "Only you can see this" banner with a confirm-before-share dialog, member guidance, reason-specific messages and Try again.
+
+**Data repair (needs Harsha / data-plane approval, NOT yet run):**
+```
+cd backend
+# 1. preview (no writes)
+NODE_ENV=production npx ts-node src/scripts/migrate-clickup-to-org.ts --org-id=3583d005-434b-449f-901d-1b250452d19d --dry-run
+# 2. apply to XCures only
+NODE_ENV=production npx ts-node src/scripts/migrate-clickup-to-org.ts --org-id=3583d005-434b-449f-901d-1b250452d19d
+# 3. (optional) preview every other affected org
+NODE_ENV=production npx ts-node src/scripts/migrate-clickup-to-org.ts --dry-run
+```
+Prefers the org owner's token; never overwrites an existing org token; safe to re-run. Foreplay has the same personal-fallback shape (`migrate-foreplay-to-org.ts`) and was not checked.
+
+## ENG-2720: enrichment cost estimate recalibrated to what prod books (2026-11-12)
+
+The pre-run estimate (the percent of the monthly allowance shown in the confirm dialog) was calibrated on one Opiner run of 2026-10-27, before the ENG-2720 savings, and ran high. Measured on prod (customer runs since the 11-04 changes, prod logs `runEnrichment DONE` joined to `AW-UsageRecords` by user and day, test accounts excluded): 118 processed contacts, 4 customers, $8.09 booked ($0.0686 per contact); the old constants quoted $14.4-14.8 for those runs (+78% to +83%, depending on the config's field count; about 60% of the excess was the Apollo line).
+
+`services/enrichmentCostEstimate.ts`:
+- `lookupPerLead` = Apollo match + org as booked ($4.80 / 118 = $0.0407; cache hits are free), `webSearchPerLead` = You.com as booked ($1.113 / 118 = $0.0094). The unattributed `otherPerLead` remainder (gpt-5.5-era spend) is gone. LLM line unchanged ($0.002 per field).
+- The per-contact lines are per PROCESSED contact, so leads the identity resolver skips (no usable email, no LinkedIn, no first and last name: they book nothing) are left out of them via the new `skippedCount` input. In one of the measured runs 54 of 84 leads were skipped.
+- The Apollo broker line is priced on the leads it can be sent for: `apolloEligibleRate` 60/146 for emailless leads with a first and last name plus a company or email domain on the lead (prod logs), `apolloOtherRate` 34/112 for the other resolvable emailless leads (the Opiner list's overall share; not measured on that bucket). New input `brokerEligibleCount`.
+
+`services/enrichmentQuote.ts`: `inspectLeads` also counts broker-eligible and skipped leads (`canReachApolloBroker`, `hasIdentitySignal`), and a saved config that does not request an email (`configRequestsEmail`: an included `email` field, an alias of it, or a smart dependency on it) is quoted no Apollo line, because tier 3.5a only runs for a requested email and the resolver's broker step never runs in v3 (no lead hint). A website or domain alone does not make a lead eligible: the broker reads only `company` / `emailDomain`.
+
+`__tests__/enrichmentQuote.brokerGateContract.test.ts` runs the REAL tier 3.5a gate and the REAL resolver over the same lead shapes and requires them to agree with the two rules above, so a change to either gate fails there instead of silently skewing the estimate.
+
+Backtest (from the same prod data the constants come from, so a fit, not a validation): Nov 4+ runs quote $7.80 vs $8.09 booked (-4%; the gap is the one $0.445 broker request on an emailed lead); the 2026-11-03 list of 146 broker-eligible leads $36.94 vs $37.19 booked (-1%). Per run the error is large: booked cost per contact depends on what Apollo already has cached (shared across customers) and on how many distinct companies a list spans ($0.009-$0.019 for cache-served re-runs, $0.09-$0.14 for small cold runs, $0.072 for the 146-lead cold list), so the estimate is right in total and not for a single run (a cold 30-contact run of 12 fields booked about 1.7 times the quote; a cache-served re-run about a quarter of it). Known, not modelled: (1) the broker share of 41% was measured only on leads that have a LinkedIn URL (Apollo's LinkedIn match supplied the email for the other 59%); for eligible leads without a LinkedIn URL it is unmeasured (no customer list had any; the test account's synthetic leads always fire the broker) and probably higher, up to every such lead at $0.445, which would put the Apollo line up to 2.4x above the quote for such a list; (2) emailed leads with no fresh email metadata can fire the broker when Apollo has no person for them (2 of ~203 emailed leads, about +$0.004 per emailed lead; worst case a list of all such leads). The admission reserve (`withinAllowance`) is unchanged and stays conservative.
+
 ## ENG-2979: Google toolkit RSA content edits via guarded preview (2026-11-12)
 
 - `call_google_ads_api` AD UPDATE now accepts `headlines` / `descriptions` / `final_url` for RESPONSIVE_SEARCH_AD ads (status still sent alone). Preview shows current vs new; confirm mutates `customers/{cid}/ads/{adId}` (AdService) with an update_mask of only the changed fields; read-back verifies each field (MISMATCH/UNCONFIRMED never success). Non-RSA and foreign ads refused.

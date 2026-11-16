@@ -52,10 +52,22 @@ export function gatewayAcceptsTemperature(upstreamModel: string): boolean {
 
 /**
  * Providers callLLM excludes via `provider.ignore` for this upstream model.
- * See the ENG-1702 comment in callLLM before changing the slug.
+ *
+ * Empty since ENG-2704. Gemini used to exclude the "Google" (Vertex) BYOK slot
+ * (ENG-1702), which pushed every Gemini call onto OpenRouter credits and the
+ * production key's monthly cap. The Vertex credential was re-tested on
+ * 2026-11-16 with production-shaped requests (large tool prompts, JSON,
+ * vision): 18 of 18 landed on "Google" with is_byok true and zero OpenRouter
+ * charge. `allow_fallbacks` still lets OpenRouter fall back to the pooled
+ * "Google AI Studio" slot if Vertex fails.
+ *
+ * If a slot has to be excluded again: `provider.ignore` matches the
+ * `provider_name` from GET /v1/models/{id}/endpoints ("Google" is Vertex,
+ * "Google AI Studio" is the pooled slot), not the BYOK slugs. Verify against
+ * live calls before changing it.
  */
-export function openRouterIgnoredProviders(upstreamModel: string): string[] {
-  return upstreamModel.startsWith('google/gemini-') ? ['Google'] : [];
+export function openRouterIgnoredProviders(_upstreamModel: string): string[] {
+  return [];
 }
 
 /** Single gateway routing policy; provider credentials live only in OpenRouter BYOK.
