@@ -3007,6 +3007,27 @@ export const taskDb = {
     }
   },
 
+  /**
+   * Who owns an execution and which task it belongs to, without reading the (large) execution row. Used by the file access policy
+   * (ENG-2988), which asks this for every file under an execution.
+   */
+  async getTaskExecutionOwnerById(executionId: string): Promise<{ executionId: string; userId?: string; taskId?: string } | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: {
+          executionId,
+        },
+        ProjectionExpression: "executionId, userId, taskId",
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskExecutionOwnerById");
+    }
+  },
+
   async updateTaskExecution(
     executionId: string,
     updates: Partial<{

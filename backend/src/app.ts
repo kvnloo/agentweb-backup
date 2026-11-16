@@ -165,7 +165,6 @@ import { authenticateAgentRunsSecretOrAdmin } from "./middleware/agentRunsAuth";
 import { setupMcpServer } from "./mcp/server/mcpServer";
 import { setupMcpOAuth } from "./mcp/oauth/oauthRoutes";
 import {
-  viewExternalFile,
   getFileContent,
   saveHtmlContent,
   getPresignedFileUrl,
