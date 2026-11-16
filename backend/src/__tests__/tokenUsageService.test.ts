@@ -2,7 +2,6 @@ import {
   getUserTokenUsage,
   getUserTokenAllowance,
   checkTokenUsage,
-  incrementUserTokenUsage,
   grantTokenBonus,
   resolveBillingUserId,
   deriveBlockedByCost,
@@ -35,33 +34,22 @@ jest.mock("../services/chatbotService", () => ({
   },
 }));
 
-// Explicit mock (rather than relying on the shared aws-sdk auto-mock's
-// always-succeeding `put`) so isNewCharge can be driven to false for the
-// "don't strand an unapplied event" regression test below.
-jest.mock("../services/llmChargeAuditDb", () => ({
-  recordLlmChargeEvent: jest.fn(),
-  LLM_CHARGE_EVENTS_TABLE: "AW-LlmChargeEvents",
-}));
 
 import { userDb, orgDb } from "../services/db";
 import {
   getUserSubscriptionType,
   getSubscriptionTypeConfig,
 } from "../services/subscriptionService";
-import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
 import { chatbotDb } from "../services/chatbotService";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetUserSessions = chatbotDb.getUserSessions as jest.Mock;
-const mockGetUserByIdConsistent = (userDb as any).getUserByIdConsistent as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
 const mockResetTokenUsageForMonth = (userDb as any).resetTokenUsageForMonth as jest.Mock;
-const mockApplyMonthlyChargeAtomic = (userDb as any).applyMonthlyChargeAtomic as jest.Mock;
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
-const mockRecordLlmChargeEvent = recordLlmChargeEvent as jest.Mock;
 
 function currentMonth(): string {
   const now = new Date();
@@ -72,14 +60,6 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockIncrementTokenUsageForMonth.mockResolvedValue({});
   mockResetTokenUsageForMonth.mockResolvedValue(true);
-  mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
-  mockRecordLlmChargeEvent.mockResolvedValue(true);
-  // incrementUserTokenUsage's retry loop reads via getUserByIdConsistent
-  // (Greptile P1: a stale GSI read on retry can exhaust every attempt on
-  // the same staleness window). Delegate to whatever mockGetUserById is
-  // configured to return so every existing test's setup applies to both
-  // without touching each call site individually.
-  mockGetUserByIdConsistent.mockImplementation((...args: unknown[]) => mockGetUserById(...args));
 });
 
 // ─── FAIL TESTS ──────────────────────────────────────────────────────────
@@ -713,208 +693,6 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
   });
 });
 
-describe("incrementUserTokenUsage", () => {
-  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
-  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
-  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
-
-  it("initializes usage for new month (lazy reset)", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2025-01", totalTokens: 50000, totalCost: 5.0, resetDate: "2025-02-01T00:00:00.000Z" },
-      tokenAllowanceBonus: 10000,
-    });
-    mockUpdateUser.mockResolvedValue(undefined);
-
-    await incrementUserTokenUsage("u1", 1000, 0.1);
-
-    // Bonus clearing is part of the atomic reset write itself.
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userId: "u1",
-        month: currentMonth(),
-        tokens: 1000,
-        cost: 0.1,
-        isNewMonth: true,
-      })
-    );
-  });
-
-  it("saves previous month usage to tokenUsageHistory on monthly reset", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2025-01", totalTokens: 50000, totalCost: 5.0, resetDate: "2025-02-01T00:00:00.000Z" },
-      tokenAllowanceBonus: 10000,
-      tokenUsageHistory: [],
-    });
-    mockUpdateUser.mockResolvedValue(undefined);
-
-    await incrementUserTokenUsage("u1", 1000, 0.1);
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        history: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
-      })
-    );
-  });
-
-  it("appends to existing tokenUsageHistory on monthly reset", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2025-02", totalTokens: 30000, totalCost: 3.0, resetDate: "2025-03-01T00:00:00.000Z" },
-      tokenAllowanceBonus: 0,
-      tokenUsageHistory: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
-    });
-    mockUpdateUser.mockResolvedValue(undefined);
-
-    await incrementUserTokenUsage("u1", 500, 0.05);
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        history: [
-        { month: "2025-01", totalTokens: 50000, totalCost: 5.0 },
-        { month: "2025-02", totalTokens: 30000, totalCost: 3.0 },
-      ],
-    }));
-  });
-
-  it("caps tokenUsageHistory at 24 entries on reset", async () => {
-    const oldHistory = Array.from({ length: 24 }, (_, i) => ({
-      month: `2023-${String(i + 1).padStart(2, "0")}`,
-      totalTokens: 1000,
-      totalCost: 0.1,
-    }));
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2025-01", totalTokens: 5000, totalCost: 0.5, resetDate: "2025-02-01T00:00:00.000Z" },
-      tokenAllowanceBonus: 0,
-      tokenUsageHistory: oldHistory,
-    });
-    mockUpdateUser.mockResolvedValue(undefined);
-
-    await incrementUserTokenUsage("u1", 100, 0.01);
-
-    const call = mockApplyMonthlyChargeAtomic.mock.calls[0][0];
-    expect(call.history).toHaveLength(24);
-    // The oldest entry should have been dropped
-    expect(call.history[0].month).toBe("2023-02");
-    // The newest entry should be the just-reset month
-    expect(call.history[23].month).toBe("2025-01");
-  });
-
-  it("does not save to history when there is no previous usage", async () => {
-    // User with no prior tokenUsage at all
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-    });
-    mockUpdateUser.mockResolvedValue(undefined);
-
-    await incrementUserTokenUsage("u1", 1000, 0.1);
-
-    const call = mockApplyMonthlyChargeAtomic.mock.calls[0][0];
-    // No history should be written for a user with no prior usage.
-    expect(call.history ?? []).toEqual([]);
-  });
-
-  it("increments within same month", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
-    });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
-
-    await incrementUserTokenUsage("u1", 2000, 0.2);
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userId: "u1",
-        month: currentMonth(),
-        tokens: 2000,
-        cost: 0.2,
-        resetDate: "2026-05-01T00:00:00.000Z",
-        isNewMonth: false,
-      })
-    );
-    expect(mockUpdateUser).not.toHaveBeenCalled();
-    // Should NOT clear bonus when incrementing within same month — no history
-    // is computed/passed on the increment path.
-    expect(mockApplyMonthlyChargeAtomic.mock.calls[0][0].history).toBeUndefined();
-  });
-
-  it("does not use a read-computed total for same-month increments", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
-    });
-    mockIncrementTokenUsageForMonth.mockResolvedValue({});
-
-    await incrementUserTokenUsage("u1", 2000, 0.2);
-
-    expect(mockUpdateUser).not.toHaveBeenCalledWith("u1", expect.objectContaining({
-      tokenUsage: expect.objectContaining({
-        totalTokens: 7000,
-        totalCost: 0.7,
-      }),
-    }));
-  });
-
-  it("skips update when tokens and cost are zero", async () => {
-    await incrementUserTokenUsage("u1", 0, 0);
-    expect(mockGetUserById).not.toHaveBeenCalled();
-    expect(mockUpdateUser).not.toHaveBeenCalled();
-  });
-
-  it("does not throw on DB error (graceful degradation)", async () => {
-    mockGetUserById.mockRejectedValue(new Error("DB connection failed"));
-    // Should not throw
-    await expect(incrementUserTokenUsage("u1", 1000, 0.1)).resolves.toBeUndefined();
-  });
-
-  it("threads a caller-supplied eventId through to the atomic apply call (ENG-1251)", async () => {
-    // A stable, caller-supplied eventId is what makes a retried usage report a
-    // no-op instead of a duplicate charge — see llmChargeAuditDb.recordLlmChargeEvent.
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 100, totalCost: 1, resetDate: "2026-09-01T00:00:00.000Z" },
-    });
-
-    await incrementUserTokenUsage("u1", 1000, 0.1, { eventId: "chatcmpl-stable-123" });
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({ eventId: "chatcmpl-stable-123" })
-    );
-  });
-
-  it("still attempts to apply the charge when the audit event was already recorded (ENG-1251 Greptile P1: unapplied events must not block retries)", async () => {
-    // isNewCharge=false means an event with this ID already EXISTS -- it does
-    // NOT mean it was already APPLIED. A prior attempt could have recorded
-    // the event and then been interrupted before completing the atomic
-    // apply. Returning early here would strand that charge forever, since a
-    // retry reuses the same stable eventId and recordLlmChargeEvent would
-    // keep reporting false for it.
-    mockRecordLlmChargeEvent.mockResolvedValue(false);
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 100, totalCost: 1, resetDate: "2026-09-01T00:00:00.000Z" },
-    });
-
-    await incrementUserTokenUsage("u1", 1000, 0.1, { eventId: "chatcmpl-recovery-case" });
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({ eventId: "chatcmpl-recovery-case" })
-    );
-  });
-});
-
 describe("grantTokenBonus", () => {
   it("adds bonus tokens to existing bonus", async () => {
     mockGetUserById.mockResolvedValue({
@@ -1046,57 +824,6 @@ describe("checkTokenUsage - org member uses owner quota", () => {
     expect(mockGetUserSubscriptionType).toHaveBeenCalledWith("owner1");
   });
 });
-
-describe("incrementUserTokenUsage - org member increments owner counter", () => {
-  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
-  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
-  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
-
-  it("increments org owner's usage when called for org member", async () => {
-    // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
-    // chain. `resolveBillingUserId` now verifies the org owner resolves before
-    // returning it, which adds a getUserById call and silently shifted every
-    // value in the old chain by one. The assertions below are unchanged — only
-    // the mock's dependence on call ORDER is removed.
-    const rows: Record<string, any> = {
-      member1: { userId: "member1", email: "member@example.com", orgId: "org1", orgRole: "member" },
-      owner1: { userId: "owner1", email: "owner@example.com",
-        tokenUsage: { month: currentMonth(), totalTokens: 5000, totalCost: 0.5, resetDate: "2026-05-01T00:00:00.000Z" },
-      },
-    };
-    mockGetUserById.mockImplementation(async (id: string) => rows[id] ?? null);
-    mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
-
-    await incrementUserTokenUsage("member1", 2000, 0.2);
-
-    // Atomic increment should be applied to owner1, not member1
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userId: "owner1",
-        month: currentMonth(),
-        tokens: 2000,
-        cost: 0.2,
-        resetDate: "2026-05-01T00:00:00.000Z",
-        isNewMonth: false,
-        billingUserId: "owner1",
-      })
-    );
-    expect(mockUpdateUser).not.toHaveBeenCalledWith("member1", expect.anything());
-  });
-});
-
-// ─── ENG-1116: cost REPLACES tokens as the enforced gate ─────────────────
-// Until now the two caps were ANDed: `tokenAllowed && (enforceCostCap ? costAllowed
-// : true)`. Cost was an *additional* cap. The product decision is that cost is the
-// real unit of consumption, so when ENFORCE_COST_CAP is on the dollar cap becomes
-// the gate and the token counter goes observe-only.
-//
-// The one exception is the ungated-tier guard: a tier with no monthlyCostAllowance
-// would otherwise become completely unlimited the moment the flag flips, which is a
-// strictly worse failure than the cap it replaces. Those tiers keep their token cap
-// until a dollar allowance is configured, which also makes the rollout order-
-// independent — the code can ship before the allowances are set.
 
 describe("checkTokenUsage - cost replaces tokens as the gate (ENG-1116)", () => {
   afterEach(() => {
@@ -1272,183 +999,5 @@ describe("deriveBlockedByCost - respects the enforced dimension (ENG-1116)", () 
 
     expect(result.blockedByCost).toBe(false);
     expect(result.tokenCapTriggered).toBe(true);
-  });
-});
-
-// ─── Month-rollover race (Greptile, ENG-1134) ────────────────────────────
-// The same-month path has always been conditional: incrementTokenUsageForMonth
-// carries `ConditionExpression: #tokenUsage.#month = :month` and reports failure
-// so the caller can react. The month-RESET path did not — it read the stored
-// month and then unconditionally overwrote tokenUsage with its own totals.
-//
-// So on the first calls of a new month, two concurrent charges for one user both
-// see a stale month, both take the reset branch, and the second overwrite
-// discards the first call's tokens and cost outright. Not a rounding error — a
-// whole charge vanishes, silently, on the one day of the month when every active
-// user rolls over at once.
-//
-// This got likelier with ENG-1134: agent-engine ingestion is now a third writer
-// to the same counter alongside agent mode and Emma.
-
-describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () => {
-  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
-  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
-  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
-
-  it("does not lose a charge when another writer resets the month first", async () => {
-    const staleUser = {
-      userId: "u1",
-      email: "a@b.com",
-      // Stale month — this caller believes it must reset.
-      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
-      tokenUsageHistory: [],
-    };
-    const winnerRolledUser = {
-      userId: "u1",
-      email: "a@b.com",
-      // Re-read after losing the race: the winner already rolled the month.
-      tokenUsage: { month: currentMonth(), totalTokens: 500, totalCost: 5, resetDate: "2026-09-01T00:00:00.000Z" },
-      tokenUsageHistory: [{ month: "2026-07", totalTokens: 900, totalCost: 9 }],
-    };
-    mockGetUserById
-      .mockResolvedValueOnce(staleUser) // resolveBillingUserId's own lookup (no orgId — short-circuits)
-      .mockResolvedValueOnce(staleUser) // retry attempt 0
-      .mockResolvedValueOnce(winnerRolledUser); // retry attempt 1, after losing the race
-    // The atomic reset attempt loses the race: someone else already rolled the month.
-    mockApplyMonthlyChargeAtomic
-      .mockResolvedValueOnce("lost_race")
-      .mockResolvedValueOnce("applied");
-
-    await incrementUserTokenUsage("u1", 500, 5);
-
-    // It must retry against a fresh read and apply as an increment on top of
-    // the winner's already-created month row, rather than dropping the charge.
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(2);
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ userId: "u1", isNewMonth: true })
-    );
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        userId: "u1",
-        month: currentMonth(),
-        tokens: 500,
-        cost: 5,
-        isNewMonth: false,
-      })
-    );
-  });
-
-  it("does not blindly overwrite the counter on the reset path", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
-      tokenUsageHistory: [],
-    });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
-
-    await incrementUserTokenUsage("u1", 500, 5);
-
-    // The unconditional updateUser write is what made the race lose data —
-    // the atomic transaction (conditional users-table update + audit marker,
-    // both-or-neither) replaces it entirely.
-    expect(mockUpdateUser).not.toHaveBeenCalled();
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(1);
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({ isNewMonth: true })
-    );
-  });
-
-  it("archives the previous month exactly once, on the winning reset", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
-      tokenUsageHistory: [{ month: "2026-06", totalTokens: 10, totalCost: 1 }],
-    });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
-
-    await incrementUserTokenUsage("u1", 500, 5);
-
-    const call = mockApplyMonthlyChargeAtomic.mock.calls[0][0];
-    expect(call.history).toEqual([
-      { month: "2026-06", totalTokens: 10, totalCost: 1 },
-      { month: "2026-07", totalTokens: 900, totalCost: 9 },
-    ]);
-  });
-
-  it("gives up after exhausting retries under sustained contention, without applying or throwing", async () => {
-    // ENG-1251 Greptile P1: previously a lost race still marked the audit
-    // event applied even though the counter was never touched. Now a
-    // sustained loss must leave BOTH the counter and the audit marker
-    // untouched (fail-open) rather than silently claiming success.
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 100, totalCost: 1, resetDate: "2026-09-01T00:00:00.000Z" },
-    });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("lost_race");
-
-    await expect(incrementUserTokenUsage("u1", 500, 5)).resolves.toBeUndefined();
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(3);
-  });
-
-  it("treats already_applied as done without retrying", async () => {
-    // A prior attempt's transaction already landed (e.g. this call is itself
-    // a retry of the outer usage report) — no need to spin further.
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      tokenUsage: { month: currentMonth(), totalTokens: 100, totalCost: 1, resetDate: "2026-09-01T00:00:00.000Z" },
-    });
-    mockApplyMonthlyChargeAtomic.mockResolvedValue("already_applied");
-
-    await incrementUserTokenUsage("u1", 500, 5);
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(1);
-  });
-});
-
-
-describe("incrementUserTokenUsage - legacy counter writes are OFF by default (ENG-1250 AC7 stage 3)", () => {
-  beforeEach(() => {
-    delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES;
-    mockApplyMonthlyChargeAtomic.mockClear();
-    mockRecordLlmChargeEvent.mockClear();
-    mockGetUserById.mockReset();
-  });
-  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
-
-  it("writes nothing and reads nothing by default: no counter update, no audit row, no user lookup", async () => {
-    await incrementUserTokenUsage("u1", 1000, 0.5);
-
-    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
-    expect(mockRecordLlmChargeEvent).not.toHaveBeenCalled();
-    expect(mockGetUserById).not.toHaveBeenCalled();
-  });
-
-  it("only the exact value 'true' re-enables it (rollback), nothing truthy-ish", async () => {
-    // A resolvable user, so an unguarded writer WOULD reach the atomic apply (otherwise this proves nothing).
-    const user = { userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } };
-    mockGetUserById.mockResolvedValue(user);
-    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.(user);
-    for (const v of ["", "1", "TRUE", "yes", "false"]) {
-      process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = v;
-      await incrementUserTokenUsage("u1", 1000, 0.5);
-    }
-    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
-  });
-
-  it("resumes the legacy writes when AW_LEGACY_TOKEN_COUNTER_WRITES=true (the rollback path works)", async () => {
-    process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true";
-    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
-    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
-
-    await incrementUserTokenUsage("u1", 1000, 0.5);
-
-    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalled();
   });
 });

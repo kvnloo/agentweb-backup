@@ -18,7 +18,7 @@ import { cronJobRegistry } from '../../utils/cronJobRegistry';
 // fire-and-forget and fail-open, so it can neither delay nor break the LLM call.
 //
 // Only the ledger's descriptive `billingUserId` attribute depends on this: the
-// per-user cap charge (`incrementUserTokenUsage`) resolves the org pool itself.
+// legacy per-user cap charge (retired, ENG-2286) used to resolve the org pool itself.
 // The agent loop already passes `billingUserId`, so its metering takes the
 // synchronous path below exactly as before.
 //

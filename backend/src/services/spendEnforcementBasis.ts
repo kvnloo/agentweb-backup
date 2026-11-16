@@ -83,30 +83,18 @@ function excludedTiers(): Set<string> {
 export const SPEND_PROJECTION_MAX_STALENESS_MIN_ENV = "AW_SPEND_PROJECTION_MAX_STALENESS_MIN";
 
 /**
- * ENG-2286 / ENG-1250 AC7 — whether a MISSING or UNREADABLE projection may fall back
- * to the legacy `AW-Users.tokenUsage` counter. Default OFF.
- *
- * AC7 retires the legacy counter "rather than maintained as fallbacks", and §9.8
- * then stops writing it, after which it would be a stale number. So the ledger is
- * the only basis for an enforced subject:
+ * ENG-2286 / ENG-1250 AC7 -- a MISSING or UNREADABLE projection never falls back to the
+ * legacy `AW-Users.tokenUsage` counter (retired; no longer written). The ledger is the
+ * only basis for an enforced subject:
  *   - no projection row  -> no spend recorded this month -> counts as $0. That is
  *     the ordinary state of an account's first request of a new month (the row is
- *     created by its first settled event), and the legacy counter, which also resets
- *     monthly, would have said $0 too. Verified 2026-10-05: all 24 subjects with
- *     legacy October spend already have an October projection row.
+ *     created by its first settled event).
  *   - read error         -> FAIL OPEN: admit, and log loudly. Availability over
  *     precision, the same posture as the rest of the metering path.
  *
- * Set AW_SPEND_LEDGER_LEGACY_FALLBACK=true to restore the old behaviour without a
- * deploy. Two other legacy fallbacks remain until Stage 4 deletes them: the opt-in
- * staleness guard (default off, never enabled) and a subject the mode flags leave
- * dark or excludes by tier (neither is configured in prod).
+ * Two other legacy fallbacks remain: the opt-in staleness guard (default off) and a
+ * subject the mode flags leave dark or excludes by tier.
  */
-export const SPEND_LEDGER_LEGACY_FALLBACK_ENV = "AW_SPEND_LEDGER_LEGACY_FALLBACK";
-
-export function isLegacyFallbackEnabled(): boolean {
-  return (process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] || "").trim().toLowerCase() === "true";
-}
 
 /** Log a "no projection yet" subject once per process, not on every request. */
 const missingLogged = new Set<string>();
@@ -182,7 +170,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
   billingMonth: string;
   /**
    * The legacy per-user counter figure. Pass a function: it is invoked ONLY on the paths that fall
-   * back to the legacy basis (enforcement off for this subject, or the opt-in legacy fallback), so
+   * back to the legacy basis (enforcement off for this subject, or the opt-in staleness guard), so
    * with the ledger live the retiring counter is never read at all (ENG-1250 AC7).
    */
   legacyRawCostUsedMicroUsd: number | (() => number | Promise<number>);
@@ -203,15 +191,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
     projection = await getProjection(input.billingUserId, input.billingMonth);
   } catch (err) {
     // A ledger read failure must not take the gate down.
-    if (isLegacyFallbackEnabled()) {
-      console.error(
-        `[spendEnforcementBasis] projection read failed for ${input.billingUserId} ${input.billingMonth}; ` +
-          `falling back to legacy basis:`,
-        err,
-      );
-      return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: true, stale: false };
-    }
-    // AC7: no legacy fallback. FAIL OPEN — admit — and say so loudly, because an
+    // FAIL OPEN — admit — and say so loudly, because an
     // over-cap account is admitted for as long as this keeps failing.
     console.error(
       `[spendEnforcementBasis] projection read FAILED for ${input.billingUserId} ${input.billingMonth}; ` +
@@ -222,18 +202,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
   }
 
   if (!projection) {
-    if (isLegacyFallbackEnabled()) {
-      // Enabled but nothing to read: the writer/backfill has not covered this
-      // subject yet. Logged (it used to be silent) so a canary can tell a real
-      // ledger read from a fall-through — the exact gap that hid the missing
-      // production writer for two weeks.
-      console.log(
-        `[spendEnforcementBasis] projection MISSING for ${input.billingUserId} ${input.billingMonth}; ` +
-          `falling back to legacy basis (writer/backfill has not covered this subject).`,
-      );
-      return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: true, stale: false };
-    }
-    // AC7: no row means no settled spend has been recorded for this subject this
+    // No row means no settled spend has been recorded for this subject this
     // month — the normal state of a first request in a new month — so it counts $0.
     const key = `${input.billingUserId}|${input.billingMonth}`;
     if (!missingLogged.has(key)) {

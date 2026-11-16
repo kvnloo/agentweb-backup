@@ -19,7 +19,6 @@ import {
   SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV,
   SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV,
   SPEND_PROJECTION_MAX_STALENESS_MIN_ENV,
-  SPEND_LEDGER_LEGACY_FALLBACK_ENV,
   __resetMissingProjectionLogForTests,
 } from "../services/spendEnforcementBasis";
 
@@ -60,7 +59,6 @@ describe("spendEnforcementBasis", () => {
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV];
     delete process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV];
     delete process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV];
-    delete process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV];
     __resetMissingProjectionLogForTests();
   });
 
@@ -174,7 +172,7 @@ describe("spendEnforcementBasis", () => {
       expect(getProjectionMock).toHaveBeenCalledWith(ACCT, MONTH);
     });
 
-    describe("no legacy fallback by default (ENG-1250 AC7)", () => {
+    describe("ledger basis never falls back to the legacy counter (ENG-1250 AC7)", () => {
       const input = { billingUserId: ACCT, billingMonth: MONTH, legacyRawCostUsedMicroUsd: 115_740_000 };
 
       it("a MISSING projection counts as $0 spend — never the legacy figure", async () => {
@@ -219,34 +217,6 @@ describe("spendEnforcementBasis", () => {
         getProjectionMock.mockResolvedValue(projection(218_240_000));
         const res = await resolveEnforcementCostBasisMicroUsd(input);
         expect(res).toEqual({ rawCostUsedMicroUsd: 218_240_000, basis: "spend_ledger", projectionMissing: false, stale: false });
-      });
-    });
-
-    describe("AW_SPEND_LEDGER_LEGACY_FALLBACK=true restores the old fallback (rollback lever)", () => {
-      const input = { billingUserId: ACCT, billingMonth: MONTH, legacyRawCostUsedMicroUsd: 115_740_000 };
-
-      it("a MISSING projection falls back to the legacy figure", async () => {
-        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
-        process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
-        getProjectionMock.mockResolvedValue(null);
-        const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
-
-        const res = await resolveEnforcementCostBasisMicroUsd(input);
-
-        expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
-        logSpy.mockRestore();
-      });
-
-      it("a read ERROR falls back to the legacy figure", async () => {
-        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
-        process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
-        getProjectionMock.mockRejectedValue(new Error("dynamo unavailable"));
-        const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-
-        const res = await resolveEnforcementCostBasisMicroUsd(input);
-
-        expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
-        errSpy.mockRestore();
       });
     });
 
@@ -425,22 +395,6 @@ describe("spendEnforcementBasis", () => {
       expect(legacy).toHaveBeenCalledTimes(1);
     });
 
-    it("IS invoked on the opt-in legacy fallback for a missing projection and a failed read", async () => {
-      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
-      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
-      process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
-      jest.spyOn(console, "log").mockImplementation(() => {});
-      jest.spyOn(console, "error").mockImplementation(() => {});
-      const legacy = jest.fn().mockResolvedValue(3_000_000);
-
-      getProjectionMock.mockResolvedValueOnce(null);
-      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
-      getProjectionMock.mockRejectedValueOnce(new Error("boom"));
-      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
-
-      expect(legacy).toHaveBeenCalledTimes(2);
-      jest.restoreAllMocks();
-    });
 
     it("IS invoked on the staleness fallback", async () => {
       process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
