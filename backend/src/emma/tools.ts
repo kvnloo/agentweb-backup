@@ -4346,6 +4346,35 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'delete_lead_engagement',
+  definition: {
+    name: 'delete_lead_engagement',
+    description: 'Delete one manually recorded engagement from a lead, for example one logged on the wrong lead. Only engagements whose type starts with "custom." can be deleted; email and LinkedIn history cannot. Get the event_id from get_lead_engagements first. This cannot be undone.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead the engagement is recorded on'
+        },
+        event_id: {
+          type: 'string',
+          description: 'The eventId of the engagement to delete, as returned by get_lead_engagements'
+        }
+      },
+      required: ['list_id', 'lead_id', 'event_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await leadsImpl.deleteLeadEngagement(args.list_id, args.lead_id, args.event_id, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'send_email_to_lead',
   definition: {
     name: 'send_email_to_lead',

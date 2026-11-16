@@ -347,6 +347,7 @@ function chatHistoryFailureScope(args: unknown): string {
 const LEAD_SCOPED_TOOLS = new Set([
   'get_lead_details',
   'add_lead_engagement',
+  'delete_lead_engagement',
   'get_lead_engagements',
   'update_lead',
   'send_email_to_lead',

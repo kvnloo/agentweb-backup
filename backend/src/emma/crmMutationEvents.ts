@@ -33,6 +33,7 @@ export const CRM_MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'delete_lead_list',
   'configure_lead_statuses',
   'add_lead_engagement',
+  'delete_lead_engagement',
   'assign_lead',
   'import_leads_from_search',
 ]);

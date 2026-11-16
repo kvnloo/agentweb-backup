@@ -2498,6 +2498,102 @@ export async function addLeadEngagement(
     }
   }
 
+/**
+ * ENG-3051: remove one custom engagement from a lead. Same access check and the
+ * same `crmDb.deleteLeadEngagement` write as
+ * `DELETE /api/crm/lists/:listId/leads/:leadId/engagements/:eventId`.
+ *
+ * Only engagements whose type starts with "custom." can be removed. System
+ * events (email, LinkedIn) are refused and left in place.
+ *
+ * A missing list, lead or engagement is a normal answer, not a tool failure:
+ * it returns `deleted: false, found: false` with a hint to re-read.
+ */
+const DELETE_ENGAGEMENT_NOT_FOUND_HINT =
+  'Nothing was deleted. Call get_lead_engagements for this lead to get current eventId values (use search_leads first if the lead_id or list_id may be wrong), then retry with an eventId from that result.';
+
+function engagementNotFound(what: 'list' | 'lead' | 'engagement') {
+  const messages = {
+    list: 'Lead list not found. Nothing was deleted.',
+    lead: 'Lead not found in this list. Nothing was deleted.',
+    engagement: 'No engagement with that event_id on this lead. Nothing was deleted.',
+  };
+  return {
+    success: true,
+    deleted: false,
+    found: false,
+    notFound: what,
+    message: messages[what],
+    hint: DELETE_ENGAGEMENT_NOT_FOUND_HINT,
+  };
+}
+
+export async function deleteLeadEngagement(
+    listId: string, leadId: string, eventId: string, userId: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('../../services/db');
+
+      if (typeof eventId !== 'string' || !eventId.trim()) {
+        return { success: false, message: 'Missing event_id', error: 'event_id is required. Get it from get_lead_engagements.' };
+      }
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return engagementNotFound('list');
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../../services/crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
+      if (!hasAccess) {
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return engagementNotFound('lead');
+      }
+
+      const stored = (Array.isArray(lead.engagements) ? lead.engagements : []) as Array<{ eventId?: string; eventType?: string }>;
+      const target = stored.find((eng) => eng?.eventId === eventId);
+      if (!target) {
+        return engagementNotFound('engagement');
+      }
+      if (typeof target.eventType !== 'string' || !target.eventType.startsWith('custom.')) {
+        return {
+          success: false,
+          message: 'Engagement cannot be deleted',
+          error: `Only engagements whose type starts with "custom." can be deleted. This one is "${target.eventType ?? 'unknown'}", a system-recorded event, and was left in place.`,
+        };
+      }
+
+      let updated: any;
+      try {
+        updated = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
+      } catch (error) {
+        // The lead or the engagement went away between the read above and the write.
+        const text = error instanceof Error ? error.message : '';
+        if (text === 'Lead not found') return engagementNotFound('lead');
+        if (text === 'Engagement not found') return engagementNotFound('engagement');
+        throw error;
+      }
+
+      const remaining = Array.isArray(updated?.engagements) ? updated.engagements.length : stored.length - 1;
+      const leadName = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      return {
+        success: true,
+        deleted: true,
+        message: `Deleted engagement "${target.eventType}"${leadName ? ` from ${leadName}` : ''}. ${remaining} logged engagement(s) remain on the lead record.`,
+        eventId,
+        eventType: target.eventType,
+        remainingEngagementCount: remaining,
+        leadName,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error deleting lead engagement:', error);
+      return { success: false, message: 'Failed to delete lead engagement', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
 export async function sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
