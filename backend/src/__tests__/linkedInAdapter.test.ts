@@ -168,6 +168,20 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
+    it('ENG-3003: a 401 during media upload still surfaces as a coded reconnect error, not an uncoded refusal', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+      await expect(adapter.createPost(mockCompanyAccount, 'Photo', ['https://cdn.example.com/a.png'], 'user-1'))
+        .rejects.toMatchObject({ code: 401, message: expect.stringMatching(/reconnect/i) });
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3003: a rate limit during media upload surfaces as a coded 429, not an uncoded refusal', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(new Error('LinkedIn rate limit exceeded'));
+      await expect(adapter.createPost(mockCompanyAccount, 'Photo', ['https://cdn.example.com/a.png'], 'user-1'))
+        .rejects.toMatchObject({ code: 429 });
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
     it('ENG-3003: still uploads image media_urls', async () => {
       mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:1');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:1');

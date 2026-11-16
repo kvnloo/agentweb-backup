@@ -191,6 +191,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           } catch (uploadError: any) {
             if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
             if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
+            // Auth and rate-limit failures keep their class (reconnect / retry-later) via the outer catch; the post is not created either way.
+            if (isLinkedIn401(uploadError) || uploadError?.response?.status === 429 || /rate limit exceeded/i.test(uploadError?.message || '')) throw uploadError;
             const errorMsg = uploadError?.message || 'Unknown upload error';
             console.error(`[LinkedInAdapter] Failed to upload media ${url}:`, errorMsg);
             const what = uploadError?.isVideoUpload || isVideoUrl(url) ? 'video' : 'image';
@@ -269,7 +271,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         return { success: false, message: error.message };
       }
       // Rate limit handling
-      if (error.response?.status === 429) {
+      if (error.response?.status === 429 || /rate limit exceeded/i.test(error?.message || '')) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (isLinkedIn401(error)) {

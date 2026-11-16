@@ -1066,7 +1066,7 @@ export class LinkedInService {
           }
         });
       } catch (error: any) {
-        if (isVideo && error && typeof error === 'object') error.isVideoUpload = true;
+        if (isVideo && error && typeof error === 'object') { try { error.isVideoUpload = true; } catch { /* frozen error: the adapter still refuses */ } }
         throw error;
       }
     });
