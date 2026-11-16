@@ -20,6 +20,7 @@ import {
 } from './googleToolkitManifest';
 import { executeGoogleToolkitWrite } from './googleToolkitWrites';
 import { GOOGLE_ADS_PROVIDER, resolveProviderAccount } from './zomaProviders';
+import { zomaWriteKindFor } from '../services/zomaWriteKind';
 
 export { isGoogleToolkitTool, isGoogleGuardedWrite, isGoogleToolkitWrite };
 
@@ -40,6 +41,15 @@ export interface GoogleToolkitGatewayDeps {
   executeWrite?: (userId: string, args: any, currency: string) => Promise<any>;
   /** A foreign/unusable account (403); the gateway passes its MetaToolkitAuthError so HTTP maps it the same way. */
   accessError: (message: string) => Error;
+}
+
+/** Entities whose UPDATE status=ENABLED is a go-live approval. Enabling a keyword is an edit. */
+const GO_LIVE_ENTITIES = new Set(['CAMPAIGN', 'AD_GROUP', 'AD', 'ASSET_GROUP']);
+
+/** ENG-3072: the scoreboard's create | edit | pause | approve for a Google write (same field Meta records). */
+export function googleWriteKind(args: Record<string, unknown>) {
+  const kind = zomaWriteKindFor(args.action, args, 'ENABLED');
+  return kind === 'approve' && !GO_LIVE_ENTITIES.has(String(args.entity_type)) ? 'edit' : kind;
 }
 
 export async function handleGoogleToolkitCall(
@@ -81,6 +91,7 @@ export async function handleGoogleToolkitCall(
       action: String(args.action),
       verification: result.verification,
       objectId: result.id ?? undefined,
+      writeKind: googleWriteKind(args),
     }).catch((error) => {
       console.error('[google-toolkit] write metering failed:', error instanceof Error ? error.message : error);
       result.metering = 'failed: this write executed but was not recorded in usage';

@@ -17,6 +17,10 @@
  *     timestamp, so nothing here claims WHEN delivery happened relative to the approval.
  *     Recorded write-once on the user row (`zomaFirstAdLive`) only after that provider check
  *     passes; never inferred. See isFirstSuccessfulAd for the exact predicate.
+ *     ENG-3072: the same rule applies to Google Ads, where the go-live approval is a CONFIRMED
+ *     UPDATE status=ENABLED on the campaign or one of its ad groups / ads / asset groups. The
+ *     Google gateway records that as writeKind `approve` only from ENG-3072 on; earlier Google
+ *     updates carry no status and are never treated as approvals.
  *   - team/test accounts (our domains, admins, fixtures — journeyProductBackfill.accountFlag)
  *     are listed but flagged and excluded from every summary count.
  *
@@ -59,11 +63,14 @@ export interface ZomaUserRecord {
   zomaFirstAdLive?: FirstAdLive;
 }
 
+/** ENG-3072: providers a first ad can be verified on. Events without a platform are Meta (pre-Google). */
+export type FirstAdPlatform = 'meta' | 'google_ads';
+
 export interface FirstAdLive {
   at: string;
   approvedAt: string;
   campaignId: string;
-  platform: 'meta';
+  platform: FirstAdPlatform;
   /** Campaign effective_status when verified (informational; paused is allowed). */
   effectiveStatus?: string;
   /** The approved entity whose post-write read-back was status ACTIVE (CONFIRMED approval). */
@@ -232,15 +239,22 @@ export interface FirstAdResult {
   error?: string;
 }
 
-export interface FirstAdDeps {
-  listWriteEvents(startIso: string, endIso: string): Promise<ZomaWriteEvent[]>;
-  getUser(userId: string): Promise<ZomaUserRecord | undefined>;
+/** The three provider reads one first-ad check needs. A failed read must throw, never return 0 / null. */
+export interface FirstAdProviderDeps {
   /** Provider read-back of a campaign the user owns; null when not found in any of their accounts. */
   readCampaign(userId: string, campaignId: string): Promise<{ accountId: string; effectiveStatus?: string } | null>;
   /** Campaign of an approved ad set / ad (provider read); null when unresolvable. */
   campaignOf(userId: string, entityType: string, objectId: string): Promise<string | null>;
   /** Lifetime impressions of a campaign. */
   campaignImpressions(userId: string, accountId: string, campaignId: string): Promise<number>;
+}
+
+/** The top-level provider reads are Meta's; `google` adds Google Ads (ENG-3072). */
+export interface FirstAdDeps extends FirstAdProviderDeps {
+  listWriteEvents(startIso: string, endIso: string): Promise<ZomaWriteEvent[]>;
+  getUser(userId: string): Promise<ZomaUserRecord | undefined>;
+  /** Google Ads reads. When absent, Google approvals are not checked at all. */
+  google?: FirstAdProviderDeps;
   /** Conditional write-once; false when a first ad is already recorded. */
   recordFirstAd(userId: string, record: FirstAdLive): Promise<boolean>;
   onFirstAd?(userId: string, record: FirstAdLive): Promise<void>;
@@ -270,7 +284,7 @@ export async function verifyZomaFirstAds(
   )).filter(isSuccessfulWrite);
   const approvalsByUser = new Map<string, ZomaWriteEvent[]>();
   for (const e of events) {
-    if (classifyZomaWrite(e) !== 'approve' || (e.platform && e.platform !== 'meta') || !e.objectId) continue;
+    if (classifyZomaWrite(e) !== 'approve' || !providerFor(deps, e) || !e.objectId) continue;
     if (opts.userId && e.userId !== opts.userId) continue;
     approvalsByUser.set(e.userId, [...(approvalsByUser.get(e.userId) ?? []), e]);
   }
@@ -284,8 +298,8 @@ export async function verifyZomaFirstAds(
     if (user?.zomaFirstAdLive) { results.push({ userId, outcome: 'already_recorded', campaignId: user.zomaFirstAdLive.campaignId }); continue; }
     if (checked >= maxUsers || deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { results.push({ userId, outcome: 'deferred' }); continue; }
     checked += 1;
-    const created = new Set(events
-      .filter((e) => e.userId === userId && e.entityType === 'CAMPAIGN' && String(e.action).toUpperCase() === 'CREATE' && e.objectId)
+    const createdOn = (platform?: FirstAdPlatform) => new Set(events
+      .filter((e) => e.userId === userId && platformOf(e) === platform && e.entityType === 'CAMPAIGN' && String(e.action).toUpperCase() === 'CREATE' && e.objectId)
       .map((e) => e.objectId as string));
     let best: FirstAdResult = { userId, outcome: 'not_zoma_created' };
     const rank: FirstAdOutcome[] = ['not_zoma_created', 'provider_error', 'no_impressions'];
@@ -294,14 +308,14 @@ export async function verifyZomaFirstAds(
       if (deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { best = { userId, outcome: 'deferred' }; break; }
       let attempt: FirstAdResult;
       try {
-        attempt = await checkApproval(deps, userId, approval, created);
+        attempt = await checkApproval(deps, userId, approval, createdOn(platformOf(approval)));
       } catch (error) {
         attempt = { userId, outcome: 'provider_error', error: error instanceof Error ? error.message.slice(0, 200) : 'unknown' };
       }
       if (attempt.outcome === 'verified') {
         const record: FirstAdLive = {
           at: new Date(now).toISOString(), approvedAt: approval.ts, campaignId: attempt.campaignId!,
-          platform: 'meta',
+          platform: platformOf(approval)!,
           ...(attempt.effectiveStatus ? { effectiveStatus: attempt.effectiveStatus } : {}),
           approvedEntity: { type: String(approval.entityType ?? '').toUpperCase(), id: approval.objectId! },
           activationEvidence: attempt.evidence!, impressionsScope: 'lifetime', impressions: attempt.impressions!,
@@ -320,15 +334,30 @@ export async function verifyZomaFirstAds(
   return results;
 }
 
+function platformOf(e: ZomaWriteEvent): FirstAdPlatform | undefined {
+  if (!e.platform || e.platform === 'meta') return 'meta';
+  return e.platform === 'google_ads' ? 'google_ads' : undefined;
+}
+
+/** The provider reads for an event's platform; undefined when that platform is not checked. */
+function providerFor(deps: FirstAdDeps, e: ZomaWriteEvent): FirstAdProviderDeps | undefined {
+  const platform = platformOf(e);
+  return platform === 'meta' ? deps : platform === 'google_ads' ? deps.google : undefined;
+}
+
 async function checkApproval(
   deps: FirstAdDeps, userId: string, approval: ZomaWriteEvent, created: Set<string>,
 ): Promise<FirstAdResult> {
+  const provider = providerFor(deps, approval)!;
   const entity = String(approval.entityType ?? '').toUpperCase();
-  const campaignId = entity === 'CAMPAIGN' ? approval.objectId! : await deps.campaignOf(userId, entity, approval.objectId!);
+  const campaignId = entity === 'CAMPAIGN' ? approval.objectId! : await provider.campaignOf(userId, entity, approval.objectId!);
   if (!campaignId || !created.has(campaignId)) return { userId, outcome: 'not_zoma_created', ...(campaignId ? { campaignId } : {}) };
-  const campaign = await deps.readCampaign(userId, campaignId);
-  if (!campaign) return { userId, outcome: 'provider_error', campaignId, error: 'campaign not readable in any connected Meta account' };
-  const impressions = await deps.campaignImpressions(userId, campaign.accountId, campaignId);
+  const campaign = await provider.readCampaign(userId, campaignId);
+  if (!campaign) {
+    const where = platformOf(approval) === 'google_ads' ? 'the Google Ads customer it was created in' : 'any connected Meta account';
+    return { userId, outcome: 'provider_error', campaignId, error: `campaign not readable in ${where}` };
+  }
+  const impressions = await provider.campaignImpressions(userId, campaign.accountId, campaignId);
   // One event proves both: a Zoma UPDATE status=ACTIVE whose post-write read-back was status
   // ACTIVE (verification CONFIRMED; metaToolkitWrites verify()). Callers pass only these.
   const confirmedApproval = classifyZomaWrite(approval) === 'approve' && isSuccessfulWrite(approval);
@@ -424,6 +453,49 @@ async function metaAdAccountIds(userId: string): Promise<string[]> {
   return [...new Set(ids)].slice(0, 5);
 }
 
+type GaqlRead = (userId: string, customerId: string, gaql: string) => Promise<any[]>;
+
+const GOOGLE_CAMPAIGN_RN = /^customers\/(\d+)\/campaigns\/\d+$/;
+/** Approved child entity → the GAQL resource it is read from, and its resource-name shape. */
+const GOOGLE_CHILD: Record<string, { from: string; shape: RegExp }> = {
+  AD_GROUP: { from: 'ad_group', shape: /^customers\/(\d+)\/adGroups\/\d+$/ },
+  AD: { from: 'ad_group_ad', shape: /^customers\/(\d+)\/adGroupAds\/\d+~\d+$/ },
+  ASSET_GROUP: { from: 'asset_group', shape: /^customers\/(\d+)\/assetGroups\/\d+$/ },
+};
+
+/**
+ * ENG-3072 — Google Ads reads for the first-ad check. Ids are the resource names the Google
+ * gateway stored on the write event; the customer id is taken from the name and the name must
+ * match the exact shape before it is put in a query. A Google error propagates (provider_error).
+ */
+export function googleFirstAdDeps(read?: GaqlRead): FirstAdProviderDeps {
+  const query: GaqlRead = read ?? (async (userId, customerId, gaql) =>
+    (await import('./googleAdsService')).googleAdsService.queryReporting(userId, customerId, gaql));
+  return {
+    async readCampaign(userId, campaignId) {
+      const customerId = GOOGLE_CAMPAIGN_RN.exec(campaignId)?.[1];
+      if (!customerId) return null;
+      const rows = await query(userId, customerId, `SELECT campaign.resource_name, campaign.status FROM campaign WHERE campaign.resource_name = '${campaignId}'`);
+      const campaign = rows.find((r: any) => r?.campaign?.resourceName === campaignId)?.campaign;
+      return campaign ? { accountId: customerId, ...(campaign.status ? { effectiveStatus: String(campaign.status) } : {}) } : null;
+    },
+    async campaignOf(userId, entityType, objectId) {
+      const child = GOOGLE_CHILD[entityType];
+      const customerId = child?.shape.exec(objectId)?.[1];
+      if (!child || !customerId) return null;
+      const rows = await query(userId, customerId, `SELECT campaign.resource_name FROM ${child.from} WHERE ${child.from}.resource_name = '${objectId}'`);
+      const campaign = rows.find((r: any) => typeof r?.campaign?.resourceName === 'string')?.campaign?.resourceName;
+      return campaign ?? null;
+    },
+    async campaignImpressions(userId, accountId, campaignId) {
+      if (GOOGLE_CAMPAIGN_RN.exec(campaignId)?.[1] !== accountId) throw new Error('campaign does not belong to the Google Ads customer it was read from');
+      // No date segment: Google reports the campaign's all-time total.
+      const rows = await query(userId, accountId, `SELECT metrics.impressions FROM campaign WHERE campaign.resource_name = '${campaignId}'`);
+      return rows.reduce((sum: number, r: any) => sum + (Number(r?.metrics?.impressions) || 0), 0);
+    },
+  };
+}
+
 export function defaultFirstAdDeps(): FirstAdDeps {
   const ams = async () => (await import('./agentModeService')).agentModeService;
   return {
@@ -488,10 +560,11 @@ export function defaultFirstAdDeps(): FirstAdDeps {
         throw error;
       }
     },
-    async onFirstAd(userId) {
+    async onFirstAd(userId, record) {
       const { zomaMilestone } = await import('./journeyMilestones');
-      await zomaMilestone(userId, 'ad_live', { emit: 'always', props: { product: 'zoma', platform: 'meta' } });
+      await zomaMilestone(userId, 'ad_live', { emit: 'always', props: { product: 'zoma', platform: record.platform } });
     },
+    google: googleFirstAdDeps(),
     now: () => Date.now(),
   };
 }
