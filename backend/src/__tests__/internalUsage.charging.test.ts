@@ -7,14 +7,14 @@
  * and it is the largest remaining unmetered spender now that agent mode and Emma
  * are correct.
  *
+ * (The legacy per-user counter that this charged was retired in ENG-2286; the charge
+ * is now asserted through the atomic ledger + charge-event write that records it.)
+ *
  * Two properties matter beyond "it charges":
  *
  * 1. It charges ONCE PER USER per batch, not once per record. A batch may carry up
- *    to 500 records; incrementUserTokenUsage is a read-modify-write on a single
- *    user row, so per-record charging would mean 500 sequential contended writes
- *    for one task run. The ledger stays granular (rows are keyed by model+feature
- *    and must be), while the charge is summed — the same split the coding agent
- *    already uses.
+ *    to 500 records; the charge is summed per (user, model, feature) rather than
+ *    written per record.
  *
  * 2. Attribution must follow the route's existing anti-spoofing rule. The charge
  *    lands on the resolved user, never on the raw record's claim, or any engine
@@ -41,7 +41,6 @@ jest.mock("../middleware/auth", () => ({
 }));
 
 const mockRecordUsage = jest.fn().mockResolvedValue(undefined);
-const mockIncrementUserTokenUsage = jest.fn().mockResolvedValue(undefined);
 // ENG-1251 Greptile P1 ("Coverage suppresses unrelated aggregate usage"): a
 // charged group's ledger write and its paired charge event are now written
 // atomically in one DynamoDB transaction (usageRecordDb.incrementUsageWithChargeEvent) --
@@ -61,7 +60,6 @@ jest.mock("../services/usageRecorderService", () => ({
   recordUsage: (...args: unknown[]) => mockRecordUsage(...args),
 }));
 jest.mock("../services/tokenUsageService", () => ({
-  incrementUserTokenUsage: (...args: unknown[]) => mockIncrementUserTokenUsage(...args),
   // ENG-1251 Greptile P1: internalUsage.ts now resolves each contributing
   // actor's billing owner before recording the ledger row. Defaults to
   // "same as input" (no pooling) -- no test in this file exercises pooling.
@@ -74,6 +72,29 @@ jest.mock("../services/usageRecordDb", () => ({
 }));
 
 import internalUsageRoutes from "../routes/internalUsage";
+
+/**
+ * One entry per charge group the route wrote, in the shape the legacy counter write used to
+ * be asserted in -- [userId, tokens, cost (USD), { eventId, model, feature, occurredAt, calls }]
+ * -- read from the atomic ledger + charge-event write that is now the only record of the charge.
+ */
+type ChargeAudit = { eventId: string; model: string; feature: string; occurredAt: string; calls: number };
+type ChargeEvent = ChargeAudit & { actingUserId: string; tokens: number; costMicroUsd: number };
+
+function chargeCalls(): Array<[string, number, number, ChargeAudit]> {
+  return mockIncrementUsageWithChargeEvent.mock.calls.map(([, ev]: [unknown, ChargeEvent]) => [
+    ev.actingUserId,
+    ev.tokens,
+    ev.costMicroUsd / 1_000_000,
+    {
+      eventId: ev.eventId,
+      model: ev.model,
+      feature: ev.feature,
+      occurredAt: ev.occurredAt,
+      calls: ev.calls,
+    },
+  ]);
+}
 
 const app = express();
 app.use(express.json());
@@ -116,8 +137,8 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .send({ records: [record()] });
 
     expect(res.status).toBe(202);
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
-    const [userId, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(chargeCalls()).toHaveLength(1);
+    const [userId, tokens, cost] = chargeCalls()[0];
     expect(userId).toBe("user-1");
     expect(tokens).toBe(1_000_000);
     expect(cost).toBeCloseTo(5, 5); // 1M input tokens at $5/M
@@ -138,8 +159,8 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     const [ledgerInc] = mockIncrementUsageWithChargeEvent.mock.calls[0];
     expect(ledgerInc.inputTokens).toBe(3_000_000);
     expect(ledgerInc.calls).toBe(3);
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
-    const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(chargeCalls()).toHaveLength(1);
+    const [, tokens, cost] = chargeCalls()[0];
     expect(tokens).toBe(3_000_000);
     expect(cost).toBeCloseTo(15, 5);
   });
@@ -150,7 +171,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record(), record(), record()] });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.calls).toBe(3);
   });
 
@@ -179,7 +200,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
         records: [record({ inputTokens: 0, cacheReadTokens: 2_000_000 })],
       });
 
-    const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, tokens, cost] = chargeCalls()[0];
     expect(tokens).toBe(2_000_000);
     expect(cost).toBeCloseTo(1, 5); // 2M cache-read at $0.50/M
   });
@@ -200,7 +221,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
         ],
       });
 
-    const [, , cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , cost] = chargeCalls()[0];
     expect(cost).toBeCloseTo(0.000286, 9);
     const [ledgerInc] = mockIncrementUsageWithChargeEvent.mock.calls[0];
     expect(ledgerInc.costMicroUsd).toBe(286);
@@ -214,9 +235,9 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
         records: [record({ userId: "user-a" }), record({ userId: "user-b" }), record({ userId: "user-a" })],
       });
 
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
+    expect(chargeCalls()).toHaveLength(2);
     const byUser = Object.fromEntries(
-      mockIncrementUserTokenUsage.mock.calls.map((c) => [c[0], c[1]])
+      chargeCalls().map((c) => [c[0], c[1]])
     );
     expect(byUser["user-a"]).toBe(2_000_000);
     expect(byUser["user-b"]).toBe(1_000_000);
@@ -239,9 +260,9 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
         ],
       });
 
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
+    expect(chargeCalls()).toHaveLength(2);
     const byModel = Object.fromEntries(
-      mockIncrementUserTokenUsage.mock.calls.map((c) => [c[3]?.model, c[3]])
+      chargeCalls().map((c) => [c[3]?.model, c[3]])
     );
     expect(byModel["anthropic.claude-opus-5"]).toMatchObject({
       model: "anthropic.claude-opus-5",
@@ -263,8 +284,8 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ userId: "victim-9" })] });
 
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
-    expect(mockIncrementUserTokenUsage.mock.calls[0][0]).toBe("user-1");
+    expect(chargeCalls()).toHaveLength(1);
+    expect(chargeCalls()[0][0]).toBe("user-1");
   });
 
   it("does not charge for an unpriced model but still records it", async () => {
@@ -276,7 +297,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .send({ records: [record({ model: "some-unlisted-model-xyz" })] });
 
     expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
-    const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, tokens, cost] = chargeCalls()[0];
     expect(tokens).toBe(1_000_000);
     expect(cost).toBe(0);
   });
@@ -288,7 +309,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .send({ records: [record(), { model: "", inputTokens: 1, outputTokens: 1 }] });
 
     expect(res.body).toEqual({ accepted: 1, skipped: 1 });
-    const [, tokens] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, tokens] = chargeCalls()[0];
     expect(tokens).toBe(1_000_000);
   });
 
@@ -309,14 +330,14 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     // through the plain (non-atomic) recordUsage() path, unaffected by any
     // of the atomic-write machinery above.
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    expect(chargeCalls()).toHaveLength(0);
     expect(mockIncrementUsageWithChargeEvent).not.toHaveBeenCalled();
   });
 
   it("never lets a metering failure fail the ingestion", async () => {
     // The engine is fail-open by contract; a quota write blip must not turn into
     // a 500 that makes it retry and double-charge.
-    mockIncrementUserTokenUsage.mockRejectedValueOnce(new Error("dynamo down"));
+    mockIncrementUsageWithChargeEvent.mockRejectedValue(new Error("dynamo down"));
 
     const res = await request(app)
       .post("/api/internal/usage")
@@ -341,7 +362,7 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record()] });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
 
@@ -350,9 +371,9 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     // Same task, identical record content resubmitted (e.g. engine retry /
     // crash-restart) — must derive the identical eventId, which is what lets
@@ -362,7 +383,7 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(second.eventId).toBe(first.eventId);
   });
@@ -382,16 +403,16 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
         .post("/api/internal/usage")
         .set("Authorization", `Bearer ${ownerToken}`)
         .send({ records: [record({ taskId: "task-abc" })] });
-      const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+      const [, , , first] = chargeCalls()[0];
 
-      mockIncrementUserTokenUsage.mockClear();
+      mockIncrementUsageWithChargeEvent.mockClear();
 
       Date.now = jest.fn(() => new Date("2026-08-16T00:20:00.000Z").getTime());
       await request(app)
         .post("/api/internal/usage")
         .set("Authorization", `Bearer ${ownerToken}`)
         .send({ records: [record({ taskId: "task-abc" })] });
-      const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+      const [, , , second] = chargeCalls()[0];
 
       expect(second.eventId).not.toBe(first.eventId);
     } finally {
@@ -404,15 +425,15 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-one" })] });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-two" })] });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(first.eventId).not.toBe(second.eventId);
   });
@@ -426,9 +447,9 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     // Same task, but a second record on top this time — a genuinely
     // different batch, not a resubmission.
@@ -436,7 +457,7 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" }), record({ taskId: "task-abc", outputTokens: 500 })] });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(second.eventId).not.toBe(first.eventId);
   });
@@ -446,9 +467,9 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-b" }), record({ taskId: "task-a" })] });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     // Same two records, reported in the opposite order — must still collapse
     // to the same key.
@@ -456,7 +477,7 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-a" }), record({ taskId: "task-b" })] });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(first.eventId).toBe(second.eventId);
   });
@@ -473,7 +494,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "a1b2c3d4e5f6" });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.eventId).toEqual(
       expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:a1b2c3d4e5f6:[0-9a-f]{32}$/)
     );
@@ -484,16 +505,16 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     // Identical resubmission -- the exact retry case reportId exists to handle.
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(second.eventId).toBe(first.eventId);
   });
@@ -510,15 +531,15 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc", outputTokens: 999 })], reportId: "same-report-id" });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(second.eventId).not.toBe(first.eventId);
   });
@@ -532,15 +553,15 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "report-one" });
-    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , first] = chargeCalls()[0];
 
-    mockIncrementUserTokenUsage.mockClear();
+    mockIncrementUsageWithChargeEvent.mockClear();
 
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "report-two" });
-    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , second] = chargeCalls()[0];
 
     expect(second.eventId).not.toBe(first.eventId);
   });
@@ -551,7 +572,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
 
@@ -561,7 +582,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: 12345 });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     // Falls back to the fingerprint format, not "engine:user-1:12345".
     expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
@@ -580,7 +601,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: oversizedReportId });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
     expect(audit?.eventId).not.toContain(oversizedReportId);
   });
@@ -592,7 +613,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: boundaryReportId });
 
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, , , audit] = chargeCalls()[0];
     expect(audit?.eventId).toContain(boundaryReportId);
   });
 });
@@ -609,7 +630,7 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     expect(res.status).toBe(202);
     expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
     expect(mockRecordUsage).not.toHaveBeenCalled();
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+    expect(chargeCalls()).toHaveLength(1);
   });
 
   it("on a confirmed duplicate (\"duplicate\"), neither the atomic write nor the recordUsage() fallback double-writes the ledger", async () => {
@@ -629,7 +650,7 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     // The counter apply still runs unconditionally -- safe (idempotent) and
     // necessary for the crash-recovery case (event recorded, apply never
     // reached on a prior attempt).
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+    expect(chargeCalls()).toHaveLength(1);
   });
 
   it("on a conflict that PERSISTS through the retries, falls back to the non-atomic recordUsage() write so real usage is never silently dropped", async () => {
@@ -646,7 +667,6 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     expect(res.status).toBe(202);
     expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(3);
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
   });
 
   it("retries the SAME grouped transaction on a conflict — a commit hidden behind it resolves as a duplicate, with no fallback write", async () => {
@@ -690,7 +710,7 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     // ledger row atomically, "duplicate" correctly skipped writing at all.
     expect(mockRecordUsage).not.toHaveBeenCalled();
     // Both charge groups still get their counter-apply attempt.
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
+    expect(chargeCalls()).toHaveLength(2);
   });
 
   it("a conflict/error in one group's atomic write does not affect a sibling group's clean atomic write in the same batch", async () => {
@@ -736,7 +756,7 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
 
     expect(res.status).toBe(202);
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    expect(chargeCalls()).toHaveLength(0);
     // "system" is never charged, so the atomic write never runs for it.
     expect(mockIncrementUsageWithChargeEvent).not.toHaveBeenCalled();
   });
@@ -754,7 +774,7 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     // worse than an occasional double-count under a genuine infra error.
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     // The counter apply still proceeds regardless.
-    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+    expect(chargeCalls()).toHaveLength(1);
   });
 });
 
@@ -810,7 +830,7 @@ describe("POST /api/internal/usage — engine spend is separable in the ledger",
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record()] });
 
-    const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    const [, tokens, cost] = chargeCalls()[0];
     expect(tokens).toBe(1_000_000);
     expect(cost).toBeCloseTo(5, 5);
   });
