@@ -282,17 +282,46 @@ export function stripCredentials<T>(value: T, depth = 0): T {
   return out as T;
 }
 
+type MetaToolkitCallRequest = { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string };
+
+/**
+ * A failure whose reason the caller must be able to read: a refusal, or a 403 about the caller's own
+ * connection ("No usable Meta ad account is connected"). 401, 429 and 503 stay protocol errors because
+ * the OAuth challenge and retry handling depend on them.
+ */
+function isReadableFailure(error: unknown): error is Error {
+  return error instanceof MetaToolkitRefusal || (error instanceof MetaToolkitAuthError && error.status === 403);
+}
+
 /**
  * Full external call: authenticate → resolve account → execute → meter once on success.
  * A refused or failed call is not metered.
  */
-export async function handleMetaToolkitCall(
-  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string },
-  deps: MetaToolkitGatewayDeps = defaultDeps,
-) {
+export async function handleMetaToolkitCall(request: MetaToolkitCallRequest, deps: MetaToolkitGatewayDeps = defaultDeps) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  try {
+    return await runAuthenticatedMetaToolkitCall(caller, request, deps);
+  } catch (error) {
+    // Databricks' gateway replaces the text of every MCP tool error with a generic "The external MCP tool
+    // failed" line, so the model and the user never see why a call was refused (read-only gate, Meta
+    // rejecting a read, no Meta account connected). Answer those to a Databricks-origin caller as a normal
+    // result carrying the reason. Nothing is loosened: the call was still refused or failed, and it is not
+    // metered (ENG-2747).
+    if (caller.databricksOrigin && isReadableFailure(error)) {
+      return { success: false, message: error.message };
+    }
+    throw error;
+  }
+}
+
+async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, request: MetaToolkitCallRequest, deps: MetaToolkitGatewayDeps) {
   // ENG-2747 (option B): refused before any upstream call or metering.
   if (caller.databricksOrigin && !isDatabricksAllowedCall(request.toolName, request.args)) {
+    // Tool name and action only: arguments can hold ad copy and ids. Shows a model retrying a write.
+    console.warn('[meta-toolkit] databricks read-only gate refused', {
+      tool: String(request.toolName).slice(0, 80),
+      action: typeof request.args?.action === 'string' ? request.args.action.slice(0, 40) : undefined,
+    });
     throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
   }
   const meter = (platform?: string) => {
