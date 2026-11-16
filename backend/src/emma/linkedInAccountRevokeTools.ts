@@ -4,14 +4,21 @@
  * that previously required direct production AWS access.
  *
  * Scope is the caller's own user record only (connected_accounts on that user),
- * so another tenant's account id simply is not found. Revocation reuses the same
+ * so another tenant's account id simply is not found. ENG-3108: inspect also
+ * lists LinkedIn accounts a teammate shared with the caller's organization,
+ * marked sharedByTeammate / revocableByCaller:false, so its list matches
+ * list_connected_accounts. Revoke and queued actions stay own-accounts-only. Revocation reuses the same
  * path as DELETE /connected-accounts/unipile/:accountId, including the org-shared
  * owner guard. Queued actions are paused (status 'paused'), not deleted: the
  * executor only picks up status 'active', and the row stays as audit evidence.
  */
 import { emmaToolRegistry } from './registry';
 import { scheduleDb } from '../services/db';
-import { getAccountsByUserId, deleteAccountById } from '../services/connectedAccountsDb';
+import {
+  getAccountsByUserId,
+  getAccountsWithOwnerIncludingOrgShared,
+  deleteAccountById,
+} from '../services/connectedAccountsDb';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 const PLATFORM = 'unipile';
@@ -67,17 +74,23 @@ emmaToolRegistry.register({
   },
   execute: async (args: { account_id?: string }, context: any) => {
     const userId = callerId(context);
-    const accounts = await linkedInAccounts(userId);
-    const listed = accounts.map((a: any) => ({
+    const reachable = (await getAccountsWithOwnerIncludingOrgShared(userId)).filter((a: any) => a?.platform === PLATFORM);
+    const entry = (a: any) => ({
       accountId: a.account_id,
       name: a.account_name,
       sharedWithOrg: a.sharedWithOrg === true,
       connectedAt: a.connected_at ?? a.created_at,
-    }));
+      // ENG-3108: only a teammate's shared account carries these two fields.
+      ...(a.userId !== userId && { sharedByTeammate: true, revocableByCaller: false }),
+    });
+    const listed = reachable.map(entry);
     if (!args?.account_id) return { accounts: listed };
-    if (!accounts.some((a: any) => a.account_id === args.account_id)) {
+    const selected = reachable.find((a: any) => a.account_id === args.account_id);
+    if (!selected) {
       return { accounts: listed, error: `No LinkedIn Outreach account ${args.account_id} is connected to this user.` };
     }
+    // A teammate's shared account: return its entry; its queued actions belong to its owner.
+    if (selected.userId !== userId) return { accounts: listed, accountId: args.account_id, account: entry(selected) };
     const queued = await queuedActionsFor(userId, args.account_id);
     return { accounts: listed, accountId: args.account_id, queuedActions: queued.map(summarizeAction) };
   },

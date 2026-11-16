@@ -1,12 +1,13 @@
 // ENG-1153: inspect/revoke LinkedIn Outreach account + neutralize queued engagement actions.
 const getAccountsByUserId = jest.fn();
+const getAccountsWithOwnerIncludingOrgShared = jest.fn();
 const deleteAccountById = jest.fn();
 const getSchedulesByUserId = jest.fn();
 const updateSchedule = jest.fn();
 const deleteUnipile = jest.fn();
 const canCallerDisconnectAccount = jest.fn();
 
-jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserId, deleteAccountById }));
+jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccountById }));
 jest.mock('../services/db', () => ({ scheduleDb: { getSchedulesByUserId, updateSchedule } }));
 jest.mock('../services/linkedInOutreachService', () => ({ linkedInOutreachService: { deleteAccount: deleteUnipile } }));
 jest.mock('../routes/connectedAccounts', () => ({ canCallerDisconnectAccount }));
@@ -23,10 +24,13 @@ const action = (id: string, extra: any = {}) => ({
 
 describe('ENG-1153 LinkedIn revoke tools', () => {
   let connected: any[];
+  let shared: any[];
   beforeEach(() => {
     jest.clearAllMocks();
     connected = [acct, { platform: 'gmail', account_id: 'g', config: {} }];
     getAccountsByUserId.mockImplementation(async () => connected);
+    shared = [];
+    getAccountsWithOwnerIncludingOrgShared.mockImplementation(async () => [...connected.map((a) => ({ ...a, userId: 'u1' })), ...shared]);
     deleteAccountById.mockImplementation(async () => { connected = connected.filter((a) => a.account_id !== 'acc1'); });
     let schedules = [action('s1'), action('s2'), action('other', { variableValues: { engagingAccountId: 'acc2', ownerAccountId: 'acc2' } }), { scheduleId: 'chat', type: 'chat', status: 'active' }];
     getSchedulesByUserId.mockImplementation(async () => schedules);
@@ -98,5 +102,53 @@ describe('ENG-1153 LinkedIn revoke tools', () => {
     expect(r).toEqual({ revoked: false, error: 'Only the org owner' });
     expect(deleteUnipile).not.toHaveBeenCalled();
     expect(updateSchedule).not.toHaveBeenCalled();
+  });
+
+  describe('ENG-3108 org-shared accounts in inspect', () => {
+    const mate = { platform: 'unipile', account_id: 'mate1', account_name: 'Teammate', sharedWithOrg: true, connected_at: '2026-11-01T00:00:00Z', userId: 'u2', config: { access_token: 'MATESECRET' } };
+    const ownEntry = { accountId: 'acc1', name: 'Rui', sharedWithOrg: false, connectedAt: undefined };
+
+    it('with no shared account the result is the same as before', async () => {
+      expect(await emmaToolRegistry.execute('inspect_linkedin_account', {}, ctx)).toEqual({ accounts: [ownEntry] });
+    });
+
+    it('lists a teammate-shared account marked as shared and not revocable, own entry unmarked', async () => {
+      shared = [mate, { ...mate, platform: 'gmail', account_id: 'mateg' }];
+      const r = await emmaToolRegistry.execute('inspect_linkedin_account', {}, ctx);
+      expect(r).toEqual({
+        accounts: [
+          ownEntry,
+          { accountId: 'mate1', name: 'Teammate', sharedWithOrg: true, connectedAt: '2026-11-01T00:00:00Z', sharedByTeammate: true, revocableByCaller: false },
+        ],
+      });
+      expect(JSON.stringify(r)).not.toContain('SECRET');
+    });
+
+    it('asking for a shared account by id returns its entry, no error, and does not read its queued actions', async () => {
+      shared = [mate];
+      const r = await emmaToolRegistry.execute('inspect_linkedin_account', { account_id: 'mate1' }, ctx);
+      expect(r.error).toBeUndefined();
+      expect(r.accountId).toBe('mate1');
+      expect(r.account).toEqual(expect.objectContaining({ accountId: 'mate1', sharedByTeammate: true, revocableByCaller: false }));
+      expect(r.queuedActions).toBeUndefined();
+      expect(getSchedulesByUserId).not.toHaveBeenCalled();
+    });
+
+    it('an id the caller cannot reach keeps the existing not-connected text', async () => {
+      shared = [mate];
+      const r = await emmaToolRegistry.execute('inspect_linkedin_account', { account_id: 'nope' }, ctx);
+      expect(r.error).toBe('No LinkedIn Outreach account nope is connected to this user.');
+      expect(r.account).toBeUndefined();
+    });
+
+    it('revoke of a teammate-shared account is still refused and touches nothing', async () => {
+      shared = [mate];
+      const r = await emmaToolRegistry.execute('revoke_linkedin_account', { account_id: 'mate1', confirm: true }, ctx);
+      expect(r).toEqual({ revoked: false, error: 'No LinkedIn Outreach account mate1 is connected to this user.' });
+      expect(deleteUnipile).not.toHaveBeenCalled();
+      expect(deleteAccountById).not.toHaveBeenCalled();
+      expect(updateSchedule).not.toHaveBeenCalled();
+      expect(canCallerDisconnectAccount).not.toHaveBeenCalled();
+    });
   });
 });
