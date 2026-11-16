@@ -39,7 +39,7 @@ export const ZOMA_TOOL_DEFINITIONS = [
   {
     name: 'zoma_usage',
     description:
-      "Shows this month's Zoma usage for the logged-in user: tool calls, and writes sent to Meta with their read-back result (confirmed, mismatch, unconfirmed). Call when the user asks what they have used. Billing is not enabled yet; usage is only recorded.",
+      "Shows this month's Zoma usage for the logged-in user: tool calls, and writes sent to Meta with their read-back result (confirmed, mismatch, unconfirmed). Call when the user asks what they have used. When billing is on, also shows the plan's included calls, calls used, overage and billing period.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {

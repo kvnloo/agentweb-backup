@@ -25,13 +25,14 @@ import {
 } from './zomaProviders';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
+import {
+  formatZomaBillingUsage, formatZomaPlanLine, getZomaBillingConfig, getZomaBillingUsage, getZomaPlanSummary,
+  type ZomaBillingUsage, type ZomaPlanSummary,
+} from './zomaBilling';
 
-export class ZomaNotReadyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ZomaNotReadyError';
-  }
-}
+import { ZomaNotReadyError } from './zomaErrors';
+
+export { ZomaNotReadyError };
 
 export interface ZomaMetaAccountSummary {
   account_id: string;
@@ -73,6 +74,11 @@ export interface ZomaReadiness {
   };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
+  /**
+   * ENG-3131: present only while ZOMA_BILLING_ENABLED=true. Reads and drafts never need it;
+   * a write that makes ads live needs `publish_enabled`. `link` is the $1 trial Checkout.
+   */
+  plan?: ZomaPlanSummary;
   next_step: string | null;
 }
 
@@ -91,6 +97,10 @@ export interface ZomaOnboardingDeps {
   frontendUrl: () => string;
   now: () => number;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
+  /** ENG-3131 plan section of zoma_status; undefined while billing is off. */
+  getPlan?: (userId: string) => Promise<ZomaPlanSummary | undefined>;
+  /** ENG-3130 included/used/overage block of zoma_usage; undefined while billing is off. */
+  getBillingUsage?: (userId: string) => Promise<ZomaBillingUsage | undefined>;
 }
 
 const defaultDeps: ZomaOnboardingDeps = {
@@ -104,6 +114,8 @@ const defaultDeps: ZomaOnboardingDeps = {
   frontendUrl: () => process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro',
   now: () => Date.now(),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
+  getPlan: (userId) => getZomaPlanSummary(userId),
+  getBillingUsage: (userId) => getZomaBillingUsage(userId),
 };
 
 /** Same usability rule the toolkit gateway applies to account resolution (now in zomaProviders). */
@@ -259,6 +271,10 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
+  if (mintLinks && deps.getPlan) {
+    const plan = await deps.getPlan(userId);
+    if (plan) readiness.plan = plan;
+  }
   readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? metaPageProblem(accounts);
   return readiness;
 }
@@ -299,6 +315,7 @@ export function formatZomaStatus(r: ZomaReadiness): string {
           : r.google_ads.link ? ` → ${r.google_ads.link}` : ''
       }`]
       : []),
+    ...(r.plan ? [formatZomaPlanLine(r.plan, getZomaBillingConfig())] : []),
     '',
     r.next_step ?? 'All set. Ask me about your Meta ads, e.g. "how are my campaigns doing this week?"',
   ];
@@ -314,13 +331,13 @@ export function currentUsageMonth(now: number): { start: string; end: string } {
   };
 }
 
-export function formatZomaUsage(u: McpUserUsage): string {
+export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage): string {
   const lines = [
     `Zoma usage ${u.start.slice(0, 7)} (UTC month):`,
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
     ...u.recentWrites.map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
-    'Billing is not enabled yet; usage is only recorded.',
+    ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');
 }
@@ -333,7 +350,8 @@ export async function runZomaTool(name: ZomaToolName, _args: unknown, context: {
   }
   if (name === 'zoma_usage') {
     const usage = await deps.getUsage(context.userId, currentUsageMonth(deps.now()));
-    return { summary: formatZomaUsage(usage), ...usage };
+    const billing = deps.getBillingUsage ? await deps.getBillingUsage(context.userId) : undefined;
+    return { summary: formatZomaUsage(usage, billing), ...usage, ...(billing ? { billing } : {}) };
   }
   throw new ZomaNotReadyError(`Unknown Zoma tool ${name}.`);
 }
