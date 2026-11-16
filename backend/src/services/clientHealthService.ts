@@ -438,6 +438,68 @@ function determineStatus(
 }
 
 /**
+ * Every client an admin's identifier could mean. An exact email match stands alone; otherwise
+ * every user whose display name or email contains the text (case-insensitive), in scan order.
+ * ENG-1907: sandbox principals are not clients and never match.
+ */
+export async function findClientMatches(clientNameOrEmail: string): Promise<any[]> {
+  const byEmail = await userDb.getUserByEmail(clientNameOrEmail);
+  if (byEmail && !isEvaluationUser(byEmail.userId)) return [byEmail];
+  const allUsers = await userDb.getAllUsers();
+  const searchLower = clientNameOrEmail.toLowerCase();
+  return allUsers.filter(
+    (u: any) =>
+      !isEvaluationUser(u.userId) &&
+      ((u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
+        (u.email && u.email.toLowerCase().includes(searchLower)))
+  );
+}
+
+/**
+ * Pick the Meta ad account an admin read goes through, and whether it is read with the client's
+ * own token (`useConnectedAccount`) or the legacy `adAccount` id with the shared token.
+ */
+export function resolveClientMetaAccount(
+  client: { adAccount?: string },
+  metaAdAccounts: any[],
+  nowMs: number,
+): { connectedMetaAccount: any; useConnectedAccount: boolean; resolvedAdAccountId: string | undefined } {
+  // ENG-1767: resolve the account id AND token together as a genuine matched pair — preferring
+  // the client's own connected Meta account (their own OAuth grant, their own token) over the
+  // legacy `adAccount` field, same precedence `getMetaCredentials` already uses and already has
+  // tests for ("connected_accounts over adAccount fallback when both exist"). Both must come
+  // from the SAME source: using the connected account's id with the shared/global token (or
+  // vice versa) silently reintroduces the exact bug this fix exists to close — the shared token
+  // queried against an account id it may not be granted access to, returning zero campaigns
+  // with no error. Only falls back to the legacy id + shared token TOGETHER, and only when the
+  // connected account has no usable (non-empty) access_token of its own.
+  // Prefer the first account the campaign fetch can actually use (unexpired AND carrying an
+  // account id and token), then any unexpired record, then the first. A stale or incomplete first
+  // record must not shadow a working later one (the health status and the fetch agree).
+  const hasFetchCredentials = (acc: AdConnectionAccount): boolean => {
+    const config = acc.config as { ad_account_id?: string; access_token?: string } | undefined;
+    return !!config?.ad_account_id && !!config?.access_token;
+  };
+  const connectedMetaAccount =
+    metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs) && hasFetchCredentials(acc)) ??
+    metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs)) ??
+    metaAdAccounts[0];
+  const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
+  const connectedAccessToken = connectedMetaAccount?.config?.access_token;
+  // An expired connected account never wins over a legacy adAccount: the classifier counts the
+  // legacy account as the live connection, so the fetch must read through it too.
+  const connectedIsUsable = !!connectedMetaAccount && hasUsableAdToken(connectedMetaAccount, nowMs);
+  const legacyAvailable = typeof client.adAccount === 'string' && client.adAccount.trim() !== '';
+  const useConnectedAccount =
+    !!connectedAdAccountId && !!connectedAccessToken && (connectedIsUsable || !legacyAvailable);
+  return {
+    connectedMetaAccount,
+    useConnectedAccount,
+    resolvedAdAccountId: useConnectedAccount ? connectedAdAccountId : (client.adAccount || undefined),
+  };
+}
+
+/**
  * Assess a single client's health. Admin-only.
  */
 export async function assessClientHealth(
@@ -459,23 +521,8 @@ export async function assessClientHealth(
       };
     }
 
-    // Look up client by email first, then by name
-    let client = await userDb.getUserByEmail(clientNameOrEmail);
-    // ENG-1907: sandbox principals are not clients — same rule as the name match below.
-    if (client && isEvaluationUser(client.userId)) client = undefined;
-
-    if (!client) {
-      // Try name match
-      const allUsers = await userDb.getAllUsers();
-      const searchLower = clientNameOrEmail.toLowerCase();
-      client = allUsers.find(
-        (u: any) =>
-          // ENG-1907: sandbox principals are not clients.
-          !isEvaluationUser(u.userId) &&
-          ((u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
-            (u.email && u.email.toLowerCase().includes(searchLower)))
-      );
-    }
+    // First match wins here (unchanged); readClientMetaActivity refuses an ambiguous name instead.
+    const client = (await findClientMatches(clientNameOrEmail))[0];
 
     if (!client) {
       return {
@@ -494,42 +541,9 @@ export async function assessClientHealth(
     );
     const hasAds = metaAdAccounts.length > 0 || (client.adAccount && client.adAccount.trim() !== '');
 
-    // ENG-1767: resolve the account id AND token together as a genuine matched pair — preferring
-    // the client's own connected Meta account (their own OAuth grant, their own token) over the
-    // legacy `adAccount` field, same precedence `getMetaCredentials` already uses and already has
-    // tests for ("connected_accounts over adAccount fallback when both exist"). Both must come
-    // from the SAME source: using the connected account's id with the shared/global token (or
-    // vice versa) silently reintroduces the exact bug this fix exists to close — the shared token
-    // queried against an account id it may not be granted access to, returning zero campaigns
-    // with no error. Only falls back to the legacy id + shared token TOGETHER, and only when the
-    // connected account has no usable (non-empty) access_token of its own.
-    // Prefer the first account the campaign fetch can actually use (unexpired AND carrying an
-    // account id and token), then any unexpired record, then the first. A stale or incomplete first
-    // record must not shadow a working later one (the health status and the fetch agree).
     const nowMs = Date.now();
-    const hasFetchCredentials = (acc: AdConnectionAccount): boolean => {
-      const config = acc.config as { ad_account_id?: string; access_token?: string } | undefined;
-      return !!config?.ad_account_id && !!config?.access_token;
-    };
-    const connectedMetaAccount =
-      metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs) && hasFetchCredentials(acc)) ??
-      metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs)) ??
-      metaAdAccounts[0];
-    const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
-    const connectedAccessToken = connectedMetaAccount?.config?.access_token;
-    // An expired connected account never wins over a legacy adAccount: the classifier counts the
-    // legacy account as the live connection, so the fetch must read through it too.
-    const connectedIsUsable = !!connectedMetaAccount && hasUsableAdToken(connectedMetaAccount, nowMs);
-    const legacyAvailable = typeof client.adAccount === 'string' && client.adAccount.trim() !== '';
-    const useConnectedAccount =
-      !!connectedAdAccountId && !!connectedAccessToken && (connectedIsUsable || !legacyAvailable);
-
-    // Reused below for the campaigns/insights fetches, the reported ad_account_id, and the
-    // thresholds lookup, replacing three independent re-derivations that previously disagreed on
-    // which field won and could silently drift out of sync with each other.
-    const resolvedAdAccountId: string | undefined = useConnectedAccount
-      ? connectedAdAccountId
-      : (client.adAccount || undefined);
+    const { connectedMetaAccount, useConnectedAccount, resolvedAdAccountId } =
+      resolveClientMetaAccount(client, metaAdAccounts, nowMs);
 
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
@@ -913,6 +927,110 @@ export async function assessClientHealth(
       error: error instanceof Error ? error.message : 'Unknown error',
     };
   }
+}
+
+/**
+ * ENG-3070: an admin reads one named client's Meta change history (the `activities` edge).
+ * Read-only. Resolves the client and the account/token pair exactly as assessClientHealth does,
+ * but refuses an ambiguous name instead of taking the first match, and never reads any account
+ * other than the named client's.
+ */
+export async function readClientMetaActivity(
+  callerUserId: string,
+  clientNameOrEmail: string,
+  args: { since?: string; until?: string; limit?: number; after?: string } = {},
+  callerIsAdmin?: boolean,
+): Promise<any> {
+  const refuse = (reason: string, message: string, extra: Record<string, unknown> = {}) =>
+    ({ success: false, reason, message, ...extra });
+
+  const isAdmin = callerIsAdmin !== undefined
+    ? callerIsAdmin
+    : (await userDb.getUserById(callerUserId))?.isAdmin === true;
+  if (!isAdmin) {
+    return { ...refuse('not_admin', 'Access denied. Only admin users can read a client\'s Meta change history.'), error: 'Admin access required' };
+  }
+
+  const matches = await findClientMatches(clientNameOrEmail);
+  if (matches.length === 0) {
+    return { ...refuse('client_not_found', `Client "${clientNameOrEmail}" not found.`), error: 'Client not found' };
+  }
+  if (matches.length > 1) {
+    return refuse(
+      'ambiguous_client',
+      `"${clientNameOrEmail}" matches ${matches.length} clients. Nothing was read; ask again with the client's exact email.`,
+      { matches: matches.slice(0, 10).map((u: any) => ({ email: u.email, displayName: u.displayName })) },
+    );
+  }
+  const client = matches[0];
+  const clientRef = { userId: client.userId, email: client.email, displayName: client.displayName };
+
+  const metaAdAccounts = (await getAccountsByUserId(client.userId)).filter(
+    (acc: any) => acc.platform === 'meta' && acc.config?.account_type === 'ad_account'
+  );
+  const nowMs = Date.now();
+  const { connectedMetaAccount, useConnectedAccount, resolvedAdAccountId } =
+    resolveClientMetaAccount(client, metaAdAccounts, nowMs);
+
+  if (!resolvedAdAccountId) {
+    // A connected account id without its own token is not read with the shared token.
+    return (connectedMetaAccount?.config as any)?.ad_account_id
+      ? refuse('credential_pair_mismatch', 'The client\'s connected Meta ad account has no access token of its own, and the shared token is not used for a client-connected account. Nothing was read; the client needs to reconnect Meta.', { client: clientRef })
+      : refuse('no_meta_connection', 'This client has no Meta ad account connected. Nothing was read.', { client: clientRef });
+  }
+  if (useConnectedAccount && !hasUsableAdToken(connectedMetaAccount, nowMs)) {
+    return refuse('no_meta_connection', 'This client\'s Meta connection has expired and cannot refresh. Nothing was read; the client needs to reconnect Meta.', { client: clientRef, ad_account_id: resolvedAdAccountId });
+  }
+
+  let accessToken: string;
+  if (useConnectedAccount) {
+    const { ensureFreshMetaAdAccountToken } = await import('./metaTokenRefresh');
+    await ensureFreshMetaAdAccountToken(connectedMetaAccount, client.userId);
+    accessToken = connectedMetaAccount.config.access_token;
+  } else {
+    const { getMetaAccessToken } = await import('../utils/secretsManager');
+    accessToken = await getMetaAccessToken();
+  }
+  const scope = {
+    client: clientRef,
+    ad_account_id: resolvedAdAccountId,
+    credential_source: useConnectedAccount ? 'client_connection' : 'legacy_shared_token',
+  };
+
+  const { executeActivityLogRead } = await import('../mcp/metaToolkitDiagnostics');
+  const { MetaToolkitRefusal } = await import('../mcp/metaToolkitErrors');
+  const readArgs = Object.fromEntries(
+    (['since', 'until', 'limit', 'after'] as const).filter((k) => args[k] !== undefined).map((k) => [k, args[k]])
+  );
+  let data: any;
+  try {
+    data = await executeActivityLogRead(readArgs, { accountId: resolvedAdAccountId, accessToken });
+  } catch (error) {
+    if (error instanceof MetaToolkitRefusal) return refuse('invalid_argument', error.message, scope);
+    throw error;
+  }
+  // executeActivityLogRead returns Meta failures as { success: false, ... }; anything without an
+  // event array is a failed read, never an empty history.
+  if (data?.success === false) return { ...data, reason: 'meta_read_failed', ...scope };
+  if (!Array.isArray(data?.data)) {
+    return refuse('meta_read_failed', 'Meta returned no activity list for this account. Treat the history as unread, not empty.', scope);
+  }
+  return {
+    success: true,
+    ...scope,
+    events: data.data.map(withBeforeAfter),
+    ...(data.paging ? { paging: data.paging } : {}),
+  };
+}
+
+/** Lift Meta's own old/new values out of `extra_data` when it parses; add nothing otherwise. */
+function withBeforeAfter(event: any) {
+  let extra: any = event?.extra_data;
+  if (typeof extra === 'string') {
+    try { extra = JSON.parse(extra); } catch { return event; }
+  }
+  if (!extra || typeof extra !== 'object' || !('old_value' in extra || 'new_value' in extra)) return event;
+  return { ...event, before: extra.old_value ?? null, after: extra.new_value ?? null };
 }
 
 /**
