@@ -20,6 +20,12 @@ Needs read access to the prod CloudWatch log group and the `AW-*` DynamoDB table
 python3 scripts/enrichment-estimate-calibration.py --since <first day after the last check>
 ```
 
+`--since` is required, zero-padded, and must be the day **after the last change** to pricing or the enrichment pipeline
+(or the last check), whichever is later. The script cannot know that date, and a window that reaches back before a change
+gives a false DRIFT: on 2026-11-16 a 14-day window started on 2026-11-02 and included the 2026-11-03 run from before the
+2026-11-04 fixes (148 contacts at 3.6 times the quote, 245 contacts in total, ratio 2.61, "DRIFT"); the same data from
+2026-11-04 is 97 contacts at 1.13, inside the band. Always read the per-line table before acting on the verdict.
+
 It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs filter-log-events`, `dynamodb scan` and
 `dynamodb get-item`. It prints one line per customer and day (6-character user id prefix, contacts, fields, booked dollars,
 dollars per contact, the quote per contact, the ratio) and a verdict. It prints no email, lead or field value. It reads
@@ -50,8 +56,8 @@ id in `--exclude-user-ids`, otherwise it counts as a customer toward the 3-custo
 - Customer quotes use a model-aware per-field cost; this check uses the same per-field constant the recalibration used.
 - A run that straddles `--since` or midnight UTC is dropped or split across days. A run whose START is before `--since` is
   dropped; a START with no DONE (a crashed run) leaves its cost in the booked dollars with no contacts.
-- Write `--since` zero-padded (`2026-11-05`, not `2026-11-5`): the ledger filter is a string comparison and would silently
-  drop rows for the unpadded form.
+- `--since` must be zero-padded (`2026-11-05`, not `2026-11-5`): the ledger filter is a string comparison, so the script
+  rejects the unpadded form instead of silently dropping rows.
 - The 100-contact and 3-customer gate counts totals, not spread: read the per-customer lines (one customer can supply
   almost all the contacts).
 - AWS CLI error text is echoed (up to 400 characters); on an SSO session that could include a session name.
