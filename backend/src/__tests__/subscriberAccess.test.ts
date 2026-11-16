@@ -39,8 +39,9 @@ import { clearSubscriberLookups } from '../services/subscriberLookup';
 const TASK = 'task-1';
 const EMAIL = 'reader@example.com';
 const UNSUB_AT = '2026-02-01T00:00:00.000Z';
+const NONCE = 'nonce-of-the-persons-opt-out';
 const subscribed = { taskId: TASK, email: EMAIL, subscribedAt: '2026-01-01T00:00:00Z', unsubscribed: false, feedback: 'private note', customFields: { phone: '555' } };
-const optedOut = { ...subscribed, unsubscribed: true, unsubscribedAt: UNSUB_AT };
+const optedOut = { ...subscribed, unsubscribed: true, unsubscribedAt: UNSUB_AT, optOutNonce: NONCE };
 
 let app: express.Application;
 let nextClient = 1;
@@ -72,7 +73,7 @@ beforeEach(() => {
   (subscriberDb.getTaskSubscribers as jest.Mock).mockResolvedValue([subscribed]);
   (subscriberDb.getTaskSubscriberStates as jest.Mock).mockResolvedValue([]);
   (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue({ ...optedOut });
-  (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue({ ...optedOut });
+  (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue(true);
   (subscriberDb.resubscribe as jest.Mock).mockResolvedValue({ ...subscribed });
   (emailService.sendSubscriberWelcomeEmail as jest.Mock).mockResolvedValue(undefined);
 });
@@ -87,7 +88,7 @@ describe('GET /api/tasks/:taskId/subscribers (ENG-2990)', () => {
   it('refuses a token that is not a login token', async () => {
     const forged = jwt.sign({ userId: 'owner' }, 'some-other-secret');
     await request(app).get(`/api/tasks/${TASK}/subscribers`).set('Authorization', `Bearer ${forged}`).expect(401);
-    const subscriberLink = signResubscribeToken(TASK, EMAIL, UNSUB_AT);
+    const subscriberLink = signResubscribeToken(TASK, EMAIL, NONCE);
     await request(app).get(`/api/tasks/${TASK}/subscribers`).set('Authorization', `Bearer ${subscriberLink}`).expect(401);
     expect(subscriberDb.getTaskSubscribers).not.toHaveBeenCalled();
   });
@@ -142,7 +143,7 @@ describe('POST /api/tasks/:taskId/unsubscribe (public)', () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(subscribed);
     const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL, feedback: 'too many' }).expect(200);
     expect(subscriberDb.softUnsubscribe).toHaveBeenCalledWith(TASK, EMAIL, 'too many', { onlyIfActive: true });
-    expect(readResubscribeToken(res.body.resubscribeToken)).toEqual({ taskId: TASK, email: EMAIL, unsubscribedAt: UNSUB_AT });
+    expect(readResubscribeToken(res.body.resubscribeToken)).toEqual({ taskId: TASK, email: EMAIL, optOutNonce: NONCE });
   });
 
   it('hands out NO token when the row was already opted out (the conditional update does not apply)', async () => {
@@ -150,8 +151,60 @@ describe('POST /api/tasks/:taskId/unsubscribe (public)', () => {
     (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
     const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(200);
     expect(res.body).toEqual({ message: 'Already unsubscribed' });
-    // ...and the opt-out gets a new time, which voids any undo token someone obtained for the earlier one
+    // ...and the opt-out gets a new nonce, which voids any undo token someone obtained for the earlier one
     expect(subscriberDb.refreshOptOut).toHaveBeenCalledWith(TASK, EMAIL);
+  });
+
+  it('a repeat call for an opted-out address never moves the opt-out time (it is the record, and the confirmation-link rule depends on it)', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(optedOut);
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
+    await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(200);
+    // the only write besides the refused conditional update is the nonce refresh, which takes no time argument at all
+    expect((subscriberDb.refreshOptOut as jest.Mock).mock.calls[0]).toEqual([TASK, EMAIL]);
+  });
+
+  it('if the refresh finds the row put back to subscribed in between, the person who clicked Unsubscribe is unsubscribed after all (and gets the undo token)', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(subscribed);
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValueOnce(null).mockResolvedValueOnce({ ...optedOut });
+    (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue(false);
+    const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(200);
+    expect(subscriberDb.softUnsubscribe).toHaveBeenCalledTimes(2);
+    expect(readResubscribeToken(res.body.resubscribeToken)).toMatchObject({ optOutNonce: NONCE });
+  });
+
+  it('a failed refresh is not answered "done" (the earlier undo token would stay alive): it asks to try again, and logs nothing but a code', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(optedOut);
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
+    (subscriberDb.refreshOptOut as jest.Mock).mockRejectedValue(Object.assign(new Error(`table AW-Subscribers key ${EMAIL}`), { code: 'ThrottlingException' }));
+    const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(503);
+    expect(JSON.stringify(res.body)).not.toContain('AW-Subscribers');
+    const logged = (console.error as jest.Mock).mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(logged).toContain('ThrottlingException');
+    expect(logged).not.toContain(EMAIL);
+  });
+
+  it('answers 404, not "try again", when the owner removed the address between the first read and the writes', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValueOnce(subscribed).mockResolvedValue(undefined);
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
+    (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue(false);
+    await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(404);
+    expect(subscriberDb.softUnsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps going while the row is flipped back and forth under it (up to three rounds), and then asks to try again rather than claiming it is done', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(subscribed);
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
+    (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue(false);
+    await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(503);
+    expect(subscriberDb.softUnsubscribe).toHaveBeenCalledTimes(3);
+    expect(subscriberDb.refreshOptOut).toHaveBeenCalledTimes(3);
+
+    jest.clearAllMocks();
+    // refused, row put back, refused again, then the flip lands: the caller gets its own token
+    (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValueOnce(null).mockResolvedValueOnce(null).mockResolvedValueOnce({ ...optedOut });
+    (subscriberDb.refreshOptOut as jest.Mock).mockResolvedValue(false);
+    const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(200);
+    expect(readResubscribeToken(res.body.resubscribeToken)).toMatchObject({ optOutNonce: NONCE });
   });
 
   it('does not touch the opt-out time when the call itself flips the row', async () => {
@@ -161,14 +214,14 @@ describe('POST /api/tasks/:taskId/unsubscribe (public)', () => {
   });
 
   it('an attacker who unsubscribed an address first cannot undo the person\'s own later opt-out: the person\'s call voids the attacker\'s token', async () => {
-    const attackersToken = signResubscribeToken(TASK, EMAIL, UNSUB_AT);
-    // the person unsubscribes after the attacker did: the row is already opted out, so the call refreshes the opt-out time
+    const attackersToken = signResubscribeToken(TASK, EMAIL, NONCE);
+    // the person unsubscribes after the attacker did: the row is already opted out, so the call gives the opt-out a new nonce
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(optedOut);
     (subscriberDb.softUnsubscribe as jest.Mock).mockResolvedValue(null);
     await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(200);
     expect(subscriberDb.refreshOptOut).toHaveBeenCalledTimes(1);
-    // the row now carries a later opt-out time than the attacker's token names
-    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, unsubscribedAt: '2026-02-01T00:05:00.000Z' });
+    // the row now carries a different nonce than the attacker's token names (and the same opt-out time as before)
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, optOutNonce: 'a-new-nonce' });
     await post(`/api/tasks/${TASK}/resubscribe`).send({ email: EMAIL, token: attackersToken }).expect(403);
     expect(subscriberDb.resubscribe).not.toHaveBeenCalled();
   });
@@ -219,10 +272,10 @@ describe('POST /api/tasks/:taskId/unsubscribe (public)', () => {
 });
 
 describe('the per-connection limit on the public unsubscribe and undo calls', () => {
-  it('allows 60 an hour from one connection, then answers 429 and writes nothing more', async () => {
+  it('allows 300 an hour from one connection (a shared office or campus address may hold many people), then answers 429 and writes nothing more', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(undefined);
     const fromOneConnection = () => request(app).post(`/api/tasks/${TASK}/unsubscribe`).set('X-Forwarded-For', '203.0.113.200').send({ email: EMAIL });
-    for (let i = 0; i < 60; i++) expect((await fromOneConnection()).status).toBe(404);
+    for (let i = 0; i < 300; i++) expect((await fromOneConnection()).status).toBe(404);
     const limited = await fromOneConnection();
     expect(limited.status).toBe(429);
     expect(limited.body.message).toMatch(/too many/i);
@@ -236,28 +289,28 @@ describe('POST /api/tasks/:taskId/resubscribe (public)', () => {
 
   it('undoes the unsubscribe with the token for that opt-out', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(optedOut);
-    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, UNSUB_AT) }).expect(200);
+    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, NONCE) }).expect(200);
     // one atomic update that applies only while the row is still opted out by exactly that opt-out
-    expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, EMAIL, { onlyIfUnsubscribedAt: UNSUB_AT });
+    expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, EMAIL, { onlyIfOptOutNonce: NONCE });
   });
 
   it('refuses when the person opted out again between the check and the update (the conditional update does not apply)', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(optedOut);
     (subscriberDb.resubscribe as jest.Mock).mockResolvedValue(null);
-    const res = await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, UNSUB_AT) }).expect(403);
+    const res = await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, NONCE) }).expect(403);
     expect(res.body.message).toMatch(/expired/i);
   });
 
   it('refuses the same address in another letter case: rows are case-sensitive, so the token names one row exactly', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockImplementation(async (_t: string, e: string) => (e === 'Reader@Example.com' ? { ...optedOut, email: e } : e === EMAIL ? subscribed : undefined));
-    const tokenForTheActiveRow = signResubscribeToken(TASK, EMAIL, UNSUB_AT);
+    const tokenForTheActiveRow = signResubscribeToken(TASK, EMAIL, NONCE);
     await resubscribe({ email: 'Reader@Example.com', token: tokenForTheActiveRow }).expect(403);
     expect(subscriberDb.resubscribe).not.toHaveBeenCalled();
   });
 
   it('refuses a replay: once the person has opted out again, the old undo token no longer matches that row', async () => {
-    const oldToken = signResubscribeToken(TASK, EMAIL, UNSUB_AT);
-    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, unsubscribedAt: '2026-03-01T00:00:00.000Z' });
+    const oldToken = signResubscribeToken(TASK, EMAIL, NONCE);
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, optOutNonce: 'nonce-of-a-newer-opt-out' });
     const res = await resubscribe({ email: EMAIL, token: oldToken }).expect(403);
     expect(res.body.message).toMatch(/expired/i);
     expect(subscriberDb.resubscribe).not.toHaveBeenCalled();
@@ -265,24 +318,24 @@ describe('POST /api/tasks/:taskId/resubscribe (public)', () => {
 
   it('refuses a token when the address has already been put back (the opt-out it undoes is over)', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...subscribed, resubscribedAt: '2026-02-02T00:00:00Z' });
-    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, UNSUB_AT) }).expect(403);
+    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, NONCE) }).expect(403);
     expect(subscriberDb.resubscribe).not.toHaveBeenCalled();
   });
 
   it('answers 404 when the row is gone', async () => {
-    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, UNSUB_AT) }).expect(404);
+    await resubscribe({ email: EMAIL, token: signResubscribeToken(TASK, EMAIL, NONCE) }).expect(404);
   });
 
   it.each([
     ['no token', () => undefined],
     ['an empty token', () => ''],
     ['garbage', () => 'not-a-token'],
-    ['a token for another address', () => signResubscribeToken(TASK, 'someone.else@example.com', UNSUB_AT)],
-    ['a token for another task', () => signResubscribeToken('task-2', EMAIL, UNSUB_AT)],
+    ['a token for another address', () => signResubscribeToken(TASK, 'someone.else@example.com', NONCE)],
+    ['a token for another task', () => signResubscribeToken('task-2', EMAIL, NONCE)],
     ['a confirm-subscription token', () => signConfirmToken(TASK, EMAIL)],
-    ['an expired token', () => mint({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, unsubscribedAt: UNSUB_AT }, { expiresIn: -10 })],
-    ['a token signed with the login secret', () => mint({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, unsubscribedAt: UNSUB_AT }, { expiresIn: '1h' }, process.env.JWT_SECRET!)],
-    ['an unsigned token', () => jwt.sign({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, unsubscribedAt: UNSUB_AT }, '', { algorithm: 'none' as any })],
+    ['an expired token', () => mint({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, optOutNonce: NONCE }, { expiresIn: -10 })],
+    ['a token signed with the login secret', () => mint({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, optOutNonce: NONCE }, { expiresIn: '1h' }, process.env.JWT_SECRET!)],
+    ['an unsigned token', () => jwt.sign({ purpose: 'resubscribe', taskId: TASK, email: EMAIL, optOutNonce: NONCE }, '', { algorithm: 'none' as any })],
     ['a token that names no opt-out', () => mint({ purpose: 'resubscribe', taskId: TASK, email: EMAIL })],
     ['a non-string token', () => ({ nested: 'object' }) as any],
   ])('refuses to resubscribe with %s, and changes nothing', async (_name, makeToken) => {
@@ -372,7 +425,7 @@ describe('the confirmation link (public)', () => {
     it('turns an opted-out address back on, under its stored spelling, when the person asked again after opting out', async () => {
       storedSpelling({ unsubscribed: true, unsubscribedAt: new Date(Date.now() - 60_000).toISOString() });
       await confirm(good()).expect(200);
-      expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, 'Reader@Example.com');
+      expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, 'Reader@Example.com', { onlyIfUnsubscribedAt: expect.any(String) });
       expect(subscriberDb.addSubscriber).not.toHaveBeenCalled();
       expect(emailService.sendSubscriberWelcomeEmail).toHaveBeenCalledWith('Reader@Example.com', TASK);
     });
@@ -412,8 +465,18 @@ describe('the confirmation link (public)', () => {
     it('turns an opted-out address back on when the link was sent after the opt-out', async () => {
       (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, unsubscribedAt: new Date(Date.now() - 60_000).toISOString() });
       await confirm(good()).expect(200);
-      expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, EMAIL);
+      // one atomic update that applies only while the row is still opted out at the very time that was just checked
+      const optedOutRow = await (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mock.results[0].value;
+      expect(subscriberDb.resubscribe).toHaveBeenCalledWith(TASK, EMAIL, { onlyIfUnsubscribedAt: optedOutRow.unsubscribedAt });
       expect(emailService.sendSubscriberWelcomeEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not turn mail back on when the person opted out again between the check and the write (the conditional update is refused)', async () => {
+      (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue({ ...optedOut, unsubscribedAt: new Date(Date.now() - 60_000).toISOString() });
+      (subscriberDb.resubscribe as jest.Mock).mockResolvedValue(null);
+      const res = await confirm(good()).expect(400);
+      expect(res.text).toContain('no longer valid');
+      expect(emailService.sendSubscriberWelcomeEmail).not.toHaveBeenCalled();
     });
 
     it('does NOT turn mail back on from a link that was sent before the person unsubscribed (a forwarded email or a rescan)', async () => {
@@ -437,7 +500,7 @@ describe('the confirmation link (public)', () => {
       ['no token', () => undefined],
       ['garbage', () => 'nope'],
       ['an expired token', () => mint({ purpose: 'confirm-subscribe', taskId: TASK, email: EMAIL }, { expiresIn: -10 })],
-      ['a resubscribe token', () => signResubscribeToken(TASK, EMAIL, UNSUB_AT)],
+      ['a resubscribe token', () => signResubscribeToken(TASK, EMAIL, NONCE)],
       ['a token for another task', () => signConfirmToken('task-2', EMAIL)],
       ['a token signed with the login secret', () => mint({ purpose: 'confirm-subscribe', taskId: TASK, email: EMAIL }, { expiresIn: '1h' }, process.env.JWT_SECRET!)],
     ])('shows an expired-link page for %s, and subscribes nobody', async (_name, makeToken) => {
@@ -472,7 +535,7 @@ describe('the confirmation link (public)', () => {
 
 describe('subscriber tokens and login tokens cannot be mixed up', () => {
   it('a subscriber token does not verify as a login token', () => {
-    expect(() => jwt.verify(signResubscribeToken(TASK, EMAIL, UNSUB_AT), process.env.JWT_SECRET!)).toThrow();
+    expect(() => jwt.verify(signResubscribeToken(TASK, EMAIL, NONCE), process.env.JWT_SECRET!)).toThrow();
     expect(() => jwt.verify(signConfirmToken(TASK, EMAIL), process.env.JWT_SECRET!)).toThrow();
   });
 });
