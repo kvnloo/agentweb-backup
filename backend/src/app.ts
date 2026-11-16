@@ -334,6 +334,9 @@ const corsOptions = {
 app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
+      // ENG-2991: the confirmation page's button is a plain form post. The signed link in the email is the credential (no cookie is sent), so
+      // this needs no origin check, and without it the button is refused on any deployment whose address is not on the list above.
+      /^\/api\/tasks\/+[^\/]+\/+subscribers\/+confirm\/*$/i.test(req.path) ||
       req.path.startsWith('/api/lead-magnet/') ||
       // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
       // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
@@ -394,6 +397,24 @@ app.use("/api/track/event", ...trackBodyParser);
 // ENG-2271: Twilio voice callbacks are small flat forms; parse them with a narrow limit first (body-parser
 // skips a body that is already parsed), so the global 50mb extended parser below never sees them.
 app.use("/api/webhooks/twilio-voice", twilioVoiceBodyParser);
+// ENG-2991: the public subscriber calls (join, confirm, unsubscribe, undo) take a short address or a token, and anyone can call them without
+// logging in. Parse them with a narrow limit first (body-parser skips a body that is already parsed), so the global 50mb parser below never
+// buffers a large body for a request that nothing has limited yet. The routers match paths in any letter case, with a trailing slash and with
+// a doubled slash after the mount path (`/api/tasks//<id>/unsubscribe`), so these patterns do too. The unsubscribe call gets more room because its feedback note is cut to 2000 characters by the route, not refused.
+const publicSubscriberBody = (limit: string) => [
+  express.json({ limit }),
+  express.urlencoded({ limit, extended: false }),
+  // A body that is too large or not valid is the caller's mistake: answer it here, plainly, by its status, instead of letting the global
+  // handler below report every one of these anonymous requests as a server error.
+  (err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const status = Number(err?.status ?? err?.statusCode);
+    if (!(status >= 400 && status < 500)) return next(err);
+    if (err?.type === "request.aborted" || res.headersSent) return undefined; // the caller went away: nothing to answer
+    return res.status(status === 413 ? 413 : 400).json({ message: status === 413 ? "Request too large" : "Invalid request" });
+  },
+];
+app.use(/^\/api\/tasks\/+[^\/]+\/+(?:subscribers\/+(?:join|confirm)|resubscribe)\/*$/i, ...publicSubscriberBody("8kb"));
+app.use(/^\/api\/tasks\/+[^\/]+\/+unsubscribe\/*$/i, ...publicSubscriberBody("32kb"));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 

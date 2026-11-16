@@ -2,7 +2,7 @@ import express, { Request, RequestHandler, Response } from 'express';
 import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import rateLimit from 'express-rate-limit';
 import { signConfirmToken, signResubscribeToken, readConfirmToken, readResubscribeToken } from '../services/subscriberTokens';
-import { parseSignupEmail, isStoredEmail, reserveJoinConfirmation, renderConfirmPage } from '../services/subscriberSignup';
+import { parseSignupEmail, isStoredEmail, reserveJoinConfirmation, renderConfirmPage, tryBeginJoinSend } from '../services/subscriberSignup';
 import { findSubscriberAnyCase, forgetSubscriberLookup } from '../services/subscriberLookup';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
@@ -147,8 +147,17 @@ interface ResultFile extends MarketingActionCarrier {
 router.get('/execution/:executionId/token/:token', getExecutionWithToken);
 router.get('/:id/executions/:executionId/log', getExecutionLog);
 router.get('/:id/executions/:executionId/public', getTaskExecutionPublic);
+// The public status check answers for any task id and address: slow down anyone walking through them (the unsubscribe page makes one call).
+const statusIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests from this connection. Please try again later.' },
+});
+
 // Check subscriber status (public - no authentication required)
-router.get('/:taskId/subscribers/:email/status', async (req, res) => {
+router.get('/:taskId/subscribers/:email/status', statusIpLimiter, async (req, res) => {
   try {
     const { taskId, email } = req.params;
     
@@ -184,10 +193,12 @@ router.get('/:id/name', async (req, res) => {
   }
 });
 
-// Public unsubscribe/undo calls write to a table anyone can name an address in: bound what one connection can do.
+// Public unsubscribe/undo calls write to a table anyone can name an address in: bound what one connection can do. The limit is generous
+// because a shared address (an office, a campus, a mobile network) can legitimately hold many people opting out in the same hour, and one
+// counter covers both calls and every task.
 const optOutIpLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  limit: 60,
+  limit: 300,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many requests from this connection. Please try again later.' },
@@ -213,16 +224,38 @@ router.post('/:taskId/unsubscribe', optOutIpLimiter, async (req, res) => {
     // ENG-2991: the undo token is what lets someone switch mail back on, so it goes only to the caller whose request really changes the row
     // from subscribed to unsubscribed (one atomic update). Repeating the call for an address that has already opted out, or racing a
     // person's own unsubscribe, gets no token.
-    const updated = await subscriberDb.softUnsubscribe(taskId, email, typeof feedback === 'string' ? feedback.slice(0, 2000) : undefined, { onlyIfActive: true });
-    if (!updated?.unsubscribedAt) {
-      // Already opted out. Give the opt-out a new time, which voids any undo token that was handed out for the earlier one: someone who
-      // unsubscribed this address just before the person did must not keep a token that undoes the person's own opt-out.
-      await subscriberDb.refreshOptOut(taskId, email);
-      return res.json({ message: 'Already unsubscribed' });
+    const unsubscribeIfActive = () => subscriberDb.softUnsubscribe(taskId, email, typeof feedback === 'string' ? feedback.slice(0, 2000) : undefined, { onlyIfActive: true });
+    let updated: any = null;
+    for (let attempt = 0; attempt < 3 && !updated; attempt++) {
+      updated = await unsubscribeIfActive();
+      if (updated) break;
+      // Already opted out. Give the opt-out a new nonce, which voids any undo token that was handed out for the earlier one: someone who
+      // unsubscribed this address just before the person did must not keep a token that undoes the person's own opt-out. The time of the
+      // opt-out is left alone (it is the record, and the rule for confirmation links depends on it). If the refresh cannot be made the caller
+      // is told to try again (it can be repeated safely): answering "done" would leave the earlier token alive.
+      let refreshed: boolean;
+      try {
+        refreshed = await subscriberDb.refreshOptOut(taskId, email);
+      } catch (refreshError: any) {
+        console.error('Could not refresh an existing opt-out:', refreshError?.code || refreshError?.name || 'error');
+        return res.status(503).json({ message: 'Something went wrong. Please try again.' });
+      }
+      if (refreshed) return res.json({ message: 'Already unsubscribed' });
+      // Not opted out any more, or gone. If the owner removed the address in the meantime there is nothing to unsubscribe.
+      if (!(await subscriberDb.getTaskSubscriberByEmail(taskId, email, true))) {
+        return res.status(404).json({ message: 'Subscriber not found for this task' });
+      }
+      // It was put back to subscribed in between: this person asked to unsubscribe, so try that again.
+    }
+    if (!updated) {
+      return res.status(503).json({ message: 'Something went wrong. Please try again.' });
+    }
+    if (typeof updated.optOutNonce !== 'string' || !updated.optOutNonce) {
+      return res.json({ message: 'Successfully unsubscribed' });
     }
     // The unsubscribe page's "undo" needs this token. It is tied to this opt-out and this exact address, so it stops working once the person
     // opts out again or has been put back.
-    res.json({ message: 'Successfully unsubscribed', resubscribeToken: signResubscribeToken(taskId, email, updated.unsubscribedAt) });
+    res.json({ message: 'Successfully unsubscribed', resubscribeToken: signResubscribeToken(taskId, email, updated.optOutNonce) });
   } catch (error: any) {
     console.error('Error unsubscribing:', error);
     res.status(500).json({ message: 'Something went wrong. Please try again.' });
@@ -247,18 +280,18 @@ router.post('/:taskId/resubscribe', optOutIpLimiter, async (req, res) => {
       return expired();
     }
 
-    // The row must still be opted out by the very opt-out the token was issued for (an address that has been put back, or opted out again
-    // since, no longer matches).
+    // The row must still be opted out by the very opt-out the token was issued for (an address that has been put back, opted out again, or
+    // opted out again by a repeat call since, no longer carries that nonce).
     const subscriber = await subscriberDb.getTaskSubscriberByEmail(taskId, email, true);
     if (!subscriber) {
       return res.status(404).json({ message: 'Subscriber not found for this task' });
     }
-    if (subscriber.unsubscribed !== true || subscriber.unsubscribedAt !== claim.unsubscribedAt) {
+    if (subscriber.unsubscribed !== true || subscriber.optOutNonce !== claim.optOutNonce) {
       return expired();
     }
 
     // One atomic step: it applies only while the row is still opted out by exactly the opt-out this token undoes.
-    const done = await subscriberDb.resubscribe(taskId, email, { onlyIfUnsubscribedAt: claim.unsubscribedAt });
+    const done = await subscriberDb.resubscribe(taskId, email, { onlyIfOptOutNonce: claim.optOutNonce });
     if (!done) {
       return expired();
     }
@@ -325,7 +358,7 @@ router.post('/:taskId/subscribers/confirm', async (req, res) => {
     // address in any letter case (an older sign-up, or an import), so the person is not added a second time under another spelling.
     let existing = await subscriberDb.getTaskSubscriberByEmail(taskId, claim.email, true);
     if (!existing) {
-      // The address list is read once for everyone who asks within 30 seconds, with only the fields needed (see services/subscriberLookup.ts),
+      // The address list is read once for everyone who asks within 10 seconds, with only the fields needed (see services/subscriberLookup.ts),
       // and the matching row is then read again so what is decided below is not based on the cached copy.
       const sameAddress = await findSubscriberAnyCase(taskId, claim.email);
       if (sameAddress) existing = await subscriberDb.getTaskSubscriberByEmail(taskId, sameAddress.email, true);
@@ -346,7 +379,15 @@ router.post('/:taskId/subscribers/confirm', async (req, res) => {
         if (!/already subscribed|already in the subscriber list/i.test(String(e?.message))) throw e;
       }
     } else if (existing.unsubscribed) {
-      await subscriberDb.resubscribe(taskId, existing.email);
+      // One atomic step that applies only while the row is still opted out at the time just checked: a person who opts out again between the
+      // check above and this write is not switched back on.
+      const switchedOn = await subscriberDb.resubscribe(taskId, existing.email, { onlyIfUnsubscribedAt: existing.unsubscribedAt });
+      if (!switchedOn) {
+        return sendConfirmPage(res, 400, renderConfirmPage({
+          title: 'This link is no longer valid',
+          message: 'You unsubscribed after this link was sent. To receive updates again, use the sign-up form.',
+        }));
+      }
       changed = true;
     }
     if (changed) {
@@ -396,22 +437,43 @@ router.post('/:taskId/subscribers/join', cors({
     if (!alreadyActive) {
       const base = (process.env.BACKEND_URL || 'https://api.agentweb.pro').replace(/\/+$/, '');
       const confirmUrl = `${base}/api/tasks/${encodeURIComponent(taskId)}/subscribers/confirm?token=${encodeURIComponent(signConfirmToken(taskId, email))}`;
-      const reservation = reserveJoinConfirmation(taskId, email, task.userId ? String(task.userId) : `no-owner:${taskId}`);
-      if (!reservation.ok) {
+      const endSend = tryBeginJoinSend();
+      let reservation: ReturnType<typeof reserveJoinConfirmation> | null = null;
+      if (endSend) {
+        try {
+          reservation = reserveJoinConfirmation(taskId, email, task.userId ? String(task.userId) : `no-owner:${taskId}`);
+        } catch (reserveError) {
+          endSend(); // the place in the mail queue must not be lost if the limiter itself fails
+          throw reserveError;
+        }
+      }
+      if (!endSend) {
+        // The outgoing mail queue already holds as many confirmations as one burst may take: say so, nothing was reserved.
+        return res.status(429).json({ message: 'This form is getting a lot of sign-ups right now. Please try again in a little while.' });
+      }
+      if (!reservation || !reservation.ok) {
+        endSend();
         // A limit on this one address answers like any sign-up, so the limit itself does not reveal who is subscribed; a limit on the whole
         // form says to try later, so nobody waits for mail that was never sent. (/status and /unsubscribe already tell anyone who knows a task id
         // and an address whether it is subscribed, so this is no new exposure.)
-        if (reservation.visible) {
+        if (reservation && reservation.visible) {
           return res.status(429).json({ message: 'This form is getting a lot of sign-ups right now. Please try again in a little while.' });
         }
       } else {
         // If the email could not be sent, give the person's slot back so they can try again straight away.
         emailService.sendSubscriberConfirmationEmail(email, taskId, confirmUrl)
-          .then((sent) => { if (!sent) reservation.release(); })
+          .then((sent) => {
+            if (!sent) {
+              reservation.release();
+              // The person was told to check their email: say in the log that nothing went out, so an owner whose sign-ups vanish can be found.
+              console.warn(JSON.stringify({ event: 'subscriber_join_confirmation_not_sent', taskId }));
+            }
+          })
           .catch((emailError) => {
             reservation.release();
-            console.error('Failed to send subscription confirmation email:', emailError);
-          });
+            console.error('Failed to send subscription confirmation email:', emailError?.statusCode || emailError?.name || 'error');
+          })
+          .finally(endSend);
       }
     }
 
@@ -838,6 +900,7 @@ router.post('/:taskId/subscribers/batch', authenticateToken, async (req, res) =>
 
     // Process batch upload
     const results = await subscriberDb.batchAddSubscribers(taskId, subscribers);
+    forgetSubscriberLookup(taskId);
     
     res.json({
       successCount: results.successCount,
@@ -980,6 +1043,7 @@ router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
     }
 
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    forgetSubscriberLookup(taskId);
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
@@ -1002,6 +1066,7 @@ router.delete('/:taskId/subscribers/:email', async (req, res) => {
     }
 
     await subscriberDb.removeSubscriber(taskId, email);
+    forgetSubscriberLookup(taskId);
     res.status(204).send();
   } catch (error: any) {
     console.error('Error removing subscriber:', error);

@@ -5,8 +5,9 @@
  *    the person confirms from the link). Bound to the task and the lower-cased address, and to when it was issued.
  *  - `resubscribe`: handed back by the unsubscribe call, so the "undo" on the unsubscribe page works for the person who just unsubscribed and
  *    cannot be used by anyone else to re-enable mail to an address that opted out. Bound to the task, the address exactly as stored (rows are
- *    case-sensitive, so `A@x.com` and `a@x.com` are different rows) and the opt-out it undoes (`unsubscribedAt`): once the person opts out
- *    again, or has been put back, an old token no longer matches the row.
+ *    case-sensitive, so `A@x.com` and `a@x.com` are different rows) and the random `optOutNonce` the unsubscribe wrote on the row: a repeat
+ *    unsubscribe, a new opt-out, or being put back changes or ends it, so an old token no longer matches the row. (The nonce, not the opt-out
+ *    time, because the time is the record of when the person opted out and a rule about confirmation links depends on it.)
  * Each token expires. They are signed with a key derived (HMAC) from the app's JWT secret but different from it, so a subscriber link can
  * never be accepted as a login token, nor a login token as a subscriber link.
  */
@@ -46,22 +47,22 @@ export function readConfirmToken(token: unknown): { taskId: string; email: strin
   }
 }
 
-/** The undo token for one opt-out: `unsubscribedAt` is the time the row was marked unsubscribed, as stored. */
-export function signResubscribeToken(taskId: string, email: string, unsubscribedAt: string): string {
-  return jwt.sign({ purpose: 'resubscribe', taskId: String(taskId), email: String(email), unsubscribedAt: String(unsubscribedAt) }, subscriberTokenKey(), {
+/** The undo token for one opt-out: `optOutNonce` is the nonce the unsubscribe wrote on the row, as stored. */
+export function signResubscribeToken(taskId: string, email: string, optOutNonce: string): string {
+  return jwt.sign({ purpose: 'resubscribe', taskId: String(taskId), email: String(email), optOutNonce: String(optOutNonce) }, subscriberTokenKey(), {
     algorithm: 'HS256',
     expiresIn: RESUBSCRIBE_TTL as any,
   });
 }
 
 /** What an undo token was minted for, or null when it is invalid, expired or not an undo token. */
-export function readResubscribeToken(token: unknown): { taskId: string; email: string; unsubscribedAt: string } | null {
+export function readResubscribeToken(token: unknown): { taskId: string; email: string; optOutNonce: string } | null {
   if (typeof token !== 'string' || !token) return null;
   try {
     const decoded = jwt.verify(token, subscriberTokenKey(), { algorithms: ['HS256'] }) as any;
     if (decoded?.purpose !== 'resubscribe') return null;
-    if (typeof decoded.taskId !== 'string' || typeof decoded.email !== 'string' || typeof decoded.unsubscribedAt !== 'string' || !decoded.unsubscribedAt) return null;
-    return { taskId: decoded.taskId, email: decoded.email, unsubscribedAt: decoded.unsubscribedAt };
+    if (typeof decoded.taskId !== 'string' || typeof decoded.email !== 'string' || typeof decoded.optOutNonce !== 'string' || !decoded.optOutNonce) return null;
+    return { taskId: decoded.taskId, email: decoded.email, optOutNonce: decoded.optOutNonce };
   } catch {
     return null;
   }
