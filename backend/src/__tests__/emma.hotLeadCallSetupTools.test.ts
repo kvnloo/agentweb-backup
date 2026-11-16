@@ -1206,9 +1206,20 @@ describe('hot lead calls add-on (ENG-2783)', () => {
   it('asks nothing extra and buys nothing when the add-on is already active', async () => {
     org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: '2026-11-13T00:00:00.000Z' };
     const halt = await call();
-    expect(card(halt).question).toContain('per minute');
+    // The wording follows the billing model, not whether a purchase is needed: no per-minute terms, no new charge.
+    expect(card(halt).question).toContain('already covers these calls');
+    expect(card(halt).question).not.toContain('per minute');
+    expect(JSON.stringify(card(halt).options)).not.toContain('Adds the add-on');
     answerCard(recordHalt(halt), 'approve');
     await call();
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+  });
+  it('an approval given while the add-on was active does not authorize buying it if it lapses before the answer', async () => {
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: '2026-11-13T00:00:00.000Z' };
+    answerCard(recordHalt(await call()), 'approve'); // card said: already covered
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'canceled', updatedAt: '2026-11-13T01:00:00.000Z' };
+    const halt = await call();                        // now a purchase is needed: a new card, nothing bought
+    expect(card(halt).question).toContain('This costs');
     expect(addHotLeadCallBilling).not.toHaveBeenCalled();
   });
   it('the number card says the rent is part of the $70 price', async () => {
