@@ -35,6 +35,7 @@ import { validateZomaToken, ZOMA_TOKEN_PREFIX } from './zomaDeviceFlow';
 import { isMetaHealthTool, runMetaHealthTool } from './metaToolkitHealth';
 import { isMetaCatalogTool, runMetaCatalogTool } from './metaToolkitCatalogs';
 import { EXPERIMENT_WRITE_KIND, isMetaExperimentWrite, isMetaExperimentWriteTool, runMetaExperimentWriteTool } from './metaToolkitExperimentWrites';
+import { MetaToolkitForbidden } from './metaToolkitErrors';
 import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite, runMetaEventSourceTool } from './metaToolkitEventSources';
 import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
@@ -452,7 +453,9 @@ export async function handleMetaToolkitCall(
 
   // ENG-2927: catalog event sources (reads + preview-confirmed connect/disconnect).
   if (isMetaEventSourceTool(request.toolName)) {
-    const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args);
+    const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args)
+      // ENG-3060: an object outside the selected account is a 403, not a 400 argument error.
+      .catch((error: unknown) => { throw error instanceof MetaToolkitForbidden ? new MetaToolkitAuthError(error.message, 403) : error; });
     const kind = EVENT_SOURCE_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
     await meter('meta');

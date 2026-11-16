@@ -15823,8 +15823,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   ): Promise<any> {
     // ENG-2927: a catalog's external_event_sources edge (connect = POST, disconnect = DELETE).
     // ENG-2926: business owned_product_catalogs (catalog create), a catalog's product_feeds, a feed's uploads / rules.
-    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules))?$/ : /^\d+(\/external_event_sources)?$/;
+    // ENG-3060: a dataset's events edge, for a Conversions API TEST event only. A send without
+    // test_event_code would be a production conversion, so it is refused here as well as in the tool.
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules|events))?$/ : /^\d+(\/external_event_sources)?$/;
     if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
+    if (path.endsWith('/events') && !String(params.test_event_code ?? '').trim()) throw new Error('A Conversions API send requires test_event_code.');
     const { accessToken } = await this.getMetaCredentials(userId, account_id);
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     try {
