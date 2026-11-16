@@ -703,7 +703,14 @@ export function detectFalseCompletionClaim(
       const afterEnd = Math.min(content.length, afterStart + 256);
       const after = (content.slice(afterStart, afterEnd) + (afterEnd < content.length ? 'x' : '')).split(/[.!?\n]/)[0];
       const producedBefore = /\b(?:generated|created|rendered|delivered|produced|exported|saved)\s*$/i.test(before);
-      const producedAfter = /^\s*(?:(?:have|has)\s+been\s+|(?:were|was|are|is)\s+)?(?:successfully\s+)?(?:generated|created|rendered|delivered|produced|exported|saved)(?:\s+successfully)?(?=\s*(?:$|[,;]|and\b|for\b))/i.test(after)
+      // The verb may end the sentence, introduce a list ("generated:"), or point
+      // at one ("generated below"). "are ready" / "are done" claim the same thing
+      // with no production verb at all.
+      const verbAfter = /^\s*(?:(?:have|has)\s+been\s+|(?:were|was|are|is)\s+)?(?:successfully\s+)?(generated|created|rendered|delivered|produced|exported|saved)(?:\s+successfully)?(?=\s*(?:$|[,;:]|and\b|for\b|below\b|above\b|here\b))/i.exec(after);
+      // "4 of 4 ads delivered" is Meta delivery status, not an asset this turn made.
+      const adDelivery = !!verbAfter && verbAfter[1].toLowerCase() === 'delivered' && /\b(?:ads?|campaigns?|ad\s+sets?)$/i.test(match[0]);
+      const producedAfter = (!!verbAfter && !adDelivery)
+        || /^\s*(?:(?:have|has)\s+been\s+|(?:were|was|are|is)\s+)(?:all\s+)?(?:now\s+)?(?:ready|done|complete|completed|finished|attached)\b/i.test(after)
         || /^\s+for\b[^.!?\n]{0,120}\b(?:were|was|have been)\s+(?:generated|created|rendered|delivered|produced|exported|saved)\b/i.test(after);
       if (!producedBefore && !producedAfter) continue;
       const n = parseInt(match[1], 10);

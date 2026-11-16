@@ -380,6 +380,22 @@ describe('detectFalseCompletionClaim', () => {
   ])('verifies the production-verb success suffix: %s', content => {
     expect(detectFalseCompletionClaim(content, [])).toEqual({ claimed: 12, actual: 0 });
   });
+  // Opslane run 156 on #2963: main corrects each of these; the production
+  // predicate must not lose them.
+  it.each([
+    ['All 6 sizes are ready below.', 6],
+    ['All 4 images generated:\n- one\n- two\n- three\n- four', 4],
+    ['All 6 sizes generated below.', 6],
+    ['All 6 sizes are done.', 6],
+  ])('still verifies a production claim that points at a list or says ready: %s', (content, claimed) => {
+    expect(detectFalseCompletionClaim(content, [{ name: 'create_html_file', result: { success: false } }])).toEqual({ claimed, actual: 0 });
+  });
+  it.each([
+    'All 4 ads generated leads this week. 4 of 4 ads delivered.',
+    '4 of 4 ads delivered impressions this week.',
+  ])('does not read ad delivery as asset production after a failed asset tool: %s', content => {
+    expect(detectFalseCompletionClaim(content, [{ name: 'create_html_file', result: { success: false } }])).toBeNull();
+  });
   it('scans a large read-only analysis without quadratic predicate rescanning', () => {
     const content = 'All 4 ads generated leads in this reporting window. '.repeat(20_000);
     const started = performance.now();
