@@ -54,7 +54,6 @@ jest.mock('../../services/generateMarketingResponseWorkerService', () => ({
 // suite in __tests__/agentModeController.ishareUsageGate.test.ts).
 jest.mock('../../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, percentUsed: 0 }),
-  incrementUserTokenUsage: jest.fn(),
 }));
 
 // Mock the User type
