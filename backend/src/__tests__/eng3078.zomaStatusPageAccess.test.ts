@@ -63,9 +63,10 @@ const status = (d: ZomaOnboardingDeps): Promise<any> => runZomaTool('zoma_status
 // ENG-3127: the Page step leads with the fact that reads still work.
 const READS_OK = 'Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:\n';
 /** ENG-3125: the ENG-3127 lead, the canonical message verbatim and exactly once, then the guided fix steps. */
-const expectPageStep = (nextStep: string, message: string) => {
-  expect(nextStep.startsWith(`${READS_OK}${message}\n\nTo fix it:\n1. `)).toBe(true);
-  expect(nextStep.split(message).length).toBe(2);
+const expectPageStep = (nextStep: string | null, message: string) => {
+  expect(typeof nextStep).toBe('string');
+  expect(nextStep!.startsWith(`${READS_OK}${message}\n\nTo fix it:\n1. `)).toBe(true);
+  expect(nextStep!.split(message).length).toBe(2);
 };
 
 describe('ENG-3078 zoma_status and Facebook Page access', () => {
