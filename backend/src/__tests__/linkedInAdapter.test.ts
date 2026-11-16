@@ -156,6 +156,18 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
+    it('ENG-3003: does not publish text-only when an image fails to upload', async () => {
+      mockLinkedInService.uploadMediaFromUrl
+        .mockResolvedValueOnce('urn:li:image:1')
+        .mockRejectedValueOnce(new Error('Could not download the media_url (HTTP 404).'));
+      const result = await adapter.createPost(
+        mockCompanyAccount, 'Photos', ['https://cdn.example.com/a.png', 'https://cdn.example.com/b.png'], 'user-1',
+      );
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/image failed to upload[\s\S]*HTTP 404[\s\S]*Nothing was posted/);
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
     it('ENG-3003: still uploads image media_urls', async () => {
       mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:1');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:1');

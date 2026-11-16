@@ -180,26 +180,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Get valid token (refreshes if expired)
       const { token, isFresh } = await this.getValidToken(account, userId);
 
-      // Upload images if provided - track failures for transparency
+      // Every attachment must upload: a post published without the media the caller approved cannot be taken back.
       let imageUrns: string[] = [];
-      let failedImageUploads: { url: string; error: string }[] = [];
-      
+
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
             const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadMediaFromUrl(token, authorUrn, url));
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
-            // The same token will be refused for the post itself; do not publish it without the image.
             if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
-            // Publishing the text without the media the caller asked for would be a silent downgrade.
             if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
             const errorMsg = uploadError?.message || 'Unknown upload error';
-            if (uploadError?.isVideoUpload || isVideoUrl(url)) {
-              return { success: false, message: `The video failed to upload to LinkedIn (${errorMsg}). Nothing was posted.` };
-            }
-            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
-            failedImageUploads.push({ url, error: errorMsg });
+            console.error(`[LinkedInAdapter] Failed to upload media ${url}:`, errorMsg);
+            const what = uploadError?.isVideoUpload || isVideoUrl(url) ? 'video' : 'image';
+            return { success: false, message: `The ${what} failed to upload to LinkedIn (${errorMsg}). Nothing was posted.` };
           }
         }
       }
@@ -263,12 +258,6 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };
-      
-      // Add warning if some images failed to upload
-      if (failedImageUploads.length > 0) {
-        result.warning = `${failedImageUploads.length} image(s) failed to upload: ${failedImageUploads.map(f => f.url).join(', ')}`;
-        result.failedUploads = failedImageUploads;
-      }
       
       return result;
     } catch (error: any) {
