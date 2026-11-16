@@ -15,7 +15,7 @@ jest.mock('../services/linkedInService', () => ({
     getAggregatedMetrics: jest.fn(),
     verifyToken: jest.fn(),
     refreshAccessToken: jest.fn(),
-    uploadImageFromUrl: jest.fn(),
+    uploadMediaFromUrl: jest.fn(),
     getPersonalPostAnalytics: jest.fn(),
     getPersonalFollowerCount: jest.fn(),
   },
@@ -48,7 +48,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { linkedInService } from '../services/linkedInService';
-import { LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE } from '../services/linkedInMedia';
+import { LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_FORMAT_MESSAGE } from '../services/linkedInMedia';
 import { ConnectedAccount, updateAccountTokens } from '../services/connectedAccountsDb';
 import * as linkedInPostsDb from '../services/linkedInPostsDb';
 const mockPostsDb = linkedInPostsDb as jest.Mocked<typeof linkedInPostsDb>;
@@ -99,31 +99,61 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('createPost', () => {
-    it('ENG-3003: refuses video media_urls instead of sending them through the image pipeline', async () => {
+    it('ENG-3116: posts a single video through the media upload and says "video", not "image(s)"', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:video:C5505AQH');
+      mockLinkedInService.createPost.mockResolvedValue('urn:li:share:vid1');
       const result = await adapter.createPost(
         mockCompanyAccount, 'Event recap', ['https://cdn.example.com/clips/event.MP4?X-Amz-Signature=abc'], 'user-1',
       );
+      expect(result.success).toBe(true);
+      expect(result.message).toBe('Posted successfully on LinkedIn with 1 video');
+      expect(mockLinkedInService.createPost.mock.calls[0][3]).toEqual(['urn:li:video:C5505AQH']);
+    });
+
+    it('ENG-3116: refuses a video mixed with other media before uploading anything', async () => {
+      const result = await adapter.createPost(
+        mockCompanyAccount, 'Mix', ['https://cdn.example.com/a.png', 'https://cdn.example.com/b.mp4'], 'user-1',
+      );
       expect(result.success).toBe(false);
-      expect(result.message).toMatch(/video/i);
       expect(result.message).toMatch(/nothing was posted/i);
-      expect(mockLinkedInService.uploadImageFromUrl).not.toHaveBeenCalled();
+      expect(mockLinkedInService.uploadMediaFromUrl).not.toHaveBeenCalled();
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
-    it('ENG-3003: refuses instead of posting text-only when the upload step finds the media is a video', async () => {
-      mockLinkedInService.uploadImageFromUrl.mockRejectedValue(new LinkedInUnsupportedMediaError(LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE));
+    it('ENG-3116: refuses a mix that only the downloaded bytes reveal (extensionless video + image)', async () => {
+      mockLinkedInService.uploadMediaFromUrl
+        .mockResolvedValueOnce('urn:li:image:1')
+        .mockResolvedValueOnce('urn:li:video:2');
+      const result = await adapter.createPost(
+        mockCompanyAccount, 'Mix', ['https://cdn.example.com/asset/1', 'https://cdn.example.com/asset/2'], 'user-1',
+      );
+      expect(result.success).toBe(false);
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3003: refuses instead of posting text-only when the media is rejected as unsupported', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(new LinkedInUnsupportedMediaError(LINKEDIN_VIDEO_FORMAT_MESSAGE));
       const result = await adapter.createPost(mockCompanyAccount, 'Event recap', ['https://cdn.example.com/asset/9f3a'], 'user-1');
       expect(result.success).toBe(false);
       expect(result.message).toMatch(/nothing was posted/i);
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
+    it('ENG-3116: does not publish text-only when a video upload fails for any reason', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(new Error('LinkedIn Error: boom'));
+      const result = await adapter.createPost(mockCompanyAccount, 'Event recap', ['https://cdn.example.com/clip.mp4'], 'user-1');
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/video failed to upload/i);
+      expect(result.message).toMatch(/nothing was posted/i);
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
     it('ENG-3003: still uploads image media_urls', async () => {
-      mockLinkedInService.uploadImageFromUrl.mockResolvedValue('urn:li:image:1');
+      mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:1');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:1');
       const result = await adapter.createPost(mockCompanyAccount, 'Photo', ['https://cdn.example.com/a.png'], 'user-1');
       expect(result.success).toBe(true);
-      expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(1);
+      expect(mockLinkedInService.uploadMediaFromUrl).toHaveBeenCalledTimes(1);
     });
 
     it('ENG-428: draft mode passes draft option, skips posts cache, claims no public URL', async () => {
@@ -182,7 +212,7 @@ describe('LinkedInAdapter', () => {
           config: { ...mockCompanyAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
         } as any;
         mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-org-token', expires_in: 5184000 });
-        mockLinkedInService.uploadImageFromUrl
+        mockLinkedInService.uploadMediaFromUrl
           .mockRejectedValueOnce(new Error('LinkedIn access token expired or invalid'))
           .mockResolvedValueOnce('urn:li:image:123');
         mockLinkedInService.createPost.mockResolvedValue('urn:li:share:333444');
@@ -193,7 +223,7 @@ describe('LinkedInAdapter', () => {
 
         expect(result.success).toBe(true);
         expect(result.failedUploads).toBeUndefined();
-        expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(2);
+        expect(mockLinkedInService.uploadMediaFromUrl).toHaveBeenCalledTimes(2);
         expect(mockLinkedInService.createPost).toHaveBeenCalledWith(
           'fresh-org-token', 'urn:li:organization:123456', 'Post with image', ['urn:li:image:123'], undefined
         );
@@ -210,7 +240,7 @@ describe('LinkedInAdapter', () => {
           config: { ...mockCompanyAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
         } as any;
         mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-org-token', expires_in: 5184000 });
-        mockLinkedInService.uploadImageFromUrl.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+        mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
 
         const pending = adapter.createPost(expired, 'Post with image', ['https://example.com/a.png', 'https://example.com/b.png']).catch((e) => e);
         await jest.advanceTimersByTimeAsync(11000);
@@ -218,7 +248,7 @@ describe('LinkedInAdapter', () => {
 
         expect(err.name).toBe('FreshTokenRejectedError');
         expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
-        expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(2);
+        expect(mockLinkedInService.uploadMediaFromUrl).toHaveBeenCalledTimes(2);
       } finally {
         jest.useRealTimers();
       }
@@ -244,7 +274,7 @@ describe('LinkedInAdapter', () => {
     });
 
     it('should create a post with images for company account', async () => {
-      mockLinkedInService.uploadImageFromUrl.mockResolvedValue('urn:li:image:123');
+      mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:123');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:333444');
 
       const result = await adapter.createPost(
@@ -253,7 +283,7 @@ describe('LinkedInAdapter', () => {
         ['https://example.com/image1.png']
       );
 
-      expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledWith(
+      expect(mockLinkedInService.uploadMediaFromUrl).toHaveBeenCalledWith(
         'test-org-token',
         'urn:li:organization:123456',
         'https://example.com/image1.png'
@@ -955,7 +985,7 @@ describe('LinkedInAdapter', () => {
 
     it('should store mediaUrls in database when images provided', async () => {
       // Arrange
-      mockLinkedInService.uploadImageFromUrl.mockResolvedValue('urn:li:image:123');
+      mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:123');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:with-image');
       mockPostsDb.createPost.mockResolvedValue({} as any);
 
