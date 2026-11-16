@@ -10,7 +10,9 @@
 #   EB_ENVIRONMENT_NAME=<staging env> bash .github/scripts/staging-env-override.sh show
 #
 # Safety:
-#   - Refuses any environment whose name does not contain "staging".
+#   - Runs only when EB_ENVIRONMENT_NAME is exactly the backend staging
+#     environment name. Production is refused by exact name, and so is every
+#     other name (ENG-3087; a substring test used to refuse real staging).
 #   - Only keys in ALLOWED_KEYS may be set or removed (no secrets, no infra).
 #   - `restore` REMOVES the override so the code default applies again.
 #   - Each set/restore waits for the env to return to Ready (EB restarts the
@@ -21,7 +23,7 @@
 set -euo pipefail
 
 AWS_CMD="${AWS_CMD:-aws}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-us-west-2}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-900}"
 WAIT_INTERVAL_SECONDS="${WAIT_INTERVAL_SECONDS:-15}"
 NAMESPACE="aws:elasticbeanstalk:application:environment"
@@ -39,11 +41,19 @@ is_allowed() {
   return 1
 }
 
+# ENG-3087: the environment is matched by exact name. These are constants on
+# purpose: no caller-supplied variable can widen the guard. If an environment is
+# renamed, change the name here and in staging-env-override.test.sh.
+#   staging    = `staging` environment variable EB_BACKEND_STAGING_ENVIRONMENT_NAME
+#   production = `prod` environment variable EB_BACKEND_ENVIRONMENT_NAME
+readonly STAGING_ENVIRONMENT_NAME="Agentweb-backend-env-1"
+readonly PRODUCTION_ENVIRONMENT_NAME="Agentweb-backend-env-prod-3"
+
 ENV_NAME="${EB_ENVIRONMENT_NAME:-}"
 [[ -n "$ENV_NAME" ]] || die "EB_ENVIRONMENT_NAME is required"
-shopt -s nocasematch
-[[ "$ENV_NAME" == *staging* ]] || die "refusing non-staging environment '$ENV_NAME'"
-shopt -u nocasematch
+[[ "$ENV_NAME" != "$PRODUCTION_ENVIRONMENT_NAME" ]] || die "refusing the production environment '$ENV_NAME'"
+[[ "$ENV_NAME" == "$STAGING_ENVIRONMENT_NAME" ]] \
+  || die "refusing '$ENV_NAME': the only environment this script touches is '$STAGING_ENVIRONMENT_NAME'"
 
 wait_ready() {
   local deadline=$(( SECONDS + WAIT_TIMEOUT_SECONDS )) status
