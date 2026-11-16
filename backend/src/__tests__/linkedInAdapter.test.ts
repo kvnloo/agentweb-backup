@@ -48,6 +48,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { linkedInService } from '../services/linkedInService';
+import { LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE } from '../services/linkedInMedia';
 import { ConnectedAccount, updateAccountTokens } from '../services/connectedAccountsDb';
 import * as linkedInPostsDb from '../services/linkedInPostsDb';
 const mockPostsDb = linkedInPostsDb as jest.Mocked<typeof linkedInPostsDb>;
@@ -106,6 +107,14 @@ describe('LinkedInAdapter', () => {
       expect(result.message).toMatch(/video/i);
       expect(result.message).toMatch(/nothing was posted/i);
       expect(mockLinkedInService.uploadImageFromUrl).not.toHaveBeenCalled();
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3003: refuses instead of posting text-only when the upload step finds the media is a video', async () => {
+      mockLinkedInService.uploadImageFromUrl.mockRejectedValue(new LinkedInUnsupportedMediaError(LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE));
+      const result = await adapter.createPost(mockCompanyAccount, 'Event recap', ['https://cdn.example.com/asset/9f3a'], 'user-1');
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/nothing was posted/i);
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
