@@ -52,9 +52,13 @@ describe('addHotLeadCallBilling', () => {
     expect(mockOrgDb.updateOrg).toHaveBeenCalledWith('org-a', { hotLeadCallBilling: expect.objectContaining({ itemId: 'si_first' }) });
   });
 
-  it('a failed duplicate check never fails an add that was paid', async () => {
+  it('when the item cannot be confirmed by a read, nothing is mirrored and calling stays off; the retry finds the paid item', async () => {
     mockStripe.subscriptions.retrieve.mockResolvedValueOnce(sub([baseItem])).mockRejectedValueOnce(new Error('boom'));
-    await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_hlc', alreadyPresent: false });
+    await expect(addHotLeadCallBilling('org-a')).rejects.toThrow(/could not be confirmed/);
+    expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
+    mockStripe.subscriptions.retrieve.mockReset().mockResolvedValue(sub([baseItem, item()]));
+    await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_hlc', alreadyPresent: true });
+    expect(mockStripe.subscriptionItems.create).toHaveBeenCalledTimes(1);
   });
 
   it('never mirrors an item that is not on the subscription (a replayed idempotent response for a removed item)', async () => {

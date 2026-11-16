@@ -17,7 +17,7 @@ import {
   ValidationError, VerificationCodeError,
 } from './hotLeadCallErrors';
 import {
-  HOT_LEAD_CALL_SUBSCRIBE_MESSAGE, isHotLeadCallBillingActive, isHotLeadCallBillingRequired, isHotLeadCallEntitled, isHotLeadCallPlanEntitled,
+  HOT_LEAD_CALL_SUBSCRIBE_MESSAGE, isHotLeadCallBillingActive, isHotLeadCallBillingRequired, isHotLeadCallPlanEntitled,
 } from './voice/hotLeadCallEntitlement';
 import { isConditionalFailure, unchangedSince } from './voice/setupWrites';
 import {
@@ -150,9 +150,11 @@ export function storedHotLeadCallConfig(org: Pick<Organization, 'hotLeadCall'>):
 }
 
 /** Plain-English reasons enabling is not possible yet, in the order the person should fix them. */
-function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean): string[] {
+function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean, needsAddon: boolean): string[] {
   const blockers: string[] = [];
   if (!entitled) blockers.push(BLOCKER_NOT_ENTITLED);
+  // The plan includes the feature but the paid add-on is not active: say how to get it (the portal cannot buy it).
+  else if (needsAddon) blockers.push(HOT_LEAD_CALL_SUBSCRIBE_MESSAGE);
   if (!config?.team.length) blockers.push(BLOCKER_NO_VERIFIED_PERSON);
   else if (!config.team.some(m => m.verifiedAt)) blockers.push(BLOCKER_UNVERIFIED);
   if (!config?.callingHours) blockers.push(BLOCKER_NO_HOURS);
@@ -160,8 +162,9 @@ function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean): s
   return blockers;
 }
 
-function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig | undefined, entitled: boolean): HotLeadCallSettingsDto {
-  const blockers = [...blockersOf(config, entitled), ...effectiveBlockersOf(config)];
+/** `entitled` is the PLAN check; `needsAddon` is true when the plan has the feature but the required paid add-on is not active. */
+function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig | undefined, entitled: boolean, needsAddon = false): HotLeadCallSettingsDto {
+  const blockers = [...blockersOf(config, entitled, needsAddon), ...effectiveBlockersOf(config)];
   return {
     _revision: hotLeadCallRevisionOf(org.hotLeadCall),
     entitled,
@@ -190,7 +193,8 @@ function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig
 
 export async function getHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller): Promise<HotLeadCallSettingsDto> {
   requireConfigure(org, caller);
-  return toDto(org, storedHotLeadCallConfig(org), await isHotLeadCallEntitled(org));
+  const planEntitled = await isHotLeadCallPlanEntitled(org);
+  return toDto(org, storedHotLeadCallConfig(org), planEntitled, planEntitled && !await isHotLeadCallBillingActive(org));
 }
 
 export async function previewHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, at: Date): Promise<HotLeadCallPreviewDto> {
@@ -481,7 +485,7 @@ export async function applyHotLeadCallSettings(
   };
   const draft = hotLeadCallConfigOf(candidate);
   if (!draft) throw new ValidationError('These settings are not valid');
-  const blockers = blockersOf(draft, true);
+  const blockers = blockersOf(draft, true, false);
   // Turning on is also refused when the settings could never place a call (no callable country, hours that never meet the
   // lead window); an org that is already on keeps its setting through an unrelated edit and sees the problem in the read-out.
   const turningOn = wantsEnabled && !current?.enabled;
@@ -517,7 +521,7 @@ export async function applyHotLeadCallSettings(
     if (isConditionalFailure(err)) throw new ConflictError(`The settings were changed by someone else. Reload them and try again.${addOnBought ? ' The hot lead calls add-on is already active on your subscription and will not be charged again.' : ''}`);
     throw err;
   }
-  return { dto: toDto({ hotLeadCall: next }, next, entitled && (addOnBought || await isHotLeadCallBillingActive(org))), config: next };
+  return { dto: toDto({ hotLeadCall: next }, next, entitled, entitled && !(addOnBought || await isHotLeadCallBillingActive(org))), config: next };
 }
 
 export async function updateHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>): Promise<HotLeadCallSettingsDto> {

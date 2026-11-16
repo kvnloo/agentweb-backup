@@ -1176,6 +1176,7 @@ describe('hot lead calls add-on (ENG-2783)', () => {
   const card = (halt: Halt) => halt.questionDeckPayload![0];
   beforeEach(() => {
     process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+    (isHotLeadCallEnabled as jest.Mock).mockResolvedValue(true);
     org.hotLeadCall = withNumber({ verified: true });
   });
   afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
@@ -1221,6 +1222,24 @@ describe('hot lead calls add-on (ENG-2783)', () => {
     const halt = await call();                        // now a purchase is needed: a new card, nothing bought
     expect(card(halt).question).toContain('This costs');
     expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+  });
+  it('does not sell the add-on while the global calling switch is off: no card, no charge', async () => {
+    (isHotLeadCallEnabled as jest.Mock).mockResolvedValue(false);
+    await expect(call()).rejects.toThrow(/not open for your organization yet/);
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+    expect(isOn()).toBe(false);
+  });
+  it('looks at the switch again after the approval, right before charging', async () => {
+    answerCard(recordHalt(await call()), 'approve');
+    (isHotLeadCallEnabled as jest.Mock).mockResolvedValue(false); // turned off while the card was open
+    await expect(call()).rejects.toThrow(/not open for your organization yet/);
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+    expect(isOn()).toBe(false);
+  });
+  it('does not block an org that already has the add-on from enabling while the switch is off', async () => {
+    (isHotLeadCallEnabled as jest.Mock).mockResolvedValue(false);
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: '2026-11-13T00:00:00.000Z' };
+    expect(card(await call()).question).toContain('already covers these calls');
   });
   it('the number card says the rent is part of the $70 price', async () => {
     org.hotLeadCall = configured({ verified: true });
