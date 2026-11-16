@@ -4536,7 +4536,7 @@ emmaToolRegistry.register({
         media_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube. LinkedIn accepts images only for now: a video URL is refused and nothing is posted, so do not retry it — post the text with an image instead.'
+          description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube. LinkedIn: pass either ONE MP4 video (3 seconds to 30 minutes, up to 150 MB; other video formats are refused) or images, never both. The video upload can take a minute or two.'
         },
         in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
         save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
