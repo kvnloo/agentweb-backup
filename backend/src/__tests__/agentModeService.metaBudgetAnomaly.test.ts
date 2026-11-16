@@ -55,6 +55,18 @@ describe('ENG-2279 budget anomaly confirmation', () => {
       expect(write).not.toHaveBeenCalled();
     },
   );
+  it('ENG-2913: adding a spend cap to an uncapped campaign is a normal change, not unverifiable', async () => {
+    read.mockResolvedValue({ id: 'campaign', daily_budget: '10000' });
+    const result: any = await invoke({ spend_cap: 500 });
+    expect(result.success).toBe(true);
+    expect(write).toHaveBeenCalledWith('user', 'campaign', { spend_cap: 500 }, ACCOUNT);
+  });
+  it('ENG-2913: a failed read-back still blocks a spend cap as unverifiable', async () => {
+    read.mockResolvedValue(null);
+    const result: any = await invoke({ spend_cap: 500 });
+    expect(result.reason).toBe('meta_budget_prior_unavailable');
+    expect(write).not.toHaveBeenCalled();
+  });
   it('a valid tracking override cannot bypass the anomaly', async () => {
     const params: any = { budget_amount: 210, override_tracking_check: true };
     params.tracking_override_token = computeTrackingOverrideDigest(getJwtSecret(), {

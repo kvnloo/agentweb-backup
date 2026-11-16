@@ -10,8 +10,8 @@ jest.mock('../services/chatbotService', () => ({
 }));
 
 describe('Agent Mode Controller - getShareOgMetadata', () => {
-  const mockRequest = (shareId: string): Request =>
-    ({ params: { shareId } } as unknown as Request);
+  const mockRequest = (shareId: string, query: Record<string, unknown> = {}): Request =>
+    ({ params: { shareId }, query } as unknown as Request);
 
   const mockResponse = () => {
     const res: any = {};
@@ -149,24 +149,120 @@ describe('Agent Mode Controller - getShareOgMetadata', () => {
     });
   });
 
-  it('should work for interactive share sessions', async () => {
-    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+  // ENG-2654: an iShare link is token-gated; the chat id alone must not reveal its title or first message.
+  describe('interactive (iShare) share with no read-only share', () => {
+    const ishareSession = (interactiveShareMetadata: Record<string, unknown>) => ({
       sessionId: 'session-1',
       title: 'Interactive Session',
-      messages: [
-        { role: 'user', content: 'Interactive chat content' },
-      ],
+      messages: [{ role: 'user', content: 'Interactive chat content' }],
       shareMetadata: { isShared: false },
-      interactiveShareMetadata: { isActive: true, sharedAt: '2024-01-01T00:00:00Z', expiresAt: '2099-01-01T00:00:00Z' },
+      interactiveShareMetadata: { isActive: true, token: 'tok-1', sharedAt: '2024-01-01T00:00:00Z', expiresAt: '2099-01-01T00:00:00Z', ...interactiveShareMetadata },
     });
-    const req = mockRequest('session-1');
+
+    it.each([
+      ['no token', {}],
+      ['an empty token', { conversable: '' }],
+    ])('returns 404 and nothing of the chat with %s', async (_label, query) => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(ishareSession({}));
+      const res = mockResponse();
+
+      await agentModeController.getShareOgMetadata(mockRequest('session-1', query), res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.json).toHaveBeenCalledWith({ error: 'This conversation is not shared' });
+    });
+
+    it('returns 401 for a wrong token', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(ishareSession({}));
+      const res = mockResponse();
+
+      await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'guess' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toContain('Interactive');
+    });
+
+    it('returns 401 when the share has no token, whatever is sent', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(ishareSession({ token: undefined }));
+      const res = mockResponse();
+
+      await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'undefined' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('returns 410 for the right token on an expired share', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(ishareSession({ expiresAt: '2000-01-01T00:00:00Z' }));
+      const res = mockResponse();
+
+      await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'tok-1' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(410);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Interactive share link has expired' });
+    });
+
+    it('returns the preview for the right token', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(ishareSession({}));
+      const res = mockResponse();
+
+      await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'tok-1' }), res);
+
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({ title: 'Interactive Session', description: 'Interactive chat content' });
+    });
+  });
+
+  it('serves a read-only share without a token even when an iShare is also active', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-1',
+      title: 'Both shares',
+      messages: [{ role: 'user', content: 'Hello' }],
+      shareMetadata: { isShared: true },
+      interactiveShareMetadata: { isActive: true, token: 'tok-1', expiresAt: '2099-01-01T00:00:00Z' },
+    });
     const res = mockResponse();
 
-    await agentModeController.getShareOgMetadata(req, res);
+    await agentModeController.getShareOgMetadata(mockRequest('session-1'), res);
 
-    expect(res.json).toHaveBeenCalledWith({
-      title: 'Interactive Session',
-      description: 'Interactive chat content',
+    expect(res.json).toHaveBeenCalledWith({ title: 'Both shares', description: 'Hello' });
+  });
+
+  it('returns 410 for an expired read-only share even when the request carries a valid iShare token', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-1',
+      title: 'Expired read-only',
+      messages: [{ role: 'user', content: 'Hello' }],
+      shareMetadata: { isShared: true, expiresAt: '2000-01-01T00:00:00Z' },
+      interactiveShareMetadata: { isActive: true, token: 'tok-1', expiresAt: '2099-01-01T00:00:00Z' },
     });
+    const res = mockResponse();
+
+    await agentModeController.getShareOgMetadata(mockRequest('session-1', { conversable: 'tok-1' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(410);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Share link has expired' });
+  });
+
+  // ENG-2654: the description comes from what the share page shows, not raw messages (ENG-2163 admin-turn filter).
+  it('never uses an admin-tainted prompt as the description', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-1',
+      title: 'Support session',
+      messages: [
+        { role: 'system', content: 'internal system prompt' },
+        { role: 'user', content: 'run get_pr_digest for this org' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1', function: { name: 'get_pr_digest' } }] },
+        { role: 'tool', name: 'get_pr_digest', content: 'internal PR data' },
+        { role: 'assistant', content: 'Here is the digest' },
+        { role: 'user', content: 'Customer question' },
+        { role: 'assistant', content: 'Answer' },
+      ],
+      shareMetadata: { isShared: true },
+    });
+    const res = mockResponse();
+
+    await agentModeController.getShareOgMetadata(mockRequest('session-1'), res);
+
+    expect(res.json).toHaveBeenCalledWith({ title: 'Support session', description: 'Customer question' });
   });
 });

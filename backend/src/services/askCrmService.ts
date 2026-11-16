@@ -40,6 +40,8 @@ export interface AskCrmLead {
   lastActivityAt?: string | null;
   lastUsageAt?: string | null;
   openDealStages?: string[] | null;
+  /** Open stages from this read's live deal query ONLY (never the stored, stale-prone openDealStages). */
+  liveOpenDealStages?: string[] | null;
   contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed' | null;
   primaryPOCName?: string | null;
 }
@@ -142,7 +144,13 @@ function toItem(lead: AskCrmLead, heatScore: number, lifecycle: LifecycleStage):
   };
 }
 
-/** Compute heat + lifecycle for one lead, preferring stored values when present. */
+/**
+ * Compute heat + lifecycle for one lead.
+ *
+ * Stored lifecycle is a compatibility fallback. Positive live signals may
+ * advance it, but partial/negative snapshots must never silently downgrade a
+ * stronger stored state.
+ */
 function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: LifecycleStage } {
   const heat = typeof lead.heatScore === 'number'
     ? lead.heatScore
@@ -159,19 +167,93 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
         now
       );
 
-  const lifecycle = lead.lifecycle ?? computeLifecycle(
+  const nowMs = now.getTime();
+  const ageDays = (value: string | null | undefined): number | null => {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed) || parsed > nowMs) return null;
+    return (nowMs - parsed) / (24 * 60 * 60 * 1000);
+  };
+  // past_due is only a meaningful transition when computeLifecycle's own Rule 2
+  // would actually act on it (isOrWasPaying — see lifecycleService.ts). Treating it
+  // as definitive from a colder stored state (inbox/signed_up) fires this gate for
+  // no effect: computeLifecycle drops the signal and falls through to signed_up,
+  // the same answer a plain "no subscription signal at all" would have produced.
+  const subscriptionIsDefinitive =
+    lead.subscriptionState === 'active' ||
+    lead.subscriptionState === 'trialing' ||
+    lead.subscriptionState === 'canceled' ||
+    (lead.subscriptionState === 'past_due' && (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk'));
+  // An open deal only PROMOTES a cold lead. Against a stored paying/trialing/at_risk/churned
+  // state it is weak evidence (the deal's contact may simply not be linked to the account that
+  // holds the subscription, e.g. an upsell on a differently-addressed contact), and letting it
+  // win would downgrade a real customer to in_deal. Mirrors routes/sequences.ts's gate.
+  const hasCurrentOpenDeal =
+    Array.isArray(lead.openDealStages) &&
+    lead.openDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase())) &&
+    (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox' || lead.lifecycle === 'signed_up');
+  const provesSignup =
+    lead.hasUserRecord === true &&
+    (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox');
+  const hasLiveSubscription =
+    lead.subscriptionState === 'active' || lead.subscriptionState === 'trialing';
+  const provesChurn = !hasLiveSubscription && (ageDays(lead.lastActivityAt) ?? 0) > 60;
+  // No provesRisk gate: healthScore/lastUsageAt are NOT live signals today.
+  // askCrmLeadLoader.ts never merges either one — healthScore is written once,
+  // historic-only, by scripts/backfill-crm-scores.ts (never refreshed after;
+  // contactSyncService's would-be live recompute hooks, loadSignals/
+  // persistScores, are never wired with real deps anywhere in production —
+  // see stripeController.ts's own "once D2 ships" comment), and lastUsageAt is
+  // never persisted onto a lead row at all outside that same one-time script.
+  // Letting a gate branch here recompute off those fields would authorize
+  // exactly the failure this whole gate exists to prevent: a stale,
+  // potentially years-old snapshot silently downgrading a stronger stored
+  // lifecycle, with zero live evidence behind it. Revisit once the loader
+  // actually live-merges a health/usage signal.
+
+  const computedLifecycle = computeLifecycle(
     {
       email: lead.email ?? undefined,
       phone: lead.phone ?? undefined,
       hasUserRecord: lead.hasUserRecord ?? undefined,
       subscriptionState: lead.subscriptionState ?? undefined,
-      lastActivityAt: lead.lastActivityAt ?? undefined,
-      lastUsageAt: lead.lastUsageAt ?? undefined,
-      healthScore: lead.healthScore ?? undefined,
+      // Deliberate deviation from computeLifecycle's Rule 1 ordering, ask_crm only: a live
+      // active/trialing subscription outranks "no login in 60 days". lastActivityAt is built
+      // from login/engagement timestamps, which an annual or API-only subscriber may never
+      // produce, so honoring the inactivity rule would report a paying customer as churned.
+      // A canceled subscription still churns via Rule 1's subscription check.
+      lastActivityAt: hasLiveSubscription ? undefined : lead.lastActivityAt ?? undefined,
+      // lastUsageAt/healthScore deliberately NOT passed: computeLifecycle's Rule 2 would
+      // turn a stale stored value into at_risk whenever ANY other gate branch fires
+      // (e.g. a live active subscription), re-opening the hole the removed provesRisk
+      // branch closed. See the comment above on why they are not live signals.
+      currentLifecycle: lead.lifecycle ?? undefined,
       openDealStages: lead.openDealStages ?? undefined,
     } as LifecycleSignals,
     now
   );
+
+  const gated =
+    !lead.lifecycle ||
+    subscriptionIsDefinitive ||
+    hasCurrentOpenDeal ||
+    provesSignup ||
+    provesChurn
+      ? computedLifecycle
+      : lead.lifecycle;
+
+  // Win-back: a lead that reads as churned (stored, or computed from a canceled subscription /
+  // 60+ days idle) but has an open deal in THIS read's live deal query is being actively
+  // worked, so report in_deal. Only liveOpenDealStages counts: the stored openDealStages can be
+  // stale, and an open deal never overrides a live active/trialing subscription. If the deal
+  // query misses the deal (it is bounded, and deals without a heatScore are invisible to it,
+  // ENG-2340) this simply does not fire and the lead stays churned.
+  const hasLiveOpenDeal =
+    Array.isArray(lead.liveOpenDealStages) &&
+    lead.liveOpenDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase()));
+  const winBack =
+    hasLiveOpenDeal && !hasLiveSubscription && (lead.lifecycle === 'churned' || gated === 'churned');
+  const lifecycle: LifecycleStage = winBack ? 'in_deal' : gated;
 
   return { heat, lifecycle };
 }

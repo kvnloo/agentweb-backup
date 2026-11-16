@@ -16,6 +16,7 @@
  * or an invalid verdict each return `status: 'error'` with a reason. Such a result carries no
  * verdicts, so it can never be read as a pass. The public functions never throw.
  */
+import { cutWithoutSplittingPair } from '../utils/surrogateSafeCut';
 import type { PairwiseChoice } from '../loops/eval/agreement';
 import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
 import type { CreativeGateResult } from './creativeGates';
@@ -222,6 +223,8 @@ export interface RubricJudgeLlmRequest {
 export interface RubricJudgeLlmResponse {
   text: string;
   usage?: RubricJudgeUsage;
+  /** The completion's finish_reason; "error" means the provider failed partway through the reply. */
+  finishReason?: string;
 }
 
 export interface RubricJudgeLlm {
@@ -229,7 +232,7 @@ export interface RubricJudgeLlm {
 }
 
 interface ChatCompletionLike {
-  choices?: Array<{ message?: { content?: unknown } }>;
+  choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }>;
   usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; cost?: unknown };
 }
 
@@ -239,8 +242,10 @@ function finiteOr(value: unknown, fallback: number): number {
 
 /** Reads text and token usage from an OpenAI-shaped chat completion. */
 export function readChatCompletion(res: ChatCompletionLike): RubricJudgeLlmResponse {
-  const content = res.choices?.[0]?.message?.content;
+  const choice = res.choices?.[0];
+  const content = choice?.message?.content;
   const text = typeof content === 'string' ? content : '';
+  const finishReason = typeof choice?.finish_reason === 'string' ? choice.finish_reason : undefined;
   const usage = res.usage
     ? {
         inputTokens: finiteOr(res.usage.prompt_tokens, 0),
@@ -248,7 +253,7 @@ export function readChatCompletion(res: ChatCompletionLike): RubricJudgeLlmRespo
         ...(typeof res.usage.cost === 'number' && Number.isFinite(res.usage.cost) ? { costUsd: res.usage.cost } : {}),
       }
     : undefined;
-  return usage ? { text, usage } : { text };
+  return { text, ...(usage ? { usage } : {}), ...(finishReason ? { finishReason } : {}) };
 }
 
 /** Production client: the OpenRouter gateway, metered as `creative_rubric_judge` system spend. */
@@ -301,7 +306,7 @@ export function assertJudgeModelAllowed(model: string): void {
 function clip(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  return trimmed ? trimmed.slice(0, MAX_BRIEF_FIELD_CHARS) : undefined;
+  return trimmed ? cutWithoutSplittingPair(trimmed, MAX_BRIEF_FIELD_CHARS) : undefined;
 }
 
 function clipList(value: unknown): string[] | undefined {
@@ -657,7 +662,7 @@ export async function judgeLandingPage(
             `Landing page under review${page.url ? ` (live at ${page.url}; you are shown its source, not a render)` : ''}:`,
             cut ? `(source cut to its first ${MAX_LANDING_PAGE_SOURCE_CHARS} characters)` : '',
             '```tsx',
-            source.slice(0, MAX_LANDING_PAGE_SOURCE_CHARS),
+            cutWithoutSplittingPair(source, MAX_LANDING_PAGE_SOURCE_CHARS),
             '```',
           ]
             .filter(Boolean)

@@ -21,6 +21,8 @@
  * prompt contains BRICK 4 markers from the prod copy.
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -30,6 +32,8 @@ import {
   creativeDirReadyPatch,
   creativeDirStartPatch,
   CreativeDirResult,
+  CreativeDirStatusFields,
+  CREATIVE_DIR_TIMEOUT_MS,
   sanitizeCreativeDirResult,
 } from "./creativeDirStatusService";
 import {
@@ -38,6 +42,7 @@ import {
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
 import type { CompetitorResult } from "./competitorStatusService";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Bedrock model alias. Same family as Steps 2 + 3 for tone consistency. */
 const CREATIVE_DIR_MODEL = "anthropic.claude-sonnet-4-6";
@@ -217,11 +222,32 @@ export async function generateCreativeDirectionForUser(
  * competitor result out of the persisted state, runs the LLM, and patches
  * the User with the result.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here).
+ */
+function creativeDirOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#creativeDirStartedAt = :creativeDirOwnerStartedAt",
+    names: { "#creativeDirStartedAt": "creativeDirStartedAt" },
+    values: { ":creativeDirOwnerStartedAt": expectedStartedAt },
+  };
+}
+
 export async function triggerCreativeDirForUser(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    expectedStartedAt?: string;
+  } = {}
 ): Promise<void> {
-  const user = await userDb.getUserById(userId);
+  // This runs moments after the ICP and competitor steps wrote their results, so
+  // an index read can still show the row from before them and generate the
+  // creative direction on an empty persona/competitor set (and the step would
+  // then be recorded ready). Read the base table.
+  const user = await readUserForOwnership(userId);
   if (!user) return;
   const personas: ICPPersona[] = Array.isArray((user as any).icpResult)
     ? ((user as any).icpResult as ICPPersona[])
@@ -248,14 +274,46 @@ export async function triggerCreativeDirForUser(
       // User is no longer in `running` (stale completion) — drop silently.
       return;
     }
-    await userDb.updateUser(userId, patch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, patch as any, {
+          condition: creativeDirOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCreativeDirService] dropping stale completion — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, patch as any);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
-      userId,
-      creativeDirFailedPatch((current as any) || {}, msg) as any
-    );
+    const failedPatch = creativeDirFailedPatch((current as any) || {}, msg);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, failedPatch as any, {
+          condition: creativeDirOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCreativeDirService] dropping stale failure — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, failedPatch as any);
+    }
     console.error("[onboardingCreativeDirService] generation failed", {
       userId,
       err: msg,
@@ -274,17 +332,84 @@ export async function triggerCreativeDirForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor axes: a
+ * plain read-then-write here lets two concurrent callers both observe a
+ * non-running status and both win, launching two fully parallel LLM calls.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `CREATIVE_DIR_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again.
+ */
+function creativeDirStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - CREATIVE_DIR_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning OR #creativeDirStartedAt <= :creativeDirStaleBefore",
+    names: {
+      "#creativeDirStatus": "creativeDirStatus",
+      "#creativeDirStartedAt": "creativeDirStartedAt",
+    },
+    values: {
+      ":creativeDirRunning": "running",
+      ":creativeDirStaleBefore": staleBefore,
+    },
+  };
+}
+
+/**
+ * Claim the creative-dir axis for a new run: atomically flip
+ * `creativeDirStatus` to `running` (or no-op, returning `null`, if someone
+ * else already holds the claim). Every entry point that wants to run
+ * creative-direction generation must go through here — both
+ * `/creative-dir/start` (via `startCreativeDirForUser`) and the
+ * eager-pipeline orchestrator's `runCreativeDir`
+ * (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runCreativeDir` needed this split out (ENG-2308 follow-up, caught
+ * live): it used to call `triggerCreativeDirForUser` directly, with
+ * nothing ever flipping `creativeDirStatus` to `running` first on a pure
+ * orchestrator-driven cascade. `creativeDirReadyPatch` requires
+ * `current.creativeDirStatus === 'running'` to persist a result — without
+ * it, the trigger ran for real then silently dropped its result, and the
+ * orchestrator recorded the step `ready` with a `null` output anyway,
+ * since nothing threw — which then made `adImage` fail downstream (its own
+ * gate reads the never-set legacy `creativeDirStatus` field directly).
+ */
+export async function claimCreativeDirRun(
+  userId: string,
+): Promise<CreativeDirStatusFields | null> {
+  const patch = creativeDirStartPatch();
+  try {
+    await userDb.updateUser(userId, withClearedError(patch, "creativeDirError") as any, {
+      condition: creativeDirStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
+}
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns once the start patch has been
- * persisted so the route can return the running snapshot.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runCreativeDir` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
  */
 export async function startCreativeDirForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
-): Promise<void> {
-  await userDb.updateUser(userId, creativeDirStartPatch() as any);
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+): Promise<CreativeDirStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -295,7 +420,19 @@ export async function startCreativeDirForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return null;
   }
-  void triggerCreativeDirForUser(userId, deps);
+  const patch = await claimCreativeDirRun(userId);
+  if (!patch) return null;
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  trackBackgroundRun(
+    "onboardingCreativeDir",
+    triggerCreativeDirForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.creativeDirStartedAt,
+    }),
+  );
+  return patch;
 }

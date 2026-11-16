@@ -1,0 +1,17 @@
+{
+  "env": "test1",
+  "uidMin": 400000,
+  "uidMax": 410000,
+  "socket": { "dir": "/run/aw-login-host-test1", "gid": 990 },
+  "limits": { "memoryMax": "1G", "tasksMax": 256, "tmpSize": "128M", "shmSize": "64M", "runtimeMaxSec": 7200 },
+  "quota": { "blocksKb": 204800, "inodes": 20000 },
+  "egress": { "allow": ["api.anthropic.com:443", "platform.claude.com:443", "console.anthropic.com:443", "claude.ai:443"] },
+  "claude": {
+    "binaryPath": "/opt/aw-claude/2.1.294/claude",
+    "expectedSha256": "<sha256 of that exact binary: sha256sum>",
+    "version": "2.1.294",
+    "systemPromptFile": "/opt/aw-login-host/system-prompt.txt",
+    "bridgeUrl": "http://127.0.0.1:3001/internal/tool-bridge/run/mcp",
+    "nodePath": "/opt/aw-node/v22.23.3/bin/node"
+  }
+}

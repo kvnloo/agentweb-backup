@@ -496,7 +496,7 @@ describe('ENG-1358 — every launch route relays the warning, not just RESUME/UP
     expect(result.trackingWarning).toContain('GTM-NFWK798Z');
   });
 
-  it('the two creative routes read gate.warning at all', () => {
+  it('every creative route reads gate.warning at all', () => {
     // Guards the wiring itself: if a future edit drops the capture, this fails even when
     // the mock-heavy handler test above cannot reach its success path.
     // ENG-2103 (F2): handleCallGoogleAdsApi's body moved from agentModeService.ts to
@@ -506,9 +506,11 @@ describe('ENG-1358 — every launch route relays the warning, not just RESUME/UP
       require('path').join(__dirname, '../emma/impl/adsCrmApis.ts'), 'utf8');
     // Matches any gate-result variable name: the point is that both call sites capture
     // the warning, not what the local is called.
+    // ENG-2928 adds the third route: ASSET_GROUP UPDATE status ENABLED (ad CREATE,
+    // asset group CREATE, asset group enable).
     const captures = src.match(/creativeTrackingWarning = \w+\.warning;/g) || [];
-    expect(captures).toHaveLength(2);
+    expect(captures).toHaveLength(3);
     const relays = src.match(/trackingWarning: creativeTrackingWarning/g) || [];
-    expect(relays).toHaveLength(2);
+    expect(relays).toHaveLength(3);
   });
 });

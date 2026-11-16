@@ -77,3 +77,33 @@ export function assertMemoryContentWithinLimit(content: string, field = 'content
     + `${MEMORY_CONTENT_MAX_CHARS} characters each.`,
   );
 }
+
+/**
+ * ENG-2574 — the largest content save_memory / save_org_memory accept in one call. Up to
+ * this size the tool splits content itself (at `suggestMemorySplitPoint` boundaries) into
+ * rows of at most MEMORY_CONTENT_MAX_CHARS, instead of rejecting a 2,018-character note and
+ * spending a model turn on a retry the tool could do itself. Beyond it the schema still
+ * rejects: an 8,000-character "fact" is a document, not a memory.
+ */
+export const MEMORY_AUTOSPLIT_MAX_CHARS = MEMORY_CONTENT_MAX_CHARS * 4;
+
+/**
+ * Split content into chunks of at most `max` code points, cutting at paragraph, line,
+ * sentence, or whitespace boundaries where possible. Content within the cap comes back
+ * as a single unchanged chunk. Whitespace at a cut is trimmed; empty chunks are dropped.
+ */
+export function splitMemoryContent(content: string, max: number = MEMORY_CONTENT_MAX_CHARS): string[] {
+  if (memoryContentLength(content) <= max) return [content];
+  const chunks: string[] = [];
+  let rest = content;
+  while (memoryContentLength(rest) > max) {
+    const cut = suggestMemorySplitPoint(rest, max);
+    const chars = Array.from(rest);
+    const head = chars.slice(0, cut).join('').trim();
+    if (head) chunks.push(head);
+    rest = chars.slice(cut).join('').trimStart();
+  }
+  const tail = rest.trim();
+  if (tail) chunks.push(tail);
+  return chunks;
+}

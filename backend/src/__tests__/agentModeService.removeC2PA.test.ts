@@ -289,6 +289,33 @@ describe('AgentModeService - remove_c2pa_from_image function', () => {
       expect(result.error).toContain('Network error');
     });
 
+    it('ENG-2584: returns actionable source_download_refused on HTTP 403', async () => {
+      const err: any = new Error('Request failed with status code 403');
+      err.response = { status: 403 };
+      (mockAxios.default.get as jest.Mock).mockRejectedValue(err);
+
+      const result = await (agentModeService as any).removeC2PAFromImage(
+        'https://external-sea5-1.xx.fbcdn.net/emg1/v/t13/1?url=x',
+        'thumb.jpg',
+        'user123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('source_download_refused');
+      expect(result.status).toBe(403);
+      expect(result.message).toContain('Do not retry');
+      expect(s3Utils.uploadFileToS3).not.toHaveBeenCalled();
+    });
+
+    it('ENG-2584: non-HTTP network errors keep the original message', async () => {
+      (mockAxios.default.get as jest.Mock).mockRejectedValue(new Error('socket hang up'));
+      const result = await (agentModeService as any).removeC2PAFromImage(
+        'https://example.com/a.png', 'a.png', 'user123'
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('socket hang up');
+    });
+
     it('should handle metadata removal errors gracefully', async () => {
       const originalBuffer = Buffer.from('original-image-data');
       

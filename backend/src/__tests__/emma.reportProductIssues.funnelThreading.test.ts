@@ -28,10 +28,6 @@ import { fileUserIssue } from '../services/intakeService';
 import { userDb } from '../services/db';
 
 const tool = () => emmaToolRegistry.getTool('report_product_issues')!;
-const OLD_FLAG = process.env.FEATUREBASE_INTAKE;
-
-beforeAll(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-afterAll(() => { process.env.FEATUREBASE_INTAKE = OLD_FLAG; });
 beforeEach(() => jest.clearAllMocks());
 
 describe('report_product_issues — funnelStatus threading (ENG-187)', () => {

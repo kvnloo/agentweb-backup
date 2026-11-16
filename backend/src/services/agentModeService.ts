@@ -1,4 +1,8 @@
+import { addCompanionTools } from './agentMode/companionTools';
+import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { normalizeSkillIdArg } from './agentMode/skillIdArg';
+import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
@@ -7,7 +11,9 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
-import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
+import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
@@ -35,13 +41,17 @@ import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAuto
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
+import { buildUnappliedFieldsMessage, findUnappliedCreativeFields } from './agentMode/metaCreativeFieldsCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { createCrmEvidenceCollector, crmEvidenceFromEarlierInvocations, crmNumbersFromSessionHistory, runCrmFreshnessShadow, serializeCrmEvidence } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -50,7 +60,9 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
-import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
+import { ANTI_LOOP_STOP_MESSAGE, EMPTY_FINAL_RESPONSE_FALLBACK, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './agentMode/core/termination';
+import { recordPagingCalls, PAGING_SPIRAL_STOP_MESSAGE } from './agentMode/core/pagingSpiral';
+import { createSerialReadState, recordSerialReadStep, SERIAL_READ_BATCH_MESSAGE } from './agentMode/core/serialReadSpiral';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
@@ -68,6 +80,7 @@ import {
   type LLMModelConfig,
   type ModelProvider,
   type ModelTier,
+  LEGACY_MODEL_ALIASES,
 } from './agentMode/llmModelRegistry';
 import {
   isMalformedOpenRouterResponseError,
@@ -76,15 +89,17 @@ import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActions
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): agentMode/brandLogo's
 // 4 exports and agentMode/dataFabricationGuard's 5 exports were used only by
 // generateImage, which moved to emma/impl/mediaVideo.ts (imports them there directly).
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
-import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory, type ToolDispatchPorts } from './agentMode/core/toolDispatch';
+import { computeCheckpointBatch, isPersistedResponseMessage } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
-import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
-import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, buildFinalizeJudgePrompt, parseFinalizeJudgeOutput, FINALIZE_JUDGE_MAX_COMPLETION_TOKENS } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors, ROW_KEYS as LEDGER_ROW_KEYS } from './agentMode/core/unconsumedCursor';
 import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
 import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
 import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
+import type { MessageModelRouting } from './agentMode/agentWebModelRouter';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { boundToolsForModel } from '../utils/boundToolsForModel';
 // ENG-2103 (F2, Pattern A): resolveOrgProfileField's only 5 callers
 // (readBrandGuidelines/readMarketStrategy and friends) moved to
 // emma/impl/brandMarketStrategy.ts, which imports it lazily itself
@@ -134,6 +149,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+import { getDefaultApproverForGate } from './approverDirectory';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -167,7 +183,8 @@ import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import { pickTransport } from './funding/transport';
 import { currentRunFunding } from './funding/runFunding';
-import { recordLlmUsage } from './funding/recordLlmUsage';
+import { recordLlmUsage, customerUpstreamCost, openRouterByokCostUsd } from './funding/recordLlmUsage';
+import { resolveCallFunding, customerKeyBlocksTurn } from './funding/callFunding';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -263,6 +280,8 @@ import * as linkedinImpl from '../emma/impl/linkedin';
 import * as twitterImpl from '../emma/impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster, same treatment as leadsImpl above.
 import * as adsApisImpl from '../emma/impl/adsApis';
+import { buildToolkitObjectiveGate, readBackMetaNode } from './agentMode/metaToolkitSeams';
+import { PAUSED_BUNDLE_ACTION, PausedMetaBundle, parsePausedMetaBundle, pausedBundleSummary, executePausedMetaBundle, assertPausedBundleUserCount, preflightPausedMetaCreatives } from './agentMode/metaPausedBundle';
 // ENG-2103 (F2): Google Ads + HubSpot/Attio CRM passthrough tool cluster,
 // same treatment as leadsImpl above.
 import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
@@ -322,7 +341,7 @@ import {
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
-const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+export const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 /*
  * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
  * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
@@ -330,6 +349,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  * files, not decoration — change it in both or in neither.
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+
 /*
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
@@ -356,11 +376,11 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
-const MAX_TOOL_CONTENT_SIZE = 300_000;
+export const MAX_TOOL_CONTENT_SIZE = 300_000;
 
 // Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
 // 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
@@ -517,10 +537,12 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 // DEFAULT_MAX_IMAGE_BYTES were used only by describeImage, which moved to
 // emma/impl/mediaVideo.ts (imports them there directly). assertPublicHostname
 // was already unused before this move (pre-existing, left as-is).
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { assertPublicHostname, DEFAULT_MAX_REDIRECTS, fetchBufferFollowingRedirects } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
-import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
+import { isTransientLLMError, isProviderDeserializationError, extractAffordableTokens, PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
+import { classifyOpenRouterQuotaExhaustion } from '../utils/openRouterKeyLimit';
+import { isLLMProviderOutage } from './agentMode/providerOutage';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -576,6 +598,7 @@ type ApprovalDeckExecutionSummary = {
     stepId: string;
     status: 'verified' | 'failed';
     appliedObjectId?: string;
+    bundle?: { requested_ad_count: number; verified_ad_count: number; ledger: unknown[] };
     error?: string;
     mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
   }>;
@@ -595,6 +618,7 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
+import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
 
 
 /**
@@ -1012,10 +1036,16 @@ export interface SupportedModelInfo {
 const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 interface LLMCallOptions {
+  /** ENG-2108: set only by the agent's own working loop; lets this call use a customer key. */
+  customerRoutable?: boolean;
   tools?: any[] | null;
+  /** ENG-2824: tool names that must survive maxTools truncation (e.g. a schedule's required calls). */
+  priorityToolNames?: string[];
   tool_choice?: 'auto' | 'none' | any | null;
   /** Execute search through OpenRouter's provider-independent server tool. */
   webSearch?: boolean;
+  /** Parameters for the web-search server tool (engine, max_results, max_uses, ...); omitted means OpenRouter's defaults. */
+  webSearchParameters?: Record<string, string | number>;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -1045,6 +1075,15 @@ interface LLMCallOptions {
   timeoutMs?: number;
   /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
   fallbackModels?: string[];
+  /**
+   * ENG-55: Compare-only OpenRouter provider policy (`data_collection: 'deny'`), merged into
+   * `provider` next to the shared order/fallback preferences. Normal chat never sets it.
+   */
+  providerPolicy?: CompareProviderPolicy | null;
+  /** Provider names OpenRouter must not route this request to; merged with any default ignore list. */
+  providerIgnore?: string[];
+  /** Treat a 200 with no answer as a failed, retryable attempt. For callers that need text back. */
+  requireContent?: boolean;
 }
 
 function nonNegativeTokenCount(value: unknown): number {
@@ -1115,24 +1154,6 @@ const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 // readFileContent, moved in the same cluster (describeVideo, cluster 21,
 // already carries its own separately-duplicated copy of IMAGE_EXTENSIONS).
 
-// Legacy model ids persisted by sessions/schedules created before a model was
-// renamed or fully retired. Maps the old id to its current registry key so old
-// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
-// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
-// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
-// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
-// during the migration off the Rui-owned Azure resource — see the registry
-// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
-// non-legacy top of the same gpt5-chat family.
-const LEGACY_MODEL_ALIASES: Record<string, string> = {
-  'claude-opus-4-8': 'anthropic.claude-opus-4-8',
-  'gpt-5-chat-2': 'gpt-5.5',
-  'gpt-5.2-chat': 'gpt-5.5',
-  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
-  // ENG-2178: schedules created before the OpenRouter migration pin the bare
-  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
-  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
-};
 
 // Context passed to the diagnosis agent when the main agent fails
 export interface DiagnosisContext {
@@ -1224,6 +1245,32 @@ async function recordToolReliabilityEvent(params: {
   } catch (reliabilityErr) {
     console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
   }
+}
+
+/** A plain title cut from the user's first message: no AI call, so nothing for AgentWeb to pay. */
+export function titleFromUserMessage(message: string): string {
+  const flat = message.replace(/[`*_#>\[\]{}"]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!flat) return 'Marketing Task';
+  if (flat.length <= 60) return flat;
+  const cut = flat.slice(0, 60);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
+}
+
+/**
+ * The closing sentence of an ad-set read-back mismatch, worded from the status
+ * Meta actually reported. A PAUSED ad set is not delivering, so telling the user
+ * it "is live" was false; an ACTIVE or unknown status still says to pause it.
+ */
+export function describeMismatchedAdSetState(status: unknown): string {
+  const s = typeof status === 'string' ? status.toUpperCase() : '';
+  if (s === 'PAUSED' || s === 'ARCHIVED' || s === 'DELETED') {
+    return `It exists with status ${s} and is not delivering — review these settings in Ads Manager before activating it.`;
+  }
+  if (s === 'ACTIVE') {
+    return 'It is ACTIVE with settings that differ from the request — review or pause it in Ads Manager.';
+  }
+  return 'Its delivery status could not be confirmed — review it in Ads Manager and pause it if it is delivering.';
 }
 
 export class AgentModeService {
@@ -1715,6 +1762,7 @@ export class AgentModeService {
     console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
   }
 
+  // Every tool registered here also reaches the Claude plan route and must fit its limits: docs/plan-route-tool-limits.md
   private async registerTools() {
     // 1. Ensure Emma's tools are loaded into the emmaToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {
@@ -1725,6 +1773,7 @@ export class AgentModeService {
         await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
+        await import('../emma/lumaTools');
         await import('../emma/meetingActionRouter');
         await import('../emma/notionGuideTools');
         await import('../emma/slackMessageTools');
@@ -1732,6 +1781,7 @@ export class AgentModeService {
         await import('../emma/testAccountTools');
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
+        await import('../emma/linkedInAccountRevokeTools');
         await import('../emma/solveRecaptchaTool');
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
@@ -2021,11 +2071,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
@@ -2106,53 +2179,23 @@ export class AgentModeService {
   // directly. No test spies on it directly.
 
   async getVideoGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.videoGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported video generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting video generation default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.videoGenerationDefaultModelSettingName, 'video generation default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCustomerSupportDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting customer support default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.customerSupportDefaultModelSettingName, 'customer support default');
+    if (configured) return configured;
     // Fall back to the general default model
     return this.getDefaultModel();
   }
 
   async getCodingAgentDefaultModel(): Promise<string> {
     const fallbackModel = 'anthropic.claude-sonnet-4-6';
-    try {
-      const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting coding agent default model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.codingAgentDefaultModelSettingName, 'coding agent default');
+    if (configured) return configured;
     // Fall back to Sonnet 4.6
     return fallbackModel;
   }
@@ -2165,18 +2208,8 @@ export class AgentModeService {
    */
   async getVisionModel(): Promise<string> {
     const fallbackModel = this.llmModels['anthropic.claude-opus-4-8'] ? 'anthropic.claude-opus-4-8' : this.default_model;
-    try {
-      const setting = await settingsService.getSetting(this.visionModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported vision model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting vision model setting:', error);
-    }
+    const configured = await this.resolveConfiguredModel(this.visionModelSettingName, 'vision');
+    if (configured) return configured;
     return fallbackModel;
   }
 
@@ -2193,8 +2226,6 @@ export class AgentModeService {
 
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
-  private vertex_client: any | null = null;
-  private vertex_client_promise: Promise<any> | null = null;
 
   // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
   // the app for OpenRouter's own analytics
@@ -2248,47 +2279,6 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
-  /** Convert OpenAI-format content into Anthropic-native content blocks. */
-  private static convertContentToAnthropicBlocks(content: any): any[] {
-    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
-
-    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-    const blocks: any[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        blocks.push({ type: 'text', text: item });
-      } else if (!item || typeof item !== 'object') {
-        blocks.push({ type: 'text', text: String(item ?? '') });
-      } else if (item.type === 'text') {
-        blocks.push({ type: 'text', text: item.text || '' });
-      } else if (item.type === 'image_url') {
-        const url = item.image_url?.url || '';
-        if (url.startsWith('data:')) {
-          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (match) {
-            let mediaType = match[1].toLowerCase();
-            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
-            blocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: match[2] },
-            });
-          } else {
-            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
-          }
-        } else if (url) {
-          blocks.push({ type: 'image', source: { type: 'url', url } });
-        }
-      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        blocks.push(item);
-      } else {
-        blocks.push({ type: 'text', text: JSON.stringify(item) });
-      }
-    }
-    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
-  }
 
   // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
   // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
@@ -2355,16 +2345,62 @@ export class AgentModeService {
   }
 
   /**
-   * Registry entitlement for HTTP picker selection and model-mention guidance.
-   * ENG-2028: a name-based Opus deny contradicted ENG-744's explicit public
-   * availability contract. Registry flags are authoritative; Live stays on its
-   * separate voice path and admin/internal restrictions remain enforced.
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
+  /**
+   * Would the model picker accept this id for this user? The single source of
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
+   * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
+   * re-derive a subset inline — just the opus check — which let a non-admin
+   * who named an adminOnly auto-added model by id bypass it) so the two cannot
+   * drift again.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * The live-voice model behind the chat's voice button, or null when none is served to this user (ENG-2957). Voice mode
+   * is a client-side mode: the chat's stored model is never switched to it, and isModelSelectableBy keeps refusing it as
+   * a text pick. Same internal/adminOnly gates as the picker; the first live registry entry wins.
+   */
+  getVoiceModelFor(isAdmin: boolean): string | null {
+    for (const id of Object.keys(this.llmModels)) {
+      const config = this.llmModels[id];
+      if (config.isLive && !config.internalOnly && (isAdmin || !config.adminOnly)) return id;
+    }
+    return null;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2436,7 +2472,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -2529,15 +2565,40 @@ export class AgentModeService {
       tools = null,
       tool_choice = null,
       webSearch = false,
+      webSearchParameters,
       max_completion_tokens = null,
       temperature = null,
       response_format = null,
       usageContext = null,
       humanPaced = false,
       timeoutMs,
-      fallbackModels,
+      fallbackModels: requestedFallbackModels,
+      customerRoutable = false,
       taskClass,
+      providerPolicy,
+      providerIgnore,
+      requireContent,
+      priorityToolNames,
     } = options || {};
+
+    // ENG-2108: the funding for THIS call. A run starts AgentWeb-funded; this call moves
+    // to a customer key only when they have a usable key for this model's provider.
+    // Both the transport and the usage record below use this, not the run's ambient value.
+    const callFunding = await resolveCallFunding(currentRunFunding(), {
+      userId: usageContext?.userId,
+      modelLab: this.llmModels[model].provider,
+      customerRoutable,
+    });
+    // On a customer key the request may only stay with the customer's provider, so a
+    // fallback model from another lab is dropped rather than left to fail (or bill AgentWeb).
+    const fallbackModels =
+      callFunding?.route === 'api_key'
+        ? requestedFallbackModels?.filter((id) => {
+            const fallback = this.llmModels[this.normalizeModelId(id)];
+            // An unknown id is kept so it is rejected below exactly as on an AgentWeb call.
+            return !fallback || fallback.provider === this.llmModels[model].provider;
+          })
+        : requestedFallbackModels;
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
     // throttling, and provider fallback for every text/tool call.
@@ -2556,26 +2617,14 @@ export class AgentModeService {
     params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
-      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
-      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
-      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
-      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
-      // Studio" slot, and default routing lands on the degraded one. Skip it
-      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
-      // uptime recovers — remove this then, since it forfeits the BYOK cost
-      // discount in exchange for reliability.
-      //
-      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
-      // are the slugs OpenRouter's separate BYOK-credential-creation API
-      // uses, not what `provider.ignore` matches on here. This param matches
-      // against the `provider_name` string from GET /v1/models/{id}/endpoints
-      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
-      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
-      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
-      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
-      // proposed the slug form once already and was reverted for this reason
-      // — verify empirically against live traffic before changing this line.
+      // No default exclusions today; see openRouterIgnoredProviders.
       params.provider.ignore = ignoredProviders;
+    }
+    if (providerIgnore?.length) {
+      params.provider.ignore = [...new Set([...(params.provider.ignore ?? []), ...providerIgnore])];
+    }
+    if (providerPolicy) {
+      params.provider = applyProviderPolicy(params.provider, providerPolicy);
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
@@ -2616,9 +2665,11 @@ export class AgentModeService {
       if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
         console.warn(
           `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
-          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping ${callerToolLimit}` +
+          `${priorityToolNames?.length ? ` (required tools first: ${priorityToolNames.join(', ')})` : ''}.`,
         );
-        boundedTools = callerTools.slice(0, callerToolLimit);
+        // ENG-2824: a plain slice silently undeclared any required tool past the cap.
+        boundedTools = boundToolsForModel(callerTools, callerToolLimit, priorityToolNames);
       }
     }
     // OpenRouter normalizes the transport, but the selected provider still
@@ -2637,7 +2688,7 @@ export class AgentModeService {
         }) : tool)
       : boundedTools;
     const requestTools = webSearch
-      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search', ...(webSearchParameters && Object.keys(webSearchParameters).length ? { parameters: webSearchParameters } : {}) }]
       : normalizedCallerTools;
     // ENG-1831: every chain member receives the same parameter set, and
     // require_parameters makes one unsupported field unroutable (ENG-199 404).
@@ -2699,7 +2750,10 @@ export class AgentModeService {
       // this covers OpenRouter's malformed/empty-response failure classes,
       // which are not a rate limit, network blip, or 5xx by
       // classifyToolErrorClass's general taxonomy.
-      return isMalformedOpenRouterResponseError(error);
+      // ENG-503: a truncated provider body the SDK could not deserialize is the
+      // same "response cut mid-stream" class — one in-call retry (bounded by
+      // maxAttempts, before anything from this call is persisted).
+      return isMalformedOpenRouterResponseError(error) || isProviderDeserializationError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
@@ -2725,9 +2779,10 @@ export class AgentModeService {
     // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
     // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
     // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
-    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+    const res = await pickTransport(callFunding, model).send(client, model, params, {
       timeoutMs: timeoutMs ?? 5 * 60 * 1000,
       maxAttempts,
+      requireContent,
       isRetryableError: isRetryableLlmCallError,
       // Bound to the instance method, not a transport-local timer: this is the seam
       // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
@@ -2788,6 +2843,9 @@ export class AgentModeService {
       (res as any)?.model,
       paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
     ) ?? model;
+    if (meteredModel !== model) {
+      console.warn(`AgentMode: OpenRouter fallback served "${meteredModel}" instead of "${model}"`);
+    }
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2797,7 +2855,7 @@ export class AgentModeService {
       const usage: any = (res as any)?.usage;
       if (usage) {
         const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-        recordLlmUsage(currentRunFunding(), {
+        recordLlmUsage(callFunding, {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
@@ -2810,13 +2868,23 @@ export class AgentModeService {
           cacheReadTokens: normalizedUsage.cacheReadTokens,
           cacheWriteTokens: normalizedUsage.cacheWriteTokens,
           cacheWriteByTtl: usage.cache_creation_by_ttl,
+          // ENG-2106: only on a BYOK response, and only for the customer-funded branch of
+          // recordLlmUsage (it strips this before any AgentWeb rail). Not costUsdOverride:
+          // on a non-BYOK response that is AgentWeb's own cost.
+          ...customerUpstreamCost(usage),
+          // ENG-2720: on BYOK, upstream tokens PLUS OpenRouter's own charge (web-search fee, BYOK fee).
           costUsdOverride:
             usage.is_byok === true
-              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                usage.cost_details.upstream_inference_cost > 0
-                ? usage.cost_details.upstream_inference_cost
-                : undefined
+              ? openRouterByokCostUsd(
+                  usage,
+                  this.estimateCost(
+                    meteredModel,
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheReadTokens,
+                    normalizedUsage.cacheWriteTokens,
+                  ),
+                )
               : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,
@@ -2892,6 +2960,25 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
+  /**
+   * ENG-2824: the schedule's requiredFunctionCalls for a scheduled session, so callLLM
+   * keeps them declared when it truncates the tool list. Empty for any other session or
+   * when the schedule cannot be read.
+   */
+  private async resolveScheduledRequiredToolNames(currentSession: any): Promise<string[]> {
+    if (currentSession?.sessionType !== 'scheduled') return [];
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return [];
+    try {
+      const schedule: any = await scheduleDb.getScheduleById(scheduleId);
+      const required = schedule?.requiredFunctionCalls;
+      return Array.isArray(required) ? required.filter((n: unknown): n is string => typeof n === 'string') : [];
+    } catch (error) {
+      console.warn(`AgentMode: could not read schedule ${scheduleId} for required-tool prioritisation:`, error);
+      return [];
+    }
+  }
+
   private async resolveScheduledPublishAuthorization(
     currentSession: any
   ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
@@ -2982,6 +3069,471 @@ export class AgentModeService {
     return sharedMakeToolUsageCallback(sessionId, toolName);
   }
 
+  /**
+   * ENG-2113 PR C0: the turn preamble of generateMarketingResponse, moved out unchanged so a second backend (Claude Code
+   * through the login host) can build the exact context Emma's own loop builds. Fetches the session, user, skills and
+   * system prompt, resolves entitlement and billing, injects skills, memory, roster, the conversation, the unattended
+   * publish directive and the anti-loop directive, and returns the messages plus every value the loop derives from them.
+   * Any change here changes what the model reads: agentModeService.prepareTurnContext.golden.test.ts pins it.
+   */
+  async prepareTurnContext(input: {
+    messageContent: string;
+    sessionHistory: ChatMessage[];
+    userId: string;
+    llmModel: string;
+    sessionId: string;
+    isInteractiveShare: boolean;
+    screenshotUrl?: string;
+    isDelegatedAccess: boolean;
+    publishAuthorizationOverride?: SchedulePublishAuthorization;
+    isUnattendedRun?: boolean;
+  }): Promise<{
+    currentSession: Awaited<ReturnType<typeof chatbotDb.getChatSession>>;
+    userAllowedSkillIds: Awaited<ReturnType<typeof getAllowedSkills>>;
+    publishedSkills: Awaited<ReturnType<typeof skillService.getPublishedSkills>>;
+    billingUserId: string;
+    userAllowedSkillIdsForDisplay: string[];
+    isAdmin: boolean;
+    turnModelCorrection: ReturnType<typeof resolveTurnModelCorrection>;
+    hasAdminAccess: boolean;
+    workPlanTurnBefore: ReturnType<typeof snapshotWorkPlanTurn>;
+    isLegacySession: boolean;
+    associatedSkills: any[];
+    sessionAssociatedSkillIds: string[];
+    liveInstalledSkillIds: string[];
+    allowedToolNames: Set<string>;
+    installedSkillContextMsg: string;
+    availableSkillContextMsg: string;
+    messages: any[];
+    isScheduledSession: boolean;
+    humanPacedTurn: boolean;
+    loopBreakerActive: boolean;
+  }> {
+    const { messageContent, sessionHistory, userId, llmModel, sessionId, isInteractiveShare, screenshotUrl, isDelegatedAccess, publishAuthorizationOverride, isUnattendedRun } = input;
+    // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
+    const { userDb: userDbForAdmin } = await import('./db');
+    // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+    // tokenUsageService pulls in the db -> aws config graph, and a static import
+    // here would drag it into every suite that mocks this module.
+    //
+    // Everything is swallowed to the acting user. Several legacy suites replace
+    // this module with a partial mock that defines only `incrementUserTokenUsage`,
+    // so the export can genuinely be missing — and beyond that, a descriptive
+    // ledger attribute must never be the reason a customer's response fails.
+    // `userId` is the value the row carried before this existed, so the
+    // degraded path is the old behaviour exactly.
+    const resolveBillingSubject = async (): Promise<string> => {
+      try {
+        const { resolveBillingUserId } = await import('./tokenUsageService');
+        if (typeof resolveBillingUserId !== 'function') return userId;
+        return (await resolveBillingUserId(userId)) || userId;
+      } catch (err) {
+        console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+        return userId;
+      }
+    };
+    let [
+      currentSession,
+      userAllowedSkillIds,
+      publishedSkills,
+      baseSystemPrompt,
+      currentUser,
+      billingUserId
+    ] = await Promise.all([
+      chatbotDb.getChatSession(sessionId),
+      getAllowedSkills(userId),
+      skillService.getPublishedSkills(),
+      this.getMarketingSystemPrompt(),
+      userDbForAdmin.getUserById(userId).catch((err) => {
+        console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+        return null;
+      }),
+      // ENG-1217: who this response's spend is BILLED to, resolved once and
+      // stamped on every ledger row it writes. The ledger has always carried a
+      // `billingUserId` attribute and this path has never filled it, so an org
+      // member's rows claimed they paid for themselves while
+      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // disagreed, and a reader had nothing but today's membership to go on.
+      //
+      // Resolved here rather than inside `recordUsage` because it costs two
+      // reads: once per response is free alongside this fetch, once per LLM
+      // call would not be.
+      resolveBillingSubject()
+    ]);
+
+    // Log if user not found (indicates orphaned schedule or deleted user)
+    if (!currentUser) {
+      console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
+    }
+
+    // ENG-1978: getAllowedSkills returns null when the tier could not be read or recognised.
+    // The RAW value (possibly null) is what reaches getFilteredTools below, which fails closed
+    // on it — that is the actual gate. The skill-catalog/context helpers further down only need
+    // a list to filter a catalog against, and for them an unresolved entitlement should show
+    // nothing extra rather than everything, so they get [] instead. Keeping the two separate
+    // matters: collapsing null to [] here would silently downgrade the gate to "no skills, but
+    // still hand over every foundation tool."
+    const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
+    const isAdmin = currentUser?.isAdmin === true;
+
+    // ENG-1205: the correction this turn was admitted under, stamped onto the
+    // turn's assistant messages beside `llm` so a reload can still explain why
+    // the badge disagrees with the picker. The controller wrote this decision
+    // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+    // rejects a slot that does not describe THIS turn, so a resumed or replayed
+    // run degrades to no stamp rather than borrowing a newer turn's model.
+    const turnModelCorrection = resolveTurnModelCorrection(
+      (currentSession as any)?.llmUsagePolicyDecision,
+      llmModel,
+    );
+    // Admin tools are available to real admins OR to messages arriving via admin delegated access.
+    // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
+    const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
+
+    const workPlan = currentSession?.workPlan;
+    const openResearchRequests = currentSession?.openResearchRequests;
+    const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
+    const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
+
+    // 2. Initialize Context Variables
+    // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
+    // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
+    const rawAssociatedSkills = currentSession?.associatedSkills;
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    let associatedSkills: any[] = [];
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    let liveInstalledSkillIds: string[] = sessionAssociatedSkillIds;
+    if (sessionAssociatedSkillIds.length) {
+      associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
+    }
+
+    // Build initial skill context
+    let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
+
+    // 3. Build Initial Messages
+    let effectiveMessageContent = messageContent;
+    if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+      try {
+        const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
+        effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
+      } catch (voiceInjectErr) {
+        console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
+      }
+    }
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+
+    // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
+    let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
+
+    const today = new Date().toISOString().split('T')[0];
+    // ENG-803: resolve this scheduled run's publish authorization from the schedule
+    // record so the directive states a DECISION rather than leaving one for the
+    // model to guess — guessing is what produced the fabricated "X publishing gate".
+    // Resolved here rather than in the controller so ENG-803 stays clear of the
+    // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+    // text. This is the UNATTENDED run path, so it always passes a resolved
+    // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+    // deliberately passes nothing (see the tri-state note on the override).
+    // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
+    // and the publish directive appended after the conversation, so a single read
+    // backs every statement the model sees about publishing.
+    // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
+    // can straddle a revocation, and the disagreement that bites is a prompt saying
+    // "draft only" while the checker still requires a publishing tool — the agent is
+    // then told not to publish and marked incomplete for not publishing, which is the
+    // retry loop this ticket is about. Using one value makes that unrepresentable.
+    // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
+    // turn message, and the publish sinks re-read live consent at the write itself.
+    const publishAuthorization =
+      publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
+    // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
+    // passes a resolved boolean") was true only when this function had a single
+    // caller. It is also reached by an ATTENDED turn — a schedule-created session
+    // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
+    // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
+    // WITHHELD... turn off Require approval before publishing" message for a user
+    // who never attempted to publish anything (live-confirmed on env2: an attended
+    // turn asking to post to Slack got this unrelated publish-authorization
+    // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
+    // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
+    // undefined -> "Emit the base override... No mandate, no publish block") — it was
+    // simply never reached because this call always supplied a resolved value.
+    const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
+    // ENG-1245: reason is only ever present on the withheld branch, and only when
+    // resolveScheduledPublishAuthorization derived it (an override supplied by a
+    // caller elsewhere carries no reason, so this falls back to the pre-existing,
+    // genuine-hold text — see getScheduledSessionOverride's default).
+    const sessionTypeLabel = getScheduledSessionOverride(
+      currentSession?.sessionType,
+      publishAuthorized,
+      isUnattendedRun === true
+        ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+        : undefined
+    );
+    const messages: any[] = [
+      { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
+    ];
+    // Use helper to inject installed skills and templates
+    this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
+
+    // Inject admin delegation notice so the LLM knows admin tools are available via delegation
+    if (isDelegatedAccess && !isAdmin) {
+      messages.push({
+        role: 'system',
+        content: '⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session.'
+      });
+    }
+
+    // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
+    // current message, not just recency — so a relevant older fact is surfaced even when
+    // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
+    // (<= limit) inject everything, identical to the previous recency behavior.
+    try {
+      const { userDb, orgMemoryDb, orgDb } = await import('./db');
+      const memoryUser = await userDb.getUserById(userId);
+
+      const MEMORY_INJECTION_LIMIT = 20;
+      // Embed the current message once, lazily, and reuse for both account + org memory.
+      // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
+      let queryEmbedding: number[] | null | undefined;
+      const getQueryEmbedding = async (): Promise<number[] | null> => {
+        if (queryEmbedding === undefined) {
+          queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
+        }
+        return queryEmbedding;
+      };
+
+      // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
+      // any legacy memory missing an embedding so ranking is fair and one-time.
+      const selectRelevantMemories = async (
+        all: any[],
+        backfill: (memoryId: string, embedding: number[]) => void
+      ): Promise<any[]> => {
+        if (all.length <= MEMORY_INJECTION_LIMIT) {
+          return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+        }
+        const qEmbedding = await getQueryEmbedding();
+        if (!qEmbedding) {
+          // Embedding unavailable → degrade gracefully to recency.
+          return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
+        }
+        for (const m of all) {
+          if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
+            const emb = await embedText(m.content, { userId, feature: 'agent_task' });
+            if (emb) {
+              m.embedding = emb;
+              backfill(m.memoryId, emb);
+            }
+          }
+        }
+        return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
+      };
+
+      if (memoryUser?.memoryEnabled !== false) {
+        const allMemories = await accountMemoryDb.getUserMemories(userId);
+        const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
+          accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
+            console.error('Failed to backfill account memory embedding:', e)
+          );
+        });
+        // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+        // sessions (buildMemoryContextMessage bookends them with a staleness caution
+        // that itself dictates how to label any figure not re-verified this session).
+        const accountMemoryMessage = buildMemoryContextMessage(
+          'Account Memory (unverified notes from previous sessions):',
+          relevantMemories,
+          new Date()
+        );
+        if (accountMemoryMessage) {
+          messages.push({ role: 'assistant', content: accountMemoryMessage });
+        }
+      }
+
+      // Inject org-wide memory if the user belongs to an org
+      if (memoryUser?.orgId) {
+        const org = await orgDb.getOrgById(memoryUser.orgId);
+        if (org && org.orgMemoryEnabled !== false) {
+          const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
+          const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
+            orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
+              console.error('Failed to backfill org memory embedding:', e)
+            );
+          });
+          const orgMemoryMessage = buildMemoryContextMessage(
+            `Organization Memory (unverified shared notes for "${org.name}"):`,
+            relevantOrgMemories,
+            new Date()
+          );
+          if (orgMemoryMessage) {
+            messages.push({ role: 'assistant', content: orgMemoryMessage });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load account memories:', err);
+    }
+
+    // For Slack sessions (including scheduled scans), inject team roster as an assistant
+    // acknowledgement so the model treats it as established knowledge rather than an
+    // instruction it can override.
+    if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
+      messages.push({
+        role: 'assistant',
+        content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+      });
+    }
+
+    messages.push(...marketingMessages);
+
+    // ENG-827: the unattended publish directive goes LAST, after the conversation.
+    //
+    // It used to be appended to the system prompt the controller stores as the
+    // session's first message — which `buildMarketingContext` slices off (startIdx=1),
+    // so the model never read it at all. Position then turned out to matter on its own:
+    // on the preview, an authorized run whose base system prompt already carried an
+    // equivalent block still opened with "Should I post this?" and only published after
+    // three checker nudges. Buried ~70k characters up, the instruction lost to the
+    // publishing tools' own "get explicit approval first" text. Placed here it is the
+    // last thing before the model answers, and it is the same authorization object the
+    // dispatch guard enforces.
+    // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
+    // created session reopened in the attended chat UI keeps sessionType 'scheduled'
+    // but leaves isUnattendedRun undefined (per its own doc comment above: "every
+    // other caller of generateMarketingResponse is an attended interactive path and
+    // leaves this undefined"). This directive now carries a live-approval bypass
+    // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
+    // so undefined must be excluded, not just false — same strict-true discriminator
+    // already used at the Meta-write approval-deck gate below.
+    if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+      // ENG-2204: owner opt-out for the Slack-send override — resolved independently
+      // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
+      // for why this isn't threaded through publishAuthorizationOverride instead.
+      const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
+      const publishDirective = getUnattendedExecutionDirective(
+        'scheduled',
+        isAdmin,
+        publishAuthorization.authorized ? 'authorized' : 'withheld',
+        publishAuthorization.tools,
+        slackSendAuthorized
+      );
+      if (publishDirective) messages.push({ role: 'system', content: publishDirective });
+    }
+
+    // Cross-message loop detection: when the user repeats the same message multiple times
+    // without providing requested information, stop asking and use available context tools.
+    const LOOP_DETECTION_THRESHOLD = 3;
+    const recentUserHistory = sessionHistory
+      .filter(m => m.role === 'user')
+      .slice(-LOOP_DETECTION_THRESHOLD);
+    const normalizedCurrent = messageContent.trim().toLowerCase();
+    const consecutiveIdentical = recentUserHistory.filter(
+      m => (m.content || '').trim().toLowerCase() === normalizedCurrent
+    ).length;
+
+    const isScheduledSession = currentSession?.sessionType === 'scheduled';
+
+    // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
+    //
+    // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
+    // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
+    // itself if the prefix is re-read after the 5-minute window would have
+    // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
+    // runs, but still charges the surcharge to a fast back-and-forth chat and
+    // to a one-turn session that writes the cache and ends, neither of which
+    // ever collects the benefit.
+    //
+    // The signal is how long the user actually took to send THIS message,
+    // measured from the message history. Do NOT use `session.updatedAt`: the
+    // controller persists the incoming user message (bumping updatedAt) and
+    // reloads the session BEFORE handing it to this loop, so that gap is
+    // always ~0 and the extended TTL would never be requested at all.
+    // STICKY on purpose: any pause in this session, not just the latest one.
+    // Checking only the newest gap leaves the fast->slow transition uncovered
+    // — a turn that followed a quick reply writes a 5-minute cache, and the
+    // user's next pause then expires it. Modelled on the ticket's own session
+    // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
+    // $12.44). A user who has paused once has shown they are human-paced, and
+    // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
+    const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
+    const humanPacedTurn =
+      !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
+    // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
+    // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
+    // human withholding information. The anti-loop remedy cannot satisfy a tool call
+    // and — for an irreversible/publishing write — becomes pressure to publish
+    // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
+    // of the loop-breaker entirely; also suppress it for ANY verification press so a
+    // non-scheduled verified-generate run is covered too.
+    const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
+    if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
+      console.warn(
+        `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
+        `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
+        `not injecting a 'proceed anyway' instruction (ENG-844).`
+      );
+    }
+    // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
+    // human sending the same message 3+ times. Scheduled/headless runs get a fresh
+    // session per run (one user turn), so this can never legitimately trigger there;
+    // gating it out explicitly is defense-in-depth against any future path and, more
+    // importantly, guarantees a headless run is NEVER told to "hold and wait for the
+    // user" (which would park an autonomous delivery — the ENG-517/634 class) and
+    // that a scheduled run's install_skills gateway is never stripped.
+    //
+    // When the loop-breaker fires, also hard-gate `install_skills` for this turn
+    // (see the tool-build block below). On the agentMode path install_skills is the
+    // legitimate skill gateway, so it is only stripped while a loop is active — a
+    // stuck user should never trigger skill installation, and the read-only
+    // foundation context tools (read_brand_guidelines / read_market_strategy) remain
+    // available so the model is never starved of a way to make progress.
+    const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
+    if (loopBreakerActive) {
+      // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
+      // converters hoist role:'system' into the system instruction, so the model
+      // never sees this control text as part of the user's message. Injecting it
+      // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
+      // — Gemini merges consecutive user parts — to read the directive as the
+      // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
+      // the user that they never sent. The directive also no longer tells the
+      // model to "proceed with reasonable generic placeholders" — for a task with
+      // no target (e.g. a QA check) that is an instruction to fabricate, which the
+      // model refuses and then falls back to re-asking, sustaining the loop.
+      messages.push({
+        role: 'system',
+        content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
+3. If that context is enough to complete the task, do so using it.
+4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
+5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
+      });
+    }
+
+    return {
+      currentSession,
+      userAllowedSkillIds,
+      publishedSkills,
+      billingUserId,
+      userAllowedSkillIdsForDisplay,
+      isAdmin,
+      turnModelCorrection,
+      hasAdminAccess,
+      workPlanTurnBefore,
+      isLegacySession,
+      associatedSkills,
+      sessionAssociatedSkillIds,
+      liveInstalledSkillIds,
+      allowedToolNames,
+      installedSkillContextMsg,
+      availableSkillContextMsg,
+      messages,
+      isScheduledSession,
+      humanPacedTurn,
+      loopBreakerActive,
+    };
+  }
+
   // Generate AI response for marketing conversation
   async generateMarketingResponse(
     messageContent: string,
@@ -3020,6 +3572,9 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
+    // ENG-669 PR-C: set when `llmModel` was routed by the AgentWeb Model (the selection, the table rule and version).
+    // Stamped on this turn's assistant messages beside `llm`, like the ENG-1205 correction.
+    modelRouting?: MessageModelRouting,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -3065,399 +3620,61 @@ export class AgentModeService {
       const startMemory = process.memoryUsage();
       const startTime = Date.now();
 
-      // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
-      const { userDb: userDbForAdmin } = await import('./db');
-      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
-      // tokenUsageService pulls in the db -> aws config graph, and a static import
-      // here would drag it into every suite that mocks this module.
-      //
-      // Everything is swallowed to the acting user. Several legacy suites replace
-      // this module with a partial mock that defines only `incrementUserTokenUsage`,
-      // so the export can genuinely be missing — and beyond that, a descriptive
-      // ledger attribute must never be the reason a customer's response fails.
-      // `userId` is the value the row carried before this existed, so the
-      // degraded path is the old behaviour exactly.
-      const resolveBillingSubject = async (): Promise<string> => {
-        try {
-          const { resolveBillingUserId } = await import('./tokenUsageService');
-          if (typeof resolveBillingUserId !== 'function') return userId;
-          return (await resolveBillingUserId(userId)) || userId;
-        } catch (err) {
-          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
-          return userId;
-        }
-      };
-      let [
-        currentSession,
+      // ENG-2113 PR C0: everything the model is told before the loop starts (data fetch, system prompt, skills, memory,
+      // conversation, directives) is built by prepareTurnContext(), a pure move so the Claude Code backend builds the
+      // identical context. The loop below reads the values it needs from `turnContext`.
+      const turnContext = await this.prepareTurnContext({
+        messageContent,
+        sessionHistory,
+        userId,
+        llmModel,
+        sessionId,
+        isInteractiveShare,
+        screenshotUrl,
+        isDelegatedAccess,
+        publishAuthorizationOverride,
+        isUnattendedRun,
+      });
+      const {
         userAllowedSkillIds,
         publishedSkills,
-        baseSystemPrompt,
-        currentUser,
-        billingUserId
-      ] = await Promise.all([
-        chatbotDb.getChatSession(sessionId),
-        getAllowedSkills(userId),
-        skillService.getPublishedSkills(),
-        this.getMarketingSystemPrompt(),
-        userDbForAdmin.getUserById(userId).catch((err) => {
-          console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
-          return null;
-        }),
-        // ENG-1217: who this response's spend is BILLED to, resolved once and
-        // stamped on every ledger row it writes. The ledger has always carried a
-        // `billingUserId` attribute and this path has never filled it, so an org
-        // member's rows claimed they paid for themselves while
-        // `incrementUserTokenUsage` was charging the org root — the two stores
-        // disagreed, and a reader had nothing but today's membership to go on.
-        //
-        // Resolved here rather than inside `recordUsage` because it costs two
-        // reads: once per response is free alongside this fetch, once per LLM
-        // call would not be.
-        resolveBillingSubject()
-      ]);
+        billingUserId,
+        userAllowedSkillIdsForDisplay,
+        isAdmin,
+        turnModelCorrection,
+        hasAdminAccess,
+        workPlanTurnBefore,
+        isLegacySession,
+        sessionAssociatedSkillIds,
+        messages,
+        isScheduledSession,
+        humanPacedTurn,
+        loopBreakerActive,
+      } = turnContext;
+      // The loop reassigns these when a skill is installed mid-turn.
+      let {
+        currentSession,
+        associatedSkills,
+        liveInstalledSkillIds,
+        allowedToolNames,
+        installedSkillContextMsg,
+        availableSkillContextMsg,
+      } = turnContext;
 
-      // Log if user not found (indicates orphaned schedule or deleted user)
-      if (!currentUser) {
-        console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
-      }
-
-      const isAdmin = currentUser?.isAdmin === true;
-
-      // ENG-1205: the correction this turn was admitted under, stamped onto the
-      // turn's assistant messages beside `llm` so a reload can still explain why
-      // the badge disagrees with the picker. The controller wrote this decision
-      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
-      // rejects a slot that does not describe THIS turn, so a resumed or replayed
-      // run degrades to no stamp rather than borrowing a newer turn's model.
-      const turnModelCorrection = resolveTurnModelCorrection(
-        (currentSession as any)?.llmUsagePolicyDecision,
-        llmModel,
-      );
-      // Admin tools are available to real admins OR to messages arriving via admin delegated access.
-      // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
-      const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
-
-      const workPlan = currentSession?.workPlan;
-      const openResearchRequests = currentSession?.openResearchRequests;
-      const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
-      const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
-
-      // 2. Initialize Context Variables
-      // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
-      // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
-      const rawAssociatedSkills = currentSession?.associatedSkills;
-      const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
-      let associatedSkills: any[] = [];
-      const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
-      if (sessionAssociatedSkillIds.length) {
-        associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
-      }
-
-      // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
-
-      // 3. Build Initial Messages
-      let effectiveMessageContent = messageContent;
-      if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
-        try {
-          const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
-          effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
-        } catch (voiceInjectErr) {
-          console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
-        }
-      }
-      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
-
-      // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
-
-      const today = new Date().toISOString().split('T')[0];
-      // ENG-803: resolve this scheduled run's publish authorization from the schedule
-      // record so the directive states a DECISION rather than leaving one for the
-      // model to guess — guessing is what produced the fabricated "X publishing gate".
-      // Resolved here rather than in the controller so ENG-803 stays clear of the
-      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
-      // text. This is the UNATTENDED run path, so it always passes a resolved
-      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
-      // deliberately passes nothing (see the tri-state note on the override).
-      // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
-      // and the publish directive appended after the conversation, so a single read
-      // backs every statement the model sees about publishing.
-      // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
-      // can straddle a revocation, and the disagreement that bites is a prompt saying
-      // "draft only" while the checker still requires a publishing tool — the agent is
-      // then told not to publish and marked incomplete for not publishing, which is the
-      // retry loop this ticket is about. Using one value makes that unrepresentable.
-      // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
-      // turn message, and the publish sinks re-read live consent at the write itself.
-      const publishAuthorization =
-        publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
-      // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
-      // passes a resolved boolean") was true only when this function had a single
-      // caller. It is also reached by an ATTENDED turn — a schedule-created session
-      // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
-      // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
-      // WITHHELD... turn off Require approval before publishing" message for a user
-      // who never attempted to publish anything (live-confirmed on env2: an attended
-      // turn asking to post to Slack got this unrelated publish-authorization
-      // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
-      // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
-      // undefined -> "Emit the base override... No mandate, no publish block") — it was
-      // simply never reached because this call always supplied a resolved value.
-      const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
-      // ENG-1245: reason is only ever present on the withheld branch, and only when
-      // resolveScheduledPublishAuthorization derived it (an override supplied by a
-      // caller elsewhere carries no reason, so this falls back to the pre-existing,
-      // genuine-hold text — see getScheduledSessionOverride's default).
-      const sessionTypeLabel = getScheduledSessionOverride(
-        currentSession?.sessionType,
-        publishAuthorized,
-        isUnattendedRun === true
-          ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
-          : undefined
-      );
-      const messages: any[] = [
-        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
-      ];
-      // Use helper to inject installed skills and templates
-      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
-
-      // Inject admin delegation notice so the LLM knows admin tools are available via delegation
-      if (isDelegatedAccess && !isAdmin) {
-        messages.push({
-          role: 'system',
-          content: '⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session.'
-        });
-      }
-
-      // Inject memory context (cross-session knowledge). Retrieve by *relevance* to the
-      // current message, not just recency — so a relevant older fact is surfaced even when
-      // the account has more than MEMORY_INJECTION_LIMIT stored memories. Small accounts
-      // (<= limit) inject everything, identical to the previous recency behavior.
-      try {
-        const { userDb, orgMemoryDb, orgDb } = await import('./db');
-        const memoryUser = await userDb.getUserById(userId);
-
-        const MEMORY_INJECTION_LIMIT = 20;
-        // Embed the current message once, lazily, and reuse for both account + org memory.
-        // Only computed when a memory set actually exceeds the limit (no cost for small accounts).
-        let queryEmbedding: number[] | null | undefined;
-        const getQueryEmbedding = async (): Promise<number[] | null> => {
-          if (queryEmbedding === undefined) {
-            queryEmbedding = messageContent ? await embedText(messageContent, { userId, feature: 'agent_task' }) : null;
-          }
-          return queryEmbedding;
-        };
-
-        // Rank `all` memories by relevance to the message. Lazily embeds (and backfills)
-        // any legacy memory missing an embedding so ranking is fair and one-time.
-        const selectRelevantMemories = async (
-          all: any[],
-          backfill: (memoryId: string, embedding: number[]) => void
-        ): Promise<any[]> => {
-          if (all.length <= MEMORY_INJECTION_LIMIT) {
-            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
-          }
-          const qEmbedding = await getQueryEmbedding();
-          if (!qEmbedding) {
-            // Embedding unavailable → degrade gracefully to recency.
-            return rankMemoriesByRelevance(all, [], MEMORY_INJECTION_LIMIT);
-          }
-          for (const m of all) {
-            if (!Array.isArray(m.embedding) || m.embedding.length === 0) {
-              const emb = await embedText(m.content, { userId, feature: 'agent_task' });
-              if (emb) {
-                m.embedding = emb;
-                backfill(m.memoryId, emb);
-              }
-            }
-          }
-          return rankMemoriesByRelevance(all, qEmbedding, MEMORY_INJECTION_LIMIT);
-        };
-
-        if (memoryUser?.memoryEnabled !== false) {
-          const allMemories = await accountMemoryDb.getUserMemories(userId);
-          const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
-            accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
-              console.error('Failed to backfill account memory embedding:', e)
-            );
-          });
-          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
-          // sessions (buildMemoryContextMessage bookends them with a staleness caution
-          // that itself dictates how to label any figure not re-verified this session).
-          const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (unverified notes from previous sessions):',
-            relevantMemories,
-            new Date()
-          );
-          if (accountMemoryMessage) {
-            messages.push({ role: 'assistant', content: accountMemoryMessage });
-          }
-        }
-
-        // Inject org-wide memory if the user belongs to an org
-        if (memoryUser?.orgId) {
-          const org = await orgDb.getOrgById(memoryUser.orgId);
-          if (org && org.orgMemoryEnabled !== false) {
-            const allOrgMemories = await orgMemoryDb.getOrgMemories(memoryUser.orgId);
-            const relevantOrgMemories = await selectRelevantMemories(allOrgMemories, (memoryId, emb) => {
-              orgMemoryDb.setMemoryEmbedding(memoryUser.orgId!, memoryId, emb).catch((e) =>
-                console.error('Failed to backfill org memory embedding:', e)
-              );
-            });
-            const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (unverified shared notes for "${org.name}"):`,
-              relevantOrgMemories,
-              new Date()
-            );
-            if (orgMemoryMessage) {
-              messages.push({ role: 'assistant', content: orgMemoryMessage });
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load account memories:', err);
-      }
-
-      // For Slack sessions (including scheduled scans), inject team roster as an assistant
-      // acknowledgement so the model treats it as established knowledge rather than an
-      // instruction it can override.
-      if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
-        messages.push({
-          role: 'assistant',
-          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
-        });
-      }
-
-      messages.push(...marketingMessages);
-
-      // ENG-827: the unattended publish directive goes LAST, after the conversation.
-      //
-      // It used to be appended to the system prompt the controller stores as the
-      // session's first message — which `buildMarketingContext` slices off (startIdx=1),
-      // so the model never read it at all. Position then turned out to matter on its own:
-      // on the preview, an authorized run whose base system prompt already carried an
-      // equivalent block still opened with "Should I post this?" and only published after
-      // three checker nudges. Buried ~70k characters up, the instruction lost to the
-      // publishing tools' own "get explicit approval first" text. Placed here it is the
-      // last thing before the model answers, and it is the same authorization object the
-      // dispatch guard enforces.
-      // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
-      // created session reopened in the attended chat UI keeps sessionType 'scheduled'
-      // but leaves isUnattendedRun undefined (per its own doc comment above: "every
-      // other caller of generateMarketingResponse is an attended interactive path and
-      // leaves this undefined"). This directive now carries a live-approval bypass
-      // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
-      // so undefined must be excluded, not just false — same strict-true discriminator
-      // already used at the Meta-write approval-deck gate below.
-      if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
-        // ENG-2204: owner opt-out for the Slack-send override — resolved independently
-        // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
-        // for why this isn't threaded through publishAuthorizationOverride instead.
-        const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
-        const publishDirective = getUnattendedExecutionDirective(
-          'scheduled',
-          isAdmin,
-          publishAuthorization.authorized ? 'authorized' : 'withheld',
-          publishAuthorization.tools,
-          slackSendAuthorized
-        );
-        if (publishDirective) messages.push({ role: 'system', content: publishDirective });
-      }
-
-      // Cross-message loop detection: when the user repeats the same message multiple times
-      // without providing requested information, stop asking and use available context tools.
-      const LOOP_DETECTION_THRESHOLD = 3;
-      const recentUserHistory = sessionHistory
-        .filter(m => m.role === 'user')
-        .slice(-LOOP_DETECTION_THRESHOLD);
-      const normalizedCurrent = messageContent.trim().toLowerCase();
-      const consecutiveIdentical = recentUserHistory.filter(
-        m => (m.content || '').trim().toLowerCase() === normalizedCurrent
-      ).length;
-
-      const isScheduledSession = currentSession?.sessionType === 'scheduled';
-
-      // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
-      //
-      // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
-      // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
-      // itself if the prefix is re-read after the 5-minute window would have
-      // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
-      // runs, but still charges the surcharge to a fast back-and-forth chat and
-      // to a one-turn session that writes the cache and ends, neither of which
-      // ever collects the benefit.
-      //
-      // The signal is how long the user actually took to send THIS message,
-      // measured from the message history. Do NOT use `session.updatedAt`: the
-      // controller persists the incoming user message (bumping updatedAt) and
-      // reloads the session BEFORE handing it to this loop, so that gap is
-      // always ~0 and the extended TTL would never be requested at all.
-      // STICKY on purpose: any pause in this session, not just the latest one.
-      // Checking only the newest gap leaves the fast->slow transition uncovered
-      // — a turn that followed a quick reply writes a 5-minute cache, and the
-      // user's next pause then expires it. Modelled on the ticket's own session
-      // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
-      // $12.44). A user who has paused once has shown they are human-paced, and
-      // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
-      const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
-      const humanPacedTurn =
-        !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
-      // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
-      // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
-      // human withholding information. The anti-loop remedy cannot satisfy a tool call
-      // and — for an irreversible/publishing write — becomes pressure to publish
-      // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
-      // of the loop-breaker entirely; also suppress it for ANY verification press so a
-      // non-scheduled verified-generate run is covered too.
-      const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
-        console.warn(
-          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
-          `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
-          `not injecting a 'proceed anyway' instruction (ENG-844).`
-        );
-      }
-      // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
-      // human sending the same message 3+ times. Scheduled/headless runs get a fresh
-      // session per run (one user turn), so this can never legitimately trigger there;
-      // gating it out explicitly is defense-in-depth against any future path and, more
-      // importantly, guarantees a headless run is NEVER told to "hold and wait for the
-      // user" (which would park an autonomous delivery — the ENG-517/634 class) and
-      // that a scheduled run's install_skills gateway is never stripped.
-      //
-      // When the loop-breaker fires, also hard-gate `install_skills` for this turn
-      // (see the tool-build block below). On the agentMode path install_skills is the
-      // legitimate skill gateway, so it is only stripped while a loop is active — a
-      // stuck user should never trigger skill installation, and the read-only
-      // foundation context tools (read_brand_guidelines / read_market_strategy) remain
-      // available so the model is never starved of a way to make progress.
-      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
-      if (loopBreakerActive) {
-        // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
-        // converters hoist role:'system' into the system instruction, so the model
-        // never sees this control text as part of the user's message. Injecting it
-        // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
-        // — Gemini merges consecutive user parts — to read the directive as the
-        // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
-        // the user that they never sent. The directive also no longer tells the
-        // model to "proceed with reasonable generic placeholders" — for a task with
-        // no target (e.g. a QA check) that is an instruction to fabricate, which the
-        // model refuses and then falls back to re-asking, sustaining the loop.
-        messages.push({
-          role: 'system',
-          content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
-1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
-3. If that context is enough to complete the task, do so using it.
-4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
-5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
-        });
-      }
+      // ENG-2824: a scheduled run's required calls must stay declared when callLLM
+      // truncates the tool list to the model's maxTools. Read once per turn; a failed
+      // read only loses the prioritisation, never the turn.
+      const requiredToolNamesForTurn = await this.resolveScheduledRequiredToolNames(currentSession);
 
       let content = '';
       const toolCalls: any[] = [];
       _toolCallsForTelemetry = toolCalls;
+      // ENG-2263: numbers the CRM tools actually returned this turn (the ledger above stores minimised results).
+      const crmEvidence = createCrmEvidenceCollector();
+      // ENG-2263: CRM tools that ran in earlier invocations of the task this one continues (auto-continuation, an answered
+      // question/approval card, "continue" after a time-limit partial). Their numbers are unrecoverable, so the check abstains.
+      const crmEarlier = crmEvidenceFromEarlierInvocations(sessionHistory);
+      const crmSessionNumbers = crmNumbersFromSessionHistory(sessionHistory);
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
       // ENG-351: accumulates the web sources this message consults across all its search
@@ -3514,6 +3731,8 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-922: sticky per-run flag — see priorMediaBudgetDeferred in toolDispatch.
+      let mediaBudgetDeferredThisRun = false;
       // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
       // of headroom below the controller's 10-min whole-turn hard cap. A single slow
       // high-quality image can take ~6–7 min, so the next variant slips past the fixed
@@ -3617,6 +3836,8 @@ export class AgentModeService {
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
       let truncatedByTimeBudget = false;
+      // ENG-2778: the forced synthesis was triggered by the step budget, not the clock.
+      let stepBudgetSynthesis = false;
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
@@ -3641,11 +3862,18 @@ export class AgentModeService {
       let lastToolSignature = '';
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
+      let antiLoopRepeatNudged = false;
       // Sliding-window loop detection: catches alternating/cycling patterns like
       // navigate→screenshot→navigate→screenshot that evade the consecutive check
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-2778: per-turn call counts keyed on tool + non-pagination args, so paging the
+      // same resource with varying offset/limit (which evades both signature checks) is seen.
+      const pagingCallCounts = new Map<string, number>();
+      let pagingSpiralNudged = false;
+      // ENG-2863: consecutive one-read-per-step streak; nudges the model to batch lookups.
+      const serialReadState = createSerialReadState();
       // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
       // Meta write that keeps failing the same way — see the annotation logic
       // below (and applyMetaWriteRetryBackstop's own header) for why this
@@ -3727,7 +3955,26 @@ export class AgentModeService {
           const urgency = remaining <= 3
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
-          (messages as any[]).push({ role: 'user', content: urgency });
+          // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
+          // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
+          (messages as any[]).push({ role: 'system', content: urgency });
+        }
+
+        // ENG-2778: the last step-budget iteration is a forced synthesis, mirroring the
+        // ENG-907 wall-clock path. Before this, a model still paging at step 40 got its
+        // tool calls executed and the loop exited with empty content, so the user got only
+        // the canned "maximum number of processing steps" apology despite 39 steps of
+        // gathered work. Reusing forceFinalSynthesis drops any tool calls this turn makes
+        // and suppresses the continuation ladders, so the turn ends with the model's own
+        // summary. Does not raise maxIterations. Iteration 1 is exempt (nothing gathered).
+        if (remaining === 0 && iteration > 1 && !forceFinalSynthesis) {
+          forceFinalSynthesis = true;
+          stepBudgetSynthesis = true;
+          console.warn(
+            `AgentMode: step budget exhausted for session ${sessionId} (${iteration}/${maxIterations}) — ` +
+            'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
+          );
+          (messages as any[]).push({ role: 'system', content: STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE });
         }
 
         // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
@@ -3751,13 +3998,13 @@ export class AgentModeService {
               'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
             });
           } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
             timeBudgetWrapUpWarned = true;
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
             });
           }
@@ -3769,6 +4016,7 @@ export class AgentModeService {
             // Refresh session and skills
             currentSession = await chatbotDb.getChatSession(sessionId);
             const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
+            liveInstalledSkillIds = updatedAssociatedSkillIds;
 
             if (updatedAssociatedSkillIds.length) {
               associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
@@ -3777,7 +4025,7 @@ export class AgentModeService {
             }
 
             // Re-build context using helper
-            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIdsForDisplay, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
             // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
             // Bedrock chains its cache checkpoints tools -> system -> messages —
             // so the whole cached prefix dies and the next call re-writes it in
@@ -3807,7 +4055,7 @@ export class AgentModeService {
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
             // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
+            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
 
             // Update messages using helper — track length change to keep initialMessageCount accurate
             const preUpdateLen = messages.length;
@@ -3908,6 +4156,12 @@ export class AgentModeService {
           }
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          // ENG-1948: never offer evaluation_workspace to a principal that can only be denied.
+          if (filteredToolsCache) {
+            filteredToolsCache = applyEvaluationWorkspaceListing(filteredToolsCache, allowedToolNames,
+              shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess, isInteractiveShare, isUnattendedRun }));
+          }
+
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
@@ -4000,6 +4254,7 @@ export class AgentModeService {
             // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
             // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
+            priorityToolNames: requiredToolNamesForTurn,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
@@ -4013,6 +4268,7 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            customerRoutable: true,
             // ENG-2121: bound this call to whatever remains before the synthesis
             // reserve (computed above) instead of letting it run unbounded — see the
             // catch block below for what happens when this actually fires.
@@ -4022,7 +4278,9 @@ export class AgentModeService {
           // OpenRouter performs provider/model failover inside the one request. A
           // transient failure here is therefore final for AgentWeb; do not issue a
           // second full completion with altered model semantics.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+          // ENG-2763: quota/credits exhaustion must reach the rethrow + quota classifier
+          // below; its 402 text can match the transient /5xx/ digit patterns.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && !classifyOpenRouterQuotaExhaustion(callError) && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
           } else if (
@@ -4059,7 +4317,7 @@ export class AgentModeService {
               'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
             );
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: buildTurnTimeBudgetNudge(
                 evaluateTurnTimeBudget({
                   startedAtMs: turnStartedAtMs,
@@ -4098,7 +4356,9 @@ export class AgentModeService {
         // hazard). Say plainly that the time ran out and point at the work in the steps
         // above, which is what the user can actually act on.
         if (synthesisRetryUnaffordable) {
-          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          // ENG-2778 (CodeRabbit): a failed step-budget synthesis has no time-budget cause;
+          // clear stale narration so the post-loop step-limit fallback applies instead.
+          content = stepBudgetSynthesis ? '' : TURN_TIME_BUDGET_FALLBACK_CONTENT;
           break;
         }
         const llmDurationMs = Date.now() - llmStart;
@@ -4134,6 +4394,21 @@ export class AgentModeService {
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
+
+        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
+        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        recordSessionBreakerShadowTurn({
+          sessionId,
+          userId,
+          billingUserId,
+          isScheduled: isScheduledSession,
+          costUsd: () => {
+            const usage: any = (response as any)?.usage;
+            if (!usage) return 0;
+            if (typeof usage.cost === 'number') return usage.cost;
+            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+          },
+        });
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
@@ -4176,10 +4451,17 @@ export class AgentModeService {
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
+        } else if (stepBudgetSynthesis) {
+          // ENG-2778 (CodeRabbit): an empty forced step-budget synthesis must not ship an
+          // earlier iteration's narration as the answer; clear it so the post-loop
+          // step-limit fallback applies.
+          content = '';
         }
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-669 PR-C: and, when the AgentWeb Model chose it, the selection and why.
+        if (modelRouting) Object.assign(responseMessage, modelRouting);
         // ENG-1205: and, when the model that ran is not the one that was asked
         // for, what was asked for — `llm` alone cannot distinguish "you picked
         // this" from "you were given this".
@@ -4386,7 +4668,12 @@ export class AgentModeService {
             // the four nudges ENG-1188 exists to cover. The sibling branch below
             // (plain emptiness, no residue detected at all) has no such guarantee
             // attached to it and keeps its own truncatedByTimeBudget exclusion.
-            if (!turnHadUsableText) {
+            if (!turnHadUsableText && stepBudgetSynthesis) {
+              // ENG-2778 (Opslane): at the step cap the post-loop step-limit message is
+              // the specific fallback; the ledger would ask the user to request a summary.
+              console.warn(`AgentMode: Step-budget synthesis unusable in session ${sessionId} — deferring to the step-limit message`);
+              content = '';
+            } else if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
             } else {
@@ -4403,7 +4690,7 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
-          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget && !stepBudgetSynthesis) {
             // Same failure family as the residue case above (a synthesis the run could
             // not produce), just without residue text to detect: the bounded
             // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
@@ -4430,6 +4717,8 @@ export class AgentModeService {
             // message the user actually needs to see (found via ENG-426 verification:
             // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
             // branch was clobbering it before the post-loop check ever ran).
+            // ENG-2778: same exclusion for the step-budget forced synthesis, whose
+            // post-loop step-limit message is the specific fallback.
             console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
@@ -4557,7 +4846,7 @@ export class AgentModeService {
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
-              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation && !stepBudgetSynthesis) {
                 workPlanDispositionRetries += 1;
                 // The invalid assistant turn has not been checkpointed yet. Remove it
                 // before the next iteration so neither the model nor the customer sees
@@ -4575,6 +4864,13 @@ export class AgentModeService {
                 continue;
               }
 
+              if (stepBudgetSynthesis) {
+                // ENG-2778 (Opslane): no iteration remains for the in-turn recovery retry at
+                // the step cap. Deliver the model's recap (or the post-loop step-limit
+                // message) instead of a decision-card error, and do not stamp a retryable
+                // failure the recovery never attempted.
+                console.warn(`AgentMode: workplan turn missing structured disposition at step budget in session ${sessionId}; delivering recap`);
+              } else {
               const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
               content = retryMessage;
               if (responseMessage) {
@@ -4588,6 +4884,7 @@ export class AgentModeService {
                 };
               }
               console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+              }
             }
           }
 
@@ -4693,6 +4990,7 @@ export class AgentModeService {
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,
+          describeGateRefusal: (toolName: string) => this.describeToolGateRefusal(toolName, publishedSkills, liveInstalledSkillIds, userAllowedSkillIds),
           toolResponseS3Threshold: TOOL_RESPONSE_S3_THRESHOLD,
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
@@ -4703,37 +5001,17 @@ export class AgentModeService {
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
           priorSearchCallCount: searchCallCountThisRun,
-          ports: {
-            evaluateAgentToolPolicy,
-            validateAndRepairToolArgs,
-            getToolInputSchema: (toolName: string) => {
-              const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
-              return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
-            },
-            executeAgentToolThroughGateway,
-            executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
-            toolResultError,
-            // ENG-105: validate tool output against the minimum-output contract so
-            // an empty/undefined/invalid "success" becomes a structured tool
-            // failure (errorClass invalid_output) instead of feeding garbage to
-            // the model and counting as success.
-            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
-            recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
-                mediaAssetsProducedThisRun,
-                mediaGenerationDeadlineMs,
-              }, userId),
-            recordDuplicateSuppression: (entries) =>
-              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
-            extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
-            extractToolContent,
-            formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
-            uploadScreenshotToS3,
-            uploadFileToS3WithPath,
-            buildCrmDataChangedPayload,
-            crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+          priorMediaBudgetDeferred: mediaBudgetDeferredThisRun,
+          ports: this.buildToolDispatchPorts({
+            agentRuntimeRunId,
+            sessionId,
+            userId,
+            iteration,
+            mediaAssetsProducedThisRun,
+            mediaGenerationDeadlineMs,
+            observeFullToolResult: (toolName: string, fullResult: any) => crmEvidence.record(toolName, fullResult),
             socketEmit,
-          },
+          }),
         });
         const toolDispatchDurationMs = Date.now() - toolDispatchStart;
         if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
@@ -4746,6 +5024,10 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-922: once any iteration defers media on the time budget, the batch is
+        // incomplete for the rest of this run — later iterations must not perform
+        // state-changing (Graph upload/creative/ad) calls against it.
+        if (dispatchResult.mediaBudgetDeferred) mediaBudgetDeferredThisRun = true;
         // ENG-426: carry the run-wide search-call count forward so the next iteration's
         // budget check sees calls made earlier THIS turn, on top of prior-turn history.
         searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
@@ -4909,6 +5191,7 @@ export class AgentModeService {
               role: 'assistant',
               content: staged.turnMessage,
               llm: llmModel,
+              ...modelRouting,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
             });
             if (onProgress) {
@@ -4955,6 +5238,7 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
+              ...modelRouting,
               // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
               // ask_user_question, this halt is pushed as plain content) — this is the only
               // correlator the frontend has to know THIS message should render the
@@ -4992,6 +5276,7 @@ export class AgentModeService {
             role: 'assistant',
             content: confirmationPrompt,
             llm: llmModel,
+            ...modelRouting,
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
@@ -5007,10 +5292,13 @@ export class AgentModeService {
           .join('|') || '';
         if (currentToolSignature && currentToolSignature === lastToolSignature) {
           consecutiveRepeats++;
-          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS) {
+          // Once per turn: re-adding it on every identical step piles up copies of the
+          // same instruction (Opslane 2026-10-13); one standing system directive is enough.
+          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS && !antiLoopRepeatNudged) {
+            antiLoopRepeatNudged = true;
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
-              role: 'user',
+              role: 'system',
               content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
@@ -5036,11 +5324,25 @@ export class AgentModeService {
               console.warn(`AgentMode: Detected cycling tool call pattern (${maxCount}x in last ${SIGNATURE_HISTORY_WINDOW} steps) in session ${sessionId}, injecting anti-loop warning`);
               toolSignatureHistory.length = 0; // reset to avoid spamming
               (messages as any[]).push({
-                role: 'user',
+                role: 'system',
                 content: '[SYSTEM] You are stuck in a loop — you have been calling the same tools repeatedly without making meaningful progress. STOP. Do not navigate or take screenshots again. Provide your final response now based on what you have already observed.'
               });
             }
           }
+        }
+
+        // ENG-2778: paging-spiral detection — same tool + same target, different page.
+        const pagingTripped = recordPagingCalls(pagingCallCounts, responseMessage.tool_calls);
+        if (pagingTripped.length > 0 && !pagingSpiralNudged) {
+          pagingSpiralNudged = true;
+          console.warn(`AgentMode: Detected paging spiral (${pagingTripped.join(', ')}) in session ${sessionId}, injecting paging-stop warning`);
+          (messages as any[]).push({ role: 'system', content: PAGING_SPIRAL_STOP_MESSAGE });
+        }
+
+        // ENG-2863: serial-read spiral — one independent read per step burns the step cap.
+        if (recordSerialReadStep(serialReadState, responseMessage.tool_calls)) {
+          console.warn(`AgentMode: Detected serial single-read steps in session ${sessionId}, injecting batch-lookups nudge`);
+          (messages as any[]).push({ role: 'system', content: SERIAL_READ_BATCH_MESSAGE });
         }
 
         // Do not append an assistant message; tool messages above are sufficient for model continuation
@@ -5094,6 +5396,7 @@ export class AgentModeService {
         try {
           const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
             toolName: tc.name,
+            args: tc.arguments,
             // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
             // media call never EXECUTED — neither may back a claim on its own (the
             // original executed call has its own ledger entry), so both map to
@@ -5139,6 +5442,11 @@ export class AgentModeService {
           // finalizeGuard.ts), so without this they'd be invisible even though
           // the whole point of the confidence tier is to surface them for
           // review instead of silently risking a false correction.
+          if (guardOutcome.discardedClaims) {
+            // Judge claims with no quoted statement or a class the lexicon did not surface are ignored (ENG-2459).
+            // Counted here so a judge whose output shape drifts shows up instead of silently disabling detection.
+            console.warn(`AgentMode: finalize guard discarded ${guardOutcome.discardedClaims} judge claim(s) in session ${sessionId} (no statement or non-candidate class)`);
+          }
           if (guardOutcome.ambiguousClaimClasses.length > 0) {
             console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
@@ -5207,6 +5515,13 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-2263 (log-only): a `[verified: <CRM tool>]` tag that no CRM call this turn can back —
+      // a carried-over number dressed as fresh. Measures how often it happens, per model, before
+      // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
+      if (content && !wasCancelled && !mockMode) {
+        runCrmFreshnessShadow({ finalText: content, toolCalls, evidence: crmEvidence.snapshot(), earlier: crmEarlier, sessionNumbers: crmSessionNumbers, sessionMessages: Array.isArray(sessionHistory) ? sessionHistory.length : undefined, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
@@ -5336,6 +5651,39 @@ export class AgentModeService {
         }
       }
 
+      if (truncatedByStepBudget && !wasCancelled) {
+        content = buildIterationLimitReport(content, toolCalls);
+      }
+
+      // Opslane 2026-10-13: persist exactly what is returned. The step-cap,
+      // content-filter and time-budget texts are assigned to `content` after the
+      // model's own (often empty) message was already appended, so the transcript
+      // kept "" while the user read the explanation. Reconcile once, here, after
+      // every content rewrite above. Never mutate a message incremental
+      // checkpointing already wrote — append a fresh one instead.
+      if (!wasCancelled) {
+        if (!content || !content.trim()) {
+          content = EMPTY_FINAL_RESPONSE_FALLBACK;
+        }
+        const persistedTail = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
+        const lastResponse: any = persistedTail[persistedTail.length - 1];
+        const lastIsUnflushedTextAnswer = !!lastResponse
+          && lastResponse.role === 'assistant'
+          && !(Array.isArray(lastResponse.tool_calls) && lastResponse.tool_calls.length > 0)
+          && persistedTail.length > persistedResponseCount;
+        if (lastIsUnflushedTextAnswer) {
+          if (lastResponse.content !== content) lastResponse.content = content;
+        } else {
+          (messages as any[]).push({
+            role: 'assistant',
+            content,
+            llm: llmModel,
+            ...modelRouting,
+            metadata: { timestamp: new Date().toISOString() },
+          });
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -5365,15 +5713,20 @@ export class AgentModeService {
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(truncatedByStepBudget && !wasCancelled ? { iterationLimitReached: true } : {}),
             ...(citations.length > 0 ? { citations } : {}),
+            // ENG-2263: the numbers (never text) this invocation's CRM tools returned, so a continuation of this task can check
+            // its totals against them. Additive and optional; bounded to 64 numbers + tool names. Off with the guard's kill switch.
+            ...(process.env.AGENT_CRM_FRESHNESS_GUARD === 'off' ? {} : (() => {
+              const ev = serializeCrmEvidence(crmEvidence.snapshot());
+              return ev ? { crmEvidence: ev } : {};
+            })()),
           };
         }
       }
-      // Filter out user messages from responseMessages since the controller already saved
-      // the user message before calling this function. Only return assistant/tool messages.
-      const responseMessages = messages.slice(initialMessageCount).filter(
-        (msg: any) => msg.role !== 'user'
-      );
+      // Only assistant/tool messages are persisted: the controller already saved the
+      // user message, and system messages are in-turn control nudges.
+      const responseMessages = messages.slice(initialMessageCount).filter(isPersistedResponseMessage);
 
       recordAgentModeRunCompleted(agentRuntimeRunId, {
         sessionId,
@@ -5437,7 +5790,13 @@ export class AgentModeService {
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
       const isContextLimit = /input is too long|context length|context window|token limit|too many tokens|prompt is too long|exceeds.*context|exceeded.*tokens|maximum.*tokens|messages.*exceed|request too large/i.test(errorMsg);
-      if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
+      if (classifyOpenRouterQuotaExhaustion(error)) {
+        // ENG-2763: OpenRouter key-limit / credits exhaustion is a known class that a
+        // retry cannot fix; name it so the controller answers 503 and alerts once per class.
+        // Checked first: the credits 402 text ("fewer max_tokens ... can only afford N")
+        // otherwise trips the context-limit/400 patterns below and ends in a 500.
+        userMessage = QUOTA_EXHAUSTED_USER_MESSAGE;
+      } else if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
         userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
       } else if (httpStatus === 429) {
         userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
@@ -5445,6 +5804,12 @@ export class AgentModeService {
         userMessage = 'Your request took longer than expected. Please try again.';
       } else if (isContextLimit || httpStatus === 400) {
         userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
+      } else if (isLLMProviderOutage(error)) {
+        // ENG-2381: a final upstream 5xx (e.g. OpenRouter "503 Provider returned error"
+        // after its own provider failover and callLLM's transient retry) is a provider
+        // outage, not an unknown bug. Name it so the controller answers 503 instead of
+        // paging oncall as an "Unknown Error".
+        userMessage = PROVIDER_UNAVAILABLE_USER_MESSAGE;
       } else {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
@@ -5458,7 +5823,7 @@ export class AgentModeService {
       const partialResponseMessages = _messages
         ? _messages
             .slice(_initialMessageCount)
-            .filter((msg: any) => msg.role !== 'user')
+            .filter(isPersistedResponseMessage)
             .slice(_persistedResponseCount)
             .filter((msg: any) => msg.usage)
         : [];
@@ -6385,6 +6750,9 @@ export class AgentModeService {
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
     'connect_account',        // Read-only UI handoff when a required account is absent
+    // LinkedIn Outreach self-service (ENG-1153): caller-scoped inspect + confirm-gated revoke.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -6396,6 +6764,27 @@ export class AgentModeService {
     // Org Memory (shared facts for all org members)
     'save_org_memory',
     'delete_org_memory',
+
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
+    'get_hot_lead_call_settings',
+    'update_hot_lead_call_settings',
+    'provision_hot_lead_call_number',
+    'release_hot_lead_call_number',
+    'start_hot_lead_call_verification',
+    'confirm_hot_lead_call_verification',
+
+    // Smartlead push (ENG-673): the user's own Smartlead campaigns; starting and releasing are approval-card gated
+    'list_smartlead_campaigns',
+    'get_smartlead_campaign_stats',
+    'preview_smartlead_push',
+    'start_smartlead_push',
+    'get_smartlead_push_status',
+    'pause_smartlead_push',
+    'resume_smartlead_push',
+    'cancel_smartlead_push',
+    'release_leads_from_smartlead',
 
     // Scheduled Chat Management
     'list_scheduled_chats',
@@ -6409,6 +6798,10 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+
+    // Luma API (ENG-2338): guest lists without a browser login
+    'luma_list_events',
+    'luma_get_guests',
 
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
@@ -6468,6 +6861,10 @@ export class AgentModeService {
     // only asks the current page to open the existing OAuth dialog; it does not
     // grant consent or connect an account by itself.
     'connect_account',
+    // LinkedIn Outreach inspect/revoke (ENG-1153) must survive a stale DB
+    // foundation_tools override, otherwise chat cannot reach them at all.
+    'inspect_linkedin_account',
+    'revoke_linkedin_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -6524,6 +6921,12 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // Luma API (ENG-2338). Force-merged for the same reason as the Fathom tools: a
+    // stale prod `foundation_tools` override would otherwise strip them. Like Fathom,
+    // they stay reachable with no key connected so the model gets the "connect Luma /
+    // fall back to the browser path" guidance instead of a generic not-available error.
+    'luma_list_events',
+    'luma_get_guests',
     // ENG-396/400: re-exposed after being found dormant-only in practice (a
     // user asking Emma to "confirm settings via a card before building"
     // couldn't get one at all — she has no way to render a real card and was
@@ -6693,6 +7096,7 @@ export class AgentModeService {
 
     // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
     if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -6715,10 +7119,14 @@ export class AgentModeService {
    */
   private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
     const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    // ENG-1978: this is a catalog read (what may this user see/install?), not the execution gate.
+    // An unresolved entitlement lists nothing extra — the user still sees skills they own or that
+    // their org shares, which is correct: those grants do not come from the subscription tier.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
     return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
@@ -6951,6 +7359,12 @@ export class AgentModeService {
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
       ]);
+      // ENG-1978: null = entitlement unresolved. This is refusal-*messaging* only; treating it as
+      // "no skills allowed" here would claim the customer's plan excludes the skill, which is
+      // exactly the unproven claim the catch below exists to avoid. Throw into that branch instead.
+      if (allowed === null) {
+        throw new Error('entitlement unresolved; cannot classify skill rejection');
+      }
       allowedIds = allowed;
       existingIds = new Set(published.map(s => s.skillId));
       // The virtual bundles are real ids with no catalog row; entitlement still governs them.
@@ -7055,6 +7469,8 @@ export class AgentModeService {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
         return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
+      // ENG-2612: models copy the catalog display line ("<uuid>- Skill Name") as the id.
+      skillIds = [...new Set(skillIds.map(normalizeSkillIdArg))];
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
       const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
@@ -7086,6 +7502,7 @@ export class AgentModeService {
         if (rejectedSkillIds.length > 0) {
           const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
           const { unentitled, unavailable, unresolved, forbidden } = buckets;
+          await this.logInstallRefusal(sessionId, userId, skillIds, buckets, false);
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -7139,6 +7556,7 @@ export class AgentModeService {
          * ledger too.
          */
         const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        await this.logInstallRefusal(sessionId, userId, skillIds, partialBuckets, true);
         /*
          * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
          * the dispatcher's downgrade attaches an error class whose retryability line carries
@@ -7209,6 +7627,238 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-2109: the ports `executePreparedTools` needs, built in one place so Emma's own
+   * loop and the tool bridge (a `claude -p` session calling tools one at a time) hand
+   * the dispatcher exactly the same ones.
+   */
+  public buildToolDispatchPorts(ctx: {
+    agentRuntimeRunId: string;
+    sessionId: string;
+    userId: string;
+    iteration: number;
+    mediaAssetsProducedThisRun: number;
+    mediaGenerationDeadlineMs?: number;
+    observeFullToolResult?: ToolDispatchPorts['observeFullToolResult'];
+    socketEmit?: ToolDispatchPorts['socketEmit'];
+  }): ToolDispatchPorts {
+    return {
+      evaluateAgentToolPolicy,
+      validateAndRepairToolArgs,
+      getToolInputSchema: (toolName: string) => {
+        const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
+        return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
+      },
+      executeAgentToolThroughGateway,
+      executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
+      toolResultError,
+      // ENG-105: validate tool output against the minimum-output contract so
+      // an empty/undefined/invalid "success" becomes a structured tool
+      // failure (errorClass invalid_output) instead of feeding garbage to
+      // the model and counting as success.
+      validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
+      recordToolTelemetry: (telemetryToolResults) =>
+        recordAgentModeToolTelemetry(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, telemetryToolResults as any, {
+          mediaAssetsProducedThisRun: ctx.mediaAssetsProducedThisRun,
+          mediaGenerationDeadlineMs: ctx.mediaGenerationDeadlineMs,
+        }, ctx.userId),
+      recordDuplicateSuppression: (entries) =>
+        recordAgentModeDuplicateSuppression(ctx.agentRuntimeRunId, ctx.sessionId, ctx.iteration, entries),
+      observeFullToolResult: ctx.observeFullToolResult,
+      extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
+      extractToolContent,
+      formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
+      uploadScreenshotToS3,
+      uploadFileToS3WithPath,
+      buildCrmDataChangedPayload,
+      crmDataChangedEvent: CRM_DATA_CHANGED_EVENT,
+      socketEmit: ctx.socketEmit,
+    };
+  }
+
+  /**
+   * ENG-2109: the tool access Emma's loop would give this session right now — the
+   * skill-gated tool names and the filtered tool definitions sent to the model.
+   *
+   * Mirrors the loop's own steps (session skills -> buildSkillContext -> per-user MCP
+   * discovery -> getFilteredTools -> voice augment -> excludeTools) by calling the same
+   * helpers. The loop's turn-history-dependent filter (the ENG-763 loop breaker, which
+   * drops install_skills while a repetition loop is active) is not applied here.
+   * `funding/__tests__/emmaToolBridgeExecutor.integration.test.ts` compares this with
+   * what the loop sends, for a legacy and a skill-gated session.
+   */
+  public async resolveRunToolAccess(input: {
+    userId: string;
+    sessionId: string;
+    isDelegatedAccess?: boolean;
+    isInteractiveShare?: boolean;
+    excludeTools?: string[];
+  }): Promise<{
+    tools: any[];
+    allowedToolNames: Set<string>;
+    hasAdminAccess: boolean;
+    publishedSkillsCount: number;
+    sessionAssociatedSkillIdsCount: number;
+  }> {
+    const { userId, sessionId } = input;
+    const { userDb } = await import('./db');
+    const [currentSession, userAllowedSkillIds, publishedSkills, currentUser] = await Promise.all([
+      chatbotDb.getChatSession(sessionId),
+      getAllowedSkills(userId),
+      skillService.getPublishedSkills(),
+      userDb.getUserById(userId).catch((err) => {
+        console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+        return null;
+      }),
+    ]);
+
+    const isAdmin = currentUser?.isAdmin === true;
+    const hasAdminAccess = (isAdmin || input.isDelegatedAccess === true) && input.isInteractiveShare !== true;
+
+    // ENG-1978: see the main turn handler's comment on the same split — this helper mirrors it,
+    // not `getFilteredTools` below, which gets the RAW (possibly null) value so it can fail closed.
+    const userAllowedSkillIdsForDisplay: string[] = userAllowedSkillIds ?? [];
+
+    const rawAssociatedSkills = currentSession?.associatedSkills;
+    const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
+    const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
+    const associatedSkills = sessionAssociatedSkillIds.length
+      ? await skillService.getSkillsByIds(sessionAssociatedSkillIds)
+      : [];
+    const { allowedToolNames } = this.buildSkillContext(
+      associatedSkills,
+      userAllowedSkillIdsForDisplay,
+      publishedSkills,
+      sessionAssociatedSkillIds,
+      hasAdminAccess,
+    );
+
+    try {
+      const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
+      if (discovered > 0) {
+        for (const tool of this.mcpClientService.getTools()) {
+          if (!this.toolRegistry.getTool(tool.name)) this.toolRegistry.register(tool);
+        }
+      }
+    } catch (e) {
+      console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
+    }
+
+    const skillFilter = isLegacySession ? undefined : allowedToolNames;
+    let tools = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+    if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+      try {
+        const { augmentPublishToolDefinitions } = await import('./voiceProfileHooks');
+        tools = augmentPublishToolDefinitions(tools, currentSession.sessionVoiceProfile);
+      } catch (voiceToolErr) {
+        console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
+      }
+    }
+
+    // ENG-1948: mirror the main turn handler's evaluation_workspace listing filter.
+    tools = applyEvaluationWorkspaceListing(tools, allowedToolNames,
+      shouldOfferEvaluationWorkspace({ userId, isAdmin, isDelegatedAccess: input.isDelegatedAccess, isInteractiveShare: input.isInteractiveShare }));
+
+    if (input.excludeTools?.length) {
+      const excludeSet = new Set(input.excludeTools);
+      tools = tools.filter((t: any) => !excludeSet.has(t.function?.name));
+    }
+
+    return {
+      tools,
+      allowedToolNames,
+      hasAdminAccess,
+      publishedSkillsCount: publishedSkills.length,
+      sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
+    };
+  }
+
+  /** ENG-2299: one diagnostic line per install_skills rejection; never alters the result. */
+  private async logInstallRefusal(
+    sessionId: string,
+    userId: string,
+    requested: string[],
+    buckets: { unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] },
+    partial: boolean,
+  ): Promise<void> {
+    try {
+      const published = await skillService.getPublishedSkills();
+      console.warn('[install-refused]', JSON.stringify({
+        sessionId,
+        userId,
+        partial,
+        requested: requested.slice(0, 20),
+        unentitled: buckets.unentitled.slice(0, 20),
+        unavailable: buckets.unavailable.slice(0, 20),
+        unresolved: buckets.unresolved.slice(0, 20),
+        forbidden: buckets.forbidden.slice(0, 20),
+        catalogSize: published.length,
+        otherSkillsPoolSize: this.getUnassociatedToolNames(published).length,
+      }));
+    } catch { /* diagnostics must never change the refusal */ }
+  }
+
+  /**
+   * ENG-2299: facts needed to tell a missing install from catalog or entitlement drift when a
+   * "tool is not available" refusal is reported. Logged by the dispatch gate; changes no behavior.
+   */
+  public describeToolGateRefusal(
+    toolName: string,
+    publishedSkills: any[],
+    installedSkillIds: string[],
+    userAllowedSkillIds: string[] | null,
+  ): Record<string, unknown> {
+    const entitlementResolved = userAllowedSkillIds !== null && userAllowedSkillIds !== undefined;
+    const allowed = userAllowedSkillIds ?? [];
+    const isWildcard = allowed.includes('*');
+    const claimedBy = publishedSkills
+      .filter(s => s.isPublished === true && Array.isArray(s.toolNames) && s.toolNames.includes(toolName))
+      .map(s => ({
+        skillId: s.skillId,
+        installed: installedSkillIds.includes(s.skillId),
+        tierAllows: isWildcard || allowed.includes(s.skillId),
+      }));
+    return {
+      entitlementResolved,
+      installedSkillIds,
+      otherSkillsInstalled: installedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID),
+      tierAllowsOtherSkills: isWildcard || allowed.includes(OTHER_SKILLS_VIRTUAL_ID),
+      allowedSkillCount: allowed.length,
+      catalogSize: publishedSkills.length,
+      inOtherSkillsPool: this.getUnassociatedToolNames(publishedSkills).includes(toolName),
+      claimedBy,
+    };
+  }
+
+  /** The one line the "Installed Skills:" block carries per skill: id, name, description and the skill's own instructions. */
+  public static formatInstalledSkillLine(s: { skillId: string; name: string; description?: string; systemPrompt?: string }): string {
+    return `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`;
+  }
+
+  /**
+   * ENG-2113 (tool relay): in-process Emma rebuilds the "Installed Skills:" block after install_skills so the NEXT model call of the same turn sees the new
+   * skills' instructions. A relayed turn has no such block to rebuild, so the same lines (formatInstalledSkillLine) are returned here to travel with the install_skills
+   * answer. Only the skills this call installed (by name, as the result lists them) and that are now on the session. '' when there are none. Never throws.
+   */
+  public async buildInstalledSkillsNote(sessionId: string, requestedSkillIds: unknown, installedNames: unknown): Promise<string> {
+    try {
+      if (!Array.isArray(requestedSkillIds) || !Array.isArray(installedNames)) return '';
+      const names = new Set(installedNames.filter((n): n is string => typeof n === 'string'));
+      const ids = [...new Set(requestedSkillIds.filter((i): i is string => typeof i === 'string').map(normalizeSkillIdArg))];
+      if (!ids.length || !names.size) return '';
+      const session = await chatbotDb.getChatSession(sessionId);
+      const associated = new Set<string>(session?.associatedSkills ?? []);
+      const present = ids.filter((id) => associated.has(id));
+      if (!present.length) return '';
+      const skills = (await skillService.getSkillsByIds(present)).filter((sk: any) => names.has(sk.name));
+      if (!skills.length) return '';
+      return `Installed Skills (now active in this conversation):\n${skills.map((sk: any) => AgentModeService.formatInstalledSkillLine(sk)).join('\n')}`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
    * ENG-1222: the single source of truth for "which tools + skill-context text
    * does a session with these installed skills get". Was private to Agent Mode
    * until chatbotService.generateChatResponse (the Emma-widget path) started
@@ -7245,6 +7895,7 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
+      // ENG-2299: use the full published catalog; scoping by the caller's tier would leak higher-tier tools into the catch-all.
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
@@ -7254,10 +7905,12 @@ export class AgentModeService {
       ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
 
+    addCompanionTools(allowedToolNames);
+
     let installedSkillContextMsg = '';
     const skillLines: string[] = [];
     if (associatedSkills.length) {
-      associatedSkills.forEach(s => skillLines.push(`${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`));
+      associatedSkills.forEach(s => skillLines.push(AgentModeService.formatInstalledSkillLine(s)));
     }
     if (hasAdminAccess) {
       skillLines.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
@@ -7330,10 +7983,22 @@ export class AgentModeService {
     return { added, removed, changed: added > 0 || removed > 0 };
   }
 
+  /**
+   * ENG-1978: the toolset for the catch-all error path in getFilteredTools — `install_skills` and
+   * nothing else, enough to recover, not enough to act. (An unresolved entitlement is handled
+   * separately and is more generous: it keeps the foundation tools.) Deliberately silent: the
+   * caller's catch already logs the error, and an unresolved tier is recorded as a structured
+   * `[entitlement] ENTITLEMENT-DENIED` event where it failed to resolve.
+   */
+  private installSkillsOnlyToolset(): any[] {
+    const installSkillsTool = this.toolRegistry.getTool('install_skills');
+    return installSkillsTool ? [installSkillsTool.definition] : [];
+  }
+
   public async getFilteredTools(
     userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
-    precomputedAllowedSkillIds?: string[]  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call
+    precomputedAllowedSkillIds?: string[] | null  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call. null = unresolved (ENG-1978)
   ): Promise<any[]> {
     try {
 
@@ -7350,13 +8015,31 @@ export class AgentModeService {
       const definitions = contextAwareTools.map(t => t.definition);
 
       // 4. Apply Subscription Filtering
-      // Resolve skill IDs to tool names for the subscription filter step
-      const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
+      // Resolve skill IDs to tool names for the subscription filter step.
+      // `!== undefined`, not `??`: a precomputed `null` (ENG-1978 — the caller already knows the
+      // entitlement is unresolved) must stay null, not silently re-fetch and double-report.
+      const skillIds = precomputedAllowedSkillIds !== undefined
+        ? precomputedAllowedSkillIds
+        : await getAllowedSkills(userId);
       // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
       // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
       // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
       // make the single most important signal in the 2-week analysis the one nobody can act on.
       const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
+
+      // ENG-1978: null means the entitlement could not be resolved — an unknown/malformed tier or
+      // a failed settings read. Fail closed: nothing the tier would have unlocked is granted.
+      // Foundation tools (plus install_skills, so the user can recover) are still returned: every
+      // tier, Free included, already gets them unconditionally on the normal path, so handing them
+      // to an unresolved tier grants nothing a plan-less user lacks — it just keeps the session
+      // usable through a blip instead of dead. Skill tools already installed in the session are
+      // NOT carried over: their entitlement is exactly what could not be confirmed.
+      if (allowedFunctionCalls === null) {
+        return filterFunctionCalls(definitions, [
+          ...AgentModeService.FOUNDATION_TOOLS,
+          'install_skills',
+        ]);
+      }
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -7383,8 +8066,7 @@ export class AgentModeService {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
       // DO NOT return all tools on error as it's a security risk
-      const installSkillsTool = this.toolRegistry.getTool('install_skills');
-      return installSkillsTool ? [installSkillsTool.definition] : [];
+      return this.installSkillsOnlyToolset();
     }
   }
 
@@ -7637,6 +8319,18 @@ export class AgentModeService {
       for (const field of keep) {
         if (result?.[field] !== undefined) minimal[field] = result[field];
       }
+      return minimal;
+    }
+
+    // ENG-2338: keep enough of a Luma result for the ledger to tell "pulled 0 guests" from "no key connected" (both
+    // would otherwise minimise to {}). `rowCount` is what the unread-page notice reads; rows themselves are dropped.
+    if (toolName === 'luma_get_guests' || toolName === 'luma_list_events') {
+      const rows = Array.isArray(result?.guests) ? result.guests : Array.isArray(result?.events) ? result.events : undefined;
+      const minimal: Record<string, any> = {};
+      for (const field of ['success', 'connected', 'nothing_pulled', 'reason', 'count', 'has_more', 'next_cursor', 'skipped_without_registration']) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      if (rows) minimal.rowCount = rows.length;
       return minimal;
     }
 
@@ -8125,7 +8819,7 @@ export class AgentModeService {
       // Zero is worse than silence in that sentence: it reads as "this found
       // nothing", the opposite of what happened.
       if (Object.keys(paginationMarkers).length > 0) {
-        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+        for (const key of LEDGER_ROW_KEYS) {
           const value = (result as Record<string, unknown>)[key];
           if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
         }
@@ -9140,8 +9834,11 @@ export class AgentModeService {
     // an explicit `false` (attended) must survive distinctly from `undefined`
     // (caller has not resolved a value, fall back to session.sessionType).
     isUnattendedRun?: boolean;
+    // ENG-2816: the restriction the calling principal runs under (a share-link visitor), enforced again in executeTool.
+    restrictionProfile?: RestrictionProfileId;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
+    if (input.restrictionProfile) toolOptions.restrictionProfile = input.restrictionProfile;
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
@@ -9311,6 +10008,11 @@ export class AgentModeService {
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
+    // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
+    // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
+    // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    if (restricted) throw new ToolRestrictionDenied(restricted);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -10151,7 +10853,7 @@ export class AgentModeService {
 
   public async attachKnowledgeBaseFiles(
     taskId: string,
-    files: Array<{ name: string; content: string }>,
+    files: unknown,
     userId: string,
     sessionId: string
   ): Promise<any> {
@@ -10265,7 +10967,19 @@ export class AgentModeService {
     return tasksImpl.createImageTaskFromPrompt(taskName, prompt, category, userId, sessionId, attachPreviousTaskResults);
   }
 
-  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
+  /**
+   * `turnModel` is the model the user's turn (the one this title belongs to) will run on. When the
+   * user has switched on their own key for that model's provider and it cannot serve the turn, the
+   * turn fails closed, so AgentWeb must not spend an AI call on a title for it either: the title is
+   * cut from the message instead. Omitted by callers that have no customer-routable turn behind
+   * the title (the title is then always AgentWeb-funded, as before).
+   */
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext, turnModel?: string): Promise<string> {
+    if (turnModel && usageContext?.userId) {
+      // Same alias map the turn itself uses, so a legacy model id resolves to the same provider.
+      const modelLab = this.llmModels[this.normalizeModelId(turnModel)]?.provider;
+      if (await customerKeyBlocksTurn(usageContext.userId, modelLab)) return titleFromUserMessage(userMessage);
+    }
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -10624,36 +11338,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
-        content:
-          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
-          + '(not offers, plans, or suggestions). The possible claim classes are: '
-          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
-          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
-          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
-          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
-          + finalText,
+        content: buildFinalizeJudgePrompt(finalText, candidateClasses),
       },
     ], {
-      max_completion_tokens: 500,
+      max_completion_tokens: FINALIZE_JUDGE_MAX_COMPLETION_TOKENS,
       temperature: 0,
       taskClass: 'nonstandard_consumer',
       // ENG-1858: the guard audits the user's own reply, so the user's run pays.
       usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
     });
 
-    const text = (response as any)?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
-      throw new Error('finalize-guard judge returned no content');
-    }
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
-    }
-    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
-    if (!Array.isArray(parsed)) {
-      throw new Error('finalize-guard judge output is not an array');
-    }
-    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+    return parseFinalizeJudgeOutput((response as any)?.choices?.[0]?.message?.content);
   }
 
   /**
@@ -10949,17 +11644,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       clientScope?.toolName ?? 'meta_ads_tool'
     );
 
-    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
-    // auto-selects an account and never falls back to the shared-token legacy
-    // adAccount field — both fallback branches below are only reachable via
-    // the `!accountId` path, so this one guard structurally disables both for
-    // the scoped path while leaving the unscoped path's fallback code untouched.
-    if (strict && !accountId) {
-      throw this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
-      );
-    }
-
+    // ENG-1801: the strict (client_id-scoped) no-account_id guard lives after
+    // the connected-account lookup below (ENG-2786), so it can list candidates.
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(effectiveUserId);
     if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
@@ -10982,6 +11668,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       acc.config?.access_token
     );
 
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field. ENG-2786: this is a usage error, not a credential
+    // failure — classify it invalid_args and list the client's candidate
+    // account_ids so the model can retry with one directly. Candidates come from
+    // every Meta ad account the client has connected (not only token-bearing
+    // ones), so a seeded/odd-typed account still surfaces as a choice.
+    if (strict && !accountId) {
+      const candidateIds = Array.from(new Set(
+        (connectedAccounts as any[])
+          .filter((acc: any) =>
+            (acc.platform === 'facebook' || acc.platform === 'meta') &&
+            (!acc.config?.account_type || acc.config.account_type === 'ad_account')
+          )
+          .map((acc: any) => clean(acc.account_id || acc.config?.ad_account_id || acc.accountId || ''))
+          .filter(Boolean)
+          .map((id: string) => `act_${id}`)
+      ));
+      if (candidateIds.length > 0) {
+        const err = this.makeMetaAuthError(
+          `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account. Candidate account_ids: [${candidateIds.join(', ')}].`
+        ) as any;
+        err.toolErrorClass = 'invalid_args';
+        err.candidateAccountIds = candidateIds;
+        throw err;
+      }
+    }
+
     if (fbAccounts.length === 0) {
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
@@ -11001,6 +11715,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         strict
           ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
           : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
+      );
+    }
+
+
+    // ENG-1801: a strict call without account_id never auto-selects, even when
+    // no candidate id could be listed above.
+    if (strict && !accountId) {
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
       );
     }
 
@@ -11342,6 +12065,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
           call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data?.child_attachments) {
         const ld = existingSpec.link_data;
@@ -11371,6 +12095,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           carousel_cards: updatedCards,
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else if (existingSpec.link_data) {
         const ld = existingSpec.link_data;
@@ -11391,6 +12116,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           link_url: newLinkUrl || ld.link || '',
           call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
           url_tags: carriedUrlTags,
+          ...AgentModeService.carriedCreativeFields(existingSpec, params),
         };
       } else {
         return {
@@ -12145,6 +12871,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Meta returns monetary fields as strings; compare stringified so
       // 1000 and "1000" are the same value and not a fake mismatch.
       const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      // Schedule fields are instants, not strings: Meta echoes them back in the
+      // ad account's timezone at whole-second precision (requested
+      // 16:44:56.157+00:00 is stored as 08:44:56-0800). Compare the instant at
+      // second resolution so an equivalent time is never reported as overridden.
+      const sameInstant = (requested: string | null, applied: string | null) => {
+        if (requested === null || applied === null) return false;
+        const r = Date.parse(requested);
+        const a = Date.parse(applied);
+        return Number.isFinite(r) && Number.isFinite(a) && Math.floor(r / 1000) === Math.floor(a / 1000);
+      };
+      const isScheduleField = (parameter: string) => parameter === 'start_time' || parameter === 'end_time';
       const readBackMismatches = expected
         .filter(([, requested]) => requested !== undefined)
         .map(([parameter, requested]) => ({
@@ -12152,7 +12889,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           requested: asComparable(requested),
           applied: asComparable(readBack?.[parameter])
         }))
-        .filter(m => m.requested !== m.applied);
+        .filter(m => m.requested !== m.applied &&
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -12168,7 +12906,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} ${describeMismatchedAdSetState(readBack?.status ?? adSet?.status)}`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
@@ -12335,6 +13073,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-2609: link description + Instagram identity of an existing creative, for rebuilding it
+   * (COPY_AD / swap). Carousels are skipped for description: they have no creative-level slot.
+   * `assetFeedSpec` is passed only when rebuilding a placement_assets creative, whose description
+   * lives in asset_feed_spec.descriptions rather than link_data / video_data.
+   */
+  private static carriedCreativeFields(
+    spec: any,
+    params: { description?: string; instagram_user_id?: string },
+    assetFeedSpec?: any,
+  ): { description?: string; instagram_user_id?: string } {
+    const carousel = !!spec?.link_data?.child_attachments;
+    const description = params.description
+      ?? (assetFeedSpec ? assetFeedSpec.descriptions?.[0]?.text : undefined)
+      ?? (carousel ? undefined : (spec?.video_data ? spec.video_data.link_description : spec?.link_data?.description));
+    const instagramUserId = params.instagram_user_id ?? spec?.instagram_user_id;
+    return {
+      ...(description ? { description } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+    };
+  }
+
+  /**
    * When a placement_assets creative serves Instagram placements, Meta requires
    * object_story_spec.instagram_user_id (else attaching it to an ad fails with subcode 1772103).
    * Resolve it from the Page if the caller didn't supply one.
@@ -12382,15 +13142,44 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
-      const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      const created = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // Meta's create response carries only the id; keep the name we sent so messages don't say "undefined".
+      const creative = created ? { ...created, name: created.name ?? resolvedParams.name } : created;
       // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
       if (creative?.id) {
         void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
       }
 
+      // ENG-2596: a 200 doesn't prove Meta stored the IG identity / link description — read back.
+      // Only a caller-supplied IG id is checked: one auto-resolved for placement creatives was not asked for.
+      const requestedFields = { ...resolvedParams, instagram_user_id: params.instagram_user_id };
+      let unappliedFields: string[] = [];
+      let readbackUnavailable = false;
+      if (creative?.id && (requestedFields.instagram_user_id || requestedFields.description)) {
+        try {
+          const live = await metaService.getAdCreative(accessToken, String(creative.id));
+          unappliedFields = findUnappliedCreativeFields(requestedFields, live);
+        } catch (err: unknown) {
+          readbackUnavailable = true;
+          console.warn(`AgentMode: creative field read-back failed for ${creative.id}:`,
+            err instanceof Error ? err.message : err);
+        }
+      }
+      if (unappliedFields.length > 0) {
+        return {
+          success: true,
+          verified: false,
+          unapplied_fields: unappliedFields,
+          message: buildUnappliedFieldsMessage(creative, requestedFields, unappliedFields),
+          creative: creative
+        };
+      }
+
       return {
         success: true,
-        message: `Ad creative "${creative.name}" created successfully`,
+        message: `Ad creative "${creative.name}" created successfully` +
+          (readbackUnavailable ? ' (could not read it back to confirm description / instagram_user_id were stored)' : ''),
+        ...(readbackUnavailable ? { readback_unavailable: true } : {}),
         creative: creative
       };
     } catch (error: any) {
@@ -12636,7 +13425,29 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // silently drops it (see updateAd's params typing), so a UTM-only retag
   // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
   // the swap path. carriedUrlTags below already forwards it correctly.
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags', 'description', 'instagram_user_id'];
+
+  /**
+   * A just-created placement-customized creative cannot be attached for ~20-30s: Meta answers
+   * 1772103 "Instagram Account Is Missing" until it has processed it (measured live, ENG-2623).
+   * Retry only that error; any other failure, or running out of attempts, is thrown as before.
+   * The backoff is 30s because Meta also allows only one update per ad per 30s (#613).
+   */
+  private async attachCreativeWhenReady(accessToken: string, adId: string, creativeId: string, accountId: string): Promise<void> {
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = 30_000;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: creativeId } }, accountId);
+        return;
+      } catch (err: any) {
+        const subcode = Number(err?.structuredError?.error_subcode ?? err?.response?.error?.error_subcode);
+        if (subcode !== 1772103 || attempt >= MAX_ATTEMPTS) throw err;
+        console.log(`AgentMode: creative ${creativeId} not yet attachable to ad ${adId} (1772103, attempt ${attempt}/${MAX_ATTEMPTS}). Retrying in ${BACKOFF_MS}ms.`);
+        await this.sleep(BACKOFF_MS);
+      }
+    }
+  }
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -12778,15 +13589,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // creative. Copy/link/CTA carry over from the existing creative unless overridden.
       const ld = existingSpec.link_data || {};
       const vd = existingSpec.video_data || {};
+      // A placement-customized source has no link_data / video_data: its copy lives in asset_feed_spec.
+      const afs = creativeData.asset_feed_spec || {};
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (placement-customized)`,
         page_id: pageId,
         placement_assets: params.placement_assets,
-        body: params.body || ld.message || vd.message || creativeData.body || '',
-        title: params.title || ld.name || vd.title || creativeData.title || '',
-        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || '',
-        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type,
+        body: params.body || ld.message || vd.message || afs.bodies?.[0]?.text || creativeData.body || '',
+        title: params.title || ld.name || vd.title || afs.titles?.[0]?.text || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || vd.call_to_action?.value?.link || afs.link_urls?.[0]?.website_url || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type || vd.call_to_action?.type || afs.call_to_action_types?.[0],
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params, creativeData.asset_feed_spec),
       };
     } else if (existingSpec.video_data) {
       // Video creative
@@ -12803,6 +13617,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
@@ -12810,6 +13625,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
+      // A carousel has no creative-level description slot, so a swap could not apply it: refuse
+      // before creating a replacement creative that would silently leave the cards unchanged.
+      if (params.description) {
+        return {
+          success: false,
+          message: 'Carousel creatives have no creative-level description, so it cannot be updated here. Put per-card text in carousel_cards[].description instead.',
+          error: 'CAROUSEL_DESCRIPTION_UNSUPPORTED'
+        };
+      }
       const updatedCards = ld.child_attachments.map((card: any) => ({
         image_hash: card.image_hash,
         image_url: card.picture || card.image_url,
@@ -12827,6 +13651,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         carousel_cards: updatedCards,
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
     } else if (existingSpec.link_data) {
       // Single image creative
@@ -12842,6 +13667,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         link_url: newLinkUrl || ld.link || '',
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
+        ...AgentModeService.carriedCreativeFields(existingSpec, params),
       };
       if (params.image_hash || params.image_url) {
         imageSwap = {
@@ -12919,7 +13745,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      await this.attachCreativeWhenReady(accessToken, adId, newCreativeId, accountId);
       verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
@@ -13212,9 +14038,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      // Download image from URL
-      const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-      const buffer = Buffer.from(response.data as any);
+      // Download image from URL. ENG-2915: the URL can come from an external Zoma caller, so
+      // the fetch is pinned to a re-validated public address on every redirect hop (a probe
+      // before this fetch is not enough: DNS can rebind and a redirect can point inside), and
+      // the body is capped at Meta's 30 MB image limit with a bounded total time.
+      const { buffer } = await fetchBufferFollowingRedirects(imageUrl, {}, DEFAULT_MAX_REDIRECTS, 30_000, 30 * 1024 * 1024);
       // Simple filename extraction or default
       let filename = 'ad-image.jpg';
       try {
@@ -13467,7 +14295,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't publish to a campaign or destroy anything.
    */
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
-    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
+    CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE', PAUSED_BUNDLE_ACTION],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
     AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
@@ -13577,6 +14405,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     const session = await chatbotDb.getChatSession(sessionId);
+    if (action === PAUSED_BUNDLE_ACTION && session?.userId !== userId) return { granted: false, digest, reason: 'not_approved' };
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
@@ -13599,6 +14428,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // which IS the deck that was just answered.
     const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
     if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    if (action === PAUSED_BUNDLE_ACTION && outcome.answer.answeredBy !== 'user') return { granted: false, digest, reason: 'not_approved' };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
     return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
   }
@@ -13731,24 +14561,47 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     writeHalts: any[],
   ): Promise<{ manifestId: string; turnMessage: string } | null> {
-    const manifestId = uuidv4();
+    // One packet PER AD ACCOUNT: the Desk groups packets under an account and one Approve All
+    // dispatches a whole packet, so a single iteration that writes to two ad accounts must not
+    // become one packet shown under only the first account.
+    // Taken before any createDecision call: a row whose createdAt is >= this was created by THIS call,
+    // an older one is an idempotent hit on an already-staged digest (a retried iteration).
+    const stagingStartedAt = new Date().toISOString();
+    const manifestByAccount = new Map<string, string>();
+    const manifestFor = (r: any): string => {
+      const key = String(r?.metaWriteDispatch?.resolvedAccountId || r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown').replace(/^act_/, '');
+      if (!manifestByAccount.has(key)) manifestByAccount.set(key, uuidv4());
+      return manifestByAccount.get(key)!;
+    };
+    const manifestId = manifestFor(writeHalts[0]);
     // Same default window stage_pending_decision uses for a team decision —
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
+    // ENG-1853 follow-up: unlike the plan_choice producer (ask_user_question, which lets
+    // the model supply an explicit chat_url), this path never gave a reviewer any way
+    // back to the conversation that proposed a real Meta write — evidencePacket only
+    // ever carried researchSummary. sessionId is already a parameter here; the same
+    // ${CUSTOMER_FRONTEND_URL}/agent-mode/${sessionId} link agentModeController.ts
+    // already uses elsewhere for "go back to this session" is trivial to attach.
+    const chatUrl = `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${sessionId}`;
     const settled = await Promise.allSettled(
       writeHalts.map((r) =>
         approvalInboxService.createDecision({
           gateType: 'meta_write',
-          approver: 'matt',
+          approver: getDefaultApproverForGate('meta_write'),
           subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
           businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-          evidencePacket: { researchSummary: r?.summary },
+          // No separate researchSummary here: confirmationDetail (above) IS r.summary, so
+          // setting evidencePacket.researchSummary to r.summary as well rendered the exact
+          // same sentence twice on the card. There's no separate agent-authored rationale
+          // captured at this halt point to put here instead.
+          evidencePacket: { chatUrl },
           metaWriteManifestDigest: r.metaWriteManifestDigest,
           metaWriteDispatch: r.metaWriteDispatch,
           originSessionId: sessionId,
-          manifestId,
+          manifestId: manifestFor(r),
           expiresAt,
         }),
       ),
@@ -13786,7 +14639,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
-    if (manifestIds.length > 1) {
+    // More than one manifest is EXPECTED when the batch spans several ad accounts (one packet per
+    // account); it is only suspicious when it exceeds that, i.e. pre-existing idempotent hits.
+    if (manifestIds.length > manifestByAccount.size) {
       // Second-review fix: this genuinely CAN'T be made fully correct
       // without a return-contract change (multiple real manifestIds, no
       // single one actually contains every staged decision) — nothing
@@ -13799,11 +14654,47 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       );
     }
 
+    // One short Slack reminder per packet to the assigned reviewer (same style as the eval queue).
+    // Fire-and-forget: the decisions are already durably staged, and a slow or rate-limited Slack must
+    // never hold up the agent turn. Only rows created by this call are announced — createDecision returns the
+    // EXISTING row on an idempotent hit, and a retried iteration must not re-ping the reviewer.
+    const packets = new Map<string, { approver: NonNullable<ApprovalDecision['approver']>; manifestId: string; items: ApprovalDecision[] }>();
+    const announced = new Set<string>();
+    for (const d of staged) {
+      if (d.status !== 'pending_team_review' || !d.manifestId || !d.approver) continue;
+      if (d.createdAt < stagingStartedAt) continue;
+      // Two halts with the same digest in one call resolve to the same row: count it once.
+      if (announced.has(d.decisionId)) continue;
+      announced.add(d.decisionId);
+      const key = `${d.manifestId}|${d.approver}`;
+      const entry = packets.get(key) || { approver: d.approver, manifestId: d.manifestId, items: [] };
+      entry.items.push(d);
+      packets.set(key, entry);
+    }
+    if (packets.size > 0) {
+      void (async () => {
+        const { postManifestReadyNotice } = await import('./approvalInboxSlack');
+        for (const { approver, manifestId: mid, items } of packets.values()) {
+          // Only a bare numeric ad account id is ever interpolated into Slack text (no mentions/links).
+          const acct = String(items[0]?.metaWriteDispatch?.resolvedAccountId || '').replace(/^act_/, '');
+          await postManifestReadyNotice(approver, {
+            manifestId: mid,
+            itemCount: items.length,
+            accountLabel: /^\d+$/.test(acct) ? `ad account ${acct}` : undefined,
+          });
+        }
+      })().catch((err: any) => {
+        console.warn('[agent-mode-service] failed to post the Approval Desk reminder to Slack:', err?.message || err);
+      });
+    }
+
     const count = staged.length;
     return {
       manifestId: reportedManifestId,
       turnMessage:
-        count === 1
+        manifestIds.length > 1
+          ? `These ${count} changes span ${manifestIds.length} ad accounts, so they were queued as ${manifestIds.length} separate packets (one per account) for the assigned approver in the Approval Desk. I'll resume automatically as each is resolved.`
+          : count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
           : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
@@ -13817,8 +14708,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    *  same-iteration halts" behavior the write-deck builder already has. */
   private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
     const questions: QuestionDeckQuestionInput[] = [];
+    // The model can repeat a hot lead call approval in one reply, and each call mints its own card; one is enough.
+    const seenCards = new Set<string>();
     for (const r of questionHalts) {
-      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+      if (!Array.isArray(r.questionDeckPayload)) continue;
+      for (const q of r.questionDeckPayload) {
+        const identity = approvalCardIdentity(q.kind);
+        if (identity !== null && seenCards.has(identity)) continue;
+        if (identity !== null) seenCards.add(identity);
+        questions.push(q);
+      }
     }
     if (questions.length === 0) return null;
     try {
@@ -13977,6 +14876,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
+    // The entity being UPDATED (never set on a CREATE) — already fetched in full by
+    // resolveCampaign/resolveAdSet/resolveAd below for its .name, but every other field
+    // on it (current daily_budget, current status, ...) was being thrown away. Kept here
+    // so the Changes: line below can show what's actually changing, not just which keys.
+    let currentEntity: any;
 
     /*
      * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
@@ -14046,6 +14950,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
+        currentEntity = campaign;
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
         lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
@@ -14058,6 +14963,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
+        currentEntity = adSet;
         const campaign = await resolveCampaign(adSet?.campaign_id);
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
@@ -14091,6 +14997,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
+        currentEntity = ad;
         const adSet = await resolveAdSet(ad?.adset_id);
         const campaign = await resolveCampaign(ad?.campaign_id);
         target.ad = nameOf(ad, ad_id);
@@ -14118,13 +15025,77 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
+    // Review fix (ENG-1853 follow-up): this used to list only the changed field NAMES
+    // ("Changes: daily_budget.") with neither the current nor the proposed value — a
+    // reviewer approving a real budget/status change had no way to tell $60→$110 from
+    // $6,000→$11,000 without leaving the page. currentEntity (already fetched above
+    // for its .name, previously discarded) supplies the "before" side; params supplies
+    // the "after" side — both were already right here.
+    // Every agent money input is in MAJOR units of the ad account's currency (ENG-2277:
+    // normalizeMetaMoneyParams) and Meta reports the current value in MINOR units as a numeric
+    // STRING ("3000"). Both sides go through the same normalizeMetaMoney the writers use, so the
+    // card shows exactly the amount that will be submitted — "daily_budget: 3000 (= $30.00) →
+    // 310000 (= $3,100.00)" — including for zero-decimal currencies. If the account currency
+    // can't be read, the raw value is shown and flagged rather than guessed.
+    const MONEY_KEYS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount', 'budget_amount', 'spend_cap']);
+    let accountCurrency: string | undefined;
+    if (accessToken && [...MONEY_KEYS].some((k) => params?.[k] !== undefined)) {
+      // Bounded: this runs on the halt path, and a stalled Graph read must not hold the approval card up.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        accountCurrency = await Promise.race([
+          metaService.getAdAccountCurrency(scopeAccountId, accessToken),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 5000); }),
+        ]);
+      } catch { /* shown as unverified below */ } finally { if (timer) clearTimeout(timer); }
+    }
+    let currencyUnverified = false;
+    const money = (value: any, unit: 'major' | 'minor'): string => {
+      try {
+        // Only Meta's own read-back ("3000") is a numeric string; the writers reject a string
+        // PROPOSAL, so the card must not quietly accept one.
+        const n = unit === 'minor' && typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value;
+        return normalizeMetaMoney(n, accountCurrency, unit).description;
+      } catch {
+        currencyUnverified = true;
+        return `${String(value)} (${unit} units, currency unverified)`;
+      }
+    };
+    const formatChange = (key: string, value: any, side: 'before' | 'after'): string => {
+      if (value === undefined || value === null) return 'unset';
+      const text = MONEY_KEYS.has(key) ? money(value, side === 'before' ? 'minor' : 'major')
+        : value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value);
+      // Long copy and object-valued fields (placement_assets, adset_schedule) must not flood the card.
+      return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    };
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
-      if (params[key] !== undefined) contentChanges[key] = params[key];
+    const changeDescriptions: string[] = [];
+    // A rename is a real change a reviewer must see; on CREATE the name is already in the summary line.
+    const changeKeys = ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'budget_amount', 'bid_amount', 'spend_cap', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type'];
+    if (action !== 'CREATE') changeKeys.unshift('name');
+    // Everything else the write will send must be visible too (targeting, start/end time, bid
+    // strategy, …) — a card that lists only a fixed allowlist lets a reviewer approve fields they
+    // never saw. Internal control params (override/confirmation tokens) are not Meta fields.
+    for (const key of Object.keys(params || {})) {
+      if (changeKeys.includes(key) || (action === 'CREATE' && (key === 'name' || key === 'objective'))) continue;
+      if (/token|override|confirm/i.test(key) || ['campaign_id', 'adset_id', 'ad_set_id', 'ad_id', 'account_id'].includes(key)) continue;
+      changeKeys.push(key);
+    }
+    for (const key of changeKeys) {
+      if (params[key] === undefined) continue;
+      contentChanges[key] = params[key];
+      const before = currentEntity?.[key === 'budget_amount' ? 'daily_budget' : key];
+      const after = formatChange(key, params[key], 'after');
+      changeDescriptions.push(
+        before !== undefined ? `${key}: ${formatChange(key, before, 'before')} → ${after}` : `${key} → ${after}`,
+      );
     }
     if (Object.keys(contentChanges).length > 0) {
       target.changes = contentChanges;
-      lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
+      lines.push(`Changes: ${changeDescriptions.join(', ')}.`);
+    }
+    if (currencyUnverified) {
+      lines.push('WARNING: the ad account currency could not be verified, so the amounts above are NOT converted — confirm the real amounts before approving.');
     }
 
     /*
@@ -14470,9 +15441,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
       // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
       const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
-      const changes = fields.flatMap(field => {
+      type BudgetChange = { field: string; severity: 'unknown' | 'critical' | 'warning' | 'normal'; ratio: number | null; prior: number | undefined; proposed: number | undefined };
+      const changes = fields.flatMap((field): BudgetChange[] => {
         const proposed = money.params[field];
         if (proposed === undefined) return [];
+        // A spend cap is a ceiling: adding one to an object Meta read back with no cap only
+        // restricts spend. Requires a real read-back (id present) so a failed read stays unknown.
+        if (field === 'spend_cap' && prior?.id && (prior[field] === undefined || prior[field] === null || prior[field] === '')) {
+          const capped = classifyMetaBudgetChange(proposed, proposed);
+          if (capped.severity !== 'unknown') return [{ field, severity: 'normal' as const, ratio: null, prior: undefined, proposed: capped.proposed }];
+        }
         return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };
@@ -14524,7 +15502,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     params: any = {},
     sessionId?: string
   ): Promise<MetaApiResult> {
-    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, {
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId, this.metaMarketingApiDeps());
+  }
+
+  private metaMarketingApiDeps(): adsApisImpl.CallMetaMarketingApiDeps {
+    return {
+      preparePausedMetaBundle: this.preparePausedMetaBundle.bind(this),
       resolveCampaignObjectiveGate: this.resolveCampaignObjectiveGate.bind(this),
       validateMetaActionParams: this.validateMetaActionParams.bind(this),
       claimMetaWriteManifestGrant: this.claimMetaWriteManifestGrant.bind(this),
@@ -14535,7 +15518,419 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       remedyFromScopeRefusal: AgentModeService.remedyFromScopeRefusal,
       getMetaCredentials: this.getMetaCredentials.bind(this),
       checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
+    };
+  }
+
+  /** A brief is a write item, never a generic planning answer or an objective-only grant. */
+  private async preflightPausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, accessToken: string, bundle: PausedMetaBundle) {
+    const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+    if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+    assertPausedBundleUserCount(bundle, await chatbotDb.getMessagesFromMessagesTable(sessionId!));
+    return preflightPausedMetaCreatives(bundle, accountId, id => metaService.getAdCreative(accessToken, id));
+  }
+
+  private async preparePausedMetaBundle(userId: string, sessionId: string | undefined, accountId: string, input: unknown): Promise<any> {
+    try {
+      const bundle = parsePausedMetaBundle(input);
+      const session = sessionId ? await chatbotDb.getChatSession(sessionId) : null;
+      if (!session || session.userId !== userId) throw new Error('A paused bundle needs an owned chat session and explicit review-card approval.');
+      const creds = await this.getMetaCredentials(userId, accountId);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      bundle.creative_preflight = await this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle);
+      const money = await this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken,
+        bundle.campaign.advantage_campaign_budget ? bundle.campaign : bundle.ad_set);
+      // Frozen alongside the exact fields. A later currency/connection change invalidates the grant.
+      if (!money.currency) throw new Error('Account currency could not be verified.');
+      bundle.currency = money.currency;
+      const grant = await this.claimMetaWriteManifestGrant(userId, sessionId!, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle);
+      if (grant.granted) return this.dispatchAuthorizedMetaWrite(userId, 'CAMPAIGN', PAUSED_BUNDLE_ACTION, creds.accountId, undefined, undefined, undefined, bundle, false, sessionId);
+      if (grant.reason === 'already_consumed') return { success: false, complete: false,
+        message: 'This exact paused bundle approval has already been claimed. No new writes or approval request were made. Use the persisted approval execution result; do not recreate it.' };
+      const summary = pausedBundleSummary(bundle, creds.accountId);
+      return {
+        success: true, awaitingUserConfirmation: true, requiresConfirmation: true,
+        summary, confirmationDetail: summary, confirmationPrompt: summary,
+        message: `${summary}\nSubmit the single review card. The server executes the stored brief; do not re-call individual creates or ask for the objective again.`,
+        target: { account_id: creds.accountId }, metaWriteManifestDigest: grant.digest,
+        metaWriteDispatch: { entity_type: 'CAMPAIGN', action: PAUSED_BUNDLE_ACTION, account_id: creds.accountId, resolvedAccountId: creds.accountId, params: bundle },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid paused bundle.';
+      return { success: false, message, error: `PAUSED_BUNDLE_REFUSED: ${message}` };
+    }
+  }
+
+  /**
+   * ENG-2303 P3 — the Meta Toolkit's preview of a guarded write: the same shared gate as
+   * callMetaMarketingApi (validation, Page check, ownership, budget anomaly, confirmation
+   * summary), sessionless so it can only halt with a preview and never dispatches. The one
+   * difference is the ENG-400 objective gate: an external agent has no Emma transcript or
+   * approval deck, so the objective must be supplied explicitly, is validated here, and is
+   * shown in the bound preview — the user's approval of that preview is the human choice.
+   * It never auto-provisions an Emma chat session.
+   */
+  public async previewToolkitMetaWrite(
+    userId: string, entity_type: any, action: string, account_id: string,
+    campaign_id?: string, ad_set_id?: string, ad_id?: string, params: any = {},
+  ): Promise<MetaApiResult> {
+    const deps = this.metaMarketingApiDeps();
+    deps.resolveCampaignObjectiveGate = buildToolkitObjectiveGate(AgentModeService.META_OBJECTIVE_VALUES);
+    return adsApisImpl.callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, undefined, deps);
+  }
+
+  /**
+   * ENG-2303 P3 — Meta Toolkit (external MCP) seams. The external agent's user approves a
+   * preview in their own conversation; the toolkit binds the confirm to that exact preview
+   * (HMAC, see mcp/metaToolkitWrites.ts) and then dispatches the SAME way an approved
+   * deck item does: through dispatchAuthorizedMetaWrite, so the budget-anomaly re-check,
+   * tracking pre-flight and rate shaper all stay in the path. These three methods perform
+   * no authorization of their own.
+   */
+  public async previewMetaMoneyParams(userId: string, account_id: string, params: any) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return this.normalizeMetaMoneyParams(accountId, accessToken, params);
+  }
+
+  public async dispatchToolkitConfirmedMetaWrite(
+    userId: string,
+    dispatch: { entity_type: string; action: string; account_id: string; resolvedAccountId?: string; campaign_id?: string; ad_set_id?: string; ad_id?: string; params: any },
+  ): Promise<{ result: MetaApiResult; createdId?: string }> {
+    const result = await this.dispatchAuthorizedMetaWrite(
+      userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId || dispatch.account_id,
+      dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params, false, undefined,
+    );
+    return { result, createdId: AgentModeService.extractDispatchedObjectId(result) };
+  }
+
+  /** Read-only signals tools reuse the same account-bound credential resolver as other toolkit reads. */
+  public async readToolkitMetaSignals(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    return executeSignalsRead(name, args, credentials);
+  }
+
+  /** ENG-2919: read-only experiment tools reuse the account-bound credential resolver. */
+  public async readToolkitMetaExperiments(userId: string, name: string, args: any) {
+    const credentials = await this.getMetaCredentials(userId, args.account_id);
+    const { executeExperimentRead } = await import('../mcp/metaToolkitExperiments');
+    return executeExperimentRead(name, args, credentials);
+  }
+
+  /**
+   * ENG-2980: account-bound Graph call for the experiment write tools. GET reads a numeric
+   * node or the account's own ad_studies edge; POST creates on the account's ad_studies edge
+   * or updates a numeric study node. metaToolkitExperimentWrites proves campaign and study
+   * ownership before calling. `outcomeUnknown` marks a failure without a definite Meta answer.
+   */
+  public async toolkitMetaExperimentGraph(
+    userId: string, account_id: string, method: 'GET' | 'POST', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+\/ad_studies|\d+)$/.test(path)) throw new Error('Unsupported experiment path.');
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      // Meta creates ad studies only on a Business or User ad_studies edge; the ad-account edge
+      // is read-only. Create on the account's owning business (else the token's user). The
+      // study's campaigns still come from this account and the write path reads it back.
+      let target = path;
+      if (method === 'POST' && path.startsWith('act_')) {
+        const { data: acct } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path.split('/')[0]}`, {
+          params: { fields: 'business{id}', access_token: accessToken }, timeout: 30_000,
+        });
+        const businessId = acct?.business?.id ? String(acct.business.id) : '';
+        target = /^\d+$/.test(businessId) ? `${businessId}/ad_studies` : 'me/ad_studies';
+      }
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${target}`,
+        params: { ...(method === 'GET' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
+  /** ENG-2921: read-only account activity log via the account-bound credential resolver. */
+  public async readToolkitMetaActivityLog(userId: string, args: any) {
+    const { executeActivityLogRead, metaReadFailureResult } = await import('../mcp/metaToolkitDiagnostics');
+    const { classifyMetaReadFailure } = await import('../utils/metaReadErrorClass');
+    let credentials: { accountId: string; accessToken: string };
+    try {
+      credentials = await this.getMetaCredentials(userId, args?.account_id);
+    } catch (error: any) {
+      // ENG-2921: an expired/missing Meta connection is a readable reconnect result, not a bare 500.
+      if (classifyMetaReadFailure(error).kind === 'credential') return metaReadFailureResult(error);
+      throw error;
+    }
+    return executeActivityLogRead(args, credentials);
+  }
+
+  /**
+   * Zoma creative upload: Meta processing state of an uploaded video, ownership-scoped to the
+   * selected ad account (a video id addresses a node globally). Returns Meta's preferred
+   * thumbnail once ready, so the caller can build a video creative without a second upload.
+   */
+  public async readToolkitMetaVideoStatus(
+    userId: string, account_id: string, videoId: string, opts: { justUploaded?: boolean } = {},
+  ): Promise<{ status: string; thumbnail_url?: string; error?: string }> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const base = `https://graph.facebook.com/${apiVersion}`;
+    const { data: node } = await axios.get(`${base}/${encodeURIComponent(videoId)}`, {
+      params: { fields: 'id,status,thumbnails{uri,is_preferred}', access_token: accessToken },
     });
+    // AdVideo has no account_id field; confirm ownership through the account's own edge.
+    // A video we uploaded to this account a moment ago is owned by construction, and the
+    // advideos edge lags new uploads by a few seconds (it 404'd every fresh upload in prod),
+    // so the check only applies to caller-supplied ids.
+    if (!opts.justUploaded) {
+      const { data: owned } = await axios.get(`${base}/act_${accountId.replace(/^act_/, '')}/advideos`, {
+        params: { fields: 'id', filtering: JSON.stringify([{ field: 'id', operator: 'IN', value: [videoId] }]), access_token: accessToken },
+      });
+      if (!Array.isArray(owned?.data) || !owned.data.some((v: any) => String(v?.id) === String(videoId))) {
+        throw new Error('That video is not in the selected ad account (a video uploaded in the last few seconds may not be listed yet; retry shortly).');
+      }
+    }
+    const raw = String(node?.status?.video_status || 'processing').toLowerCase();
+    const status = raw === 'ready' ? 'ready' : raw === 'error' ? 'error' : 'processing';
+    const thumbs: any[] = node?.thumbnails?.data ?? [];
+    const thumb = thumbs.find((t) => t?.is_preferred) ?? thumbs[0];
+    return {
+      status,
+      ...(thumb?.uri ? { thumbnail_url: String(thumb.uri) } : {}),
+      ...(status === 'error' ? { error: String(node?.status?.processing_progress ?? 'processing failed') } : {}),
+    };
+  }
+
+  /** ENG-2922: resolved account + token for the toolkit's ARCHIVE/DELETE/COPY seam (mcp/metaToolkitLifecycle.ts). */
+  public async getToolkitMetaGraphCredentials(userId: string, account_id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return { accountId, accessToken };
+  }
+
+  /**
+   * ENG-2914 Zoma custom audiences: one Graph call with the caller's credentials for the
+   * selected ad account. `{account}` in the path becomes act_<id>. Callers (mcp/metaToolkitAudiences)
+   * build the path from validated numeric ids and check node ownership themselves. Errors are
+   * re-thrown as a plain Error with only Meta's error fields: the axios error carries the access
+   * token in its config, so it must never reach a caller or a log.
+   */
+  public async toolkitMetaGraphRequest(
+    userId: string, account_id: string, method: 'GET' | 'POST' | 'DELETE', path: string, params: Record<string, any> = {},
+  ): Promise<any> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const url = `https://graph.facebook.com/${apiVersion}/${path.replace('{account}', `act_${accountId.replace(/^act_/, '')}`)}`;
+    try {
+      const { data } = method === 'GET'
+        ? await axios.get(url, { params: { ...params, access_token: accessToken }, timeout: 30_000 })
+        : method === 'POST'
+          ? await axios.post(url, params, { params: { access_token: accessToken }, timeout: 30_000 })
+          : await axios.delete(url, { params: { access_token: accessToken }, data: params, timeout: 30_000 });
+      return data;
+    } catch (error: any) {
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta
+        ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message, error_user_msg: meta.error_user_msg }
+        : null;
+      wrapped.status = error?.response?.status;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2916: read-only Graph GET of the caller's own ad account node (edge '') or one of its
+   * edges ('adsets'). Ownership comes from the act_<id> path plus getMetaCredentials.
+   */
+  public async readToolkitMetaAccountGraph(
+    userId: string, account_id: string, edge: '' | 'adsets', params: Record<string, string>,
+  ): Promise<any> {
+    if (edge !== '' && edge !== 'adsets') throw new Error(`Unsupported account edge: ${edge}`);
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const path = `act_${accountId.replace(/^act_/, '')}${edge ? `/${edge}` : ''}`;
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2918: read-only Graph GET for the catalog tools. The path must be the caller's own
+   * account node or a numeric node's catalog edge; metaToolkitCatalogs enforces that catalog
+   * ids belong to the account's business before calling this.
+   */
+  public async readToolkitMetaCatalogGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    // ENG-2925 adds a bare numeric node (product / product-set read-back and parent-catalog
+    // lookup) and the account's adsets edge (product-set in-use check) for the catalog writes.
+    // ENG-2927 adds the account's adspixels edge (event-source pixel ownership).
+    if (!/^(act_\d+(\/(adsets|adspixels))?|\d+(\/(owned_product_catalogs|client_product_catalogs|products|product_sets|product_feeds|diagnostics|external_event_sources|uploads|rules))?)$/.test(path)) {
+      throw new Error('Unsupported catalog path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    if (path.startsWith('act_') && path.split('/')[0] !== `act_${accountId.replace(/^act_/, '')}`) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2925: Graph write for the catalog write tools. POST creates on a catalog's products /
+   * product_sets edge or updates a numeric node; DELETE removes a numeric node. Paths are
+   * allow-listed; metaToolkitCatalogWrites enforces that every catalog / product / set id
+   * belongs to the account's business before calling this. `outcomeUnknown` marks a failure
+   * without a definite Meta answer (no response, timeout, 5xx), which may still have applied.
+   */
+  public async writeToolkitMetaCatalogGraph(
+    userId: string, account_id: string, method: 'POST' | 'DELETE', path: string, params: Record<string, string>,
+  ): Promise<any> {
+    // ENG-2927: a catalog's external_event_sources edge (connect = POST, disconnect = DELETE).
+    // ENG-2926: business owned_product_catalogs (catalog create), a catalog's product_feeds, a feed's uploads / rules.
+    const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules))?$/ : /^\d+(\/external_event_sources)?$/;
+    if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
+    const { accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.request({
+        method,
+        url: `https://graph.facebook.com/${apiVersion}/${path}`,
+        params: { ...(method === 'DELETE' ? params : {}), access_token: accessToken },
+        ...(method === 'POST' ? { data: new URLSearchParams(params).toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : {}),
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-2920: read-only Graph GET for the Pages / Instagram / Ad Library tools. Paths are
+   * allow-listed; metaToolkitPages enforces id ownership against the account before calling.
+   */
+  public async readToolkitMetaPagesGraph(
+    userId: string, account_id: string, path: string, params: Record<string, string>,
+  ): Promise<any> {
+    if (!/^(act_\d+(\/(promote_pages|instagram_accounts))?|\d+\/(owned_pages|client_pages|media)|me\/accounts|ads_archive)$/.test(path)) {
+      throw new Error('Unsupported Pages/Instagram path.');
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const own = `act_${String(accountId).replace(/^act_/, '')}`;
+    if (path.startsWith('act_') && path.split('/')[0] !== own) throw new Error('Account mismatch.');
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/${apiVersion}/${path}`, {
+        params: { ...params, access_token: accessToken },
+        timeout: 30_000,
+        maxContentLength: 5_000_000,
+      });
+      return data;
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
+  public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    let creative: any;
+    try {
+      creative = await metaService.getAdCreative(accessToken, creativeId);
+    } catch (error: any) {
+      // Meta code 100 = the node does not exist or is not visible to this token: a real "not
+      // found". Anything else (5xx, rate limit, network) is a failed lookup, not a verdict.
+      const code = Number(error?.structuredError?.code ?? error?.response?.error?.code);
+      if (code === 100) throw error;
+      const failed: any = new Error(String(error?.structuredError?.error_user_msg || error?.message || 'Meta request failed'));
+      failed.creativeLookupFailed = true;
+      throw failed;
+    }
+    MetaService.assertOwnedByAccount(creative?.account_id, creativeId, 'Ad creative', accountId);
+  }
+
+  /**
+   * ENG-2942: account-scoped reads behind the toolkit's optimisation-event check. Both go
+   * through the signals read path, which binds every pixel read to the selected account.
+   */
+  public async toolkitMetaConversionLookup(userId: string, account_id: string) {
+    const credentials = await this.getMetaCredentials(userId, account_id);
+    const { executeSignalsRead } = await import('../mcp/metaToolkitSignals');
+    const { eventNamesFromStats } = await import('../mcp/metaToolkitConversionGate');
+    const read = async (name: string, args: any) => {
+      const body: any = await executeSignalsRead(name, args, credentials);
+      if (body?.success === false) throw new Error(body.message || 'Meta read failed');
+      return body;
+    };
+    return {
+      listCustomConversions: async () => {
+        const all: any[] = [];
+        let after: string | undefined;
+        for (let pages = 0; pages < 20; pages += 1) {
+          const body = await read('ads_get_customconversions', after ? { after } : {});
+          all.push(...(Array.isArray(body?.data) ? body.data : []));
+          const next = body?.paging?.has_next ? body?.paging?.cursors?.after : undefined;
+          if (typeof next !== 'string' || !next) break;
+          after = next;
+        }
+        return all;
+      },
+      listPixelEventNames: async (pixelId: string) =>
+        eventNamesFromStats(await read('ads_get_dataset_stats', { pixel_id: pixelId, aggregation: 'event' })),
+    };
+  }
+
+  /** Read-back after a toolkit write: status + effective status + budgets, ownership-scoped. */
+  public async readBackMetaWriteTarget(userId: string, account_id: string, entity_type: string, id: string) {
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    return readBackMetaNode(metaService, accountId, accessToken, entity_type, id);
   }
 
   /**
@@ -14565,6 +15960,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    if (action === PAUSED_BUNDLE_ACTION) {
+      if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || overrideApproved) throw new Error('Invalid paused-bundle scope.');
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId.replace(/^act_/, '') !== account_id.replace(/^act_/, '')) throw new Error('Approved bundle account changed.');
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(creds.connection?.config) === 'missing') throw new Error(getMetaAdsNoPagesMessage(creds.connection?.config));
+      return executePausedMetaBundle(params, {
+        preflight: bundle => this.preflightPausedMetaBundle(userId, sessionId, creds.accountId, creds.accessToken, bundle),
+        normalize: p => this.normalizeMetaMoneyParams(creds.accountId, creds.accessToken, p),
+        write: (entity, p, campaign, adSet) => this.dispatchAuthorizedMetaWrite(userId, entity, 'CREATE', account_id, campaign, adSet, undefined, p, false, sessionId),
+        read: async (entity, id, fields) => {
+          if (entity === 'AD') return metaService.getAd(creds.accessToken, id, creds.accountId);
+          const rows = entity === 'CAMPAIGN'
+            ? (await metaService.listCampaigns(creds.accountId, creds.accessToken, { campaignId: id, fields })).campaigns
+            : (await metaService.listAdSets(creds.accountId, creds.accessToken, undefined, { adSetId: id, fields })).adSets;
+          return Array.isArray(rows) ? rows.find(row => row && typeof row === 'object' && !Array.isArray(row) && row.id === id) : null;
+        },
+      }) as Promise<MetaApiResult>;
+    }
     const budgetAnomaly = await this.checkMetaBudgetChange(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
     );
@@ -14618,7 +16032,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
-      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // ENG-1636: an AD (or AD_SET) status flip usually arrives with only its own id, but the gate needs
       // the parent campaign to scope its tracking checks — and blocked such calls with
       // "no campaign was identified" even though Meta carries campaign_id on the ad
       // object. Resolve the parent instead of refusing a call whose campaign is one
@@ -14629,6 +16043,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         entityType: entity_type,
         campaignId: campaign_id,
         adId: ad_id,
+        adSetId: ad_set_id,
         accessToken: gateCreds.accessToken,
         accountId: gateCreds.accountId,
         resolver: metaService,
@@ -14798,7 +16213,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // above correctly used the raw id (matching the digest's own input); this
           // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );
@@ -14829,6 +16244,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Emma never actually received anything more specific than "Invalid parameter."
       return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
     }
+    // An accepted write whose verification failed is not a verified workflow checkpoint.
+    if (result.readBackVerified === false || result.budget_verification === 'UNCONFIRMED' ||
+        result.budget_verification === 'MISMATCH' || result.spend_cap_verified === false || result.verified === false) {
+      return { verified: false, error: result.message || 'Meta write could not be verified.' };
+    }
     // Reuses whatever read-back mismatch detection the underlying write
     // method already performs (Phase 1's existing resolver — today,
     // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
@@ -14852,6 +16272,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       verified: true,
       verifiedFields: {
         appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...((result as any).ledger ? { ledger: (result as any).ledger, requested_ad_count: (result as any).requested_ad_count, verified_ad_count: (result as any).verified_ad_count } : {}),
         ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
       },
     };
@@ -14887,6 +16308,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outputs: [],
         requiredParameters: [],
         execute: async (): Promise<Record<string, unknown>> => {
+          if (dispatch.action === PAUSED_BUNDLE_ACTION) {
+            const digest = await this.resolveMetaWriteManifestDigest(userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+              dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params);
+            if (digest !== decision.metaWriteManifestDigest) throw new Error('Paused bundle scope changed after approval.');
+          }
           // Review fix: advanceIndependentWorkflow provides no mutual
           // exclusion between two concurrent drivers of the SAME run picking
           // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
@@ -14929,7 +16355,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             throw new StepContendedError('This write is already being dispatched by a concurrent request.');
           }
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.action === PAUSED_BUNDLE_ACTION ? dispatch.account_id : dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, originSessionId,
           );
@@ -15355,8 +16781,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
+    /**
+     * ENG-2962: set when the answer came from an MCP tool acting on someone's behalf (a self-call). It may not approve a card only a
+     * person may approve; decided here, on the very deck the answers are applied to (the write below is conditional on that deck
+     * still awaiting), not on an earlier read in the route.
+     */
+    options?: { refusePersonOnlyApprovals?: boolean },
   ): Promise<
     | { outcome: 'invalid'; reason: string }
+    | { outcome: 'needs_person'; actions: string[] }
     | { outcome: 'conflict' }
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
@@ -15377,6 +16810,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outcome: 'invalid',
         reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
       };
+    }
+
+    if (options?.refusePersonOnlyApprovals) {
+      const blocked = personOnlyApprovalsIn(deck, inboundAnswers);
+      if (blocked.length > 0) return { outcome: 'needs_person', actions: blocked.map(b => b.action) };
     }
 
     let answered: PendingApprovalDeck;
@@ -15526,7 +16964,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       stepId: c.stepId,
       status: c.status,
       ...(c.status === 'verified'
-        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined,
+          ...(c.verifiedFields?.ledger ? { bundle: { requested_ad_count: c.verifiedFields.requested_ad_count as number,
+            verified_ad_count: c.verifiedFields.verified_ad_count as number, ledger: c.verifiedFields.ledger as unknown[] } } : {}) }
         : {}),
       ...(c.status === 'failed'
         ? Array.isArray(c.discrepancy)
@@ -15749,7 +17189,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
-      console.error('AgentMode: Error managing custom audiences:', error);
+      // ENG-2914: never log the error object. A Meta SDK error carries the request (URL with the
+      // access token, and for user uploads the hashed member payload); log Meta's fields only.
+      console.error('AgentMode: Error managing custom audiences:', {
+        message: error?.message,
+        code: error?.structuredError?.code,
+        error_subcode: error?.structuredError?.error_subcode,
+      });
       // Meta's raw error.message (e.g. "Permissions error") is often too terse to
       // act on. metaService.handleError attaches a structuredError with Meta's own
       // consumer-facing error_user_msg (e.g. the exact accept-terms URL for
@@ -16030,6 +17476,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // the VM sandbox (only `page` is in scope). Guide the LLM to fix the code, not retry as-is.
     const isBrowserRunCode =
       toolName === 'browser_run_code' || toolName.endsWith('_browser_run_code');
+    // ENG-2807: a Playwright locator/action timeout inside browser_run_code means the
+    // selector never appeared (wrong selector, login redirect, iframe, or the user is
+    // already signed in). Re-running the same code just burns another 30s timeout, so
+    // steer the model to inspect the live page before choosing a new selector.
+    if (
+      isBrowserRunCode &&
+      /TimeoutError/.test(safeMessage) &&
+      /Timeout \d+ms exceeded/.test(safeMessage) &&
+      /waiting for (locator|selector|getBy)/i.test(safeMessage)
+    ) {
+      const selectorMatch = safeMessage.match(/waiting for (locator\([^\n]*?\)|getBy\w+\([^\n]*?\)|selector [^\n]+)/i);
+      const selectorNote = selectorMatch ? ` (${selectorMatch[1].trim()})` : '';
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The element your code waited for${selectorNote} never appeared on the page — this is a wrong/stale selector, not a slow page. Do NOT re-run the same code with the same selector. First call browser_snapshot to see the actual page: check whether you were redirected (login, consent, captcha), whether the field is inside an iframe, or whether the step is already complete (e.g. already signed in). Then pick a selector that exists in the snapshot (prefer role/label/placeholder locators) and retry once.`;
+    }
     if (isBrowserRunCode && safeMessage.includes('ReferenceError')) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The browser_run_code sandbox only has \`page\` in scope. All variables must be declared inside the async function body. Do NOT reference external variables, imports, or closures. Rewrite the function to be fully self-contained:\n\`\`\`js\nasync (page) => {\n  // All logic here — no outside variables\n  const result = await page.evaluate(() => { ... });\n  return result;\n}\n\`\`\``;
     }
@@ -16058,6 +17518,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
     if (toolName === 'manage_scheduled_chat') {
+      // ENG-1656: tool-side preflight already names the exact field to fix.
+      if (safeMessage.includes('Invalid manage_scheduled_chat arguments')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Correct exactly the argument named above and retry immediately. Nothing was sent to the server, so no schedule was created or changed.`;
+      }
+      if (safeMessage.includes('Invalid nextRunTime') || safeMessage.includes('valid IANA timezone') || safeMessage.includes('Invalid status')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: next_run_time must be an ISO 8601 datetime, timezone a valid IANA identifier (e.g. America/Los_Angeles), and toggle status "active" or "paused". Correct the named value and retry immediately.`;
+      }
       if (safeMessage.includes('Missing required fields')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
       }
@@ -16743,8 +18210,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // readFileContent.test.ts/emma.readFileContentTool.test.ts's direct
   // real-instance calls all call agentModeService.readFileContent(...)
   // directly.
-  public async readFileContent(fileUrl: string): Promise<any> {
-    return miscImpl.readFileContent(fileUrl);
+  public async readFileContent(fileUrl: string, caller?: miscImpl.ReadFileCallerContext): Promise<any> {
+    return miscImpl.readFileContent(fileUrl, caller);
   }
 
   // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved
@@ -17374,7 +18841,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
     return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 

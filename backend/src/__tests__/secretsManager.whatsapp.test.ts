@@ -142,6 +142,14 @@ describe('secretsManager.getWhatsAppCredentials', () => {
     expect(errorSpy.mock.calls.flat().map(String).join(' ')).toContain('appSecret');
   });
 
+  it('fails closed when a secret field is whitespace-only, naming it', async () => {
+    mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify({ ...secretCreds, phoneNumberId: '   ' }) });
+
+    const { getWhatsAppCredentials } = require('../utils/secretsManager');
+    await expect(getWhatsAppCredentials()).rejects.toThrow('Failed to fetch WhatsApp credentials');
+    expect(errorSpy.mock.calls.flat().map(String).join(' ')).toContain('phoneNumberId');
+  });
+
   it.each([['empty', ''], ['whitespace', '   ']])(
     'fails closed when the secret string is %s',
     async (_label, value) => {

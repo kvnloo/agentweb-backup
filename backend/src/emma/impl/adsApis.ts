@@ -250,6 +250,7 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS,
 } from '../../utils/metaConstants';
 import { buildListMessage, buildListResult } from '../../services/agentMode/metaListScope';
+import { classifyMetaReadFailure, META_RECONNECT_MESSAGE, META_PERMISSION_MESSAGE } from '../../utils/metaReadErrorClass';
 import {
   isMetaSpendStartingWrite,
   runMetaTrackingGate,
@@ -304,6 +305,7 @@ export type GetMetaAdsMetricsDeps = {
  * confirmed by grep to have real callers well beyond this one method.
  */
 export type CallMetaMarketingApiDeps = {
+  preparePausedMetaBundle?: (userId: string, sessionId: string | undefined, accountId: string, params: unknown) => Promise<MetaApiResult>;
   resolveCampaignObjectiveGate: (
     userId: string,
     sessionId: string | undefined,
@@ -925,7 +927,7 @@ export async function listMetaAdsCampaignsNew(
   account_id: string | undefined,
   options: { campaignId?: string; fields?: string | string[] } = {},
   clientScope: { clientId?: string; callerIsAdmin?: boolean; toolName: string } | undefined,
-  deps: { getMetaCredentials: MetaCredentialsResolver }
+  deps: { getMetaCredentials: MetaCredentialsResolver; retryBackoffMs?: number }
 ): Promise<any> {
   let connection: any;
   try {
@@ -940,10 +942,35 @@ export async function listMetaAdsCampaignsNew(
     // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
     // caller regardless of this branch.
     const hasSelector = Boolean(options.campaignId || options.fields);
-    const result = hasSelector
-      ? await metaService.listCampaigns(accountId, accessToken, options)
-      : await metaService.listCampaigns(accountId, accessToken);
-    const campaigns = result?.campaigns ?? [];
+    // ENG-1890: a read is safe to retry — transient Graph failures get a bounded retry.
+    const backoffMs = deps.retryBackoffMs ?? LIST_CAMPAIGNS_RETRY_BACKOFF_MS;
+    let result: any;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        result = hasSelector
+          ? await metaService.listCampaigns(accountId, accessToken, options)
+          : await metaService.listCampaigns(accountId, accessToken);
+        break;
+      } catch (readError: any) {
+        if (attempt >= LIST_CAMPAIGNS_MAX_ATTEMPTS || classifyMetaReadFailure(readError).kind !== 'transient') {
+          throw readError;
+        }
+        if (backoffMs > 0) await new Promise(resolve => setTimeout(resolve, backoffMs * attempt));
+      }
+    }
+    // ENG-1890: an unexpected response shape is a typed handler error, never a throw or
+    // a silent "0 campaigns".
+    if (!result || typeof result !== 'object' || !Array.isArray(result.campaigns)) {
+      return {
+        success: false,
+        message: 'Meta returned an unexpected campaign-list response (no campaigns array). This is not an empty account; retry once, and report it if it persists.',
+        error: 'unexpected_response_shape',
+        errorClass: 'invalid_output',
+        errorType: 'handler',
+        details: { responseType: Array.isArray(result) ? 'array' : typeof result, keys: result && typeof result === 'object' ? Object.keys(result).slice(0, 10) : [] },
+      };
+    }
+    const campaigns = result.campaigns;
 
     // ENG-1625 follow-up: this used to be `Found ${totalCount} campaign(s)` with no scope
     // or bound — the exact ENG-1476/ENG-1584 sentence shape. Assembled via buildListResult
@@ -962,21 +989,41 @@ export async function listMetaAdsCampaignsNew(
       truncated: result?.truncated,
     });
   } catch (error: any) {
-    if (error.isMetaAuthError) throw error;
+    // ENG-1890: thrown auth errors carry their class so telemetry records `auth`, not `Error`.
+    const stampAuth = (e: any) => {
+      if (e && typeof e === 'object' && !e.toolErrorClass) e.toolErrorClass = 'auth';
+      return e;
+    };
+    if (error?.isMetaAuthError) throw stampAuth(error);
     // A permission refusal from Meta is not a "no campaigns" result — throw the
     // actionable re-consent error and record the grant we just learned (ENG-629).
-    await normalizeMetaAdsReadError(error, connection?.userId || userId, connection);
-    console.error('AgentMode: Error fetching Meta ad campaigns:', error);
+    try {
+      await normalizeMetaAdsReadError(error, connection?.userId || userId, connection);
+    } catch (scopeError: any) {
+      throw stampAuth(scopeError);
+    }
+    console.error('AgentMode: Error fetching Meta ad campaigns:', error?.message);
+    const failure = classifyMetaReadFailure(error);
+    const base = error?.message || 'Failed to fetch Meta ad campaigns.';
     return {
       success: false,
-      message: error.message || 'Failed to fetch Meta ad campaigns.',
-      error: error.message,
-      details: error.structuredError,
+      message: failure.kind === 'credential'
+        ? `${base}. ${failure.tokenInvalid ? META_RECONNECT_MESSAGE : META_PERMISSION_MESSAGE}`
+        : failure.kind === 'transient'
+          ? `${base}. Meta is temporarily unavailable or throttling (retried ${LIST_CAMPAIGNS_MAX_ATTEMPTS}x); try again shortly.`
+          : base,
+      error: error?.message,
+      errorClass: failure.errorClass,
+      errorType: failure.kind === 'credential' ? 'configuration' : failure.kind,
+      details: error?.structuredError,
       // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
       code: error?.status ?? error?.response?.status
     };
   }
 }
+
+const LIST_CAMPAIGNS_MAX_ATTEMPTS = 3;
+const LIST_CAMPAIGNS_RETRY_BACKOFF_MS = 1000;
 
 // ============================================================================
 // 3. getMetaAdsMetrics (+ exclusive helpers)
@@ -1873,6 +1920,13 @@ export async function callMetaMarketingApi(
   deps: CallMetaMarketingApiDeps,
 ): Promise<MetaApiResult> {
   console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
+
+  if (action === 'CREATE_PAUSED_BUNDLE') {
+    if (entity_type !== 'CAMPAIGN' || campaign_id || ad_set_id || ad_id || !deps.preparePausedMetaBundle) {
+      return { success: false, message: 'A paused bundle creates a new campaign, ad set and ads; existing target IDs are not allowed.' };
+    }
+    return deps.preparePausedMetaBundle(userId, sessionId, account_id, params);
+  }
 
   // Ensure params is an object
   params = params || {};
@@ -3432,6 +3486,18 @@ export async function callLinkedInMarketingApi(
         if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
         if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
         return { success: true, message: 'Creative retagged with UTMs' };
+      }
+      if (action === 'UPDATE') {
+        // ENG-2575: status change only (pause / resume / archive).
+        if (!params.creative_id) throw new Error('CREATIVE UPDATE requires params.creative_id');
+        const allowed = linkedInAdsService.CREATIVE_INTENDED_STATUSES as readonly string[];
+        const status = typeof params.status === 'string' ? params.status.trim().toUpperCase() : '';
+        if (!allowed.includes(status)) {
+          throw new Error(`CREATIVE UPDATE requires params.status, one of: ${allowed.join(', ')}`);
+        }
+        const result = await linkedInAdsService.updateCreativeStatus(accessToken, accountId, String(params.creative_id), status);
+        if (!result.success) throw new Error(result.error || 'Failed to update creative');
+        return { success: true, message: `Ad status set to ${status}`, result: result.data };
       }
       throw new Error(`Unknown action "${action}" for CREATIVE`);
     }

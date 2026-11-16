@@ -109,7 +109,7 @@ describe('forward-lead — lost duplicate-email race', () => {
       expect.anything(), expect.anything(), 'api.lead_failed', expect.anything(), expect.anything(),
     );
     // a repeat submission notifies like any other repeat
-    expect(dispatchLeadCreated).toHaveBeenCalledWith('list_123', 'lead_winner', expect.any(Object));
+    expect(dispatchLeadCreated).toHaveBeenCalledWith('list_123', 'lead_winner', 'form_fill', expect.any(Object));
   });
 
   it('merges into the CONSISTENT re-read of the winner, so keys it wrote after the GSI snapshot survive', async () => {

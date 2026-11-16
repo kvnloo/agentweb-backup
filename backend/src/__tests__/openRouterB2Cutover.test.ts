@@ -41,7 +41,6 @@ describe('ENG-1431/1432 OpenRouter B2 cutover', () => {
       'routes/crm.ts',
       'routes/tasks.ts',
       'services/workflowGenerator.ts',
-      'services/growthGeniusService.ts',
       'services/reportRevisionService.ts',
       'services/inviteNoteShortener.ts',
     ]);

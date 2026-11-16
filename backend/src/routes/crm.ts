@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { statusAfterReviewedSend, missingReviewDraftError, REVIEW_DRAFT_STATUS } from '../utils/leadSchema';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
@@ -15,21 +16,26 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
-import { signUnsubscribeUrl } from '../utils/unsubscribeUrl';
+import { signUnsubscribeUrl, signOneClickUnsubscribeUrl, listUnsubscribeHeaders } from '../utils/unsubscribeUrl';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
-import { isDoNotContact } from '../utils/leadContactStatus';
+import { isDoNotContact, getDoNotContactReason } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
+import { contactSuppressionAuditEnabled, contactSuppressionAuditEvent, guardLeadPutBody, leadWriteChannel, touchesContactSuppression } from '../utils/leadWriteGuard';
 import { suppressLeadSideEffects } from '../utils/sessionList';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
 import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
+import { normalizeLeadSelection, checkEstimateConfirmation } from '../services/enrichmentCostEstimate';
+import { priceEnrichment, quoteEnrichment, quoteFromPriced, type QuoteDeps } from '../services/enrichmentQuote';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -75,6 +81,9 @@ import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentSe
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+
+const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
+  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -248,6 +257,11 @@ router.use(authenticateToken);
 // sub-router so they can be unit-tested without mocking all of crm.ts.
 import enrichSoSubRouter from './crmEnrichSo';
 import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
+
+/** ENG-2996: enrich.so validated this lead's email as deliverable. */
+const isValidatedDeliverable = (lead: any): boolean => lead?.customFields?.email_validation?.status === 'deliverable';
+
 router.use(enrichSoSubRouter);
 
 // Apollo people-enrichment routes (lookup-by-linkedin, reveal-phone, bulk
@@ -266,9 +280,11 @@ import {
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
 import { claimEmailDomain, releaseEmailDomainClaim, confirmEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
-import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError, GroupEmailPendingBatch } from '../services/groupEmailPendingBatchService';
+import { randomUUID } from 'crypto';
 import { effectiveDailyLimit } from '../services/senderUsageTracker';
 import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
+import { brandMessagingContextFromGuidelines } from '../services/brandMessagingContext';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -828,6 +844,73 @@ router.delete('/saved-views/:viewId', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error in DELETE /api/crm/saved-views/:viewId:', error);
     return res.status(500).json({ message: error?.message || 'Failed to delete saved view' });
+  }
+});
+
+const CROSS_LIST_LEAD_STATUSES = new Set(['pending_review']);
+const CROSS_LIST_LEADS_CAP = 500;
+const CROSS_LIST_CONCURRENCY = 5;
+
+/**
+ * @route GET /api/crm/leads
+ * @desc Leads with a given status across every list the caller can access
+ *       (own + org-shared). Powers the CRM Inbox "Pending Review" quick
+ *       filter (ENG-2361). Each lead is annotated with listId + listName.
+ * @access Private
+ * @query status — required; v1 accepts only "pending_review"
+ */
+router.get('/leads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    if (!CROSS_LIST_LEAD_STATUSES.has(status)) {
+      return res.status(400).json({ message: 'status must be "pending_review"' });
+    }
+
+    // Same enumeration as GET /lists: own lists + org-shared members' lists.
+    const ownLists = (await crmDb.getLeadListsByUserId(userId)) || [];
+    const memberIds = await getReadableOrgMemberIds(userId);
+    const memberLists = memberIds.length > 0
+      ? (await Promise.all(memberIds.map((id) => crmDb.getLeadListsByUserId(id)))).flat()
+      : [];
+    const candidateLists = [...ownLists, ...memberLists].filter(Boolean);
+    const accessible = await Promise.all(candidateLists.map((list: any) => canAccessCrmList(userId, list)));
+    const lists = candidateLists.filter((_list: any, i: number) => accessible[i]);
+
+    const collected: any[] = [];
+    let truncated = false;
+    for (let i = 0; i < lists.length; i += CROSS_LIST_CONCURRENCY) {
+      if (collected.length >= CROSS_LIST_LEADS_CAP) {
+        truncated = true;
+        break;
+      }
+      const batch = lists.slice(i, i + CROSS_LIST_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((list: any) => fetchAllLeadsByStatusIndex(list.listId, status, 200))
+      );
+      results.forEach((leads, j) => {
+        const list: any = batch[j];
+        for (const lead of leads) {
+          // The index fallback returns the whole list — re-check the status.
+          if (lead?.status !== status) continue;
+          collected.push({ ...sanitizeLeadForResponse(lead, userId), listId: list.listId, listName: list.name });
+        }
+      });
+    }
+
+    collected.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    if (collected.length > CROSS_LIST_LEADS_CAP) truncated = true;
+    const leads = collected.slice(0, CROSS_LIST_LEADS_CAP);
+
+    res.json({ leads, total: leads.length, truncated });
+  } catch (error: any) {
+    console.error('Error in GET /api/crm/leads:', error);
+    res.status(500).json({ message: error?.message || 'Failed to fetch leads' });
   }
 });
 
@@ -1748,6 +1831,56 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
 });
 
 /**
+ * ENG-2716/2720: dependencies for the pre-run quote (services/enrichmentQuote.ts). The quote itself, which
+ * keeps dollars server-side and returns a percent of the allowance, lives there so it is testable.
+ */
+const getQuoteDeps = async (): Promise<QuoteDeps> => {
+  // Dynamic import, like the other CrmEnrichmentService uses in this file.
+  const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+  return {
+    getLeadsPage: (listId, limit, lastKey) => crmDb.getLeadsByListId(listId, limit, lastKey as any),
+    // A list with no saved config is quoted on the reference config (as before). A saved config that cannot be
+    // READ must not be: the run would fail on it, so issuing a price and a confirmation token for it would be
+    // misleading. The error goes through; the route answers with a generic 500 and no token.
+    getSavedConfig: async (listId, userId) => {
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      return stored.isDefault ? undefined : stored.config;
+    },
+    // Mirrors the resolver (enrichmentIdentityResolver.ts): a blank or placeholder-domain email is not an identity signal.
+    hasUsableEmail: (email) =>
+      typeof email === 'string' && email.trim().length > 0 && !CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || ''),
+  };
+};
+
+const parseLeadIds = (body: any): string[] | undefined => normalizeLeadSelection(body?.leadIds);
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-v3/estimate
+ * @desc ENG-2716: pre-run cost estimate + confirmation token. Read-only: no
+ *       vendor calls and nothing is written, but it pages the list's leads and
+ *       reads the usage ledger to express the cost as a percent of the allowance. Client echoes `confirmationToken` as
+ *       `confirmEstimateToken` on the enrich-v3 POST.
+ * @access Private
+ */
+router.post('/lists/:listId/leads/enrich-v3/estimate', async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    const { listId } = req.params;
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) return res.status(404).json({ message: 'Lead list not found' });
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+    const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: parseLeadIds(req.body) });
+    return res.json(quote.customerView);
+  } catch (error) {
+    console.error('[v3][route] enrich-v3 estimate failed:', error);
+    return res.status(500).json({ message: 'Enrichment estimate failed' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/enrich-v3?mode=preview|enrich
  * @desc Run the v3.1 enrichment waterfall on all leads in the list using the
  *       saved per-list config. Synchronous in Phase 1a — returns the final
@@ -1770,6 +1903,22 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    if (req.query.mode !== undefined && typeof req.query.mode !== 'string') {
+      return res.status(400).json({ message: 'mode must be a single value' });
+    }
+
+    if (req.query.mode === 'estimate') {
+      // ENG-2715: cost estimate before the user confirms a run. Read-only.
+      const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
+      if (stored.isDefault) {
+        return res.status(400).json({
+          message: 'No enrichment config saved for this list. Open Enrichment Config and save one first.',
+        });
+      }
+      const quote = await quoteEnrichment(await getQuoteDeps(), { userId, listId, leadIds: parseLeadIds(req.body) });
+      return res.json(quote.customerView);
     }
 
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
@@ -1795,9 +1944,27 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     }
 
     const refreshFields = Array.isArray(req.body?.refreshFields) ? req.body.refreshFields : undefined;
-    const leadIds = Array.isArray(req.body?.leadIds)
-      ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
-      : undefined;
+    const leadIds = parseLeadIds(req.body);
+    if (mode === 'enrich') {
+      // ENG-2716: a supplied estimate token must match the current estimate;
+      // a missing one is rejected only once the portal confirm dialog ships.
+      const supplied = req.body?.confirmEstimateToken;
+      const required = process.env.ENRICH_V3_REQUIRE_COST_CONFIRMATION === 'true';
+      if (supplied !== undefined || required) {
+        // Only the internal price is needed to compare tokens; the customer view (usage reads) is built for the 409 body alone.
+        const priced = await priceEnrichment(await getQuoteDeps(), { userId, listId, leadIds });
+        const check = checkEstimateConfirmation(supplied, priced.estimate, required);
+        if (!check.ok) {
+          return res.status(409).json({
+            message: check.reason === 'missing'
+              ? 'Confirm the enrichment cost estimate before starting.'
+              : 'The enrichment cost estimate changed. Review and confirm the new estimate.',
+            code: 'ENRICH_ESTIMATE_CONFIRMATION_REQUIRED',
+            estimate: (await quoteFromPriced(userId, priced)).customerView,
+          });
+        }
+      }
+    }
     // ENG-1388: user-initiated runs may use Enigma card revenue (flag/allowlist-gated).
     const deps = buildV3OrchestratorDeps(userId, { enigma: true });
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
@@ -1814,6 +1981,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       },
     );
     console.log(`[v3][route] enrich-v3 response listId=${listId} processed=${result.processed} durationMs=${result.durationMs}`);
+    if (result.budgetStop) {
+      return res.status(result.processed === 0 ? 402 : 200).json({ ...result, message: result.budgetStop.message });
+    }
     return res.json(result);
   } catch (error) {
     console.error('[v3][route] enrich-v3 failed:', error);
@@ -2075,6 +2245,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const { listId } = req.params;
     const leadData = req.body;
 
+    // ENG-2966: a lead cannot be created straight into review without a draft (also MCP add).
+    const createDraftError = missingReviewDraftError(leadData?.status, leadData);
+    if (createDraftError) {
+      return res.status(400).json({ message: createDraftError });
+    }
+
     // Attribution — accept the same `attribution` / legacy `utm` shape as the
     // public forward-lead endpoint so the CRM "quick add" flow preserves source
     // data when a rep pastes in a lead they got from a tracked link.
@@ -2128,7 +2304,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
     // email validation for their rows. Flag only added when true (other lists unchanged).
     const suppressSideEffects = suppressLeadSideEffects(list);
-    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData, 'manual');
 
     if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
@@ -2178,6 +2354,17 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return res.status(400).json({ message: 'leads must be a non-empty array' });
     }
 
+    // ENG-2966: reject the import when any row would land in review without a draft.
+    const draftlessRows = leads
+      .map((lead: any, index: number) => (missingReviewDraftError(lead?.status, lead) ? index : -1))
+      .filter((index: number) => index >= 0);
+    if (draftlessRows.length > 0) {
+      return res.status(400).json({
+        message: `Rows ${draftlessRows.join(', ')} set status "${REVIEW_DRAFT_STATUS}" without a saved draft. Import them with another status, or include the draft.`,
+        rows: draftlessRows,
+      });
+    }
+
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
@@ -2214,7 +2401,13 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return normalized;
     });
 
-    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
+
+    // ENG-2996: inherit the owner's do-not-contact flags (awaited, before any
+    // sequence enrolment) and validate the new emails in the background.
+    const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
@@ -2228,6 +2421,8 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       // nor merged, so without this the caller sees an unexplained gap between
       // `total` and what it can account for.
       anonymizedSkipped: result.anonymizedSkipped || 0,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: result.errors,
       total: leads.length,
     });
@@ -2790,12 +2985,13 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
  * @desc Update a lead
  * @access Private
  */
-router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) => {
+// ENG-2157: registered for PATCH as well - the customer portal's deal editor (DealSection) has always sent PATCH here, which 404'd, so deal edits were lost on reload.
+const updateLeadHandler = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const updates = req.body;
+    let updates = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2810,6 +3006,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
+
+    // ENG-2157: server-owned keys (sync ids, attribution, auto-send marker, write flags). Default mode only reports them.
+    updates = guardLeadPutBody(req.body, { channel: leadWriteChannel(req), userId }).body;
 
     // `lifecycle` became a writable attribute on this route when updateLead grew an
     // explicit handler for it; before that the key was silently dropped. It outranks the
@@ -2856,6 +3055,28 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updateData = updates;
 
+    // ENG-2966: moving a lead INTO review requires a draft on it after this write.
+    // Also re-checked when a lead already in review has its draft edited/cleared, so the
+    // write cannot leave an empty queue row; untouched legacy review rows stay editable.
+    const touchesDraft = !!updates && ('emailDraft' in updates || 'messageDraft' in updates);
+    if (updates?.status === REVIEW_DRAFT_STATUS || touchesDraft) {
+      const before = await crmDb.getLeadById(listId, leadId);
+      const after = before ? { ...before, ...updates } : null;
+      const entering = !!before && before.status !== REVIEW_DRAFT_STATUS && updates?.status === REVIEW_DRAFT_STATUS;
+      const draftError = after && (entering || touchesDraft)
+        ? missingReviewDraftError(after.status, after)
+        : null;
+      if (draftError) {
+        return res.status(400).json({ message: draftError });
+      }
+    }
+
+    // ENG-2157: who changed a lead's do-not-contact / unsubscribe state is recorded as an engagement event (never blocks the write).
+    const auditSuppression = contactSuppressionAuditEnabled() && touchesContactSuppression(updates);
+    const suppressionBefore = auditSuppression
+      ? await crmDb.getLeadById(listId, leadId).catch((err: any) => { console.error('[contact-status-audit] could not read lead before update:', err?.message || err); return null; })
+      : null;
+
     // Auto-create status change engagement if status changed
     if (updates.status !== undefined) {
       const existingLead = await crmDb.getLeadById(listId, leadId);
@@ -2875,6 +3096,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
 
+    if (suppressionBefore) {
+      const delegatedBy = (authReq as any).delegateInfo?.isDelegated ? (authReq as any).delegateInfo?.adminUserId : undefined;
+      const event = contactSuppressionAuditEvent({ before: suppressionBefore, updates, actorUserId: userId, delegatedByUserId: delegatedBy, channel: leadWriteChannel(req) });
+      if (event) {
+        await crmDb.addLeadEngagement(listId, leadId, event)
+          .catch((err: any) => console.error('[contact-status-audit] could not record the change:', err?.message || err));
+      }
+    }
+
     // ENG-2311: no CRM push for a session-list row (see utils/sessionList.ts).
     if (!suppressLeadSideEffects(list)) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
@@ -2890,7 +3120,9 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
   }
-});
+};
+router.put('/lists/:listId/leads/:leadId', updateLeadHandler);
+router.patch('/lists/:listId/leads/:leadId', updateLeadHandler);
 
 /**
  * @route DELETE /api/crm/lists/:listId/leads/:leadId
@@ -3242,7 +3474,12 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
-    const results = await crmDb.batchCreateLeads(listId, leads);
+    const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
+
+    // ENG-2996: same import follow-ups as bulk-import (DNC inheritance + validation).
+    const followups = await applyLeadImportFollowups(listId, list.userId, results.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
 
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -3276,6 +3513,8 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       // otherwise the row count the user uploaded silently exceeds every
       // number reported back.
       anonymizedSkipped: csvAnonymizedSkipped,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: results.errors,
       message: `Imported ${results.successCount} leads`
         + (csvAlreadyPresent > 0 ? `, ${csvAlreadyPresent} already present and up to date` : '')
@@ -3824,10 +4063,11 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       const leadBatchSize = 100;
       let connectionsAnonymizedSkipped = 0;
+      const connectionsCreated: Array<{ leadId: string; email?: string }> = [];
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
-        const results = await crmDb.batchCreateLeads(listId, batch);
+        const results = await crmDb.batchCreateLeads(listId, batch, { origin: 'enrichment_import' });
 
         connectionsSuccessCount += results.successCount;
         connectionsErrorCount += results.errorCount;
@@ -3835,6 +4075,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         // error, so they must be carried separately or the connection count
         // the user sees silently under-reports what was submitted.
         connectionsAnonymizedSkipped += results.anonymizedSkipped || 0;
+        connectionsCreated.push(...(results.created ?? []));
         if (results.errors.length > 0) {
           connectionsErrors.push(...results.errors);
         }
@@ -3847,6 +4088,11 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       // Emit final progress
       emitProgress('Import complete!', 100);
 
+      // ENG-2996: same import follow-ups as bulk/CSV import (DNC inheritance + validation).
+      const followups = await applyLeadImportFollowups(listId, list.userId, connectionsCreated, {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
+      });
+
       if (connectionsSuccessCount > 0) {
         void autoEnrollListIntoSequences(userId, listId);
       }
@@ -3856,6 +4102,8 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         successCount: connectionsSuccessCount,
         errorCount: connectionsErrorCount,
         anonymizedSkipped: connectionsAnonymizedSkipped,
+        inheritedDoNotContact: followups.inheritedDoNotContact.length,
+        doNotContactCheckFailed: followups.doNotContactCheckFailed,
         errors: connectionsErrors,
         messagesImported: messagesSuccessCount,
         message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`
@@ -4989,6 +5237,9 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
   } catch (error: any) {
     console.error('Error syncing LinkedIn connections for list:', error);
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
@@ -5036,6 +5287,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
+    }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
     // sending. Positive mismatch (wrong person behind the stored URL) → 409.
@@ -5051,28 +5310,70 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(409).json(identity.refusal);
     }
 
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      const pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-message', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
+    }
+
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
-    // Record the engagement
-    const { emailEventsDb } = await import('../services/emailEventsDb');
-    const emailDomain = `linkedin-${listId}`;
-    const leadLinkedInKey = leadLinkedIn.toLowerCase();
-    await emailEventsDb.addLinkedInMessageEvent({
-      eventId: `linkedin_sent_${Date.now()}_${leadId}`,
-      emailDomain,
-      leadEmail: leadLinkedInKey,
-      eventType: 'linkedin.message.sent',
-      text: message.trim(),
-      timestamp: new Date().toISOString(),
-      senderId: accountId,
-      messageProviderId: '',
-    });
+    // Record the engagement. The message is ALREADY sent at this point, so a failure here must not be
+    // reported as a failed send: the user would retry and message the lead twice.
+    try {
+      const { emailEventsDb } = await import('../services/emailEventsDb');
+      const emailDomain = `linkedin-${listId}`;
+      const leadLinkedInKey = leadLinkedIn.toLowerCase();
+      // eventId and timestamp are fixed BEFORE the retries: the write is a keyed put, so a retry overwrites the
+      // same item instead of creating a second engagement.
+      const engagementEvent = {
+        eventId: `linkedin_sent_${Date.now()}_${leadId}`,
+        emailDomain,
+        leadEmail: leadLinkedInKey,
+        eventType: 'linkedin.message.sent' as const,
+        text: message.trim(),
+        timestamp: new Date().toISOString(),
+        senderId: accountId,
+        messageProviderId: '',
+      };
+      const RETRY_DELAYS_MS = [150, 400];
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await emailEventsDb.addLinkedInMessageEvent(engagementEvent);
+          break;
+        } catch (writeErr) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw writeErr;
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
+        }
+      }
+    } catch (recordErr) {
+      console.error('LinkedIn message was sent but its engagement could not be recorded after retries (non-fatal):', recordErr);
+      return res.json({ success: true, engagementRecorded: false });
+    }
 
     return res.json({ success: true });
   } catch (error: any) {
     console.error('Error sending LinkedIn message:', error);
     if (error.message?.startsWith('Cannot send message:')) {
       return res.status(400).json({ message: error.message });
+    }
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn message' });
   }
@@ -5121,6 +5422,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
+      }
+    }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
     // sending the invite. Positive mismatch → 409, nothing sent.
@@ -5134,6 +5443,33 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     });
     if (!identity.allowed) {
       return res.status(409).json(identity.refusal);
+    }
+
+    // ENG-2529: hand CRM sends go through the same daily + hourly pacer as the agent tool and
+    // drip worker. Paced after the identity check so a 409 never burns a daily slot.
+    {
+      const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      // Same split as paceDripLinkedInWrite: an owned/org-shared account gets the full gate; a
+      // list-assigned/pool account with no owner record is still held to the hourly pacer.
+      let pacedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+      // The list-assigned account may belong to the list owner (an editor sending from a
+      // shared list); resolve it under the owner so its daily invite cap still applies.
+      const listOwnerId = (list as any).userId;
+      if (!pacedAccount && accountId === (list as any).linkedInAccountId && listOwnerId && listOwnerId !== userId) {
+        pacedAccount = await resolveLinkedInAccountForWrite(listOwnerId, accountId);
+      }
+      if (pacedAccount) {
+        const paced = await paceLinkedInWrite('send-invite', pacedAccount, accountId);
+        if (paced.refusal) {
+          return res.status(429).json(paced.refusal);
+        }
+      } else {
+        const { reserveWriteSlot } = await import('../services/linkedInWritePacer');
+        const slot = await reserveWriteSlot(accountId);
+        if (!slot.allowed) {
+          return res.status(429).json({ success: false, message: 'LinkedIn write actions are being paced', error: String(slot.reason ?? ''), gate: 'write_pacer' });
+        }
+      }
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
@@ -5224,6 +5560,11 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     return res.json({ success: true, linkedInInviteSentAt: sentAt, noteDropped });
   } catch (error: any) {
     console.error('Error sending LinkedIn invite:', error);
+    // Same infrastructure handling as send-linkedin-message: an unreachable Unipile (credential
+    // fetch, gateway/5xx, timeout) is a handled 503, never a 500 echoing an internal message.
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });
   }
 });
@@ -5268,11 +5609,10 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const { agentModeService } = await import('../services/agentModeService');
 
-    // Get brand guidelines for context
-    const brandGuidelines = await agentModeService.readBrandGuidelines(userId);
-    const brandContext = brandGuidelines?.exists && brandGuidelines?.content
-      ? `\nSender context: ${String(brandGuidelines.content).slice(0, 500)}`
-      : '';
+    // Sender brand context. readBrandGuidelines returns { exists, brandData,
+    // formattedContent } — the old `.content` read was always undefined, so the
+    // note never saw the sender's brand (ENG-2967).
+    const senderBrand = brandMessagingContextFromGuidelines(await agentModeService.readBrandGuidelines(userId));
 
     const firstName = (lead as any).firstName || '';
     const lastName = (lead as any).lastName || '';
@@ -5283,7 +5623,7 @@ router.post('/lists/:listId/leads/:leadId/draft-invite-note', async (req: Reques
 
     const leadDesc = [leadName !== 'this person' ? leadName : null, title, company ? `at ${company}` : null].filter(Boolean).join(', ');
     const notesLine = notes ? `\nWhat we know about them: ${notes.slice(0, 300)}` : '';
-    const senderContext = brandContext ? `\nSender context: ${brandContext.replace('\nSender context: ', '').slice(0, 400)}` : '';
+    const senderContext = senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : '';
 
     const prompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
@@ -5570,6 +5910,9 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
         connectedAccountId: s.connectedAccountId,
         effectiveDailyLimit: limit,
         sentToday: usage?.sentCount ?? 0,
+        // ENG-2868: false when usage is untracked (uncapped) or the read failed, so
+        // callers can tell "unknown" from a real zero without changing sentToday's type.
+        sentTodayKnown: usage != null,
       };
     }));
 
@@ -6339,6 +6682,20 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
+    }
+
+    // ENG-673: this contact is being emailed through the customer's Smartlead campaign. A person sending ONE email by hand may still want to, so
+    // this is a confirmation (the portal asks), not a block; bulk and automated sends skip such leads outright.
+    if (isPushedToSmartlead(lead) && req.body?.confirmPushedToSmartlead !== true) {
+      return res.status(409).json({
+        code: 'pushed_to_smartlead',
+        message: "This contact is being emailed through your Smartlead campaign, so nothing was sent from AgentWeb (they would get email from two places). To send anyway, confirm it in the lead panel.",
+      });
+    }
+
     // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
     // don't resolve to a configured sender (an older client, or an ad-hoc address),
     // fall back to a synthesized resend sender from the raw fields — same as before.
@@ -6363,10 +6720,13 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(500).json({ message: error.message || 'Failed to send email' });
     }
 
-    // Remove the email draft after successfully sending
-    await crmDb.updateLead(listId, leadId, {
-      emailDraft: null
-    });
+    // Remove the email draft after successfully sending. A lead that was waiting in
+    // Pending Review has now been contacted, so move it out of the review queue —
+    // otherwise a manual send from the lead panel leaves it stuck there.
+    const postSendUpdates: Record<string, unknown> = { emailDraft: null };
+    const nextStatus = statusAfterReviewedSend(lead.status, list.statusConfig, list.listType);
+    if (nextStatus) postSendUpdates.status = nextStatus;
+    await crmDb.updateLead(listId, leadId, postSendUpdates);
 
     res.json({
       message: 'Email sent successfully',
@@ -6413,6 +6773,11 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     const list = await crmDb.getLeadListById(listId);
     if (!list || !(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    // ENG-673: a contact marked do-not-contact (unsubscribed, bounced, opted out, or reported by Smartlead) is never emailed from AgentWeb. No override.
+    if (isDoNotContact(lead)) {
+      return res.status(409).json({ code: 'do_not_contact', message: `Not sent: this contact is marked do-not-contact (${getDoNotContactReason(lead) ?? 'do-not-contact'}). Change their status first if that is wrong.` });
     }
 
     // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
@@ -6647,7 +7012,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     });
 
     // Batch create/merge leads (always force update)
-    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads, { origin: 'integration' });
 
     const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
@@ -6696,7 +7061,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { leadIds } = req.body;
+    const { leadIds, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -6738,9 +7103,15 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // Eligibility = has email && not DNC && not undeliverable && not
     // malformed/test-domain. Single boolean filter (not arithmetic
     // subtraction) so overlapping categories don't produce negative counts.
-    const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
-    ).length;
+    // ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own group email leaves it out (send, preview
+    // and prepare all apply the same rule, or the preview would promise recipients the send does not make).
+    const smartlead = leads.filter((l: any) => l.email && !isDoNotContact(l) && isPushedToSmartlead(l)).length;
+    const sendable = leads.filter((l: any) =>
+      l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
+    );
+    // ENG-2996: mirrors the send's opt-in excludeUnvalidated filter.
+    const unvalidatedCount = excludeUnvalidated === true ? sendable.filter((l: any) => !isValidatedDeliverable(l)).length : 0;
+    const eligibleLeads = sendable.length - unvalidatedCount;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
@@ -6753,10 +7124,13 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       eligibleLeads,
       unsubscribedCount: doNotContactCount,
       doNotContactCount,
+      /** Left out because they are being emailed through the customer's Smartlead campaign (ENG-673). */
+      smartleadCount: smartlead,
       noEmailCount,
       undeliverableCount,
       riskyCount,
       invalidCount,
+      ...(excludeUnvalidated === true ? { unvalidatedCount } : {}),
       undeliverableEmails,
       riskyEmails,
       invalidEmails,
@@ -6802,7 +7176,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
     const eligibleLeads = leads.filter(
-      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+      (l: any) => l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && isEligibleGroupEmailRecipient(l.email),
     );
     const eligibleCount = eligibleLeads.length;
 
@@ -6857,6 +7231,172 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
   }
 });
 
+// ENG-2929: mailbox sends above this many leads run in the background (see group-email/send).
+const MAILBOX_SYNC_LEAD_LIMIT = 50;
+// A background run that hasn't written progress for this long is presumed dead (instance
+// restart/deploy) and may be superseded by a new send/resume for the same list.
+const BACKGROUND_RUN_STALE_MS = 2 * 60 * 1000;
+
+interface MailboxBackgroundSendInput {
+  userId: string;
+  listId: string;
+  sender: CrmSender;
+  subject: string;
+  htmlContent: string;
+  textContent?: string;
+  unsubscribeFooterHtml?: string;
+  socketId?: string;
+  leads: any[];
+  buildMessage: (lead: any) => { to: string; subject: string; html: string; text?: string; headers: Record<string, string> };
+}
+
+function isLiveBackgroundRun(batch: GroupEmailPendingBatch | null, now = Date.now()): boolean {
+  if (!batch?.backgroundRunId || !batch.backgroundHeartbeatAt) return false;
+  return now - new Date(batch.backgroundHeartbeatAt).getTime() < BACKGROUND_RUN_STALE_MS;
+}
+
+/**
+ * Claims the list's pending-batch record for a new background run (CAS on updatedAt), then
+ * sends in the background. At-most-once per lead: before each send the lead is removed from
+ * the durable remaining set, so a crash/restart mid-run can never re-email anyone on resume
+ * (the worst case is one lead left unsent and visible as not attempted).
+ */
+export async function startMailboxGroupEmailInBackground(
+  input: MailboxBackgroundSendInput,
+): Promise<{ ok: true; runId: string; total: number } | { ok: false; message: string }> {
+  const { userId, listId, sender } = input;
+  const runId = randomUUID();
+  let leads = input.leads;
+  let remainingIds: string[] = leads.map((l: any) => l.leadId);
+
+  let existing = await getPendingBatch(userId, listId).catch(() => null);
+  for (let attempt = 0; ; attempt++) {
+    if (isLiveBackgroundRun(existing)) {
+      return { ok: false, message: 'A group email to this list is already sending in the background. Wait for it to finish or stop.' };
+    }
+    // An unfinished earlier run owns which leads are still owed this email: never re-email
+    // leads it already sent to. Only leads still in its remaining set are sent (ENG-2929).
+    if (existing) {
+      const owed = new Set(existing.skippedLeadIds ?? []);
+      leads = input.leads.filter((l: any) => owed.has(l.leadId));
+      remainingIds = leads.map((l: any) => l.leadId);
+      if (leads.length === 0) {
+        return { ok: false, message: 'Every lead in this list was already sent this email by an earlier unfinished send. Dismiss it to start a new one.' };
+      }
+    }
+    try {
+      await upsertPendingBatch(userId, {
+        listId,
+        senderId: sender.id,
+        senderEmail: sender.email,
+        senderName: sender.fromName,
+        subject: input.subject,
+        htmlContent: input.htmlContent,
+        textContent: input.textContent,
+        unsubscribeFooterHtml: input.unsubscribeFooterHtml,
+        skippedLeadIds: remainingIds,
+        sentSoFar: existing?.sentSoFar ?? 0,
+        totalOriginal: existing?.totalOriginal ?? remainingIds.length,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+        backgroundRunId: runId,
+        backgroundHeartbeatAt: new Date().toISOString(),
+      }, existing?.updatedAt ?? null);
+      break;
+    } catch (err) {
+      if (!(err instanceof PendingBatchConflictError) || attempt >= 2) {
+        console.error('[ENG-2929] Failed to claim pending group-email batch:', err);
+        return { ok: false, message: 'Could not start the background send. Please try again.' };
+      }
+      existing = await getPendingBatch(userId, listId).catch(() => null);
+    }
+  }
+
+  void runMailboxGroupEmailBackground({ ...input, leads }, runId).catch((err) =>
+    console.error(`[ENG-2929] background group email ${listId} crashed:`, err),
+  );
+  return { ok: true, runId, total: leads.length };
+}
+
+/** Exported for tests: the background loop itself. */
+export async function runMailboxGroupEmailBackground(input: MailboxBackgroundSendInput, runId: string): Promise<{ sent: number; failed: number; stoppedEarlyReason: string | null; aborted: boolean }> {
+  const { userId, listId, leads, socketId } = input;
+  const total = leads.length;
+  let sent = 0;
+  let failed = 0;
+  let unrecordedSent = 0;
+  let stoppedEarlyReason: string | null = null;
+  // Leads whose send failed (not a daily-limit stop): never sent, so they stay owed for resume.
+  const failedIds: string[] = [];
+  const failedEmails: string[] = [];
+
+  // Writes the remaining set + folded sent count, only while this run still owns the record.
+  // Returns false when ownership was lost (another run superseded us, or the user dismissed it).
+  const persist = async (remaining: string[]): Promise<boolean> => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const current = await getPendingBatch(userId, listId);
+      if (!current || current.backgroundRunId !== runId) return false;
+      try {
+        await upsertPendingBatch(userId, {
+          ...current,
+          skippedLeadIds: remaining,
+          sentSoFar: (current.sentSoFar ?? 0) + unrecordedSent,
+          backgroundHeartbeatAt: new Date().toISOString(),
+        }, current.updatedAt);
+        unrecordedSent = 0;
+        return true;
+      } catch (err) {
+        if (!(err instanceof PendingBatchConflictError)) throw err;
+      }
+    }
+    return false;
+  };
+
+  for (let i = 0; i < leads.length; i++) {
+    const lead = leads[i];
+    // Mark attempted BEFORE sending: never re-send on resume, even after a crash here.
+    if (!(await persist([...failedIds, ...leads.slice(i + 1).map((l: any) => l.leadId)]))) {
+      console.error(`[ENG-2929] background group email ${listId} run ${runId} stopped: pending record no longer owned`);
+      if (socketId) io.to(socketId).emit('group-email-complete', { sent, failed, total, stoppedEarlyReason: 'Send stopped: its saved progress was replaced or dismissed.', aborted: true, failedEmails });
+      return { sent, failed, stoppedEarlyReason, aborted: true };
+    }
+    try {
+      await sendAsSender(userId, input.sender, input.buildMessage(lead));
+      sent++;
+      unrecordedSent++;
+    } catch (err: any) {
+      if (err instanceof SenderDailyLimitExceededError) {
+        stoppedEarlyReason = err.message;
+        // Not sent — put it (and everyone after it) back for the next resume.
+        await persist([...failedIds, ...leads.slice(i).map((l: any) => l.leadId)]);
+        break;
+      }
+      failed++;
+      failedIds.push(lead.leadId);
+      failedEmails.push(lead.email);
+      console.error(`[ENG-2929] Failed to send group email to ${lead.email}:`, err?.message || err);
+    }
+    if (socketId) io.to(socketId).emit('group-email-progress', { sent, failed, total });
+  }
+
+  if (stoppedEarlyReason || failedIds.length > 0) {
+    // Release ownership so the customer can resume (after the daily cap resets, or to retry
+    // the failed leads), keeping every unsent lead in the remaining set.
+    const current = await getPendingBatch(userId, listId).catch(() => null);
+    if (current?.backgroundRunId === runId) {
+      const { backgroundRunId: _r, backgroundHeartbeatAt: _h, ...rest } = current;
+      if (!stoppedEarlyReason) rest.skippedLeadIds = failedIds;
+      await upsertPendingBatch(userId, { ...rest, sentSoFar: (rest.sentSoFar ?? 0) + unrecordedSent }, current.updatedAt).catch((e) =>
+        console.error('[ENG-2929] Failed to release pending batch:', e),
+      );
+    }
+  } else {
+    const current = await getPendingBatch(userId, listId).catch(() => null);
+    if (current?.backgroundRunId === runId) await deletePendingBatch(userId, listId).catch(() => {});
+  }
+  if (socketId) io.to(socketId).emit('group-email-complete', { sent, failed, total, stoppedEarlyReason, failedEmails });
+  return { sent, failed, stoppedEarlyReason, aborted: false };
+}
+
 /**
  * @route POST /api/crm/lists/:listId/group-email/send
  * @desc Send a group email to leads in a list
@@ -6866,7 +7406,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
+    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -6913,6 +7453,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
 
+    // ENG-673: leads being emailed through the customer's Smartlead campaign are left to it. Counted and reported, never silently dropped.
+    const beforeSmartleadCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => !isPushedToSmartlead(l));
+    const skippedSmartlead = beforeSmartleadCount - eligibleLeads.length;
+
     // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
     // example.com) always fail at the provider — same validator preview uses,
     // so preview's eligible count matches what's actually attempted here.
@@ -6941,6 +7486,16 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUndeliverable = beforeCount - eligibleLeads.length;
     }
 
+    // ENG-2996: opt-in — send only to addresses enrich.so validated as
+    // deliverable (never-validated, unknown and risky are left out and counted).
+    // Default (flag absent) is unchanged.
+    let skippedUnvalidated = 0;
+    if (excludeUnvalidated === true) {
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter(isValidatedDeliverable);
+      skippedUnvalidated = beforeCount - eligibleLeads.length;
+    }
+
     // Apply dark-mode fix once before per-lead substitution.
     const sendHtml = injectColorSchemeMeta(htmlContent || '');
 
@@ -6958,18 +7513,75 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const total = eligibleLeads.length;
 
-    // ENG-266 Part 3: a mailbox send (Gmail/Graph) has no shared queue like Resend's, and
-    // budgets ~600ms/send (round-trip + throttle) — 50 leads keeps one HTTP request
-    // comfortably inside a 60s ALB timeout. Reject up front rather than partway through.
-    const MAILBOX_SENDER_LEAD_CAP = 50;
-    if (isMailboxSender(sender) && total > MAILBOX_SENDER_LEAD_CAP) {
-      return res.status(400).json({
-        message: `Sending from a connected mailbox is limited to ${MAILBOX_SENDER_LEAD_CAP} recipients per campaign. This list has ${total} eligible leads.`,
-        code: 'MAILBOX_SENDER_LEAD_CAP_EXCEEDED',
+    const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    const BACKEND_PUBLIC_URL = process.env.BACKEND_URL || 'https://api.agentweb.pro';
+
+    // ENG-266 Part 3 / ENG-2929: a mailbox send (Gmail/Graph) budgets ~600ms/send, so more
+    // than MAILBOX_SYNC_LEAD_LIMIT leads would outlive the 60s ALB timeout inside one request.
+    // Instead of refusing, run it in the background: respond 202 now, report progress through
+    // the durable pending-batch record (GET .../group-email/pending) and the socket. The
+    // sender's dailyLimit/warmup is still enforced per send by sendAsSender.
+    // Never run a second send against a list a live background run is still working through:
+    // both would draw from the same leads and email some of them twice.
+    if (isLiveBackgroundRun(await getPendingBatch(userId, listId).catch(() => null))) {
+      return res.status(409).json({
+        message: 'A group email to this list is already sending in the background. Wait for it to finish.',
+        code: 'GROUP_EMAIL_ALREADY_SENDING',
       });
     }
 
-    const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    if (isMailboxSender(sender) && total > MAILBOX_SYNC_LEAD_LIMIT) {
+      const skippedCounts = {
+        skippedUnsubscribed: skippedDoNotContact,
+        skippedDoNotContact,
+        skippedSmartlead,
+        skippedMissingVars,
+        skippedUndeliverable,
+        ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
+        skippedInvalid,
+        skippedNoEmail,
+      };
+      const started = await startMailboxGroupEmailInBackground({
+        userId,
+        listId,
+        sender,
+        subject,
+        htmlContent,
+        textContent,
+        unsubscribeFooterHtml,
+        socketId,
+        leads: eligibleLeads,
+        buildMessage: (lead: any) => {
+          let personalizedHtml = substituteVariables(sendHtml, lead);
+          const unsubscribeUrl = signUnsubscribeUrl({ baseUrl: CUSTOMER_FRONTEND_URL, listId, leadId: lead.leadId, email: lead.email });
+          personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
+          const oneClickUrl = signOneClickUnsubscribeUrl({ baseUrl: BACKEND_PUBLIC_URL, listId, leadId: lead.leadId, email: lead.email });
+          return {
+            to: lead.email,
+            subject: substituteVariables(subject, lead),
+            html: personalizedHtml,
+            text: textContent ? substituteVariables(textContent, lead) : undefined,
+            headers: listUnsubscribeHeaders(oneClickUrl),
+          };
+        },
+      });
+      if (!started.ok) {
+        return res.status(409).json({ message: started.message, code: 'GROUP_EMAIL_ALREADY_SENDING' });
+      }
+      return res.status(202).json({
+        background: true,
+        total: started.total,
+        sent: 0,
+        failed: 0,
+        failedEmails: [],
+        failureReasons: [],
+        ...skippedCounts,
+        skippedDueToLimit: 0,
+        skippedLeadIds: [],
+        stoppedEarlyReason: null,
+        message: `Sending to ${started.total} leads in the background from ${sender.email}. Progress is saved; you can close this window.`,
+      });
+    }
 
     let sent = 0;
     let failed = 0;
@@ -7007,12 +7619,20 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
           email: lead.email,
         });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
+        // ENG-2367: RFC 8058 one-click header, same signature, backend POST target.
+        const oneClickUrl = signOneClickUnsubscribeUrl({
+          baseUrl: BACKEND_PUBLIC_URL,
+          listId,
+          leadId: lead.leadId,
+          email: lead.email,
+        });
 
         await sendAsSender(userId, sender, {
           to: lead.email,
           subject: personalizedSubject,
           html: personalizedHtml,
           text: personalizedText,
+          headers: listUnsubscribeHeaders(oneClickUrl),
         });
         sent++;
       } catch (err: any) {
@@ -7086,8 +7706,10 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       failureReasons,
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
+      skippedSmartlead,
       skippedMissingVars,
       skippedUndeliverable,
+      ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
       skippedInvalid,
       skippedNoEmail,
       skippedDueToLimit,
@@ -7151,6 +7773,13 @@ router.delete('/lists/:listId/group-email/pending', async (req: Request, res: Re
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // ENG-2929: dismissing must not silently kill a live background send mid-list.
+    if (isLiveBackgroundRun(await getPendingBatch(userId, listId).catch(() => null))) {
+      return res.status(409).json({
+        message: 'This group email is still sending in the background. Wait for it to finish before dismissing.',
+        code: 'GROUP_EMAIL_ALREADY_SENDING',
+      });
+    }
     await deletePendingBatch(userId, listId);
     res.json({ message: 'Pending group email dismissed.' });
   } catch (error: any) {

@@ -4,6 +4,17 @@ import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
 
 // Mock the dependencies
+// admin.ts takes its table prefix from config/constants, a value fixed when the module
+// is first loaded (ENG-1760). These tests switch NODE_ENV per case, so the prefix is
+// resolved live from the environment here instead.
+jest.mock('../config/constants', () => ({
+  get TABLE_PREFIX() {
+    return process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  },
+  tableName: (base: string) =>
+    `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}${base}`,
+}));
+
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),

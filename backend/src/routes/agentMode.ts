@@ -2,6 +2,8 @@ import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { requireScheduledChatsServiceSecret } from '../middleware/serviceAuth';
 import { agentModeController } from '../controllers/agentModeController';
+import { compareModelsHandler, selectCompareResultHandler } from '../controllers/modelCompareController';
+import { branchSessionHandler, listBranchesHandler } from '../controllers/chatBranchController';
 import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
@@ -100,6 +102,10 @@ router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.
 // Get supported LLM models (public)
 router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedModels));
 
+// GET /api/agent-mode/public/voice-model
+// The live-voice model a chat's voice button switches to (share pages use the public catalog, which never lists it)
+router.get('/public/voice-model', asyncHandler(agentModeController.getPublicVoiceModel));
+
 // GET /api/agent-mode/public/reports-model-options
 // Get models suitable for report generation (public)
 router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));
@@ -194,6 +200,10 @@ router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunct
 // SSE endpoint for progress updates
 router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(agentModeController.getProgress));
 
+// GET /api/agent-mode/generating
+// ENG-110: the caller's own sessions currently generating on this instance (reload-survival re-attach).
+router.get('/generating', authenticateToken, asyncHandlerAuth(agentModeController.getGeneratingSessions));
+
 // POST /api/agent-mode/session/:sessionId/stop
 // Stop generation for a session
 router.post('/session/:sessionId/stop', asyncHandlerAuth(agentModeController.stopGeneration));
@@ -214,6 +224,20 @@ router.post('/tts', authenticateToken, asyncHandler(async (req: Request, res: Re
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));
+
+// POST /api/agent-mode/compare
+// ENG-55: one prompt to 2-4 models as tool-less completions; read-only for the session.
+router.post('/compare', asyncHandlerAuth(compareModelsHandler));
+
+// POST /api/agent-mode/compare/select
+// ENG-55: "Continue with this answer" — persists the chosen answer as a normal turn.
+router.post('/compare/select', asyncHandlerAuth(selectCompareResultHandler));
+
+// POST /api/agent-mode/session/:sessionId/branch
+// ENG-112: branch a chat from an assistant message into a new, independent session (flag chat_branching_enabled, default off).
+router.post('/session/:sessionId/branch', asyncHandlerAuth(branchSessionHandler));
+// GET /api/agent-mode/session/:sessionId/branches: the root + non-archived branches of this chat's family (owner only, same flag).
+router.get('/session/:sessionId/branches', asyncHandlerAuth(listBranchesHandler));
 
 // POST /api/agent-mode/verified-generate
 // Generate response with verification that required functions are called minimum number of times

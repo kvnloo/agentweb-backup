@@ -146,6 +146,82 @@ describe('apiTools', () => {
 
   // ─── SUCCESS tests ────────────────────────────────────────────────────
 
+  describe('update_landing_page_files (ENG-2896)', () => {
+    const files = [{ path: 'src/app/page.tsx', content: 'a' }, { path: 'src/app/x.tsx', content: 'b' }];
+    const call = () => mockMcpFetch.mock.calls[0][0] as any;
+
+    it('commits atomically to the draft branch by default and returns the commit SHA', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true, commit_url: 'https://github.com/o/r/commit/abc123' });
+      const res: any = await mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files }, context);
+      expect(call().method).toBe('PUT');
+      expect(call().path).toBe('/api/landing-pages/v0/generated/p1/update-files');
+      expect(call().body.branch).toBe('draft/agentweb-preview');
+      expect(call().body.files).toEqual([{ file_path: 'src/app/page.tsx', content: 'a' }, { file_path: 'src/app/x.tsx', content: 'b' }]);
+      expect(call().body.expected_base_sha).toBeUndefined();
+      expect(JSON.parse(res.content[0].text).commit_sha).toBe('abc123');
+    });
+
+    it('forwards expected_base_sha', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, expected_base_sha: 'f'.repeat(40) }, context);
+      expect(call().body.expected_base_sha).toBe('f'.repeat(40));
+    });
+
+    it('rejects main without calling the route', async () => {
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, branch: 'main' }, context)).rejects.toThrow(/never writes to main/);
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects more than 20 files without calling the route', async () => {
+      const many = Array.from({ length: 21 }, (_, i) => ({ path: `f${i}.txt`, content: 'x' }));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files: many }, context)).rejects.toThrow(/must not exceed 20/);
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a base-SHA conflict to the caller', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (409): Base SHA conflict: Branch head is b, expected a. Nothing was written.'));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'p1', files, expected_base_sha: 'a'.repeat(40) }, context)).rejects.toThrow(/409.*Base SHA conflict/);
+    });
+
+    it('surfaces the own-account denial for a foreign page', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (403): Forbidden'));
+      await expect(mcpToolRegistry.execute('update_landing_page_files', { page_id: 'foreign', files }, context)).rejects.toThrow(/403/);
+    });
+
+    it('is not callable by a read-only (tools:read) aw_ key', () => {
+      const { findScopeDenial } = require('../mcp/server/apiKeyScopes');
+      const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'update_landing_page_files', arguments: {} } };
+      const lookup = (n: string) => mcpToolRegistry.getTool(n) as any;
+      expect(findScopeDenial(body, ['tools:read'], lookup)).toEqual({ tool: 'update_landing_page_files', requiredScope: 'tools:execute' });
+      expect(findScopeDenial(body, ['tools:read', 'tools:execute'], lookup)).toBeNull();
+    });
+  });
+
+  describe('landing page file tools branch (ENG-2864)', () => {
+    beforeEach(() => mockMcpFetch.mockResolvedValue({ ok: true }));
+    const path = () => (mockMcpFetch.mock.calls[0][0] as any).path as string;
+
+    it('list_landing_page_files forwards branch when given', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files?branch=draft%2Fagentweb-preview');
+    });
+
+    it('list_landing_page_files omits branch when absent', async () => {
+      await mcpToolRegistry.execute('list_landing_page_files', { page_id: 'p1' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/files');
+    });
+
+    it('read_landing_page_file forwards branch when given', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx', branch: 'draft/agentweb-preview' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx&branch=draft%2Fagentweb-preview');
+    });
+
+    it('read_landing_page_file omits branch when absent', async () => {
+      await mcpToolRegistry.execute('read_landing_page_file', { page_id: 'p1', file_path: 'src/app/page.tsx' }, context);
+      expect(path()).toBe('/api/landing-pages/v0/generated/p1/file-content?path=src%2Fapp%2Fpage.tsx');
+    });
+  });
+
   describe('list_tasks', () => {
     it('should call GET /api/tasks', async () => {
       mockMcpFetch.mockResolvedValue([{ taskId: 't1', name: 'Test' }]);
@@ -1923,6 +1999,122 @@ describe('apiTools', () => {
       });
     });
 
+    // ENG-758: optional month breakdown from the existing itemized ledger, never dollars.
+    it('returns a usage_breakdown (tokens/calls by model and day, sessions) without USD when usage_month is set', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path === '/api/subscription/usage/itemized?month=2026-10') {
+          return {
+            month: '2026-10',
+            precision: 'per_charge',
+            items: [
+              { date: '2026-10-02', model: 'claude-sonnet', tokens: 1000, calls: 2, costMicroUsd: 987654, sessionId: 's1', source: 'charge_event' },
+              { date: '2026-10-02', model: 'gpt-mini', tokens: 300, calls: 1, costMicroUsd: 11, sessionId: 's2', source: 'charge_event' },
+              { date: '2026-10-01', model: 'claude-sonnet', tokens: 500, calls: 1, costMicroUsd: 22, sessionId: 's1', source: 'charge_event' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-10' }, context);
+      const text = (result as any).content[0].text;
+      const parsed = JSON.parse(text);
+
+      expect(parsed.usage_breakdown).toEqual({
+        month: '2026-10',
+        totals: { tokens: 1800, calls: 4 },
+        by_model: [
+          { model: 'claude-sonnet', tokens: 1500, calls: 3 },
+          { model: 'gpt-mini', tokens: 300, calls: 1 },
+        ],
+        by_day: [
+          { date: '2026-10-01', tokens: 500, calls: 1 },
+          { date: '2026-10-02', tokens: 1300, calls: 3 },
+        ],
+        sessions: { count: 2, exact: true },
+        precision: 'per_charge',
+      });
+      expect(text).not.toContain('costMicroUsd');
+      expect(text).not.toContain('987654');
+    });
+
+    it('reports the session count as a lower bound when daily aggregates lack session ids', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path.startsWith('/api/subscription/usage/itemized')) {
+          return {
+            precision: 'mixed',
+            items: [
+              { date: '2026-09-03', model: 'm', tokens: 10, calls: 1, sessionId: 's1' },
+              { date: '2026-09-04', model: 'm', tokens: 90, calls: 5, source: 'daily_aggregate' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-09' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown.sessions.count).toBe(1);
+      expect(parsed.usage_breakdown.sessions.exact).toBe(false);
+      expect(parsed.usage_breakdown.totals).toEqual({ tokens: 100, calls: 6 });
+    });
+
+    it('buckets per-charge timestamps into one row per calendar day and words the note neutrally without aggregates', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path.startsWith('/api/subscription/usage/itemized')) {
+          return {
+            precision: 'per_charge',
+            items: [
+              { date: '2026-09-02T10:00:00.000Z', model: 'm', tokens: 1200, calls: 2, source: 'charge_event' },
+              { date: '2026-09-02T11:30:00.000Z', model: 'm', tokens: 300, calls: 1, source: 'charge_event' },
+              { date: '2026-09-02', model: 'm', tokens: 0, calls: 0, source: 'charge_event' },
+              { date: '2026-09-03T08:15:00.000Z', model: 'm', tokens: 500, calls: 1, source: 'charge_event' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-09' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown.by_day).toEqual([
+        { date: '2026-09-02', tokens: 1500, calls: 3 },
+        { date: '2026-09-03', tokens: 500, calls: 1 },
+      ]);
+      expect(parsed.usage_breakdown.sessions.exact).toBe(false);
+      expect(parsed.usage_breakdown.sessions.note).not.toContain('daily aggregates');
+    });
+
+    it('rejects a malformed usage_month in-band and does not read the ledger', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-13' }, context) as any).content[0].text);
+      expect(parsed.usage_breakdown_error).toBe('usage_month must be YYYY-MM');
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(mockMcpFetch.mock.calls.some((c: any[]) => String(c[0].path).includes('itemized'))).toBe(false);
+    });
+
+    it('keeps the status read when the usage ledger read fails', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.path === '/api/auth/me') return meResponse;
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error('ledger down');
+      });
+
+      const parsed = JSON.parse((await mcpToolRegistry.execute('get_account_status', { usage_month: '2026-10' }, context) as any).content[0].text);
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(parsed.usage_breakdown).toBeUndefined();
+      expect(parsed.usage_breakdown_error).toBe('Usage data is temporarily unavailable');
+    });
+
     it('should never leak sensitive raw fields (password, stripe_customer_id) into the output', async () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
@@ -2095,5 +2287,29 @@ describe('ENG-1015 durable session polling', () => {
     await expect(mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: 'r1' }, context))
       .rejects.toThrow('Forbidden');
     expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('ENG-112: MCP never exposes the branch-family link', () => {
+  const link = { sessionId: 'a', rootSessionId: 'root-secret-id', messageIndex: 2, branchedAt: 'x' };
+  const context: any = { userId: 'user-123', agentUserId: 'user-123' };
+
+  it('emma_get_session strips session-level branchedFrom', async () => {
+    mockMcpFetch.mockResolvedValue({ sessionId: 's1', title: 'T', branchedFrom: link, pendingWorkPlanInput: null } as any);
+    const out = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1' }, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s1');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
+  });
+
+  it('emma_list_sessions strips branchedFrom from every listed session', async () => {
+    mockMcpFetch.mockResolvedValue({ sessions: [{ sessionId: 's1', branchedFrom: link }, { sessionId: 's2' }], hasMore: false } as any);
+    const out = await mcpToolRegistry.execute('emma_list_sessions', {}, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s2');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
   });
 });

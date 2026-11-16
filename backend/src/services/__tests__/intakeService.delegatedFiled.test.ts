@@ -54,13 +54,6 @@ const dfBaseParams = {
 };
 
 describe('ENG-1590 — Delegated-Filed label on direct-bug intake', () => {
-  const previousIntakeFlag = process.env.FEATUREBASE_INTAKE;
-  beforeAll(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterAll(() => {
-    if (previousIntakeFlag === undefined) delete process.env.FEATUREBASE_INTAKE;
-    else process.env.FEATUREBASE_INTAKE = previousIntakeFlag;
-  });
-
   beforeEach(() => {
     jest.clearAllMocks();
     dfCreateTicket.mockResolvedValue({ id: 't1', number: 201, url: 'https://fb/t/201' });

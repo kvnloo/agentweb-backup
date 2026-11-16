@@ -14,7 +14,6 @@
  */
 import { fileUserIssue, notifyCanonicalResolved } from '../services/intakeService';
 
-jest.mock('../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../services/dedupService', () => ({ findDuplicate: jest.fn(), MAX_CANDIDATES: 30 }));
 jest.mock('../services/featurebaseService', () => ({
   listOpenPosts: jest.fn().mockResolvedValue([]),
@@ -50,15 +49,13 @@ const expectNoFunnelStrings = (payload: unknown) => {
 };
 
 describe('fileUserIssue bug triage — funnel-derived labels, priority, state, assignee (ENG-187)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-100', url: 'lin', id: 'uuid-100' });
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   // Contract #1
   it('Paid / Retention Handoff reporter -> Bug + Customer Reported + stage labels, Urgent, Todo, Manan', async () => {
@@ -123,14 +120,12 @@ describe('fileUserIssue bug triage — funnel-derived labels, priority, state, a
 });
 
 describe('fileUserIssue bug dedup — triage upgrade on the existing canonical (ENG-187 contract #6)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
     dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
     fb.createTicket.mockResolvedValue({ id: 'tk2', number: 8, url: 'https://fb/t/8' });
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('a paying (Retention) reporter on an existing canonical -> unions stage labels + raises to Urgent', async () => {
     await fileUserIssue({ type: 'bug', title: 'crashes too', description: 'also on save', userEmail: 'paying@e.com', funnelStatus: 'paid_retention_handoff' });
@@ -157,13 +152,11 @@ describe('fileUserIssue bug dedup — triage upgrade on the existing canonical (
 });
 
 describe('funnel privacy — zero leakage to Featurebase or reporter-facing email (ENG-187 contract #5)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   const funnelContext = {
     'User Name': 'U', 'User Email': 'u@e.com', 'Page URL': '/x',
     'User Status': 'Paid / Retention Handoff', // what the call sites put in notionContext
   };
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     fb.listOpenPosts.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
@@ -171,7 +164,7 @@ describe('funnel privacy — zero leakage to Featurebase or reporter-facing emai
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
     fb.createPost.mockResolvedValue({ id: 'post9', url: 'https://fb/p/new' });
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('bug: the Featurebase TICKET creation payload carries no funnel/stage string', async () => {
     await fileUserIssue({ type: 'bug', title: 'crash', description: 'on save', userEmail: 'u@e.com', funnelStatus: 'paid_retention_handoff', notionContext: funnelContext });

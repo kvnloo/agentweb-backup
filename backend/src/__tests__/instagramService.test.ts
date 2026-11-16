@@ -391,7 +391,7 @@ describe('InstagramService', () => {
         it('should return metrics for a media object', async () => {
             const mockResponse = {
                 data: {
-                    data: [{ name: 'impressions', values: [{ value: 100 }] }]
+                    data: [{ name: 'views', values: [{ value: 100 }] }]
                 }
             };
             mockAxios.get.mockResolvedValue(mockResponse as any);
@@ -399,9 +399,38 @@ describe('InstagramService', () => {
             const result = await instagramService.getInstagramMediaInsights('media_1', 'valid_token');
             expect(mockAxios.get).toHaveBeenCalledWith(
                 `${BASE_URL}/media_1/insights`,
-                expect.objectContaining({ params: expect.objectContaining({ metric: 'impressions,reach,saved,likes,comments,shares,total_interactions' }) })
+                expect.objectContaining({ params: expect.objectContaining({ metric: 'views,reach,saved,likes,comments,shares,total_interactions' }) })
             );
-            expect(result[0].name).toBe('impressions');
+            expect(result[0].name).toBe('views');
+        });
+
+        it('never requests the retired impressions / plays metrics (ENG-2636)', async () => {
+            mockAxios.get.mockResolvedValue({ data: { data: [] } } as any);
+            await instagramService.getInstagramMediaInsights('media_1', 'valid_token', 'VIDEO', 'REELS');
+            await instagramService.getInstagramMediaInsights('media_2', 'valid_token', 'CAROUSEL_ALBUM', 'FEED');
+            for (const call of mockAxios.get.mock.calls) {
+                const metric = String((call[1] as any).params.metric);
+                expect(metric).not.toMatch(/impressions|plays/);
+                expect(metric.split(',')).toContain('views');
+            }
+        });
+
+        it('drops the one metric Meta says a media type does not support, and asks again (ENG-2636)', async () => {
+            mockAxios.get
+                .mockRejectedValueOnce({ response: { status: 400, data: { error: { message: 'The Media Insights API does not support the saved metric for this media product type.' } } } })
+                .mockResolvedValueOnce({ data: { data: [{ name: 'views', values: [{ value: 7 }] }] } } as any);
+
+            const result = await instagramService.getInstagramMediaInsights('story_1', 'valid_token', 'IMAGE', 'STORY');
+
+            expect(result[0].name).toBe('views');
+            expect(mockAxios.get).toHaveBeenCalledTimes(2);
+            expect(String((mockAxios.get.mock.calls[1][1] as any).params.metric).split(',')).not.toContain('saved');
+        });
+
+        it('still fails loudly on any other Instagram error', async () => {
+            mockAxios.get.mockRejectedValue({ response: { status: 400, data: { error: { message: 'Invalid parameter' } } } });
+            await expect(instagramService.getInstagramMediaInsights('m', 'valid_token')).rejects.toThrow('Instagram API Error: Invalid parameter');
+            expect(mockAxios.get).toHaveBeenCalledTimes(1);
         });
     });
 

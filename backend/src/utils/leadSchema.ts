@@ -649,3 +649,52 @@ export function projectLeadAttribution(lead: any): Partial<LeadAttributionFields
 
   return out;
 }
+
+/**
+ * Status a pending_review lead moves to once its draft has been sent: 'contacted'
+ * when the list has it, else the first active working status. Returns null (leave
+ * the status alone) for leads that aren't in review.
+ */
+export function statusAfterReviewedSend(
+  currentStatus: string | undefined | null,
+  statusConfig?: Array<{ value: string; type?: string }>,
+  listType?: string | null,
+): string | null {
+  if (currentStatus !== 'pending_review') return null;
+  const config = statusConfig?.length ? statusConfig : (defaultStatusConfigFor(listType) as Array<{ value: string; type?: string }>);
+  const working = config.filter(st => st.value !== 'pending_review' && (!st.type || st.type === 'active'));
+  return (working.find(st => st.value === 'contacted') ?? working[0])?.value ?? null;
+}
+
+/** The AI-draft review status: a lead here is waiting for a human to approve its draft. */
+export const REVIEW_DRAFT_STATUS = 'pending_review';
+
+const nonEmpty = (v: unknown): boolean => typeof v === 'string' && v.trim() !== '';
+
+/**
+ * Whether a lead carries a usable stored draft (ENG-2966). Email = emailDraft with a
+ * subject and a text or html body; linkedin = messageDraft.content. With no channel,
+ * either counts.
+ */
+export function hasPersistedDraftForChannel(lead: unknown, channel?: 'email' | 'linkedin'): boolean {
+  const asRecord = (v: unknown): Record<string, unknown> | null =>
+    v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+  const email = asRecord(asRecord(lead)?.emailDraft);
+  const hasEmail = !!email && nonEmpty(email.subject) && (nonEmpty(email.textContent) || nonEmpty(email.htmlContent));
+  const message = asRecord(asRecord(lead)?.messageDraft);
+  const hasMessage = !!message && nonEmpty(message.content);
+  if (channel === 'email') return hasEmail;
+  if (channel === 'linkedin') return hasMessage;
+  return hasEmail || hasMessage;
+}
+
+/**
+ * Error text when `status` is the review status but `lead` (as it would be after the
+ * write) has no persisted draft — the Pending Review queue would show nothing to
+ * approve. Null when the write is fine.
+ */
+export function missingReviewDraftError(status: unknown, lead: unknown): string | null {
+  if (status !== REVIEW_DRAFT_STATUS || hasPersistedDraftForChannel(lead)) return null;
+  return `Cannot set status "${REVIEW_DRAFT_STATUS}": the lead has no saved draft to review. `
+    + 'Create the draft first (pass message_draft for LinkedIn, or email_subject and email_body for email), then set the status.';
+}

@@ -1,10 +1,11 @@
 import { isEvaluationUser } from '../services/evaluationPolicy';
+import { mapCreateUserError } from "../utils/createUserError";
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
 import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
-import axios from "axios";
+import { fetchPublicHtml, SsrfBlockedError } from "../utils/ssrfGuard";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
@@ -12,12 +13,14 @@ import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/dele
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
-import { waitlistDb } from "../services/waitlistDb";
+import { waitlistDb, WaitlistCapacityCounterError } from "../services/waitlistDb";
+import { applyZomaWaitlistDecision } from "../services/zomaAdmission";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
+import { branchOwnMessages } from "../services/agentMode/chatBranching";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { backfillSessionScores } from "../services/scoreBackfill";
 import { DynamoDB } from "aws-sdk";
@@ -27,6 +30,7 @@ import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { deriveSelfActivity } from "../utils/selfActivity";
 import { getProjectionsBatch } from "../services/spendProjectionDb";
+import { parseProductFilter, PRODUCT_FILTERS, userHasProduct } from "../services/journeyAttribution";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
 import { grantTokenBonus, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
@@ -45,6 +49,7 @@ import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analytics
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 import { isSessionList } from "../utils/sessionList";
+import { TABLE_PREFIX } from "../config/constants";
 
 const router = express.Router();
 
@@ -227,6 +232,14 @@ const ADMIN_USER_LIST_FIELDS = [
   "phoneNumber",
   "orgId",
   "orgRole",
+  // ENG-2906: product attribution (Zoma / Emma MCP / Emma web) for the Users page pills + filter.
+  "signupProduct",
+  "signupClient",
+  "signupRef",
+  "attributionConfidence",
+  "products",
+  "zomaStage",
+  "zomaStageAt",
 ] as const;
 
 const compactAdminUserForList = (user: any, hasUsageThisMonth = false, spendThisMonthUsd?: number): Record<string, any> => {
@@ -476,10 +489,12 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
     // Fetch account details from Unipile to get the real name
     let accountName = 'LinkedIn Account';
     let username: string | undefined;
+    let providerVerified = false;
     try {
       const unipileAccount = await linkedInOutreachService.getAccount(accountId);
       if ((unipileAccount as any).name) accountName = (unipileAccount as any).name;
       username = (unipileAccount as any).connection_params?.im?.username;
+      providerVerified = true;
     } catch (unipileErr: any) {
       console.warn(`[Admin] Could not fetch Unipile account details for ${accountId}:`, unipileErr?.message);
     }
@@ -495,7 +510,7 @@ router.post("/unipile-accounts/:accountId/assign", async (req, res) => {
         token_expires_at: Number.MAX_SAFE_INTEGER,
         scopes: [],
       },
-    });
+    }, { providerVerified });
 
     linkedInOutreachService.clearStatusCache(accountId);
     console.log(`[Admin] Assigned orphan Unipile account ${accountId} to user ${normalizedEmail}`);
@@ -721,7 +736,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
-      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      ? await crmDb.batchCreateLeads(parsed.listId, leads, { origin: 'integration' })
       : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
@@ -792,9 +807,15 @@ router.get("/email-deliverability/mx-sweep", async (_req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
+    // ENG-2906: optional ?product=zoma|emma_mcp|emma_web, applied before the per-user enrichment.
+    const product = parseProductFilter(req.query.product);
+    if (product === null) {
+      return res.status(400).json({ message: `product must be one of ${PRODUCT_FILTERS.join(", ")}` });
+    }
     // The partner-portal roster is where Access Portal lives; sandbox (eval_)
     // accounts must stay reachable here even though every fleet sweep excludes them.
-    const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
+    const allUsers = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
+    const users = product ? allUsers.filter((u: any) => userHasProduct(u, product)) : allUsers;
     // ENG-1271 / ENG-1250 AC7: "has spend this month" for the self-activity signal comes
     // from the spend ledger in one batched read, not the retired legacy counter. It is a
     // secondary signal, so a failed read must not take the whole roster down: log it and
@@ -866,6 +887,49 @@ router.get("/users", async (req, res) => {
           user.subscriptionType = orgInfo.ownerSubscriptionType;
         }
       }
+    }
+
+    // ENG-273: which messaging platform each customer is on. Read from the same policy
+    // that enforces one-platform-per-customer, so this column can never disagree with
+    // what the rule allows. Computed from the full records (the compact list rows drop
+    // the channel fields), each organisation resolved once, and strictly best-effort:
+    // a failure here leaves the column empty rather than failing the whole user list.
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const fullRecordById = new Map<string, any>(users.map((u: any) => [u.userId, u]));
+      const orgSlackCache = new Map<string, Promise<boolean>>();
+      await Promise.all(
+        sanitized.map(async (user: any) => {
+          // Each account settles on its own. One failing summary must not reject the whole
+          // batch and send the roster while other accounts' summaries are still pending,
+          // which would leave them without platform fields and shown as "Not connected".
+          try {
+            const summary = await getPlatformSummary(fullRecordById.get(user.userId), orgSlackCache);
+            user.messagingPlatform = summary.platform;
+            user.messagingPlatformSource = summary.source;
+            user.whatsappNumberMasked = summary.whatsappNumberMasked;
+            const full = fullRecordById.get(user.userId);
+            // Why a no-platform account has no WhatsApp (STOP / customer / admin), for support.
+            user.whatsappDisconnect = full?.whatsappDisconnect ?? null;
+            // A number that texted STOP but could not be matched to its account at the time
+            // (verified before the phone index existed) is still bound and unreachable.
+            // Only WhatsApp accounts are checked, so this costs a handful of reads.
+            if (summary.platform === 'whatsapp') {
+              const { explicitChannels } = await import('../services/messagingChannelService');
+              const { isOptedOut } = await import('../services/whatsappService');
+              const destination = explicitChannels(full).find((c: any) => c.channel === 'whatsapp')?.destination;
+              user.whatsappOptedOut = destination ? await isOptedOut(destination) : false;
+            }
+          } catch (error) {
+            console.error(
+              `[admin/users] messaging platform lookup failed for user ${user.userId}; leaving it unset:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }),
+      );
+    } catch (error) {
+      console.error('[admin/users] messaging platform lookup failed; leaving it unset:', error);
     }
 
     // Fetch only replay settings for these users in bounded BatchGet chunks.
@@ -1377,7 +1441,81 @@ router.get("/slack/channel-info", async (req, res) => {
   }
 });
 
-// Update user slack channels (accepts an array)
+/**
+ * Disconnect a customer's WhatsApp number on their behalf (ENG-273).
+ *
+ * A customer is on one messaging platform, and only they could remove WhatsApp — so one
+ * who wanted to move to Slack and did not do it themselves left support with no way to
+ * help. This is the same disconnect the customer's own Settings performs.
+ *
+ * It removes a number the customer verified and consented with, so it is recorded with
+ * who did it, and the customer is told on WhatsApp when the 24-hour window allows.
+ */
+router.delete("/users/:userId/whatsapp", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // User ids are UUIDs or numeric strings. Reject anything else as bad input rather than
+    // letting it reach the database and come back as "not found" or a server error.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) {
+      return res.status(400).json({ message: "Invalid user id." });
+    }
+    const adminId = (req as any).user?.userId || 'unknown-admin';
+    const { disconnectWhatsApp } = await import('../services/whatsappVerificationService');
+
+    const result = await disconnectWhatsApp(userId, 'admin');
+    if (!result) return res.status(404).json({ message: "User not found" });
+    if (!result.removed) {
+      return res.status(409).json({ message: "This account has no WhatsApp number connected." });
+    }
+
+    const { redactPhone, sendText } = await import('../services/whatsappService');
+    console.log(
+      `[admin] WhatsApp ${redactPhone(result.removed)} disconnected from user ${userId} by admin ${adminId}`,
+    );
+
+    // Best-effort courtesy notice. Outside the 24h window nothing but a template can be
+    // sent, and there is no template for this — so it may not arrive, and must never
+    // fail a disconnect that has already happened.
+    let customerNotified = false;
+    try {
+      await sendText(
+        result.removed,
+        'Your WhatsApp number has been disconnected from AgentWeb by our support team, so you will no longer receive notifications here. You can reconnect it any time from AgentWeb Settings.',
+      );
+      customerNotified = true;
+    } catch {
+      /* window closed, opted out, or Meta unavailable */
+    }
+
+    // The platform the account is on NOW. Removing WhatsApp can leave an account on Slack —
+    // an organisation member inherits the organisation's channel — so the dashboard must
+    // show what is true rather than assume "not connected".
+    let summary: { platform: string | null; source: string | null; whatsappNumberMasked: string | null } = {
+      platform: null,
+      source: null,
+      whatsappNumberMasked: null,
+    };
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const { userDb } = await import('../services/db');
+      summary = await getPlatformSummary(await userDb.getUserById(userId));
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after disconnecting WhatsApp:', error);
+    }
+
+    res.json({
+      success: true,
+      customerNotified,
+      messagingPlatform: summary.platform,
+      messagingPlatformSource: summary.source,
+      whatsappNumberMasked: summary.whatsappNumberMasked,
+    });
+  } catch (error: any) {
+    console.error("Error disconnecting WhatsApp:", error?.message || error);
+    res.status(500).json({ message: "Failed to disconnect WhatsApp" });
+  }
+});
+
 router.put("/users/:userId/slack-channel", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1394,6 +1532,20 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
       ? slackChannels.map((c: any) => String(c).trim()).filter(Boolean)
       : [];
 
+    // One platform per customer (ENG-273): an account on WhatsApp cannot also be given a
+    // Slack channel. Clearing channels is always allowed — that is how Slack is removed.
+    if (channels.length > 0) {
+      const { hasWhatsApp } = await import('../services/customerChannelPolicy');
+      if (hasWhatsApp(user)) {
+        return res.status(409).json({
+          message:
+            'This account is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before assigning a Slack channel.',
+          code: 'platform_conflict',
+          connected: 'whatsapp',
+        });
+      }
+    }
+
     const { settingsService } = await import('../services/settingsService');
     // Invalidate by userId (old assignments) AND by channel ID (channels that may be cached under a different user)
     const oldChannels: string[] = (user.slackChannels ?? []).concat(user.slackChannel ? [user.slackChannel] : []);
@@ -1402,7 +1554,23 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(sanitizeUserForResponse(updatedUser));
+
+    // Clearing an account's own channels can leave a member of an organisation on the
+    // organisation's channel, so report the platform the account is on NOW rather than
+    // letting the dashboard guess.
+    let platformFields: Record<string, unknown> = {};
+    try {
+      const { getPlatformSummary } = await import('../services/customerChannelPolicy');
+      const summary = await getPlatformSummary(updatedUser);
+      platformFields = {
+        messagingPlatform: summary.platform,
+        messagingPlatformSource: summary.source,
+        whatsappNumberMasked: summary.whatsappNumberMasked,
+      };
+    } catch (error) {
+      console.error('[admin] could not recalculate the platform after a Slack channel edit:', error);
+    }
+    res.json({ ...sanitizeUserForResponse(updatedUser), ...platformFields });
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
@@ -1892,7 +2060,8 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     });
   } catch (error) {
     console.error("Error creating user from waitlist:", error);
-    res.status(500).json({ message: "Error creating user" });
+    const mapped = mapCreateUserError(error);
+    res.status(mapped.status).json(mapped.body);
   }
 });
 
@@ -2007,6 +2176,12 @@ router.put("/waitlist/:email/status", async (req, res) => {
       }
     }
 
+    // ENG-2881: under the Zoma gate, Invite/Reject is the admission decision (seat reserved first).
+    const refusal = await applyZomaWaitlistDecision(
+      await waitlistDb.getByEmail(email), email, status, (req as any).user?.userId,
+    );
+    if (refusal) return res.status(refusal.statusCode).json(refusal.body);
+
     // Update invitedAt timestamp for invited users
     let invitedAt;
     if (status === "invited") {
@@ -2043,6 +2218,9 @@ router.put("/waitlist/:email/status", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Error updating waitlist status" });
   }
@@ -2068,6 +2246,9 @@ router.put("/waitlist/:email", async (req, res) => {
     const updatedEntry = await waitlistDb.updateDetails(email, updates);
     res.json(updatedEntry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist entry:", error);
     res.status(500).json({ message: "Error updating waitlist entry" });
   }
@@ -2099,6 +2280,9 @@ router.put("/waitlist/:email/support-note", async (req, res) => {
 
     res.json(entry);
   } catch (error) {
+    if (error instanceof WaitlistCapacityCounterError) {
+      return res.status(409).json({ message: error.message });
+    }
     console.error("Error updating waitlist support note:", error);
     res.status(500).json({ message: "Error updating support note" });
   }
@@ -2128,7 +2312,7 @@ router.delete("/waitlist/:email", async (req, res) => {
     } else {
       // Use the message from deleteByEmail if available, otherwise a generic one
       res
-        .status(500)
+        .status(result.conflict ? 409 : 500)
         .json({ message: result.message || "Failed to delete waitlist entry" });
     }
   } catch (error) {
@@ -3051,15 +3235,18 @@ router.post("/announcements/load-from-url", async (req, res) => {
     console.log(`🔽 Fetching HTML content from: ${url}`);
 
     // Fetch the HTML content
-    const response = await axios.get(url, {
-      timeout: 15000, // 15 seconds timeout
-      responseType: "text",
-      headers: {
-        "User-Agent": "AgentWeb-Backend/1.0",
-      },
-    });
-
-    const html = response.data as string;
+    // ENG-2425: SSRF-safe (DNS-pinned, per-hop re-validated, size-capped).
+    let html: string;
+    try {
+      html = await fetchPublicHtml(url);
+    } catch (fetchErr) {
+      if (fetchErr instanceof SsrfBlockedError) {
+        return res
+          .status(400)
+          .json({ success: false, message: "URL must point to a public internet address" });
+      }
+      throw fetchErr;
+    }
     console.log(`✅ Successfully fetched HTML, length: ${html.length}`);
 
     // Extract title from <title> tag
@@ -3172,11 +3359,20 @@ const REVIEW_ISHARE_EXPIRATION_DAYS = 45;
 // until it expires, then regenerated. These links are shared out to reviewers,
 // so the window must outlast the review cycle — but stays bounded because the
 // session may be internal, not customer-shared (see REVIEW_ISHARE_EXPIRATION_DAYS).
+/** ENG-2648: a branch whose every row is a copy of its source (no user turn of its own). */
+function isBranchCopyOnly(session: any): boolean {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  return messages.length > 0 && branchOwnMessages(messages).length === 0;
+}
+
 async function ensureIshareLinkForReview(sessions: any[]): Promise<void> {
   await Promise.all(
     sessions.map(async (session) => {
       const meta = session.interactiveShareMetadata;
       if (meta?.isActive && meta?.token) return;
+      // ENG-2648: never mint a review link for a branch with no turns of its own (a never-continued branch or
+      // the hidden leftover of a failed copy): its content is reviewed under its source.
+      if (isBranchCopyOnly(session)) return;
       try {
         const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(
           session.sessionId,
@@ -3271,6 +3467,9 @@ router.get("/chat-sessions", async (req, res) => {
         })
       );
 
+      // ENG-2648: an owner's own list keeps a revealed branch they never continued (it is one of their chats;
+      // archived leftovers of a failed copy are already excluded by getSessionsWithoutMessages), but
+      // ensureIshareLinkForReview creates no review link for it.
       const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
         Array.isArray(session.messages) &&
         session.messages.some((msg: any) => msg.role === "user")
@@ -3463,10 +3662,13 @@ router.get("/chat-sessions", async (req, res) => {
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
       : null;
 
-    // Filter out sessions that have no user messages (not real sessions)
+    // Filter out sessions that have no user messages (not real sessions). ENG-2648: for a branch only its
+    // OWN user messages count, so a branch nobody continued and the hidden (archived) leftover of a failed
+    // branch copy — both nothing but a copy of turns already listed under their source — are left out too.
+    // (The ?sessionId= lookup above still finds any session by id, orphans included.)
     const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
       Array.isArray(session.messages) &&
-      session.messages.some((msg: any) => msg.role === "user")
+      branchOwnMessages(session.messages).some((msg: any) => msg.role === "user")
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
@@ -3526,7 +3728,6 @@ router.put("/users/:userId/role", async (req, res) => {
 router.delete("/configs/:configId", async (req, res) => {
   const { configId } = req.params;
   const dynamodb = new DynamoDB.DocumentClient(); // Ensure dynamodb client is available
-  const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
   const tableName = `${TABLE_PREFIX}AW-Configs`;
 
   try {
@@ -3850,7 +4051,6 @@ router.get("/analytics/gtm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const plans = await paginatedScan(dynamodb, {
@@ -3921,7 +4121,6 @@ router.get("/analytics/crm", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
     const scanAll = async (tableName: string) => {
       const items: any[] = [];
@@ -3996,7 +4195,6 @@ router.get("/gtm-plans", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
@@ -4056,7 +4254,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4255,7 +4452,6 @@ router.put("/gtm-plans/:planId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4339,7 +4535,6 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4436,7 +4631,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req,
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4505,7 +4699,6 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Get the existing plan
@@ -4568,7 +4761,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachmen
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4642,7 +4834,6 @@ router.delete("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachm
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
@@ -4705,7 +4896,6 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
       }),
     });
 
-    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     const getResult = await dynamodb
@@ -4755,7 +4945,7 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
 
     const { agentModeService } = await import('../services/agentModeService');
     const modelToUse = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse, undefined, 'system');
     await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
 
     // Build the initial message from work item title + description
@@ -4902,6 +5092,8 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
     const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    // What a row without a saved feature list shows: never the opt-in-only (paid-vendor) features.
+    const defaultFeatures: string[] = subscriptionService.getDefaultSubscriptionFeatureIds();
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4910,7 +5102,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
-        allowedFeatures: allAvailableFeatures,
+        allowedFeatures: defaultFeatures,
       }];
     }
 
@@ -4930,9 +5122,10 @@ router.get("/subscription-types", async (req, res) => {
         normalizedPages = allAvailablePages;
       }
 
-      // Handle allowedSkills with backward compatibility
-      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
-      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      // ENG-1978: a row without allowedSkills (old allowedFunctionCalls format) is no longer read as
+      // "all skills" — the runtime refuses to resolve it, so show it as having none rather than
+      // let an admin save it back as a full grant.
+      let normalizedSkills = Array.isArray(type.allowedSkills) ? type.allowedSkills : [];
       if (normalizedSkills.includes('*')) {
         normalizedSkills = allAvailableSkills;
       }
@@ -4943,10 +5136,12 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      // A saved "*" is an explicit grant of everything; it must be expanded before the known-id filter
+      // would drop it, or the editor would show an empty list and a save would revoke the grant.
       let normalizedFeatures = Array.isArray(type.allowedFeatures)
         ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
-        : allAvailableFeatures;
-      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+        : defaultFeatures;
+      if (Array.isArray(type.allowedFeatures) && type.allowedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
 
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
@@ -4965,6 +5160,11 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
         ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
         ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
+        // ENG-668: round-trip it, or the admin UI's next save (which posts what this returned) drops it.
+        ...(type.paygOverage ? { paygOverage: type.paygOverage } : {}),
+        // ENG-669: returned as stored ("*" is NOT expanded: it must keep meaning "every model", including
+        // models added later). Absent stays absent (= every model), so a save round-trips it unchanged.
+        ...(Array.isArray(type.allowedModels) ? { allowedModels: type.allowedModels } : {}),
       };
     }));
 
@@ -4976,6 +5176,111 @@ router.get("/subscription-types", async (req, res) => {
 });
 
 // Create or update subscription types
+/**
+ * ENG-1978: tiers an admin is about to remove (or rename away from) that accounts are still on.
+ *
+ * A user's tier is stored by NAME. If that name stops existing in `subscription_types`, the
+ * entitlement gate can no longer resolve the user and fails closed, so they drop to the foundation
+ * tools only. Before the gate failed closed those users silently kept every tool, which is why
+ * nothing ever needed to stop this save. Counted by the user's own `subscriptionType`: that covers
+ * org owners (whose tier their members inherit) but not the members themselves, so the count is a
+ * floor. `Free` is also the implicit tier of accounts with no `subscriptionType` at all (absent, null
+ * or empty — the runtime reads any falsy value as Free).
+ *
+ * This is a guard rail, not an invariant: it reads the current list, scans, and the caller writes
+ * later with no conditional write, so two concurrent admin saves or a user move racing the save
+ * can slip past it.
+ */
+async function findStrandedTiers(nextTierNames: string[]): Promise<Array<{ name: string; userCount: number }>> {
+  const current = await settingsService.getSetting("subscription_types");
+  if (!current) return [];
+  let currentTiers: any[];
+  try {
+    currentTiers = JSON.parse(current.settingValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(currentTiers)) return [];
+
+  const keep = new Set(nextTierNames);
+  const removed = currentTiers
+    .map((t) => t?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0 && !keep.has(n));
+  if (removed.length === 0) return [];
+
+  const values: Record<string, string> = {};
+  removed.forEach((name, i) => { values[`:t${i}`] = name; });
+  const clauses = [`subscriptionType IN (${removed.map((_, i) => `:t${i}`).join(", ")})`];
+  if (removed.includes("Free")) {
+    clauses.push(
+      "attribute_not_exists(subscriptionType)",
+      "attribute_type(subscriptionType, :nullType)",
+      "subscriptionType = :emptyTier"
+    );
+    values[":emptyTier"] = "";
+    values[":nullType"] = "NULL";
+  }
+  const users = await userDb.scanWithFilter(clauses.join(" OR "), values);
+
+  return removed
+    .map((name) => ({
+      name,
+      userCount: users.filter((u) =>
+        u.subscriptionType === name ||
+        (name === "Free" && !u.subscriptionType)
+      ).length,
+    }))
+    .filter((t) => t.userCount > 0);
+}
+
+/**
+ * ENG-669: a tier's `allowedModels` as it is stored: canonical registry ids (legacy aliases resolved), de-duplicated,
+ * in the admin's order; `"*"` alone when it is present (every model); the reserved `"agentweb-model"` kept as is.
+ * Throws (-> 400, nothing saved) when the value is not a list of strings, is empty (a tier that can choose no model is
+ * meaningless: use "*" or name the models), or names an id that is not served or that a customer can never select
+ * (admin-only, internal-only, live-voice).
+ */
+async function canonicalizeTierAllowedModels(tierName: string, raw: unknown): Promise<string[]> {
+  if (!Array.isArray(raw) || raw.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${tierName} allowedModels must be an array of model ids`);
+  }
+  const { ALL_MODELS, AGENTWEB_MODEL_ID } = await import('../services/agentMode/modelAccess');
+  const { agentModeService } = await import('../services/agentModeService');
+  const ids: string[] = [];
+  const unknown: string[] = [];
+  const notSelectable: string[] = [];
+  for (const entry of raw as string[]) {
+    const id = entry.trim();
+    if (!id) continue;
+    if (id === ALL_MODELS) return [ALL_MODELS];
+    if (id === AGENTWEB_MODEL_ID) {
+      if (!ids.includes(id)) ids.push(id);
+      continue;
+    }
+    const resolution = agentModeService.resolveGenerationModel(id);
+    if (resolution.fellBack) {
+      unknown.push(id);
+      continue;
+    }
+    if (!agentModeService.isModelSelectableBy(resolution.model, false)) {
+      notSelectable.push(id);
+      continue;
+    }
+    if (!ids.includes(resolution.model)) ids.push(resolution.model);
+  }
+  const list = (bad: string[]) => bad.map((id) => `'${id}'`).join(', ');
+  if (unknown.length > 0) {
+    throw new Error(`${tierName} allowedModels: unknown model id${unknown.length === 1 ? '' : 's'} ${list(unknown)}`);
+  }
+  if (notSelectable.length > 0) {
+    throw new Error(`${tierName} allowedModels: ${list(notSelectable)} cannot be selected by customers (admin-only, internal or live-voice)`);
+  }
+  if (ids.length === 0) {
+    throw new Error(`${tierName} allowedModels must name at least one model, or "*" for every model`);
+  }
+  return ids;
+}
+
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
@@ -4990,6 +5295,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
     const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    const defaultFeatures: string[] = subscriptionService.getDefaultSubscriptionFeatureIds();
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -5035,7 +5341,7 @@ router.post("/subscription-types", async (req, res) => {
 
       let normalizedFeatures = Array.isArray(type.allowedFeatures)
         ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
-        : allAvailableFeatures;
+        : defaultFeatures;
       if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
 
       // Parse monthlyTokenAllowance (preserve null for unlimited)
@@ -5055,15 +5361,18 @@ router.post("/subscription-types", async (req, res) => {
         const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
         const { getModelPrice } = await import('../utils/llmPricing');
         const { agentModeService } = await import('../services/agentModeService');
+        // Stored policies may hold a renamed model's legacy id; runtime filters drop it, so
+        // canonicalise before validating (and store the canonical id).
+        const canonicalModelId = (model: unknown): string => agentModeService.normalizeModelId(String(model).trim());
         normalizedLlmUsagePolicy = {
           version: String(type.llmUsagePolicy.version || '').trim(),
           enforcementState: type.llmUsagePolicy.enforcementState,
           optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
           hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
           optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
-            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map(canonicalModelId).filter(Boolean))]
             : [],
-          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          optimizedDefaultModel: canonicalModelId(type.llmUsagePolicy.optimizedDefaultModel || ''),
           // ENG-1214 AC5. Carried through RAW and only when present.
           //
           // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
@@ -5116,6 +5425,26 @@ router.post("/subscription-types", async (req, res) => {
         }
       }
 
+      // ENG-668: whether this tier may opt into pay-as-you-go overages. This object is rebuilt from a
+      // whitelist and replaces the stored tier, so a field missing here is silently dropped on save.
+      // `markupBps` defaults to the tier's own additional-usage (top-up) markup floor, so overage is
+      // never priced below what a top-up of the same usage costs; with no top-up to inherit from it
+      // must be given explicitly — but only for a tier that offers PAYG (`allowed: true`): a tier that
+      // does not has nothing to price. Present-but-invalid values are rejected, never coerced.
+      let normalizedPaygOverage: any = undefined;
+      if (type.paygOverage != null) {
+        const { validatePaygOverageTierConfig } = await import('../services/paygOverage');
+        const markupBps = type.paygOverage.markupBps ?? normalizedLlmUsageTopUp?.minimumMarkupBps;
+        if (markupBps === undefined && type.paygOverage.allowed === true) {
+          throw new Error(`${type.name} pay-as-you-go: markupBps is required when the tier has no additional usage markup to inherit`);
+        }
+        normalizedPaygOverage = { allowed: type.paygOverage.allowed, ...(markupBps !== undefined ? { markupBps } : {}) };
+        const paygErrors = validatePaygOverageTierConfig(normalizedPaygOverage);
+        if (paygErrors.length > 0) {
+          throw new Error(`${type.name} pay-as-you-go: ${paygErrors.join('; ')}`);
+        }
+      }
+
       // Seat-based billing (ENG-2243..2246): admin-configured pricing for extra
       // org seats. priceCents is the full monthly per-seat charge; baseSeats
       // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
@@ -5138,6 +5467,12 @@ router.post("/subscription-types", async (req, res) => {
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
         : [];
 
+      // ENG-669: this object REPLACES the stored tier, so an omitted allowedModels must stay omitted
+      // (= every model), never be materialised or dropped.
+      const normalizedAllowedModels = type.allowedModels != null
+        ? await canonicalizeTierAllowedModels(type.name, type.allowedModels)
+        : undefined;
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
@@ -5150,8 +5485,37 @@ router.post("/subscription-types", async (req, res) => {
         ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
         ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
+        ...(normalizedPaygOverage ? { paygOverage: normalizedPaygOverage } : {}),
+        ...(normalizedAllowedModels ? { allowedModels: normalizedAllowedModels } : {}),
       };
     }));
+
+    // Refuse to strand accounts on a tier that no longer exists. API callers that really mean it
+    // (e.g. after reassigning users out of band) can pass `allowStrandedUsers: true`.
+    if (req.body.allowStrandedUsers !== true) {
+      let stranded: Array<{ name: string; userCount: number }>;
+      try {
+        stranded = await findStrandedTiers(normalizedTypes.map((t: any) => t.name));
+      } catch (scanError) {
+        // Not a validation problem and nothing has been saved: tell the admin to retry.
+        console.error("Error checking which accounts are on removed subscription types:", scanError);
+        return res.status(503).json({
+          message: "Could not check which accounts are on the tiers being removed. Nothing was saved; please try again.",
+        });
+      }
+      if (stranded.length > 0) {
+        const list = stranded
+          .map((t) => `"${t.name}" (${t.userCount} account${t.userCount === 1 ? "" : "s"})`)
+          .join(", ");
+        return res.status(409).json({
+          message:
+            `Cannot remove or rename ${list}: accounts are still on ${stranded.length === 1 ? "it" : "them"} ` +
+            `(org members of those accounts inherit it too). Move them to another tier first, ` +
+            `otherwise they lose paid tools until reassigned.`,
+          strandedTiers: stranded,
+        });
+      }
+    }
 
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(

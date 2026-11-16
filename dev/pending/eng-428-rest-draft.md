@@ -1,3 +1,0 @@
-## ENG-428: Preserve REST draft intent (2026-10-07)
-
-Production artifact verification confirmed `/api/emma/post-on-account` dropped `save_as_draft`, and its service wrapper dropped the implementation's options argument. Forward the existing draft option across both boundaries so LinkedIn drafts remain drafts and other platforms reach the existing explicit refusal instead of publication. Ordinary posts retain the published default. Focused route regression: RED 1 failure/1 pass, GREEN 2/2. No provider writes, schema changes or paid model calls. Original deployed service/adapter tests also exercised DRAFT behavior using mocked HTTP clients. Production closure awaits deployment of this forwarding correction and exact-artifact replay.

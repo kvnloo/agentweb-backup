@@ -39,7 +39,7 @@ const GMAIL_ACCOUNT = {
 };
 
 /** A message summary as the email providers return it. */
-function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string }> = {}) {
+function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string; to: string; cc: string }> = {}) {
   // receivedAt (the provider's own receipt stamp) is what freshness is judged
   // on; `date` is the sender's header and is display-only. The default fixture
   // arrived AFTER the tool was invoked, which is the only thing a default call
@@ -54,6 +54,8 @@ function summary(over: Partial<{ id: string; subject: string; from: string; date
     date: over.date ?? arrived,
     receivedAt: arrived,
     snippet: '',
+    ...(over.to !== undefined ? { to: over.to } : {}),
+    ...(over.cc !== undefined ? { cc: over.cc } : {}),
   };
 }
 
@@ -655,5 +657,104 @@ describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
     expect(result.success).toBe(true);
     // Resolved once, never re-resolved: an own mailbox cannot be un-shared.
     expect(mockResolveEmailAccount).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ENG-944: a site mails the code to a role address (founders@) that is not a
+// connected account but is delivered into one (own or org-shared).
+describe('read_verification_code — role/alias address (delivered_to)', () => {
+  const ROLE = 'founders@agentweb.pro';
+
+  it('searches the connected mailbox for mail delivered to the role address and returns its code', async () => {
+    mockSearchEmails.mockResolvedValue([summary({ id: 'role-1' })]);
+    mockGetEmails.mockResolvedValue([{ id: 'role-1', to: `Founders <${ROLE}>`, body: 'Your code is 551177' }]);
+
+    const result = await tool.execute(
+      { delivered_to: 'Founders@AgentWeb.pro', subject_contains: 'Login Code', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('551177');
+    const query = mockSearchEmails.mock.calls[0][2];
+    expect(query).toContain(`deliveredto:"${ROLE}"`);
+  });
+
+  it('never returns a code addressed to a different recipient in the same mailbox', async () => {
+    mockListEmails.mockResolvedValue([summary({ id: 'other' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'other', to: 'cofounders@agentweb.pro, harsha@agentweb.pro', body: 'Your code is 999999' },
+    ]);
+
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.code).toBeUndefined();
+    expect(result.reason).not.toBe('code_not_found');
+  });
+
+  it('accepts the role address in Cc', async () => {
+    mockListEmails.mockResolvedValue([summary({ id: 'cc' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'cc', to: 'harsha@agentweb.pro', cc: ROLE, body: 'Your code is 123123' },
+    ]);
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+    expect(result.code).toBe('123123');
+  });
+
+  it('filters by summary recipients before the body cap so newer codes for others cannot crowd it out', async () => {
+    const others = [1, 2, 3, 4, 5].map((n) => summary({ id: `other-${n}`, to: 'verify@agentweb.pro', cc: `other${n}@agentweb.pro` }));
+    mockListEmails.mockResolvedValue([...others, summary({ id: 'role', to: 'verify@agentweb.pro', cc: ROLE })]);
+    mockGetEmails.mockImplementation(async (_u: string, _a: string, ids: string[]) =>
+      ids.map((id) => (id === 'role' ? { id, to: 'verify@agentweb.pro', cc: ROLE, body: 'Your code is 111111' } : { id, to: 'verify@agentweb.pro', cc: 'x@agentweb.pro', body: 'Your code is 222222' }))
+    );
+    const result = await tool.execute({ delivered_to: ROLE, wait_seconds: 0 }, context);
+    expect(result.code).toBe('111111');
+    expect(mockGetEmails.mock.calls[0][2]).toEqual(['role']);
+  });
+
+  it('reads through a teammate mailbox only when it resolves for this caller (org-scoped)', async () => {
+    // Another org's / an unshared mailbox does not resolve — no read happens.
+    mockResolveEmailAccount.mockRejectedValue(new Error('Connected account "harsha@agentweb.pro" not found.'));
+
+    const result = await tool.execute(
+      { account_id: 'harsha@agentweb.pro', delivered_to: ROLE, wait_seconds: 0 },
+      { ...context, userId: 'other-org-user' }
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('no_email_account');
+    expect(mockListEmails).not.toHaveBeenCalled();
+    expect(mockSearchEmails).not.toHaveBeenCalled();
+    expect(mockGetEmails).not.toHaveBeenCalled();
+  });
+
+  it('names the missing mapping when a role address is passed as account_id', async () => {
+    mockResolveEmailAccount.mockRejectedValue(new Error(`Connected account "${ROLE}" not found.`));
+
+    const result = await tool.execute({ account_id: ROLE, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('no_email_account');
+    expect(result.message).toContain(`delivered_to="${ROLE}"`);
+  });
+
+  it('rejects a delivered_to that is not a single address', async () => {
+    const result = await tool.execute({ delivered_to: 'founders', wait_seconds: 0 }, context);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('invalid_argument');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicitly empty delivered_to instead of dropping the filter', async () => {
+    const result = await tool.execute({ delivered_to: '  ', wait_seconds: 0 }, context);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('invalid_argument');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
+  it('leaves the query unchanged without delivered_to', async () => {
+    await tool.execute({ subject_contains: 'Login Code', wait_seconds: 0 }, context);
+    expect(mockSearchEmails.mock.calls[0][2]).not.toContain('deliveredto');
   });
 });

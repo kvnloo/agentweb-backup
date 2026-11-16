@@ -92,6 +92,12 @@ export interface UsageRunwayInput {
    * exactly that, so it is reported as `low` confidence rather than `normal`.
    */
   attributionInferred?: boolean;
+  /**
+   * ENG-668: this account is past its pool and pay-as-you-go is admitting it. The allowance is spent,
+   * but nothing is about to stop — so there is no "runs out" to forecast, and a clamped-to-zero
+   * runway (`onTrack: false`, 0 days) would claim an exhaustion the customer will never hit.
+   */
+  paygCovering?: boolean;
 }
 
 export type RunwayConfidence = "insufficient_data" | "low" | "normal";
@@ -108,6 +114,12 @@ export interface UsageRunway {
   resetDate: string;
   estimatedDaysRemaining: number | null;
   estimatedExhaustionDate: string | null;
+  /**
+   * ENG-668: present (always `true`) only while pay-as-you-go is covering usage past the pool. The
+   * exhaustion forecast is then withheld (`onTrack`, `estimatedDaysRemaining` and
+   * `estimatedExhaustionDate` are null) and clients must not raise a "runs out" alert.
+   */
+  paygCovering?: true;
   /** INTERNAL — strip before returning to a customer (AC4). */
   diagnostics: {
     cycleToDateBurnMicroUsdPerDay: number | null;
@@ -192,7 +204,7 @@ export function computeUsageRunway(input: UsageRunwayInput): UsageRunway {
   let estimatedExhaustionDate: string | null = null;
   let onTrack: boolean | null = null;
 
-  if (forecastBurn !== null) {
+  if (forecastBurn !== null && !input.paygCovering) {
     estimatedDaysRemaining = Math.floor(remainingAllowanceMicroUsd / forecastBurn);
     estimatedExhaustionDate = toIsoDay(todayMs + estimatedDaysRemaining * MS_PER_DAY);
     // On track means the allowance outlives the cycle. Exhausting exactly on the
@@ -220,6 +232,7 @@ export function computeUsageRunway(input: UsageRunwayInput): UsageRunway {
     resetDate: input.cycleResetDate,
     estimatedDaysRemaining,
     estimatedExhaustionDate,
+    ...(input.paygCovering ? { paygCovering: true as const } : {}),
     diagnostics: {
       cycleToDateBurnMicroUsdPerDay: cycleToDateBurn,
       trailingSevenDayBurnMicroUsdPerDay: trailingSevenBurn,

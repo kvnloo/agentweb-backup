@@ -108,7 +108,7 @@ export class GmailService implements IEmailService {
       throw new GmailTokenRevokedError('No refresh token available. Please reconnect your Gmail account.');
     }
 
-    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
     const { google } = await import('googleapis');
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
@@ -149,7 +149,7 @@ export class GmailService implements IEmailService {
   // ── Gmail client builder ──────────────────────────────────────────────────
 
   private async getGmailClient(userId: string, accountId: string) {
-    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
     const { google } = await import('googleapis');
     const token = await this.getValidAccessToken(userId, accountId);
     const gmailConfig = await getGmailConfig();
@@ -297,6 +297,7 @@ export class GmailService implements IEmailService {
       subject: this.getHeader(headers, 'Subject') || '(no subject)',
       from: this.getHeader(headers, 'From'),
       to: this.getHeader(headers, 'To'),
+      cc: this.getHeader(headers, 'Cc'),
       date: this.getHeader(headers, 'Date'),
       receivedAt: this.receivedAtIso(detail.data.internalDate),
       snippet: detail.data.snippet || '',
@@ -409,7 +410,7 @@ export class GmailService implements IEmailService {
 
     const ids = messages.map(m => m.id);
     const boundary = `batch_gmail_meta_${Date.now()}`;
-    const requestBody = this.buildBatchRequestBody(ids, boundary, 'metadata', ['Subject', 'From', 'Date']);
+    const requestBody = this.buildBatchRequestBody(ids, boundary, 'metadata', ['Subject', 'From', 'Date', 'To', 'Cc']);
     const parts = await this.doBatchRequest(token, requestBody, boundary);
 
     const results: EmailSummary[] = [];
@@ -425,6 +426,8 @@ export class GmailService implements IEmailService {
         date: this.getHeader(headers, 'Date'),
         receivedAt: this.receivedAtIso(part.body.internalDate),
         snippet: part.body.snippet || '',
+        to: this.getHeader(headers, 'To'),
+        cc: this.getHeader(headers, 'Cc'),
       });
     }
     return results;
@@ -472,6 +475,7 @@ export class GmailService implements IEmailService {
             subject: this.getHeader(headers, 'Subject') || '(no subject)',
             from: this.getHeader(headers, 'From'),
             to: this.getHeader(headers, 'To'),
+            cc: this.getHeader(headers, 'Cc'),
             date: this.getHeader(headers, 'Date'),
             receivedAt: this.receivedAtIso(data.internalDate),
             snippet: data.snippet || '',
@@ -561,6 +565,11 @@ export class GmailService implements IEmailService {
     if (bccStr) headerLines.push(`Bcc: ${bccStr}`);
     if (inReplyTo) headerLines.push(`In-Reply-To: ${inReplyTo}`);
     if (references) headerLines.push(`References: ${references}`);
+    // ENG-2367: caller-supplied headers; CR/LF stripped so a value can't inject extra headers.
+    for (const [name, value] of Object.entries(params.headers || {})) {
+      const safeName = name.replace(/[^A-Za-z0-9-]/g, '');
+      if (safeName) headerLines.push(`${safeName}: ${String(value).replace(/[\r\n]+/g, ' ')}`);
+    }
     headerLines.push('', params.body);
 
     const rawMessage = headerLines.join('\r\n');

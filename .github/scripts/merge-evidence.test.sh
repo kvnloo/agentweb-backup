@@ -997,6 +997,155 @@ run_gate "${d}"
 check 'retired integration success is not execution evidence' 3 'NO_EVIDENCE'
 
 # ---------------------------------------------------------------------------
+# ENG-2506 — Opslane "nothing to verify" neutral is an abstention, not a fail
+# ---------------------------------------------------------------------------
+# Real shape from agentweb#3552 (2026-10-15).
+opslane_run() { # $1 conclusion, $2 title
+  printf '{"name":"Opslane","app":{"slug":"opslane"},"status":"completed","conclusion":"%s","output":{"title":"%s","summary":"This check doesn'"'"'t block the merge."}}' "$1" "$2"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing Opslane can verify here')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane neutral nothing-to-verify alone does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing to verify in this PR')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane alternate abstention title does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Nothing to verify')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: a near-miss abstention title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run failure 'Nothing Opslane can verify here')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane failure still blocks' 1 'Opslane (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral 'Opslane found 2 risks')"'
+]'
+run_gate "${d}"
+check 'ENG-2506: Opslane neutral with any other title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_run neutral "Opslane couldn't test this commit")"'
+]'
+run_gate "${d}"
+check '#3967: Opslane could-not-test abstention does not block' 0 'VERDICT: PASS'
+
+cr_run() { # $1 conclusion, $2 title
+  printf '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"status":"completed","conclusion":"%s","output":{"title":"%s"}}' "$1" "$2"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run neutral 'Review rate limited')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit rate-limited neutral does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run neutral 'Review found issues')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit neutral with any other title still blocks' 1 'CodeRabbit (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(cr_run failure 'Review rate limited')"'
+]'
+run_gate "${d}"
+check '#3967: CodeRabbit failure still blocks' 1 'CodeRabbit (failure)'
+
+# ---------------------------------------------------------------------------
+# ENG-2833 — a hung in_progress Opslane run is not a verdict
+# ---------------------------------------------------------------------------
+# NOW = 2026-11-06T03:42:57Z; real shape from agentweb#3907.
+eng2833_now=1793936577
+opslane_live() { # $1 started_at, $2 name, $3 slug
+  printf '{"name":"%s","app":{"slug":"%s"},"status":"in_progress","conclusion":null,"started_at":"%s"}' "${2:-Opslane}" "${3:-opslane}" "$1"
+}
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T03:12:22Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: Opslane in_progress past the threshold does not block' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T03:30:00Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: a fresh Opslane run still holds' 2 'PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live '2026-11-06T01:00:00Z' 'Backend build' 'github-actions')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: an old non-Opslane run still holds' 2 'PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  '"$(opslane_live '2026-11-06T01:00:00Z')"'
+]'
+MERGE_EVIDENCE_NOW="${eng2833_now}" run_gate "${d}"
+check 'ENG-2833: a dropped hung Opslane run is not evidence' 3 'NO_EVIDENCE'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Opslane","app":{"slug":"impostor"},"status":"completed","conclusion":"neutral","output":{"title":"Nothing Opslane can verify here"}}
+]'
+run_gate "${d}"
+check 'ENG-2506: a non-Opslane app using the same name/title still blocks' 1 'Opslane (neutral)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "[$(opslane_run neutral 'Nothing Opslane can verify here')]"
+run_gate "${d}"
+check 'ENG-2506: an Opslane abstention alone is not execution evidence' 3 'NO_EVIDENCE'
+
+# ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
 # ---------------------------------------------------------------------------
 #
@@ -1609,6 +1758,68 @@ d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'swarm/eng-2116-x'; ru
 check 'ENG-2116: a swarm-owned green PR is not FOREIGN_OWNER' 0 'VERDICT: PASS'
 d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'mananx/eng-1'; run_gate "${d}"
 check 'ENG-2116: prefix match is exact (mananx/ is not manan/)' 0 'VERDICT: PASS'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'anurag-seth' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='anurag-seth' run_gate "${d}"
+check 'ENG-2116 opt2: Anurag directing a merge of his own green PR PASSes' 0 'VERDICT: PASS'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'anurag-seth' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='mananv-argusoft' run_gate "${d}"
+check 'ENG-2116 opt2: Manan cannot direct a merge of Anurag PR' 5 'VERDICT: FOREIGN_OWNER'
+d="$(new_fixture_dir)"; foreign_pr "${d}" 'harshmoney123' 'anurag/eng-1-x'; MERGE_EVIDENCE_DIRECTING_LOGIN='anurag-seth' run_gate "${d}"
+check 'ENG-2116 opt2: author must match, branch prefix alone is not enough' 5 'VERDICT: FOREIGN_OWNER'
+
+# ---------------------------------------------------------------------------
+# ENG-2944 — an Opslane 0s carry-forward failure is named, and still blocks
+# ---------------------------------------------------------------------------
+opslane_done() { # $1 conclusion, $2 started_at, $3 completed_at, $4 title
+  printf '{"id":777,"details_url":"https://opslane.example/r/777","name":"Opslane","app":{"slug":"opslane"},"status":"completed","conclusion":"%s","started_at":"%s","completed_at":"%s","output":{"title":"%s"}}' "$1" "$2" "$3" "${4:-Opslane found 1 risk}"
+}
+check_absent() { # $1 desc, $2 substring that must NOT appear
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if grep -qF "$2" <<<"${LAST_OUTPUT}"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf 'FAIL  %s\n      output unexpectedly contained: %s\n' "$1" "$2"
+    return
+  fi
+  printf 'ok    %s\n' "$1"
+}
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_done failure 2026-11-11T10:00:00Z 2026-11-11T10:00:00Z)"'
+]'
+run_gate "${d}"
+check 'ENG-2944: 0s Opslane failure still blocks as a failure' 1 'Opslane (failure)'
+check 'ENG-2944: 0s Opslane failure is named as a carry-forward' 1 'OPSLANE_CARRY_FORWARD: 777 https://opslane.example/r/777'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_done failure 2026-11-11T10:00:00Z 2026-11-11T10:07:30Z)"'
+]'
+run_gate "${d}"
+check 'ENG-2944: a real-duration Opslane failure blocks as today' 1 'Opslane (failure)'
+check_absent 'ENG-2944: a real-duration Opslane failure gets no carry-forward line' 'OPSLANE_CARRY_FORWARD'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_done neutral 2026-11-11T10:00:00Z 2026-11-11T10:00:00Z 'Nothing Opslane can verify here')"'
+]'
+run_gate "${d}"
+check 'ENG-2944: a 0s abstention neutral still passes' 0 'VERDICT: PASS'
+check_absent 'ENG-2944: an abstention neutral gets no carry-forward line' 'OPSLANE_CARRY_FORWARD'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  '"$(opslane_live 2026-11-11T08:00:00Z)"'
+]'
+MERGE_EVIDENCE_NOW="$(date -u -d 2026-11-11T10:00:00Z +%s)" run_gate "${d}"
+check 'ENG-2944: a hung Opslane run is still dropped (pass 5 unchanged)' 0 'VERDICT: PASS'
+check_absent 'ENG-2944: a hung Opslane run gets no carry-forward line' 'OPSLANE_CARRY_FORWARD'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

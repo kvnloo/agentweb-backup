@@ -4,22 +4,21 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getGoogleAdsConfig } from '../config/integrations';
 import { createAccount, getAccountsByUserId } from '../services/connectedAccountsDb';
+import { zomaMilestone } from '../services/journeyMilestones';
 import { googleAdsService } from '../services/googleAdsService';
 import type { GoogleAdsAccountNode, GoogleAdLeaf } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { buildGoogleAdsConnectUrl } from '../services/googleAdsConnectUrl';
 
 const router = express.Router();
 
-const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 interface StatePayload { userId: string; nonce: string; }
 
-const generateState = (userId: string): string =>
-  jwt.sign({ userId, nonce: crypto.randomBytes(16).toString('hex') } as StatePayload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
@@ -72,18 +71,7 @@ const retrieveTokenSession = (sessionId: string, userId: string): TokenSession |
  */
 router.get('/init', authenticateToken, async (req: any, res) => {
   try {
-    const config = await getGoogleAdsConfig();
-    const state = generateState(req.user.userId);
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: config.clientId,
-      redirect_uri: config.redirectUri,
-      scope: config.scopes.join(' '),
-      state,
-      access_type: 'offline',
-      prompt: 'consent',
-    });
-    res.json({ success: true, url: `${config.authorizationUrl}?${params.toString()}` });
+    res.json({ success: true, url: await buildGoogleAdsConnectUrl(req.user.userId) });
   } catch (error: any) {
     console.error('[Google Ads OAuth /init]', error);
     res.status(500).json({ error: 'Failed to initialize Google Ads OAuth' });
@@ -253,6 +241,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         },
       });
     }
+    // ENG-2906: journey event; zomaStage only moves for users who already use Zoma.
+    void zomaMilestone(userId, 'google_connected', { emit: 'always', requireZoma: true, props: { platform: 'google_ads' } });
     res.json({ success: true, connected: selected.length });
   } catch (error: any) {
     console.error('[Google Ads OAuth /connect]', error);

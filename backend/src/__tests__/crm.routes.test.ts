@@ -704,7 +704,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body);
+      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body, 'manual');
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockLead);
     });
@@ -781,7 +781,7 @@ describe('CRM Routes', () => {
           lastTouch: expect.objectContaining({
             utm: expect.objectContaining({ source: 'meta' }),
           }),
-        })
+        }), 'manual'
       );
       // Envelope stripped so createLead doesn't see an unknown `attribution` key
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
@@ -1740,8 +1740,80 @@ describe('CRM Routes', () => {
         subject: 'Test Subject',
         html: '<p>Test content</p>',
       });
+      // ENG-2367: one-off sends never carry bulk-mail List-Unsubscribe headers.
+      expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].headers).toBeUndefined();
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', { emailDraft: null });
       expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    describe('ENG-673 — a do-not-contact lead is never emailed', () => {
+      const run = async (path: string, body: Record<string, unknown>) => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email-id-123' });
+        (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+        mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+        mockRequest.body = { senderEmail: 'sender@example.com', senderName: 'Sender Name', subject: 'Subject', htmlContent: '<p>Hi</p>', ...body };
+        const handler = router.stack.find((r: any) => r.route?.path === path && r.route?.methods?.post);
+        await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      };
+      const blocked = [
+        ['contactStatus do-not-contact', { contactStatus: 'do-not-contact' }],
+        ['contactStatus unsubscribed', { contactStatus: 'unsubscribed' }],
+        ['the legacy unsubscribed flag', { unsubscribedFromGroupEmail: true }],
+      ] as const;
+      for (const path of ['/lists/:listId/leads/:leadId/send-email', '/lists/:listId/leads/:leadId/reply-email']) {
+        it.each(blocked)(`${path} refuses with 409 and sends nothing: %s`, async (_l, status) => {
+          (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead1', listId: 'list1', email: 'lead@example.com', linkedin: 'https://www.linkedin.com/in/x', ...status });
+          await run(path, { messageId: 'm1' });
+          expect(mockResponse.status).toHaveBeenCalledWith(409);
+          expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'do_not_contact' }));
+          expect(resendService.sendEmail).not.toHaveBeenCalled();
+        });
+      }
+      it('the Smartlead confirmation cannot override it', async () => {
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead1', listId: 'list1', email: 'lead@example.com', contactStatus: 'do-not-contact', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', pushedBy: 'u' } } });
+        await run('/lists/:listId/leads/:leadId/send-email', { confirmPushedToSmartlead: true });
+        expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'do_not_contact' }));
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+      });
+      it('an active lead is still emailed', async () => {
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead1', listId: 'list1', email: 'lead@example.com', contactStatus: 'active' });
+        await run('/lists/:listId/leads/:leadId/send-email', {});
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('ENG-673 — a lead pushed to Smartlead', () => {
+      const pushedLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com', system: { smartlead_77: { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' } } };
+      const send = async (body: Record<string, unknown> = {}) => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email-id-123' });
+        (crmDb.updateLead as jest.Mock).mockResolvedValue({});
+        mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+        mockRequest.body = { senderEmail: 'sender@example.com', senderName: 'Sender Name', subject: 'Subject', htmlContent: '<p>Hi</p>', ...body };
+        const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post);
+        await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      };
+
+      it('asks for confirmation before sending by hand, and sends nothing until it is given', async () => {
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue(pushedLead);
+        await send();
+        expect(mockResponse.status).toHaveBeenCalledWith(409);
+        expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'pushed_to_smartlead' }));
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+      });
+
+      it('sends once the person confirms', async () => {
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue(pushedLead);
+        await send({ confirmPushedToSmartlead: true });
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not ask for a lead whose marker was released', async () => {
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({ ...pushedLead, system: { smartlead_77: { ...pushedLead.system.smartlead_77, state: 'released' } } });
+        await send();
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('should send email with text content', async () => {
@@ -2308,7 +2380,7 @@ describe('CRM Routes', () => {
       }
 
       expect(crmDb.createLeadList).not.toHaveBeenCalled();
-      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array));
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array), { origin: 'integration' });
     });
 
     it('should return 400 if no subscribers to sync', async () => {

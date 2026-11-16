@@ -25,7 +25,7 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getSupportedModels: jest.fn(async () => [
       'openrouter/x-ai/grok-4.6',
-      'openrouter/qwen/qwen3.8-max',
+      'openrouter/qwen/qwen3.8-max-0902',
       'openrouter/moonshotai/kimi-k2.7-code',
       'gemini-3.5-flash',
     ]),
@@ -42,6 +42,10 @@ import {
 } from '../scripts/migrateStaleModelReferences';
 
 describe('planModelMigration (pure, ENG-9)', () => {
+  it('ENG-669 PR-C: the AgentWeb Model selection is never stale (it is not a registry id)', () => {
+    expect(planModelMigration('agentweb-model', new Set(['gpt-5.5']), (id) => id)).toEqual({ action: 'ok' });
+  });
+
   const validModelIds = new Set(['openrouter/x-ai/grok-4.6', 'gemini-3.5-flash']);
   const normalizeModelId = (id: string) => (id === 'legacy-alias-id' ? 'gemini-3.5-flash' : id);
 
@@ -77,7 +81,7 @@ describe('planModelMigration (pure, ENG-9)', () => {
       'openrouter/x-ai/grok-4.3': 'openrouter/x-ai/grok-4.6',
       'openrouter/mistralai/mistral-large-2512': 'openrouter/mistralai/mistral-small-2603',
       'openrouter/moonshotai/kimi-k2.6': 'openrouter/moonshotai/kimi-k2.7-code',
-      'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max',
+      'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max-0902',
       'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
       'claude-sonnet-4-5': 'anthropic.claude-sonnet-4-5-20250929-v1:0',
       'anthropic.claude-opus-4-7': 'anthropic.claude-opus-4-8',
@@ -111,7 +115,7 @@ describe('collectCandidates — dry-run scan across every blast-radius location 
   let doc: DynamoDB.DocumentClient;
   const validModelIds = new Set([
     'openrouter/x-ai/grok-4.6',
-    'openrouter/qwen/qwen3.8-max',
+    'openrouter/qwen/qwen3.8-max-0902',
     'openrouter/moonshotai/kimi-k2.7-code',
     'gemini-3.5-flash',
   ]);
@@ -176,7 +180,7 @@ describe('collectCandidates — dry-run scan across every blast-radius location 
         recordId: 'agent_mode_dedup_judge_model',
         field: 'settingValue',
         oldModel: 'openrouter/qwen/qwen3.7-flash',
-        plan: { action: 'migrate', newModel: 'openrouter/qwen/qwen3.8-max' },
+        plan: { action: 'migrate', newModel: 'openrouter/qwen/qwen3.8-max-0902' },
       })
     );
   });

@@ -606,6 +606,56 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toContain('Network Error');
     });
 
+    // ENG-1892: each failure family is classified and carries status + body.
+    it('classifies a 403 as a configuration error with HTTP status and reconnect guidance', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      const e: any = new Error('Request failed with status code 403');
+      e.response = { status: 403, data: { err: 'Team not authorized', ECODE: 'OAUTH_027' } };
+      mockCreateDoc.mockRejectedValue(e);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123');
+      expect(result).toMatchObject({ success: false, errorType: 'configuration', code: 403 });
+      expect(result.message).toContain('HTTP 403');
+      expect(result.message).toContain('Reconnect ClickUp');
+    });
+
+    it('classifies a 400 as invalid_parameter and includes a short ClickUp body when no err field exists', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      const e: any = new Error('Request failed with status code 400');
+      e.response = { status: 400, data: { message: 'parent doc id malformed' } };
+      mockCreatePageInDoc.mockRejectedValue(e);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'Page', 'content', 'user-123', 'bad-parent');
+      expect(result).toMatchObject({ success: false, errorType: 'invalid_parameter', code: 400 });
+      expect(result.message).toContain('parent doc id malformed');
+      expect(result.message).toContain('parent_doc_id');
+    });
+
+    it('classifies a generic Error with no HTTP response as runtime, never a bare message', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockCreateDoc.mockRejectedValue(new Error('socket hang up'));
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123');
+      expect(result).toMatchObject({ success: false, errorType: 'runtime' });
+      expect(result.message).toContain('Failed to create ClickUp document "New Doc"');
+      expect(result.message).toContain('socket hang up');
+    });
+
+    it.each([
+      [['', 'Doc', 'c', undefined], 'workspace_id'],
+      [['ws-1', '  ', 'c', undefined], 'name'],
+      [['ws-1', 'Doc', undefined, undefined], 'content'],
+      [['ws-1', 'Doc', 'c', ''], 'parent_doc_id'],
+    ])('rejects a malformed argument locally and names it (%j -> %s)', async (args: any[], param) => {
+      const result = await (agentModeService as any).writeClickUpDoc(args[0], args[1], args[2], 'user-123', args[3]);
+      expect(result).toMatchObject({ success: false, errorType: 'invalid_parameter' });
+      expect(result.message).toContain(`"${param}"`);
+      expect(mockGetAccessToken).not.toHaveBeenCalled();
+    });
+
   });
 
   // ============================================

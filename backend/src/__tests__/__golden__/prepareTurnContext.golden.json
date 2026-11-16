@@ -1,0 +1,2483 @@
+{
+  "plain first turn": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 5,
+        "sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+        "text": "Hello"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        null,
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "legacy session with history and memory": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 1856,
+        "sha256": "13ac1b8b065390d8125e273142d19a67f2269d91f29ea0fb06284189b2e6be24",
+        "text": "These are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement.\n\nAccount Memory (unverified notes from previous sessions):\n- [insight] (saved 2026-10-01, 24 days ago) Prefers a short tone\n- [insight] (saved 2026-09-20, 35 days ago) ICP is B2B SaaS\n\nThese are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement."
+      },
+      {
+        "role": "assistant",
+        "length": 16,
+        "sha256": "2ccbfa4e1963925831a5bbad1c31c30c941a0b7747edd6d6dfdbdf7181258bf0",
+        "text": "Here is a draft."
+      },
+      {
+        "role": "user",
+        "length": 33,
+        "sha256": "83c399b10a198fc61bea49ced3a1b912c36c1e189dd7a7acdb78c94870c33779",
+        "text": "What did we decide about pricing?"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        null,
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "org member with account and org memory": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 1788,
+        "sha256": "dad031ade77b95820fe47a229a11727d3f921975944ed583d1f273f2889091d2",
+        "text": "These are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement.\n\nAccount Memory (unverified notes from previous sessions):\n- [insight] (saved 2026-10-02, 23 days ago) Likes tables\n\nThese are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement."
+      },
+      {
+        "role": "assistant",
+        "length": 1796,
+        "sha256": "a483d32dda1d2894742fa689de90251c1da96ffa5006d7af1167f761348a954b",
+        "text": "These are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement.\n\nOrganization Memory (unverified shared notes for \"Acme Co\"):\n- [insight] (saved 2026-10-03, 22 days ago) Q3 pipeline $1.2M\n\nThese are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement."
+      },
+      {
+        "role": "user",
+        "length": 22,
+        "sha256": "bab7772563fc5fafbb30d3c30c16e889f4efc521fcfd556b58721da1eb2cf7cb",
+        "text": "Summarise our pipeline"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "memory disabled for the account": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 2,
+        "sha256": "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+        "text": "Hi"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "memory over the injection limit falls back to recency": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 2906,
+        "sha256": "ae0bb5c261219cdb413bc8e2026646db040f7f7ea48f8cc98f58105753d6db77",
+        "text": "These are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement.\n\nAccount Memory (unverified notes from previous sessions):\n- [insight] (saved 2026-10-01, 24 days ago) Note number 24\n- [insight] (saved 2026-10-01, 24 days ago) Note number 23\n- [insight] (saved 2026-10-01, 24 days ago) Note number 22\n- [insight] (saved 2026-10-01, 24 days ago) Note number 21\n- [insight] (saved 2026-10-01, 24 days ago) Note number 20\n- [insight] (saved 2026-10-01, 24 days ago) Note number 19\n- [insight] (saved 2026-10-01, 24 days ago) Note number 18\n- [insight] (saved 2026-10-01, 24 days ago) Note number 17\n- [insight] (saved 2026-10-01, 24 days ago) Note number 16\n- [insight] (saved 2026-10-01, 24 days ago) Note number 15\n- [insight] (saved 2026-10-01, 24 days ago) Note number 14\n- [insight] (saved 2026-10-01, 24 days ago) Note number 13\n- [insight] (saved 2026-10-01, 24 days ago) Note number 12\n- [insight] (saved 2026-10-01, 24 days ago) Note number 11\n- [insight] (saved 2026-10-01, 24 days ago) Note number 10\n- [insight] (saved 2026-10-01, 24 days ago) Note number 9\n- [insight] (saved 2026-10-01, 24 days ago) Note number 8\n- [insight] (saved 2026-10-01, 24 days ago) Note number 7\n- [insight] (saved 2026-10-01, 24 days ago) Note number 6\n- [insight] (saved 2026-10-01, 24 days ago) Note number 5\n\nThese are historical notes from previous sessions, NOT live state and NOT a substitute for checking current data yourself. Before acting on — or repeating to the user as current — any time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot re-verify it before answering, you MUST NOT state it as current: label it exactly as \"unverified — from <saved date> notes: <the figure>\" instead — or, if the note below has no saved date shown, \"unverified — from undated notes: <the figure>\". Never silently skip a configured action, and never quote a number from memory alone as though it were a fresh measurement."
+      },
+      {
+        "role": "user",
+        "length": 18,
+        "sha256": "59bad760b7cf33e0cdc97f06a797f94fda4f594b36444dc22845b0681e7599dc",
+        "text": "Tell me about cats"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "slack session gets the team roster": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 274,
+        "sha256": "be05e34dd800e9d3dc22f7ae8743bc0163bc3269965c5691709c54ea85093460",
+        "text": "[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately."
+      },
+      {
+        "role": "user",
+        "length": 15,
+        "sha256": "1c8760506f8dccca7a9cc0f84155acca78fbac62aa52110778358a9489b09696",
+        "text": "Who is the CMO?"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "voice card appended to the message": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 78,
+        "sha256": "3d40459d8cb6f523d3f006c2bb465fdd79457c7d2d1f28720294dffa07f28838",
+        "text": "Write a post\n\n[Author Voice Card]\nWarm, plain, no jargon.\n[/Author Voice Card]"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "admin user, installed skill and a published skill": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 69,
+        "sha256": "3447527260c82fe7e9e26c7b172d68737283a13a4ff48f126aa14fed68391244",
+        "text": "Available Skills:\ns2- Skill s2: Does s2: Tools: read_brand_guidelines"
+      },
+      {
+        "role": "assistant",
+        "length": 979,
+        "sha256": "c28f486b03956a7a47a54412f0f41d79c5fa4a35fb730044431bfbd8aa688cf8",
+        "text": "Installed Skills:\ns1- Skill s1: Does s1 \n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
+      },
+      {
+        "role": "user",
+        "length": 12,
+        "sha256": "a98240a13705d3662cd0c62fadba59a1cba05fedc804cdcc319d656a4d011b30",
+        "text": "Use my skill"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "assess_client_health",
+          "cancel_smartlead_push",
+          "check_account_tracking_health",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "diagnose_leads_at_zero",
+          "evaluation_workspace",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "freeze_user_account",
+          "get_account_status",
+          "get_chat_history",
+          "get_hot_lead_call_settings",
+          "get_landing_page_effective_view",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_pr_digest",
+          "get_registration_status",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_session_transcript",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_by_id",
+          "get_user_profile",
+          "get_users_by_lifecycle_stage",
+          "google_drive",
+          "inspect_client_usage",
+          "inspect_linkedin_account",
+          "inspect_orphaned_org_join_requests",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_all_clients",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_skills",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_linear_governance_label",
+          "manage_predefined_work_plan",
+          "manage_scheduled_chat",
+          "manage_scoring_judges",
+          "manage_skill",
+          "manage_user_funnel_status",
+          "manage_user_notes",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "monitor_lead_volume",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_client_meta_activity",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_linear_issues",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_landing_page_by_url",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "share_landing_page_with_org",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "s1",
+          "s2"
+        ]
+      ]
+    ]
+  },
+  "allowed skills unresolved (fails closed)": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 40,
+        "sha256": "0e50fe3d37ab5b2e1b0c60652b289f114a59512809646d70a4b7eeb846aeb5b9",
+        "text": "Installed Skills:\ns1- Skill s1: Does s1 "
+      },
+      {
+        "role": "user",
+        "length": 5,
+        "sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+        "text": "Hello"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        null
+      ]
+    ]
+  },
+  "delegated admin access on a non-admin account": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 956,
+        "sha256": "cf427f2ed6f0ebcc3406a387f594fd3a0f26036c3d5fadb38ab409a8b10817c2",
+        "text": "Installed Skills:\n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
+      },
+      {
+        "role": "system",
+        "length": 165,
+        "sha256": "7848e7deeff0260809932612bd3bdb3230ed827d3fabfd887774b7cf10a16000",
+        "text": "⚠️ ADMIN DELEGATED ACCESS: Admin tools are available in this session because an admin is viewing this account. Admin tools can be installed and used in this session."
+      },
+      {
+        "role": "user",
+        "length": 17,
+        "sha256": "99f2235f0ea947c9c6b5959d198e8cc0d3516fa2c78e994019576eeade21b801",
+        "text": "Check the account"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "assess_client_health",
+          "cancel_smartlead_push",
+          "check_account_tracking_health",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "diagnose_leads_at_zero",
+          "evaluation_workspace",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "freeze_user_account",
+          "get_account_status",
+          "get_chat_history",
+          "get_hot_lead_call_settings",
+          "get_landing_page_effective_view",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_pr_digest",
+          "get_registration_status",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_session_transcript",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_by_id",
+          "get_user_profile",
+          "get_users_by_lifecycle_stage",
+          "google_drive",
+          "inspect_client_usage",
+          "inspect_linkedin_account",
+          "inspect_orphaned_org_join_requests",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_all_clients",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_skills",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_linear_governance_label",
+          "manage_predefined_work_plan",
+          "manage_scheduled_chat",
+          "manage_scoring_judges",
+          "manage_skill",
+          "manage_user_funnel_status",
+          "manage_user_notes",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "monitor_lead_volume",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_client_meta_activity",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_linear_issues",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_landing_page_by_url",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "share_landing_page_with_org",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "interactive share blocks admin access": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 17,
+        "sha256": "99f2235f0ea947c9c6b5959d198e8cc0d3516fa2c78e994019576eeade21b801",
+        "text": "Check the account"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "user not found (orphaned)": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 5,
+        "sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+        "text": "Hello"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "no session row": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 5,
+        "sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+        "text": "Hello"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        null,
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "loop breaker fires on the third identical message": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 11,
+        "sha256": "18f81eb3186de6735941df47e34470b7bb48b8e45a2ce1419e755b67c552d528",
+        "text": "Which site?"
+      },
+      {
+        "role": "user",
+        "length": 10,
+        "sha256": "8d0877d0e097d391f5bb9b6d44c32c78463049e0a63cbe65c7a4ec4475e996e6",
+        "text": "just do it"
+      },
+      {
+        "role": "assistant",
+        "length": 11,
+        "sha256": "18f81eb3186de6735941df47e34470b7bb48b8e45a2ce1419e755b67c552d528",
+        "text": "Which site?"
+      },
+      {
+        "role": "user",
+        "length": 10,
+        "sha256": "8d0877d0e097d391f5bb9b6d44c32c78463049e0a63cbe65c7a4ec4475e996e6",
+        "text": "just do it"
+      },
+      {
+        "role": "system",
+        "length": 1654,
+        "sha256": "b3f9c9564efeb51bbb0d2deb9be9e2892088162e0bbcdf7fde70ab2488c963f0",
+        "text": "[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information 4 times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:\n1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.\n2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. \"don't guess\", \"verify first\"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.\n3. If that context is enough to complete the task, do so using it.\n4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.\n5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them."
+      }
+    ],
+    "options": {
+      "tools": [
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "loop breaker suppressed for a verification press": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 77,
+        "sha256": "45e5e1c1b8b1dde6ab55d0f02b83ab58cb0934ae20748cd2451ca966276f7a0c",
+        "text": "Please try again. Make sure to post_on_connected_account (1 more time needed)"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "slow human pace (long pause in history)": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "assistant",
+        "length": 5,
+        "sha256": "c253f451bdd56431ff15f638498d0003c36aabd5b07e5d21aaa7f1391410747c",
+        "text": "Reply"
+      },
+      {
+        "role": "user",
+        "length": 6,
+        "sha256": "8b88a85089561b7978c4e52c3150112912125f3d34ec59b6ff1450fc1079979c",
+        "text": "Second"
+      },
+      {
+        "role": "user",
+        "length": 10,
+        "sha256": "0fc45c837a8276b6b1503d073f9a5f2ef8cc7614cb0334d5164d3fd6dd4828a1",
+        "text": "Back again"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": true,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "scheduled unattended run, publish authorized": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 104337,
+        "sha256": "98e6110362a6d60c5f8e7d73f52825f8180973c78fc1d2a7af2b7455c7c6a3f0"
+      },
+      {
+        "role": "user",
+        "length": 21,
+        "sha256": "ceeef0227292d88a24b6dcf773890f9227a378a0d92d7588670dd371d6884602",
+        "text": "Run the weekly report"
+      },
+      {
+        "role": "system",
+        "length": 12770,
+        "sha256": "044d615bc91156a472d231bfa940dc10d227dbd9276b5c97119e30ce76858a07"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task:scheduled:aaaa1111-bbbb-2222-cccc-333344445555"
+        },
+        "humanPaced": false,
+        "taskClass": "scheduled_background",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "scheduled unattended run, publish withheld": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 105350,
+        "sha256": "2571df9801070e77100ffd69756105276329518334e797e833e4ece95dd61bac"
+      },
+      {
+        "role": "user",
+        "length": 21,
+        "sha256": "ceeef0227292d88a24b6dcf773890f9227a378a0d92d7588670dd371d6884602",
+        "text": "Run the weekly report"
+      },
+      {
+        "role": "system",
+        "length": 12163,
+        "sha256": "7bfb1a76dac0c72180ecebe9beb69d8cfbc527c875b3d80490e0acc9aa7270ef"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task:scheduled:aaaa1111-bbbb-2222-cccc-333344445555"
+        },
+        "humanPaced": false,
+        "taskClass": "scheduled_background",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "scheduled session reopened attended": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 101610,
+        "sha256": "7e40d665df516c5048c922ca183c04c5460683c9c109629b591506224c987956"
+      },
+      {
+        "role": "user",
+        "length": 20,
+        "sha256": "d0d0a7f11d1f07a8e77cf1989024c15d11741996345f2eb658b0ffa6e7da9ac5",
+        "text": "Show me the last run"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task:scheduled:aaaa1111-bbbb-2222-cccc-333344445555"
+        },
+        "humanPaced": false,
+        "taskClass": "scheduled_background",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  },
+  "screenshot attached": {
+    "messages": [
+      {
+        "role": "system",
+        "length": 100359,
+        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+      },
+      {
+        "role": "user",
+        "length": 208,
+        "sha256": "2a8e51979c96afc2079d0b1df807f8a656f525ce7b7e555507574e45b1a65877",
+        "text": "[{\"type\":\"text\",\"text\":\"What is wrong with this page?\\n\\n[Page screenshot captured. URL: https://example.com/shot.png]\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/shot.png\",\"detail\":\"low\"}}]"
+      }
+    ],
+    "options": {
+      "tools": [
+        "install_skills",
+        "post_on_connected_account",
+        "read_brand_guidelines",
+        "read_market_strategy"
+      ],
+      "rest": {
+        "priorityToolNames": [],
+        "tool_choice": "auto",
+        "max_completion_tokens": 32000,
+        "temperature": 0.1,
+        "usageContext": {
+          "userId": "golden-user",
+          "billingUserId": "golden-user",
+          "sessionId": "golden",
+          "feature": "agent_task"
+        },
+        "humanPaced": false,
+        "taskClass": "interactive_chat",
+        "customerRoutable": true
+      }
+    },
+    "filterCalls": [
+      [
+        "golden-user",
+        [
+          "Set",
+          "cancel_smartlead_push",
+          "coding_agent",
+          "confirm_hot_lead_call_verification",
+          "connect_account",
+          "convert_to_pdf",
+          "create_skill",
+          "create_work_plan",
+          "delete_memory",
+          "delete_org_memory",
+          "describe_image",
+          "fathom_get_meetings",
+          "fathom_get_onboarding_context",
+          "fathom_get_transcript",
+          "get_account_status",
+          "get_hot_lead_call_settings",
+          "get_lead_lists",
+          "get_lead_notification_settings",
+          "get_scheduled_chat_storage_diagnostics",
+          "get_scheduled_chat_test_history",
+          "get_smartlead_campaign_stats",
+          "get_smartlead_push_status",
+          "get_user_profile",
+          "google_drive",
+          "inspect_linkedin_account",
+          "install_skills",
+          "launch_predefined_work_plan",
+          "list_available_skills",
+          "list_connected_accounts",
+          "list_knowledge_base_files",
+          "list_predefined_work_plans",
+          "list_scheduled_chats",
+          "list_smartlead_campaigns",
+          "luma_get_guests",
+          "luma_list_events",
+          "manage_scheduled_chat",
+          "materialize_knowledge_base_asset",
+          "modify_work_plan",
+          "notify_session",
+          "open_site_signin",
+          "pause_smartlead_push",
+          "perform_data_analysis",
+          "preview_smartlead_push",
+          "provision_hot_lead_call_number",
+          "read_brand_guidelines",
+          "read_file_content",
+          "read_google_doc",
+          "read_knowledge_base_files",
+          "read_market_strategy",
+          "read_tool_response",
+          "read_verification_code",
+          "recommend_predefined_work_plan",
+          "release_hot_lead_call_number",
+          "release_leads_from_smartlead",
+          "resolve_skill",
+          "resume_smartlead_push",
+          "revoke_linkedin_account",
+          "save_memory",
+          "save_org_memory",
+          "save_work_plan",
+          "search_knowledge_base",
+          "search_leads",
+          "search_tool_response",
+          "search_user_guide",
+          "send_email_from_sender",
+          "set_work_plan_status",
+          "slack_get_recent_messages",
+          "slack_list_channels",
+          "slack_send_message",
+          "start_hot_lead_call_verification",
+          "start_smartlead_push",
+          "submit_scheduled_chat_variables",
+          "test_scheduled_chat",
+          "update_brand_guidelines",
+          "update_hot_lead_call_settings",
+          "update_lead_notification_settings",
+          "update_market_strategy",
+          "wait_seconds",
+          "you_search_news",
+          "you_search_web"
+        ],
+        [
+          "*"
+        ]
+      ]
+    ]
+  }
+}

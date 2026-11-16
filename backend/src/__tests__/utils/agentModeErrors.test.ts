@@ -4,6 +4,7 @@ import {
   isContextLimitError,
   isTransientLLMError,
   isWorkerShutdownError,
+  isProviderNoEndpointsError,
   extractAffordableTokens
 } from '../../utils/agentModeErrors';
 
@@ -136,6 +137,8 @@ describe('agentModeErrors utils', () => {
 
     it('should detect graceful worker shutdown errors', () => {
       expect(isWorkerShutdownError(new Error('Worker shutdown'))).toBe(true);
+      // ENG-2750: drain-ceiling shutdown is the same deploy-timing class
+      expect(isWorkerShutdownError(new Error('Worker shutdown — drain ceiling exceeded'))).toBe(true);
     });
 
     it('should detect worker process exit errors', () => {
@@ -146,6 +149,56 @@ describe('agentModeErrors utils', () => {
     it('should return false for unrelated worker strings', () => {
       expect(isWorkerShutdownError(new Error('Worker shutdown unexpectedly'))).toBe(false);
       expect(isWorkerShutdownError('ordinary failure')).toBe(false);
+    });
+  });
+
+  describe('isProviderNoEndpointsError', () => {
+    it('should return false for null/undefined', () => {
+      expect(isProviderNoEndpointsError(null)).toBe(false);
+      expect(isProviderNoEndpointsError(undefined)).toBe(false);
+    });
+
+    it('should detect the real OpenRouter 404 message (ENG-2293 Opslane finding)', () => {
+      expect(isProviderNoEndpointsError(new Error('404 No endpoints found that can handle the requested parameters'))).toBe(true);
+    });
+
+    it('should check originalMessage on a wrapped error', () => {
+      const wrapped = new Error('Unknown Error');
+      (wrapped as any).originalMessage = 'No endpoints found that can handle the requested parameters';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should return false for unrelated errors', () => {
+      expect(isProviderNoEndpointsError(new Error('high demand'))).toBe(false);
+      expect(isProviderNoEndpointsError('ordinary failure')).toBe(false);
+    });
+
+    it('should tolerate case and "available" wording drift', () => {
+      expect(isProviderNoEndpointsError(new Error('no endpoints found'))).toBe(true);
+      expect(isProviderNoEndpointsError(new Error('No endpoints available for this model'))).toBe(true);
+    });
+
+    it('should find the message on the nested original error', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.originalError = new Error('404 No endpoints found that can handle the requested parameters');
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should match a reworded 404 that still names the requested parameters', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'No routable provider for the requested parameters';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should NOT treat a bare 404 as a routing failure (wrong slug/URL must stay loud)', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'Not Found';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(false);
+      const wording: any = new Error('Unknown Error');
+      wording.originalMessage = 'the requested parameters were invalid';
+      expect(isProviderNoEndpointsError(wording)).toBe(false);
     });
   });
 

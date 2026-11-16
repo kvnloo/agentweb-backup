@@ -3,6 +3,22 @@ import request from 'supertest';
 import supportRouter from '../routes/support';
 
 // Mock dependencies
+// ENG-2817: the Notion fallback is gone; fileUserIssue is stubbed so these suites keep asserting
+// the payload the caller hands to the intake service (title/description/tags/context).
+const mockFileToTracker = jest.fn(async (_item: any): Promise<any> => ({ pageId: 'page-abc', notionUrl: 'https://notion.so/pageabc' }));
+jest.mock('../services/intakeService', () => ({
+  ...jest.requireActual('../services/intakeService'),
+  fileUserIssue: jest.fn(async (p: any) => {
+    const o = await mockFileToTracker({
+      title: p.title,
+      description: p.description,
+      additionalTags: p.notionTags || ['Customer Reported'],
+      context: p.notionContext,
+    });
+    return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Featurebase' };
+  }),
+}));
+
 jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn().mockResolvedValue(undefined)
@@ -23,10 +39,6 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getJsonArraySetting: jest.fn().mockResolvedValue(['founders@agentweb.pro'])
   }
-}));
-
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'page-abc', notionUrl: 'https://notion.so/pageabc' })
 }));
 
 jest.mock('../utils/s3Utils', () => ({
@@ -51,7 +63,6 @@ jest.mock('../middleware/auth', () => ({
 }));
 
 const { resendService } = require('../services/resendService');
-const { createOncallItem } = require('../services/notionService');
 const { uploadScreenshotToS3 } = require('../utils/s3Utils');
 const { userDb } = require('../services/db');
 
@@ -76,7 +87,7 @@ describe('POST /api/support/report-ui-bug', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/description is required/i);
-    expect(createOncallItem).not.toHaveBeenCalled();
+    expect(mockFileToTracker).not.toHaveBeenCalled();
   });
 
   it('returns 400 when description is an empty/whitespace string', async () => {
@@ -103,7 +114,7 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.issueId).toBe('AGW-page-abc');
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
+    expect(mockFileToTracker).toHaveBeenCalledTimes(1);
   });
 
   // SUCCESS tests — happy path
@@ -126,8 +137,8 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(uploadScreenshotToS3).toHaveBeenCalledWith(dataUrl, 'user-123');
 
     // Tracked item created on the sprint board with the right tags + context
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(mockFileToTracker).toHaveBeenCalledTimes(1);
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
     expect(itemArg.title).toMatch(/^UI Bug:/);
     expect(itemArg.description).toContain('The save button is cut off');
@@ -158,7 +169,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Connector setup is blocked', reportType: 'bug' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining([
       'Bug',
       'Status: Account Setup',
@@ -178,8 +189,8 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(uploadScreenshotToS3).not.toHaveBeenCalled();
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(mockFileToTracker).toHaveBeenCalledTimes(1);
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.context['Screenshot']).toBe('Not provided');
   });
 
@@ -196,8 +207,8 @@ describe('POST /api/support/report-ui-bug', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(mockFileToTracker).toHaveBeenCalledTimes(1);
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.context['Screenshot']).toBe('Upload failed');
   });
 
@@ -209,7 +220,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'The layout is broken' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
     expect(itemArg.title).toMatch(/^UI Bug:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Bug]');
@@ -222,7 +233,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Weird thing', reportType: 'not-a-real-type' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
   });
 
@@ -233,7 +244,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Please add dark mode', reportType: 'feature_request' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feature Request']));
     expect(itemArg.title).toMatch(/^Feature Request:/);
     const emailCall = resendService.sendEmail.mock.calls[0][0];
@@ -248,7 +259,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Make the dashboard faster', reportType: 'improvement' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Improvement']));
     expect(itemArg.title).toMatch(/^Improvement:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Improvement]');
@@ -261,7 +272,7 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Love the product!', reportType: 'feedback' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
+    const itemArg = mockFileToTracker.mock.calls[0][0];
     expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feedback']));
     expect(itemArg.title).toMatch(/^Feedback:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Feedback]');

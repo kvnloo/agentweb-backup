@@ -40,7 +40,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(mockSendMail).not.toHaveBeenCalled();
   });
 
-  it('should send slim email when a Linear issue is filed successfully', async () => {
+  it('should send no email when a Linear issue is filed successfully', async () => {
     mockFileAutoIssue.mockResolvedValueOnce({
       pageId: 'ENG-123',
       url: 'https://linear.app/emmabyaw/issue/ENG-123',
@@ -61,13 +61,8 @@ describe('EmailService - sendOncallAlert', () => {
       executionRoute: 'human-triage',
     }));
 
-    expect(mockSendMail).toHaveBeenCalled();
-    const callArgs = mockSendMail.mock.calls[0][0];
-    expect(callArgs.html).toContain('View tracked issue');
-    expect(callArgs.html).toContain('https://linear.app/emmabyaw/issue/ENG-123');
-    // Slim email should NOT contain the full context table
-    expect(callArgs.html).not.toContain('Additional Context');
-    expect(callArgs.text).toContain('Issue: https://linear.app/emmabyaw/issue/ENG-123');
+    // The tracked issue is the record; no redundant email.
+    expect(mockSendMail).not.toHaveBeenCalled();
   });
 
   it('should send full detail email when Linear filing fails', async () => {
@@ -97,10 +92,7 @@ describe('EmailService - sendOncallAlert', () => {
     );
 
     expect(mockFileAutoIssue).not.toHaveBeenCalled();
-    expect(mockSendMail).toHaveBeenCalled();
-    const callArgs = mockSendMail.mock.calls[0][0];
-    expect(callArgs.html).toContain('View tracked issue');
-    expect(callArgs.html).toContain('https://notion.so/existing-page');
+    expect(mockSendMail).not.toHaveBeenCalled();
   });
 
   it('should send oncall alert with default email when ONCALL_EMAIL_LIST is not set', async () => {
@@ -127,12 +119,7 @@ describe('EmailService - sendOncallAlert', () => {
 
   it('should send oncall alert to configured emails', async () => {
     process.env.ONCALL_EMAIL_LIST = 'oncall1@example.com,oncall2@example.com';
-    mockFileAutoIssue.mockResolvedValueOnce({
-      pageId: 'ENG-1',
-      url: 'https://linear.app/emmabyaw/issue/ENG-1',
-      deduped: false,
-      tracker: 'Linear',
-    });
+    mockFileAutoIssue.mockRejectedValueOnce(new Error('Linear down'));
 
     await emailService.sendOncallAlert(
       'Critical Error',
@@ -158,5 +145,45 @@ describe('EmailService - sendOncallAlert', () => {
       'Test Alert',
       'Test message'
     )).resolves.not.toThrow();
+  });
+});
+
+describe('EmailService - sendOncallEmailOnly (ENG-2743)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.ONCALL_EMAIL_LIST = 'test@example.com,test2@example.com';
+    process.env.NODE_ENV = 'production';
+  });
+
+  afterEach(() => {
+    delete process.env.ONCALL_EMAIL_LIST;
+    process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  it('emails the oncall list and never files a tracked issue', async () => {
+    const sent = await emailService.sendOncallEmailOnly('2 scheduled runs cost 2x+', 'line one\n- schedule <b>x</b> & y');
+    expect(sent).toBe(true);
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockSendMail).toHaveBeenCalledTimes(1);
+    const callArgs = mockSendMail.mock.calls[0][0];
+    expect(callArgs.to).toEqual(['test@example.com', 'test2@example.com']);
+    expect(callArgs.subject).toBe('[PROD] 2 scheduled runs cost 2x+');
+    expect(callArgs.text).toContain('line one\n- schedule <b>x</b> & y');
+    expect(callArgs.html).toContain('schedule &lt;b&gt;x&lt;/b&gt; &amp; y');
+    expect(callArgs.html).not.toContain('<b>x</b>');
+  });
+
+  it('sends nothing outside production', async () => {
+    process.env.NODE_ENV = 'development';
+    expect(await emailService.sendOncallEmailOnly('s', 'm')).toBe(false);
+    expect(mockSendMail).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+  });
+
+  it('returns false instead of throwing when the send fails', async () => {
+    mockSendMail.mockRejectedValueOnce(new Error('resend down'));
+    await expect(emailService.sendOncallEmailOnly('s', 'm')).resolves.toBe(false);
   });
 });

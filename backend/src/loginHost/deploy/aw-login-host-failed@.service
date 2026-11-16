@@ -1,0 +1,9 @@
+# ENG-2110: runs when aw-login-host@%i gives up (start limit reached). It only writes ONE clear line to the journal; the CloudWatch agent ships
+# the units `aw-login-host@*` and `aw-login-host-failed@*` and a metric filter on `host_start_failed` raises the alarm. Restart after fixing the cause:
+#   systemctl reset-failed aw-login-host@%i && systemctl start aw-login-host@%i     (or run the deploy again)
+[Unit]
+Description=AgentWeb login host (%i) could not start
+
+[Service]
+Type=oneshot
+ExecStart=/bin/echo host_start_failed env=%i: aw-login-host@%i stopped retrying, see journalctl -u aw-login-host@%i

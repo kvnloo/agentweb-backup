@@ -461,7 +461,7 @@ function errorMessageOf(error: unknown): string {
  * args are absent or unserializable (telemetry must never throw).
  */
 const FAILED_ARGS_MAX_CHARS = 4096;
-const SECRET_KEY_PATTERN = /token|secret|password|api[_-]?key|authorization|credential|private[_-]?key/i;
+export const SECRET_KEY_PATTERN = /token|secret|password|api[_-]?key|authorization|credential|private[_-]?key/i;
 
 function serializeFailedArgs(args: unknown): string | undefined {
   if (args == null) return undefined;

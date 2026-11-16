@@ -4,17 +4,24 @@
  * Mounts the ENG-2283 gateway so an external agent can list and call the ENG-2282 manifest:
  *   GET  /api/meta-toolkit/tools              -> manifest (bearer auth required)
  *   POST /api/meta-toolkit/tools/:name/call   -> handleMetaToolkitCall
- * Auth, account resolution, write guards and metering all live in the gateway; this file only
+ * Auth, account resolution, reads-only enforcement and metering all live in the gateway; this file only
  * maps HTTP <-> gateway and errors -> status codes. No new storage.
  */
 import { Router, type Request, type Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import {
   authenticateMetaToolkitCaller,
   handleMetaToolkitCall,
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
+import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
+import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
+import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
+import { validateRef } from '../services/journeyAttribution';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -31,6 +38,24 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
   return res.status(500).json({ error: 'Meta Toolkit call failed.' });
 }
 
+/**
+ * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
+ * The Google manifest is loaded lazily so the Meta-only path never imports it.
+ */
+function toolkitManifest() {
+  // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
+  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
+  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+}
+
+/** ENG-2747 (option B): Databricks-origin callers see only the tools they may call. */
+function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
+  const tools = toolkitManifest();
+  return caller?.databricksOrigin ? databricksToolView(tools) : tools;
+}
+
 const router = Router();
 
 router.use((req: Request, res: Response, next) => {
@@ -42,10 +67,19 @@ router.use((req: Request, res: Response, next) => {
   return next();
 });
 
+/** ENG-2303 P5 — public agent guide for the toolkit (served from backend/docs, like /skill.md). */
+router.get('/skill.md', (_req: Request, res: Response) => {
+  try {
+    res.type('text/markdown').send(fs.readFileSync(path.join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf-8'));
+  } catch {
+    res.status(404).json({ error: 'Documentation not found' });
+  }
+});
+
 router.get('/tools', async (req: Request, res: Response) => {
   try {
-    await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: getMetaToolkitManifest() });
+    const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
+    return res.json({ tools: toolsFor(caller) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -70,7 +104,7 @@ router.post('/tools/:name/call', async (req: Request, res: Response) => {
 /**
  * ENG-2295 — stateless MCP (JSON-RPC 2.0) surface so an MCP client such as Claude can add the
  * toolkit as a remote server (`claude mcp add --transport http <base>/api/meta-toolkit/mcp`).
- * Same gateway as the REST routes above: auth, account resolution, write guards and metering are
+ * Same gateway as the REST routes above: auth, account resolution, reads-only enforcement and metering are
  * not re-implemented here. No session state, no storage.
  */
 export const META_TOOLKIT_MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -118,6 +152,10 @@ router.post('/mcp', async (req: Request, res: Response) => {
   try {
     switch (method) {
       case 'initialize':
+        // MCP authorization: the protected resource answers an unauthenticated initialize with
+        // 401 + an RFC 9728 challenge, which is what makes Claude Code / Codex open the browser
+        // OAuth login. Serving initialize anonymously left clients "connected" with no tools.
+        await authenticateMetaToolkitCaller(req.headers.authorization);
         return rpcResult(res, id, {
           protocolVersion:
             typeof params.protocolVersion === 'string' && META_TOOLKIT_MCP_SUPPORTED_VERSIONS.has(params.protocolVersion)
@@ -128,9 +166,10 @@ router.post('/mcp', async (req: Request, res: Response) => {
         });
       case 'ping':
         return rpcResult(res, id, {});
-      case 'tools/list':
-        await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: getMetaToolkitManifest() });
+      case 'tools/list': {
+        const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
+        return rpcResult(res, id, { tools: toolsFor(caller) });
+      }
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');
@@ -148,6 +187,8 @@ router.post('/mcp', async (req: Request, res: Response) => {
             args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
             sessionId: req.get('mcp-session-id') ?? undefined,
             userAgent: req.get('user-agent') ?? undefined,
+            // ENG-2906: `?ref=` on the MCP URL; validated (or dropped) when the event is recorded.
+            ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
           });
           return rpcResult(res, id, { content: toolResultContent(result), isError: false });
         } catch (error) {
@@ -164,7 +205,17 @@ router.post('/mcp', async (req: Request, res: Response) => {
   } catch (error) {
     if (error instanceof MetaToolkitAuthError) {
       if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
-      if (error.status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+      if (error.status === 401) {
+        res.setHeader(
+          'WWW-Authenticate',
+          buildMcpAuthChallenge(
+            getBackendUrl(),
+            req.headers.authorization ? 'invalid_token' : undefined,
+            META_TOOLKIT_MCP_RESOURCE_PATH,
+            validateRef(req.query.ref), // ENG-2906: carry ?ref= into the resource metadata
+          ),
+        );
+      }
       return rpcError(res, id, -32001, error.message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);

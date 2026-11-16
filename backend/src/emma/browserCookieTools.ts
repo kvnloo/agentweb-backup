@@ -153,7 +153,7 @@ emmaToolRegistry.register({
   definition: {
     name: 'mark_browser_session_failed',
     description:
-      'Report that a manually-imported browser session (Settings > Browser Sessions) for a domain did NOT actually authenticate, ' +
+      'Report that a manually-imported browser session (Settings > Session Cookies) for a domain did NOT actually authenticate, ' +
       'even though load_browser_cookies reported loading it. Call this when, after load_browser_cookies succeeded, ' +
       'the site still shows a signin/login page instead of the expected authenticated state — this means the ' +
       "user's manually-imported session cookie has died server-side (it can happen before its stored expiry estimate). " +
@@ -184,7 +184,7 @@ emmaToolRegistry.register({
 
     return {
       success: true,
-      message: `Flagged the manually-imported session for "${domain}" as failed. The user will see this in Settings > Browser Sessions and can re-import a fresh one.`
+      message: `Flagged the manually-imported session for "${domain}" as failed. The user will see this in Settings > Session Cookies and can re-import a fresh one.`
     };
   }
 });

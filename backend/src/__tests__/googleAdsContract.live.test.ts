@@ -94,13 +94,35 @@ describeLive('Google Ads live API contract', () => {
     // The pair is the whole point of the read-back: a resource name cannot be installed
     // on a page. If Google changes the snippet shape, parseTagSnippets returns null and
     // every generated lander silently loses its conversion label.
+    //
+    // ENG-2869: some accounts (e.g. …1270) hold only GA4-imported conversion actions,
+    // which carry no tag snippet at all. That account shape is legitimate, not a contract
+    // break, so skip with an explicit logged reason instead of failing. The GA4 shape is
+    // still asserted in the next case.
     const tagged = actions.find((a) => Array.isArray(a.tagSnippets) && a.tagSnippets.length > 0);
-    expect(tagged).toBeDefined();
+    if (!tagged) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[googleAdsContract] tag-snippet case skipped: account ${CUSTOMER_ID} has no `
+        + `conversion action with tag snippets (types: ${[...new Set(actions.map((a) => a.type))].join(', ')})`,
+      );
+      return;
+    }
     const pair = parseTagSnippets(tagged.tagSnippets);
     expect(pair).not.toBeNull();
     expect(pair!.conversionId).toMatch(/^AW-[0-9]{6,}$/);
     expect(pair!.conversionLabel.length).toBeGreaterThan(0);
     expect(pair!.sendTo).toBe(`${pair!.conversionId}/${pair!.conversionLabel}`);
+  });
+
+  it('returns GA4-imported actions as a no-snippet result, not an error', () => {
+    // ENG-2869: GA4 imports are measured by GA4, so Google returns no tag snippet for
+    // them. Our read-back must treat that as "no pair" (null), never throw.
+    const ga4 = actions.filter((a) => typeof a.type === 'string' && a.type.startsWith('GOOGLE_ANALYTICS_4'));
+    for (const a of ga4) {
+      expect(() => parseTagSnippets(a.tagSnippets)).not.toThrow();
+      expect(parseTagSnippets(a.tagSnippets)).toBeNull();
+    }
   });
 
   it('reports only ENABLED or REMOVED as stored statuses', () => {

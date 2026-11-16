@@ -22,6 +22,29 @@
     }
   },
   {
+    "name": "cancel_smartlead_push",
+    "listed": false,
+    "description": "Cancel a Smartlead push for good; contacts already added stay in Smartlead (they can be removed there).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "The push (from get_smartlead_push_status with a listId)."
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "check_account_tracking_health",
     "listed": false,
     "description": "Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.\n\nResolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.\n\nReturns:\n- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.\n- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.\n\nUse this to check \"is the pixel broken\" / \"is CAPI deployed\" / \"does this ad's destination actually carry a pixel this account owns\" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.\n\nIf the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.",
@@ -62,6 +85,40 @@
       "required": [
         "vercel_project_id",
         "subdomain"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "create_knowledge_base_file",
+    "listed": false,
+    "description": "Create a plain-text or markdown file in one of your own knowledge bases (max 1048576 bytes, no binary). With kb_id, adds file_name to that knowledge base; without kb_id, creates a new private knowledge base named kb_name whose main file (knowledge-base.txt) holds the content. Returns the stored file key, size and sha256.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases). Omit to create a new knowledge base."
+        },
+        "kb_name": {
+          "type": "string",
+          "description": "Name for the new knowledge base (only when kb_id is omitted)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "File name ending in .txt, .md or .markdown (required with kb_id)"
+        },
+        "content": {
+          "type": "string",
+          "description": "File text"
+        }
+      },
+      "required": [
+        "content"
       ]
     },
     "sideEffect": "write",
@@ -174,6 +231,37 @@
       },
       "required": [
         "template_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "delete_knowledge_base_file",
+    "listed": false,
+    "description": "Delete one uploaded or attached file from one of your own knowledge bases. The main knowledge-base.txt file cannot be deleted. Pass file_key when two files share a name. Returns confirmation that the file is gone.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "File name to delete"
+        },
+        "file_key": {
+          "type": "string",
+          "description": "Stored file key (optional; disambiguates duplicate names)"
+        }
+      },
+      "required": [
+        "kb_id",
+        "file_name"
       ]
     },
     "sideEffect": "write",
@@ -317,7 +405,7 @@
   {
     "name": "emma_answer_question_deck",
     "listed": true,
-    "description": "Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for \"Let Emma decide\" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.",
+    "description": "Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for \"Let Emma decide\" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI. Cards that need a person's approval (adding or releasing contacts in Smartlead, a hot-lead call, activating a CRM sequence, a paused Meta campaign bundle) cannot be approved this way: approving one returns an error with the link where the person approves it in AgentWeb; declining one works.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -859,6 +947,28 @@
     }
   },
   {
+    "name": "emma_review_site",
+    "listed": true,
+    "description": "Analyse any public website's go-to-market readiness: positioning, offer clarity, and conversion blockers. Works without an account.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "Public http(s) URL of the site to review, e.g. https://example.com"
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "emma_run_marketing_task",
     "listed": true,
     "description": "Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. Use this when none of the more specific emma_* tools fits the request. Starts a new task unless you pass task_id to continue an existing one. Usually returns the finished result directly (status \"complete\"). If status is \"running\" or \"unconfirmed\", call emma_get_session with session_id set to the returned task_id — \"unconfirmed\" means the result is real but we could not verify Emma is not waiting on you. When status is \"awaiting_input\", answer with emma_answer_question_deck (awaiting_question_deck set).",
@@ -1187,6 +1297,28 @@
     }
   },
   {
+    "name": "export_lead_list",
+    "listed": false,
+    "description": "Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID to export"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "freeze_user_account",
     "listed": false,
     "description": "Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.",
@@ -1332,13 +1464,17 @@
   {
     "name": "get_account_status",
     "listed": false,
-    "description": "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    "description": "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "client_id": {
           "type": "string",
           "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        },
+        "usage_month": {
+          "type": "string",
+          "description": "Optional YYYY-MM. When set, include usage_breakdown (tokens and calls by model/day, session count) for that month."
         }
       },
       "required": []
@@ -1358,11 +1494,11 @@
       "properties": {
         "start_time": {
           "type": "string",
-          "description": "Start time in ISO 8601 format (e.g., \"2024-03-01T00:00:00.000Z\")"
+          "description": "Start time in ISO 8601 format (e.g., \"2024-03-01T00:00:00.000Z\"). Optional: defaults to 24 hours before end_time."
         },
         "end_time": {
           "type": "string",
-          "description": "End time in ISO 8601 format (e.g., \"2024-03-02T00:00:00.000Z\")"
+          "description": "End time in ISO 8601 format (e.g., \"2024-03-02T00:00:00.000Z\"). Optional: defaults to now."
         },
         "limit": {
           "type": "number",
@@ -1375,12 +1511,33 @@
           "default": false
         }
       },
-      "required": [
-        "start_time",
-        "end_time"
-      ]
+      "required": []
     },
     "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_conversion_summary",
+    "listed": false,
+    "description": "Aggregate lead/conversion counts for your own account over a date range (default: last 30 days, max 366 days): per landing page (unique leads and form-submission conversions), per lead list (leads added), and totals. Counts only — no lead details. Only your own lists and pages are included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start_date": {
+          "type": "string",
+          "description": "Inclusive start date, YYYY-MM-DD (UTC)"
+        },
+        "end_date": {
+          "type": "string",
+          "description": "Inclusive end date, YYYY-MM-DD (UTC). Default: today"
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -1639,6 +1796,57 @@
     }
   },
   {
+    "name": "get_smartlead_campaign_stats",
+    "listed": false,
+    "description": "How one of the user's Smartlead campaigns is doing, as Smartlead counts it: contacts emailed, emails sent (follow-ups included), replies, bounces and unsubscribes. Read only. Opens and clicks are not reported, and the counts can lag a few minutes behind a recent push or send.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "campaignId": {
+          "type": "number",
+          "description": "The id of one of the user's Smartlead campaigns (from list_smartlead_campaigns)."
+        },
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        }
+      },
+      "required": [
+        "campaignId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "get_smartlead_push_status",
+    "listed": false,
+    "description": "Progress of a Smartlead push (how many contacts were added, whether it is running, paused or finished, and why it paused), or a CRM list's recent pushes. Give runId for one push, or listId for the list. Read only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "One push."
+        },
+        "listId": {
+          "type": "string",
+          "description": "A CRM list (from list_lead_lists): its recent pushes."
+        }
+      },
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "get_user_by_id",
     "listed": false,
     "description": "Resolve a raw userId (e.g. from get_chat_history) to that account's profile: email, displayName, roles, subscription, timestamps. Admin-only, read-only; secret values are never returned. Returns found=false for an unknown userId.",
@@ -1694,6 +1902,29 @@
         }
       },
       "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "inspect_client_usage",
+    "listed": false,
+    "description": "ENG-2771: a named client's effective usage allowance for the CURRENT month — billing owner, paused, gatedBy, used, limit, percentUsed, resetsOn, usagePolicyVersion — exactly as the usage enforcer decided it. Admin-only, read-only, internal: never relay the raw output to a customer-facing channel. Cannot change tiers, bonuses, or counters. Pass email or user_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Account email of the client."
+        },
+        "user_id": {
+          "type": "string",
+          "description": "Internal userId of the client (or an org member; resolved to the billing owner)."
+        }
+      }
     },
     "sideEffect": "write",
     "gating": {
@@ -1785,7 +2016,7 @@
   {
     "name": "list_crm_sequences",
     "listed": false,
-    "description": "List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.\n\nUse this to answer \"are any email campaigns running for our CRM leads?\". Each entry reports `name`, `status` (draft | active | paused | archived), `audience` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), `step_count`, `is_sending` (true ONLY for `active` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and `enrollment_count` when a single sequence is inspected.\n\nAn account with no sequences returns `{ total: 0, sequences: [] }` with a summary line. That is a valid answer meaning \"no campaigns exist\", not an error — report it as such instead of retrying or guessing.",
+    "description": "List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.\n\nUse this to answer \"are any email campaigns running for our CRM leads?\". Each entry reports `name`, `status` (draft | active | paused | archived), `audience` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), `step_count`, `is_sending` (true ONLY for `active` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and `enrollment_count` when a single sequence is inspected.\n\nAn account with no sequences returns `{ total: 0, sequences: [] }` with a summary line. That is a valid answer meaning \"no campaigns exist\", not an error — report it as such instead of retrying or guessing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1853,6 +2084,10 @@
         "page_id": {
           "type": "string",
           "description": "The landing page ID"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to read from (e.g. \"draft/agentweb-preview\" to read back staged edits). Omit for \"main\". Never selects a different repo."
         }
       },
       "required": [
@@ -1881,6 +2116,28 @@
     }
   },
   {
+    "name": "list_lead_list_exports",
+    "listed": false,
+    "description": "List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "Lead list ID"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "list_lead_lists",
     "listed": false,
     "description": "List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).",
@@ -1894,7 +2151,7 @@
       },
       "required": []
     },
-    "sideEffect": "write",
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -1942,13 +2199,21 @@
   {
     "name": "list_scheduled_chats",
     "listed": false,
-    "description": "List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).",
+    "description": "List scheduled chats (newest first) for the authenticated user, or a specific client (admin-only, via client_id). Paginated: returns { items, nextCursor }; pass nextCursor back as cursor to get the next page (null = last page).",
     "inputSchema": {
       "type": "object",
       "properties": {
         "client_id": {
           "type": "string",
           "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Page size (default 50, max 100)"
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Opaque nextCursor from a previous page"
         }
       },
       "required": []
@@ -1982,6 +2247,21 @@
     }
   },
   {
+    "name": "list_sender_settings",
+    "listed": false,
+    "description": "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "list_skills",
     "listed": false,
     "description": "List all skill definitions. Returns each skill's ID, name, description, toolNames, systemPrompt, isPublished status, and extended fields. Admin-only.",
@@ -1994,6 +2274,26 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_smartlead_campaigns",
+    "listed": false,
+    "description": "List the campaigns in the user's own connected Smartlead account, with their status and whether leads can be added to them. Read only. Smartlead does the sending; AgentWeb never sends these emails.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        }
+      },
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {
@@ -2083,6 +2383,113 @@
         "visual_identity": {
           "type": "object",
           "description": "Visual identity settings (update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_crm_sequence",
+    "listed": false,
+    "description": "Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.\n\n- \"create\": builds a new sequence as a DRAFT (nothing is sent). `audience_list_ids` are the lead lists whose new leads auto-enroll once it is active.\n- \"update\": edits a draft or paused sequence. An active sequence must be paused first.\n- \"preview_activation\": shows the user the exact steps, audience and timing and asks them to approve. Always do this before \"activate\".\n- \"activate\": starts sending. Only works in a live chat, after \"preview_activation\", once the user has picked \"Activate\" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.\n- \"pause\": stops sending. Always allowed.\n- \"external_activation_preview\" / \"external_activate_confirm\" (external MCP callers only, e.g. an aw_ key acting on a human's out-of-chat approval): preview returns a digest bound to the current sequence version and the named `approver`, with no side effects; confirm activates only if the digest, approver and sequence are all unchanged since that preview.\n\nUse list_crm_sequences to find sequence ids.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "preview_activation",
+            "activate",
+            "pause",
+            "external_activation_preview",
+            "external_activate_confirm"
+          ]
+        },
+        "sequence_id": {
+          "type": "string",
+          "description": "Required for every action except create."
+        },
+        "name": {
+          "type": "string",
+          "description": "Sequence name (create; optional on update)."
+        },
+        "description": {
+          "type": "string"
+        },
+        "campaign_type": {
+          "type": "string",
+          "enum": [
+            "conversion",
+            "onboarding",
+            "reengagement",
+            "nurture",
+            "upsell",
+            "custom"
+          ]
+        },
+        "audience_list_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Lead list ids whose new leads auto-enroll while the sequence is active."
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered steps. Replaces all steps on update.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "delay_days": {
+                "type": "number",
+                "description": "Days after the previous step (or enrollment, for step 1)."
+              },
+              "channel": {
+                "type": "string",
+                "enum": [
+                  "email",
+                  "linkedin"
+                ]
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body_html": {
+                "type": "string"
+              },
+              "message_text": {
+                "type": "string",
+                "description": "LinkedIn steps only."
+              },
+              "sender_id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "preview_token": {
+          "type": "string",
+          "description": "activate only: the preview_token returned by preview_activation."
+        },
+        "approver": {
+          "type": "string",
+          "description": "external_* actions only: identity of the human who approved activation (e.g. slack:U123)."
+        },
+        "digest": {
+          "type": "object",
+          "description": "external_activate_confirm only: the `digest` object returned by external_activation_preview, unmodified."
         }
       },
       "required": [
@@ -2365,7 +2772,7 @@
         },
         "plan_id": {
           "type": "string",
-          "description": "Plan ID (required for update/delete/get)"
+          "description": "Plan ID from list_predefined_work_plans (required for update/delete/get). For get/update an exact, unique plan title is also accepted. An unknown value returns the list of valid plan ids."
         },
         "title": {
           "type": "string",
@@ -2450,6 +2857,10 @@
                   "type": "string"
                 },
                 "description": "Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren't interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is \"the N things\"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools."
+              },
+              "model": {
+                "type": "string",
+                "description": "Optional model for THIS step (a canonical model id from the model picker). When set, the step runs on exactly this model and the plan pauses (never switches models) if it becomes unavailable. Omit to use the plan default_model, then the account default. Only stored while per-step models are enabled; a blank string clears it in steps_mode=\"merge\". A model that is not served or not selectable is refused with a 422 naming the step."
               }
             },
             "required": [
@@ -2468,7 +2879,7 @@
         },
         "confirm_step_removal": {
           "type": "boolean",
-          "description": "Required (true) when a steps_mode=\"replace\" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content."
+          "description": "Required (true) when a steps_mode=\"replace\" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools, model) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content."
         }
       },
       "required": [
@@ -2665,7 +3076,7 @@
   {
     "name": "manage_scheduled_chat",
     "listed": false,
-    "description": "Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: \"create\", \"update\", \"toggle\", or \"delete\". For \"create\": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action \"create\" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For \"update\": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).",
+    "description": "Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: \"create\", \"update\", \"toggle\", or \"delete\". For \"create\": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action \"create\" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For \"update\": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2701,7 +3112,11 @@
         },
         "next_run_time": {
           "type": "string",
-          "description": "ISO 8601 datetime for the first/next run (create/update)"
+          "description": "ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "The user's IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence."
         },
         "description": {
           "type": "string",
@@ -2730,7 +3145,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)"
+          "description": "Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user's email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing."
         },
         "daily_digest": {
           "type": "boolean",
@@ -2997,7 +3412,7 @@
   {
     "name": "monitor_lead_volume",
     "listed": false,
-    "description": "Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.\n\nTrigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.\n\n⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.\n\n⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.\n\nReturns one report per connected Meta ad account for the client.\n\n⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.",
+    "description": "Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool. Pass the client's name or email as client_name_or_email; client_id and client_email are accepted aliases.\n\nTrigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.\n\n⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.\n\n⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.\n\nReturns one report per connected Meta ad account for the client.\n\n⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3027,6 +3442,83 @@
     }
   },
   {
+    "name": "pause_smartlead_push",
+    "listed": false,
+    "description": "Pause a running Smartlead push; contacts already added stay in Smartlead. Resuming it is done by a person in AgentWeb, not by an agent.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "The push (from get_smartlead_push_status with a listId)."
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "preview_smartlead_push",
+    "listed": false,
+    "description": "Check what pushing a CRM list into one of the user's Smartlead campaigns would do, without changing anything: how many contacts can be added, why others are skipped, what blocks the push and what needs a decision. Read only. An agent cannot start the push: the result has a link where the person who owns the account reviews and approves it in AgentWeb.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "listId": {
+          "type": "string",
+          "description": "The CRM list to push (its id from list_lead_lists)."
+        },
+        "campaignId": {
+          "type": "number",
+          "description": "The id of one of the user's Smartlead campaigns (from list_smartlead_campaigns)."
+        },
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        },
+        "includeUnverified": {
+          "type": "boolean",
+          "description": "Also count contacts whose email is not verified. Default false; only when the user asks."
+        },
+        "mapping": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "For a merge field the campaign uses that is not a standard one: its name mapped to the CRM field that fills it, only as the user said."
+        },
+        "acknowledgedTags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Merge fields the user said Smartlead fills in itself. Only what the user said."
+        },
+        "cohort": {
+          "type": "number",
+          "description": "How many contacts to add (default: the preview's suggestion, 50 for a first push)."
+        }
+      },
+      "required": [
+        "listId",
+        "campaignId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "publish_landing_page_changes",
     "listed": false,
     "description": "Merge the reusable draft branch into main to make landing page changes live. Use this after the user has reviewed the preview and approved the changes. This merges the draft branch, triggers a production deployment, and deletes the draft branch.",
@@ -3051,6 +3543,102 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "read_client_meta_activity",
+    "listed": false,
+    "description": "Read the Meta ad account change history (who changed what, when) for one named client. Admin-only tool, read-only — nothing is written to Meta.\n\nResolves the client the same way assess_client_health does, with one difference: a name that matches more than one client is refused, so pass the exact email when a name is ambiguous.\n\nReturns:\n- 'ad_account_id' and 'client': the account that was actually read and whose it is. Check these before quoting the history.\n- 'events': one page of Meta activity events (event_time, event_type, object_id, object_name, object_type, actor_name, extra_data). When Meta supplies old and new values (for example a budget change), they are also given as 'before' and 'after'. Fields Meta did not return are absent.\n- 'paging': cursors; pass paging.cursors.after as 'after' to read the next page.\n\nA result with success:false means nothing was read ('reason' says why: ambiguous_client, client_not_found, no_meta_connection, credential_pair_mismatch, invalid_argument, meta_read_failed). Never report a failed read as \"no changes\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        },
+        "since": {
+          "type": "string",
+          "description": "ISO date or unix seconds; earliest event."
+        },
+        "until": {
+          "type": "string",
+          "description": "ISO date or unix seconds; latest event."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Events per page (default 50)."
+        },
+        "after": {
+          "type": "string",
+          "description": "Paging cursor from a previous result."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "read_email",
+    "listed": false,
+    "description": "Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. Available when signed in to Emma (OAuth) or with an API key holding 'email:read'. Cannot send or reply, and cannot read mailboxes shared by teammates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "description": "Email account ID from list_connected_accounts"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "search",
+            "list",
+            "get"
+          ],
+          "description": "Read action to perform"
+        },
+        "query": {
+          "type": "string",
+          "description": "Search query (search action)"
+        },
+        "folder": {
+          "type": "string",
+          "description": "Folder to list (list action)",
+          "default": "INBOX"
+        },
+        "message_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "description": "Message IDs (get action, at most 50)"
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max results (search/list, 1-50)",
+          "default": 10
+        }
+      },
+      "required": [
+        "account_id",
+        "action"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {
@@ -3105,6 +3693,10 @@
         "file_path": {
           "type": "string",
           "description": "Path to the file in the repo (e.g., \"src/app/page.tsx\")"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to read from (e.g. \"draft/agentweb-preview\" to read back staged edits). Omit for \"main\". Never selects a different repo."
         }
       },
       "required": [
@@ -3384,6 +3976,38 @@
     }
   },
   {
+    "name": "update_knowledge_base_file_content",
+    "listed": false,
+    "description": "Replace the full content of an existing text or markdown file in one of your own knowledge bases (max 1048576 bytes, no binary). Returns the stored file key, size and sha256.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kb_id": {
+          "type": "string",
+          "description": "Your knowledge base ID (from list_knowledge_bases)"
+        },
+        "file_name": {
+          "type": "string",
+          "description": "Existing file name (e.g. knowledge-base.txt)"
+        },
+        "content": {
+          "type": "string",
+          "description": "New file text (replaces the old content)"
+        }
+      },
+      "required": [
+        "kb_id",
+        "file_name",
+        "content"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "update_landing_page_context",
     "listed": false,
     "description": "Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. \"this is for cold outreach targeting SaaS founders\"). Keep it concise (max 500 characters). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.",
@@ -3403,6 +4027,87 @@
         "page_id",
         "context"
       ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_landing_page_files",
+    "listed": false,
+    "description": "ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Files to write (max 20). Each: { path, content }.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo path, e.g. \"src/app/page.tsx\""
+              },
+              "content": {
+                "type": "string",
+                "description": "Full new file content"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ]
+          }
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Commit message (optional)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch. Defaults to \"draft/agentweb-preview\". \"main\" is rejected."
+        },
+        "expected_base_sha": {
+          "type": "string",
+          "description": "Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing."
+        }
+      },
+      "required": [
+        "page_id",
+        "files"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_sender_settings",
+    "listed": false,
+    "description": "Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "default_sender_id": {
+          "type": "string",
+          "description": "Sender id from list_sender_settings.senders[].id"
+        },
+        "default_linkedin_account_id": {
+          "type": "string",
+          "description": "Your own LinkedIn (unipile) connected account_id"
+        }
+      },
+      "required": []
     },
     "sideEffect": "write",
     "gating": {

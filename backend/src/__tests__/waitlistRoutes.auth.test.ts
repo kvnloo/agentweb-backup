@@ -20,6 +20,13 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+jest.mock('../services/zomaAdmission', () => ({
+  ...jest.requireActual('../services/zomaAdmission'),
+  admitZoma: jest.fn().mockResolvedValue('approved'),
+  rejectZoma: jest.fn().mockResolvedValue('rejected'),
+  zomaApprovedCount: jest.fn().mockResolvedValue({ approvedCount: 60, capacity: 60 }),
+}));
+
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
@@ -63,6 +70,36 @@ describe('Waitlist routes auth (ENG-1753)', () => {
 
   afterAll(() => {
     process.env.JWT_SECRET = originalJwtSecret;
+  });
+
+  describe('ENG-2881 capacity administration', () => {
+    beforeEach(() => { process.env.ZOMA_WAITLIST_ENABLED = 'true'; });
+    afterEach(() => { delete process.env.ZOMA_WAITLIST_ENABLED; });
+    it('denies anonymous capacity reads and decisions', async () => {
+      expect((await request(app).get('/api/waitlist/zoma/capacity')).status).toBe(401);
+      expect((await request(app).post('/api/waitlist/zoma/a@company.co/decision').send({ decision: 'approve' })).status).toBe(401);
+    });
+    it('denies a non-admin even with a valid token', async () => {
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'u1', isAdmin: false, roles: ['customer'] });
+      const token = jwt.sign({ userId: 'u1', email: 'u@company.co', isAdmin: false }, JWT_SECRET);
+      expect((await request(app).get('/api/waitlist/zoma/capacity').set('Authorization', `Bearer ${token}`)).status).toBe(403);
+    });
+    it('returns count and forwards approve/reject with authenticated actor', async () => {
+      const auth = `Bearer ${makeAdminToken()}`;
+      const count = await request(app).get('/api/waitlist/zoma/capacity').set('Authorization', auth);
+      expect(count.body).toEqual({ approvedCount: 60, capacity: 60 });
+      for (const decision of ['approve', 'reject']) {
+        const r = await request(app).post('/api/waitlist/zoma/a@company.co/decision').set('Authorization', auth).send({ decision, actor: 'forged' });
+        expect(r.status).toBe(200);
+      }
+      const service = require('../services/zomaAdmission');
+      expect(service.admitZoma).toHaveBeenCalledWith('a@company.co', 'admin-1');
+      expect(service.rejectZoma).toHaveBeenCalledWith('a@company.co', 'admin-1');
+    });
+    it('remains dark when flag is disabled', async () => {
+      delete process.env.ZOMA_WAITLIST_ENABLED;
+      expect((await request(app).get('/api/waitlist/zoma/capacity').set('Authorization', `Bearer ${makeAdminToken()}`)).status).toBe(404);
+    });
   });
 
   describe('GET /api/waitlist — admin-only', () => {

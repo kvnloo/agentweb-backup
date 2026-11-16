@@ -62,6 +62,7 @@ import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/cus
 import { isExternalLandingPageRecord } from "../services/externalLandingPageCatalog";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
+import { evaluateRequiredTestsGate } from "../services/publishGateVerifier";
 
 const router = Router();
 
@@ -440,6 +441,41 @@ router.get("/site", async (req: Request, res: Response) => {
   }
 });
 
+/** Real session ids are uuids (36 chars); DynamoDB rejects a key over 2048 bytes with a ValidationException. */
+const MAX_ORIGINATING_SESSION_ID_LENGTH = 200;
+
+/**
+ * ENG-2651: the chat a generated page reports back to. The page record carries it as
+ * `originatingSessionId`, which (a) durableLandingService.postToSession appends the completion /
+ * failure message to, and (b) the auto human-eval candidate (v0Service.enqueueLandingPageHumanEval)
+ * mints an iShare link for. Only a chat the caller may open qualifies: its owner, or an admin (the
+ * agentModeController.getSession / routes/emmaApi.ts rule; a delegate token resolves `req.user` to the
+ * target account). Anything else is dropped, never refused: the MCP tool sends `context.sessionId`,
+ * which for an external MCP client is the MCP transport session id rather than a chat, and generation
+ * without a chat to report to is the existing behaviour for that case.
+ */
+async function resolveOriginatingSessionId(
+  originatingSessionId: unknown,
+  caller: { userId?: string; isAdmin?: boolean } | undefined,
+): Promise<string | undefined> {
+  if (typeof originatingSessionId !== "string" || !originatingSessionId.trim()) return undefined;
+  if (originatingSessionId.length > MAX_ORIGINATING_SESSION_ID_LENGTH) return undefined;
+  let session;
+  try {
+    const { chatbotDb } = await import("../services/chatbotService");
+    session = await chatbotDb.getChatSessionRecord(originatingSessionId, true);
+  } catch (err: any) {
+    // Never fail a generation over its optional report-back chat: drop it, like any unusable id.
+    console.warn(`[LP GENERATION] could not read originating session, generating without it: ${err?.message}`);
+    return undefined;
+  }
+  if (!session) return undefined;
+  const isOwner = !!caller?.userId && session.userId === caller.userId;
+  if (isOwner || caller?.isAdmin === true) return originatingSessionId;
+  console.warn(`[LP GENERATION] ignoring originating_session_id owned by another account (caller ${caller?.userId})`);
+  return undefined;
+}
+
 /**
  * POST /api/landing-pages/v0/generate
  * Generate a new landing page using v0 Platform API + brand guidelines
@@ -642,6 +678,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       callerOrg
         ? await resolveOrgProfileField(caller, callerOrg, "brandGuidelines")
         : undefined,
+      callerOrg,
     );
     const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
 
@@ -686,9 +723,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
     }
 
+    const originatingSessionId = await resolveOriginatingSessionId(
+      originating_session_id,
+      (req as unknown as AuthenticatedRequest).user,
+    );
+
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
       siteId: typeof site_id === "string" ? site_id : undefined,
-      originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
+      originatingSessionId,
       mode: effectiveMode,
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
       metaPixelOverride,
@@ -1076,6 +1118,7 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     const brandContext = buildBrandContextFromUser(
       user,
       org ? await resolveOrgProfileField(user, org, "brandGuidelines") : undefined,
+      org,
     );
 
     // ENG-326 AC-3: duplicating re-generates the page — same gate as
@@ -1381,8 +1424,11 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
     const repoName = repo.replace(".git", "");
     const repoFullName = `${owner}/${repoName}`;
 
-    const { files, commit_message, branch: rawBranch } = req.body;
+    const { files, commit_message, branch: rawBranch, expected_base_sha } = req.body;
     const branch: string = rawBranch || "main";
+    if (expected_base_sha !== undefined && (typeof expected_base_sha !== "string" || !/^[0-9a-f]{40}$/i.test(expected_base_sha))) {
+      return res.status(400).json({ error: "expected_base_sha must be a 40-character commit SHA" });
+    }
     if (!validateBranchName(branch)) {
       return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/agentweb-preview'." });
     }
@@ -1428,7 +1474,8 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
       filesToCommit as any,
       commit_message,
       4,
-      branch
+      branch,
+      expected_base_sha
     );
 
     const isStaging = branch !== "main";
@@ -1450,6 +1497,14 @@ router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Resp
   } catch (error: any) {
     const ghStatus = error.response?.status;
     const ghMessage = error.response?.data?.message || error.message;
+    // Matched by name (not instanceof) so route tests that mock v0Service keep working.
+    if (error?.name === "BaseShaConflictError") {
+      return res.status(409).json({
+        error: `Base SHA conflict: ${error.message} Nothing was written.`,
+        expected_base_sha: error.expectedSha,
+        actual_base_sha: error.actualSha,
+      });
+    }
     console.error(`[LP GENERATION] Error with update-files (HTTP ${ghStatus}):`, ghMessage);
     if (ghStatus === 401 || ghStatus === 403) {
       res.status(ghStatus).json({ error: `GitHub auth error: ${ghMessage}` });
@@ -1976,20 +2031,13 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         `[LP GENERATION] ${owner}/${repoName} reported no check runs and no workflows, so no ` +
           `Tests check can exist — the required-Tests gate does not apply to this publish.`
       );
-    } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
-      const message = !testsCheck
-        ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
-        : testsCheck.conclusion === "cancelled"
-          ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
-        : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
-      return res.status(409).json({ error: "required_tests_pending", message });
-    } else if (testsCheck.conclusion !== "success") {
-      // Chained onto the branch above: when there is no CI, `testsCheck` is undefined and
-      // reading `.conclusion` here would throw.
-      return res.status(409).json({
-        error: "required_tests_failed",
-        message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
-      });
+    } else {
+      // ENG-2794: decision lives in services/publishGateVerifier so the verifier harness
+      // exercises the exact same gate logic.
+      const gate = evaluateRequiredTestsGate(testsCheck, false);
+      if (!gate.allow) {
+        return res.status(gate.status).json({ error: gate.error, message: gate.message });
+      }
     }
 
     // A Tests result belongs only to the SHA inspected above. Pin every later

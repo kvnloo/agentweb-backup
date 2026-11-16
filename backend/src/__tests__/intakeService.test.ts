@@ -1,8 +1,5 @@
 import { fileUserIssue, fileAutoIssue } from '../services/intakeService';
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-1', notionUrl: 'https://notion.so/notion-1' }),
-}));
 jest.mock('../services/dedupService', () => ({ findDuplicate: jest.fn(), MAX_CANDIDATES: 30 }));
 jest.mock('../services/featurebaseService', () => ({
   listOpenPosts: jest.fn().mockResolvedValue([]),
@@ -31,30 +28,15 @@ jest.mock('../services/linearService', () => ({
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
 
-const notion = require('../services/notionService');
 const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
 const shipNotify = require('../services/shipNotifyService');
 
-describe('fileUserIssue — flag off', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
-
-  it('files to Notion (migration default, not a fallback)', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
-    const r = await fileUserIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
-    expect(dedup.findDuplicate).not.toHaveBeenCalled();
-  });
-});
-
 describe('fileUserIssue — feature_request (public post)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; fb.listOpenPosts.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { fb.listOpenPosts.mockResolvedValue([]); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no match -> creates a public post authored by the filer + a private eng note', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
@@ -78,9 +60,8 @@ describe('fileUserIssue — feature_request (public post)', () => {
 });
 
 describe('fileUserIssue — bug (private own-card + one canonical listing affected users)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; linear.listOpenBugCanonicals.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { linear.listOpenBugCanonicals.mockResolvedValue([]); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no canonical -> creates the card + ONE canonical Linear ticket (lists affected user) + a reporter-ticket comment', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
@@ -118,7 +99,7 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   it('createTicket throws -> PROPAGATES (no Notion fallback)', async () => {
     fb.createTicket.mockRejectedValue(new Error('FB tickets down'));
     await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('FB tickets down');
-    expect(notion.createOncallItem).not.toHaveBeenCalled();
+
   });
 
   it('canonical comment failure is best-effort -> the card is still returned', async () => {
@@ -132,13 +113,11 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
 });
 
 describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved telemetry-affected user, never default to the surfacing reviewer)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('never mints a personal Featurebase card for the surfacing reviewer', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
@@ -185,16 +164,13 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
 });
 
 describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, blended with the funnel tier)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
   });
   afterEach(() => {
-    process.env.FEATUREBASE_INTAKE = realFlag;
     jest.clearAllMocks();
   });
 
@@ -561,15 +537,13 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 });
 
 describe('intakeService.fileAutoIssue', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
-  it('auto issues always use Linear even when the customer-intake migration flag is off', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
+  it('auto issues file to Linear', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-6', url: 'u' });
     const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
-    expect(notion.createOncallItem).not.toHaveBeenCalled();
+
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
       expect.objectContaining({
         labelNames: ['Auto', 'Bug', 'Needs PM'],
@@ -581,7 +555,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('maps the autofix execution route to an executable Todo owned by Manan', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
 
@@ -602,7 +575,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('maps the human-triage route to Needs PM and Harsha without autofix', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'u' });
 
@@ -701,7 +673,6 @@ describe('intakeService.fileAutoIssue', () => {
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached' }]);
     const r = await fileAutoIssue({ title: '  Context Limit Reached ', description: 'd', source: 'Context limit' });
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-7', expect.stringContaining('Recurred on'));
@@ -709,8 +680,40 @@ describe('intakeService.fileAutoIssue', () => {
     expect(r).toMatchObject({ deduped: true, tracker: 'Linear' });
   });
 
+  describe('identical same-day recurrence (ENG-2066)', () => {
+    const ctx = { email: 'order@x.com', capability: 'ad_platform_integration' };
+    const today = () => new Date().toISOString().slice(0, 10);
+    beforeEach(() => {
+      linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-66', issueId: 'uuid-66', title: 'Renewal at risk' }]);
+    });
+    afterEach(() => linear.getIssueCommentsDetailed.mockResolvedValue([]));
+
+    it('skips the comment when an identical one (Linear "* " bullets) was already posted today', async () => {
+      linear.getIssueCommentsDetailed.mockResolvedValue([
+        { body: `Recurred on ${today()}.\n* email: order@x.com\n* capability: ad_platform_integration`, createdAt: '' },
+      ]);
+      const r = await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ deduped: true });
+    });
+
+    it('still posts when the context changed or the prior comment is from another day', async () => {
+      linear.getIssueCommentsDetailed.mockResolvedValue([
+        { body: `Recurred on 2000-01-01.\n* email: order@x.com\n* capability: ad_platform_integration`, createdAt: '' },
+        { body: `Recurred on ${today()}.\n* email: order@x.com\n* capability: other`, createdAt: '' },
+      ]);
+      await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-66', expect.stringContaining('Recurred on'));
+    });
+
+    it('fails open: a comment-read error still posts the recurrence', async () => {
+      linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+      await fileAutoIssue({ title: 'Renewal at risk', description: 'd', source: 'Oncall', notionContext: ctx });
+      expect(linear.addIssueComment).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('flag ON + no match -> creates a private internal issue with the Auto label', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
@@ -722,9 +725,7 @@ describe('intakeService.fileAutoIssue', () => {
 });
 
 describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   // AC1/AC2: the only matching canonical for this class was archived. listOpenIssuesByLabel never
   // returns archived rows (linearService contract), so `open` is empty here — exactly as it would
@@ -806,9 +807,7 @@ describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
 });
 
 describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   // AC #1: a zero-output run trips BOTH the scheduled-chat filer and the oncall alert. They carry the
   // same Schedule ID; the second (oncall) must land on the first's issue, not create a twin — even
@@ -912,14 +911,12 @@ describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () =
 });
 
 describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #3)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([]);
     linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([]);
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 58, url: 'https://fb/t/58' });
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('a regression report referencing a resolved canonical REOPENS it instead of filing a new one', async () => {
     // No OPEN canonical, but the report names AGW-58 and a recently-RESOLVED canonical matches.
@@ -988,15 +985,13 @@ describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #
 });
 
 describe('intakeService.fileBugReport — exact-reference short-circuit (fix for AGW false-new-duplicate, ENG-329 incident)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
   // The exact-ref scan reads comments through the same detailed helper as the resolve bridge.
   const c = (body: string) => ({ body, createdAt: '2026-07-01T00:00:00.000Z' });
   beforeEach(() => {
-    process.env.FEATUREBASE_INTAKE = 'true';
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 121, url: 'https://fb/t/121' });
     linear.getIssueCommentsDetailed.mockResolvedValue([]);
   });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   it('no ticket reference in text -> fuzzy dedup runs exactly as before, the comment scan never fires', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
@@ -1145,9 +1140,7 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
 });
 
 describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  afterEach(() => { jest.clearAllMocks(); });
 
   const V0_CONTEXT = {
     'Plan': 'v0-team',
@@ -1349,11 +1342,8 @@ describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping'
     description: 'REPEAT REQUEST — sixth window. When the user simply has not replied, judges dock goalCompletion; score it neutral instead.',
     userEmail: 'rep@e.com',
   };
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; });
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenBugCanonicals.mockResolvedValue([ENG_1165]);
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 42, url: 'https://fb/t/42' });
     fb.findTicketByMarker = jest.fn().mockResolvedValue(null);
@@ -1427,5 +1417,279 @@ describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping'
     expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
     expect(linear.addIssueComment).not.toHaveBeenCalledWith('uuid-1165', expect.anything());
     expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
+  });
+});
+
+// ENG-2267: a per-account fleet detector carries `Alert Scope`, so one account's alert never
+// folds onto another customer's canonical just because they share an Alert Class.
+describe('intakeService.fileAutoIssue — Alert Scope narrows class clustering (ENG-2267)', () => {
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard(seed: any[] = []) {
+    const open: any[] = seed.slice();
+    let n = 4000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const file = (acct: string, count: number) => fileAutoIssue({
+    title: `Meta ad account ${acct} is paying for traffic to ${count} destination(s) that cannot report conversions`,
+    description: 'd', source: 'Oncall alert',
+    notionContext: { 'Alert Class': 'meta-destination-unmeasured', 'Alert Scope': `meta-ad-account:${acct}`, 'Alert Priority': 'high', 'Ad Account': acct },
+  });
+
+  it('two accounts in the same class get separate canonicals; each recurrence folds onto its own', async () => {
+    statefulBoard();
+    const a1 = await file('1030388036131162', 2);
+    const b1 = await file('874451754937843', 1);
+    const b2 = await file('874451754937843', 3);
+    const a2 = await file('1030388036131162', 2);
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+    expect(b1.pageId).not.toBe(a1.pageId);
+    expect(b2).toMatchObject({ pageId: b1.pageId, deduped: true });
+    expect(a2).toMatchObject({ pageId: a1.pageId, deduped: true });
+  });
+
+  it('a scope that is a prefix of another account id never cross-matches', async () => {
+    statefulBoard();
+    await file('123', 1);
+    await file('1234', 1);
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('a legacy unscoped canonical of the class does not absorb a scoped occurrence for a different account', async () => {
+    statefulBoard([{ identifier: 'ENG-2267', issueId: 'uuid-2267', title: 'Meta ad account 1030388036131162 is paying for traffic to 2 destination(s) that cannot report conversions', description: 'x\n* Alert Class: meta-destination-unmeasured' }]);
+    const r = await file('874451754937843', 3);
+    expect(r.deduped).toBe(false);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+  });
+
+  it('unscoped alerts keep plain class clustering (no behaviour change for other classes)', async () => {
+    statefulBoard([{ identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0', description: 'x\n* Alert Class: v0-credits' }]);
+    const r = await fileAutoIssue({ title: 'v0 credits LOW', description: 'd', source: 'Oncall alert', notionContext: { 'Alert Class': 'v0-credits' } });
+    expect(r).toMatchObject({ pageId: 'ENG-337', deduped: true });
+  });
+});
+
+// ENG-2363: LinkedIn disconnect alerts (first + 7d/14d reminders) carry a stable per-account
+// Alert Class, so one disconnected account files exactly one canonical regardless of title churn.
+describe('intakeService.fileAutoIssue — LinkedIn disconnect alert class (ENG-2363)', () => {
+  const { linkedInDisconnectAlertClass } = jest.requireActual('../services/linkedInConnectionHealth');
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard() {
+    const open: any[] = [];
+    let n = 3000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      // Linear normalizes "- " bullets to "* " in stored descriptions.
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const file = (accountId: string, title: string) => fileAutoIssue({
+    title, description: 'd', source: 'Agent Mode oncall',
+    notionContext: { accountId, 'Alert Class': linkedInDisconnectAlertClass(accountId) },
+  });
+
+  it('first alert files one issue; 7d and 14d reminders comment on it and create nothing', async () => {
+    statefulBoard();
+    const a = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account disconnected: Jennifer Sun');
+    const b = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account still disconnected (7d): Jennifer Sun');
+    const c = await file('ofGscnIrR5qZYZ00ovNsTQ', 'LinkedIn Outreach account still disconnected (14d): Jennifer Sun');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(b).toMatchObject({ pageId: a.pageId, deduped: true });
+    expect(c).toMatchObject({ pageId: a.pageId, deduped: true });
+    expect(linear.addIssueComment).toHaveBeenCalledTimes(2);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-3001', expect.stringMatching(/^Recurred on /));
+  });
+
+  it('a different account, including a prefix account id, still gets its own issue', async () => {
+    statefulBoard();
+    await file('abc123', 'LinkedIn Outreach account still disconnected (7d): Sue Xu');
+    await file('abc', 'LinkedIn Outreach account still disconnected (8d): Kevin Rajan');
+    await file('abc1234', 'LinkedIn Outreach account still disconnected (9d): Other');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(3);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+  });
+});
+
+// ENG-2442: Meta connection handoff alerts share the tracking monitor's per-account canonical
+// (`Alert Class: meta-token-invalid` + `Alert Scope: meta-ad-account:<id>`), so re-fires fold onto
+// the open 'Meta ad account <id> cannot be read' issue instead of filing one per tick.
+describe('intakeService.fileAutoIssue — Meta connection alert dedupe (ENG-2442)', () => {
+  const { metaAccountAlertContext } = jest.requireActual('../services/metaConnectionHandoff');
+  afterEach(() => { jest.clearAllMocks(); });
+
+  function statefulBoard(seed: any[] = []) {
+    const open: any[] = seed.slice();
+    let n = 4000;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => open.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (a: any) => {
+      n += 1;
+      open.push({ identifier: `ENG-${n}`, issueId: `uuid-${n}`, title: a.title, description: String(a.description).replace(/^- /gm, '* ') });
+      return { identifier: `ENG-${n}`, url: 'u' };
+    });
+    return open;
+  }
+  const handoff = (accountId: string, userId = 'u1') => fileAutoIssue({
+    title: `Meta connection: info@x.ai — Incentiv Pay (${accountId}) token expired`,
+    description: 'd', source: 'Oncall alert',
+    notionContext: { ...metaAccountAlertContext(accountId), userId, accountId, reason: 'refresh_failed' },
+  });
+  const canonical = (accountId: string) => ({
+    identifier: 'ENG-2416', issueId: 'uuid-2416',
+    title: `Meta ad account ${accountId} cannot be read — token invalid`,
+    description: `x\n* Alert Class: meta-token-invalid\n* Alert Scope: meta-ad-account:${accountId}\n* Alert Priority: high`,
+  });
+
+  it('a handoff alert lands on the open monitor canonical for the same account', async () => {
+    statefulBoard([canonical('409853340719899')]);
+    const r = await handoff('409853340719899');
+    expect(r).toMatchObject({ pageId: 'ENG-2416', deduped: true });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+  });
+
+  it('re-firing N times for one account yields exactly one open issue', async () => {
+    const open = statefulBoard();
+    for (let i = 0; i < 5; i++) await handoff('409853340719899', i % 2 ? 'u1' : 'u2');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(open).toHaveLength(1);
+  });
+
+  it('a different account (including a prefix id) still files its own issue', async () => {
+    statefulBoard([canonical('409853340719899')]);
+    await handoff('40985334071989');
+    await handoff('4098533407198990');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('after the canonical closes, repeated alerts file exactly one follow-up', async () => {
+    const open = statefulBoard([canonical('409853340719899')]);
+    open.splice(0, 1); // canonical closed: no longer in the open list
+    await handoff('409853340719899');
+    await handoff('409853340719899');
+    await handoff('409853340719899');
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ENG-2492: Unipile disconnect reminders must fold onto pre-ENG-2363 canonicals (no Alert Class
+// line, day count in title) keyed on accountId, never on title.
+describe('intakeService.fileAutoIssue — legacy canonical fold (ENG-2492)', () => {
+  afterEach(() => { jest.clearAllMocks(); });
+  const ACCT = 'b7S0eC2ITLS-ydjPEhj-5g';
+  const ctx = (acct: string) => ({
+    accountId: acct,
+    isReminder: true,
+    'Alert Class': `unipile-disconnected:${acct}`,
+    'Alert Legacy Key': `accountId: ${acct}`,
+  });
+  const legacyCanonical = (acct: string, id = 'ENG-2229') => ({
+    identifier: id,
+    issueId: `uuid-${id}`,
+    title: 'LinkedIn Outreach account still disconnected (42d): Sue Xu',
+    description: `body\n\n---\n\nSource: Oncall alert\n\n* accountId: ${acct}\n* isReminder: true\n* Session ID: unknown`,
+  });
+
+  it('reminder comments on an open canonical without an Alert Class line and a stale day count', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([legacyCanonical(ACCT)]);
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', extraLabels: ['Oncall'], notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-ENG-2229', expect.stringContaining('Recurred on'));
+    expect(linear.addIssueComment.mock.calls[0][1]).not.toContain('Alert Legacy Key');
+    expect(r).toMatchObject({ pageId: 'ENG-2229', deduped: true });
+  });
+
+  it('matches on accountId, not title: a different account with the same title does not fold', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([legacyCanonical('other-acct')]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9001', id: 'uuid-9001', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].description).not.toContain('Alert Legacy Key');
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  it('a legacy key never folds onto a canonical carrying a different Alert Class', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-50', issueId: 'uuid-50', title: 'x', description: `* accountId: ${ACCT}\n* Alert Class: account-health:${ACCT}` },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9002', id: 'uuid-9002', url: 'u' });
+    await fileAutoIssue({ title: 'LinkedIn Outreach account disconnected: Sue Xu', description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT) });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it('after the canonical is closed (not in the open list) a reminder files a new issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9003', id: 'uuid-9003', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'LinkedIn Outreach account still disconnected (56d): Sue Xu',
+      description: 'd', source: 'Oncall alert', notionContext: ctx(ACCT),
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].description).toContain(`Alert Class: unipile-disconnected:${ACCT}`);
+    expect(r).toMatchObject({ deduped: false });
+  });
+});
+
+// ENG-2766: a Meta connection handoff for an account whose tracking-monitor canonical
+// ("Meta ad account X cannot be read — token invalid") is open must recur on THAT issue.
+// Prod regression: the candidate scan was capped at the newest 50 open Auto issues, so an
+// older canonical fell out of view and every handoff filed a parallel issue.
+describe('fileAutoIssue — Meta handoff converges on the tracking-monitor canonical (ENG-2766)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const canonical = (acct: string, id: string) => ({
+    identifier: id,
+    issueId: `uuid-${id}`,
+    title: `Meta ad account ${acct} cannot be read — token invalid`,
+    description:
+      `Meta rejected our stored credentials for ad account ${acct}.\n\n---\n\nSource: Oncall alert — auto-identified by the system.\n\n` +
+      `* Alert Class: meta-token-invalid\n* Alert Scope: meta-ad-account:${acct}\n* Alert Priority: high\n* Ad Account: ${acct}`,
+  });
+  const handoff = (acct: string) => ({
+    title: `Meta connection: order@kraftersland.com — krafter's Land Cabinetry (${acct}) token expired`,
+    description: 'Next actor: Customer',
+    source: 'Oncall alert',
+    executionRoute: 'human-triage' as const,
+    extraLabels: ['Oncall'],
+    notionContext: {
+      'Alert Class': 'meta-token-invalid',
+      'Alert Scope': `meta-ad-account:${acct}`,
+      userId: 'u-1',
+      accountId: acct,
+      reason: 'refresh_failed',
+    },
+  });
+  const noise = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ identifier: `ENG-${3000 + i}`, issueId: `uuid-n${i}`, title: `noise ${i}`, description: 'x' }));
+
+  it('recurs on the open canonical even when it is older than 50 other open Auto issues', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    const r = await fileAutoIssue(handoff('4220433474834949'));
+    expect(linear.listOpenIssuesByLabel).toHaveBeenCalledWith('Auto');
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-ENG-2374', expect.stringContaining('Recurred on'));
+    expect(r).toMatchObject({ pageId: 'ENG-2374', deduped: true });
+  });
+
+  it('a different account still files its own issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([...noise(80), canonical('4220433474834949', 'ENG-2374')]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9100', id: 'uuid-9100', url: 'u' });
+    const r = await fileAutoIssue(handoff('1430365244346362'));
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
   });
 });

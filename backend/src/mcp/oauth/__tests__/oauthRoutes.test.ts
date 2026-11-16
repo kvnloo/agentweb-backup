@@ -141,6 +141,17 @@ describe('MCP OAuth Routes', () => {
   });
 
   describe('GET /.well-known/oauth-protected-resource', () => {
+    it('serves path-specific metadata for the Meta Toolkit MCP resource (ENG-2303)', async () => {
+      const res = await request(app)
+        .get('/.well-known/oauth-protected-resource/api/meta-toolkit/mcp')
+        .expect(200);
+
+      expect(res.body.resource).toBe('https://api.agentweb.pro/api/meta-toolkit/mcp');
+      expect(res.body.authorization_servers).toEqual(['https://api.agentweb.pro']);
+      expect(res.body.scopes_supported).toEqual(['mcp:tools']);
+      expect(res.body.resource_documentation).toBe('https://api.agentweb.pro/api/meta-toolkit/skill.md');
+    });
+
     it.each([
       '/.well-known/oauth-protected-resource',
       '/.well-known/oauth-protected-resource/mcp',
@@ -462,6 +473,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         clientName: undefined,
         clientType: 'unknown',
+        product: 'unknown', // ENG-2906: every event names its product; no resource here
         redirectUri: 'https://example.com/callback',
         scope: 'mcp:tools',
       });
@@ -586,6 +598,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         clientName: undefined,
         clientType: 'unknown',
+        product: 'unknown', // ENG-2906: every event names its product; no resource here
         redirectUri: 'https://example.com/callback',
         scope: 'mcp:tools',
       });

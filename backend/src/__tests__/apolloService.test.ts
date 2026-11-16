@@ -1,9 +1,11 @@
 import {
   ApolloService,
   __resetApolloServiceForTesting,
+  extractApolloAsyncRequestId,
   type ApolloHttpClient,
   type ApolloCacheStore,
 } from '../services/apolloService';
+import { apolloAsyncRequestCacheKey } from '../services/apolloCacheKeys';
 import {
   InMemoryApolloQuotaTracker,
   ApolloQuotaExceededError,
@@ -380,6 +382,66 @@ describe('ApolloService — input validation', () => {
       );
       const after = await quota.getUsage('u1');
       expect(after.findCount).toBe(before.findCount + 1);
+    });
+  });
+
+  describe('findEmail — Tier-3 async request id (ENG-2801)', () => {
+    // The shape Apollo really returns for run_waterfall_email (captured 2026-11-04): request_id is an unquoted
+    // 19-digit integer that JSON.parse rounds, request_id_str is the exact id the webhook will send back.
+    const EXACT = '8327452971617011608';
+    const ROUNDED = Number(EXACT); // what axios' JSON.parse produces: 8327452971617012000
+    const run = async (resp: any) => {
+      const svc = new ApolloService({ http: makeHttp({ findEmail: jest.fn().mockResolvedValue(resp) }), store: makeStore() });
+      return svc.findEmail({ firstName: 'A', lastName: 'B', domain: 'b.com' }, { userId: 'u1', runWaterfall: true });
+    };
+
+    it('uses request_id_str, never the rounded integer, so the placeholder key matches the webhook', async () => {
+      expect(String(ROUNDED)).not.toBe(EXACT); // the premise: the number cannot carry the id
+      const r = await run({ person: {}, waterfall: { status: 'accepted' }, request_id: ROUNDED, request_id_str: EXACT });
+      expect(r.asyncRequestId).toBe(EXACT);
+      expect(r.asyncPending).toBe(true);
+      expect(r.found).toBe(false);
+      // the key the run stores the placeholder under is the key the webhook handler looks up for the id it receives
+      expect(apolloAsyncRequestCacheKey({ requestId: r.asyncRequestId! })).toEqual(apolloAsyncRequestCacheKey({ requestId: EXACT }));
+    });
+
+    it('does not use a rounded integer when no exact string is present (no placeholder is better than a wrong one)', async () => {
+      const r = await run({ person: {}, request_id: ROUNDED });
+      expect(r.asyncRequestId).toBeUndefined();
+      expect(r.asyncPending).toBe(false);
+    });
+
+    it('accepts an integer id that is exactly representable, and a string request_id', async () => {
+      expect((await run({ person: {}, request_id: 123456789 })).asyncRequestId).toBe('123456789');
+      expect((await run({ person: {}, request_id: 'r1' })).asyncRequestId).toBe('r1');
+    });
+
+    it('passes a negative id through unchanged', async () => {
+      expect((await run({ person: {}, request_id: -7694135129641490782, request_id_str: '-7694135129641490782' })).asyncRequestId).toBe('-7694135129641490782');
+    });
+
+    it('passes a negative numeric id (exactly representable) through as a string', async () => {
+      expect((await run({ person: {}, request_id: -123456789 })).asyncRequestId).toBe('-123456789');
+    });
+
+    it('reads request_id_str from inside person as well', async () => {
+      expect((await run({ person: { request_id_str: EXACT }, request_id: ROUNDED })).asyncRequestId).toBe(EXACT);
+    });
+
+    it('is not pending when the email came back synchronously', async () => {
+      const r = await run({ person: { email: 'a@b.com' }, request_id: ROUNDED, request_id_str: EXACT });
+      expect(r.found).toBe(true);
+      expect(r.asyncPending).toBe(false);
+    });
+
+    it('extractApolloAsyncRequestId: ignores blanks, non-ids and unsafe numbers', () => {
+      expect(extractApolloAsyncRequestId(null)).toBeUndefined();
+      expect(extractApolloAsyncRequestId({})).toBeUndefined();
+      expect(extractApolloAsyncRequestId({ request_id_str: '   ', request_id: ROUNDED })).toBeUndefined();
+      expect(extractApolloAsyncRequestId({ request_id: NaN })).toBeUndefined();
+      expect(extractApolloAsyncRequestId({ request_id: {} })).toBeUndefined();
+      expect(extractApolloAsyncRequestId({ request_id_str: ' 42 ' })).toBe('42');
+      expect(extractApolloAsyncRequestId({ requestId: 'legacy-1' })).toBe('legacy-1');
     });
   });
 

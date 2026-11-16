@@ -22,7 +22,8 @@ export async function getSecret(secretName: string): Promise<string> {
 
     throw new Error('Secret string is empty');
   } catch (error) {
-    console.error(`Error fetching secret ${secretName}:`, error);
+    // The name and the error code only: the whole error object has no business in logs.
+    console.error(`Error fetching secret ${secretName}: ${(error as { code?: string })?.code || (error as Error)?.name || 'error'}`);
     throw new Error(`Failed to fetch secret: ${secretName}`);
   }
 }
@@ -944,15 +945,21 @@ export async function getApolloApiKey(): Promise<string> {
  * percent-encoding to round-trip cleanly).
  *
  * Resolution order: `APOLLO_WEBHOOK_SECRET` env var if set and non-empty,
- * otherwise the built-in default. The default ships intentionally so the
- * webhook works in dev without extra setup; production deploys should set
- * the env var to a rotated value.
+ * otherwise the built-in default — outside production only. The default ships
+ * so the webhook works in dev without extra setup, but it is committed to the
+ * repo, so production (NODE_ENV=production) never uses it (ENG-2803): with no
+ * env value this throws, the sender falls back to a basic match (no webhook
+ * URL is handed out) and the receiving route answers 503.
  */
 const DEFAULT_APOLLO_WEBHOOK_SECRET = 'dev_apl_wh_8k3p2x9qm7n4r5z6_v1';
 
 export async function getApolloWebhookSecret(): Promise<string> {
   const fromEnv = process.env.APOLLO_WEBHOOK_SECRET?.trim();
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_APOLLO_WEBHOOK_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('APOLLO_WEBHOOK_SECRET is not set; the built-in default is not used in production');
+  }
+  return DEFAULT_APOLLO_WEBHOOK_SECRET;
 }
 
 export interface AttioCredentials {
@@ -1223,7 +1230,12 @@ async function fetchWhatsAppCredentialsFromSecretsManager(): Promise<WhatsAppCre
   const credentials = JSON.parse(secretString) as WhatsAppCredentials;
 
   const missing = (['phoneNumberId', 'wabaId', 'accessToken', 'appSecret', 'webhookVerifyToken'] as const)
-    .filter((k) => !credentials[k]);
+    // A whitespace-only value is as unusable as an absent one (the env path already treats
+    // it that way), and for phoneNumberId it would quietly make the webhook skip every event.
+    .filter((k) => {
+      const value = credentials[k];
+      return typeof value === 'string' ? value.trim() === '' : !value;
+    });
   if (missing.length > 0) {
     throw new Error(`WhatsApp credentials missing: ${missing.join(', ')}`);
   }
@@ -1285,6 +1297,122 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
       });
   }
   return whatsappCredsInFlight;
+}
+
+export interface TwilioCredentials {
+  accountSid: string;
+  authToken: string;
+}
+
+/** Env var for each credential field; the pair is used only when both are set. */
+const TWILIO_ENV_VARS = {
+  accountSid: 'TWILIO_ACCOUNT_SID',
+  authToken: 'TWILIO_AUTH_TOKEN',
+} as const satisfies Record<keyof TwilioCredentials, string>;
+
+let twilioCredsCache: { value: TwilioCredentials; expiresAt: number } | null = null;
+let twilioCredsInFlight: Promise<TwilioCredentials> | null = null;
+const TWILIO_CREDS_TTL_MS = 5 * 60 * 1000;
+// Twilio's voice webhooks are public: with a missing or broken secret every unauthenticated request would
+// otherwise cost a Secrets Manager read and two error log lines. A failure is remembered this briefly (short
+// enough that fixing the secret takes effect at once) and logged once per window.
+const TWILIO_CREDS_FAILURE_TTL_MS = 5 * 1000;
+let twilioCredsFailedUntil = 0;
+const TWILIO_CREDS_UNAVAILABLE = 'Failed to fetch Twilio credentials. Set both TWILIO_* env vars or store them in Secrets Manager.';
+
+/** Test hook: forget any cached or in-flight Secrets-Manager-backed Twilio credentials. */
+export function __resetTwilioCredentialsCache(): void {
+  twilioCredsCache = null;
+  twilioCredsInFlight = null;
+  twilioCredsFailedUntil = 0;
+}
+
+const TWILIO_SHAPE_ERROR = 'TwilioSecretShapeError';
+
+/** Our own "secret is empty / lacks a field" error: its message names fields, never values, so it is safe to log. */
+function twilioShapeError(message: string): Error {
+  return Object.assign(new Error(message), { name: TWILIO_SHAPE_ERROR });
+}
+
+async function fetchTwilioCredentialsFromSecretsManager(): Promise<TwilioCredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Twilio'
+    : 'dev/AgentWeb/Twilio';
+
+  const secretString = await getSecret(secretName);
+
+  if (!secretString || secretString.trim() === '') {
+    throw twilioShapeError('Twilio credentials secret is empty');
+  }
+
+  // A SyntaxError from JSON.parse can quote fragments of the secret, so the catch in
+  // getTwilioCredentials logs only the error name for anything that is not one of our own shape errors.
+  const parsed: unknown = JSON.parse(secretString);
+  const fields = (parsed !== null && typeof parsed === 'object' ? parsed : {}) as Record<string, unknown>;
+
+  // Strings only: a number or object here would reach the SDK's Basic-auth header as garbage.
+  const usable = (v: unknown): v is string => typeof v === 'string' && v.trim() !== '';
+  const { accountSid, authToken } = fields;
+  if (!usable(accountSid) || !usable(authToken)) {
+    const missing = (['accountSid', 'authToken'] as const).filter((k) => !usable(fields[k]));
+    throw twilioShapeError(`Twilio credentials missing: ${missing.join(', ')}`);
+  }
+
+  // Trimmed like the env path, so a trailing newline in the stored secret cannot break Basic auth.
+  return { accountSid: accountSid.trim(), authToken: authToken.trim() };
+}
+
+/**
+ * Get Twilio Voice credentials (ENG-2271). Same resolution rules as getWhatsAppCredentials:
+ * the TWILIO_* env pair wins only when complete (never merged with the secret, so an account
+ * sid from one environment cannot be paired with another's auth token); otherwise the secret
+ * at dev/AgentWeb/Twilio (prod/... in production), cached with a TTL, one shared in-flight
+ * lookup, successes for minutes and failures for a few seconds. The auth token also verifies inbound webhook signatures, so a
+ * missing field throws rather than returning a partial object.
+ */
+export async function getTwilioCredentials(): Promise<TwilioCredentials> {
+  const fromEnv = {} as TwilioCredentials;
+  const missingEnv: string[] = [];
+  for (const [field, envName] of Object.entries(TWILIO_ENV_VARS)) {
+    const value = process.env[envName]?.trim();
+    if (value) fromEnv[field as keyof TwilioCredentials] = value;
+    else missingEnv.push(envName);
+  }
+  if (missingEnv.length === 0) return fromEnv;
+  if (missingEnv.length < Object.keys(TWILIO_ENV_VARS).length) {
+    console.warn(
+      `[twilio] ignoring partial TWILIO_* env config (missing: ${missingEnv.join(', ')}); ` +
+        'falling back to Secrets Manager.',
+    );
+  }
+
+  // A success is cached for minutes; a failure only for TWILIO_CREDS_FAILURE_TTL_MS (see the constant), so one
+  // bad Secrets Manager call cannot turn into minutes of failed webhook verification and call placement.
+  const now = Date.now();
+  if (twilioCredsCache && twilioCredsCache.expiresAt > now) {
+    return twilioCredsCache.value;
+  }
+  if (twilioCredsFailedUntil > now) throw new Error(TWILIO_CREDS_UNAVAILABLE);
+  if (!twilioCredsInFlight) {
+    twilioCredsInFlight = fetchTwilioCredentialsFromSecretsManager()
+      .then((value) => {
+        twilioCredsCache = { value, expiresAt: Date.now() + TWILIO_CREDS_TTL_MS };
+        twilioCredsFailedUntil = 0;
+        return value;
+      })
+      .catch((error) => {
+        const name = error instanceof Error ? error.name : 'error';
+        const detail = error instanceof Error && name === TWILIO_SHAPE_ERROR ? ` (${error.message})` : '';
+        twilioCredsFailedUntil = Date.now() + TWILIO_CREDS_FAILURE_TTL_MS;
+        console.error(`Error fetching Twilio credentials from Secrets Manager: ${name}${detail}`);
+        throw new Error(TWILIO_CREDS_UNAVAILABLE);
+      })
+      .finally(() => {
+        twilioCredsInFlight = null;
+      });
+  }
+  return twilioCredsInFlight;
 }
 
 export interface TeamsBotCredentials {
@@ -1351,10 +1479,8 @@ async function fetchTeamsBotCredentialsFromSecretsManager(): Promise<TeamsBotCre
  * The env set is honoured ONLY when complete. A partial set falls through rather than being
  * merged, so the dev bot's appId can never be paired with the prod bot's secret.
  *
- * Note `prod/AgentWeb/Microsoft/TeamsBot` does not exist yet — the provisioning identity
- * lacked CreateSecret on prod/*, and the prod values are in 1Password. In production this
- * therefore throws until that secret is created. It deliberately does NOT fall back to the
- * dev secret: replying to a customer's tenant with the dev bot's identity would fail
+ * `prod/AgentWeb/Microsoft/TeamsBot` was created on 2026-09-29 (ENG-2207). If it is ever
+ * missing, this throws in production. It deliberately does NOT fall back to the dev secret: replying to a customer's tenant with the dev bot's identity would fail
  * authentication in a way that looks like a Teams outage rather than a missing secret.
  */
 export async function getTeamsBotCredentials(): Promise<TeamsBotCredentials> {

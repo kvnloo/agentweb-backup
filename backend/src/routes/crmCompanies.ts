@@ -6,9 +6,21 @@ import {
   CompanyNotFoundError,
   CompanyAuthError,
 } from '../services/companyDb';
+import { crmDb } from '../services/db';
+import { canAccessCrmList } from '../services/crmAccessControl';
 
 const router = express.Router();
 router.use(authenticateToken);
+
+// ENG-2406: the lead write is keyed by caller-supplied {listId, leadId}, so the
+// caller must be allowed to edit that list (owner or org sharing, same guard as
+// other CRM list surfaces) — owning the company alone is not enough. Returns 404
+// for both missing and foreign lists so the route is not an existence oracle.
+async function canEditLeadList(userId: string, listId: string): Promise<boolean> {
+  const list = await crmDb.getLeadListById(listId, { consistentRead: true });
+  if (!list) return false;
+  return canAccessCrmList(userId, list as any);
+}
 
 // GET /api/crm/companies
 router.get('/', async (req: Request, res: Response) => {
@@ -135,11 +147,12 @@ router.post('/:companyId/leads', async (req: Request, res: Response) => {
     const { listId, leadId } = req.body;
     const userId = authReq.user!.userId;
 
-    if (!listId || !leadId) { res.status(400).json({ error: 'listId and leadId required' }); return; }
+    if (typeof listId !== 'string' || !listId || typeof leadId !== 'string' || !leadId) { res.status(400).json({ error: 'listId and leadId required' }); return; }
 
     const company = await companyDb.getCompany(companyId);
     if (!company) { res.status(404).json({ error: 'Company not found' }); return; }
     if (company.userId !== userId) { res.status(403).json({ error: 'Forbidden' }); return; }
+    if (!(await canEditLeadList(userId, listId))) { res.status(404).json({ error: 'Lead not found' }); return; }
 
     await companyDb.assignLeadToCompany(listId, leadId, companyId);
     res.status(204).send();
@@ -158,14 +171,15 @@ router.delete('/:companyId/leads/:leadId', async (req: Request, res: Response) =
   const authReq = req as AuthenticatedRequest;
   try {
     const { companyId, leadId } = req.params;
-    const listId = req.query.listId as string;
+    const listId = req.query.listId;
     const userId = authReq.user!.userId;
 
-    if (!listId) { res.status(400).json({ error: 'listId query param required' }); return; }
+    if (typeof listId !== 'string' || !listId) { res.status(400).json({ error: 'listId query param required' }); return; }
 
     const company = await companyDb.getCompany(companyId);
     if (!company) { res.status(404).json({ error: 'Company not found' }); return; }
     if (company.userId !== userId) { res.status(403).json({ error: 'Forbidden' }); return; }
+    if (!(await canEditLeadList(userId, listId))) { res.status(404).json({ error: 'Lead not found' }); return; }
 
     await companyDb.unassignLeadFromCompany(listId, leadId);
     res.status(204).send();

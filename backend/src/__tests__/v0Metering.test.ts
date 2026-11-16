@@ -180,9 +180,11 @@ describe('coverage is derived, not a hardcoded list (ENG-701)', () => {
     // contains a nested `}` (a conditional spread for onBehalfOf), which made the
     // simpler pattern stop early and under-count by exactly that one site.
     const wrapped = src.match(/meteredV0\(\{[\s\S]*?\},\s*\(\)\s*=>\s*v0\.chats\./g) || [];
-    // The row's inventory said 9; main has 11. Asserting equality rather than a
-    // count means a new call site fails this test instead of silently going unmetered.
-    expect(calls.length).toBeGreaterThanOrEqual(11);
+    // The row's inventory said 9, then main had 11; a later consolidation (unrelated to
+    // this change) brought it down to 7 real call sites, all still metered. Asserting
+    // equality rather than a count means a new call site fails this test instead of
+    // silently going unmetered.
+    expect(calls.length).toBeGreaterThanOrEqual(7);
     expect(wrapped.length).toBe(calls.length);
   });
 });

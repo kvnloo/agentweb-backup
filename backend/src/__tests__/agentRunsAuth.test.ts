@@ -69,6 +69,26 @@ describe('authenticateAgentRunsSecretOrAdmin', () => {
       expect(mockIsAdmin).not.toHaveBeenCalled();
     });
 
+    it('refuses sub-routes such as /trace (403): the secret covers the run list only', async () => {
+      const downstream = jest.fn((req: Request, res: Response) => res.status(200).json({ ok: true }));
+      const res = await request(buildApp(downstream))
+        .get('/api/admin/agent-runs/trace')
+        .query({ sessionId: 'session-abc' })
+        .set(AGENT_RUNS_SECRET_HEADER, SECRET);
+
+      expect(res.status).toBe(403);
+      expect(downstream).not.toHaveBeenCalled();
+      expect(mockAuthenticateToken).not.toHaveBeenCalled();
+    });
+
+    it('lets an admin session (no secret header) reach /trace', async () => {
+      const res = await request(buildApp()).get('/api/admin/agent-runs/trace').query({ sessionId: 'session-abc' });
+
+      expect(res.status).toBe(200);
+      expect(mockAuthenticateToken).toHaveBeenCalled();
+      expect(mockIsAdmin).toHaveBeenCalled();
+    });
+
     it('fails closed (401) on a wrong secret and never falls through to a real admin session', async () => {
       // authenticateToken/isAdmin are stubbed to ALWAYS succeed here — if the gate ever fell
       // through to them on a bad secret, this request would come back 200, not 401.

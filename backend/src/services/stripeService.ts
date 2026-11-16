@@ -7,6 +7,8 @@ import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
 import { waitlistDb, WaitlistEntry } from './waitlistDb';
 import { findSeatLineItem } from './orgSeatBillingService';
+import { mirrorHotLeadCallBilling } from './hotLeadCallBillingService';
+import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
 dotenv.config();
 
@@ -69,14 +71,20 @@ export function findBasePlanItem(
   const items = subscription.items.data;
   if (items.length <= 1) return items[0];
 
-  const seatProductId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
-  if (!seatProductId) return items[0];
+  // Add-on products that can sit next to the plan item: extra seats and the hot lead calls add-on (ENG-2783).
+  // The add-on item is created from price_data, so its price id is never a plan price: picking it as the plan
+  // would derive the wrong tier and make a plan change overwrite the add-on's price.
+  const addOnProductIds = [process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID, process.env.STRIPE_HOT_LEAD_CALL_PRODUCT_ID]
+    .filter((id): id is string => !!id);
+  if (addOnProductIds.length === 0) return items[0];
 
-  const seatItem = findSeatLineItem(subscription, seatProductId);
-  if (!seatItem) return items[0];
-
-  const nonSeatItems = items.filter((item) => item.id !== seatItem.id);
-  return nonSeatItems[0] ?? items[0];
+  const isAddOn = (item: Stripe.SubscriptionItem): boolean => {
+    const product = item.price?.product;
+    const id = typeof product === 'string' ? product : product?.id;
+    return !!id && addOnProductIds.includes(id);
+  };
+  const planItems = items.filter((item) => !isAddOn(item));
+  return planItems[0] ?? items[0];
 }
 
 /**
@@ -226,6 +234,93 @@ async function syncCheckoutProfileFields(session: any): Promise<void> {
 }
 
 /**
+ * A setup-mode Checkout Session only saves a payment method; it never creates a
+ * subscription. ENG-2303: Zoma's "add a payment method" link uses one, and the
+ * subscription handlers must not treat its completion as a purchase (that would mark a
+ * non-subscriber `subscription_status: active`).
+ */
+export function isSetupModeCheckoutSession(session: any): boolean {
+  return session?.object !== 'subscription' && session?.mode === 'setup';
+}
+
+export const ZOMA_PAYMENT_METHOD_PURCHASE_TYPE = 'zoma_payment_method';
+
+/** ENG-2571: what `resolveUserPaymentMethod` found. `customerId` never leaves the backend. */
+/** The user-row fields the ENG-2571 customer lookup reads. */
+export type CustomerCandidateUser = { stripe_customer_id?: string | null; email?: string | null } | null | undefined;
+
+export interface UserPaymentMethod {
+  hasPaymentMethod: boolean;
+  customerId: string | null;
+  card: { brand: string; last4: string } | null;
+  isZoma: boolean;
+  /**
+   * ENG-668: a method to pin on an off-session invoice, ONLY when the customer has no invoice default
+   * (`invoice_settings.default_payment_method` / `default_source`) for Stripe to charge — the newest
+   * card, else the first listed. Null when there is a default: an invoice's own
+   * `default_payment_method` overrides the customer's for every automatic retry, so pinning it would
+   * keep charging the old card after the owner updates theirs. Backend only, like `customerId`.
+   */
+  fallbackPaymentMethodId?: string | null;
+}
+
+/** ENG-668 PR-2: `metadata.purchaseType` on every month-end pay-as-you-go overage invoice. */
+export const PAYG_OVERAGE_PURCHASE_TYPE = 'payg_overage';
+
+/**
+ * Why an overage invoice is not the one the settlement record expects. `total_differs`: a finalized
+ * invoice Stripe is collecting, at another total. The rest collected nothing: `draft_deleted` (its draft
+ * total differed, so it was deleted before finalizing), `void`, or `missing` (deleted or unknown to Stripe).
+ */
+export type PaygOverageInvoiceMismatch = 'total_differs' | 'draft_deleted' | 'void' | 'missing';
+
+/** The part of a Stripe charge the overage-invoice lookup reads. */
+export interface PaygChargeRef {
+  id?: string;
+  payment_intent?: string | { id?: string } | null;
+}
+
+/** Pages of invoice payments read for one PaymentIntent (10 each) before giving up on finding its invoice. */
+const PAYG_INVOICE_PAYMENT_PAGES = 5;
+
+/** An empty overage draft at least this old has no run in flight behind it (runs take seconds). */
+const PAYG_ORPHAN_DRAFT_AGE_SECONDS = 60 * 60;
+
+/** An invoice by id, or null when Stripe reports it deleted or unknown. Any other Stripe error throws. */
+async function retrieveInvoiceIfExists(s: Stripe, invoiceId: string): Promise<Stripe.Invoice | null> {
+  try {
+    const invoice = await s.invoices.retrieve(invoiceId);
+    return (invoice as unknown as Stripe.DeletedInvoice).deleted ? null : invoice;
+  } catch (error: unknown) {
+    const { code, statusCode } = (error ?? {}) as { code?: string; statusCode?: number };
+    if (code === 'resource_missing' || statusCode === 404) return null;
+    throw error;
+  }
+}
+
+/** The metadata settlement stamps on an overage invoice (and its line item). */
+export interface PaygOverageInvoiceMetadata {
+  purchaseType: typeof PAYG_OVERAGE_PURCHASE_TYPE;
+  billingUserId: string;
+  month: string;
+  idempotencyKey: string;
+  /**
+   * The `createdAt` of the settlement record that created the invoice. `idempotencyKey` is the same for
+   * every record of a month (a `retry` re-creates the record), so this is what tells an earlier record's
+   * invoice from this one's while the record names no invoice yet.
+   */
+  recordCreatedAt: string;
+}
+
+/**
+ * What an overage invoice's failed attempt actually is, from its PaymentIntent (see
+ * `paygOverageInvoicePaymentState`): `declined` (a decline, a failed authentication, a canceled
+ * attempt), `action_required` (waiting for the customer to confirm: 3-D Secure, a mandate), or
+ * `in_progress` (the payment went through or is still processing — `invoice.paid` follows).
+ */
+export type PaygOverageInvoicePaymentState = 'declined' | 'action_required' | 'in_progress';
+
+/**
  * Stripe Service — wraps Stripe SDK calls with validation.
  */
 export const stripeService = {
@@ -349,6 +444,332 @@ export const stripeService = {
     return s.billingPortal.sessions.create({
       customer: stripeCustomerId,
       return_url: returnUrl || undefined,
+    });
+  },
+
+  /**
+   * ENG-2303 — Stripe customers created for a user that has no `stripe_customer_id` yet
+   * carry `metadata.userId`, so they can be found again without writing to the user row.
+   */
+  async findCustomerIdsByUserId(userId: string): Promise<string[]> {
+    if (!/^[A-Za-z0-9_-]+$/.test(userId)) throw new Error('userId has unexpected characters');
+    const s = getStripeOrThrow();
+    const result = await s.customers.search({ query: `metadata['userId']:'${userId}'`, limit: 10 });
+    return result.data.map((c) => c.id);
+  },
+
+  /**
+   * ENG-2571 — the customer, or null when Stripe says it is deleted or does not exist
+   * (`resource_missing`: a stale id on the user row, or a deleted id still in the lagging
+   * search index). Every other Stripe error throws.
+   */
+  async retrieveLiveCustomer(customerId: string, params?: Stripe.CustomerRetrieveParams): Promise<Stripe.Customer | null> {
+    const s = getStripeOrThrow();
+    try {
+      const customer = await s.customers.retrieve(customerId, params);
+      return (customer as Stripe.DeletedCustomer).deleted ? null : (customer as Stripe.Customer);
+    } catch (error: any) {
+      if (error?.code === 'resource_missing' || error?.statusCode === 404) return null;
+      throw error;
+    }
+  },
+
+  /**
+   * ENG-2571 — the user row's `stripe_customer_id` first, then this user's customers by email,
+   * then customers found by `metadata.userId`. Search lags new customers by up to a minute, so
+   * a card saved through Zoma's setup Checkout would read as "no card" right as the user lands
+   * back on Settings; the email list is consistent, and Zoma always creates with the email.
+   * Email matches count only when they carry this `metadata.userId`.
+   */
+  async customerCandidateIds(user: CustomerCandidateUser, userId: string): Promise<string[]> {
+    const ids = new Set<string>();
+    if (typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id) ids.add(user.stripe_customer_id);
+    if (typeof user?.email === 'string' && user.email) {
+      const byEmail = await getStripeOrThrow().customers.list({ email: user.email, limit: 10 });
+      for (const c of byEmail.data) if (c.metadata?.userId === userId) ids.add(c.id);
+    }
+    for (const id of await stripeService.findCustomerIdsByUserId(userId)) ids.add(id);
+    return [...ids];
+  },
+
+  /** ENG-2571 — the first candidate customer that still exists in Stripe, or null. */
+  async findLiveCustomerIdForUser(user: CustomerCandidateUser, userId: string): Promise<string | null> {
+    // The row's own customer first, so a live one never waits on (or fails with) discovery.
+    const rowId = typeof user?.stripe_customer_id === 'string' && user.stripe_customer_id ? user.stripe_customer_id : null;
+    if (rowId && (await stripeService.retrieveLiveCustomer(rowId))) return rowId;
+    for (const id of await stripeService.customerCandidateIds(user, userId)) {
+      if (id === rowId) continue;
+      if (await stripeService.retrieveLiveCustomer(id)) return id;
+    }
+    return null;
+  },
+
+  async createCustomerForUser(userId: string, email: string | undefined): Promise<string> {
+    if (!userId) throw new Error('userId is required');
+    const s = getStripeOrThrow();
+    // The idempotency key collapses rapid repeat calls (customer search is eventually
+    // consistent), but Stripe replays it for 24h, including after the customer is deleted
+    // (ENG-2571). So a replayed customer that is gone chains to a key derived from its id:
+    // concurrent callers that both see the same deleted customer still share one key and
+    // dedupe, and a deletion never blocks minting a new link.
+    let idempotencyKey = `zoma-customer-${userId}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const customer = await s.customers.create({ email, metadata: { userId, source: 'zoma_mcp' } }, { idempotencyKey });
+      if (await stripeService.retrieveLiveCustomer(customer.id)) return customer.id;
+      idempotencyKey = `zoma-customer-${userId}-after-${customer.id}`;
+    }
+    throw new Error(`Could not create a live Stripe customer for user ${userId}: every replayed customer is deleted.`);
+  },
+
+  /**
+   * ENG-2571 — the single answer to "does this user have a payment method, and where".
+   * Candidates are the user row's `stripe_customer_id` plus every customer carrying
+   * `metadata.userId` (Zoma's setup Checkout never touches the user row). Deleted or unknown
+   * candidates are skipped (`retrieveLiveCustomer`). The first live
+   * candidate with a payment method wins. `isZoma` means that customer completed Zoma's setup
+   * Checkout (a succeeded SetupIntent tagged ZOMA_PAYMENT_METHOD_PURCHASE_TYPE). Stripe errors
+   * propagate: callers decide how to report an unknown state, never "no card".
+   */
+  async resolveUserPaymentMethod(
+    user: CustomerCandidateUser,
+    userId: string,
+  ): Promise<UserPaymentMethod> {
+    const s = getStripeOrThrow();
+    for (const customerId of await stripeService.customerCandidateIds(user, userId)) {
+      const customer = await stripeService.retrieveLiveCustomer(customerId, { expand: ['invoice_settings.default_payment_method'] });
+      if (!customer) continue;
+      const methods = (await s.paymentMethods.list({ customer: customerId, limit: 100 })).data;
+      if (methods.length === 0) continue;
+
+      const defaultPm = customer.invoice_settings?.default_payment_method;
+      const newestCard = methods.filter((m) => m.type === 'card' && m.card).sort((a, b) => b.created - a.created)[0];
+      const cardPm = typeof defaultPm === 'object' && defaultPm?.card ? defaultPm : newestCard;
+      const setupIntents = (await s.setupIntents.list({ customer: customerId, limit: 100 })).data;
+      const defaultPmId = typeof defaultPm === 'string' ? defaultPm : defaultPm?.id;
+      return {
+        hasPaymentMethod: true,
+        customerId,
+        fallbackPaymentMethodId: defaultPmId || customer.default_source ? null : (newestCard?.id || methods[0].id),
+        card: cardPm?.card ? { brand: cardPm.card.brand, last4: cardPm.card.last4 } : null,
+        isZoma: setupIntents.some(
+          (si) => si.status === 'succeeded' && si.metadata?.purchaseType === ZOMA_PAYMENT_METHOD_PURCHASE_TYPE,
+        ),
+      };
+    }
+    return { hasPaymentMethod: false, customerId: null, card: null, isZoma: false };
+  },
+
+  /**
+   * ENG-668 PR-2: create, fill and finalize one month's pay-as-you-go overage invoice, or pick up the
+   * one an earlier attempt already started. Safe to call again for the same month:
+   *   - an earlier attempt's invoice id (`invoiceId`) is retrieved directly; with none, Stripe is ALWAYS
+   *     searched for this owner's invoice for this month (`metadata` purchaseType + billingUserId +
+   *     month) before anything is created, whatever the record's age — so neither a lost response nor
+   *     a record removed by hand can lead to a second invoice for the month;
+   *   - every Stripe write also carries a key derived from `idempotencyKey` (`:invoice`, `:item`,
+   *     `:finalize` — one key cannot be reused across endpoints), which covers the search index's lag
+   *     within Stripe's 24h key window.
+   * The draft is created with `auto_advance: false` (an empty draft must never auto-finalize as a $0
+   * invoice) and `pending_invoice_items_behavior: 'exclude'` (nothing else the customer has pending is
+   * swept onto it). Before finalizing, the draft's total is compared with `amountCents`: if Stripe would
+   * total anything else (a customer discount or coupon), the draft is deleted and nothing is ever
+   * finalized or collected. Finalizing turns `auto_advance` on, so Stripe charges the payment method.
+   * `recordInvoiceId` runs as soon as the invoice is known (found or created), before the line item.
+   *
+   * An invoice the record already names that is void, deleted or unknown to Stripe (a draft deleted on a
+   * mismatch before the hold could be written, or voided by hand) is never replaced here: nothing was or
+   * will be collected on it, and a person decides whether the month is billed again (`mismatch`).
+   */
+  async issuePaygOverageInvoice(input: {
+    idempotencyKey: string;
+    customerId: string | null;
+    /** Pinned on the invoice only when given (see `UserPaymentMethod.fallbackPaymentMethodId`). */
+    fallbackPaymentMethodId?: string | null;
+    amountCents: number;
+    description: string;
+    lineDescription: string;
+    metadata: PaygOverageInvoiceMetadata;
+    invoiceId?: string | null;
+    recordInvoiceId: (invoiceId: string) => Promise<void>;
+  }): Promise<
+    | { outcome: 'issued'; invoice: Stripe.Invoice }
+    | { outcome: 'mismatch'; invoiceId: string; reason: PaygOverageInvoiceMismatch }
+    | { outcome: 'multiple'; invoiceIds: string[] }
+    | { outcome: 'no_customer' }
+  > {
+    if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) throw new Error('amountCents must be a positive integer');
+    const { billingUserId, month } = input.metadata;
+    if (!/^[A-Za-z0-9_-]+$/.test(billingUserId) || !/^\d{4}-\d{2}$/.test(month)) {
+      throw new Error('billingUserId or month has unexpected characters');
+    }
+    const s = getStripeOrThrow();
+    const metadata: Record<string, string> = { ...input.metadata };
+
+    let invoice: Stripe.Invoice | null = null;
+    if (input.invoiceId) {
+      invoice = await retrieveInvoiceIfExists(s, input.invoiceId);
+      if (!invoice) return { outcome: 'mismatch', invoiceId: input.invoiceId, reason: 'missing' };
+      if (invoice.status === 'void') return { outcome: 'mismatch', invoiceId: input.invoiceId, reason: 'void' };
+    }
+    if (!invoice) {
+      const found = await s.invoices.search({
+        query: `metadata['purchaseType']:'${PAYG_OVERAGE_PURCHASE_TYPE}' AND metadata['billingUserId']:'${billingUserId}' AND metadata['month']:'${month}'`,
+        limit: 10,
+      });
+      // A void invoice collected nothing; any other one is this month's.
+      const live = found.data.filter((candidate) =>
+        candidate.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE
+        && candidate.metadata?.billingUserId === billingUserId
+        && candidate.metadata?.month === month
+        && candidate.status !== 'void');
+      // An EMPTY draft older than any run in flight is an orphan: a run created it and died before
+      // recording its id, and the key has since expired. It can never be collected, so it is deleted
+      // rather than adopted (adopting it next to the invoice that replaced it would bill twice).
+      const orphanBefore = Math.floor(Date.now() / 1000) - PAYG_ORPHAN_DRAFT_AGE_SECONDS;
+      const isOrphan = (candidate: Stripe.Invoice) =>
+        candidate.status === 'draft' && !(candidate.lines?.data?.length) && candidate.created < orphanBefore;
+      for (const orphan of live.filter(isOrphan)) await s.invoices.del(orphan.id!);
+      const standing = live.filter((candidate) => !isOrphan(candidate));
+      // More than one live invoice for one month: never pick one — a person decides which stands.
+      if (standing.length > 1) return { outcome: 'multiple', invoiceIds: standing.map((candidate) => candidate.id!) };
+      invoice = standing[0] ?? null;
+      if (invoice?.id) await input.recordInvoiceId(invoice.id);
+    }
+    if (!invoice) {
+      if (!input.customerId) return { outcome: 'no_customer' };
+      invoice = await s.invoices.create({
+        customer: input.customerId,
+        collection_method: 'charge_automatically',
+        auto_advance: false,
+        pending_invoice_items_behavior: 'exclude',
+        currency: 'usd',
+        description: input.description,
+        metadata,
+        ...(input.fallbackPaymentMethodId ? { default_payment_method: input.fallbackPaymentMethodId } : {}),
+      }, { idempotencyKey: `${input.idempotencyKey}:invoice` });
+      await input.recordInvoiceId(invoice.id!);
+    }
+
+    if (invoice.status !== 'draft') {
+      return invoice.total === input.amountCents
+        ? { outcome: 'issued', invoice }
+        : { outcome: 'mismatch', invoiceId: invoice.id!, reason: 'total_differs' };
+    }
+    const customer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+    if (!customer) throw new Error(`Pay-as-you-go invoice ${invoice.id} has no customer`);
+    // Only this item is ever put on the draft (pending items are excluded), so any line means it is there.
+    if (!(invoice.lines?.data?.length)) {
+      await s.invoiceItems.create({
+        customer,
+        invoice: invoice.id!,
+        amount: input.amountCents,
+        currency: 'usd',
+        description: input.lineDescription,
+        metadata,
+      }, { idempotencyKey: `${input.idempotencyKey}:item` });
+      invoice = await s.invoices.retrieve(invoice.id!);
+    }
+    if (invoice.total !== input.amountCents) {
+      await s.invoices.del(invoice.id!);
+      return { outcome: 'mismatch', invoiceId: invoice.id!, reason: 'draft_deleted' };
+    }
+    const finalized = await s.invoices.finalizeInvoice(invoice.id!, { auto_advance: true }, { idempotencyKey: `${input.idempotencyKey}:finalize` });
+    return { outcome: 'issued', invoice: finalized };
+  },
+
+  /**
+   * ENG-668 PR-2: the pay-as-you-go overage invoice a charge paid, or null when the charge is anything
+   * else. Since API version 2025-03-31.basil a charge no longer carries `invoice`; the link is the
+   * invoice payment for the charge's PaymentIntent. Charges without a PaymentIntent are never ours.
+   */
+  async findPaygOverageInvoiceForCharge(charge: PaygChargeRef): Promise<Stripe.Invoice | null> {
+    const paymentIntent = typeof charge?.payment_intent === 'string' ? charge.payment_intent : charge?.payment_intent?.id;
+    if (!paymentIntent) return null;
+    const s = getStripeOrThrow();
+    // Every invoice payment of this PaymentIntent, not just the first one listed — paged while Stripe
+    // says there are more (bounded: a PaymentIntent pays one invoice in practice): the one that was paid
+    // (a refunded or disputed charge was collected) is preferred, then any other.
+    const all: Stripe.InvoicePayment[] = [];
+    for (let page = 0; page < PAYG_INVOICE_PAYMENT_PAGES; page++) {
+      const payments = await s.invoicePayments.list({
+        payment: { type: 'payment_intent', payment_intent: paymentIntent },
+        limit: 10,
+        expand: ['data.invoice'],
+        ...(all.length ? { starting_after: all[all.length - 1].id } : {}),
+      });
+      all.push(...payments.data);
+      if (!payments.has_more || !payments.data.length) break;
+    }
+    const ordered = [...all.filter((p) => p.status === 'paid'), ...all.filter((p) => p.status !== 'paid')];
+    for (const payment of ordered) {
+      const linked = payment.invoice;
+      if (!linked) continue;
+      const invoice = typeof linked === 'string' ? await s.invoices.retrieve(linked) : linked;
+      if ((invoice as Stripe.DeletedInvoice).deleted) continue;
+      if ((invoice as Stripe.Invoice).metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) return invoice as Stripe.Invoice;
+    }
+    return null;
+  },
+
+  /**
+   * ENG-668 PR-2: what an overage invoice's payment is NOW, read from its PaymentIntent when a failure is
+   * reported (and by the sweep for a payment left unconfirmed). Since 2025-03-31.basil an invoice no
+   * longer names its PaymentIntent: it is the invoice's default invoice payment. PaymentIntent statuses
+   * (stripe@18 `PaymentIntent.Status`):
+   *   - `requires_action` — waiting for the customer (3-D Secure, a mandate): `action_required`. Stripe
+   *     sends `invoice.payment_failed` for it too, next to `invoice.payment_action_required`;
+   *   - `succeeded`, `processing`, `requires_capture` — the payment went through or is in flight (the
+   *     owner confirmed after the failure was sent; a bank debit settling): `in_progress`;
+   *   - `requires_payment_method` (a decline, or an authentication the customer failed), `canceled`,
+   *     `requires_confirmation`, or no PaymentIntent at all: `declined` — the failure Stripe reported.
+   * Stripe errors propagate (the webhook is retried, never guessed).
+   */
+  async paygOverageInvoicePaymentState(invoiceId: string): Promise<PaygOverageInvoicePaymentState> {
+    const s = getStripeOrThrow();
+    const payments = await s.invoicePayments.list({ invoice: invoiceId, limit: 10, expand: ['data.payment.payment_intent'] });
+    const current = payments.data.find((payment) => payment.is_default) ?? payments.data[0];
+    const intent = current?.payment?.payment_intent;
+    if (!intent) return 'declined';
+    const paymentIntent = typeof intent === 'string' ? await s.paymentIntents.retrieve(intent) : intent;
+    if (paymentIntent.status === 'requires_action') return 'action_required';
+    if (paymentIntent.status === 'succeeded' || paymentIntent.status === 'processing' || paymentIntent.status === 'requires_capture') return 'in_progress';
+    return 'declined';
+  },
+
+  /** ENG-668 PR-2: an overage invoice by id, or null when Stripe reports it deleted or unknown. */
+  async retrievePaygOverageInvoice(invoiceId: string): Promise<Stripe.Invoice | null> {
+    return retrieveInvoiceIfExists(getStripeOrThrow(), invoiceId);
+  },
+
+  /**
+   * ENG-668 PR-2: the refunds on a charge (newest first). A charge object no longer includes them
+   * (API 2022-11-15+), and a webhook's charge is never expanded.
+   */
+  async listChargeRefunds(chargeId: string): Promise<Stripe.Refund[]> {
+    const refunds = await getStripeOrThrow().refunds.list({ charge: chargeId, limit: 100 });
+    return refunds.data;
+  },
+
+  /** Stripe-hosted Checkout in setup mode: saves a card, charges nothing. */
+  async createPaymentMethodSetupSession(params: {
+    stripeCustomerId: string;
+    userId: string;
+    successUrl: string;
+    cancelUrl: string;
+  }) {
+    if (!params.stripeCustomerId) throw new Error('stripeCustomerId is required');
+    if (!params.userId) throw new Error('userId is required');
+    const s = getStripeOrThrow();
+    const metadata = { userId: params.userId, purchaseType: ZOMA_PAYMENT_METHOD_PURCHASE_TYPE };
+    return s.checkout.sessions.create({
+      mode: 'setup',
+      currency: 'usd',
+      customer: params.stripeCustomerId,
+      success_url: params.successUrl,
+      cancel_url: params.cancelUrl,
+      metadata,
+      setup_intent_data: { metadata },
+      custom_text: { submit: { message: 'Saving a card lets Zoma make changes to your ads. Nothing is charged today.' } },
     });
   },
 
@@ -518,7 +939,7 @@ export async function syncSubscriptionFromStripe(
       customer: stripeCustomerId,
       status: 'all',
       limit: 10,
-      expand: ['data.discount.coupon'],
+      expand: ['data.discounts'],
     });
 
     if (subscriptions.data.length === 0) {
@@ -560,13 +981,7 @@ export async function syncSubscriptionFromStripe(
 
     // Derive tier from price if available.
     //
-    // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
-    // seat-billing (ENG-2243..2246) correctness review as low-risk, since a
-    // wrong read here just skips an additive-only tier backfill rather than
-    // corrupting billing state. Don't copy this pattern elsewhere: see
-    // findBasePlanItem's doc comment for why position-based lookup breaks
-    // once a seat item can coexist on the same subscription.
-    const priceId = sub.items?.data?.[0]?.price?.id;
+    const priceId = findBasePlanItem(sub)?.price?.id;
     if (priceId) {
       const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
       if (derivedType) {
@@ -682,7 +1097,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   if (stripeSubscriptionId) {
     try {
       const s = getStripeOrThrow();
-      subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discount.coupon'] });
+      subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discounts'] });
       actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
       currentPeriodEnd = getSubscriptionPeriodEndIso(subscription);
     } catch (err) {
@@ -870,8 +1285,22 @@ export async function handleSubscriptionUpdated(
     }
   }
 
-  // Always sync activeOffer — set to null when discount is removed
-  updateData.activeOffer = extractActiveOffer(subscription);
+  // Always sync activeOffer — set to null when discount is removed. A webhook
+  // payload carries Basil `discounts` as ids, so fetch them expanded rather
+  // than clear a live offer; if that fetch fails, leave activeOffer as it is
+  // (the next invoice or reconcile sync corrects it).
+  let offerSource: SubscriptionDiscountSource | null = subscription;
+  if (typeof pickSubscriptionDiscount(subscription) === 'string') {
+    try {
+      offerSource = await getStripeOrThrow().subscriptions.retrieve(subscription.id, { expand: ['discounts'] });
+    } catch (err) {
+      offerSource = null;
+      console.warn(`[STRIPE] Failed to expand discounts of ${subscription.id}; activeOffer left unchanged: ${err}`);
+    }
+  }
+  if (offerSource) {
+    updateData.activeOffer = extractActiveOffer(offerSource);
+  }
 
   await userDb.updateUser(user.userId, updateData);
   syncUserUpdateToLeadList(user.email, {
@@ -905,15 +1334,56 @@ export async function handleSubscriptionUpdated(
     }
   }
 
+  // Hot lead calls add-on (ENG-2783): same idea for its flat-fee item; see mirrorHotLeadCallBilling.
+  await mirrorHotLeadCallBilling(user, subscription);
+
   console.log(
     `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}, offer=${updateData.activeOffer?.couponId ?? 'none'}`
   );
+}
+
+/** Subscription statuses that still bill (mrrCollectionGapService's LIVE_STATUSES). */
+const LIVE_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['active', 'trialing', 'past_due']);
+
+/**
+ * Subscription statuses that have ended for good: paying one's (final) invoice
+ * does not make the customer active again. `incomplete` / `unpaid` are not
+ * here — paying their invoice is what activates them.
+ */
+const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * The customer's live subscription (discounts expanded), or null. Same pick as
+ * reconcileStripeUser / syncSubscriptionFromStripe: active > trialing >
+ * past_due, and within a status the newest (Stripe lists newest first; the
+ * sort is stable).
+ */
+async function findLiveCustomerSubscription(s: Stripe, customerId: string): Promise<Stripe.Subscription | null> {
+  const subscriptions = await s.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 10,
+    expand: ['data.discounts'],
+  });
+  const statusPriority: Record<string, number> = { active: 0, trialing: 1, past_due: 2 };
+  const live = subscriptions.data
+    .filter((sub) => LIVE_SUBSCRIPTION_STATUSES.has(sub.status))
+    .sort((a, b) => statusPriority[a.status] - statusPriority[b.status]);
+  return live[0] ?? null;
 }
 
 /**
  * Handle invoice.payment_succeeded — confirm subscription is active and sync payment info.
  */
 export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void> {
+  // ENG-668: a pay-as-you-go overage invoice is not a subscription payment. It must never write
+  // subscription_status / subscription_amount / period fields; settlement records it instead.
+  if (invoice?.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) {
+    const { handlePaygOverageInvoicePaid } = await import('./paygSettlementService');
+    await handlePaygOverageInvoicePaid(invoice);
+    return;
+  }
+
   const customerId = typeof invoice.customer === 'string'
     ? invoice.customer
     : invoice.customer?.id;
@@ -929,46 +1399,92 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     return;
   }
 
-  const subscriptionId = typeof invoice.subscription === 'string'
-    ? invoice.subscription
-    : invoice.subscription?.id || null;
+  const subscriptionId = invoiceSubscriptionId(invoice);
+  const storedSubId: string | null = user.stripe_subscription_id || null;
 
   const updateData: Record<string, any> = {
-    subscription_status: 'active',
     has_payment_method: true,
   };
-
-  // Backfill stripe_subscription_id if user doesn't have one yet
-  if (!user.stripe_subscription_id && subscriptionId) {
-    updateData.stripe_subscription_id = subscriptionId;
-  }
 
   // Store the amount paid so it can be displayed in the admin Users tab
   if (typeof invoice.amount_paid === 'number' && invoice.amount_paid > 0) {
     updateData.subscription_amount = invoice.amount_paid;
   }
 
-  // Sync current_period_end and activeOffer from the live subscription
-  const subIdToFetch = subscriptionId || user.stripe_subscription_id;
-  if (subIdToFetch) {
+  // Pick the subscription to sync current_period_end / activeOffer from and,
+  // when the row has none, to backfill stripe_subscription_id with:
+  //  - A live stored subscription stays authoritative (an older, replaced
+  //    sub's final invoice, or a second live sub, cannot overwrite it).
+  //  - A non-subscription invoice (one-off, quote, PAYG) syncs the stored sub.
+  //  - Otherwise prefer the invoice's own subscription when it is live (a
+  //    resubscribe whose invoice.paid beats checkout.session.completed /
+  //    customer.subscription.created), else the customer's live subscription.
+  //  - With none live, nothing is backfilled; the stored sub (if any) is
+  //    synced as before. If the invoice's own sub has ENDED (a redelivered
+  //    final invoice of a canceled sub), the user is not flipped to active.
+  // stripe_subscription_id is only ever backfilled from a LIVE subscription.
+  let syncFrom: Stripe.Subscription | null = null;
+  let reactivate = true;
+  const primaryId = storedSubId || subscriptionId;
+  if (primaryId) {
     try {
       const s = getStripeOrThrow();
-      const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discount.coupon'] }) as any;
-      const invoicePeriodEndIso = getSubscriptionPeriodEndIso(subscription);
-      if (invoicePeriodEndIso) {
-        updateData.current_period_end = invoicePeriodEndIso;
+      const retrieve = (id: string) => s.subscriptions.retrieve(id, { expand: ['discounts'] });
+      const primary = await retrieve(primaryId);
+      if (LIVE_SUBSCRIPTION_STATUSES.has(primary.status) || !subscriptionId) {
+        syncFrom = primary;
+      } else {
+        let own: Stripe.Subscription | null = subscriptionId === primaryId ? primary : null;
+        if (!own) {
+          try {
+            own = await retrieve(subscriptionId);
+          } catch (err) {
+            console.warn(`[STRIPE] Failed to fetch invoice subscription ${subscriptionId}: ${err}`);
+          }
+        }
+        if (own && LIVE_SUBSCRIPTION_STATUSES.has(own.status)) {
+          syncFrom = own;
+        } else {
+          syncFrom = await findLiveCustomerSubscription(s, customerId);
+          if (!syncFrom) {
+            if (storedSubId) syncFrom = primary;
+            if (own && ENDED_SUBSCRIPTION_STATUSES.has(own.status)) reactivate = false;
+          }
+        }
       }
-      updateData.activeOffer = extractActiveOffer(subscription);
     } catch (err) {
-      console.warn(`[STRIPE] Failed to fetch subscription ${subIdToFetch} for period_end sync: ${err}`);
+      console.warn(`[STRIPE] Failed to fetch subscription ${primaryId} for period_end sync: ${err}`);
     }
   }
 
+  if (syncFrom) {
+    const invoicePeriodEndIso = getSubscriptionPeriodEndIso(syncFrom);
+    if (invoicePeriodEndIso) {
+      updateData.current_period_end = invoicePeriodEndIso;
+    }
+    updateData.activeOffer = extractActiveOffer(syncFrom);
+  }
+
+  // Backfill stripe_subscription_id if user doesn't have one yet — only with a live subscription
+  if (!storedSubId && syncFrom && LIVE_SUBSCRIPTION_STATUSES.has(syncFrom.status)) {
+    updateData.stripe_subscription_id = syncFrom.id;
+  }
+
+  if (reactivate) {
+    updateData.subscription_status = 'active';
+  } else {
+    console.log(
+      `[STRIPE] Invoice ${invoice.id} paid for ended subscription ${subscriptionId} and customer ${customerId} has no live subscription; user ${user.userId} status left unchanged`
+    );
+  }
+
   await userDb.updateUser(user.userId, updateData);
-  syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
+  if (reactivate) {
+    syncUserUpdateToLeadList(user.email, { subscription_status: 'active' });
+  }
 
   console.log(
-    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=active, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${subscriptionId}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}${updateData.current_period_end ? `, periodEnd=${updateData.current_period_end}` : ''}`
+    `[STRIPE] Invoice payment succeeded: user ${user.userId} → status=${reactivate ? 'active' : 'unchanged'}, has_payment_method=true${updateData.stripe_subscription_id ? `, backfilled sub=${updateData.stripe_subscription_id}` : ''}${updateData.subscription_amount ? `, amount=${updateData.subscription_amount}` : ''}${updateData.current_period_end ? `, periodEnd=${updateData.current_period_end}` : ''}`
   );
 }
 
@@ -1017,14 +1533,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 
           // Derive tier from the remaining subscription's price.
           //
-          // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone
-          // by the seat-billing (ENG-2243..2246) correctness review as
-          // low-risk: this only sets subscriptionType/allowedPages, and a
-          // seat item sorting first here would just skip that sync rather
-          // than corrupt billing state. See findBasePlanItem's doc comment
-          // for why position-based lookup is otherwise unsafe once a seat
-          // item can coexist on the same subscription.
-          const priceId = activeSub.items?.data?.[0]?.price?.id;
+          const priceId = findBasePlanItem(activeSub)?.price?.id;
           if (priceId) {
             const newType = deriveSubscriptionTypeFromPriceId(priceId);
             if (newType) {
@@ -1048,6 +1557,8 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             subscriptionType: updateData.subscriptionType,
             subscription_status: updateData.subscription_status,
           });
+          // The deleted subscription may have carried the hot lead calls add-on: judge it from the surviving one.
+          await mirrorHotLeadCallBilling(user, activeSub);
           console.log(
             `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
           );
@@ -1082,6 +1593,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     stripeSubscriptionId: subscription.id,
   });
 
+  // A deleted subscription takes its add-on item with it (the payload still lists the item, with status 'canceled').
+  await mirrorHotLeadCallBilling(user, subscription);
+
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
 }
 
@@ -1100,6 +1614,13 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * Handle invoice.payment_failed — mark subscription as past_due and record the failure.
  */
 export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
+  // ENG-668: a failed overage charge suspends pay-as-you-go; it does not make the SUBSCRIPTION past_due.
+  if (invoice?.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE) {
+    const { handlePaygOverageInvoicePaymentFailed } = await import('./paygSettlementService');
+    await handlePaygOverageInvoicePaymentFailed(invoice);
+    return;
+  }
+
   const customerId = typeof invoice.customer === 'string'
     ? invoice.customer
     : invoice.customer?.id;
@@ -1115,9 +1636,7 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
     return;
   }
 
-  const subscriptionId = typeof invoice.subscription === 'string'
-    ? invoice.subscription
-    : invoice.subscription?.id || null;
+  const subscriptionId = invoiceSubscriptionId(invoice);
 
   await userDb.updateUser(user.userId, {
     subscription_status: 'past_due',
@@ -1146,10 +1665,197 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
 }
 
 /**
+ * ENG-668 PR-2: the overage invoice behind a refunded or disputed charge. Recognising an overage charge
+ * costs a Stripe call per non-top-up charge that has a PaymentIntent.
+ *   - Disputes (`raise`) are looked up whether or not settlement is switched on: the switch stops NEW
+ *     charges, but a chargeback on an overage invoice already collected must still hold PAYG, and its
+ *     closing must still lift (or keep) that hold. For any other charge the outcome is unchanged; a failed
+ *     lookup raises, so the webhook answers 500 and Stripe redelivers — acknowledging a chargeback on an
+ *     overage charge unrecognised would drop it for good.
+ *   - Refunds (`alert`) are looked up only while settlement is on (`requireSwitch`), so with it off the
+ *     refund webhook is exactly as before and makes no extra call. When the lookup fails, the refund is
+ *     handled as before (it is recorded either way) and on-call is told it could not be checked.
+ */
+async function findPaygOverageInvoiceForChargeEvent(
+  charge: PaygChargeRef,
+  event: string,
+  onLookupFailure: 'raise' | 'alert',
+): Promise<Stripe.Invoice | null> {
+  // Only an invoice charge has a PaymentIntent to look up; anything else is never an overage charge.
+  if (!charge?.payment_intent) return null;
+  if (onLookupFailure === 'alert') {
+    const { paygSettlementSwitch } = await import('./paygOverageService');
+    if (!(await paygSettlementSwitch.isEnabled())) return null;
+  }
+  try {
+    return await stripeService.findPaygOverageInvoiceForCharge(charge);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (onLookupFailure === 'raise') {
+      throw new Error(`${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice (${message}); retry`);
+    }
+    console.error(`[STRIPE] ${event}: could not check whether charge ${charge?.id} paid a pay-as-you-go invoice; handling it as before:`, message);
+    try {
+      const { emailService } = await import('./emailService');
+      await emailService.sendOncallAlert(
+        `PAYG settlement: ${event} for charge ${charge?.id} could not be checked`,
+        `Stripe's invoice lookup failed (${message}), so ${event} for charge ${charge?.id} was handled as a `
+          + 'non-overage charge. If it paid a pay-as-you-go overage invoice, record it on that month\'s settlement by hand.',
+        { 'Alert Class': 'payg-settlement-lookup', chargeId: charge?.id ?? null, event },
+      );
+    } catch (alertError: unknown) {
+      console.error(`[STRIPE] ${event}: on-call alert failed:`, alertError instanceof Error ? alertError.message : alertError);
+    }
+    return null;
+  }
+}
+
+/**
+ * ENG-668: `invoice.voided`, `invoice.marked_uncollectible` and `invoice.payment_action_required` matter
+ * here only for a pay-as-you-go overage invoice (a subscription's are left to Stripe as before): each is
+ * handed to settlement, anything else is logged and acknowledged.
+ */
+export async function handleInvoiceVoided(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoiceVoided } = await import('./paygSettlementService');
+  await handlePaygOverageInvoiceVoided(invoice);
+}
+
+export async function handleInvoiceMarkedUncollectible(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoiceMarkedUncollectible } = await import('./paygSettlementService');
+  await handlePaygOverageInvoiceMarkedUncollectible(invoice);
+}
+
+export async function handleInvoicePaymentActionRequired(invoice: Stripe.Invoice): Promise<void> {
+  if (invoice?.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE) return;
+  const { handlePaygOverageInvoicePaymentActionRequired } = await import('./paygSettlementService');
+  await handlePaygOverageInvoicePaymentActionRequired(invoice);
+}
+
+/**
+ * ENG-668 PR-2: `setup_intent.succeeded` — a customer saved a payment method. Settlement pins a card on
+ * an overage invoice (`default_payment_method`) only when the customer has no invoice default — which is
+ * every customer who saved a card through the setup-mode Checkout (ENG-2571 / ENG-2303), since that flow
+ * sets none. An invoice's own payment method overrides the customer's for every automatic retry (Stripe:
+ * "If not set, defaults to ... the default payment method in the customer's invoice settings"), so after
+ * the owner saves a new card, Stripe would keep retrying the old one. Each OPEN overage invoice of this
+ * customer that is pinned to another method is therefore pointed at the one just saved (an open invoice's
+ * `default_payment_method` stays editable after finalizing), and Stripe's next attempt charges it.
+ *
+ *   - Only to the customer's NEWEST attached card: events are not ordered, so a SetupIntent for an older
+ *     card that arrives late never moves the invoice back to it (and a detached or non-card method is
+ *     never used).
+ *   - Finding the invoices: a SetupIntent tagged with the user (Zoma's Checkout) reads that user's row
+ *     (the indexed read); an untagged one asks Stripe for the customer's open invoices (one list call;
+ *     AW-Users has no index on `stripe_customer_id`, and a scan per saved card is not acceptable). Either
+ *     way an invoice is touched only if its owner's settlement record still names it, unpaid.
+ *   - Stripe refusing one update (the card was detached meanwhile) is logged, the other invoices are
+ *     still re-pointed, and on-call is told once; the webhook is acknowledged.
+ *
+ * Nothing else changes: no subscription, checkout or customer field is touched. A failed lookup before any
+ * open overage invoice is known is logged and the event acknowledged, as before this handler existed.
+ * Requires `setup_intent.succeeded` on the webhook endpoint.
+ */
+export async function handleSetupIntentSucceeded(setupIntent: Pick<Stripe.SetupIntent, 'id' | 'customer' | 'payment_method' | 'metadata'>): Promise<void> {
+  const customerId = typeof setupIntent?.customer === 'string' ? setupIntent.customer : setupIntent?.customer?.id;
+  const paymentMethodId = typeof setupIntent?.payment_method === 'string' ? setupIntent.payment_method : setupIntent?.payment_method?.id;
+  if (!customerId || !paymentMethodId) return;
+  const s = getStripeOrThrow();
+  type SettlementRow = { userId?: string; paygSettlements?: Record<string, { status?: string; invoiceId?: string }> };
+  const unpaid = (row: SettlementRow | null | undefined, month: string | undefined, invoiceId: string) => {
+    const record = month ? row?.paygSettlements?.[month] : undefined;
+    return !!record && record.invoiceId === invoiceId && (record.status === 'invoiced' || record.status === 'failed');
+  };
+
+  // Discovery: which of this customer's invoices could be open overage invoices. A failure here is
+  // logged and the event acknowledged (most saved cards have nothing to do with PAYG).
+  let taggedUser: SettlementRow | null = null;
+  let listed: Stripe.Invoice[] = [];
+  const taggedUserId = String(setupIntent?.metadata?.userId || '');
+  try {
+    if (taggedUserId) taggedUser = (await userDb.getUserById(taggedUserId)) as SettlementRow | null;
+    else listed = (await s.invoices.list({ customer: customerId, status: 'open', limit: 100 })).data
+      .filter((invoice) => invoice.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE);
+  } catch (error: unknown) {
+    console.error(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: could not look up open overage invoices; none re-pointed:`,
+      error instanceof Error ? error.message : error);
+    return;
+  }
+  // From here an open overage invoice is known: a Stripe or row-read error fails the webhook so Stripe
+  // redelivers (the update itself never does — see below).
+  const invoices: Stripe.Invoice[] = [];
+  if (taggedUserId) {
+    for (const [month, record] of Object.entries(taggedUser?.paygSettlements ?? {})) {
+      if (typeof record?.invoiceId !== 'string' || !unpaid(taggedUser, month, record.invoiceId)) continue;
+      const invoice = await retrieveInvoiceIfExists(s, record.invoiceId);
+      if (invoice && invoice.metadata?.billingUserId === taggedUser?.userId) invoices.push(invoice);
+    }
+  } else {
+    for (const invoice of listed) {
+      const owner = (await userDb.getUserById(String(invoice.metadata?.billingUserId || ''))) as SettlementRow | null;
+      if (unpaid(owner, invoice.metadata?.month, invoice.id!)) invoices.push(invoice);
+    }
+  }
+  const pinnedElsewhere = invoices.filter((invoice) => {
+    const invoiceCustomer = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+    const pinned = typeof invoice.default_payment_method === 'string' ? invoice.default_payment_method : invoice.default_payment_method?.id;
+    // Only a pin settlement set, on this customer's open overage invoice, to another method. An unpinned
+    // invoice already follows the customer's own default.
+    return invoice.status === 'open' && invoice.metadata?.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE
+      && invoiceCustomer === customerId && !!pinned && pinned !== paymentMethodId;
+  });
+  if (!pinnedElsewhere.length) return;
+
+  // The newest card attached to the customer, so out-of-order events can only ever move forward.
+  const cards = (await s.paymentMethods.list({ customer: customerId, type: 'card', limit: 100 })).data;
+  const newest = [...cards].sort((a, b) => b.created - a.created)[0];
+  if (newest?.id !== paymentMethodId) {
+    console.log(`[STRIPE] setup_intent.succeeded ${setupIntent?.id}: ${paymentMethodId} is not ${customerId}'s newest attached card (${newest?.id ?? 'none'}); no overage invoice re-pointed`);
+    return;
+  }
+  const refused: Array<{ invoiceId: string; error: string }> = [];
+  for (const invoice of pinnedElsewhere) {
+    try {
+      await s.invoices.update(invoice.id!, { default_payment_method: paymentMethodId }, { idempotencyKey: `payg-repoint:${invoice.id}:${paymentMethodId}` });
+      console.log(`[STRIPE] overage invoice ${invoice.id} (${invoice.metadata?.billingUserId}) now charges the newly saved ${paymentMethodId}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[STRIPE] re-pointing overage invoice ${invoice.id} to ${paymentMethodId} was refused:`, message);
+      refused.push({ invoiceId: invoice.id!, error: message });
+    }
+  }
+  if (refused.length) {
+    try {
+      const { emailService } = await import('./emailService');
+      await emailService.sendOncallAlert(
+        `PAYG: ${refused.length} overage invoice(s) could not be moved to a newly saved card`,
+        `Customer ${customerId} saved ${paymentMethodId}, but Stripe refused to make it the payment method of `
+          + `${refused.map((r) => r.invoiceId).join(', ')}. Stripe keeps retrying the card pinned on those invoices; the `
+          + 'owner can still pay each on its hosted page. Check the card in Stripe and set the invoice\'s payment method by hand if needed.',
+        { 'Alert Class': 'payg-settlement-repoint', customerId, paymentMethodId, refused },
+      );
+    } catch (alertError: unknown) {
+      console.error('[STRIPE] re-point on-call alert failed:', alertError instanceof Error ? alertError.message : alertError);
+    }
+  }
+}
+
+/**
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
   const metadata = charge.metadata || {};
+  // ENG-668: a refunded pay-as-you-go overage charge is recorded against its settlement only. It never
+  // lifts a suspension (refunding an overage is not a reason to resume billing it).
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.refunded', 'alert');
+    if (overageInvoice) {
+      const { handlePaygOverageChargeRefunded } = await import('./paygSettlementService');
+      await handlePaygOverageChargeRefunded(charge, overageInvoice);
+      return;
+    }
+  }
   const customerId = typeof charge.customer === 'string'
     ? charge.customer
     : charge.customer?.id;
@@ -1249,6 +1955,13 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
 
   const metadata = charge.metadata || {};
   if (metadata.purchaseType !== 'llm_usage_top_up') {
+    // ENG-668: a chargeback on a pay-as-you-go overage charge suspends pay-as-you-go.
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.dispute.created', 'raise');
+    if (overageInvoice) {
+      const { handlePaygOverageChargeDisputed } = await import('./paygSettlementService');
+      await handlePaygOverageChargeDisputed(dispute, charge, overageInvoice);
+      return;
+    }
     console.log(
       `[STRIPE] Dispute ${dispute.id} is not an AgentWeb Credits purchase; no capacity to revoke`
     );
@@ -1349,7 +2062,17 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
   if (!charge) return;
 
   const metadata = charge.metadata || {};
-  if (metadata.purchaseType !== 'llm_usage_top_up') return;
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    // ENG-668: a closed dispute on a pay-as-you-go overage charge — won lifts its hold, lost writes the
+    // month off — whether or not settlement is switched on. A failed lookup errors the webhook so Stripe
+    // redelivers (as for the dispute opening).
+    const overageInvoice = await findPaygOverageInvoiceForChargeEvent(charge, 'charge.dispute.closed', 'raise');
+    if (overageInvoice) {
+      const { handlePaygOverageChargeDisputeClosed } = await import('./paygSettlementService');
+      await handlePaygOverageChargeDisputeClosed(dispute, charge, overageInvoice);
+    }
+    return;
+  }
 
   const billingUserId = String(metadata.billingUserId || '');
   const user = billingUserId ? await userDb.getUserById(billingUserId) : null;
@@ -1435,9 +2158,41 @@ export async function handleSubscriptionScheduleEnded(schedule: any): Promise<vo
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
+/** The part of a subscription (any API version) the activeOffer reads. */
+interface SubscriptionDiscountSource {
+  discounts?: Array<string | Stripe.Discount> | null;
+  /** Pre-Basil location. */
+  discount?: Stripe.Discount | null;
+}
+
 /**
- * Extract activeOffer from a Stripe subscription's discount field.
- * Returns null when there is no discount or the discount has no coupon.
+ * The subscription discount an activeOffer describes.
+ *
+ * Basil (2025-03-31+) removed `subscription.discount`; a subscription carries
+ * `discounts: Array<string | Stripe.Discount>`, ids unless expanded with
+ * `expand: ['discounts']` (list: `data.discounts`). A Basil Discount embeds its
+ * `coupon` (not expandable, no `source` wrapper in this version).
+ *
+ * When several discounts apply, the first listed entry of `discounts` is used,
+ * so the pick is deterministic (Stripe does not document the list order as the
+ * order discounts are applied). The legacy `discount` (pre-Basil webhook payloads) is the
+ * fallback when that entry is not expanded. Returns the discount's id when it
+ * is not expanded and no legacy discount is present (the caller must fetch).
+ */
+function pickSubscriptionDiscount(
+  subscription: SubscriptionDiscountSource | null | undefined
+): Stripe.Discount | string | null {
+  const first = Array.isArray(subscription?.discounts) ? subscription.discounts[0] : undefined;
+  if (first && typeof first === 'object' && first.coupon) return first;
+  const legacy = subscription?.discount;
+  if (legacy && typeof legacy === 'object' && legacy.coupon) return legacy;
+  return typeof first === 'string' && first ? first : null;
+}
+
+/**
+ * Extract activeOffer from a Stripe subscription's discount (see
+ * pickSubscriptionDiscount). Returns null when there is no discount, the
+ * discount has no coupon, or it is an unexpanded id.
  */
 function extractActiveOffer(subscription: any): {
   couponId: string;
@@ -1448,8 +2203,8 @@ function extractActiveOffer(subscription: any): {
   durationInMonths: number | null;
   endsAt: string | null;
 } | null {
-  const discount = subscription?.discount;
-  if (!discount || !discount.coupon) return null;
+  const discount = pickSubscriptionDiscount(subscription);
+  if (!discount || typeof discount === 'string') return null;
   const coupon = discount.coupon;
   return {
     couponId: coupon.id,
@@ -1570,7 +2325,7 @@ export async function reconcileStripeUser(
     customer: user.stripe_customer_id,
     status: 'all',
     limit: 10,
-    expand: ['data.discount.coupon'],
+    expand: ['data.discounts'],
   });
 
   // Find the most relevant subscription: active > trialing > past_due > canceled
@@ -1602,14 +2357,7 @@ export async function reconcileStripeUser(
 
   // Derive tier.
   //
-  // NOTE: still `items.data[0]`, not `findBasePlanItem`. Same hazard class as
-  // syncSubscriptionFromStripe above (not one of the sites the seat-billing
-  // ENG-2243..2246 correctness review named, but identical in kind): a seat
-  // item sorting first here would just leave this admin-triggered
-  // reconciliation skipping a tier overwrite rather than corrupting billing
-  // state. See findBasePlanItem's doc comment before reusing this pattern
-  // anywhere a subscription's items can include a seat line item.
-  const priceId = sub.items?.data?.[0]?.price?.id;
+  const priceId = findBasePlanItem(sub)?.price?.id;
   const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
 
   // Build updates only for fields that are wrong
@@ -1797,14 +2545,15 @@ export async function resyncAllSubscriptionAmounts(): Promise<{
         console.log(`[STRIPE RESYNC] ${user.email}: reconciled ${Object.keys(reconcileUpdates).join(', ')}`);
       }
 
-      // 2. Refresh subscription_amount from the latest paid invoice.
+      // 2. Refresh subscription_amount from the latest paid invoice. A pay-as-you-go overage invoice
+      //    (ENG-668) is not the subscription's price, so it is skipped.
       const invoices = await stripe.invoices.list({
         customer: user.stripe_customer_id,
         status: 'paid',
-        limit: 1,
+        limit: 10,
       });
 
-      const latestPaid = invoices.data[0];
+      const latestPaid = invoices.data.find((inv) => inv.metadata?.purchaseType !== PAYG_OVERAGE_PURCHASE_TYPE);
       if (!latestPaid || typeof latestPaid.amount_paid !== 'number' || latestPaid.amount_paid <= 0) {
         if (!reconcileUpdates) summary.skipped++;
         continue;

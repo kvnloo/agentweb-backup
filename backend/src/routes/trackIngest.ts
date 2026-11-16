@@ -23,7 +23,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { getIngestList, ingestTrackerEvent } from '../services/trackerIngestService';
 import { isSessionList } from '../utils/sessionList';
-import { parseIngestBody } from '../utils/trackingIngest';
+import { allowListFor, parseIngestBody } from '../utils/trackingIngest';
 import { isOriginAllowed, isPlausibleListId } from '../utils/trackingConfig';
 
 export const MAX_INGEST_BODY = '16kb';
@@ -106,7 +106,7 @@ export function createTrackIngestRouter(opts: { rateLimiter?: express.RequestHan
 
   router.post('/event', (req, res, next) => { setCors(res); next(); }, ipLimiter, limiter, async (req: Request, res: Response) => {
     try {
-      const parsed = parseIngestBody(req.body, Date.now());
+      const parsed = parseIngestBody(req.body, Date.now(), allowListFor((req.body as { listId?: unknown } | undefined)?.listId));
       if (!parsed.ok) {
         res.status(400).json({ success: false, code: parsed.code, message: parsed.message });
         return;

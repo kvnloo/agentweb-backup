@@ -380,7 +380,7 @@ export type DailyVolumeClass = 'invite' | 'message';
  * send volume, so this rule doesn't apply to them — they stay governed by the
  * hourly/burst pacer above only.
  */
-function dailyVolumeClassFor(action: string): DailyVolumeClass | null {
+export function dailyVolumeClassFor(action: string): DailyVolumeClass | null {
   if (action === 'send-invite') return 'invite';
   if (action === 'send-message' || action === 'send-inmail') return 'message';
   return null;

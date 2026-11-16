@@ -39,12 +39,35 @@ export function normalizeOpenRouterResponseMetadata(res: any): OpenRouterMetadat
   };
 }
 
-/** Normalize the resolved provider/is_byok slot off a thrown OpenRouter error, when present. */
-export function normalizeOpenRouterErrorMetadata(error: any): OpenRouterMetadataSlot {
+/** Max chars of the upstream provider body kept in a log line. */
+export const UPSTREAM_ERROR_LOG_MAX_CHARS = 500;
+
+/**
+ * Normalize the resolved provider/is_byok slot off a thrown OpenRouter error, when present.
+ *
+ * ENG-2721: an OpenRouter "400 Provider returned error" carries the real upstream
+ * reason only in the ErrorResponse's `metadata = { provider_name, raw }`, which is
+ * top-level, not under `endpoints`. Before this, the failure log printed
+ * `provider: undefined` and dropped `raw`, so a mid-run 400 left no root cause in
+ * the logs. `upstream_error` is bounded so a large provider body cannot flood logs.
+ */
+export function normalizeOpenRouterErrorMetadata(
+  error: any,
+): OpenRouterMetadataSlot & { upstream_error?: string } {
   const metadata = error?.metadata ?? error?.error?.metadata;
+  const provider = extractProvider(metadata?.openrouter_metadata ?? metadata)
+    ?? (typeof metadata?.provider_name === 'string' ? metadata.provider_name : undefined);
+  const raw = metadata?.raw;
+  let upstreamError: string | undefined;
+  if (typeof raw === 'string' && raw.length > 0) {
+    upstreamError = raw;
+  } else if (raw !== undefined && raw !== null) {
+    try { upstreamError = JSON.stringify(raw); } catch { upstreamError = String(raw); }
+  }
   return {
-    provider: extractProvider(metadata?.openrouter_metadata ?? metadata),
+    provider,
     is_byok: typeof metadata?.is_byok === 'boolean' ? metadata.is_byok : undefined,
+    ...(upstreamError ? { upstream_error: upstreamError.slice(0, UPSTREAM_ERROR_LOG_MAX_CHARS) } : {}),
   };
 }
 

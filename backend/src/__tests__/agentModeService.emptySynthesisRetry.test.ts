@@ -1,4 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
+import { EMPTY_FINAL_RESPONSE_FALLBACK } from '../services/agentMode/core/termination';
 
 // Mock all dependencies
 jest.mock('openai');
@@ -220,8 +221,9 @@ describe('AgentModeService - Empty Synthesis Retry', () => {
       'test-session'
     );
 
-    // No tool calls ran, so no synthesis nudge — exits immediately
-    expect(result.content).toBe('');
+    // No tool calls ran, so no synthesis nudge — exits immediately. Opslane 2026-10-13:
+    // the empty answer is replaced by a short fallback rather than returned/stored as "".
+    expect(result.content).toBe(EMPTY_FINAL_RESPONSE_FALLBACK);
     expect(callLLMSpy).toHaveBeenCalledTimes(1);
   });
 });

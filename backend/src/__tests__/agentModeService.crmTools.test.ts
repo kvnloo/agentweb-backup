@@ -33,6 +33,12 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../services/contactGuard', () => ({
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+}));
+
 jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
@@ -577,10 +583,10 @@ describe('AgentModeService - CRM Tools', () => {
       expect(notEmptyResult.leads[0].leadId).toBe(leadId);
     });
 
-    it('should return error when no filters provided', async () => {
+    it('should return error when no filters, search, or list scope provided (ENG-2360)', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
 
-      const result = await service.searchLeads(listId, [], userId);
+      const result = await service.searchLeads(undefined as any, [], userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('filter');
@@ -2187,6 +2193,22 @@ describe('AgentModeService - CRM Tools', () => {
       });
       // Should clear draft after sending
       expect(mockCrmDb.updateLead).toHaveBeenCalledWith(listId, leadId, { emailDraft: null });
+    });
+
+    it('ENG-673: refuses to email a lead pushed to Smartlead, and says why; a released marker is fine', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      const marker = { state: 'pushed', pushedAt: 'x', runId: 'r', payloadHash: 'h' };
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, system: { smartlead_77: marker } } as any);
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Smartlead');
+      expect(mockResend.sendEmail).not.toHaveBeenCalled();
+
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, system: { smartlead_77: { ...marker, state: 'released' } } } as any);
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({ success: true, senders: [{ id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales' }], defaultSenderId: 'sender-1' });
+      mockResend.sendEmail.mockResolvedValue({ id: 'email-9' } as any);
+      expect((await service.sendEmailToLead(listId, leadId, userId)).success).toBe(true);
     });
 
     it('should fall back to list sender when lead has no selected sender', async () => {

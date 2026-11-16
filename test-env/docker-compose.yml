@@ -12,7 +12,21 @@ services:
       - NODE_ENV=development
       - FRONTEND_URL=http://${PUBLIC_IP}:5173
       - CUSTOMER_FRONTEND_URL=http://${PUBLIC_IP}:5174
+      # Empty by default (real Smartlead). Set to http://smartlead-stub:4010/api/v1 and start the
+      # smartlead-stub profile to test the Smartlead key flow without a real key (ENG-673).
+      - SMARTLEAD_API_BASE_URL=${SMARTLEAD_API_BASE_URL:-}
       # BACKEND_URL is intentionally omitted here — read from .env.test-env (contains the ngrok HTTPS URL)
+    restart: unless-stopped
+
+  smartlead-stub:
+    image: node:22-alpine
+    profiles: ["smartlead-stub"]
+    working_dir: /app
+    volumes:
+      - ./smartlead-stub.js:/app/smartlead-stub.js:ro
+    command: node smartlead-stub.js
+    ports:
+      - "4010:4010"
     restart: unless-stopped
 
   ngrok:

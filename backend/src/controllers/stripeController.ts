@@ -14,10 +14,23 @@ import {
   handleChargeDisputeCreated,
   handleChargeDisputeClosed,
   handleSubscriptionScheduleEnded,
+  handleInvoiceVoided,
+  handleInvoiceMarkedUncollectible,
+  handleInvoicePaymentActionRequired,
+  handleSetupIntentSucceeded,
   reconcileAllStripeUsers,
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
+  isSetupModeCheckoutSession,
+  PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
+import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
+import { emitStripeSignals, emitAccountSignal } from '../services/serverSignalEmitter';
+import {
+  InMemoryPaymentFeedbackAskLedger,
+  isPaymentFeedbackAskEnabled,
+  shouldSendPaymentFeedbackAsk,
+} from '../services/paymentFeedbackTrigger';
 
 const CUSTOMER_FRONTEND_URL =
   process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -62,6 +75,11 @@ export async function createCheckoutSession(req: Request, res: Response) {
       cancelUrl || `${CUSTOMER_FRONTEND_URL}/pricing`
     );
 
+    // ENG-2684: fire-and-forget hireemma.ai session-list signal; never affects the response.
+    void userDb.getUserById(userId)
+      .then((user: any) => emitAccountSignal(user, 'checkout_started', { checkoutSessionId: session.id || '', priceId: String(priceId).slice(0, 120) }))
+      .catch(() => undefined);
+
     res.json({ url: session.url, sessionId: session.id });
   } catch (error: any) {
     console.error('Error creating checkout session:', error.message);
@@ -91,7 +109,10 @@ export async function handleWebhook(req: Request, res: Response) {
   try {
     switch (event.type) {
       case 'checkout.session.completed':
-        if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
+        if (isSetupModeCheckoutSession(event.data.object)) {
+          // Saved a payment method only (ENG-2303 Zoma onboarding); no subscription exists.
+          console.log(`[STRIPE] Setup-mode checkout ${event.data.object?.id} completed; no subscription changes.`);
+        } else if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
           await handleLlmUsageTopUpCheckoutCompleted(event.data.object);
         } else {
           await handleCheckoutSessionCompleted(event.data.object);
@@ -126,11 +147,29 @@ export async function handleWebhook(req: Request, res: Response) {
       case 'invoice.paid':
       case 'invoice.payment_succeeded':
         await handleInvoicePaymentSucceeded(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_succeeded');
+        // A pay-as-you-go overage invoice is recorded by settlement under its own payment types.
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_succeeded');
+        logPaymentFeedbackAskDecision(event.data.object);
         break;
       case 'invoice.payment_failed':
         await handleInvoicePaymentFailed(event.data.object);
-        await handleInvoicePayment(event.data.object, 'payment_failed');
+        if (!isPaygOverageInvoiceEvent(event)) await handleInvoicePayment(event.data.object, 'payment_failed');
+        break;
+      // ENG-668: pay-as-you-go overage invoices only (subscription invoices are a no-op here). Like the
+      // dispute events, these must be enabled on the Stripe webhook endpoint.
+      case 'invoice.voided':
+        await handleInvoiceVoided(event.data.object);
+        break;
+      case 'invoice.marked_uncollectible':
+        await handleInvoiceMarkedUncollectible(event.data.object);
+        break;
+      case 'invoice.payment_action_required':
+        await handleInvoicePaymentActionRequired(event.data.object);
+        break;
+      // ENG-668: a newly saved card replaces the one settlement pinned on an open overage invoice, so
+      // Stripe's retries charge it. Must be enabled on the webhook endpoint like the events above.
+      case 'setup_intent.succeeded':
+        await handleSetupIntentSucceeded(event.data.object);
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
@@ -163,7 +202,18 @@ export async function handleWebhook(req: Request, res: Response) {
     // CRM signal (B3): mirror billing events into AW-ContactEvents so lifecycle
     // and health scores reflect live billing state. Fire-and-forget — never
     // blocks the webhook ack. Errors are swallowed inside the hook.
-    void sendStripeEventToCrm(event);
+    // A setup-mode checkout is not a subscription event (it would map to payment.subscribed).
+    // Nor is a pay-as-you-go overage invoice (ENG-668): the CRM mirror models the subscription.
+    // Nor is a saved payment method (`setup_intent.succeeded`).
+    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))
+      && event.type !== 'setup_intent.succeeded'
+      && !isPaygOverageInvoiceEvent(event)) {
+      void sendStripeEventToCrm(event);
+    }
+
+    // ENG-2684: billing signals into the hireemma.ai session list. Fire-and-forget; emitStripeSignals
+    // never throws, so the webhook ack is unaffected by any emission failure.
+    if (!isPaygOverageInvoiceEvent(event)) void emitStripeSignals(event);
 
     res.json({ received: true });
   } catch (error: any) {
@@ -295,13 +345,34 @@ async function handleInvoicePayment(
       currency: invoice.currency || 'usd',
       status: invoice.status || eventType,
       stripeInvoiceId: invoice.id,
-      stripeSubscriptionId: invoice.subscription || undefined,
-      priceId: invoice.lines?.data?.[0]?.price?.id || undefined,
+      stripeSubscriptionId: invoiceSubscriptionId(invoice) || undefined,
+      priceId: invoiceLinePriceId(invoice.lines?.data?.[0]) || undefined,
       planName: invoice.lines?.data?.[0]?.description || undefined,
     });
   } catch (err: any) {
     console.error(`[PaymentHistory] Failed to record ${eventType}: ${err.message}`);
   }
+}
+
+// ENG-2856: process-local idempotency; the dark trigger only logs, so a restart re-asking is harmless.
+const paymentFeedbackAskLedger = new InMemoryPaymentFeedbackAskLedger();
+
+/** ENG-2856: dark post-payment feedback-ask trigger. Logs the decision only; never throws into the webhook. */
+function logPaymentFeedbackAskDecision(invoice: unknown): void {
+  try {
+    const enabled = isPaymentFeedbackAskEnabled();
+    if (!enabled) return;
+    const decision = shouldSendPaymentFeedbackAsk(invoice, { enabled, ledger: paymentFeedbackAskLedger });
+    console.log('[PaymentFeedbackAsk] decision', JSON.stringify(decision));
+  } catch (err: any) {
+    console.error(`[PaymentFeedbackAsk] decision failed: ${err?.message || err}`);
+  }
+}
+
+/** ENG-668: an `invoice.*` event for a pay-as-you-go overage invoice (settlement's, not the subscription's). */
+function isPaygOverageInvoiceEvent(event: { type: string; data: { object: unknown } }): boolean {
+  const metadata = (event.data?.object as { metadata?: Record<string, string> | null } | undefined)?.metadata;
+  return event.type.startsWith('invoice.') && !!metadata?.purchaseType && metadata.purchaseType === PAYG_OVERAGE_PURCHASE_TYPE;
 }
 
 /**
@@ -315,9 +386,12 @@ async function sendStripeEventToCrm(event: any): Promise<void> {
   try {
     const obj = event?.data?.object || {};
     const customerId = typeof obj.customer === 'string' ? obj.customer : obj.customer?.id;
-    const subscriptionId = typeof obj.subscription === 'string'
-      ? obj.subscription
-      : obj.subscription?.id || (obj.object === 'subscription' ? obj.id : undefined);
+    // Basil moved an invoice's subscription under `parent` (ENG-2599).
+    const subscriptionId = obj.object === 'invoice'
+      ? invoiceSubscriptionId(obj) || undefined
+      : typeof obj.subscription === 'string'
+        ? obj.subscription
+        : obj.subscription?.id || (obj.object === 'subscription' ? obj.id : undefined);
 
     // Resolve email: prefer customer_details from checkout; fallback to user lookup by Stripe customer id.
     let email: string | undefined = obj.customer_details?.email || obj.customer_email || undefined;

@@ -1,10 +1,9 @@
 /**
  * Issue intake orchestration — one place that decides where a filing goes.
  *
- * The FEATUREBASE_INTAKE flag is an EXPLICIT migration switch (Linear when on, Notion
- * when off — the off branch is deleted once the migration completes). It is NOT an
- * on-error fallback: we do not silently reroute a failed Linear write to Notion.
- * Instead we fail well —
+ * User-filed issues always go to Linear/Featurebase (the pre-migration Notion branch was
+ * removed in ENG-2817). There is no on-error fallback to another tracker. Instead we
+ * fail well —
  *   - non-critical sub-steps (dedup search, upvote, comment) are best-effort and degrade
  *     in place (dedup fails -> treat as new; upvote/comment fails -> still filed),
  *   - a core create failure propagates so the caller surfaces it (user-filed -> the user
@@ -96,10 +95,6 @@ async function findExactCanonicalMatch(
   return null;
 }
 
-function intakeEnabled(): boolean {
-  return process.env.FEATUREBASE_INTAKE === 'true';
-}
-
 /**
  * Idempotency keys for auto-issue dedup (ENG-240): the stable identifiers of the underlying event —
  * the failing Session ID and/or the owning Schedule ID. Two filers reacting to the SAME failure carry
@@ -122,7 +117,8 @@ function idempotencyKeys(context?: Record<string, any>): string[] {
 
 function contextLines(context?: Record<string, any>): string[] {
   if (!context) return [];
-  return Object.entries(context).map(([k, v]) => {
+  // ENG-2492: the legacy match key is matcher input only, never occurrence data.
+  return Object.entries(context).filter(([k]) => k !== 'Alert Legacy Key').map(([k, v]) => {
     const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
     return `- ${k}: ${val.length > 400 ? val.slice(0, 400) + '…' : val}`;
   });
@@ -242,8 +238,8 @@ export interface FileUserIssueParams {
 const LINEAR_PRIORITY: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4 };
 
 export interface FiledUserResult {
-  pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
-  trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
+  pageId: string;       // Featurebase post id
+  trackerUrl: string;   // internal tracker link (Featurebase post)
   userUrl?: string;     // public, user-facing Featurebase post link
   /**
    * Internal Linear canonical issue link (bugs only) — the single ticket eng works, whether this
@@ -257,18 +253,6 @@ export interface FiledUserResult {
 }
 
 export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserResult> {
-  // Migration switch (NOT a fallback): off -> Notion, the pre-migration default.
-  if (!intakeEnabled()) {
-    const { createOncallItem } = await import('./notionService');
-    const o = await createOncallItem({
-      title: p.title,
-      description: p.description,
-      additionalTags: p.notionTags || ['Customer Reported'],
-      context: p.notionContext,
-    });
-    return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Notion' };
-  }
-
   // Featurebase-first. Bugs -> a private per-reporter TICKET (their own card) grouped onto a
   // Linear canonical (the resolve-bridge notifies every reporter on fix). Feature requests ->
   // a public, votable POST. This split matches Featurebase's own guidance (public requests on
@@ -652,6 +636,16 @@ export interface FileAutoIssueParams {
  */
 const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
 const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
+const ALERT_SCOPE_CONTEXT_KEY = 'Alert Scope';
+/**
+ * ENG-2492: `Alert Legacy Key` (e.g. `accountId: <id>`) lets a classed alert fold onto an open
+ * canonical filed BEFORE its filer emitted an Alert Class line. Such a canonical carries no class
+ * marker and a title whose numbers moved ("still disconnected (42d)" vs "(56d)"), so neither the
+ * class nor the title fallback matched and every reminder filed a new issue. Matched only against
+ * open candidates with NO `Alert Class:` line, anchored as a whole context line, so a classed
+ * canonical of a different class can never absorb it. Not rendered into the issue body.
+ */
+const ALERT_LEGACY_KEY_CONTEXT_KEY = 'Alert Legacy Key';
 
 export interface FiledAutoResult {
   pageId: string;
@@ -667,8 +661,7 @@ export interface FiledAutoResult {
  * File an auto-identified issue in Linear. Callers should treat this as best-effort and wrap it
  * (a failed self-report must not break the user's real request) — it throws on a hard failure.
  *
- * Auto issues deliberately ignore FEATUREBASE_INTAKE: that flag controls the customer-facing
- * Featurebase migration, while Linear is the sole source of truth for system-generated work.
+ * Auto issues are private: Linear is the sole source of truth for system-generated work.
  */
 export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoResult> {
   const {
@@ -696,7 +689,7 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // the same issue. Collapsing amounts also lets pre-ENG-358 open canonicals (no class marker in
   // their body yet) keep matching new classed occurrences instead of spawning a parallel canonical.
   const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\$[\d,]+(?:\.\d+)?/g, '$').replace(/\s+/g, ' ');
-  const open = await listOpenIssuesByLabel('Auto', 50);
+  const open = await listOpenIssuesByLabel('Auto');
   // Dedup gate (ENG-240 / ENG-358). One failure event must never spawn 2-3 issues, and a recurring
   // alert must never file per occurrence, whichever filer reacts to it:
   //  1. Alert class — an open Auto issue whose body carries this alert's `Alert Class: <name>`
@@ -715,19 +708,54 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
   // thing on its own line.
   const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const classNeedle = alertClass
+  // ENG-2267: an optional `Alert Scope` narrows the class to one subject (e.g. one ad account),
+  // so a fleet detector that alerts per account files one canonical PER ACCOUNT instead of
+  // folding every customer's occurrence onto whichever account happened to file first.
+  const rawScope = p.notionContext?.[ALERT_SCOPE_CONTEXT_KEY];
+  const alertScope = rawScope === undefined || rawScope === null ? '' : String(rawScope).trim();
+  const classRe = alertClass
     ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
+  const scopeRe = alertScope
+    ? new RegExp(`${escapeRegExp(`${ALERT_SCOPE_CONTEXT_KEY}: ${alertScope}`)}\\s*$`, 'm')
+    : null;
+  const classNeedle = classRe
+    ? { test: (d: string) => classRe.test(d) && (!scopeRe || scopeRe.test(d)) }
     : null;
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
   const idKeys = idempotencyKeys(p.notionContext);
+  const rawLegacy = p.notionContext?.[ALERT_LEGACY_KEY_CONTEXT_KEY];
+  const legacyKey = rawLegacy === undefined || rawLegacy === null ? '' : String(rawLegacy).trim();
+  const legacyRe = classRe && legacyKey ? new RegExp(`^[-*]?\\s*${escapeRegExp(legacyKey)}\\s*$`, 'm') : null;
+  const anyClassRe = new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}:`)}`, 'm');
+  const legacyNeedle = legacyRe
+    ? { test: (d: string) => !anyClassRe.test(d) && legacyRe.test(d) }
+    : null;
   const match =
     (classNeedle ? open.find((i) => classNeedle.test(i.description || '')) : undefined) ||
+    (legacyNeedle ? open.find((i) => legacyNeedle.test(i.description || '')) : undefined) ||
     (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
     try {
-      await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));
+      const recurBody = [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n');
+      // ENG-2066: an hourly re-fire with byte-identical context (same day, same facts) adds no
+      // information — it buried ENG-2066 under ~20 identical comments in two days. Post only when
+      // this day's occurrence carries something new. Fails open: a comment-read error still posts.
+      let prior: { body: string }[] = [];
+      try {
+        const { getIssueCommentsDetailed } = await import('./linearService');
+        prior = (await getIssueCommentsDetailed(match.issueId)) || [];
+      } catch {
+        prior = []; // fail open
+      }
+      // Linear stores "- " bullets as "* ", so compare line-by-line with the bullet marker stripped.
+      const canon = (s: string) =>
+        (s || '').split('\n').map((l) => l.trim().replace(/^[-*]\s+/, '')).filter(Boolean).join('\n');
+      const target = canon(recurBody);
+      const alreadyPosted = (prior || []).some((c) => canon(c.body) === target);
+      if (!alreadyPosted) await addIssueComment(match.issueId, recurBody);
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
     }
@@ -794,6 +822,46 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // Outside production nothing is filed (ENG-1099). Report the suppression rather than a fake
     // issue id, so an alert email links nowhere instead of linking somewhere wrong.
     return { pageId: '', deduped: false, tracker: 'Linear', suppressed: true };
+  }
+
+  // Race reconciliation (ENG-2426). The gate above is list-then-create, so two concurrent filers
+  // (two processes, or two sweeps whose in-memory suppression maps are not shared) can both see no
+  // canonical and both create — ENG-2416/2417 were filed 0.3s apart. After creating, re-list with
+  // the SAME matcher; if an older open match exists, the oldest (lowest issue number) is the
+  // canonical. "Oldest wins" is deterministic, so every racer converges on one issue. Best-effort:
+  // any failure here returns the created issue exactly as before.
+  try {
+    const issueNumber = (identifier: string) => Number(String(identifier).split('-').pop()) || Number.MAX_SAFE_INTEGER;
+    const after = await listOpenIssuesByLabel('Auto');
+    const matches = after.filter(
+      (i) =>
+        i.identifier === li.identifier ||
+        (classNeedle ? classNeedle.test(i.description || '') : false) ||
+        (legacyNeedle ? legacyNeedle.test(i.description || '') : false) ||
+        (idKeys.length ? idKeys.some((k) => (i.description || '').includes(k)) : false) ||
+        norm(i.title) === norm(p.title),
+    );
+    const winner = matches.reduce<(typeof matches)[number] | undefined>(
+      (best, i) => (!best || issueNumber(i.identifier) < issueNumber(best.identifier) ? i : best),
+      undefined,
+    );
+    const loserId = li.id || after.find((i) => i.identifier === li.identifier)?.issueId;
+    if (winner && winner.identifier !== li.identifier && loserId) {
+      const { markIssueDuplicateOf } = await import('./linearService');
+      await markIssueDuplicateOf(loserId, winner.issueId);
+      await addIssueComment(
+        loserId,
+        `Duplicate of ${winner.identifier}: filed concurrently with it by a racing filer (ENG-2426). Occurrence recorded there.`,
+      );
+      try {
+        await addIssueComment(winner.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)} (concurrent filing ${li.identifier} folded in).`, ...contextLines(p.notionContext)].join('\n'));
+      } catch (e) {
+        console.warn('[intake] race recur-comment failed:', e instanceof Error ? e.message : e);
+      }
+      return { pageId: winner.identifier, url: `${LINEAR_ISSUE_BASE}/${winner.identifier}`, deduped: true, tracker: 'Linear' };
+    }
+  } catch (e) {
+    console.warn('[intake] auto race reconciliation failed:', e instanceof Error ? e.message : e);
   }
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }

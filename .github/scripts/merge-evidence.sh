@@ -133,6 +133,10 @@
 #
 # Environment:
 #   REPO                        owner/repo
+#   MERGE_EVIDENCE_DIRECTING_LOGIN GitHub login of the human directing the
+#                               agent. When it equals the PR author, the
+#                               FOREIGN_OWNER stop is lifted (ENG-2116 opt 2)
+#                               and the normal CI gate decides.
 #   PR_NUMBER                   pull request number
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
@@ -289,6 +293,14 @@ if [ -z "${foreign_reason}" ] && [ -n "${pr_head_ref}" ]; then
       "${prefix}"*) foreign_reason="head branch '${pr_head_ref}'"; break ;;
     esac
   done <<<"${FOREIGN_BRANCH_PREFIXES}"
+fi
+# ENG-2116 option 2 (approved by Harsha 2026-10-13): an Argusoft engineer's own
+# agent may merge that engineer's PR. Exact author match only; the head branch
+# must not carry a *different* owner's prefix. CI evidence below still decides.
+DIRECTING_LOGIN="${MERGE_EVIDENCE_DIRECTING_LOGIN:-}"
+if [ -n "${foreign_reason}" ] && [ -n "${DIRECTING_LOGIN}" ] && [ "${DIRECTING_LOGIN}" = "${pr_author}" ]; then
+  log "ENG-2116: ${REPO}#${PR_NUMBER} authored by directing user '${DIRECTING_LOGIN}'; owner-directed merge allowed, continuing to CI evidence."
+  foreign_reason=''
 fi
 if [ -n "${foreign_reason}" ]; then
   verdict 'FOREIGN_OWNER' "${REPO}#${PR_NUMBER} is owned by an Argusoft engineer (${foreign_reason}). Agents must not merge, auto-merge, push to, or close it; its owner merges it (ENG-2116)."
@@ -548,6 +560,119 @@ if [ -n "${RETIRED_CHECKS}" ]; then
     log "ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS, any conclusion: ${retired_names}"
   fi
 fi
+
+# Pass 4 — DROP OPSLANE'S "NOTHING TO VERIFY" NEUTRAL (ENG-2506).
+# Opslane reports `neutral` with the title "Nothing Opslane can verify here"
+# ("This check doesn't block the merge.") on PRs it has no opinion on. That is
+# an abstention, not a negative verdict, but section 4 counts every `neutral`
+# as bad, so it blocked every otherwise-proven PR (#3552, #3543). The match is
+# deliberately narrow: app slug AND name AND conclusion AND exact title. An
+# Opslane `failure`, or a `neutral` with any other title, still blocks. A
+# dropped abstention is not positive evidence either. Opslane uses more than
+# one abstention wording (#3559 got "Nothing to verify in this PR"), so the
+# exact-title match is against a closed allowlist.
+# #3967 got "Opslane couldn't test this commit" ("No test finished, so this
+# check doesn't block.") — the same abstention, a third wording.
+OPSLANE_NOOP_TITLES='["Nothing Opslane can verify here","Nothing to verify in this PR","Opslane couldn'"'"'t test this commit"]'
+# shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
+opslane_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
+  and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'
+opslane_noop="$(printf '%s' "${runs_json}" | jq -r --argjson t "${OPSLANE_NOOP_TITLES}" \
+  "[ .check_runs[] | ${opslane_filter} ] | length" 2>/dev/null)"
+if ! grep -qE '^[0-9]+$' <<<"${opslane_noop}"; then
+  hard_fail "failed to identify Opslane nothing-to-verify check-runs at ${head_sha}"
+fi
+if [ "${opslane_noop}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson t "${OPSLANE_NOOP_TITLES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude Opslane nothing-to-verify check-runs at ${head_sha}"
+  fi
+  log "ignored ${opslane_noop} Opslane (neutral) check-run(s) with an abstention title: an abstention, not a verdict"
+fi
+
+# Pass 4b — DROP CODERABBIT'S RATE-LIMIT NEUTRAL.
+# CodeRabbit is advisory only (AGENTS.md: never a required check, never hold a
+# proven PR because it is unavailable or rate-limited). When rate-limited it
+# posts `neutral` titled "Review rate limited" — no review happened, so it is
+# not a verdict (#3967 held three ticks on it). Narrow match: app slug AND name
+# AND conclusion AND exact title. A CodeRabbit `failure`, or a neutral with any
+# other title, still blocks. A dropped run is not evidence.
+CODERABBIT_NOOP_TITLES='["Review rate limited"]'
+# shellcheck disable=SC2016 # $t is a jq variable, not a shell expansion
+coderabbit_filter='select((.app.slug // "") == "coderabbitai" and .name == "CodeRabbit"
+  and .conclusion == "neutral" and ((.output.title // "") as $x | $t | index($x) != null))'
+coderabbit_noop="$(printf '%s' "${runs_json}" | jq -r --argjson t "${CODERABBIT_NOOP_TITLES}" \
+  "[ .check_runs[] | ${coderabbit_filter} ] | length" 2>/dev/null)"
+if ! grep -qE '^[0-9]+$' <<<"${coderabbit_noop}"; then
+  hard_fail "failed to identify CodeRabbit rate-limited check-runs at ${head_sha}"
+fi
+if [ "${coderabbit_noop}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson t "${CODERABBIT_NOOP_TITLES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${coderabbit_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude CodeRabbit rate-limited check-runs at ${head_sha}"
+  fi
+  log "ignored ${coderabbit_noop} CodeRabbit (neutral) rate-limited check-run(s): advisory, no review ran"
+fi
+
+# Pass 5 — DROP A HUNG OPSLANE RUN (ENG-2833).
+# Opslane is not a required check, and its check-runs regularly hang
+# `in_progress` for hours (#3907: >1h on four successive heads, rerequest 404
+# because the run is app-owned). Counted as pending, one hung advisory run held
+# a PR with every required check green forever. The match is narrow: app slug
+# AND name AND a non-completed status AND started_at older than the threshold.
+# A fresh Opslane run still holds as PENDING; a completed Opslane failure still
+# blocks; no other app's run is touched. A dropped run is not evidence.
+# MERGE_EVIDENCE_NOW (epoch seconds) exists only so the test suite can pin time.
+OPSLANE_STALE_MINUTES="${MERGE_EVIDENCE_OPSLANE_STALE_MINUTES:-30}"
+if ! grep -qE '^[0-9]+$' <<<"${OPSLANE_STALE_MINUTES}"; then
+  hard_fail "MERGE_EVIDENCE_OPSLANE_STALE_MINUTES must be a whole number of minutes, got '${OPSLANE_STALE_MINUTES}'"
+fi
+now_epoch="${MERGE_EVIDENCE_NOW:-$(date -u +%s)}"
+# shellcheck disable=SC2016 # $now/$max are jq variables
+opslane_hung_filter='select((.app.slug // "") == "opslane" and .name == "Opslane"
+  and (.status // "") != "completed" and (.started_at // "") != ""
+  and ($now - (.started_at | fromdateiso8601)) > ($max * 60))'
+if ! opslane_hung="$(printf '%s' "${runs_json}" | jq -r --argjson now "${now_epoch}" \
+  --argjson max "${OPSLANE_STALE_MINUTES}" "[ .check_runs[] | ${opslane_hung_filter} ] | length" 2>/dev/null)" \
+  || ! grep -qE '^[0-9]+$' <<<"${opslane_hung}"; then
+  hard_fail "failed to identify hung Opslane check-runs at ${head_sha}"
+fi
+if [ "${opslane_hung}" -gt 0 ]; then
+  if ! runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson now "${now_epoch}" \
+    --argjson max "${OPSLANE_STALE_MINUTES}" \
+    ".check_runs |= map(select(. as \$c | [\$c | ${opslane_hung_filter}] | length == 0))" 2>/dev/null)" \
+    || [ -z "${runs_json}" ]; then
+    hard_fail "failed to exclude hung Opslane check-runs at ${head_sha}"
+  fi
+  log "ignored ${opslane_hung} Opslane check-run(s) still running after ${OPSLANE_STALE_MINUTES}m: Opslane is not required, and a hung advisory run is not a verdict"
+fi
+
+# Pass 5b — NAME AN OPSLANE CARRY-FORWARD FAILURE (ENG-2944, child of ENG-2749).
+# Opslane re-posts the previous head's `failure` as a 0s check-run
+# (started_at == completed_at) instead of re-testing the new head (ENG-2767).
+# Diagnostic only: the run is NOT dropped and still blocks exactly as before;
+# whether it should block is the parent's open decision. The distinct line
+# stops callers from update-branch churn hoping for a fresh run.
+OPSLANE_CF_SECONDS="${MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS:-2}"
+if ! grep -qE '^[0-9]+$' <<<"${OPSLANE_CF_SECONDS}"; then
+  hard_fail "MERGE_EVIDENCE_OPSLANE_CARRY_FORWARD_SECONDS must be a whole number of seconds, got '${OPSLANE_CF_SECONDS}'"
+fi
+# shellcheck disable=SC2016 # $max is a jq variable
+if ! opslane_cf="$(printf '%s' "${runs_json}" | jq -r --argjson max "${OPSLANE_CF_SECONDS}" '
+  .check_runs[]
+  | select((.app.slug // "") == "opslane" and .name == "Opslane"
+      and (.status // "") == "completed" and .conclusion == "failure"
+      and (.started_at // "") != "" and (.completed_at // "") != ""
+      and ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) <= $max)
+  | "\(.id // "unknown") \(.details_url // .html_url // "no-url")"' 2>/dev/null)"; then
+  hard_fail "failed to identify Opslane carry-forward check-runs at ${head_sha}"
+fi
+while IFS= read -r cf_line; do
+  [ -n "${cf_line}" ] || continue
+  log "OPSLANE_CARRY_FORWARD: ${cf_line} — not a re-test of ${head_sha}; see ENG-2749"
+done <<<"${opslane_cf}"
 
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
 if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then

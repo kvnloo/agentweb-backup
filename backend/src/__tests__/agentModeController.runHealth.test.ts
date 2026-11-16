@@ -90,4 +90,45 @@ describe('computeScheduleRunHealth', () => {
     ];
     expect(computeScheduleRunHealth(results).consecutiveFailures).toBe(2);
   });
+
+  // ENG-669 PR-C: the blocked run's own model, so the card does not describe whatever the schedule is set to NOW.
+  describe('lastRunBlockedModel', () => {
+    const blocked = (extra: Record<string, unknown>) => ({
+      ...run('failure', '2026-08-01T10:00:00.000Z'), blockedBy: 'model_unavailable', blockedReason: 'not_served', ...extra,
+    });
+
+    it('carries the last run\'s blockedModel next to lastRunBlockedBy / lastRunBlockedReason', () => {
+      expect(computeScheduleRunHealth([blocked({ blockedModel: 'agentweb-model' })])).toEqual({
+        lastRunStatus: 'failure',
+        lastRunAt: '2026-08-01T10:00:00.000Z',
+        consecutiveFailures: 1,
+        lastRunBlockedBy: 'model_unavailable',
+        lastRunBlockedReason: 'not_served',
+        lastRunBlockedModel: 'agentweb-model',
+      });
+    });
+
+    it('is the LAST run\'s model, not an earlier blocked run\'s', () => {
+      const health = computeScheduleRunHealth([
+        blocked({ blockedModel: 'agentweb-model', createdAt: '2026-08-01T09:00:00.000Z' }),
+        blocked({ blockedModel: 'gpt-5.5', blockedReason: 'not_in_plan' }),
+      ]);
+      expect(health.lastRunBlockedModel).toBe('gpt-5.5');
+    });
+
+    it('is absent when the last run was not blocked, or its block names no model (shape unchanged)', () => {
+      const unblocked = computeScheduleRunHealth([blocked({ blockedModel: 'agentweb-model' }), run('success', '2026-08-01T11:00:00.000Z')]);
+      expect('lastRunBlockedModel' in unblocked).toBe(false);
+      const noModel = computeScheduleRunHealth([{ ...run('success', '2026-08-01T11:00:00.000Z'), blockedBy: 'linkedin_search_unavailable' }]);
+      expect(noModel).toEqual({
+        lastRunStatus: 'success', lastRunAt: '2026-08-01T11:00:00.000Z', consecutiveFailures: 0,
+        lastRunBlockedBy: 'linkedin_search_unavailable',
+      });
+      // A stray blockedModel on an UNBLOCKED run (no blockedBy) is never surfaced.
+      expect('lastRunBlockedModel' in computeScheduleRunHealth([{ ...run('success', '2026-08-01T11:00:00.000Z'), blockedModel: 'agentweb-model' }])).toBe(false);
+      for (const bad of ['', 5, null]) {
+        expect('lastRunBlockedModel' in computeScheduleRunHealth([blocked({ blockedModel: bad })])).toBe(false);
+      }
+    });
+  });
 });

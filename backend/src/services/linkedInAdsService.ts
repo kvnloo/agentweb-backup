@@ -425,11 +425,19 @@ export function resolveTargetingCriteria(params: Record<string, any>): any | nul
  * e.g. (include:(and:List((or:(urn%3A...:List(urn%3A...))))),exclude:(or:(...))).
  * Structural tokens stay literal; URN keys and values are percent-encoded (per LinkedIn docs).
  */
+/**
+ * encodeURIComponent leaves ( ) ' ! * literal, but ( ) are RestLi 2.0 structural tokens, so a
+ * value URN such as urn:li:staffCountRange:(11,50) broke the query (ENG-2576).
+ */
+function encodeRestLiValue(value: string): string {
+  return encodeURIComponent(value).replace(/[()'!*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function encodeTargetingCriteriaParam(tc: any): string {
   const encodeOrMap = (orMap: Record<string, string[]>): string => {
     const entries = Object.entries(orMap).map(([facetUrn, values]) => {
-      const encodedValues = (values || []).map((v) => encodeURIComponent(v)).join(',');
-      return `${encodeURIComponent(facetUrn)}:List(${encodedValues})`;
+      const encodedValues = (values || []).map((v) => encodeRestLiValue(v)).join(',');
+      return `${encodeRestLiValue(facetUrn)}:List(${encodedValues})`;
     });
     return `(or:(${entries.join(',')}))`;
   };
@@ -444,7 +452,7 @@ function encodeTargetingCriteriaParam(tc: any): string {
   if (tc?.exclude?.or) {
     const excludeEntries = Object.entries(normalizeOrClause(tc.exclude.or)).map(
       ([facetUrn, values]) =>
-        `${encodeURIComponent(facetUrn)}:List(${((values as string[]) || []).map((v) => encodeURIComponent(v)).join(',')})`
+        `${encodeRestLiValue(facetUrn)}:List(${((values as string[]) || []).map((v) => encodeRestLiValue(v)).join(',')})`
     );
     parts.push(`exclude:(or:(${excludeEntries.join(',')}))`);
   }
@@ -970,6 +978,29 @@ export async function createCreativeInline(
   };
 
   return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives?action=createInline`, accessToken, body);
+}
+
+/** ENG-2575: statuses LinkedIn accepts for a creative's intendedStatus. */
+export const CREATIVE_INTENDED_STATUSES = ['ACTIVE', 'PAUSED', 'ARCHIVED', 'CANCELED', 'DRAFT'] as const;
+
+/**
+ * ENG-2575: change a creative's status (pause / resume / archive). LinkedIn models
+ * this as a PARTIAL_UPDATE of `intendedStatus` on the account-scoped creative.
+ */
+export async function updateCreativeStatus(
+  accessToken: string,
+  adAccountId: string,
+  creativeId: string,
+  status: string,
+): Promise<LinkedInAdsApiResult> {
+  const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
+  return makeRequest(
+    'POST',
+    `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`,
+    accessToken,
+    { patch: { $set: { intendedStatus: status } } },
+    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
+  );
 }
 
 /**

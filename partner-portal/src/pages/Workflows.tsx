@@ -28,6 +28,7 @@ import {
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../config';
+import { EmptyState, ErrorState } from '../components/StatusState';
 
 interface Workflow {
   id: string;
@@ -50,6 +51,8 @@ export default function Workflows() {
   const [showSnackbar, setShowSnackbar] = useState(false);
   const [snackbarMessage, setSnackbarMessage] = useState('');
   const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error'>('success');
+
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     const fetchWorkflows = async () => {
@@ -91,7 +94,7 @@ export default function Workflows() {
     };
 
     fetchWorkflows();
-  }, []);
+  }, [reloadKey]);
 
   const handleMenuOpen = (event: React.MouseEvent<HTMLElement>, workflow: Workflow) => {
     setAnchorEl(event.currentTarget);
@@ -148,7 +151,9 @@ export default function Workflows() {
       setShowSnackbar(true);
     } catch (error) {
       console.error('Error archiving workflow:', error);
-      setError(error instanceof Error ? error.message : 'Failed to archive workflow');
+      setSnackbarMessage(error instanceof Error ? error.message : 'Failed to archive workflow');
+      setSnackbarSeverity('error');
+      setShowSnackbar(true);
     } finally {
       setIsArchiveDialogOpen(false);
       handleMenuClose();
@@ -188,23 +193,14 @@ export default function Workflows() {
         <Box sx={{ display: 'flex', justifyContent: 'center', my: 4 }}>
           <CircularProgress />
         </Box>
-      ) : error ? (
-        <Alert severity="error" sx={{ mb: 3 }}>
-          {error}
-        </Alert>
+      ) : error && workflows.length === 0 ? (
+        <ErrorState title="We couldn't load your workflows" onRetry={() => setReloadKey((k) => k + 1)} />
       ) : workflows.length === 0 ? (
-        <Paper sx={{ p: 3, textAlign: 'center' }}>
-          <Typography color="text.secondary" sx={{ mb: 2 }}>
-            No workflows found
-          </Typography>
-          <Button
-            variant="outlined"
-            startIcon={<AddIcon />}
-            onClick={handleCreateWorkflow}
-          >
-            Create your first workflow
-          </Button>
-        </Paper>
+        <EmptyState
+          title="No workflows found"
+          description="Workflows chain tasks together so they run in order. Create one to get started."
+          action={{ label: 'Create your first workflow', onClick: handleCreateWorkflow, icon: <AddIcon /> }}
+        />
       ) : (
         <Grid container spacing={3}>
           {workflows.map((workflow) => (

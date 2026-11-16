@@ -20,9 +20,9 @@
  *
  * Idempotency: an atomic per-item claim (DynamoDB string-set ADD via
  * settingsService.claimSetMember) taken BEFORE the send, so concurrent or replayed
- * webhook deliveries produce exactly one ping per item × reporter. The claim covers
- * the reporter, not one channel — releasing it because WhatsApp failed would
- * re-deliver the Slack message too. It is released only when NO channel succeeded.
+ * webhook deliveries produce exactly one ping per item × reporter × channel. The claim
+ * is per channel, so a failure on one channel releases only that channel's claim and
+ * never re-delivers on the other.
  */
 import { userDb } from './db';
 import { settingsService } from './settingsService';

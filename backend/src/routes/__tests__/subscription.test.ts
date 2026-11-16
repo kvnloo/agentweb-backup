@@ -405,6 +405,19 @@ describe('POST /api/subscription/usage-runway/apply — error mapping', () => {
     await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(400);
   });
 
+  it('ENG-669: a model outside the schedule owner\'s plan is the standard 422 model_unavailable / not_in_plan body', async () => {
+    const { ModelUnavailableError } = jest.requireActual('../../services/agentMode/modelUnavailable') as typeof import('../../services/agentMode/modelUnavailable');
+    applyModelChange.mockRejectedValue(new ModelUnavailableError(body.toModel, 'not_in_plan', {
+      model: body.toModel, tier: 'Free', allowedModels: ['gemini-3.5-flash'], upgradeRequired: ['Pro'],
+    }));
+    const res = await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(422);
+    expect(res.body).toMatchObject({
+      code: 'model_unavailable', reason: 'not_in_plan', requestedModel: body.toModel,
+      model: body.toModel, tier: 'Free', allowedModels: ['gemini-3.5-flash'], upgradeRequired: ['Pro'],
+    });
+    expect(res.body.error).toContain("isn't included in your plan");
+  });
+
   it('leaves an unexpected failure as a 500', async () => {
     // The conflict path must not swallow real errors into a reassuring status.
     applyModelChange.mockRejectedValue(new Error('dynamo exploded'));

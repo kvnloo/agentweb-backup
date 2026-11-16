@@ -80,3 +80,28 @@ describe('unipileNameMatches — separate first_name / last_name (existing behav
     ).toBe(false);
   });
 });
+
+describe('unipileNameMatches — compound names split differently (ENG-2870)', () => {
+  it('accepts the same full name when the middle name sits in last_name on one side and first_name on the other', () => {
+    // Prod session 28f84741: profile "Diego Javier Llorente" refused against
+    // lead "Diego Javier Llorente" because the providers split it differently.
+    expect(
+      unipileNameMatches({ first_name: 'Diego', last_name: 'Javier Llorente' }, 'Diego Javier', 'Llorente'),
+    ).toBe(true);
+    expect(
+      unipileNameMatches({ first_name: 'Diego Javier', last_name: 'Llorente' }, 'Diego', 'Javier Llorente'),
+    ).toBe(true);
+  });
+
+  it('accepts accent/case differences in a differently split compound name', () => {
+    expect(
+      unipileNameMatches({ first_name: 'maría josé', last_name: 'García' }, 'María', 'José Garcia'),
+    ).toBe(true);
+  });
+
+  it('still rejects a different person even when tokens overlap', () => {
+    expect(
+      unipileNameMatches({ first_name: 'Diego', last_name: 'Javier Perez' }, 'Diego Javier', 'Llorente'),
+    ).toBe(false);
+  });
+});

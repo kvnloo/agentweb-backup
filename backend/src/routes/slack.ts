@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express"; // slack-triggered-session v2
 import { createHmac, timingSafeEqual } from "crypto";
-import { authenticateToken } from "../middleware/auth";
+import { authenticateToken, isRealAdmin } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getSecret } from "../utils/secretsManager";
 import {
@@ -20,7 +20,8 @@ import {
   resolveSlackMentionsInText,
   downloadSlackFile,
   resolveSlackFileUrl,
-  postSlackMessage
+  postSlackMessage,
+  getEffectiveAllowedChannels
 } from "../services/slackService";
 import {
   APPROVAL_DECISION_ACTION_IDS,
@@ -30,8 +31,10 @@ import {
 } from "../services/approvalInboxSlack";
 import { approvalInboxService } from "../services/approvalInboxService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
-import { taskDb, subscriberDb } from "../services/db";
+import { taskDb, userDb } from "../services/db";
 import { emailService } from "../services/emailService";
+import { notifySubscribersOfApproval } from "../services/approvalSubscriberNotify";
+import { hasWhatsApp } from "../services/customerChannelPolicy";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
@@ -40,6 +43,7 @@ import { agentModeService } from '../services/agentModeService';
 import { handleSessionResponse } from "../services/conversation/sessionResponder";
 import { slackChannelAdapter, renderOutboundForSlack } from "../services/conversation/slackChannelAdapter";
 import type { ConversationRef } from "../services/conversation/channelPort";
+import { isModelUnavailableError } from "../services/agentMode/modelUnavailable";
 
 // ENG-351 citation rendering now lives with the Slack channel adapter (ENG-272 extraction);
 // aliased here for the other Slack reply paths in this file.
@@ -259,7 +263,7 @@ async function handleMappedSlackThreadResponse(params: {
 }): Promise<boolean> {
   const { channel, threadTs, slackUserId, text, files, sessionId, userId } = params;
   const { chatbotDb } = await import('../services/chatbotService');
-  const { generateSessionResponse } = await import('../controllers/agentModeController');
+  const { generateSessionResponse, modelUnavailableBody } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
   const { cronJobRegistry } = await import('../utils/cronJobRegistry');
   const session = await chatbotDb.getChatSession(sessionId);
@@ -298,11 +302,13 @@ async function handleMappedSlackThreadResponse(params: {
     else await postThreadResponse(channel, threadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
   } catch (genError) {
     console.error('❌ Error generating thread response:', genError);
-    await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+    // ENG-669: the session's model is outside the owner's plan: say so (nothing ran on another model).
+    const modelRefusal = isModelUnavailableError(genError) ? modelUnavailableBody(genError).error : undefined;
+    await postThreadResponse(channel, threadTs, modelRefusal ?? 'Sorry, I encountered an error. Please try again.');
     try {
       await chatbotDb.addMessageToSession(sessionId, {
         role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        content: modelRefusal ?? 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
         metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
       });
@@ -383,6 +389,32 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
       return res.status(401).json({ error: "User not authenticated" });
     }
 
+    if (typeof channel !== "string") {
+      return res.status(400).json({ error: "channel must be a string" });
+    }
+
+    // ENG-2413 (ENG-2407 pattern): the bot posts with the workspace token, so the caller
+    // may only target a channel configured for their user/org (or be a real, non-delegated
+    // admin). Checked before any Slack call or approvalDb write.
+    //
+    // Not applied to a customer on WhatsApp: they are entitled to no Slack channel by
+    // design, and requestApproval ignores the channel it is given for them (nothing is
+    // posted to Slack), so refusing here would only stop a task that still names an old
+    // Slack channel from ever asking them on WhatsApp — and hold their output.
+    let targetChannel: string = channel;
+    if (!isRealAdmin(req)) {
+      const user = await userDb.getUserById(userId);
+      const allowed = await getEffectiveAllowedChannels(user);
+      if (hasWhatsApp(user)) {
+        // Hand requestApproval NO channel. It re-reads the account itself; if that read
+        // disagrees (a blip, or a disconnect between the two reads) an empty channel makes
+        // it fail closed instead of posting to whatever channel the caller named.
+        targetChannel = "";
+      } else if (!allowed.includes(channel)) {
+        return res.status(403).json({ error: "Not allowed to post to this Slack channel" });
+      }
+    }
+
     // Determine asset type from filename
     const assetType = getAssetTypeFromFilename(filename);
 
@@ -395,7 +427,7 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
       filename,
       assetType,
       userId,
-      channel,
+      channel: targetChannel,
       channelName: authReq.body.channelName || channel, // Use channel name if provided, fallback to channel ID
       note: note // Pass the note to Slack
     });
@@ -411,6 +443,9 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
   } catch (error: any) {
     console.error("❌ Error sending approval request:", error.message);
     
+    if (error?.name === "ApprovalForbiddenError" || error?.constructor?.name === "ApprovalForbiddenError") {
+      return res.status(403).json({ error: error.message });
+    }
     if (error.message.includes("Slack client not initialized")) {
       res.status(503).json({ 
         error: "Slack integration not configured", 
@@ -611,6 +646,17 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text: `User not found: ${targetEmail}`,
+                thread_ts: responseThreadTs
+              });
+              return;
+            }
+
+            // One platform per customer: an account on WhatsApp cannot also be linked
+            // to a Slack channel.
+            if (hasWhatsApp(targetUser)) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: `${targetEmail} is already connected to WhatsApp. An account can use one messaging platform, so disconnect WhatsApp before linking a Slack channel.`,
                 thread_ts: responseThreadTs
               });
               return;
@@ -1097,66 +1143,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           user.username || user.id
         );
 
-        // Send email notifications to subscribers after approval
-        try {
-          if (approval && approval.executionId) {
-            console.log(`🔍 Looking up execution details for executionId: ${approval.executionId}`);
-            
-            // Get task information from the execution
-            const execution = await taskDb.getTaskExecutionById(approval.executionId);
-            if (execution) {
-              console.log(`✅ Found execution for taskId: ${execution.taskId}`);
-              
-              // Get task details
-              const task = await taskDb.getTaskById(execution.taskId);
-              if (task) {
-                console.log(`✅ Found task: ${task.name}`);
-                
-                // Get task subscribers
-                const subscribers = await subscriberDb.getTaskSubscribers(execution.taskId);
-                const activeSubscribers = subscribers ? subscribers.filter(sub => !sub.unsubscribed) : [];
-                const subscriberEmails = activeSubscribers.map(sub => sub.email);
-                
-                // Apply subscriber email limit
-                const emailLimit = parseInt(process.env.SUBSCRIBER_EMAIL_LIMIT || '1000');
-                const limitedSubscriberEmails = subscriberEmails.slice(0, emailLimit);
-                
-                console.log(`📧 Found ${subscriberEmails.length} active subscribers for task: ${execution.taskId}`);
-                if (subscriberEmails.length > emailLimit) {
-                  console.log(`⚠️ Subscriber count (${subscriberEmails.length}) exceeds limit (${emailLimit}). Sending to first ${emailLimit} subscribers only.`);
-                }
-                
-                if (limitedSubscriberEmails.length > 0) {
-                  // Send task results to subscribers using common function
-                  for (const email of limitedSubscriberEmails) {
-                    try {
-                      await emailService.sendTaskExecutionEmail(
-                        email,
-                        approval.executionId
-                      );
-                      console.log(`📧 Task results sent to subscriber: ${email}`);
-                    } catch (error) {
-                      console.error(`Failed to send task results to ${email}:`, error);
-                      // Continue with other subscribers even if one fails
-                    }
-                  }
-                  console.log(`📧 Task results sent to ${limitedSubscriberEmails.length} subscribers for task: ${execution.taskId}`);
-                } else {
-                  console.log(`No subscribers to notify for task: ${execution.taskId}`);
-                }
-              } else {
-                console.log(`❌ Task not found for taskId: ${execution.taskId}`);
-              }
-            } else {
-              console.log(`❌ Execution not found for executionId: ${approval.executionId}`);
-            }
-          } else {
-            console.log(`❌ No executionId found in approval:`, approval);
-          }
-        } catch (error) {
-          console.error('Error sending approval notifications to subscribers:', error);
-          // Don't fail the approval if email notifications fail
-        }
+        // Email the task's subscribers. Shared with the WhatsApp approval path (ENG-273)
+        // so 'approved' has one consequence whichever channel it came from.
+        await notifySubscribersOfApproval(approval);
 
         console.log(`✅ Approved: ${assetUrl} by ${user.username}`);
         res.status(200).json({
@@ -1534,6 +1523,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                     return;
                   }
+                  // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). Only the
+                  // owner can fix it: tell the reviewer what to do, and do not page on-call (not an outage).
+                  const { isModelUnavailableError } = await import('../services/agentMode/modelUnavailable');
+                  if (isModelUnavailableError(error)) {
+                    console.warn(`Agent Mode revision for session ${agentSessionId} refused: model_unavailable (${error.reason}).`);
+                    if (originalApproval.slackChannel) {
+                      const { modelRefusalReviewerNotice } = await import('../utils/modelRefusalReviewerNotice');
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        await modelRefusalReviewerNotice(error),
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post model-refusal notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1798,6 +1804,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             originalApproval.slackMessageTs || undefined,
                           ).catch((slackErr: any) =>
                             console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
+                        return;
+                      }
+                      // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). Only the
+                      // owner can fix it: tell the reviewer what to do, and do not page on-call (not an outage).
+                      const { isModelUnavailableError } = await import('../services/agentMode/modelUnavailable');
+                      if (isModelUnavailableError(error)) {
+                        console.warn(`Agent Mode revision for session ${task.sessionId} refused: model_unavailable (${error.reason}).`);
+                        if (originalApproval.slackChannel) {
+                          const { modelRefusalReviewerNotice } = await import('../utils/modelRefusalReviewerNotice');
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            await modelRefusalReviewerNotice(error),
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post model-refusal notice to Slack:', slackErr?.message || slackErr),
                           );
                         }
                         return;

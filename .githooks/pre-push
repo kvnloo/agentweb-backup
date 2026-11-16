@@ -20,5 +20,16 @@ if ! command -v node >/dev/null 2>&1; then
   echo "pre-push: node not found on PATH — skipping local verification. CI is the backstop." >&2
   exit 0
 fi
+# The checks need CI's node major (tests.yml). If the default node is older, use an nvm-installed
+# one when there is one; ci-prepush.mjs still refuses to run on an older node, with instructions.
+REQUIRED_NODE_MAJOR=22
+node_major() { local m; m=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null) || m=0; echo "${m:-0}"; }
+if [ "$(node_major)" -lt "$REQUIRED_NODE_MAJOR" ]; then
+  NVM_NODE="$(ls -d "${NVM_DIR:-$HOME/.nvm}"/versions/node/v${REQUIRED_NODE_MAJOR}.*/bin 2>/dev/null | sort -V | tail -1)"
+  if [ -n "$NVM_NODE" ] && [ -x "$NVM_NODE/node" ]; then
+    PATH="$NVM_NODE:$PATH"
+    echo "pre-push: default node is too old; using $NVM_NODE/node" >&2
+  fi
+fi
 # stdin carries "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref
 exec node "$SCRIPT" --remote "$1" --url "$2"

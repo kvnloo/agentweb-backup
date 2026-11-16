@@ -264,6 +264,13 @@ export function explicitChannels(user: ChannelUser | null | undefined): UserMess
  */
 const VERIFIED_OPT_IN_CHANNELS: ReadonlySet<MessagingChannel> = new Set(['whatsapp']);
 
+/** True once this account has a WhatsApp number it has proven it controls. */
+export function hasVerifiedWhatsApp(user: ChannelUser | null | undefined): boolean {
+  return normalizeUserChannels(user).some(
+    (c) => c.channel === 'whatsapp' && c.enabled && !!c.optIn?.verifiedAt,
+  );
+}
+
 /**
  * The one platform-wide answer to "where does this user receive messages on channel X".
  *
@@ -279,6 +286,16 @@ export async function resolveDestination(
   channel: MessagingChannel,
 ): Promise<string | null> {
   try {
+    // One platform per customer (ENG-273). An account with a verified WhatsApp number IS on
+    // WhatsApp, and is not delivered to on Slack — neither through a channel of its own nor
+    // one inherited from its organisation. Connecting a second platform is refused up front
+    // wherever it can be asked for, but two can still come to coexist after the fact (an
+    // organisation gains a channel, its owner is assigned one, a WhatsApp user joins it, or
+    // an account predates the rule). Settling it here, in the one place every send resolves
+    // through, means none of those can produce a double delivery, and the account is on the
+    // same platform everywhere — including the admin screens, which report WhatsApp first.
+    if (channel === 'slack' && hasVerifiedWhatsApp(user)) return null;
+
     const personal = normalizeUserChannels(user).find(
       (c) =>
         c.channel === channel &&

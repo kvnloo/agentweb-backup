@@ -48,7 +48,7 @@ jest.mock("../services/settingsService", () => ({
   settingsService: { getSetting: jest.fn().mockResolvedValue(null) },
 }));
 
-import { withRetry, describeError } from "../services/v0Service";
+import { withRetry, describeError, setRateLimitBackoffConfig } from "../services/v0Service";
 
 // Use 1ms base delay for fast tests
 const FAST = 1;
@@ -184,13 +184,19 @@ describe("withRetry", () => {
   });
 
   it("SUCCESS: retries on HTTP 429 rate limit", async () => {
-    const fn = jest.fn()
-      .mockRejectedValueOnce(new Error("HTTP 429: Too Many Requests"))
-      .mockResolvedValueOnce("ok");
+    // ENG-949 waits at least 20 s before retrying a 429; shrink it so the test stays fast.
+    setRateLimitBackoffConfig(1, 1);
+    try {
+      const fn = jest.fn()
+        .mockRejectedValueOnce(new Error("HTTP 429: Too Many Requests"))
+        .mockResolvedValueOnce("ok");
 
-    const result = await withRetry(fn, "test-op", 3, FAST);
-    expect(result).toBe("ok");
-    expect(fn).toHaveBeenCalledTimes(2);
+      const result = await withRetry(fn, "test-op", 3, FAST);
+      expect(result).toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+    } finally {
+      setRateLimitBackoffConfig(20_000, 120_000);
+    }
   });
 
   it("FAIL: exhausts retries on persistent HTTP 500", async () => {

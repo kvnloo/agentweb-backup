@@ -1,0 +1,10 @@
+# Code owners for the hosted-login worker's deploy path.
+# Anything that can change what runs as root on the worker that holds customers' Claude logins: these people are asked to look at it.
+# Owners are only asked to review (no blocking): "Require review from Code Owners" is deliberately OFF on main so deploys stay automatic.
+
+/backend/src/loginHost/deploy/ @mananv-argusoft @harshmoney123 @anurag-seth
+/backend/scripts/build-login-host.sh @mananv-argusoft @harshmoney123 @anurag-seth
+/backend/scripts/sign-login-host.sh @mananv-argusoft @harshmoney123 @anurag-seth
+/.github/workflows/login-host-deploy.yml @mananv-argusoft @harshmoney123 @anurag-seth
+/.github/scripts/login-host-* @mananv-argusoft @harshmoney123 @anurag-seth
+/.github/CODEOWNERS @mananv-argusoft @harshmoney123 @anurag-seth

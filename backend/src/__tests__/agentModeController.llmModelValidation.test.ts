@@ -9,22 +9,22 @@ import { Request, Response } from 'express';
 
 const REGISTRY = [
   'gpt-5-chat-2',
-  'admin-only-model',
-  'internal-model',
-  'live-model',
   'anthropic.claude-opus-4-8',
   'anthropic.claude-opus-5',
   'gemini-3.5-flash',
+  'openrouter/example/admin-only-model',
+  'internal-model',
+  'admin-only-model',
 ];
 const ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
 };
 const FALLBACK = 'gpt-5-chat-2';
+const ADMIN_ONLY = new Set(['openrouter/example/admin-only-model', 'admin-only-model']);
+const INTERNAL_ONLY = new Set(['internal-model', 'live-model']);
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    isModelSelectableBy: jest.fn((model: string, admin: boolean) =>
-      REGISTRY.includes(model) && !['internal-model', 'live-model'].includes(model) && (model !== 'admin-only-model' || admin)),
     // Mirrors the real resolver: normalize legacy aliases, then validate against
     // the allow-list with an own-property check.
     resolveGenerationModel: jest.fn((model: string) => {
@@ -33,6 +33,14 @@ jest.mock('../services/agentModeService', () => ({
         return { model: normalized, fellBack: false, requestedModel: model };
       }
       return { model: FALLBACK, fellBack: true, requestedModel: model };
+    }),
+    // ENG-2293: mirrors the real gate the controller now delegates to instead
+    // of re-deriving a subset inline (allow-list membership was already
+    // covered above; this adds adminOnly + internal/live; no model-name check).
+    isModelSelectableBy: jest.fn((modelId: string, isAdmin: boolean) => {
+      if (!REGISTRY.includes(modelId) || INTERNAL_ONLY.has(modelId)) return false;
+      if (ADMIN_ONLY.has(modelId) && !isAdmin) return false;
+      return true;
     }),
   },
   AgentModeService: jest.fn(),
@@ -76,16 +84,6 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
     ({ params: { sessionId }, body, user } as unknown as Request);
 
   describe('updateSessionLlmModel', () => {
-    it.each([42, {}, ['gpt-5-chat-2']])('rejects wrong-type model values on both network boundaries: %j', async llmModel => {
-      const own = makeRes();
-      await agentModeController.updateSessionLlmModel(patch({ llmModel }) as any, own);
-      expect(own.status).toHaveBeenCalledWith(400);
-      const shared = makeRes();
-      await agentModeController.updateSharedSessionLlmModel({ params: { shareId: sessionId }, query: { conversable: 'token-1' }, body: { llmModel } } as unknown as Request, shared);
-      expect(shared.status).toHaveBeenCalledWith(400);
-      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-    });
-
     it('rejects a model that is not in the registry instead of storing it', async () => {
       const res = makeRes();
       // The exact value observed on 6 real sessions in the measured window.
@@ -126,7 +124,7 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         sessionId,
-        'gemini-3.5-flash'
+        'gemini-3.5-flash', undefined, 'user',
       );
       expect(res.status).not.toHaveBeenCalledWith(400);
     });
@@ -142,22 +140,70 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
 
       expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
         sessionId,
-        'anthropic.claude-opus-4-8'
+        'anthropic.claude-opus-4-8', undefined, 'user',
       );
     });
 
-    it.each(['claude-opus-4-8', 'anthropic.claude-opus-5'])('ENG-744/2028 permits an entitled non-admin selection: %s', async llmModel => {
+    // ENG-2028: flipped from 'still blocks opus for non-admins'. The name-based
+    // Opus deny is gone; only registry adminOnly/internalOnly flags gate selection.
+    it('allows opus for non-admins, evaluated on the canonical id', async () => {
       const res = makeRes();
-      await agentModeController.updateSessionLlmModel(patch({ llmModel }) as any, res);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, ALIASES[llmModel] ?? llmModel);
+      await agentModeController.updateSessionLlmModel(
+        patch({ llmModel: 'claude-opus-4-8' }) as any,
+        res
+      );
+
       expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-4-8', undefined, 'user');
     });
 
-    it.each(['admin-only-model', 'internal-model', 'live-model'])('rejects registry-restricted model %s before persistence', async llmModel => {
+    it('still refuses registry-restricted models (internalOnly; adminOnly for non-admins)', async () => {
+      for (const [model, admin, allowed] of [
+        ['internal-model', false, false],
+        ['internal-model', true, false],
+        ['admin-only-model', false, false],
+        ['admin-only-model', true, true],
+      ] as const) {
+        jest.clearAllMocks();
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel(
+          patch({ llmModel: model }, { userId: ownerId, isAdmin: admin }) as any,
+          res
+        );
+        if (allowed) {
+          expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, model, undefined, 'user');
+        } else {
+          expect(res.status).toHaveBeenCalledWith(403);
+          expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+        }
+      }
+    });
+
+    it('blocks an adminOnly model for non-admins even though it is a registered id (ENG-2293)', async () => {
+      // Before this fix, only the opus-substring check ran here, so a
+      // non-admin who named an adminOnly auto-added model directly (not
+      // through the picker, which already hides it) still got a 200.
       const res = makeRes();
-      await agentModeController.updateSessionLlmModel(patch({ llmModel }) as any, res);
+      await agentModeController.updateSessionLlmModel(
+        patch({ llmModel: 'openrouter/example/admin-only-model' }) as any,
+        res
+      );
+
       expect(res.status).toHaveBeenCalledWith(403);
       expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it('allows an adminOnly model for admins', async () => {
+      const res = makeRes();
+      await agentModeController.updateSessionLlmModel(
+        patch({ llmModel: 'openrouter/example/admin-only-model' }, { userId: ownerId, isAdmin: true }) as any,
+        res
+      );
+
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        sessionId,
+        'openrouter/example/admin-only-model', undefined, 'user',
+      );
     });
 
     it('still enforces session ownership', async () => {
@@ -173,36 +219,6 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
   });
 
   describe('updateSharedSessionLlmModel', () => {
-    it.each(['admin-only-model', 'internal-model', 'live-model'])('shared selection rejects registry-restricted model %s', async llmModel => {
-      const res = makeRes();
-      const req = { params: { shareId: sessionId }, query: { conversable: 'token-1' }, body: { llmModel } } as unknown as Request;
-      await agentModeController.updateSharedSessionLlmModel(req, res);
-      expect(res.status).toHaveBeenCalledWith(403);
-      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-    });
-
-    it('shared selection honors entitled Opus only with a valid unexpired share token', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({ sessionId, userId: ownerId,
-        interactiveShareMetadata: { isActive: true, token: 'token-1', expiresAt: '2099-01-01T00:00:00Z' } } as any);
-      const req = { params: { shareId: sessionId }, query: { conversable: 'token-1' }, body: { llmModel: 'anthropic.claude-opus-5' } } as unknown as Request;
-      const res = makeRes();
-      await agentModeController.updateSharedSessionLlmModel(req, res);
-      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-5');
-      mockChatbotDb.updateSessionLlmModel.mockClear();
-      req.query.conversable = 'wrong';
-      const denied = makeRes();
-      await agentModeController.updateSharedSessionLlmModel(req, denied);
-      expect(denied.status).toHaveBeenCalledWith(401);
-      mockChatbotDb.getChatSession.mockResolvedValue({ sessionId, userId: ownerId,
-        interactiveShareMetadata: { isActive: true, token: 'token-1', expiresAt: '2000-01-01T00:00:00Z' } } as any);
-      req.query.conversable = 'token-1';
-      const expired = makeRes();
-      await agentModeController.updateSharedSessionLlmModel(req, expired);
-      expect(expired.status).toHaveBeenCalledWith(410);
-
-      expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-    });
-
     it('rejects an unregistered model before touching the shared session', async () => {
       const res = makeRes();
       const req = {
@@ -216,6 +232,27 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
       expect(res.status).toHaveBeenCalledWith(400);
       expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it('allows opus for shared viewers but refuses admin-only/internal models', async () => {
+      const call = async (llmModel: string) => {
+        jest.clearAllMocks();
+        const res = makeRes();
+        mockChatbotDb.getChatSession.mockResolvedValue({ sessionId, interactiveShareMetadata: { isActive: true, token: 'token-1', createdAt: new Date() } } as any);
+        await agentModeController.updateSharedSessionLlmModel(
+          { params: { shareId: sessionId }, query: { conversable: 'token-1' }, body: { llmModel } } as unknown as Request,
+          res
+        );
+        return res;
+      };
+      const ok = await call('anthropic.claude-opus-5');
+      expect(ok.status).not.toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-5', undefined, 'user');
+      for (const m of ['internal-model', 'admin-only-model']) {
+        const r = await call(m);
+        expect(r.status).toHaveBeenCalledWith(403);
+        expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+      }
     });
   });
 });

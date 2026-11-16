@@ -211,7 +211,7 @@ async function getGoogleAccessToken(userId: string): Promise<{ token: string; ac
   }
 
   try {
-    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
     const { google } = await import('googleapis');
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
@@ -245,7 +245,7 @@ async function getGoogleAccessToken(userId: string): Promise<{ token: string; ac
  * Returns null if no token is available or if calendar scope is not granted.
  */
 async function getCalendarClient(userId: string) {
-  // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+  // ENG-1277: lazy load — `googleapis` pulls ~990 modules (~613ms cold) on require.
   const { google } = await import('googleapis');
   const tokenResult = await getGoogleAccessToken(userId);
   if (!tokenResult) return null;

@@ -3,12 +3,14 @@ import express from 'express';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
+import { emitResendEngagementSignal } from '../services/serverSignalEmitter';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
+import { parseHubSpotMergeEvent, repointMergedContactIds, HubSpotContactMerge } from '../services/hubspotContactMerge';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { AttioAdapter } from '../services/adapters/attioAdapter';
@@ -21,10 +23,12 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isPushedToSmartlead } from '../services/smartleadMarkers';
 import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { buildCallConsentRecord, consentPhoneDigits, pageUrlOf, parseCallConsent, type CallConsentRecord } from '../services/voice/callConsent';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
@@ -35,7 +39,11 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
+import { fillBlankCustomFields, phoneDedupeKey, phoneNamesConflict, phoneNameSeed } from '../utils/phoneLeadDedupe';
+import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
+import { claimLeadSubmission, completeLeadSubmission, releaseLeadSubmission, resolveSubmissionKey } from '../services/leadSubmissionIdempotency';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -281,6 +289,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       console.log(`Skipping CRM event storage for Emma-related email: ${event.data.email_id}`);
     }
 
+    // ENG-2686: platform-email engagement → hireemma.ai session list. The mapper drops anything not
+    // sent by the AgentWeb system sender, so customer mail never reaches the funnel. Fire-and-forget.
+    void emitResendEngagementSignal(event);
+
     // Handle specific event types
     switch (event.type) {
       case 'email.delivered':
@@ -520,6 +532,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     });
   }
 
+  // ENG-2837: the (listId, submission key) claim this request holds, if any, and whether a lead
+  // write may have started under it. Declared outside the try so the catch can give the claim
+  // back — but ONLY when no write was attempted; otherwise a retry could repeat the write.
+  let submissionClaim: { key: string; ownerToken: string } | null = null;
+  let leadWriteStarted = false;
+
   try {
 
     // ENG-2311: read from the list row the DATABASE returned, never from the body. One
@@ -575,6 +593,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // what the value actually is: the VISITOR, not whoever made this request.
       visitorIp: declaredClientIp,
       visitorUserAgent: declaredClientUserAgent,
+      // ENG-2783: the call-consent notice the visitor agreed to, and the page it was on (declared by the capture
+      // route, which is the only place the Referer is knowable). Both are listed in HANDLED_TOP_LEVEL_KEYS below so
+      // they never become free-form custom fields, and neither is ever echoed in a response.
+      callConsent: rawCallConsent,
+      visitorPageUrl: declaredPageUrl,
     } = req.body;
 
     // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
@@ -597,6 +620,50 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         success: false,
         message: 'Email or phone is required'
       });
+    }
+
+    // ENG-2837: server-side idempotency per (listId, submission key). A lander that lost the
+    // response to a successful capture retries with the same key; the repeat must get the
+    // ORIGINAL response back and must not write the lead or fire any side effect again.
+    // Claimed only after every 4xx above, so a rejected request never holds a key. No key →
+    // nothing here runs and the handler behaves exactly as before.
+    const submissionKey = resolveSubmissionKey(req.body);
+    if (submissionKey) {
+      let claim: Awaited<ReturnType<typeof claimLeadSubmission>>;
+      try {
+        claim = await claimLeadSubmission(leadList.listId, submissionKey);
+      } catch (claimErr: any) {
+        // Fail CLOSED: the caller asked for exactly-once and we cannot tell whether this key is
+        // already taken, so write nothing and fire nothing. The lander keeps the same key and
+        // retries; nothing has happened that a retry could repeat.
+        console.error(`[forward-lead] ENG-2837 submission claim store unavailable for list ${leadList.listId}; rejecting retryably: ${claimErr?.message || claimErr}`);
+        res.setHeader('Retry-After', '2');
+        return res.status(503).json({
+          success: false,
+          retryable: true,
+          message: 'Lead capture is temporarily unavailable. Retry with the same submissionId.',
+        });
+      }
+      if (claim.outcome === 'completed') {
+        res.setHeader('Idempotent-Replayed', 'true');
+        return res.status(claim.record.responseStatus).json(claim.record.responseBody);
+      }
+      if (claim.outcome === 'in_progress') {
+        // Usually the original is still being processed: not a success (we cannot yet name its
+        // leadId) and not a failure, and the same key retried shortly gets the original
+        // response. But a claim is never taken over, so one left in_progress by a crashed
+        // owner or a failure after a lead write may have started 409s forever for THIS
+        // submission (other keys are unaffected) until an operator checks the lead and clears
+        // the claim. Say so, so a client that keeps getting 409 escalates instead of looping.
+        res.setHeader('Retry-After', '2');
+        return res.status(409).json({
+          success: false,
+          retryable: true,
+          message: 'This submission is already being processed. Retry with the same submissionId. '
+            + 'If 409 persists for this submission, it needs operator reconciliation: contact support with the submissionId.',
+        });
+      }
+      submissionClaim = { key: submissionKey, ownerToken: claim.ownerToken };
     }
 
     // Prepare lead data
@@ -659,6 +726,27 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (capturedClientIp) leadData.clientIp = capturedClientIp;
     if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
+    // ENG-2783: validate and stamp the call consent BEFORE any lead write, so a new lead is created with it already
+    // in the row and the call gates (which run from the create hook) can never see the lead without it. Anything
+    // that does not validate is ignored (never a 400: the lead is still created) with one warning of the reason code
+    // only; the lead then has no consent and the hot-lead call gate skips it (`no_call_consent`).
+    let callConsentRecord: CallConsentRecord | null = null;
+    const consentParse = parseCallConsent(rawCallConsent);
+    if (consentParse.ok && !consentPhoneDigits(normalizedPhone)) {
+      // Consent is for a number; with no usable phone in the same submission there is nothing to bind it to.
+      console.warn('[forward-lead] call consent ignored: no_phone');
+    } else if (consentParse.ok) {
+      callConsentRecord = buildCallConsentRecord(consentParse, {
+        phone: normalizedPhone,
+        pageUrl: pageUrlOf(req.headers['referer']) ?? pageUrlOf(req.headers['origin']) ?? pageUrlOf(declaredPageUrl),
+        ip: capturedClientIp,
+        userAgent: capturedUserAgent,
+      });
+      leadData.system = { callConsent: callConsentRecord };
+    } else if (consentParse.reason !== 'absent' && consentParse.reason !== 'unchecked') {
+      console.warn(`[forward-lead] call consent ignored: ${consentParse.reason}`);
+    }
+
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
     // nested under `customFields`) got a 201 and a visible lead row with the data gone.
@@ -688,6 +776,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // customFields as junk on every event. `sessionId` is deliberately NOT added: LPs
       // already post it (flat or in customFields) and read it back out of customFields.
       'sessionStartMs',
+      // ENG-2783: consumed above, never stored as free-form data.
+      'callConsent', 'visitorPageUrl',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -765,9 +855,32 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // the body only supplies the identity to use, and an invalid or missing identity falls back
     // to exactly the behaviour below, so LPs that do not send sessionStartMs yet are unchanged.
     const sessionIdentity = isSessionList(leadList) ? resolveSessionIdentity(req.body) : null;
-    const existingLead = normalizedEmail && !sessionIdentity
+    let existingLead: any = normalizedEmail && !sessionIdentity
       ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
       : null;
+
+    // ENG-2123: an EMAIL-LESS capture can be a repeat of an earlier one on the same number. Off unless the
+    // LEAD_PHONE_DEDUPE_MODE setting says otherwise (utils/phoneLeadDedupeMode.ts), never for session lists
+    // or the synthetic smoke-test numbers (which have their own deterministic-id path below).
+    const phoneMode = !normalizedEmail && !leadData.linkedin && normalizedPhone && !sessionIdentity && !isSessionList(leadList) && !isSmokeTestPhone(normalizedPhone)
+      ? await getPhoneDedupeMode()
+      : 'off';
+    const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);
+    let phoneSharedLine = false;
+    let existingFoundByPhone = false;
+    if (phoneKey && (phoneMode === 'shadow' || phoneMode === 'on')) {
+      try {
+        const match = await findPhoneMatch(leadList.listId, phoneKey, leadData);
+        // No phone number, name or lead id in this line: only counts and the decision.
+        console.log(`[phone-dedupe] mode=${phoneMode} list=${leadList.listId} decision=${match.decision} candidates=${match.candidates} valid=${match.valid}`);
+        if (phoneMode === 'on' && match.decision === 'match') { existingLead = match.lead; existingFoundByPhone = true; }
+        // A known shared line is never collapsed, not even by the same-bucket exactly-once create.
+        phoneSharedLine = match.decision === 'shared-line';
+      } catch (lookupErr: any) {
+        // A failed lookup must never fail the capture: create normally.
+        console.warn(`[phone-dedupe] lookup failed, creating normally: ${lookupErr?.message || lookupErr}`);
+      }
+    }
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     let mergedCustomFields: Record<string, any> = existingLead
@@ -778,13 +891,18 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     let lead: any;
     let isNew = false;
     let isUpdated = false;
+    // ENG-2783: the phone the EXISTING lead held before this submission merged into it (consent binding, see below).
+    let consentBasePhone: unknown;
 
     // The one merge routine for an EXISTING lead. Two entry points reach it: the
     // getLeadByEmail hit at the top of this handler, and a createLead that lost a race to a
     // concurrent submission of the same email (the adopt in the create branch below). Sharing
     // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
     // enclosing `lead` and `isUpdated`.
-    const mergeIntoExistingLead = async (existingLead: any): Promise<void> => {
+    const mergeIntoExistingLead = async (existingLead: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
+      // ENG-2123: a lead matched by PHONE (not email) only has its blanks filled, never overwritten.
+      const fillBlanksOnly = opts.fillBlanksOnly === true;
+      consentBasePhone = existingLead.phone;
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -799,7 +917,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         const newValue = normalize(leadData[field]);
         if (newValue) {
           const existingValue = normalize(existingLead[field]);
-          if (existingValue !== newValue) {
+          if (existingValue !== newValue && !(fillBlanksOnly && existingValue)) {
             updates[field] = newValue;
             changed = true;
           }
@@ -808,7 +926,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // Merge custom fields
       const existingCustomFields = existingLead.customFields || {};
-      const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      const mergedCf = fillBlanksOnly
+        ? fillBlankCustomFields(existingCustomFields, mergedCustomFields)
+        : { ...existingCustomFields, ...mergedCustomFields };
       // `source` is defaulted to 'api' whenever the caller omits it, so a blind spread lets
       // that synthesized value overwrite a real stored source on every repeat submission —
       // the same data loss the phone adopt path was fixed for, on the far more common email
@@ -816,10 +936,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       if (!callerSuppliedSource && 'source' in existingCustomFields) {
         mergedCf.source = existingCustomFields.source;
       }
+      // A phone-matched merge must not stamp the DEFAULTED 'api' source onto a row that never had one.
+      if (fillBlanksOnly && !callerSuppliedSource && !('source' in existingCustomFields)) {
+        delete mergedCf.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
       }
+
+      // ENG-2123: what the caller's own data changed, before the attribution refresh below flips `changed`.
+      const fieldsChanged = changed;
 
       // Attribution merge (Lead UTM — mirrors the User schema contract).
       // The new-lead path stamps firstTouch+lastTouch via createLead; the merge
@@ -894,11 +1021,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
-        isUpdated = changed;
+        // A phone-matched repeat that filled nothing is not an update: the lastTouch refresh is still saved,
+        // but it must not re-run drip enrolment, CRM sync or the owner alert.
+        isUpdated = fillBlanksOnly ? fieldsChanged : changed;
       }
 
       lead = { ...existingLead, ...updates };
     };
+
+    // ENG-2837: everything above is a read; from here on a lead write may happen (and may
+    // succeed even if its call then throws), so a claimed key can no longer be given back.
+    leadWriteStarted = true;
 
     if (sessionIdentity) {
       // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
@@ -912,7 +1045,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         touch,
       }));
     } else if (existingLead) {
-      await mergeIntoExistingLead(existingLead);
+      await mergeIntoExistingLead(existingLead, { fillBlanksOnly: existingFoundByPhone });
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
@@ -946,17 +1079,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // dedupe on top of it. Until then the primary key stops doubling as an index.
       const deterministicLeadId =
         !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
+      const createInput: any = {
+        ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
+        // Only added when true, so every non-session list passes byte-identical input.
+        ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+        // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+        ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
+        // ENG-2123: the phone twin, when the rollout mode is not 'off' and the number is specific enough.
+        ...(phoneKey && !phoneSharedLine ? { phoneUniqueCreate: true } : {}),
+        // ENG-2837: a keyed capture fires the new-lead notification itself, AFTER its replay
+        // record is durable, instead of createLead firing it at the write.
+        ...(submissionClaim ? { deferCreatedNotification: true } : {}),
+      };
       try {
-        lead = await crmDb.createLead(
-          leadList.listId,
-          {
-            ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
-            // Only added when true, so every non-session list passes byte-identical input.
-            ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
-            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
-            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
-          }
-        );
+        lead = await crmDb.createLead(leadList.listId, createInput, 'form_fill');
         isNew = true;
       } catch (createErr: any) {
         // The conditional create lost to an earlier submission of the same number. That is
@@ -964,7 +1100,45 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // report it as a duplicate. isNew stays false, so none of the new-lead side effects
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
-        if (createErr?.duplicateEmail && createErr.existingLead) {
+        // The winner is re-read by primary key: the carried row may predate an edit made since (a corrected
+        // phone, an added email), and a row that no longer qualifies must not be merged into.
+        const phoneWinner: any = createErr?.duplicatePhone && createErr.existingLead
+          ? (await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true })) || createErr.existingLead
+          : null;
+        if (phoneWinner && (
+          phoneNamesConflict(phoneWinner, leadData)
+          || String(phoneWinner.email ?? '').trim() !== ''
+          || phoneDedupeKey(phoneWinner.phone) !== phoneKey
+        )) {
+          // ENG-2123: a concurrent submission on the same number that names a DIFFERENT person (a shared
+          // household/office line). Merging would overwrite the first person's name and answers with the
+          // second's, so keep two rows - exactly what happened before this feature - on an ordinary id.
+          //
+          // Everyone who names that same other person shares ONE separate row: the id is bucketed on the number
+          // AND the normalized names, so a burst of same-named submissions collapses instead of writing one row each.
+          let separateHandled = false;
+          if (phoneNamesConflict(phoneWinner, leadData)) {
+            try {
+              lead = await crmDb.createLead(leadList.listId, { ...createInput, phoneUniqueIdSeed: phoneNameSeed(leadData) }, 'form_fill');
+              isNew = true;
+              separateHandled = true;
+            } catch (nameErr: any) {
+              if (!(nameErr?.duplicatePhone && nameErr.existingLead)) throw nameErr;
+              const sameName = (await crmDb.getLeadById(leadList.listId, nameErr.existingLead.leadId, { consistentRead: true })) || nameErr.existingLead;
+              if (String(sameName.email ?? '').trim() === '' && phoneDedupeKey(sameName.phone) === phoneKey && !phoneNamesConflict(sameName, leadData)) {
+                mergedCustomFields = incomingCustomFields;
+                leadData.customFields = mergedCustomFields;
+                await mergeIntoExistingLead(sameName, { fillBlanksOnly: true });
+                separateHandled = true;
+              }
+            }
+          }
+          if (!separateHandled) {
+            const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
+            lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
+            isNew = true;
+          }
+        } else if ((createErr?.duplicateEmail || createErr?.duplicatePhone) && createErr.existingLead) {
           // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
           // above, but createLead's own pre-check found a row a concurrent submission wrote in
           // between. That is a REPEAT submission of an existing lead, not a failure — throwing
@@ -980,8 +1154,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // decides `changed` and the write-once backfills — so re-read by primary key,
           // consistently (one GetItem, race path only); fall back to the carried row only if
           // that read comes back empty.
-          const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
-          await mergeIntoExistingLead(fresh || createErr.existingLead);
+          const fresh = phoneWinner || await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
+          await mergeIntoExistingLead(fresh || createErr.existingLead, { fillBlanksOnly: !!createErr?.duplicatePhone });
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
         } else {
@@ -1012,6 +1186,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // that branch is the well-trodden email path and is not worth destabilising here.
           const normalizeAdopted = (value: any): string =>
             value === null || value === undefined ? '' : String(value).trim();
+          consentBasePhone = lead.phone;
           const adoptedUpdates: any = {};
           let adoptedChanged = false;
 
@@ -1079,6 +1254,32 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
     }
 
+    // ENG-2783: consent on a REPEAT submission. A new lead already carries it (written in the create input above). An
+    // existing lead that has none gets it recorded now, with a write that creates `system.callConsent` only if absent:
+    // the FIRST granted record is kept forever and a later one (same or different text) is IGNORED, not appended, so
+    // the proof of what the person first agreed to is never replaced. This runs before the dispatch below, which
+    // re-reads the lead consistently. A repeat submission DOES dispatch the call gates (notifyRepeatSubmission ->
+    // dispatchLeadCreated(..., submission)), and the only call-specific refusal that sticks is `has_record` (a call
+    // already happened), so a lead first skipped as `no_call_consent` and now resubmitting WITH consent is called by
+    // THAT submission, if every other gate passes. That is intended and visible: the earlier `call.skipped` stays on the
+    // timeline and the new `call.started` follows it. A failed write only warns: the lead is then skipped, never called.
+    // Phone binding. The record is consent for the number the visitor typed, and is only recorded on an existing lead when that
+    // number is the one the lead ALREADY held before this submission: otherwise anyone who knows a lead's email could tick the box
+    // with their own number and attach it to the lead. Can a resubmission CHANGE the stored phone? Yes: an email-matched merge
+    // overwrites a differing phone with the submitted one, a phone-matched merge (fillBlanksOnly) and the adopt path only fill blanks or
+    // overwrite on the same key. A changed phone never inherits an old record because the gate (hasCallConsent) requires the
+    // record's phoneDigits to equal the lead's CURRENT phone.
+    if (callConsentRecord && !isNew && lead?.leadId && !lead.system?.callConsent) {
+      if (!callConsentRecord.phoneDigits || consentPhoneDigits(consentBasePhone) !== callConsentRecord.phoneDigits) {
+        console.warn('[forward-lead] call consent ignored: phone_mismatch');
+      } else try {
+        const created = await crmDb.createLeadSystemRecordOnce(leadList.listId, lead.leadId, 'callConsent', callConsentRecord);
+        if (created) lead = { ...lead, system: { ...(lead.system || {}), callConsent: callConsentRecord } };
+      } catch (consentErr: unknown) {
+        console.warn(`[forward-lead] call consent not recorded on existing lead: ${consentErr instanceof Error ? consentErr.name : 'error'}`);
+      }
+    }
+
     // Inserts already notify at the CRM write boundary. Every accepted repeat form
     // submission also notifies, even when it merges into an unchanged existing row.
     // A server-generated event ID keeps distinct submissions separate on recovery.
@@ -1091,39 +1292,64 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // numbers at random, so collisions are routine by construction and every colliding
     // resubmission notified a real human about a fake lead. The gate's own comment claims
     // it skips "the whole cascade"; this is the part that escaped it.
-    if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
-      const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
-      void import('../services/orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
-        .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
-    }
+    // ENG-2837: dispatched below, after the replay record (if any) is durable.
+    const notifyRepeatSubmission = !suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData);
 
     // Send API response immediately so caller is not blocked
-    if (isNew) {
-      res.status(201).json({
-        success: true,
-        message: 'Lead forwarded successfully',
-        event: 'lead.created',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else if (isUpdated) {
-      res.status(200).json({
-        success: true,
-        message: 'Lead updated successfully',
-        event: 'lead.updated',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
-    } else {
-      res.status(200).json({
-        success: true,
-        message: 'Lead already exists with no changes',
-        event: 'lead.unchanged',
-        leadId: lead.leadId,
-        listId: leadList.listId
-      });
+    const responseStatus = isNew ? 201 : 200;
+    const responseBody = isNew
+      ? { success: true, message: 'Lead forwarded successfully', event: 'lead.created', leadId: lead.leadId, listId: leadList.listId }
+      : isUpdated
+        ? { success: true, message: 'Lead updated successfully', event: 'lead.updated', leadId: lead.leadId, listId: leadList.listId }
+        : { success: true, message: 'Lead already exists with no changes', event: 'lead.unchanged', leadId: lead.leadId, listId: leadList.listId };
+
+    // ENG-2837: make the replay record durable BEFORE answering and before ANY side effect
+    // (the notifications just below, CAPI / CRM sync / email further down), so a retry can
+    // only ever see "completed" and replay. If it cannot be recorded, the lead is saved but
+    // the claim stays in_progress for good: we fire nothing and answer retryably. Retries
+    // then get 409 instead of a second write or a second round of side effects. Safety over
+    // liveness — the owner is not notified about this lead until the claim is cleared by hand.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      let recorded = false;
+      try {
+        recorded = await completeLeadSubmission(leadList.listId, claim.key, claim.ownerToken, {
+          leadId: lead.leadId, responseStatus, responseBody,
+        });
+      } catch (completeErr: any) {
+        console.error(`[forward-lead] ENG-2837 completion store error for lead ${lead.leadId}: ${completeErr?.message || completeErr}`);
+      }
+      if (!recorded) {
+        console.error(`[forward-lead] ENG-2837 lead ${lead.leadId} saved on list ${leadList.listId} but its submission record was not written; claim left in_progress, side effects withheld`);
+        res.setHeader('Retry-After', '2');
+        return res.status(503).json({
+          success: false,
+          retryable: true,
+          message: 'This submission could not be confirmed. Retry with the same submissionId.',
+        });
+      }
     }
+
+    if (isNew && submissionKey && !sessionIdentity) {
+      // The keyed create deferred this out of createLead (deferCreatedNotification); same call
+      // createLead would have made, so the notifier's own gates (session lists etc.) still apply.
+      void import('../services/orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill'))
+        .catch(() => console.warn('[leadNotifications] hook failed', { listId: leadList.listId, leadId: lead.leadId }));
+    }
+    if (notifyRepeatSubmission) {
+      // A caller-supplied key makes the notification id deterministic, so the notifier dedupes
+      // it too. Otherwise a server-generated id keeps distinct submissions separate on recovery.
+      const submission = {
+        submissionId: submissionKey ? `client:${submissionKey}` : crypto.randomUUID(),
+        submittedAt: new Date().toISOString(),
+      };
+      void import('../services/orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
+        .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
+    }
+    res.status(responseStatus).json(responseBody);
 
     // Server-side Meta Conversions API send. Fire-and-forget (same pattern as the
     // roadmap-delivery email below) — this must never delay or affect the lead-save response
@@ -1307,6 +1533,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                       }
                     }
 
+                    // ENG-673: this block also runs for an EXISTING lead that resubmits a form (isUpdated), and that lead keeps its Smartlead
+                    // marker. A lead being emailed through the customer's Smartlead campaign is not also auto-emailed from here.
+                    // An existing lead that opted out and then resubmits a form must not be auto-emailed either: the auto-draft step has no
+                    // do-not-contact check of its own, and neither did this one (found by a review of ENG-673; older than that work).
+                    if (!autoSendStatus && isDoNotContact(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is do-not-contact`);
+                      autoSendStatus = 'skipped_do_not_contact';
+                    }
+
+                    if (!autoSendStatus && isPushedToSmartlead(freshLead ?? lead)) {
+                      console.log(`Auto send skipped: lead ${lead.leadId} in list ${leadList.listId} is being emailed through Smartlead`);
+                      autoSendStatus = 'skipped_smartlead';
+                    }
+
                     if (!autoSendStatus) {
                       // Resolve sender
                       const sendersResult = await agentModeService.getCrmSenders(leadList.userId);
@@ -1400,6 +1640,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   } catch (error: any) {
     console.error('Lead forwarding error:', error);
+
+    // ENG-2837: the capture failed before its response was recorded. Give the key back ONLY
+    // if no lead write was attempted — then nothing happened and the retry is processed fresh.
+    // Once a write may have happened, the claim stays in_progress (retries get 409) so a retry
+    // can never repeat the write or its side effects.
+    if (submissionClaim) {
+      const claim = submissionClaim;
+      submissionClaim = null;
+      if (!leadWriteStarted) {
+        await releaseLeadSubmission(leadList.listId, claim.key, claim.ownerToken).catch((releaseErr: any) =>
+          console.error(`[forward-lead] ENG-2837 failed to release submission claim (key stays in_progress): ${releaseErr?.message || releaseErr}`));
+      } else {
+        console.error(`[forward-lead] ENG-2837 capture failed after a lead write may have started on list ${leadList.listId}; claim left in_progress`);
+      }
+    }
 
     // Trigger api.lead_failed alert if configured
     try {
@@ -1702,6 +1957,8 @@ interface HubspotContactChange {
 
 interface HubspotJobPayload {
   changesByObjectId: Record<string, HubspotContactChange>;
+  /** contact.merge events (ENG-2465). Optional: jobs queued before this field existed lack it. */
+  merges?: Array<HubSpotContactMerge & { portalId: number }>;
 }
 
 /** Contact/deal sync, run either inline (same request, the common case) or later by
@@ -1709,6 +1966,39 @@ interface HubspotJobPayload {
  *  fast-follow, Greptile P1 — same fire-and-forget crash-loss risk the Calendly
  *  receiver had, since this handler acks HubSpot's webhook before this runs). */
 export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
+  // ── contact.merge: re-point stored contact ids at the survivor ───────────
+  let mergeFailures = 0;
+  for (const merge of payload.merges ?? []) {
+    try {
+      const userId = await getUserIdByHubSpotPortalId(merge.portalId);
+      if (!userId) {
+        console.log(`[HubSpot Webhook] contact.merge: no user found for portal ${merge.portalId}`);
+        continue;
+      }
+      const lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+      for (const list of lists) {
+        const cfgs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+        if (String(cfgs?.hubspot?.accountId) !== String(merge.portalId)) continue;
+        const r = await repointMergedContactIds(list.listId, merge);
+        mergeFailures += r.lookupFailed;
+      }
+    } catch (err: any) {
+      mergeFailures++;
+      console.error(`[HubSpot Webhook] contact.merge handling failed for survivor ${merge.survivorId}: ${err?.message || err}`);
+    }
+  }
+
+  await processHubspotContactChanges(payload);
+
+  // A merge whose lookup or write failed throws AFTER the rest of the delivery is applied, so the
+  // durable queue retries the job (the repoint is idempotent; the contact changes are idempotent
+  // updates, as for any retry of this job). Attempts are capped by the queue.
+  if (mergeFailures > 0) {
+    throw new Error(`contact.merge: ${mergeFailures} stored contact id(s) could not be re-pointed`);
+  }
+}
+
+async function processHubspotContactChanges(payload: HubspotJobPayload): Promise<void> {
   // ── Process each contact / deal ─────────────────────────────────────────
   for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
@@ -1912,7 +2202,7 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
             try {
-              await crmDb.createLead(list.listId, newLead);
+              await crmDb.createLead(list.listId, newLead, 'integration');
               console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
               continue;
             } catch (createErr: any) {
@@ -1993,6 +2283,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // ── Aggregate events by objectId ────────────────────────────────────────
       const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       const changesByObjectId: Record<string, HubspotContactChange> = {};
+      const merges: Array<HubSpotContactMerge & { portalId: number }> = [];
 
       for (const event of events) {
         const eventType: string = event?.subscriptionType ?? 'unknown';
@@ -2002,6 +2293,12 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         const propertyValue: string = event?.propertyValue ?? '';
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const merge = parseHubSpotMergeEvent(event);
+        if (merge) {
+          merges.push({ ...merge, portalId });
+          continue;
+        }
 
         const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
         const isDealEvent = eventType === 'deal.propertyChange';
@@ -2024,7 +2321,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // a hash of the raw body is stable across a genuine redelivery of the exact
       // same payload and distinct for any payload with different actual content.
       const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
-      const jobPayload: HubspotJobPayload = { changesByObjectId };
+      const jobPayload: HubspotJobPayload = merges.length > 0 ? { changesByObjectId, merges } : { changesByObjectId };
 
       // claimImmediately: this same request processes the job right below, so the
       // enqueue writes it straight in as 'processing' — no separate claim call, no

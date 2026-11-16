@@ -3,6 +3,7 @@ import { authenticateToken } from "../middleware/auth";
 import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
 import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
+import { ADSET_DELIVERY_FIELDS, CAMPAIGN_DELIVERY_FIELDS, extractDeliveryConfig } from "../utils/metaDeliveryConfig";
 import { sandboxManagementUrl } from "../services/sandboxManagementUrl";
 import { isEvaluationUser } from "../services/evaluationPolicy";
 import { stampMetaImageUpload, stampMetaPublish } from "../services/creativeLineage";
@@ -158,7 +159,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
     try {
-      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&access_token=${accessToken}`;
+      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,effective_status,objective,${CAMPAIGN_DELIVERY_FIELDS}&access_token=${accessToken}`;
       // Never log the URL itself: it carries `access_token` in the query string.
       console.log("Fetching campaigns for act_%s", adAccountId);
 
@@ -180,7 +181,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ad sets for timeframe:", timeframe);
     let adSets;
     try {
-      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,effective_status,campaign_id,targeting&access_token=${accessToken}`;
+      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,effective_status,campaign_id,targeting,${ADSET_DELIVERY_FIELDS}&access_token=${accessToken}`;
       console.log("Fetching ad sets for act_%s", adAccountId);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
@@ -338,6 +339,7 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
       status: campaign.effective_status || campaign.status,
       configuredStatus: campaign.status,
       objective: campaign.objective,
+      ...extractDeliveryConfig(campaign),
       impressions: 0,
       clicks: 0,
       spend: 0,
@@ -446,6 +448,7 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       campaignId: adSet.campaign_id,
       campaignName: campaignMap.get(adSet.campaign_id) || 'Unknown Campaign',
       targeting: adSet.targeting,
+      ...extractDeliveryConfig(adSet),
       impressions: 0,
       clicks: 0,
       spend: 0,

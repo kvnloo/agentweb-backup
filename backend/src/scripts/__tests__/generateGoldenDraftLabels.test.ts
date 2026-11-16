@@ -1,13 +1,16 @@
 import {
   DEFAULT_DRAFT_LABEL_MODEL,
   buildAccountHealthContentText,
+  buildPreflight,
   collectCandidates,
   draftLabelsForCase,
   parseArgs,
   resolveAccountHealthContent,
   resolveAgentContent,
+  redactedDraftSummary,
   resolveCreativeContent,
   run,
+  runCli,
   selectCandidateCases,
   type CliOptions,
   type GenerateDraftDeps,
@@ -474,6 +477,82 @@ describe('generateGoldenDraftLabels (ENG-2208)', () => {
       expect(() => parseArgs(['--model', 'not-a-real-model'])).toThrow(/LLM_MODEL_REGISTRY/);
       expect(() => parseArgs(['--limit', '0'])).toThrow(/--limit/);
       expect(() => parseArgs(['--limit', 'nope'])).toThrow(/--limit/);
+    });
+  });
+
+  describe('preflight, --yes and dry-run redaction (ENG-2135)', () => {
+    const fullLlm = () =>
+      llmJsonResponse({
+        task_success: { label: 'pass', rationale: 'CUSTOMER-QUOTE-ABC' },
+        tool_correctness: { label: 'pass', rationale: 'x' },
+        groundedness: { label: 'na', rationale: 'x' },
+        instruction_compliance: { label: 'pass', rationale: 'x' },
+        argued_with_instruction: { label: 'fail', rationale: 'x' },
+        escalated_when_not_required: { label: 'fail', rationale: 'x' },
+        failed_to_escalate: { label: 'fail', rationale: 'x' },
+      });
+    const session: ChatSession = { sessionId: 'a1', userId: 'u1', messages: [{ role: 'user', content: 'hi' }], createdAt: NOW.toISOString(), updatedAt: NOW.toISOString() };
+    const setup = () => {
+      const callLLM = jest.fn(async () => fullLlm());
+      const saveDraft = jest.fn(async (caseId: string, draft: unknown) => ({ ...agentCase(caseId), draft }) as GoldenCase);
+      const deps = baseDeps({
+        getChatSession: async () => session,
+        callLLM,
+        store: { listCases: async (surface) => (surface === 'agent' ? [agentCase('a1'), agentCase('a2')] : []), saveDraft },
+      });
+      return { deps, callLLM, saveDraft };
+    };
+
+    it('preflight names the table, surface, case count and model', () => {
+      const text = buildPreflight({ tableName: 'AW-EvalGoldenCases', opts: { model: DEFAULT_DRAFT_LABEL_MODEL, force: false, dryRun: false, surface: 'agent' }, wouldDraft: 2 }).join('\n');
+      expect(text).toContain('AW-EvalGoldenCases');
+      expect(text).toContain('surface: agent');
+      expect(text).toContain('would draft: 2');
+      expect(text).toContain(DEFAULT_DRAFT_LABEL_MODEL);
+    });
+
+    it('a live run without --yes prints the preflight, exits 1, and neither calls the LLM nor writes', async () => {
+      const { deps, callLLM, saveDraft } = setup();
+      const lines: string[] = [];
+      const code = await runCli(['--surface', 'agent'], deps, 'AW-EvalGoldenCases', (l) => lines.push(l));
+      expect(code).toBe(1);
+      expect(callLLM).not.toHaveBeenCalled();
+      expect(saveDraft).not.toHaveBeenCalled();
+      expect(lines.join('\n')).toMatch(/table:\s+AW-EvalGoldenCases/);
+      expect(lines.join('\n')).toMatch(/would draft: 2/);
+    });
+
+    it('a live run with --yes proceeds and writes', async () => {
+      const { deps, saveDraft } = setup();
+      const code = await runCli(['--surface', 'agent', '--yes'], deps, 'AW-EvalGoldenCases', () => undefined);
+      expect(code).toBe(0);
+      expect(saveDraft).toHaveBeenCalledTimes(2);
+    });
+
+    it('--dry-run needs no --yes, writes nothing, and prints no rationale text', async () => {
+      const { deps, saveDraft } = setup();
+      const logged: string[] = [];
+      const spy = jest.spyOn(console, 'log').mockImplementation((...a: unknown[]) => void logged.push(a.join(' ')));
+      const code = await runCli(['--surface', 'agent', '--dry-run'], deps, 'AW-EvalGoldenCases', () => undefined);
+      spy.mockRestore();
+      expect(code).toBe(0);
+      expect(saveDraft).not.toHaveBeenCalled();
+      const out = logged.join('\n');
+      expect(out).toMatch(/would draft \(dry-run\) task_success=pass tool_correctness=pass/);
+      expect(out).not.toContain('CUSTOMER-QUOTE-ABC');
+    });
+
+    it('refuses when the store is not provisioned', async () => {
+      const { deps, callLLM } = setup();
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      expect(await runCli(['--yes'], deps, null, () => undefined)).toBe(1);
+      err.mockRestore();
+      expect(callLLM).not.toHaveBeenCalled();
+    });
+
+    it('redactedDraftSummary keeps criterion and label only', () => {
+      const out = redactedDraftSummary({ model: 'm', generatedAt: 'g', labels: { hook: { label: 'fail', rationale: 'SECRET' } } });
+      expect(out).toBe('hook=fail');
     });
   });
 });

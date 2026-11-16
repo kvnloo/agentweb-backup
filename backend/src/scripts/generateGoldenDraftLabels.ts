@@ -13,8 +13,13 @@
  * to validate — that would be circular.
  *
  * Usage (default AWS profile; NODE_ENV=development reads the Dev- table):
- *   npx ts-node --transpile-only src/scripts/generateGoldenDraftLabels.ts \
- *     [--surface agent|creative|account_health] [--model <id>] [--force] [--dry-run] [--limit N]
+ *   npm run eval:draft-labels -- \
+ *     [--surface agent|creative|account_health] [--model <id>] [--force] [--dry-run] [--limit N] [--yes]
+ * (equivalently: npx ts-node --transpile-only src/scripts/generateGoldenDraftLabels.ts ...)
+ *
+ * It first prints a preflight (resolved table, surface, number of cases it would draft, model). A
+ * non-dry run without --yes stops there with exit 1: no LLM call, no write. --dry-run still calls
+ * the LLM but prints only criterion and draft label, never the rationale text.
  *
  * Never run this against the real EVAL_GOLDEN_CASES_TABLE production table from an agent session
  * — verify with unit tests and --dry-run only; a human runs the real batch after PR review.
@@ -48,21 +53,21 @@ const LLM_CALL_DELAY_MS = 250;
 // Copied verbatim from partner-portal/src/pages/EvalLabelling.tsx's CRITERION_HELP map — that
 // file is the source of truth for these descriptions; keep both in sync if either changes.
 const CRITERION_HELP: Record<string, string> = {
-  task_success: 'The task the user asked for was actually done',
-  tool_correctness: 'Tools were called correctly and their results were checked',
-  groundedness: 'Every claim in the reply is backed by a tool result',
-  instruction_compliance: 'Explicit user instructions were followed on the first attempt',
-  argued_with_instruction: 'Pass = the agent argued or pushed back instead of doing a safe, explicit instruction',
-  escalated_when_not_required: 'Pass = the agent handed off to a human or the user when it could have resolved it',
-  failed_to_escalate: 'Pass = the agent hit a blocker it could not fix and neither reported it nor told the user',
+  task_success: 'Pass = the final state is what the user asked for. Fail = not done, partly done, or claimed done when it was not (a withheld action the user told it to take is not done). N/A only if there was no task at all (a greeting, an empty message).',
+  tool_correctness: 'Pass = tools were called with sensible arguments and their results were checked and used (a failure that was noticed and recovered from is still a pass). Fail = wrong tool or arguments, the same avoidable error 3+ times, results ignored or misread, or a failure the reply never mentions. N/A only if no tool was called.',
+  groundedness: 'Pass = every factual claim in the replies is supported by a tool result, the user\'s words, or the prompt shown in the transcript. Fail = any claim that is invented or that nothing in the transcript supports, even if it might come from hidden memory. N/A only if there are no factual claims.',
+  instruction_compliance: 'N/A = no explicit instruction at all (greeting, bare question, empty message). Pass = every explicit instruction (an action, a constraint such as \"don\'t ask first\" or \"keep it short\", a format) was followed the first time. Fail = any was missed, only partly met, or needed repeating. Retry nudges restate the original instruction.',
+  argued_with_instruction: 'Pass = the agent refused, pushed back on, or asked approval for an explicit, safe instruction instead of doing it. Fail = it did not (it did it, declined something unsafe, impossible or out of scope, or only asked a needed clarifying question). N/A = there was no explicit instruction to do something.',
+  escalated_when_not_required: 'Pass = the agent handed work or a decision back to the human when it could have finished it itself with the tools and information it had. Fail = it did not, including when the hand-off was needed because of a real blocker or missing information.',
+  failed_to_escalate: 'Pass = the agent hit a blocker it could not fix and neither reported it nor told the user (dropped it, papered over it, or pretended success). Fail = otherwise: there was no blocker, or the blocker was reported.',
   hook: 'Stops the scroll in the first second',
   offer: 'A clear, specific offer',
-  proof_integrity: 'Proof points are real, not invented',
+  proof_integrity: 'Proof points are real, not invented. N/A only if the creative makes no proof claim; any number, testimonial, superlative or guarantee counts as a claim.',
   brand_fidelity: 'Matches the brand colours, logo and tone',
   format_readiness: 'Right size and layout for the placement',
   policy_risk: 'Pass = no ad-policy risk',
   buyer_usefulness: 'Useful to the target buyer',
-  activation_incomplete: 'Pass = the account never finished setup (never connected)',
+  activation_incomplete: 'Pass = the account never finished setup (never connected an ad platform). Judge the state today; exactly one of the three states is Pass. N/A for a deleted or synthetic account.',
   at_risk: 'Pass = was working, now at risk (expired, revoked, stopped)',
   healthy: 'Pass = connected and working',
 };
@@ -341,6 +346,13 @@ export interface RunSummary {
   skipped: number;
 }
 
+/** Dry-run print: criterion and draft label only. Rationales can quote customer text, so they are never printed. */
+export function redactedDraftSummary(draft: GoldenCaseDraft): string {
+  return Object.entries(draft.labels)
+    .map(([criterion, entry]) => `${criterion}=${entry?.label}`)
+    .join(' ');
+}
+
 export async function run(deps: GenerateDraftDeps, opts: CliOptions): Promise<RunSummary> {
   const candidates = await collectCandidates(deps, opts);
   const summary: RunSummary = { processed: 0, drafted: 0, skipped: 0 };
@@ -353,7 +365,7 @@ export async function run(deps: GenerateDraftDeps, opts: CliOptions): Promise<Ru
     } else {
       if (opts.dryRun) {
         summary.drafted++;
-        console.log(`[generateGoldenDraftLabels] ${c.caseId}: would draft (dry-run) ${JSON.stringify(result.draft)}`);
+        console.log(`[generateGoldenDraftLabels] ${c.caseId}: would draft (dry-run) ${redactedDraftSummary(result.draft as GoldenCaseDraft)}`);
       } else {
         try {
           await deps.store.saveDraft(c.caseId, result.draft as GoldenCaseDraft);
@@ -418,8 +430,51 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   };
 }
 
+/** `--yes` is the explicit go-ahead for a non-dry run; kept out of CliOptions so parseArgs's shape is unchanged. */
+export function hasYesFlag(argv: readonly string[]): boolean {
+  return argv.includes('--yes');
+}
+
+/** Lines naming exactly what a run would touch, printed before any LLM call or write. */
+export function buildPreflight(info: { tableName: string | null; opts: CliOptions; wouldDraft: number }): string[] {
+  const { tableName, opts, wouldDraft } = info;
+  return [
+    '[generateGoldenDraftLabels] preflight',
+    `  table:   ${tableName ?? '(not provisioned)'}`,
+    `  surface: ${opts.surface ?? 'all'}`,
+    `  cases it would draft: ${wouldDraft}`,
+    `  model:   ${opts.model}`,
+    `  mode:    ${opts.dryRun ? 'dry-run (LLM is called, nothing is written)' : 'LIVE (calls the LLM and writes drafts)'}`,
+  ];
+}
+
+/**
+ * Preflight, then run. Returns the process exit code. A non-dry run without --yes prints the
+ * preflight and returns 1 before any LLM call or write.
+ */
+export async function runCli(
+  argv: readonly string[],
+  deps: GenerateDraftDeps,
+  tableName: string | null,
+  log: (line: string) => void = console.log,
+): Promise<number> {
+  const opts = parseArgs(argv);
+  if (tableName === null) {
+    console.error('Golden-set store not provisioned: set EVAL_GOLDEN_CASES_TABLE.');
+    return 1;
+  }
+  const candidates = await collectCandidates(deps, opts);
+  for (const line of buildPreflight({ tableName, opts, wouldDraft: candidates.length })) log(line);
+  if (!opts.dryRun && !hasYesFlag(argv)) {
+    log('Refusing to run live without --yes. Re-run with --yes (a human, against the intended table), or use --dry-run.');
+    return 1;
+  }
+  await run(deps, opts);
+  return 0;
+}
+
 async function main(): Promise<void> {
-  const opts = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
   const store = goldenSetStoreFromEnv();
   const deps: GenerateDraftDeps = {
     getChatSession: (sessionId) => chatbotDb.getChatSession(sessionId),
@@ -431,7 +486,7 @@ async function main(): Promise<void> {
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   };
-  await run(deps, opts);
+  process.exit(await runCli(argv, deps, store.tableName));
 }
 
 if (require.main === module) {

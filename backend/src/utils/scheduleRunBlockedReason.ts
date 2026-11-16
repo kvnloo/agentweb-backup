@@ -10,3 +10,11 @@
  * the constant there would create a circular import.
  */
 export const LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON = 'linkedin_search_unavailable';
+
+/**
+ * ENG-669 PR-D: recorded on a run result whose schedule's saved model was refused before anything ran: outside the
+ * owner's plan (`not_in_plan`), or no longer served / selectable. The run is still a `failure` (nothing ran); this
+ * says WHY in a way the owner can act on, alongside `blockedReason` (the ModelUnavailableReason) and `blockedModel`
+ * (the refused id). Written only while `model_tier_allowlist_enabled` is on.
+ */
+export const MODEL_UNAVAILABLE_BLOCK_REASON = 'model_unavailable';

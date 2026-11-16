@@ -43,6 +43,23 @@ export const ALL_ONBOARDING_STAGES: readonly OnboardingStage[] = [
   "stale",
 ] as const;
 
+/** Analytics-only events that must not alter a user's lifecycle stage. */
+export const LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS = new Set<string>([
+  "voice_onboarding_presented",
+  "voice_onboarding_started",
+  "voice_onboarding_text_fallback",
+  "brand_review_brand_edit",
+  "brand_review_confirmed",
+  "brand_review_icp_edit",
+  "brand_review_icp_regenerate",
+  "brand_review_icp_remove",
+  "brand_review_valueprop_edit",
+  "phase3_generate_ads",
+  "phase3_icp_selected",
+  "phase3_pick_for_me",
+  "phase3_summary_confirmed",
+]);
+
 /**
  * Event types the onboarding flow emits. Kept as a wide set — the endpoint
  * accepts any of these; unknown event types are rejected at the HTTP layer.
@@ -82,6 +99,8 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "voice_onboarding_presented",
   "voice_onboarding_started",
   "voice_onboarding_text_fallback",
+  // Click-level review-screen analytics: accepted via LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS below.
+  ...LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS,
   // Outreach (test-env re-enable — not committed to harsha/dev)
   "outreach_channel_connect_already_connected",
   "outreach_channel_connect_clicked",
@@ -113,12 +132,6 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "outreach_specs_submitted",
 ]);
 
-/** Analytics-only events that must not alter a user's lifecycle stage. */
-export const LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS = new Set<string>([
-  "voice_onboarding_presented",
-  "voice_onboarding_started",
-  "voice_onboarding_text_fallback",
-]);
 
 export function isLifecycleNeutralOnboardingEvent(event: string): boolean {
   return LIFECYCLE_NEUTRAL_ONBOARDING_EVENTS.has(event);

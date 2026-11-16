@@ -44,6 +44,13 @@ jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
 }));
 
+// ENG-673: the do-not-contact address guard has its own tests (contactGuard.test.ts); here it is controlled and defaults to "nobody blocked".
+const mockBlockedRecipients = jest.fn().mockResolvedValue([]);
+jest.mock('../services/contactGuard', () => ({
+  blockedRecipients: (...a: any[]) => mockBlockedRecipients(...a),
+  blockedMessage: (b: string[]) => `Not sent: ${b.join(', ')} is marked do-not-contact`,
+}));
+
 jest.mock('../services/crmAccessControl', () => ({
   canDestructiveCrmList: jest.fn(async () => true),
   CRM_EDITOR_REQUIRED_MESSAGE: 'Editor access required',
@@ -120,6 +127,18 @@ describe('sendEmailToLead — daily-cap enforcement (ENG-265)', () => {
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
     expect(mockReserveSend).toHaveBeenCalledWith(OWNER, CAPPED_SENDER_ID, 5);
     expect(mockReleaseSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('sendEmailFromConfiguredSender — do-not-contact (ENG-673)', () => {
+  it('refuses an address that belongs to a do-not-contact lead, sends nothing and uses no daily-cap slot', async () => {
+    mockBlockedRecipients.mockResolvedValueOnce(['someone@external.com']);
+    const result = await (agentModeService as any).sendEmailFromConfiguredSender(OWNER, { to: 'someone@external.com', subject: 'Hello', html: '<p>Hi</p>' });
+    expect(result).toEqual(expect.objectContaining({ success: false, reason: 'do_not_contact', code: 409 }));
+    expect(mockBlockedRecipients).toHaveBeenCalledWith([OWNER], 'someone@external.com');
+    expect(mockReserveSend).not.toHaveBeenCalled();
+    expect(mockResendSendEmail).not.toHaveBeenCalled();
+    expect(mockProviderSendEmail).not.toHaveBeenCalled();
   });
 });
 

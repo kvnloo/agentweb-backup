@@ -98,7 +98,7 @@ describe('AgentModeController - createSession', () => {
         effectiveModel: 'gpt-5-chat-2',
         modelSelection: 'honored',
         usageMode: 'full_choice',
-      }),
+      }), 'system',
     );
     expect(mockRes.status).toHaveBeenCalledWith(201);
     expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
@@ -153,7 +153,7 @@ describe('AgentModeController - createSession', () => {
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
       mockSessionWithImageType.sessionId,
       'gpt-5-chat-2',
-      undefined,
+      undefined, 'system',
     );
     expect(mockRes.status).toHaveBeenCalledWith(201);
     expect(mockRes.json).toHaveBeenCalledWith({

@@ -2,6 +2,7 @@ import {
   applyLlmUsageCredits,
   getCurrentUsageMonth,
   getLlmUsageCreditAdjustment,
+  getRevocablePurchasedCreditMicroUsd,
   grantMonthlyLlmUsageCredit,
   planRolloutMigrationCredit,
   reverseMonthlyPurchasedLlmUsageCredit,
@@ -164,5 +165,45 @@ describe('LLM usage credits', () => {
     expect(updateUser).toHaveBeenCalledTimes(1);
     getUser.mockRestore();
     updateUser.mockRestore();
+  });
+});
+
+// ENG-668: the PAYG pool high-water mark leaves out top-up credit a refund or dispute can still revoke.
+describe('getRevocablePurchasedCreditMicroUsd', () => {
+  const USD = 1_000_000;
+  const ledger = (over: Record<string, unknown> = {}) => ({
+    month: '2026-10',
+    totalPurchasedMicroUsd: 70 * USD,
+    totalPurchasedReversedMicroUsd: 0,
+    totalAdminGrantedMicroUsd: 10 * USD,
+    totalMigrationOffsetMicroUsd: 0,
+    grantIds: ['stripe:cs_1', 'seat-credit:org-1:2026-10', 'admin:1'],
+    grants: [
+      { id: 'stripe:cs_1', source: 'purchase', amountMicroUsd: 50 * USD, grantedAt: '2026-10-02T00:00:00.000Z' },
+      { id: 'seat-credit:org-1:2026-10', source: 'purchase', amountMicroUsd: 20 * USD, grantedAt: '2026-10-01T00:00:00.000Z' },
+      { id: 'admin:1', source: 'admin', amountMicroUsd: 10 * USD, grantedAt: '2026-10-01T00:00:00.000Z' },
+    ],
+    ...over,
+  }) as any;
+
+  it('counts top-ups, not the seat credit (also source "purchase") or admin grants', () => {
+    expect(getRevocablePurchasedCreditMicroUsd(ledger(), '2026-10')).toBe(50 * USD);
+  });
+
+  it('nets out what a refund already took back', () => {
+    const refunded = ledger({
+      totalPurchasedReversedMicroUsd: 30 * USD,
+      reversalIds: ['re_1'],
+      reversals: [{ id: 're_1', grantId: 'stripe:cs_1', amountMicroUsd: 30 * USD, reversedAt: '2026-10-05T00:00:00.000Z' }],
+    });
+    expect(getRevocablePurchasedCreditMicroUsd(refunded, '2026-10')).toBe(20 * USD);
+  });
+
+  it('is 0 for another month\'s ledger', () => {
+    expect(getRevocablePurchasedCreditMicroUsd(ledger(), '2026-11')).toBe(0);
+  });
+
+  it('treats an un-itemised purchase total as all revocable (keeps the mark low, never high)', () => {
+    expect(getRevocablePurchasedCreditMicroUsd(ledger({ grants: [] }), '2026-10')).toBe(70 * USD);
   });
 });

@@ -1,27 +1,19 @@
+import { allowsLeadOrigin, configOf, LeadOrigin } from './leadNotificationConfig';
+export type { LeadOrigin, LeadNotificationsConfig } from './leadNotificationConfig';
 import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
 import { createHash } from 'crypto';
+import { judgeLeadFit } from './leadFitGate';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
 import { crmDb, orgDb, userDb } from './db';
+import { dispatchHotLeadCall } from './hotLeadCallService';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
 
-export interface LeadNotificationsConfig {
-  enabled: boolean;
-  slackChannelId: string;
-  /** Case-insensitive persisted list IDs/names or LP/source identifiers; absent means all. */
-  sources?: string[];
-  maskPhone?: boolean;
-  /** Slack user IDs, not arbitrary mrkdwn. */
-  mentions?: string[];
-  /** Deprecated; only noemail+*@waterheater.app placeholders are hidden. */
-  excludeEmailPatterns?: string[];
-}
-interface LeadNotificationJob { orgId: string; listId: string; leadId: string; submissionId?: string; submittedAt?: string }
+interface LeadNotificationJob { origin?: LeadOrigin; orgId: string; listId: string; leadId: string; submissionId?: string; submittedAt?: string }
 const SOURCE = 'org_lead_notification';
 const string = (v: unknown): string => typeof v === 'string' ? v.trim() : '';
 const record = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
-const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string' && x.trim().length > 0);
 const escapeSlack = (v: unknown, limit = 300): string => string(v).slice(0, limit)
   .replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -51,15 +43,6 @@ export function maskLeadPhone(phone: string): string {
   const digits = phone.replace(/\D/g, '');
   return digits.length > 4 ? `***-***-${digits.slice(-4)}` : '***';
 }
-function configOf(value: unknown): LeadNotificationsConfig | undefined {
-  if (!record(value) || value.enabled !== true || (value.maskPhone !== undefined && typeof value.maskPhone !== 'boolean') ||
-      typeof value.slackChannelId !== 'string' || !/^[CG][A-Z0-9]+$/.test(value.slackChannelId)) return;
-  for (const field of ['sources', 'mentions', 'excludeEmailPatterns']) {
-    if (value[field] !== undefined && (!strings(value[field]) || value[field].length > 50 || value[field].some((entry: string) => entry.length > 254))) return;
-  }
-  if (value.mentions?.some((id: string) => !/^[UW][A-Z0-9]+$/.test(id))) return;
-  return value as unknown as LeadNotificationsConfig;
-}
 
 /** All routing comes from persisted list ownership, never lead.userId/tenantId or form input. */
 async function routingContext(listId: string, expectedOrgId?: string) {
@@ -75,7 +58,7 @@ async function routingContext(listId: string, expectedOrgId?: string) {
   const org = await orgDb.getOrgById(owner.orgId!);
   if (!org || org.orgId !== owner.orgId) return;
   const config = configOf(org.leadNotifications);
-  if (!config) return;
+  if (!config?.enabled) return;
   // Only org-owned connections. No personal-account lookup, global bot, or cross-org fallback.
   const accounts: unknown[] = Array.isArray(org.connected_accounts) ? org.connected_accounts : [];
   const slack = accounts.filter(a => record(a) && a.platform === 'slack');
@@ -202,13 +185,14 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
 export async function processLeadNotificationJob(job: LeadNotificationJob): Promise<void> {
   if (!record(job) || !string(job.orgId) || !string(job.listId) || !string(job.leadId)) throw new Error('Invalid lead notification job');
   const ctx = await context(job.listId, job.leadId, job.orgId);
-  if (!ctx) return;
+  if (!ctx || !allowsLeadOrigin(ctx.config, job.origin)) return;
   await deliverLeadNotification(job, ctx);
 }
 
 async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullable<Awaited<ReturnType<typeof context>>>) {
   const step = stepOf(job);
   if (ctx.lead.system?.[step] === 'sent') return;
+  if (await suppressedByFitGate(job, ctx, step)) return;
   if (!await crmDb.claimLeadStepOnce(job.listId, job.leadId, step)) throw new Error('Lead notification claimed');
   let sent = false;
   try {
@@ -262,22 +246,52 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
   }
 }
 
-/** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
-export async function dispatchLeadCreated(listId: string, leadId: string, submission?: { submissionId: string; submittedAt: string }): Promise<void> {
-  await dispatchLead(listId, leadId, submission);
+/**
+ * ENG-2876: judged once per delivery key; a recorded verdict is reused on queue retries.
+ * Notification-only: the lead stays in the CRM, labeled `leadFit: bad`. Fails open.
+ */
+async function suppressedByFitGate(job: LeadNotificationJob, ctx: NonNullable<Awaited<ReturnType<typeof context>>>, step: string): Promise<boolean> {
+  const gate = ctx.config.fitGate;
+  if (!gate?.enabled) return false;
+  const fitKey = `${step}_fit`;
+  const prior = ctx.lead.system?.[fitKey];
+  if (prior === 'bad') return true;
+  if (prior === 'good' || prior === 'maybe') return false;
+  const result = await judgeLeadFit(ctx.lead, ctx.customFields, gate, ctx.list.userId);
+  if (!result) return false;
+  try {
+    await crmDb.setLeadFields(job.listId, job.leadId, {
+      system: { [fitKey]: result.verdict },
+      ...(result.verdict === 'bad' ? { customFields: { leadFit: 'bad', leadFitReasons: result.reasons.join('; ') } } : {}),
+    });
+  } catch {
+    console.warn('[leadNotifications] fit verdict not recorded', { listId: job.listId, leadId: job.leadId });
+  }
+  if (result.verdict === 'bad') {
+    console.info('[leadNotifications] suppressed by fit gate', { orgId: job.orgId, listId: job.listId, leadId: job.leadId });
+    return true;
+  }
+  return false;
 }
 
-/** One routing lookup and at most five active pipelines for an entire import. */
-export async function dispatchLeadsCreated(listId: string, leadIds: string[]): Promise<void> {
+/** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
+export async function dispatchLeadCreated(listId: string, leadId: string, origin?: LeadOrigin, submission?: { submissionId: string; submittedAt: string }): Promise<void> {
+  // First, so orgs without Slack (dispatchLead returns early) still reach it. Never rejects, never awaited.
+  void dispatchHotLeadCall(listId, leadId, origin, submission);
+  await dispatchLead(listId, leadId, origin, submission);
+}
+
+/** One upfront routing lookup to filter imports; at most five active delivery pipelines. */
+export async function dispatchLeadsCreated(listId: string, leadIds: string[], origin?: LeadOrigin): Promise<void> {
   if (!leadIds.length) return;
   try {
     const routing = await routingContext(listId);
-    if (!routing) return;
+    if (!routing || !allowsLeadOrigin(routing.config, origin)) return;
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(5, leadIds.length) }, async () => {
       while (next < leadIds.length) {
         const leadId = leadIds[next++];
-        await dispatchLead(listId, leadId, undefined, routing);
+        await dispatchLead(listId, leadId, origin, undefined, routing);
       }
     }));
   } catch {
@@ -286,23 +300,22 @@ export async function dispatchLeadsCreated(listId: string, leadIds: string[]): P
 }
 
 async function dispatchLead(
-  listId: string, leadId: string,
+  listId: string, leadId: string, origin?: LeadOrigin,
   submission?: { submissionId: string; submittedAt: string },
   routing?: RoutingContext,
 ): Promise<void> {
   try {
     const ctx = routing ? await leadContext(routing, leadId) : await context(listId, leadId);
-    if (!ctx) return;
-    const job = { orgId: ctx.org.orgId, listId, leadId, ...submission };
+    if (!ctx || !allowsLeadOrigin(ctx.config, origin)) return;
+    const job = { ...submission, orgId: ctx.org.orgId, listId, leadId, origin };
     const key = keyOf(job);
     const queued = await enqueueJob(SOURCE, key, job, { claimImmediately: true });
     if (queued === 'duplicate') return;
     if (queued !== 'enqueued') throw new Error('Lead notification queue unavailable');
     const stop = startHeartbeat(SOURCE, key);
     try {
-      // Batch delivery reuses its validated routing; recovered jobs always reload it.
-      if (routing) await deliverLeadNotification(job, ctx);
-      else await processLeadNotificationJob(job);
+      // Re-read settings at delivery too, including when an import is already queued.
+      await processLeadNotificationJob(job);
       await markJobComplete(SOURCE, key);
     } catch {
       // Never put contact details, bot tokens, or raw Slack errors into queue logs.

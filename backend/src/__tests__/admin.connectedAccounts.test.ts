@@ -34,6 +34,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllAvailableSubscriptionFeatures: jest.fn(() => [{
     id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.',
   }]),
+  getDefaultSubscriptionFeatureIds: jest.fn(() => ["scheduled_chats"]),
 }));
 
 // Mock skillService

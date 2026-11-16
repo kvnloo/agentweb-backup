@@ -15,7 +15,7 @@
  *  4. Cache hits never re-enter this file's HTTP client, so no test here
  *     can call the vendor a second time for the same input.
  *  5. Apollo's broker-waterfall email reveal records a distinguishable
- *     endpoint (full_enrichment) from a basic reveal (email_reveal).
+ *     endpoint (waterfall_email) from a basic reveal (email_reveal).
  */
 
 const mockAxiosPost = jest.fn();
@@ -78,6 +78,7 @@ import { initApolloServiceFromEnv } from '../services/apolloServiceFactory';
 import { initEnrichSoServiceFromEnv } from '../services/enrichSoServiceFactory';
 import { getApolloService, __resetApolloServiceForTesting } from '../services/apolloService';
 import { getEnrichSoService } from '../services/enrichSoService';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 const OWNER = 'user-1';
 
@@ -113,7 +114,7 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     expect(mockRecordVendorUsage.mock.calls[0][0].userId).toBeUndefined();
   });
 
-  it('AC5: a waterfall email reveal records full_enrichment, distinct from a basic reveal', async () => {
+  it('AC5: a waterfall email reveal records waterfall_email, distinct from a basic reveal', async () => {
     mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
     process.env.BACKEND_URL = 'https://api.agentweb.pro';
 
@@ -123,7 +124,26 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     );
 
     const ctx = mockRecordVendorUsage.mock.calls[0][0];
-    expect(ctx.operation).toBe('full_enrichment');
+    expect(ctx.operation).toBe('waterfall_email');
+    // ENG-2720: no phone is requested, so no phone component is ever booked.
+    expect(mockRecordVendorUsage.mock.calls.map((c: any[]) => c[0].operation)).not.toContain('waterfall_phone');
+    expect(mockAxiosPost.mock.calls[0][1]).not.toHaveProperty('reveal_phone_number');
+    expect(mockAxiosPost.mock.calls[0][1]).not.toHaveProperty('run_waterfall_phone');
+    delete process.env.BACKEND_URL;
+  });
+
+  it('sends a basic match, with no webhook URL, when the webhook secret cannot be resolved (ENG-2803)', async () => {
+    const { getApolloWebhookSecret } = jest.requireMock('../utils/secretsManager');
+    getApolloWebhookSecret.mockRejectedValueOnce(new Error('APOLLO_WEBHOOK_SECRET is not set'));
+    mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+
+    await getApolloService().findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER, runWaterfall: true });
+
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body).not.toHaveProperty('run_waterfall_email');
+    expect(body).not.toHaveProperty('webhook_url');
+    expect(mockRecordVendorUsage.mock.calls[0][0].operation).toBe('email_reveal');
     delete process.env.BACKEND_URL;
   });
 
@@ -132,6 +152,41 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     await getApolloService().findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER });
 
     expect(mockRecordVendorUsage.mock.calls[0][0].operation).toBe('email_reveal');
+  });
+
+  it.each([404, 422])('a %i on a waterfall request still books waterfall_email, priced on the rate card (ENG-2720)', async (status) => {
+    mockAxiosPost.mockRejectedValue({ response: { status } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+
+    await getApolloService().findEmail(
+      { firstName: 'A', lastName: 'B', domain: 'y.com' },
+      { userId: OWNER, runWaterfall: true }
+    );
+
+    expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
+    const ctx = mockRecordVendorUsage.mock.calls[0][0];
+    expect(ctx.operation).toBe('waterfall_email');
+    expect(ctx.rateKey).toBe('waterfall_email');
+    // The key the factory emits must exist on the card, or the recorder books it `unpriced`.
+    expect(getAllocatedRate('apollo', ctx.rateKey)).toBe(0.445);
+    delete process.env.BACKEND_URL;
+  });
+
+  it('every Apollo ledger key the factory emits is priced on the rate card (ENG-2720)', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { email: 'x@y.com' } });
+    mockAxiosGet.mockResolvedValue({ data: { organization: { id: 'o1' } } });
+    process.env.BACKEND_URL = 'https://api.agentweb.pro';
+    const apollo = getApolloService();
+
+    await apollo.findEmail({ firstName: 'A', lastName: 'B', domain: 'y.com' }, { userId: OWNER, runWaterfall: true });
+    await apollo.findEmail({ firstName: 'C', lastName: 'D', domain: 'z.com' }, { userId: OWNER });
+    await apollo.matchPerson({ email: 'a@y.com' }, { userId: OWNER });
+    await apollo.matchOrg('example.com', { userId: OWNER });
+
+    const keys = mockRecordVendorUsage.mock.calls.map((c: any[]) => c[0].rateKey);
+    expect(new Set(keys)).toEqual(new Set(['waterfall_email', 'email_reveal', 'person_match', 'org_enrichment']));
+    for (const key of keys) expect(getAllocatedRate('apollo', key)).not.toBeNull();
+    delete process.env.BACKEND_URL;
   });
 
   it('a 404 "not found" response still records — it reached and billed the vendor', async () => {

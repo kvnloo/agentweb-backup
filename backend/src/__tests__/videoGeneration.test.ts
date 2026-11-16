@@ -14,7 +14,6 @@ jest.mock('../services/imageGeneration', () => ({
   imageService: { generateImage: jest.fn() },
 }));
 jest.mock('axios');
-jest.mock('@google/genai');
 jest.mock('../services/remotionService', () => ({
   remotionService: { compose: jest.fn() },
 }));
@@ -46,90 +45,194 @@ describe('VideoService', () => {
     videoService = new VideoService();
   });
 
-  describe('Video Generation with Veo 3.1', () => {
-    it('should have generateVideo method', () => {
-      expect(videoService.generateVideo).toBeDefined();
-      expect(typeof videoService.generateVideo).toBe('function');
+  describe('gemini-omni-1.1-flash via the Gemini Interactions API', () => {
+    const INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+    const VIDEO_B64 = Buffer.from('fake-mp4-bytes').toString('base64');
+    const completed = (usage: any = undefined) => ({
+      data: {
+        id: 'int-1',
+        status: 'completed',
+        ...(usage ? { usage } : {}),
+        steps: [
+          { type: 'thought', content: [{ type: 'text', text: 'planning' }] },
+          { type: 'model_output', content: [{ type: 'video', mime_type: 'video/mp4', data: VIDEO_B64 }] },
+        ],
+      },
+    });
+    const baseParams = { prompt: 'A cat surfing', filename: 'cat.mp4', userId: 'user123', videoModel: 'gemini-omni-1.1-flash' };
+    let setTimeoutSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      mockedGetSecret.mockResolvedValue('fake-key');
+      mockedUpload.mockResolvedValue({ success: true, url: 'https://s3.example.com/cat.mp4' });
+      mockedAxios.post.mockResolvedValue(completed() as any);
+      setTimeoutSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((cb: any) => { cb(); return 0 as any; }) as any);
+    });
+    afterEach(() => setTimeoutSpy.mockRestore());
+
+    it('text-to-video: POSTs to /v1beta/interactions with model, prompt string and video response_format', async () => {
+      const result = await videoService.generateVideo({ ...baseParams, aspectRatio: '9:16', resolution: '1080p' });
+
+      expect(result.success).toBe(true);
+      expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+      const [url, body, config] = mockedAxios.post.mock.calls[0] as any[];
+      expect(url).toBe(INTERACTIONS_URL);
+      expect(config.params).toEqual({ key: 'fake-key' });
+      expect(body).toEqual({
+        model: 'gemini-omni-1.1-flash',
+        input: 'A cat surfing',
+        // No duration requested → the 8s default is sent as Omni's string form.
+        response_format: { type: 'video', aspect_ratio: '9:16', resolution: '1080p', duration: '8s' },
+      });
     });
 
-    it('should accept valid parameters for video generation', () => {
-      const params = {
-        prompt: 'Test video prompt',
-        filename: 'test.mp4',
-        userId: 'user123',
-        videoModel: 'veo-3.1-generate-preview'
+    it('sends response_format.duration as a "<n>s" string, rounded and clamped to 3–10s', async () => {
+      const sent = async (durationSeconds: number) => {
+        mockedAxios.post.mockClear();
+        await videoService.generateVideo({ ...baseParams, durationSeconds });
+        return (mockedAxios.post.mock.calls[0] as any[])[1].response_format.duration;
       };
-      
-      // Just verify the method signature accepts these parameters
-      expect(params.prompt).toBeDefined();
-      expect(params.filename).toBeDefined();
-      expect(params.userId).toBeDefined();
-    }, 10000);
+      expect(await sent(5)).toBe('5s');
+      expect(await sent(6.6)).toBe('7s');
+      expect(await sent(10)).toBe('10s');
+      expect(await sent(1)).toBe('3s');
+      // Never the integer form (the API rejects {"duration":5} with 400).
+      expect(typeof (await sent(5))).toBe('string');
+    });
 
-    it('should accept start and end frame URLs', () => {
-      const params = {
-        prompt: 'Test video prompt',
-        filename: 'test.mp4',
-        userId: 'user123',
-        videoModel: 'veo-3.1-generate-preview',
-        startFrame: 'https://example.com/start.png',
-        endFrame: 'https://example.com/end.png'
-      };
-      
-      // Verify the parameters structure
-      expect(params.startFrame).toBe('https://example.com/start.png');
-      expect(params.endFrame).toBe('https://example.com/end.png');
-    }, 10000);
+    it('decodes the base64 video from steps[].content[] and uploads the bytes to S3', async () => {
+      const result = await videoService.generateVideo({ ...baseParams });
 
-    it('should support fallback to fast model on quota exhaustion', () => {
-      // Verify that both models are in the supported models list
-      const supportedModels = ['veo-3.1-generate-preview', 'veo-3.1-fast-generate-preview'];
-      expect(supportedModels).toContain('veo-3.1-generate-preview');
-      expect(supportedModels).toContain('veo-3.1-fast-generate-preview');
-    }, 10000);
+      expect(result).toMatchObject({ success: true, videoUrl: 'https://s3.example.com/cat.mp4', model: 'gemini-omni-1.1-flash' });
+      const [buffer, filename, userId, mime] = mockedUpload.mock.calls[0];
+      expect(Buffer.isBuffer(buffer)).toBe(true);
+      expect(buffer.toString()).toBe('fake-mp4-bytes');
+      expect([filename, userId, mime]).toEqual(['cat.mp4', 'user123', 'video/mp4']);
+    });
 
-    it('should handle RAI media filtering response structure', () => {
-      // Verify the response structure for RAI filtering
-      const mockRaiResponse = {
-        raiMediaFilteredCount: 1,
-        raiMediaFilteredReasons: ['Content filtered by policy'],
-        generatedVideos: []
-      };
-      
-      expect(mockRaiResponse.raiMediaFilteredCount).toBe(1);
-      expect(mockRaiResponse.raiMediaFilteredReasons).toContain('Content filtered by policy');
-    }, 10000);
+    it('defaults to 720p, omits aspect_ratio for auto, and maps Seedance ratios to 16:9/9:16', async () => {
+      await videoService.generateVideo({ ...baseParams, resolution: '480p' });
+      expect((mockedAxios.post.mock.calls[0] as any[])[1].response_format).toEqual({ type: 'video', resolution: '720p', duration: '8s' });
 
-    it('should handle image processing error structure', () => {
-      // Verify error handling structure for image processing
-      const mockError = new Error('Failed to download image');
-      expect(mockError.message).toContain('Failed to download');
-    }, 10000);
+      await videoService.generateVideo({ ...baseParams, aspectRatio: '21:9' });
+      expect((mockedAxios.post.mock.calls[1] as any[])[1].response_format.aspect_ratio).toBe('16:9');
+    });
+
+    it('image-to-video and first/last-frame interpolation send image parts (first, then last) before the text', async () => {
+      mockedAxios.get
+        .mockResolvedValueOnce({ data: Buffer.from('first'), headers: { 'content-type': 'image/jpeg' } } as any)
+        .mockResolvedValueOnce({ data: Buffer.from('last'), headers: { 'content-type': 'image/png' } } as any);
+
+      await videoService.generateVideo({
+        ...baseParams, startFrame: 'https://example.com/first.jpg', endFrame: 'https://example.com/last.png',
+      });
+
+      const body = (mockedAxios.post.mock.calls[0] as any[])[1];
+      expect(body.input).toEqual([
+        { type: 'image', data: Buffer.from('first').toString('base64'), mime_type: 'image/jpeg' },
+        { type: 'image', data: Buffer.from('last').toString('base64'), mime_type: 'image/png' },
+        { type: 'text', text: 'A cat surfing' },
+      ]);
+    });
+
+    it('accepts every retired Veo id as an alias for gemini-omni-1.1-flash', async () => {
+      for (const legacy of ['veo-3.1-generate-preview', 'veo-3.1-fast-generate-preview', 'veo-3-generate-preview', 'veo-3.0-generate-preview']) {
+        mockedAxios.post.mockClear();
+        const result = await videoService.generateVideo({ ...baseParams, videoModel: legacy });
+        expect(result.success).toBe(true);
+        expect(result.model).toBe('gemini-omni-1.1-flash');
+        expect((mockedAxios.post.mock.calls[0] as any[])[1].model).toBe('gemini-omni-1.1-flash');
+      }
+    });
+
+    it('bills the actual usage (video tokens at $17.50/M, text $9/M, input $1.50/M) exactly once', async () => {
+      mockedAxios.post.mockResolvedValue(completed({
+        total_input_tokens: 1000,
+        total_output_tokens: 58_920,
+        output_tokens_by_modality: [{ modality: 'video', tokens: 57_920 }, { modality: 'text', tokens: 1000 }],
+      }) as any);
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      const expected = (1000 * 1.5 + 1000 * 9 + 57_920 * 17.5) / 1e6;
+      expect(result.costUsd).toBeCloseTo(expected, 10);
+      expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+      expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
+        model: 'gemini-omni-1.1-flash', provider: 'google', feature: 'video_generation',
+        inputTokens: 0, outputTokens: 0, generationCount: 1,
+      }));
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(expected, 10);
+    });
+
+    it('falls back to the $0.1014/s estimate on the actual requested seconds when no usage is reported', async () => {
+      const result = await videoService.generateVideo({ ...baseParams, durationSeconds: 8 });
+      expect(result.costUsd).toBeCloseTo(8 * 0.1014, 10);
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(8 * 0.1014, 10);
+    });
+
+    it('fails clearly on a quota error (HTTP 429) with no fallback model and no charge', async () => {
+      mockedAxios.post.mockRejectedValue({ response: { status: 429, data: { error: { message: 'Resource exhausted' } } }, message: 'Request failed' });
+
+      const result = await videoService.generateVideo({ ...baseParams });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/quota exhausted for gemini-omni-1\.1-flash/);
+      expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+      expect(mockMeterUserUsage).not.toHaveBeenCalled();
+    });
+
+    it('surfaces the API error message for other HTTP failures', async () => {
+      mockedAxios.post.mockRejectedValue({ response: { status: 400, data: { error: { message: 'bad request field' } } }, message: 'Request failed' });
+      const result = await videoService.generateVideo({ ...baseParams });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('bad request field');
+    });
+
+    it('fails when the interaction completes without a video part', async () => {
+      mockedAxios.post.mockResolvedValue({ data: { status: 'completed', steps: [{ content: [{ type: 'text', text: 'refused' }] }] } } as any);
+      const result = await videoService.generateVideo({ ...baseParams });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no video was returned/);
+      expect(mockedUpload).not.toHaveBeenCalled();
+    });
+
+    it('splits >10s requests into <=10s clips, each requested at its exact length, and stitches them', async () => {
+      const mockedCompose = remotionService.compose as jest.Mock;
+      mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'cat.mp4' });
+      mockedUpload.mockImplementation(async (_b: any, filename: string) => ({ success: true, url: `https://s3.example.com/${filename}` }));
+
+      const result = await videoService.generateVideo({ ...baseParams, durationSeconds: 14 });
+
+      expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      const durations = (mockedAxios.post.mock.calls as any[]).map((c) => c[1].response_format.duration).sort();
+      expect(durations).toEqual(['10s', '4s']);
+      const arg = mockedCompose.mock.calls[0][0];
+      expect(arg.clipUrl).toBe('https://s3.example.com/cat_clip1.mp4');
+      expect(arg.extraClipUrls).toEqual(['https://s3.example.com/cat_clip2.mp4']);
+      expect(arg.clipDurationsSeconds).toEqual([10, 4]);
+      expect(arg.maxClipSeconds).toBe(10);
+      expect(result.videoUrl).toBe('https://s3.example.com/stitched.mp4');
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(14 * 0.1014, 10);
+      expect(mockMeterUserUsage.mock.calls[0][0].generationCount).toBe(2);
+    });
+
+    it('a remainder under 3s borrows from the previous clip so clips sum to the request (21s → 10/8/3)', async () => {
+      const mockedCompose = remotionService.compose as jest.Mock;
+      mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'cat.mp4' });
+      mockedUpload.mockImplementation(async (_b: any, filename: string) => ({ success: true, url: `https://s3.example.com/${filename}` }));
+
+      await videoService.generateVideo({ ...baseParams, durationSeconds: 21 });
+
+      const byFile = Object.fromEntries((mockedUpload.mock.calls as any[]).map((c, i) =>
+        [c[1], (mockedAxios.post.mock.calls[i] as any[])[1].response_format.duration]));
+      expect(mockedAxios.post).toHaveBeenCalledTimes(3);
+      expect(Object.values(byFile).sort()).toEqual(['10s', '3s', '8s']);
+      expect(mockedCompose.mock.calls[0][0].clipDurationsSeconds).toEqual([10, 8, 3]);
+      expect(mockMeterUserUsage.mock.calls[0][0].costUsdOverride).toBeCloseTo(21 * 0.1014, 10);
+    });
   });
 
   describe('Model Validation', () => {
-    it('should accept veo-3.1-generate-preview model', () => {
-      const params = {
-        prompt: 'Test',
-        filename: 'test.mp4',
-        userId: 'user123',
-        videoModel: 'veo-3.1-generate-preview'
-      };
-
-      expect(params.videoModel).toBe('veo-3.1-generate-preview');
-    });
-
-    it('should accept veo-3.1-fast-generate-preview model', () => {
-      const params = {
-        prompt: 'Test',
-        filename: 'test.mp4',
-        userId: 'user123',
-        videoModel: 'veo-3.1-fast-generate-preview'
-      };
-
-      expect(params.videoModel).toBe('veo-3.1-fast-generate-preview');
-    });
-
     it('should reject an unsupported model', async () => {
       const result = await videoService.generateVideo({
         prompt: 'Test',
@@ -139,6 +242,7 @@ describe('VideoService', () => {
       });
       expect(result.success).toBe(false);
       expect(result.error).toContain("Invalid videoModel 'not-a-real-model'");
+      expect(result.error).toContain('gemini-omni-1.1-flash, seedance-2.0');
     });
   });
 
@@ -245,7 +349,7 @@ describe('VideoService', () => {
       expect(result.error).toMatch(/content polic/i);
     });
 
-    it('treats ip_detected as a gated failure (→ triggers Veo fallback upstream)', async () => {
+    it('treats ip_detected as a gated failure (→ triggers Omni fallback upstream)', async () => {
       routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'ip_detected' } } } });
       const result = await (videoService as any).generateWithHiggsfield({ ...baseParams });
       expect(result.success).toBe(false);
@@ -268,35 +372,35 @@ describe('VideoService', () => {
     });
 
     // M2: Seedance already succeeded (paid). A transient S3 upload blip must NOT discard
-    // the paid clip and trigger a full Veo regen — retry the download/upload instead.
-    it('retries a transient S3 upload failure instead of falling back to Veo (no double spend)', async () => {
+    // the paid clip and trigger a full Omni regen — retry the download/upload instead.
+    it('retries a transient S3 upload failure instead of falling back to Omni (no double spend)', async () => {
       routeTools();
       mockedUpload
         .mockResolvedValueOnce({ success: false, error: 'transient S3 error' })
         .mockResolvedValueOnce({ success: true, url: 'https://s3.example.com/retried.mp4' });
-      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31');
+      const omniSpy = jest.spyOn(videoService as any, 'generateWithOmni');
 
       const result = await videoService.generateVideo({ ...baseParams });
 
       expect(result.success).toBe(true);
       expect(result.videoUrl).toBe('https://s3.example.com/retried.mp4');
       expect(mockedUpload).toHaveBeenCalledTimes(2); // first failed, retry succeeded
-      expect(veoSpy).not.toHaveBeenCalled();          // paid Seedance clip reused, not regenerated
-      veoSpy.mockRestore();
+      expect(omniSpy).not.toHaveBeenCalled();          // paid Seedance clip reused, not regenerated
+      omniSpy.mockRestore();
     });
 
-    it('falls back to Veo only after the upload retries are exhausted', async () => {
+    it('falls back to Omni only after the upload retries are exhausted', async () => {
       routeTools();
       mockedUpload.mockResolvedValue({ success: false, error: 'S3 down' });
-      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+      const omniSpy = jest.spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'promo.mp4' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
       expect(mockedUpload.mock.calls.length).toBeGreaterThanOrEqual(3); // retried before giving up
-      expect(veoSpy).toHaveBeenCalledTimes(1);
-      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
-      veoSpy.mockRestore();
+      expect(omniSpy).toHaveBeenCalledTimes(1);
+      expect(result.videoUrl).toBe('https://s3.example.com/omni.mp4');
+      omniSpy.mockRestore();
     });
 
     it('defaults to Seedance 2.0 (MCP) when no videoModel is specified', async () => {
@@ -324,26 +428,27 @@ describe('VideoService', () => {
       );
     });
 
-    it('meters exactly once (as Veo) on the Seedance→Veo fallback — no double record', async () => {
+    it('meters exactly once (as Omni) on the Seedance→Omni fallback — no double record', async () => {
       mockCallTool.mockRejectedValue(new Error('no credits'));
-      const veoSpy = jest
-        .spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+      const omniSpy = jest
+        .spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'promo.mp4' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
       expect(result.success).toBe(true);
-      // The failed Seedance attempt returns into the Veo recursion BEFORE its own meter,
-      // so only the terminal (successful) Veo model is charged — exactly once.
+      // The failed Seedance attempt returns into the Omni recursion BEFORE its own meter,
+      // so only the terminal (successful) Omni model is charged — exactly once.
       expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
       expect(mockMeterUserUsage).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'veo-3.1-generate-preview',
+          model: 'gemini-omni-1.1-flash',
           feature: 'video_generation',
-          costUsdOverride: 3.2,
+          costUsdOverride: expect.closeTo(8 * 0.1014, 10), // default 8s at $0.1014/s
         })
       );
-      veoSpy.mockRestore();
+      expect(result.model).toBe('gemini-omni-1.1-flash');
+      omniSpy.mockRestore();
     });
 
     it('does not charge when generation fails (invalid model)', async () => {
@@ -352,38 +457,38 @@ describe('VideoService', () => {
       expect(mockMeterUserUsage).not.toHaveBeenCalled();
     });
 
-    it('falls back to Veo when Seedance THROWS (auth/credits/stream error)', async () => {
+    it('falls back to Omni when Seedance THROWS (auth/credits/stream error)', async () => {
       mockCallTool.mockRejectedValue(new Error('no credits'));
-      const veoSpy = jest
-        .spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+      const omniSpy = jest
+        .spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'promo.mp4' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
-      expect(veoSpy).toHaveBeenCalledTimes(1);
+      expect(omniSpy).toHaveBeenCalledTimes(1);
       expect(result.success).toBe(true);
-      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
-      veoSpy.mockRestore();
+      expect(result.videoUrl).toBe('https://s3.example.com/omni.mp4');
+      omniSpy.mockRestore();
     });
 
-    it('falls back to Veo when Seedance returns a non-throw failure (job failed)', async () => {
+    it('falls back to Omni when Seedance returns a non-throw failure (job failed)', async () => {
       routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'failed' } } } });
-      const veoSpy = jest
-        .spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+      const omniSpy = jest
+        .spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'promo.mp4' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
-      expect(veoSpy).toHaveBeenCalledTimes(1);
+      expect(omniSpy).toHaveBeenCalledTimes(1);
       expect(result.success).toBe(true);
-      expect(result.videoUrl).toBe('https://s3.example.com/veo.mp4');
-      veoSpy.mockRestore();
+      expect(result.videoUrl).toBe('https://s3.example.com/omni.mp4');
+      omniSpy.mockRestore();
     });
 
-    it('falls back to Veo on nsfw and ip_detected failures', async () => {
-      const veoSpy = jest
-        .spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'promo.mp4' });
+    it('falls back to Omni on nsfw and ip_detected failures', async () => {
+      const omniSpy = jest
+        .spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'promo.mp4' });
 
       routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'nsfw' } } } });
       expect((await videoService.generateVideo({ ...baseParams })).success).toBe(true);
@@ -391,26 +496,26 @@ describe('VideoService', () => {
       routeTools({ job_status: { structuredContent: { generation: { id: 'job-1', status: 'ip_detected' } } } });
       expect((await videoService.generateVideo({ ...baseParams })).success).toBe(true);
 
-      expect(veoSpy).toHaveBeenCalledTimes(2);
-      veoSpy.mockRestore();
+      expect(omniSpy).toHaveBeenCalledTimes(2);
+      omniSpy.mockRestore();
     });
 
-    it('returns a clean failure (no loop, Veo tried once) when BOTH Seedance and Veo fail', async () => {
+    it('returns a clean failure (no loop, Omni tried once) when BOTH Seedance and Omni fail', async () => {
       mockCallTool.mockRejectedValue(new Error('no credits'));
-      const veoSpy = jest
-        .spyOn(videoService as any, 'generateWithVeo31')
-        .mockResolvedValue({ success: false, error: 'veo down' });
+      const omniSpy = jest
+        .spyOn(videoService as any, 'generateWithOmni')
+        .mockResolvedValue({ success: false, error: 'omni down' });
 
       const result = await videoService.generateVideo({ ...baseParams });
 
-      expect(veoSpy).toHaveBeenCalledTimes(1); // Veo tried exactly once — no re-entry into Seedance
+      expect(omniSpy).toHaveBeenCalledTimes(1); // Omni tried exactly once — no re-entry into Seedance
       expect(result.success).toBe(false);
-      veoSpy.mockRestore();
+      omniSpy.mockRestore();
     });
   });
 
-  // H1: a branded Seedance video >8s is ONE real clip of the full length. The compose
-  // call must place it at its true duration, not the Veo per-8s-clip split — otherwise
+  // H1: a branded Seedance video >10s is ONE real clip of the full length. The compose
+  // call must place it at its true duration, not the Omni per-10s-clip split — otherwise
   // Remotion renders only the first 8s and the rest of the paid clip is discarded.
   describe('branded Seedance composition (H1)', () => {
     const mockedCompose = remotionService.compose as jest.Mock;
@@ -430,7 +535,7 @@ describe('VideoService', () => {
 
     afterEach(() => jest.restoreAllMocks());
 
-    it('composes the single full-length Seedance clip at its true duration (not the Veo [8,6] split)', async () => {
+    it('composes the single full-length Seedance clip at its true duration (not the Omni [10,4] split)', async () => {
       const result = await videoService.generateVideo({
         prompt: 'x', filename: 'promo.mp4', userId: 'u', videoModel: 'seedance-2.0',
         durationSeconds: 14,
@@ -440,27 +545,27 @@ describe('VideoService', () => {
 
       expect(mockedCompose).toHaveBeenCalledTimes(1);
       const arg = mockedCompose.mock.calls[0][0];
-      // ONE clip, no Veo-style extras, full 14s playback — NOT [8,6]
+      // ONE clip, no Omni-style extras, full 14s playback — NOT [10,4]
       expect(arg.clipUrl).toBe('https://s3.example.com/raw.mp4'); // Seedance clip after S3 upload
       expect(arg.extraClipUrls ?? []).toEqual([]);
       expect(arg.clipDurationsSeconds).toEqual([14]);
-      // Seedance clips can be up to 15s, so the 8s Veo clamp must not apply here.
+      // Seedance clips can be up to 15s, so the 10s Omni clamp must not apply here.
       expect(arg.maxClipSeconds).toBe(15);
       expect(result.success).toBe(true);
       expect(result.videoUrl).toBe('https://s3.example.com/branded.mp4');
     });
   });
 
-  // Option B: a multi-clip Veo result (>8s) must be stitched even with no brand overlay,
-  // or the video is silently truncated to the first 8s clip.
-  describe('multi-clip Veo stitching (option B)', () => {
+  // Option B: a multi-clip Omni result (>10s) must be stitched even with no brand overlay,
+  // or the video is silently truncated to the first clip.
+  describe('multi-clip Omni stitching (option B)', () => {
     const mockedCompose = remotionService.compose as jest.Mock;
 
     beforeEach(() => {
       jest.spyOn(global, 'setTimeout').mockImplementation(((cb: any) => { cb(); return 0 as any; }) as any);
       mockedUpload.mockResolvedValue({ success: true, url: 'https://s3.example.com/raw.mp4' });
       mockedAxios.get.mockResolvedValue({ data: Buffer.from('x') } as any);
-      // Seedance fails immediately so we exercise the Veo fallback.
+      // Seedance fails immediately so we exercise the Omni fallback.
       mockCallTool.mockImplementation(async (tool: string) => {
         if (tool === 'generate_video') return { structuredContent: { results: [{ id: 'job-1', status: 'failed' }] } };
         if (tool === 'job_status') return { structuredContent: { generation: { id: 'job-1', status: 'failed' } } };
@@ -470,16 +575,16 @@ describe('VideoService', () => {
 
     afterEach(() => jest.restoreAllMocks());
 
-    it('stitches a >8s Veo fallback even when compose is not requested (no truncation to 8s)', async () => {
-      // Each Veo clip "succeeds"
-      jest.spyOn(VideoService.prototype as any, 'generateWithVeo31').mockImplementation(async (p: any) => ({
+    it('stitches a >10s Omni fallback even when compose is not requested (no truncation to 10s)', async () => {
+      // Each Omni clip "succeeds"
+      jest.spyOn(VideoService.prototype as any, 'generateWithOmni').mockImplementation(async (p: any) => ({
         success: true, videoUrl: `https://s3.example.com/${p.filename}`, filename: p.filename,
       }));
       mockedCompose.mockResolvedValue({ success: true, videoUrl: 'https://s3.example.com/stitched.mp4', filename: 'shoe.mp4' });
 
       const result = await videoService.generateVideo({
         prompt: 'x', filename: 'shoe.mp4', userId: 'u', videoModel: 'seedance-2.0',
-        durationSeconds: 14, // → 2 Veo clips
+        durationSeconds: 14, // → 2 Omni clips
         compose: false,      // no branding
       });
 
@@ -488,13 +593,13 @@ describe('VideoService', () => {
       const arg = mockedCompose.mock.calls[0][0];
       expect(arg.extraClipUrls.length).toBe(1); // clip1 + 1 extra = 2 clips
       expect(arg.brandName).toBe('');           // plain concat, no overlay
-      // ...and the stitched video is returned, not the first 8s clip.
+      // ...and the stitched video is returned, not the first clip.
       expect(result.success).toBe(true);
       expect(result.videoUrl).toBe('https://s3.example.com/stitched.mp4');
     });
   });
 
-  // Option C: the whole video op (Seedance attempt + Veo fallback) is bounded by a
+  // Option C: the whole video op (Seedance attempt + Omni fallback) is bounded by a
   // single deadline that stays under the agent-mode turn cap, so the fallback can't be
   // killed mid-run. These cover the deadline-enforcement branches specifically.
   describe('time-budget enforcement (option C)', () => {
@@ -507,7 +612,7 @@ describe('VideoService', () => {
 
     it('Seedance returns a budget error when polling never reaches a terminal state in time', async () => {
       // Job stays "queued"; with the deadline already at hand the poll budget is 0, so
-      // Seedance gives up immediately with the budget message (→ Veo fallback upstream).
+      // Seedance gives up immediately with the budget message (→ Omni fallback upstream).
       mockCallTool.mockImplementation(async (tool: string) => {
         if (tool === 'generate_video') return { structuredContent: { results: [{ id: 'job-1', status: 'queued', results: {} }] } };
         if (tool === 'job_status') return { structuredContent: { generation: { id: 'job-1', status: 'queued', results: {} } } };
@@ -516,41 +621,37 @@ describe('VideoService', () => {
 
       const result = await (videoService as any).generateWithHiggsfield({
         prompt: 'x', filename: 'p.mp4', userId: 'u', videoModel: 'seedance-2.0',
-        deadlineMs: Date.now(), // no budget left after the Veo reserve
+        deadlineMs: Date.now(), // no budget left after the Omni reserve
       });
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/budget/i);
     });
 
-    it('carries the SAME whole-op deadline into the Veo fallback (does not reset it)', async () => {
+    it('carries the SAME whole-op deadline into the Omni fallback (does not reset it)', async () => {
       let hfDeadline: number | undefined;
-      let veoDeadline: number | undefined;
+      let omniDeadline: number | undefined;
       const hfSpy = jest.spyOn(videoService as any, 'generateWithHiggsfield')
         .mockImplementation(async (p: any) => { hfDeadline = p.deadlineMs; return { success: false, error: 'seedance down' }; });
-      const veoSpy = jest.spyOn(videoService as any, 'generateWithVeo31')
-        .mockImplementation(async (p: any) => { veoDeadline = p.deadlineMs; return { success: true, videoUrl: 'https://s3.example.com/veo.mp4', filename: 'p.mp4' }; });
+      const omniSpy = jest.spyOn(videoService as any, 'generateWithOmni')
+        .mockImplementation(async (p: any) => { omniDeadline = p.deadlineMs; return { success: true, videoUrl: 'https://s3.example.com/omni.mp4', filename: 'p.mp4' }; });
 
       await videoService.generateVideo({ prompt: 'x', filename: 'p.mp4', userId: 'u', videoModel: 'seedance-2.0' });
 
       expect(typeof hfDeadline).toBe('number');
-      expect(veoDeadline).toBe(hfDeadline); // one deadline, propagated through the fallback
+      expect(omniDeadline).toBe(hfDeadline); // one deadline, propagated through the fallback
       hfSpy.mockRestore();
-      veoSpy.mockRestore();
+      omniSpy.mockRestore();
     });
 
-    it('Veo returns a time-budget error when the deadline has already passed', async () => {
+    it('Omni returns a time-budget error (without calling the API) when the deadline has already passed', async () => {
       mockedGetSecret.mockResolvedValue('fake-key');
-      const genai = require('@google/genai');
-      (genai.GoogleGenAI as jest.Mock).mockImplementation(() => ({
-        models: { generateVideos: jest.fn().mockResolvedValue({ done: false }) },
-        operations: { getVideosOperation: jest.fn().mockResolvedValue({ done: false }) },
-      }));
 
-      const result = await (videoService as any).generateWithVeo31({
+      const result = await (videoService as any).generateWithOmni({
         prompt: 'x', filename: 'p.mp4', userId: 'u', deadlineMs: Date.now() - 1, // already past
       });
 
+      expect(mockedAxios.post).not.toHaveBeenCalled();
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/time budget/i);
     });

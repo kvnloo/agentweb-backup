@@ -8,12 +8,14 @@
  *
  * Sources (ENG-2128 brain F4, F7, F10, F14):
  *   agent          sessions named in the judge false-positive catalogue (off-repo input file:
- *                  Linear issue -> session ids/prefixes) and sessions with satisfactionScore.adminOverride
+ *                  Linear issue -> session ids/prefixes) and sessions with satisfactionScore.adminOverride,
+ *                  plus an unbiased `sampled_session` fill (ordinary recent sessions, hash order, see below)
  *   creative       AW-HumanEvalQueue image/landing-page candidates with feedback from their reviewer (Matt)
  *   account_health AW-Users with subscription_status canceled vs active (by userId; admins excluded)
  */
 
 import { createHash } from 'crypto';
+import { isEvaluationUser } from '../../services/evaluationPolicy';
 import type { EvalSurface } from './evalRegistry';
 import { newGoldenCase, type GoldenCase, type ReplayLink } from './goldenSet';
 
@@ -22,7 +24,16 @@ export const DEFAULT_SEED_TARGETS: Record<EvalSurface, number> = { agent: 50, cr
 export interface SeedSessionRow {
   sessionId: string;
   adminOverride: boolean;
+  /** Cheap attributes for the `sampled_session` source; a row missing createdAt or messageCount is never sampled. */
+  createdAt?: string;
+  sessionType?: string;
+  messageCount?: number;
+  userId?: string;
 }
+
+/** `sampled_session` eligibility: created within this many days of `inputs.now`, with at least this many messages. */
+export const SAMPLE_WINDOW_DAYS = 90;
+export const SAMPLE_MIN_MESSAGES = 4;
 
 export interface SeedCandidateRow {
   candidateId: string;
@@ -30,12 +41,24 @@ export interface SeedCandidateRow {
   reviewerSlackUserId?: string;
   /** Slack user ids of everyone who replied; text is never read. */
   feedbackSlackUserIds: string[];
+  /** The candidate carries a stored creative-gate result that was actually evaluated (not `notChecked`). */
+  gated?: boolean;
 }
 
 export interface SeedUserRow {
   userId: string;
   subscriptionStatus?: string;
   isAdmin?: boolean;
+  /** At least one connected ad platform (Meta, Google Ads or LinkedIn Ads); organic and outreach connections do not count. */
+  hasAdPlatform?: boolean;
+}
+
+/** Platforms that carry ad delivery. Outreach (unipile, linkedin), mail, drive and CRM connections are not ad platforms. */
+export const AD_PLATFORMS: ReadonlySet<string> = new Set(['meta', 'google_ads', 'linkedin_ads']);
+
+/** A tombstoned (deleted) or synthetic evaluation account has no health state to label. */
+function isLabellableAccount(u: SeedUserRow): boolean {
+  return !u.isAdmin && !u.userId.startsWith('deleted_') && !isEvaluationUser(u.userId);
 }
 
 /** Off-repo input: which sessions each false-positive issue names, and which session turn backs
@@ -51,6 +74,10 @@ export interface SeedInputs {
   users: SeedUserRow[];
   fpCatalogue?: FpCatalogue;
   targets?: Partial<Record<EvalSurface, number>>;
+  /** Opt in to `gated_candidate` creative cases (see seedCreative). Off by default so a plain run never adds them. */
+  gatedCreatives?: boolean;
+  /** Opt in to taking every ad-connected account first (see seedAccount). Off by default. */
+  adConnectedAccounts?: boolean;
   now: Date;
 }
 
@@ -98,6 +125,18 @@ function take(cases: GoldenCase[], target: number, pinned: (c: GoldenCase) => bo
   return [...first, ...rest].slice(0, Math.max(target, first.length));
 }
 
+/** Ordinary interactive traffic only: scheduled runs, generation pipelines and other machine-started
+ * session types are not what the agent judge is meant to agree with humans on. Legacy rows with no
+ * sessionType were written as regular. */
+function isSampleEligible(s: SeedSessionRow, now: Date): boolean {
+  if (s.sessionType !== undefined && s.sessionType !== 'regular') return false;
+  if (isEvaluationUser(s.userId)) return false;
+  if (typeof s.messageCount !== 'number' || s.messageCount < SAMPLE_MIN_MESSAGES) return false;
+  const created = s.createdAt ? Date.parse(s.createdAt) : NaN;
+  if (Number.isNaN(created)) return false;
+  return created <= now.getTime() && created >= now.getTime() - SAMPLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+}
+
 function countBy(cases: GoldenCase[], key: (c: GoldenCase) => string): Record<string, number> {
   const out: Record<string, number> = {};
   for (const c of cases) out[key(c)] = (out[key(c)] ?? 0) + 1;
@@ -138,41 +177,74 @@ function seedAgent(inputs: SeedInputs, target: number) {
     }
   }
 
+  // Unbiased source, added last so a session already in another source keeps that source. Selection
+  // below orders it by hash of the id (never recency or score), so a larger target only appends.
+  for (const s of inputs.sessions) if (isSampleEligible(s, inputs.now)) add(s.sessionId, 'sampled_session', 'sampled_session');
+
   const eligible = [...byId.values()];
-  // Replay-linked and human-overridden sessions are always kept; the catalogue fills the rest.
-  const selected = take(eligible, target, (c) => c.taskType !== 'fp_catalogue');
+  // Replay-linked and human-overridden sessions are always kept; the catalogue fills next, then the sample.
+  const tier = (c: GoldenCase) => (c.taskType === 'sampled_session' ? 2 : c.taskType === 'fp_catalogue' ? 1 : 0);
+  const pinned = eligible.filter((c) => tier(c) === 0).length;
+  const selected = [...eligible].sort((a, b) => tier(a) - tier(b) || hashOrder(a, b)).slice(0, Math.max(target, pinned));
   return { eligible, selected, unresolved, unresolvedReplayFixtures };
 }
 
 function seedCreative(inputs: SeedInputs, target: number) {
-  const eligible = inputs.candidates
+  const reviewed = inputs.candidates
     .filter((c) => CREATIVE_REVIEW_TYPES.has(c.reviewType))
     .filter((c) => !!c.reviewerSlackUserId && c.feedbackSlackUserIds.includes(c.reviewerSlackUserId))
     .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'human_eval_reviewer_feedback', now: inputs.now }));
-  return { eligible, selected: take(eligible, target, () => false) };
+  if (!inputs.gatedCreatives) return { eligible: reviewed, selected: take(reviewed, target, () => false) };
+
+  // ENG-2226: the gates adapter can only grade a candidate that carries a stored gate result, and every
+  // reviewer-feedback candidate predates the gates (earliest gated candidate 2026-09-25), so it abstains on
+  // all of them. Gated image candidates are added after the reviewed ones; a larger target only appends.
+  const seen = new Set(reviewed.map((c) => c.sourceRef.id));
+  const gated = inputs.candidates
+    .filter((c) => c.gated === true && c.reviewType === 'creative_image' && !seen.has(c.candidateId))
+    .map((c) => newGoldenCase({ surface: 'creative', taskType: c.reviewType, sourceId: c.candidateId, seedSource: 'gated_candidate', now: inputs.now }))
+    .sort(hashOrder);
+  const first = [...reviewed].sort(hashOrder);
+  return { eligible: [...reviewed, ...gated], selected: [...first, ...gated].slice(0, Math.max(target, 0)) };
 }
 
-function seedAccount(inputs: SeedInputs, target: number) {
+function seedAccount(inputs: SeedInputs, target: number, adConnectedFirst: boolean) {
   const build = (status: 'canceled' | 'active') =>
     inputs.users
-      .filter((u) => !u.isAdmin && u.subscriptionStatus === status)
+      .filter((u) => isLabellableAccount(u) && u.subscriptionStatus === status)
       .map((u) => newGoldenCase({ surface: 'account_health', taskType: `subscription_${status}`, sourceId: u.userId, seedSource: `subscription_status:${status}`, now: inputs.now }))
       .sort(hashOrder);
   const canceled = build('canceled');
   const active = build('active');
-  // Balance the two classes; if one runs short the other fills the remainder.
-  const half = Math.ceil(target / 2);
-  let nCanceled = Math.min(canceled.length, half);
-  const nActive = Math.min(active.length, target - nCanceled);
-  nCanceled = Math.min(canceled.length, target - nActive);
-  return { eligible: [...canceled, ...active], selected: [...canceled.slice(0, nCanceled), ...active.slice(0, nActive)] };
+  const balanced = (n: number, from: { canceled: GoldenCase[]; active: GoldenCase[] }) => {
+    // Balance the two classes; if one runs short the other fills the remainder.
+    const half = Math.ceil(n / 2);
+    let nCanceled = Math.min(from.canceled.length, half);
+    const nActive = Math.min(from.active.length, n - nCanceled);
+    nCanceled = Math.min(from.canceled.length, n - nActive);
+    return [...from.canceled.slice(0, nCanceled), ...from.active.slice(0, nActive)];
+  };
+  if (!adConnectedFirst) return { eligible: [...canceled, ...active], selected: balanced(target, { canceled, active }) };
+
+  // ENG-2135: subscription status is a poor stratifier for health. About 27 of ~490 users have an ad platform
+  // connected, and they are the only source of `healthy` and `at_risk` examples (a 30-account sample by
+  // subscription status came out 22 activation_incomplete / 3 healthy / 2 at_risk). Take every ad-connected
+  // account first, in hash order, then fill the rest with the balanced subscription sample.
+  const adConnected = inputs.users
+    .filter((u) => isLabellableAccount(u) && u.hasAdPlatform === true)
+    .map((u) => newGoldenCase({ surface: 'account_health', taskType: 'ad_connected', sourceId: u.userId, seedSource: 'ad_platform_connected', now: inputs.now }))
+    .sort(hashOrder);
+  const taken = new Set(adConnected.map((c) => c.sourceRef.id));
+  const rest = { canceled: canceled.filter((c) => !taken.has(c.sourceRef.id)), active: active.filter((c) => !taken.has(c.sourceRef.id)) };
+  const lead = adConnected.slice(0, Math.max(target, 0));
+  return { eligible: [...adConnected, ...rest.canceled, ...rest.active], selected: [...lead, ...balanced(Math.max(target - lead.length, 0), rest)] };
 }
 
 export function buildSeedCases(inputs: SeedInputs): SeedResult {
   const targets = { ...DEFAULT_SEED_TARGETS, ...inputs.targets };
   const agent = seedAgent(inputs, targets.agent);
   const creative = seedCreative(inputs, targets.creative);
-  const account = seedAccount(inputs, targets.account_health);
+  const account = seedAccount(inputs, targets.account_health, inputs.adConnectedAccounts === true);
   return {
     cases: [...agent.selected, ...creative.selected, ...account.selected],
     report: {
@@ -183,6 +255,67 @@ export function buildSeedCases(inputs: SeedInputs): SeedResult {
     unresolvedCatalogueIds: agent.unresolved,
     unresolvedReplayFixtures: agent.unresolvedReplayFixtures,
   };
+}
+
+// Work-plan sessions (ENG-665) ------------------------------------------------------------------
+
+/** One AW-ChatSessions row that has at least one work-plan step (ids and dates only). */
+export interface WorkPlanSessionRow {
+  sessionId: string;
+  userId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export const WORK_PLAN_SEED_SOURCE = 'work_plan_session';
+
+export interface WorkPlanSeedResult {
+  /** New cases to create; already-stored work-plan cases are not repeated. */
+  cases: GoldenCase[];
+  eligible: number;
+  alreadyStored: number;
+  target: number;
+}
+
+/**
+ * `agent-task-success` only grades sessions that carry a work plan; it abstained on 46 of the first 50
+ * agent cases (45 had none), so labelling them could never reach the validation minimum. This source
+ * adds work-plan sessions of every session type (the eval-v2 sampler grades scheduled and predefined
+ * work-plan runs too), created within SAMPLE_WINDOW_DAYS, in hash order, never by any grader verdict.
+ *
+ * A session never updated after it was created was opened and not used (ENG-2608: 20 of the first
+ * 80 were predefined work plans with no messages), so it is skipped.
+ *
+ * `target` is the total number of work-plan cases the store should hold, so a re-run with the same
+ * target creates nothing. `existing` must include excluded cases: a session already in the store
+ * under any agent source is skipped, and an excluded one is not counted toward the target, so a
+ * re-run replaces it with a new session.
+ */
+export function buildWorkPlanCases(input: {
+  sessions: WorkPlanSessionRow[];
+  existing: GoldenCase[];
+  target: number;
+  now: Date;
+}): WorkPlanSeedResult {
+  const stored = new Set(input.existing.filter((c) => c.surface === 'agent').map((c) => c.sourceRef.id));
+  const alreadyStored = input.existing.filter((c) => c.surface === 'agent' && c.seedSource === WORK_PLAN_SEED_SOURCE && !c.excluded).length;
+  const windowStart = input.now.getTime() - SAMPLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const eligible = input.sessions
+    .filter((s) => !isEvaluationUser(s.userId))
+    .filter((s) => {
+      const created = s.createdAt ? Date.parse(s.createdAt) : NaN;
+      return !Number.isNaN(created) && created <= input.now.getTime() && created >= windowStart;
+    })
+    .filter((s) => {
+      const updated = s.updatedAt ? Date.parse(s.updatedAt) : NaN;
+      return !Number.isNaN(updated) && updated > Date.parse(s.createdAt!);
+    })
+    .map((s) => newGoldenCase({ surface: 'agent', taskType: WORK_PLAN_SEED_SOURCE, sourceId: s.sessionId, seedSource: WORK_PLAN_SEED_SOURCE, now: input.now }));
+  const cases = eligible
+    .filter((c) => !stored.has(c.sourceRef.id))
+    .sort(hashOrder)
+    .slice(0, Math.max(input.target - alreadyStored, 0));
+  return { cases, eligible: eligible.length, alreadyStored, target: input.target };
 }
 
 /** Validates the off-repo catalogue file's shape. */

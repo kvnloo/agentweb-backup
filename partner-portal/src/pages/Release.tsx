@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Container, Typography, Paper, Box, Divider, CircularProgress } from '@mui/material';
+import { EmptyState, ErrorState } from '../components/StatusState';
 import axios from 'axios';
 
 interface Release {
@@ -11,11 +12,13 @@ export default function Release() {
   const [releases, setReleases] = useState<Release[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   
   useEffect(() => {
     const fetchReleaseData = async () => {
       try {
         setLoading(true);
+        setError(null);
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
         const response = await axios.get(`${apiUrl}/api/docs/release`);
         
@@ -33,7 +36,7 @@ export default function Release() {
     };
     
     fetchReleaseData();
-  }, []);
+  }, [reloadKey]);
   
   if (loading) {
     return (
@@ -45,14 +48,23 @@ export default function Release() {
   
   if (error) {
     return (
-      <Container>
-        <Paper elevation={3} sx={{ p: 4, mt: 4, textAlign: 'center' }}>
-          <Typography color="error" variant="h6">{error}</Typography>
-        </Paper>
+      <Container sx={{ mt: 4 }}>
+        <ErrorState title="We couldn't load the release history" onRetry={() => setReloadKey((k) => k + 1)} />
       </Container>
     );
   }
-  
+
+  if (releases.length === 0) {
+    return (
+      <Container sx={{ mt: 4 }}>
+        <EmptyState
+          title="No releases published yet"
+          description="Release notes will appear here after the next deploy. Check back later."
+        />
+      </Container>
+    );
+  }
+
   return (
     <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Typography variant="h4" component="h1" gutterBottom>

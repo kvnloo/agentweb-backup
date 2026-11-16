@@ -1,0 +1,11 @@
+# /etc/systemd/system/aw-<env>.slice : the ceiling for ALL customer units of one environment (per-customer slices aw-<env>-<uid>.slice nest below it
+# automatically, by name). The production installer renders this file from prod/versions.env (SLICE_*), with @@CPU_QUOTA@@ from the machine's vCPU count.
+# Size it from the worker: MemoryMax must leave room for the OS, the host and its proxy (no swap on the worker), and
+# maxTurnsPerHost x (resident size of one Claude CLI + about 50 MiB for the relay shim, measured) + the sign-in processes running at once must fit under it.
+# The CLI's resident size (~300 MB) and a sign-in process (~200 MB) are ESTIMATES until the live test measures them: at 8 turns the sum is already
+# 8 x 350 MiB = MemoryHigh of the production slice, so check it against the numbers you measure, not these.
+[Slice]
+MemoryMax=@@MEMORY_MAX@@
+MemoryHigh=@@MEMORY_HIGH@@
+TasksMax=@@TASKS_MAX@@
+CPUQuota=@@CPU_QUOTA@@

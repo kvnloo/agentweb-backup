@@ -29,3 +29,35 @@ describe('seedGoldenCases CLI arg parsing', () => {
     expect(() => parseArgs(['--bogus'])).toThrow(/unknown argument --bogus/);
   });
 });
+
+describe('seedGoldenCases --gated-creatives (ENG-2226)', () => {
+  it('is off unless passed, and parses alongside the other flags', () => {
+    expect(parseArgs([]).gatedCreatives).toBeUndefined();
+    expect(parseArgs(['--gated-creatives', '--target-creative', '80'])).toEqual({ write: false, gatedCreatives: true, targets: { creative: 80 } });
+  });
+});
+
+describe('seedGoldenCases --ad-connected-accounts (ENG-2135)', () => {
+  it('is off unless passed, and parses alongside the other flags', () => {
+    expect(parseArgs([]).adConnectedAccounts).toBeUndefined();
+    expect(parseArgs(['--ad-connected-accounts', '--target-account-health', '50'])).toEqual({ write: false, adConnectedAccounts: true, targets: { account_health: 50 } });
+  });
+});
+
+describe('seedGoldenCases --work-plan-sessions (ENG-665)', () => {
+  it('parses the target, with or without --write', () => {
+    expect(parseArgs(['--work-plan-sessions', '80'])).toEqual({ write: false, targets: {}, workPlanSessions: 80 });
+    expect(parseArgs(['--work-plan-sessions', '80', '--write'])).toEqual({ write: true, targets: {}, workPlanSessions: 80 });
+  });
+
+  it('rejects a non-positive-integer target', () => {
+    expect(() => parseArgs(['--work-plan-sessions', '0'])).toThrow(/positive integer/);
+    expect(() => parseArgs(['--work-plan-sessions'])).toThrow(/positive integer/);
+  });
+
+  it('runs on its own: refuses to combine with the other seed options', () => {
+    expect(() => parseArgs(['--work-plan-sessions', '80', '--target-agent', '60'])).toThrow(/runs on its own/);
+    expect(() => parseArgs(['--work-plan-sessions', '80', '--gated-creatives'])).toThrow(/runs on its own/);
+    expect(() => parseArgs(['--fp-catalogue', 'c.json', '--work-plan-sessions', '80'])).toThrow(/runs on its own/);
+  });
+});

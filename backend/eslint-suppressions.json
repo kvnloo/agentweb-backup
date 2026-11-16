@@ -4179,11 +4179,6 @@
       "count": 6
     }
   },
-  "src/__tests__/growthGeniusService.usage.test.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 1
-    }
-  },
   "src/__tests__/gtmPlan.commonItems.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 4
@@ -8105,20 +8100,6 @@
       "count": 1
     }
   },
-  "src/controllers/growthGeniusController.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 3
-    },
-    "@typescript-eslint/no-require-imports": {
-      "count": 5
-    },
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    },
-    "prefer-const": {
-      "count": 1
-    }
-  },
   "src/controllers/htmlTemplatesController.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 3
@@ -10696,17 +10677,6 @@
       "count": 2
     }
   },
-  "src/services/growthGeniusService.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 4
-    },
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    },
-    "prefer-const": {
-      "count": 2
-    }
-  },
   "src/services/gtmPlanNotificationService.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 9
@@ -11388,7 +11358,7 @@
   },
   "src/services/smartleadService.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 4
+      "count": 2
     }
   },
   "src/services/socialPostsService.ts": {
@@ -11444,36 +11414,6 @@
   "src/services/subscriptionService.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 10
-    }
-  },
-  "src/services/swarm/__tests__/helpers.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 4
-    }
-  },
-  "src/services/swarm/__tests__/pipeline.integration.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 5
-    }
-  },
-  "src/services/swarm/__tests__/prioritySorter.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/sprintCurator.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/taskFilter.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/services/swarm/__tests__/workerCoordinator.test.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
     }
   },
   "src/services/taskSubscriberMetricsService.ts": {

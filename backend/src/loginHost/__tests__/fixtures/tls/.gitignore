@@ -1,0 +1,4 @@
+.generated
+.generating/
+.tmp-*/
+*.srl

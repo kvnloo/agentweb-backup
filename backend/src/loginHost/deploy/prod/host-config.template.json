@@ -1,0 +1,34 @@
+{
+  "env": "prod",
+  "uidMin": 500000,
+  "uidMax": 510000,
+  "socket": { "dir": "/run/aw-login-host-prod", "gid": 10, "mode": 384 },
+  "limits": { "memoryMax": "1G", "tasksMax": 256, "tmpSize": "128M", "shmSize": "64M", "runtimeMaxSec": 1800 },
+  "quota": { "blocksKb": 204800, "inodes": 20000 },
+  "manager": { "maxTurnsPerHost": 8 },
+  "tls": {
+    "host": "@@WORKER_IP@@",
+    "port": 8443,
+    "certPath": "@@TLS_DIR@@/server.crt",
+    "keyPath": "@@TLS_DIR@@/server.key",
+    "caPath": "@@TLS_DIR@@/ca.crt",
+    "clientCommonNames": ["agentweb-backend-prod"]
+  },
+  "egress": {
+    "allow": ["api.anthropic.com:443", "platform.claude.com:443", "console.anthropic.com:443", "claude.ai:443"],
+    "launcherPath": "@@RELEASE_DIR@@/aw-net.sh"
+  },
+  "tools": {
+    "writeFileHelper": "@@RELEASE_DIR@@/aw-write-file.sh"
+  },
+  "claude": {
+    "binaryPath": "/opt/aw-claude/@@CLAUDE_VERSION@@/claude",
+    "expectedSha256": "@@CLAUDE_BIN_SHA256@@",
+    "version": "@@CLAUDE_VERSION@@",
+    "systemPromptFile": "@@RELEASE_DIR@@/system-prompt.txt",
+    "turnWrapperPath": "@@RELEASE_DIR@@/claude-turn.sh",
+    "relayShimPath": "@@RELEASE_DIR@@/aw-relay-shim.js",
+    "nodePath": "/opt/aw-node/v@@NODE_VERSION@@/bin/node",
+    "bridgeUrl": "@@BRIDGE_URL@@"
+  }
+}

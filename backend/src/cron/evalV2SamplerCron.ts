@@ -76,6 +76,7 @@ import {
 } from '../loops/eval/evalV2Surfaces';
 import { ACCOUNT_HEALTH_SIGNAL_CAPABILITY } from '../services/accountCapabilityRequirementsDb';
 import { SPEND_EVENTS_OCCURRED_AT_INDEX, SPEND_EVENTS_TABLE } from '../services/spendEventDb';
+import { TABLE_PREFIX } from '../config/constants';
 
 export const EVAL_V2_SAMPLER_FLAG = 'EVAL_V2_SAMPLER_ENABLED';
 export const EVAL_V2_SAMPLE_SIZE_ENV = 'EVAL_V2_SAMPLE_SIZE';
@@ -289,7 +290,13 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
   let written = 0;
   let alreadyScored = 0;
   const scoredAt = deps.clock.now();
+  let skippedBranchCopies = 0;
   for (const l of loaded) {
+    // ENG-2648: a never-continued branch is only a copy of turns graded under its source.
+    if (l.branchCopyOnly) {
+      skippedBranchCopies++;
+      continue;
+    }
     const graded = gradeSession(l.session, l.model, l.spend);
     tallies.task[graded.task.verdict]++;
     tallies.tool[graded.tools.verdict]++;
@@ -306,6 +313,10 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
     }, scoredAt);
     if (await putIfAbsent(deps.dynamo, item)) written++;
     else alreadyScored++;
+  }
+
+  if (skippedBranchCopies > 0) {
+    console.log(`[evalV2Sampler] ${sampleDate}: skipped ${skippedBranchCopies} sampled branch copies with no turns of their own`);
   }
 
   let snapshotsWritten = 0;
@@ -328,7 +339,7 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
     sampleDate,
     frameSize: run.frameSize,
     sampled: run.sessionIds.length,
-    graded: loaded.length,
+    graded: loaded.length - skippedBranchCopies,
     written,
     alreadyScored,
     tallies,
@@ -478,7 +489,6 @@ export async function readEvalV2Trend(
 // Production wiring
 // ---------------------------------------------------------------------------
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
 export function productionGraderTables(): GraderTables {
   return {

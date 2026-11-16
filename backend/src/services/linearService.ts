@@ -391,6 +391,10 @@ export interface OpenIssue {
 const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
 const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
 
+/** ENG-2766: page size and runaway cap for the open-issue dedupe candidate scan. */
+export const OPEN_ISSUES_PAGE_SIZE = 100;
+export const OPEN_ISSUES_SCAN_CAP = 1000;
+
 /**
  * List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see
  * OPEN_STATE_TYPES.
@@ -403,22 +407,39 @@ const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', '
  * This is a candidacy EXCLUSION, not a post-selection filter (ENG-730 AC2): archived rows never
  * enter the candidate list in the first place.
  */
-export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
-  const data = await linearGraphQL(
-    `query($team: String!, $label: String!, $limit: Int!) {
-      issues(
-        first: $limit,
-        orderBy: createdAt,
-        filter: {
-          team: { key: { eq: $team } },
-          state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
-          labels: { name: { eq: $label } }
-        }
-      ) { nodes { id identifier title description } }
-    }`,
-    { team: TEAM_KEY, label: labelName, limit },
-  );
-  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+export async function listOpenIssuesByLabel(labelName: string, limit = OPEN_ISSUES_SCAN_CAP): Promise<OpenIssue[]> {
+  // ENG-2766: this list is the dedupe CANDIDATE SET. A single `first: 50` page returned only the
+  // newest 50 open Auto issues, so once the board held more than 50, an older open canonical
+  // (e.g. ENG-2374, filed Oct 9) silently dropped out and every recurrence filed a parallel issue.
+  // Page through every open match (bounded by `limit` as a runaway guard).
+  const out: OpenIssue[] = [];
+  let after: string | null = null;
+  while (out.length < limit) {
+    const pageSize = Math.min(OPEN_ISSUES_PAGE_SIZE, limit - out.length);
+    const data: any = await linearGraphQL(
+      `query($team: String!, $label: String!, $limit: Int!, $after: String) {
+        issues(
+          first: $limit,
+          after: $after,
+          orderBy: createdAt,
+          filter: {
+            team: { key: { eq: $team } },
+            state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
+            labels: { name: { eq: $label } }
+          }
+        ) { nodes { id identifier title description } pageInfo { hasNextPage endCursor } }
+      }`,
+      { team: TEAM_KEY, label: labelName, limit: pageSize, after },
+    );
+    const nodes = data?.issues?.nodes || [];
+    for (const n of nodes) {
+      out.push({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' });
+    }
+    const pageInfo = data?.issues?.pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor || nodes.length === 0) break;
+    after = pageInfo.endCursor;
+  }
+  return out.slice(0, limit);
 }
 
 /**
@@ -460,6 +481,54 @@ export async function findMostRecentArchivedIssueByLabel(
     .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
     .find(isMatch);
   return candidate || null;
+}
+
+/**
+ * ENG-589: most-recently-updated COMPLETED, non-archived issue carrying
+ * `labelName` that matches `isMatch`. Lets a recurring failure cluster reopen its canonical
+ * instead of filing a fresh issue after the first one was closed. Canceled issues are excluded:
+ * a cancel is a human decision the loop must not override. Read-only; callers must treat
+ * a lookup failure as "no closed canonical" and fall through to normal intake.
+ */
+export async function findMostRecentClosedIssueByLabel(
+  labelName: string,
+  isMatch: (issue: OpenIssue) => boolean,
+  limit = OPEN_ISSUES_SCAN_CAP,
+): Promise<OpenIssue | null> {
+  // Page newest-updated first and stop at the first match: a single `first: 50` page dropped the
+  // class's closed canonical once >50 completed Auto issues were updated after it, filing a
+  // duplicate instead of reopening (same defect class as ENG-2766). `limit` is a runaway guard.
+  let scanned = 0;
+  let after: string | null = null;
+  while (scanned < limit) {
+    const pageSize = Math.min(OPEN_ISSUES_PAGE_SIZE, limit - scanned);
+    const data: any = await linearGraphQL(
+      `query($team: String!, $label: String!, $limit: Int!, $after: String) {
+        issues(
+          first: $limit,
+          after: $after,
+          orderBy: updatedAt,
+          filter: {
+            team: { key: { eq: $team } },
+            state: { type: { eq: "completed" } },
+            labels: { name: { eq: $label } }
+          }
+        ) { nodes { id identifier title description archivedAt } pageInfo { hasNextPage endCursor } }
+      }`,
+      { team: TEAM_KEY, label: labelName, limit: pageSize, after },
+    );
+    const nodes: any[] = data?.issues?.nodes || [];
+    scanned += nodes.length;
+    const candidate = nodes
+      .filter((n) => !n.archivedAt)
+      .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+      .find(isMatch);
+    if (candidate) return candidate;
+    const pageInfo = data?.issues?.pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor || nodes.length === 0) break;
+    after = pageInfo.endCursor;
+  }
+  return null;
 }
 
 /**
@@ -604,7 +673,55 @@ function metricValue(value: number | null): string {
   return value == null ? 'n/a' : value.toFixed(4);
 }
 
-function attributionEvidence(outcome: AttributionIssueOutcome, marker: string): string {
+interface LinkedPullRequest {
+  url: string;
+  title: string;
+}
+
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+
+function escapeMarkdownLinkText(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+}
+
+/** GitHub PRs the Linear GitHub integration attached to the issue (ENG-590). */
+function linkedPullRequests(
+  attachments: Array<{ url?: string | null; title?: string | null } | null> | undefined,
+): LinkedPullRequest[] {
+  const seen = new Set<string>();
+  const prs: LinkedPullRequest[] = [];
+  for (const attachment of attachments ?? []) {
+    const url = attachment?.url?.trim();
+    if (!url || !GITHUB_PR_URL.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    prs.push({ url, title: attachment?.title?.trim() || url });
+  }
+  return prs;
+}
+
+function howToVerify(
+  outcome: AttributionIssueOutcome,
+  prs: LinkedPullRequest[],
+  lift: string,
+): string[] {
+  const delta = `${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`;
+  const prLines = prs.length
+    ? prs.map((pr) => `- Linked PR [${escapeMarkdownLinkText(pr.title)}](${pr.url}); if it shipped this change, follow its "How to test" steps.`)
+    : ['- No linked GitHub PR on this issue; verify against the metric below.'];
+  return [
+    '### How to verify',
+    '',
+    ...prLines,
+    `- Confirm the metric moved as attributed: ${delta}.`,
+    '',
+  ];
+}
+
+function attributionEvidence(
+  outcome: AttributionIssueOutcome,
+  marker: string,
+  prs: LinkedPullRequest[] = [],
+): string {
   const lift = outcome.observedLiftPct == null
     ? 'n/a'
     : `${outcome.observedLiftPct >= 0 ? '+' : ''}${outcome.observedLiftPct.toFixed(1)}%`;
@@ -623,6 +740,7 @@ function attributionEvidence(outcome: AttributionIssueOutcome, marker: string): 
     `- ${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`,
     `- Result: ${state}`,
     '',
+    ...howToVerify(outcome, prs, lift),
     marker,
   ].join('\n');
 }
@@ -644,6 +762,7 @@ export async function recordLoopAttributionOutcome(
     `query($id: String!) {
       issue(id: $id) {
         id
+        attachments(first: 50) { nodes { url title } }
         comments(first: 250, orderBy: createdAt) {
           nodes { body }
           pageInfo { hasNextPage }
@@ -696,7 +815,7 @@ export async function recordLoopAttributionOutcome(
     {
       input: {
         issueId: issue.id,
-        body: attributionEvidence(outcome, marker),
+        body: attributionEvidence(outcome, marker, linkedPullRequests(issue.attachments?.nodes)),
       },
     },
   );

@@ -27,7 +27,7 @@ import {
   voidSpend,
 } from '../services/spendChargingService';
 import { recordSpendEvent, transitionSpendEvent, getSpendEvent } from '../services/spendEventDb';
-import { VENDOR_RATE_CARD_VERSION } from '../utils/vendorRateCard';
+import { VENDOR_RATE_CARD_VERSION, setVendorRateOverridesForTests } from '../utils/vendorRateCard';
 
 const mockRecord = recordSpendEvent as jest.Mock;
 const mockTransition = transitionSpendEvent as jest.Mock;
@@ -80,6 +80,25 @@ describe('spendChargingService', () => {
       expect(cost.rateCardVersion).toBe(VENDOR_RATE_CARD_VERSION);
       expect(cost.costMicroUsd).toBe(50000); // 4 x $0.0125
       expect(cost.unit).toBe('query');
+    });
+
+    describe('with an admin rate override (ENG-2271)', () => {
+      afterEach(() => setVendorRateOverridesForTests(null));
+
+      it('prices and stamps from the same override snapshot', () => {
+        setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
+        const cost = resolveCost(aRequest({ provider: 'twilio', operation: 'voice_minute_outbound', quantity: 10 }));
+
+        expect(cost.costMicroUsd).toBe(200000);
+        expect(cost.rateCardVersion).toBe(`${VENDOR_RATE_CARD_VERSION}+ovr:2026-11-01T00:00:00.000Z`);
+      });
+
+      it('keeps the plain version for a key the override does not touch', () => {
+        setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } });
+        const cost = resolveCost(aRequest({ provider: 'you.com', operation: 'query', quantity: 4 }));
+
+        expect(cost.rateCardVersion).toBe(VENDOR_RATE_CARD_VERSION);
+      });
     });
 
     it('lets a vendor-reported cost win over the card, with no rate version', () => {

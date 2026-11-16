@@ -42,6 +42,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { buildApiUrl } from '../../config';
 import axios from 'axios';
+import { withoutAgentWebModel } from '../../utils/agentWebModel';
 
 interface BenchmarkTest {
   testId: string;
@@ -149,10 +150,12 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       );
       
       if (response.data && Array.isArray(response.data)) {
-        setSupportedModels(response.data);
+        // ENG-669 PR-C: a benchmark runs one concrete model; the AgentWeb Model (a per-turn router) cannot be run here.
+        const models = withoutAgentWebModel(response.data);
+        setSupportedModels(models);
         // Set default model to first available if not set and not editing
-        if (!selectedModel && !editTest && response.data.length > 0) {
-          setSelectedModel(response.data[0]);
+        if (!selectedModel && !editTest && models.length > 0) {
+          setSelectedModel(models[0]);
         }
       }
     } catch (err: any) {

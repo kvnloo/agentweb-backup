@@ -10,6 +10,7 @@
  */
 
 import { AgentModeService } from '../services/agentModeService';
+import { approvalKindPrefix, computeApprovalDigest, newApprovalKind } from '../services/voice/hotLeadCallApprovalGate';
 
 let service: AgentModeService;
 
@@ -121,6 +122,36 @@ describe('ENG-1635/1644 Phase 2 — buildQuestionApprovalDeckFromHalts', () => {
 
   it('returns null when no question-deck halts are present', () => {
     expect((service as any).buildQuestionApprovalDeckFromHalts([])).toBeNull();
+  });
+});
+
+describe('ENG-2271 — one approval card per identical hot lead call change in a reply', () => {
+  const digestA = computeApprovalDigest({ action: 'enable', orgId: 'o', userId: 'u', sessionId: 's', target: '{"enabled":true}', priceText: '$0.014 per minute', revision: 'r' });
+  const digestB = computeApprovalDigest({ action: 'enable', orgId: 'o', userId: 'u', sessionId: 's', target: '{"enabled":true,"maxCallsPerHour":3}', priceText: '$0.014 per minute', revision: 'r' });
+  const cardHalt = (digest: string) => ({
+    awaitingUserConfirmation: true,
+    type: 'ask_user_question',
+    questionDeckPayload: [{
+      question: 'Turn on hot lead calling?', kind: newApprovalKind('enable', digest), immutable: true, allowEmmaDecide: false,
+      options: [{ id: 'decline', label: 'Decline', consequence: 'x', recommended: true, why: 'y' }, { id: 'approve', label: 'Turn calling on', consequence: 'z' }],
+    }],
+  });
+
+  type Deck = { items: Array<{ kind: string }> };
+  const buildDeck = (halts: unknown[]) => (service as unknown as { buildQuestionApprovalDeckFromHalts(h: unknown[]): Deck }).buildQuestionApprovalDeckFromHalts(halts);
+
+  it('keeps one card when the reply made the same change twice', () => {
+    const deck = buildDeck([cardHalt(digestA), cardHalt(digestA)]);
+    expect(deck.items).toHaveLength(1);
+    expect(deck.items[0].kind.startsWith(approvalKindPrefix('enable', digestA))).toBe(true);
+  });
+  it('keeps a card for each different change', () => {
+    const deck = buildDeck([cardHalt(digestA), cardHalt(digestB), cardHalt(digestA)]);
+    expect(deck.items.map(i => i.kind.split(':')[2])).toEqual([digestA, digestB]);
+  });
+  it('never merges questions that are not hot lead approval cards', () => {
+    const deck = buildDeck([questionDeckHalt([{ question: 'Same?' }]), questionDeckHalt([{ question: 'Same?' }])]);
+    expect(deck.items).toHaveLength(2);
   });
 });
 

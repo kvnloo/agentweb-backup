@@ -37,7 +37,7 @@
  */
 import { randomUUID } from "crypto";
 import { SpendEvent, recordSpendEvent } from "./spendEventDb";
-import { VENDOR_RATE_CARD_VERSION, VendorRateProvider, getAllocatedRate } from "../utils/vendorRateCard";
+import { VendorRateProvider, getAllocatedRateWithVersion } from "../utils/vendorRateCard";
 import { LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 /**
@@ -67,6 +67,12 @@ export interface VendorUsageMirrorInput {
   quantity: number;
   costSource: "measured" | "allocated" | "unpriced";
   costUsd?: number;
+  /**
+   * The rate-card version that priced `costUsd`, when the caller priced it from a card
+   * snapshot (recordVendorUsage with a rateKey). Wins over a fresh lookup, which could
+   * observe a different override than the one that produced the amount.
+   */
+  rateCardVersion?: string;
   /** A real idempotency token when the call site has one. See the header. */
   idempotencyKey?: string;
 }
@@ -88,9 +94,7 @@ export type MirrorResult =
  * requirement holds: the event records which rate produced it.
  */
 export function resolveRateProvenance(provider: string, operation: string): string {
-  return getAllocatedRate(provider as VendorRateProvider, operation) !== null
-    ? VENDOR_RATE_CARD_VERSION
-    : `caller:${provider}`;
+  return getAllocatedRateWithVersion(provider as VendorRateProvider, operation)?.version ?? `caller:${provider}`;
 }
 
 /**
@@ -130,7 +134,7 @@ export function buildShadowEvent(
       costMicroUsd: Math.max(0, Math.round((input.costUsd || 0) * 1e6)),
       costSource: input.costSource,
       ...(input.costSource === "allocated"
-        ? { rateCardVersion: resolveRateProvenance(input.provider, input.operation) }
+        ? { rateCardVersion: input.rateCardVersion ?? resolveRateProvenance(input.provider, input.operation) }
         : {}),
       ...(input.sessionId ? { references: { sessionId: input.sessionId } } : {}),
       lifecycle: "settled",

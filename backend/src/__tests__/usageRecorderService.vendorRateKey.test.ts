@@ -24,10 +24,11 @@ jest.mock('../services/usageRecordDb', () => {
 import {
   recordVendorUsage,
   __resetUnpricedVendorReportsForTests,
+  __setBillingOwnerResolverForTests,
 } from '../services/usageRecorderService';
 import { usageRecordDb } from '../services/usageRecordDb';
 import { resetDroppedWriteState, setDroppedWriteAlertSink } from '../services/usageWriteFailureMonitor';
-import { getAllocatedRate, VENDOR_RATE_CARD_VERSION } from '../utils/vendorRateCard';
+import { getAllocatedRate, setVendorRateOverridesForTests, VENDOR_RATE_CARD_VERSION } from '../utils/vendorRateCard';
 
 const mockTxn = usageRecordDb.incrementUsageWithSpendEvent as jest.Mock;
 const mockPlain = usageRecordDb.incrementUsage as jest.Mock;
@@ -68,6 +69,39 @@ describe('recordVendorUsage prices from a rateKey (ENG-1929)', () => {
       costMicroUsd: Math.round(4 * rate * 1e6),
       rateCardVersion: VENDOR_RATE_CARD_VERSION,
     });
+  });
+
+  it('an admin override prices the call and its event carries the override version', async () => {
+    setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
+    try {
+      await recordVendorUsage({ ...base, provider: 'twilio', operation: 'voice_minute_outbound', unit: 'minute', quantity: 10, rateKey: 'voice_minute_outbound' });
+    } finally {
+      setVendorRateOverridesForTests(null);
+    }
+    const [increment, event] = mockTxn.mock.calls[0];
+    expect(increment.costMicroUsd).toBe(200000);
+    expect(event).toMatchObject({
+      costMicroUsd: 200000,
+      rateCardVersion: `${VENDOR_RATE_CARD_VERSION}+ovr:2026-11-01T00:00:00.000Z`,
+    });
+  });
+
+  it('the event is stamped with the version of the rate that priced it, even if the override changes before the ledger write', async () => {
+    setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.02 } }, '2026-11-01T00:00:00.000Z');
+    // The billing-owner lookup runs between pricing and the ledger event being built.
+    __setBillingOwnerResolverForTests(async (id: string) => {
+      setVendorRateOverridesForTests({ twilio: { voice_minute_outbound: 0.03 } }, '2026-11-02T00:00:00.000Z');
+      return id;
+    });
+    try {
+      await recordVendorUsage({ ...base, userId: 'user-race', provider: 'twilio', operation: 'voice_minute_outbound', unit: 'minute', quantity: 10, rateKey: 'voice_minute_outbound' });
+    } finally {
+      __setBillingOwnerResolverForTests(null);
+      setVendorRateOverridesForTests(null);
+    }
+    const [, event] = mockTxn.mock.calls[0];
+    expect(event.costMicroUsd).toBe(200000); // priced at 0.02
+    expect(event.rateCardVersion).toBe(`${VENDOR_RATE_CARD_VERSION}+ovr:2026-11-01T00:00:00.000Z`);
   });
 
   it('AC1: an unpriced key never throws — not synchronously, not as a rejection', async () => {

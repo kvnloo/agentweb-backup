@@ -257,7 +257,12 @@ describe('MCP tool annotation policy gate (ENG-2334)', () => {
 
   it('mutating tools are never read-only', () => {
     const mutating = /(^|_)(post|publish|send|email|create|update|delete|manage|deploy|duplicate|edit|freeze|enable|configure|set|share|revert|launch|execute|submit|schedule|generate|iterate|file|answer)(_|$)/;
-    const bad = inventory.filter((e) => mutating.test(e.name) && classifyMcpTool(e.name) === 'read');
+    // Name-heuristic exceptions, each proven read-only elsewhere: read_email's
+    // schema has no send/reply fields, its action enum is search|list|get, and
+    // the handler refuses anything else before any request
+    // (mcp/server/__tests__/readEmailTool.test.ts).
+    const readOnlyByContract = new Set(['read_email']);
+    const bad = inventory.filter((e) => mutating.test(e.name) && !readOnlyByContract.has(e.name) && classifyMcpTool(e.name) === 'read');
     expect(bad.map((e) => e.name)).toEqual([]);
   });
 

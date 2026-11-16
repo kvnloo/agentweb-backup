@@ -112,10 +112,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
@@ -325,7 +328,7 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
           effectiveModel: 'gpt-5-chat-2',
           modelSelection: 'honored',
           usageMode: 'full_choice',
-        }),
+        }), 'user',
       );
       expect(res.body).toEqual(expect.objectContaining({
         requestedModel: 'gpt-5-chat-2',
@@ -376,7 +379,7 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
           modelSelection: 'blocked',
           usageMode: 'paused',
           usagePolicyVersion: 'policy-v1',
-        }),
+        }), 'user',
       );
     });
 

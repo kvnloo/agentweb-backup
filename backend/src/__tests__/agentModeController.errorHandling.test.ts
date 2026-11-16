@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { PROVIDER_UNAVAILABLE_USER_MESSAGE, QUOTA_EXHAUSTED_USER_MESSAGE } from '../utils/agentModeErrors';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
@@ -302,6 +303,72 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockRes.status).toHaveBeenCalledWith(500);
 
       consoleErrorSpy.mockRestore();
+    });
+  });
+
+  describe('generateResponse - provider unavailable (ENG-2381)', () => {
+    it('answers 503 PROVIDER_UNAVAILABLE and does not page oncall as an unknown error', async () => {
+      const wrapped: any = new Error(PROVIDER_UNAVAILABLE_USER_MESSAGE);
+      wrapped.originalMessage = '503 Provider returned error';
+      wrapped.status = 503;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(wrapped);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: { sessionId: mockSessionId, userMessage: 'How many lead lists?' },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
+      } as unknown as Request;
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_UNAVAILABLE' }));
+      expect(mockEmailService.sendOncallAlert).not.toHaveBeenCalledWith(
+        'Agent Mode: Unknown Error in Generate Response', expect.anything(), expect.anything(),
+      );
+    });
+  });
+
+  describe('generateResponse - OpenRouter quota exhausted (ENG-2763)', () => {
+    const keyLimitMsg = '403 Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/x $800.23 of $800.00 used; resets 2026-11-01T00:00:00.000Z.';
+    const makeReq = () => ({
+      user: { userId: mockUserId, email: 'test@example.com' },
+      body: { sessionId: mockSessionId, userMessage: 'Provided details for Target customer' },
+      method: 'POST', path: '/api/agent-mode/generate', ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' }, on: jest.fn(),
+    } as unknown as Request);
+
+    it('answers 503 PROVIDER_QUOTA_EXHAUSTED, no "try again", and pages once per class', async () => {
+      const raw: any = new Error(keyLimitMsg);
+      raw.status = 403;
+      const wrapped: any = new Error(QUOTA_EXHAUSTED_USER_MESSAGE);
+      wrapped.originalError = raw;
+      wrapped.originalMessage = keyLimitMsg;
+      wrapped.status = 403;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(wrapped);
+
+      for (let i = 0; i < 3; i++) {
+        const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+        await agentModeController.generateResponse(makeReq(), res);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_QUOTA_EXHAUSTED' }));
+        expect((res.json as jest.Mock).mock.calls[0][0].message).not.toMatch(/try again/i);
+      }
+
+      const calls = (mockEmailService.sendOncallAlert as jest.Mock).mock.calls;
+      expect(calls.filter((c: any[]) => c[0] === 'Agent Mode: Unknown Error in Generate Response')).toHaveLength(0);
+      const quotaCalls = calls.filter((c: any[]) => c[0] === 'Agent Mode: OpenRouter quota exhausted');
+      expect(quotaCalls).toHaveLength(1);
+      expect(quotaCalls[0][2]).toEqual(expect.objectContaining({
+        'Alert Class': 'openrouter-quota-exhausted', 'Quota Kind': 'key_limit', 'Resets At': '2026-11-01T00:00:00.000Z',
+      }));
     });
   });
 
@@ -1245,7 +1312,7 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
     });
 
-    it('should NOT call createOncallItem when there is no sessionId', async () => {
+    it('should NOT file an auto issue when there is no sessionId', async () => {
       await agentModeController.generateResponse(
         { ...makeReq(), body: { userMessage: 'hi', llmModel: 'gpt-5-chat-2', attachments: [] } } as unknown as Request,
         makeRes()
@@ -1267,6 +1334,81 @@ describe('AgentModeController - Error Handling', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(413);
       expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'CONTEXT_LIMIT_EXCEEDED' }));
+    });
+  });
+  // ENG-2293 (Opslane run 151): OpenRouter answers 404 "No endpoints found..." when
+  // no provider supports every requested parameter. That is a handled, retryable
+  // routing condition, not an unknown server error — it must not 500, page oncall,
+  // or be classified like a bug. Uses the REAL error predicates (this file never
+  // mocks agentModeErrors), so these exercise the full controller chain.
+  describe('provider "No endpoints found" → handled 503 (ENG-2293)', () => {
+    const noEndpoints = () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.originalMessage = '404 No endpoints found that can handle the requested parameters';
+      wrapped.status = 404;
+      return wrapped;
+    };
+    const makeRes = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+
+    it('generateResponse returns 503 PROVIDER_UNAVAILABLE and does not page oncall', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(noEndpoints());
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: { sessionId: mockSessionId, userMessage: 'Test message', llmModel: 'gpt-5-chat-2' },
+        method: 'POST', path: '/api/agent-mode/generate', ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' }, on: jest.fn(),
+      } as unknown as Request;
+      const res = makeRes();
+
+      await agentModeController.generateResponse(mockReq, res);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_UNAVAILABLE', suggestion: 'wait_and_retry' }));
+      expect(res.status).not.toHaveBeenCalledWith(500);
+      expect(mockEmailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('generateSharedResponse returns 503 PROVIDER_UNAVAILABLE and does not page oncall', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(noEndpoints());
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        interactiveShareMetadata: { isActive: true, token: 'test-token', expiresAt: '2099-01-01T00:00:00Z' },
+      } as any);
+      const mockReq = {
+        params: { shareId: mockSessionId }, query: { conversable: 'test-token' },
+        body: { userMessage: 'Test message', attachments: [] },
+        method: 'POST', path: '/api/agent-mode/ishare/test-session-123/generate', ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' }, on: jest.fn(),
+      } as unknown as Request;
+      const res = makeRes();
+
+      await agentModeController.generateSharedResponse(mockReq, res);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PROVIDER_UNAVAILABLE' }));
+      expect(mockEmailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('an unrelated 404 from the provider is still a loud 500 with an oncall alert', async () => {
+      const bare: any = new Error('Unknown Error');
+      bare.status = 404;
+      bare.originalMessage = 'Not Found';
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(bare);
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: { sessionId: mockSessionId, userMessage: 'Test message', llmModel: 'gpt-5-chat-2' },
+        method: 'POST', path: '/api/agent-mode/generate', ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' }, on: jest.fn(),
+      } as unknown as Request;
+      const res = makeRes();
+
+      await agentModeController.generateResponse(mockReq, res);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(mockEmailService.sendOncallAlert).toHaveBeenCalled();
     });
   });
 });

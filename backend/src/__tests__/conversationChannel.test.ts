@@ -32,6 +32,8 @@ jest.mock('../services/gtmPlanService', () => ({
 
 jest.mock('../controllers/agentModeController', () => ({
   generateSessionResponse: jest.fn(),
+  // ENG-669: the real single producer of the model_unavailable wording.
+  modelUnavailableBody: (e: any) => jest.requireActual('../services/agentMode/modelUnavailable').buildModelUnavailableBody(e),
 }));
 
 jest.mock('../services/agentModeService', () => ({
@@ -109,6 +111,18 @@ describe('handleSessionResponse — FAIL cases', () => {
       role: 'assistant',
       content: 'Sorry, I encountered an error processing your request. Please try again.',
     }));
+  });
+
+  it("ENG-669: a session model outside the owner's plan is reported as such (thread + session), not as a generic error", async () => {
+    const { ModelUnavailableError } = jest.requireActual('../services/agentMode/modelUnavailable');
+    generateSessionResponse.mockRejectedValue(new ModelUnavailableError('gpt-4o', 'not_in_plan', {
+      model: 'gpt-4o', tier: 'Free', allowedModels: [], upgradeRequired: ['Pro'],
+    }));
+    const adapter = makeAdapter();
+    await expect(handleSessionResponse(baseParams(), adapter)).resolves.toBeUndefined();
+    const refusal = "The model you selected (gpt-4o) isn't included in your plan, so nothing was sent to a different model. Choose another model, or upgrade your plan to use this one.";
+    expect(adapter.postReply).toHaveBeenCalledWith(REF, refusal);
+    expect(chatbotDb.addMessageToSession).toHaveBeenCalledWith('s1', expect.objectContaining({ role: 'assistant', content: refusal }));
   });
 
   it('reports the failure into the thread when attachment resolution throws', async () => {
@@ -216,7 +230,7 @@ describe('handleSessionResponse — edges', () => {
   it('resolves and persists a default model when the session has none', async () => {
     await handleSessionResponse(baseParams({ session: { sessionId: 's1' } }), makeAdapter());
 
-    expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'default-model');
+    expect(chatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('s1', 'default-model', undefined, 'system');
     expect(generateSessionResponse).toHaveBeenCalledWith('s1', 'John: hello there', 'u1', 'default-model', []);
   });
 

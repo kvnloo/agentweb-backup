@@ -56,6 +56,25 @@ describe('ask_user_question tool handler', () => {
     expect(JSON.stringify(result)).not.toMatch(/confirm\s*[:=]\s*true/i);
   });
 
+  it.each([
+    'hot_lead_call_approval:provision:abc:n1',
+    'hot_lead_call_approval:',
+    'smartlead_push_approval:push:abc:n1',
+    'smartlead_push_approval:release:abc:n1',
+    'smartlead_push_approval:',
+  ])('REJECTS the reserved approval card kind %s, so a model cannot author an approval card', async (kind) => {
+    const result = await emmaToolRegistry.execute('ask_user_question', { ...validArgs(), kind }, { sessionId: 's-1' });
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/reserved/);
+    expect(result.questionDeckPayload).toBeUndefined();
+    expect(result.awaitingUserConfirmation).toBeUndefined();
+  });
+
+  it('still accepts a kind that merely resembles the reserved one', async () => {
+    const result = await emmaToolRegistry.execute('ask_user_question', { ...validArgs(), kind: 'hot_lead_call' }, { sessionId: 's-1' });
+    expect(result.success).toBe(true);
+  });
+
   it('auto-generates option ids by position when omitted', async () => {
     const result = await emmaToolRegistry.execute('ask_user_question', validArgs(), { sessionId: 's-1' });
     const q = result.questionDeckPayload[0];

@@ -1,5 +1,7 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
+import { summarizeItemizedUsage, USAGE_MONTH_PATTERN } from './usageBreakdown';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
+import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
  *
@@ -10,16 +12,25 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
  * No direct service calls — all tools route through the REST API.
  */
 
+import { createHash } from 'node:crypto';
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
+import './readEmailTool';
+// Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
+import './smartleadTools';
+import './conversionSummaryTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
+import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
+import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
+import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
@@ -241,7 +252,7 @@ mcpToolRegistry.register({
   name: 'emma_answer_question_deck',
   definition: {
     name: 'emma_answer_question_deck',
-    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI. Cards that need a person\'s approval (adding or releasing contacts in Smartlead, a hot-lead call, activating a CRM sequence, a paused Meta campaign bundle) cannot be approved this way: approving one returns an error with the link where the person approves it in AgentWeb; declining one works.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -387,7 +398,9 @@ mcpToolRegistry.register({
       }
     }
     return jsonResult({
-      ...data,
+      // ENG-112: branch-family linkage is portal-only; MCP clients never see it.
+      // ENG-110: the cross-instance run marker (runId/instanceId) is internal; MCP clients never see it.
+      ...omitActiveRun(omitBranchedFrom(data)),
       run,
       // Terminal means the request ended, not that all detached or continuation work did.
       completion_confirmed: run !== null && run.status !== 'running' &&
@@ -406,7 +419,7 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/sessions', context: ctx(context) });
-    return jsonResult(data);
+    return jsonResult(omitActiveRun(omitBranchedFrom(data)));
   }
 });
 
@@ -474,16 +487,16 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${args.task_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
         const { action, task_id, ...updates } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${task_id}`, context: c, body: updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/tasks/${encodeURIComponent(task_id)}`, context: c, body: updates });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${args.task_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/tasks/${encodeURIComponent(args.task_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -504,7 +517,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: `/api/tasks/${args.task_id}/execute`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'POST', path: `/api/tasks/${encodeURIComponent(args.task_id)}/execute`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -525,8 +538,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const path = args.execution_id
-      ? `/api/tasks/${args.task_id}/executions/${args.execution_id}`
-      : `/api/tasks/${args.task_id}/executions`;
+      ? `/api/tasks/${encodeURIComponent(args.task_id)}/executions/${encodeURIComponent(args.execution_id)}`
+      : `/api/tasks/${encodeURIComponent(args.task_id)}/executions`;
     const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
     return jsonResult(data);
   }
@@ -546,7 +559,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/schedules/task/${args.task_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/schedules/task/${encodeURIComponent(args.task_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -588,11 +601,11 @@ mcpToolRegistry.register({
       }
       case 'update': {
         const { action, schedule_id, ...updates } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/schedules/${schedule_id}`, context: c, body: updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/schedules/${encodeURIComponent(schedule_id)}`, context: c, body: updates });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/schedules/${args.schedule_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/schedules/${encodeURIComponent(args.schedule_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -607,29 +620,76 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    description: 'List scheduled chats (newest first) for the authenticated user, or a specific client (admin-only, via client_id). Paginated: returns { items, nextCursor }; pass nextCursor back as cursor to get the next page (null = last page).',
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: {
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
+        limit: { type: 'number', description: `Page size (default ${SCHEDULED_CHATS_DEFAULT_LIMIT}, max ${SCHEDULED_CHATS_MAX_LIMIT})` },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
       required: []
     }
   },
-  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  /**
+   * Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account.
+   * ENG-1611: always requests a bounded page so a large client account cannot
+   * produce an unbounded response.
+   */
   execute: async (args: any, context: any) => {
+    const limit = Number.isFinite(Number(args?.limit))
+      ? Math.min(SCHEDULED_CHATS_MAX_LIMIT, Math.max(1, Math.floor(Number(args.limit))))
+      : SCHEDULED_CHATS_DEFAULT_LIMIT;
+    const queryParams: Record<string, string> = { limit: String(limit) };
+    if (typeof args?.cursor === 'string' && args.cursor) queryParams.cursor = args.cursor;
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/agent-mode/scheduled-chats',
+      queryParams,
       context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
     });
     return jsonResult(data);
   }
 });
 
+const MANAGE_SCHEDULED_CHAT_ACTIONS = ['create', 'update', 'toggle', 'delete'];
+
+function isNonEmptyString(v: unknown): boolean {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/** ENG-1656: field-named validation for manage_scheduled_chat; null when the call is well-formed. */
+export function validateManageScheduledChatArgs(args: any): string | null {
+  const action = args?.action;
+  if (!MANAGE_SCHEDULED_CHAT_ACTIONS.includes(action)) return null; // default branch reports Unknown action
+  const fail = (msg: string) => `Invalid manage_scheduled_chat arguments: ${msg}`;
+  if (action === 'create') {
+    const missing = ['schedule_name', 'starting_message', 'schedule_frequency'].filter((f) => !isNonEmptyString(args[f]));
+    if (missing.length) return fail(`Missing required fields: ${missing.join(', ')} (required for action "create")`);
+  } else if (!isNonEmptyString(args.schedule_id)) {
+    return fail(`schedule_id is required for action "${action}" — call list_scheduled_chats to get one`);
+  }
+  if (action === 'toggle' && args.status !== 'active' && args.status !== 'paused') {
+    return fail('status must be "active" or "paused" for action "toggle"');
+  }
+  if (action === 'create' || action === 'update') {
+    if (args.email_notifications !== undefined &&
+        !Array.isArray(args.email_notifications)) {
+      // [] is valid: the explicit "no email" opt-out (Opslane #2).
+      return fail('email_notifications must be an array of email addresses when provided (use [] for no email)');
+    }
+    if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
+      return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
+    }
+  }
+  return null;
+}
+
 mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For "update": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -639,12 +699,13 @@ mcpToolRegistry.register({
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails.' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
-        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected.' },
+        timezone: { type: 'string', description: 'The user\'s IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence.' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user\'s email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing.' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
@@ -661,6 +722,13 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1656: reject malformed calls before any network hop with a message that
+    // names the exact field. Without this an update/toggle/delete missing
+    // schedule_id hit `/scheduled-chats/undefined` and came back as a misleading
+    // "Scheduled chat not found", and a create missing a required field cost a
+    // round-trip before failing.
+    const preflight = validateManageScheduledChatArgs(args);
+    if (preflight) throw new Error(preflight);
     switch (args.action) {
       case 'create': {
         const body: any = {
@@ -674,7 +742,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -683,6 +757,7 @@ mcpToolRegistry.register({
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -698,7 +773,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -721,22 +802,23 @@ mcpToolRegistry.register({
         if (args.revoke_autopublish === true) {
           publishConsent = await mcpFetch({
             method: 'POST',
-            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/publish-consent`,
             context: c,
             body: { authorized: false },
           });
         }
 
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
+        if (args.timezone !== undefined) body.timezone = args.timezone;
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}`, context: c, body });
         return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
-        const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });
+        const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/toggle`, context: c, body: { status: args.status } });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -761,7 +843,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test`, context: ctx(context),
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/test`, context: ctx(context),
       body: { sendNotificationEmail: args.send_notification_email || false }
     });
     return jsonResult(data);
@@ -782,7 +864,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test-history`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/test-history`, context: ctx(context) });
     // A test run started via test_scheduled_chat executes in the background and can take
     // several minutes. When the history is still empty, returning a bare `[]` leads the model
     // to report "empty results" to the user as if the run finished with nothing. Instead,
@@ -821,7 +903,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/variables`, context: ctx(context),
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/variables`, context: ctx(context),
       body: {
         variableValues: args.variable_values,
         triggerRun: args.trigger_run || false,
@@ -846,7 +928,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/storage-diagnostics`, context: ctx(context)
+      method: 'GET', path: `/api/agent-mode/scheduled-chats/${encodeURIComponent(args.schedule_id)}/storage-diagnostics`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -938,11 +1020,11 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -986,7 +1068,7 @@ mcpToolRegistry.register({
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
     if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
     if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
-    const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
+    const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${encodeURIComponent(args.template_id)}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
 });
@@ -995,6 +1077,8 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'list_lead_lists',
+  // A GET only: listing lists changes nothing. Read-only so a key scoped to tools:read (e.g. a Smartlead agent key) can find a listId.
+  readOnly: true,
   definition: {
     name: 'list_lead_lists',
     description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
@@ -1006,6 +1090,11 @@ mcpToolRegistry.register({
   },
   /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
+    // The tool is read-only so a tools:read key can find its own listIds, but reading ANOTHER account's lists (client_id, admin-only)
+    // stays a tools:execute capability, as it was before the tool was marked read-only.
+    if (args?.client_id && context?.externalMcp === true && context?.authMethod === 'api_key' && !(context.apiKeyScopes ?? []).includes('tools:execute')) {
+      throw new Error("client_id needs an API key that holds the 'tools:execute' scope.");
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',
@@ -1040,15 +1129,15 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${args.list_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${args.list_id}`, context: c, body: { name: args.name, description: args.description } });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c, body: { name: args.name, description: args.description } });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${args.list_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -1057,19 +1146,71 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM lead-list CSV export, own account only (ENG-2867) ──────────────────
+//
+// Thin wrappers over POST /api/crm/lists/:listId/leads/export and
+// GET /api/crm/lists/:listId/export-history. The route owns everything that
+// matters: list ownership/sharing checks (canDestructiveCrmList /
+// canAccessCrmList), Enigma card-revenue stripping, export-history record.
+// The tool deliberately takes no client_id/user override — identity is always
+// the calling key's runtime identity via ctx(context).
+
+function requireListId(raw: unknown): string | null {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id ? encodeURIComponent(id) : null;
+}
+
+mcpToolRegistry.register({
+  name: 'export_lead_list',
+  definition: {
+    name: 'export_lead_list',
+    description: 'Export every lead in one of your own CRM lead lists to a CSV file. Returns the export record (exportId, recordCount, filename, fileUrl). Requires editor access to the list; works only on lists your account can edit.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID to export' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads/export`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_lead_list_exports',
+  readOnly: true,
+  definition: {
+    name: 'list_lead_list_exports',
+    description: 'List past CSV exports (newest first, up to 50) for one of your own CRM lead lists.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'Lead list ID' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const listId = requireListId(args?.list_id);
+    if (!listId) return jsonResult({ error: 'list_id is required' });
+    const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/export-history`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
 // the campaign itself. Read-only by construction: list + inspect + enrollment
-// counts only. Create/activate/pause live in the sibling ENG-442 work
-// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
-// never be added here.
+// counts only. Create/activate/pause live in manage_crm_sequence (ENG-964,
+// below) behind the activation gate and must never be added here.
 
 mcpToolRegistry.register({
   name: 'list_crm_sequences',
   definition: {
     name: 'list_crm_sequences',
-    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.
 
 Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
 
@@ -1159,6 +1300,347 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
   },
 });
 
+// ─── CRM drip sequences, write side (ENG-964) ───────────────────────────────
+//
+// create / update / pause are ordinary reversible writes on a DRAFT (or paused)
+// sequence. `activate` is the only path from this tool that ever sets
+// status 'active', and it sits behind the ENG-587 A1+A2 boundary in
+// crmSequenceActivationGate: attended sessions only, and only after the exact
+// content/audience/cadence was previewed and a human picked "Activate" on the
+// approval card. create/update never forward a `status`.
+
+function mapSequenceSteps(steps: unknown): { steps?: any[]; error?: string } {
+  if (steps === undefined) return {};
+  if (!Array.isArray(steps) || steps.length === 0) return { error: 'steps must be a non-empty array' };
+  const mapped: any[] = [];
+  for (const [i, raw] of steps.entries()) {
+    const s: any = raw ?? {};
+    const channel = s.channel ?? 'email';
+    const delayDays = Number(s.delay_days ?? 0);
+    if (!Number.isFinite(delayDays) || delayDays < 0) return { error: `steps[${i}].delay_days must be a non-negative number` };
+    if (channel === 'email' && (!s.subject || !s.body_html)) {
+      return { error: `steps[${i}] is an email step and needs both subject and body_html` };
+    }
+    if (channel === 'linkedin' && !s.message_text) return { error: `steps[${i}] is a LinkedIn step and needs message_text` };
+    if (channel !== 'email' && channel !== 'linkedin') return { error: `steps[${i}].channel must be "email" or "linkedin"` };
+    mapped.push({
+      name: typeof s.name === 'string' && s.name.trim() ? s.name.trim() : `Step ${i + 1}`,
+      delayDays,
+      channel,
+      ...(s.subject !== undefined ? { subject: s.subject } : {}),
+      ...(s.body_html !== undefined ? { bodyHtml: s.body_html } : {}),
+      ...(s.message_text !== undefined ? { messageText: s.message_text } : {}),
+      ...(s.sender_id !== undefined ? { senderId: s.sender_id } : {}),
+    });
+  }
+  return { steps: mapped };
+}
+
+function mapAudienceListIds(ids: unknown): { ids?: string[]; error?: string } {
+  if (ids === undefined) return {};
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !id.trim())) {
+    return { error: 'audience_list_ids must be an array of lead list ids' };
+  }
+  return { ids: ids.map((id: string) => id.trim()) };
+}
+
+mcpToolRegistry.register({
+  name: 'manage_crm_sequence',
+  definition: {
+    name: 'manage_crm_sequence',
+    description: `Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.
+
+- "create": builds a new sequence as a DRAFT (nothing is sent). \`audience_list_ids\` are the lead lists whose new leads auto-enroll once it is active.
+- "update": edits a draft or paused sequence. An active sequence must be paused first.
+- "preview_activation": shows the user the exact steps, audience and timing and asks them to approve. Always do this before "activate".
+- "activate": starts sending. Only works in a live chat, after "preview_activation", once the user has picked "Activate" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.
+- "pause": stops sending. Always allowed.
+- "external_activation_preview" / "external_activate_confirm" (external MCP callers only, e.g. an aw_ key acting on a human's out-of-chat approval): preview returns a digest bound to the current sequence version and the named \`approver\`, with no side effects; confirm activates only if the digest, approver and sequence are all unchanged since that preview.
+
+Use list_crm_sequences to find sequence ids.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'preview_activation', 'activate', 'pause', 'external_activation_preview', 'external_activate_confirm'] },
+        sequence_id: { type: 'string', description: 'Required for every action except create.' },
+        name: { type: 'string', description: 'Sequence name (create; optional on update).' },
+        description: { type: 'string' },
+        campaign_type: { type: 'string', enum: ['conversion', 'onboarding', 'reengagement', 'nurture', 'upsell', 'custom'] },
+        audience_list_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lead list ids whose new leads auto-enroll while the sequence is active.',
+        },
+        steps: {
+          type: 'array',
+          description: 'Ordered steps. Replaces all steps on update.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              delay_days: { type: 'number', description: 'Days after the previous step (or enrollment, for step 1).' },
+              channel: { type: 'string', enum: ['email', 'linkedin'] },
+              subject: { type: 'string' },
+              body_html: { type: 'string' },
+              message_text: { type: 'string', description: 'LinkedIn steps only.' },
+              sender_id: { type: 'string' },
+            },
+          },
+        },
+        preview_token: { type: 'string', description: 'activate only: the preview_token returned by preview_activation.' },
+        approver: { type: 'string', description: 'external_* actions only: identity of the human who approved activation (e.g. slack:U123).' },
+        digest: { type: 'object', description: 'external_activate_confirm only: the `digest` object returned by external_activation_preview, unmodified.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const gate = await import('../../services/crmSequenceActivationGate');
+    const { describeSequenceAudience } = await import('../../services/crmSequenceRead');
+    const action = args?.action;
+    const sequenceId = typeof args?.sequence_id === 'string' ? args.sequence_id.trim() : '';
+    const refuse = (code: string, error: string) => ({ success: false, blocked: true, code, error });
+    const isSequenceConflict = (err: any) => /API error \(409\)/.test(String(err?.message ?? ''));
+    const path = `/api/crm/sequences/${encodeURIComponent(sequenceId)}`;
+    const loadSequence = async () => {
+      const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
+      if (!data?.sequence) throw new Error(`Sequence not found: ${sequenceId}`);
+      return data.sequence;
+    };
+
+    try {
+      if (action !== 'create' && !sequenceId) return { success: false, error: 'sequence_id is required' };
+
+      switch (action) {
+        case 'create': {
+          const name = typeof args?.name === 'string' ? args.name.trim() : '';
+          if (!name) return { success: false, error: 'name is required' };
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          // No status, no enrollmentTrigger: the route defaults to draft, and the
+          // drip worker enrolls from autoEnrollListIds, not the trigger.
+          const created = await mcpFetch({
+            method: 'POST',
+            path: '/api/crm/sequences',
+            context: ctx(context),
+            body: { name, description: args?.description, campaignType: args?.campaign_type, steps: steps.steps },
+          });
+          let sequence = created?.sequence;
+          if (!sequence?.sequenceId) return { success: false, error: 'Sequence creation returned no sequence' };
+          if (audience.ids?.length) {
+            // PUT is the audience writer that refuses session lists (ENG-2311).
+            try {
+              const updated = await mcpFetch({
+                method: 'PUT',
+                path: `/api/crm/sequences/${encodeURIComponent(sequence.sequenceId)}`,
+                context: ctx(context),
+                body: { autoEnrollListIds: audience.ids },
+              });
+              sequence = updated?.sequence ?? sequence;
+            } catch (err: any) {
+              return {
+                success: false,
+                sequence_id: sequence.sequenceId,
+                error: `Draft sequence ${sequence.sequenceId} was created, but setting its audience failed: ${err?.message || String(err)}. It has no audience and sends nothing.`,
+              };
+            }
+          }
+          return { success: true, sequence_id: sequence.sequenceId, status: sequence.status, audience: describeSequenceAudience(sequence) };
+        }
+
+        case 'update': {
+          const existing = await loadSequence();
+          if (existing.status === 'active') {
+            return refuse('active_sequence', 'This sequence is active. Pause it before editing, then preview and activate it again.');
+          }
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          const body: Record<string, unknown> = {};
+          if (typeof args?.name === 'string' && args.name.trim()) body.name = args.name.trim();
+          if (args?.description !== undefined) body.description = args.description;
+          if (args?.campaign_type !== undefined) body.campaignType = args.campaign_type;
+          if (steps.steps) body.steps = steps.steps;
+          if (audience.ids) body.autoEnrollListIds = audience.ids;
+          if (Object.keys(body).length === 0) return { success: false, error: 'Nothing to update' };
+          // Atomic: the route refuses (409) if the sequence went active after the check above.
+          body.requireStatusNot = 'active';
+          let data: any;
+          try {
+            data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('active_sequence', 'This sequence became active while editing. Pause it before editing, then preview and activate it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status, audience: describeSequenceAudience(data?.sequence ?? {}) };
+        }
+
+        case 'pause': {
+          const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body: { status: 'paused' } });
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'paused' };
+        }
+
+        case 'external_activation_preview':
+        case 'external_activate_confirm': {
+          // ENG-2961: out-of-chat activation for external MCP callers, bound to the ENG-2958
+          // digest. Never reachable from an Emma session; no approval card, no agent call.
+          if (context?.externalMcp !== true) {
+            return refuse('external_only', 'This action is only available to external MCP callers. In chat, use preview_activation.');
+          }
+          if (args?.client_id !== undefined && args?.client_id !== null) {
+            return refuse('own_account_only', 'External activation acts only on your own sequences; client_id is not accepted.');
+          }
+          const approver = typeof args?.approver === 'string' ? args.approver.trim() : '';
+          if (!approver) return { success: false, error: 'approver is required' };
+          const ext = await import('../../services/externalActivationPreview');
+          const sequence = await loadSequence();
+          if (sequence.userId !== undefined && context?.userId !== undefined && sequence.userId !== context.userId) {
+            return refuse('own_account_only', 'This sequence does not belong to your account.');
+          }
+          if (sequence.status === 'active') return { success: true, sequence_id: sequenceId, status: 'active', note: 'Already active.' };
+          if (!Array.isArray(sequence.steps) || sequence.steps.length === 0) {
+            return { success: false, error: 'This sequence has no steps, so there is nothing to send.' };
+          }
+
+          if (action === 'external_activation_preview') {
+            const digest = ext.buildExternalActivationPreview(sequence, { approverPrincipal: approver });
+            return {
+              success: true,
+              digest,
+              preview: {
+                sequence_id: sequenceId,
+                name: sequence.name,
+                audience: describeSequenceAudience(sequence),
+                steps: sequence.steps.map((s: any) => ({
+                  name: s.name,
+                  delay_days: s.delayDays,
+                  channel: s.channel ?? 'email',
+                  subject: s.subject,
+                  body_html: s.bodyHtml,
+                  message_text: s.messageText,
+                })),
+              },
+              message: 'Nothing was activated. Pass `digest` unchanged with the same approver to external_activate_confirm.',
+            };
+          }
+
+          const digest = args?.digest;
+          if (!digest || typeof digest !== 'object') {
+            return refuse('missing_digest', 'A digest from external_activation_preview is required. Nothing was activated.');
+          }
+          const verdict = ext.verifyExternalActivationPreview(digest, sequence, { approverPrincipal: approver });
+          if (!verdict.ok) {
+            const why = verdict.reason === 'version_drift'
+              ? 'The sequence changed after the preview. Preview it again.'
+              : verdict.reason === 'principal_mismatch'
+                ? 'The approver does not match the preview.'
+                : 'The digest is malformed or was altered.';
+            return refuse(verdict.reason === 'version_drift' ? 'stale_preview' : verdict.reason, `${why} Nothing was activated.`);
+          }
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview. Preview it again. Nothing was activated.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active', approver };
+        }
+
+        case 'preview_activation':
+        case 'activate': {
+          // A1 first: an unattended/external caller learns nothing more than "no".
+          let session: any = null;
+          if (context?.externalMcp !== true && context?.unattended !== true && context?.sessionId) {
+            const { chatbotDb } = await import('../../services/chatbotService');
+            session = await chatbotDb.getChatSession(context.sessionId).catch(() => null);
+          }
+          const attended = gate.checkAttendedSession({
+            externalMcp: context?.externalMcp,
+            unattended: context?.unattended,
+            sessionId: context?.sessionId,
+            session,
+          });
+          if (!attended.allowed) return refuse(attended.code, attended.reason);
+
+          const sequence = await loadSequence();
+          if (sequence.status === 'active') return { success: true, sequence_id: sequenceId, status: 'active', note: 'Already active.' };
+          if (!Array.isArray(sequence.steps) || sequence.steps.length === 0) {
+            return { success: false, error: 'This sequence has no steps, so there is nothing to send.' };
+          }
+          const token = gate.computeSequencePreviewToken(sequence);
+
+          if (action === 'preview_activation') {
+            const audience = describeSequenceAudience(sequence);
+            const question = gate.buildActivationQuestion(sequence, token, audience);
+            return {
+              success: true,
+              awaitingUserConfirmation: true,
+              type: 'ask_user_question',
+              sessionId: context.sessionId,
+              questionDeckPayload: [question],
+              confirmationPrompt: question.question,
+              summary: question.question,
+              preview_token: token,
+              preview: {
+                sequence_id: sequenceId,
+                name: sequence.name,
+                audience,
+                steps: sequence.steps.map((s: any) => ({
+                  name: s.name,
+                  delay_days: s.delayDays,
+                  channel: s.channel ?? 'email',
+                  subject: s.subject,
+                  body_html: s.bodyHtml,
+                  message_text: s.messageText,
+                })),
+              },
+              message: 'The run halts here until the user picks an option. Do NOT call activate yourself in this turn.',
+            };
+          }
+
+          const { chatbotDb } = await import('../../services/chatbotService');
+          const messages = await chatbotDb.getMessagesFromMessagesTable(context.sessionId);
+          const approval = gate.checkActivationApproval(messages as any, sequenceId, token);
+          if (!approval.allowed) return refuse(approval.code, approval.reason);
+          if (typeof args?.preview_token !== 'string' || args.preview_token !== token) {
+            return refuse('stale_preview', 'preview_token does not match the sequence as it is now. Preview it again.');
+          }
+
+          // Atomic: activate only the exact version the user approved. If anything edited the
+          // sequence after the read that produced `token`, the route returns 409 and nothing goes live.
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview was approved. Preview it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active' };
+        }
+
+        default:
+          return { success: false, error: `Unknown action: ${action}` };
+      }
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  },
+});
+
 mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
@@ -1216,7 +1698,7 @@ mcpToolRegistry.register({
         const qp: Record<string, string> = {};
         if (args.limit) qp.limit = String(args.limit);
         if (args.last_key) qp.lastKey = args.last_key;
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/leads`, context: c, queryParams: qp });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, queryParams: qp });
         return jsonResult(data);
       }
       case 'add': {
@@ -1232,27 +1714,27 @@ mcpToolRegistry.register({
           const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
           return jsonResult({ dryRun: true, ...preview });
         }
-        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: leadPayload });
+        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, body: leadPayload });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${listId}/leads/${args.lead_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${listId}/leads/${args.lead_id}`, context: c, body: args.updates });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c, body: args.updates });
         return jsonResult(data);
       }
       case 'delete': {
         // Delete uses the single-lead endpoint if one ID, or we need to call per-lead
         if (args.lead_ids && args.lead_ids.length === 1) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${listId}/leads/${args.lead_ids[0]}`, context: c });
+          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_ids[0])}`, context: c });
           return jsonResult(data);
         }
         // For multiple deletes, call individually
         const results = [];
         for (const leadId of (args.lead_ids || [])) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${listId}/leads/${leadId}`, context: c });
+          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(leadId)}`, context: c });
           results.push(data);
         }
         return jsonResult({ deleted: args.lead_ids?.length || 0, results });
@@ -1346,16 +1828,16 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       case 'update': {
         const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${plan_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -1395,25 +1877,25 @@ mcpToolRegistry.register({
     switch (args.action) {
       case 'add_phase': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/phases`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases`, context: c,
           body: { name: args.name, description: args.description, status: args.status }
         });
         return jsonResult(data);
       }
       case 'update_phase': {
         const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}`, context: c,
+          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c,
           body: { name: args.name, description: args.description, status: args.status }
         });
         return jsonResult(data);
       }
       case 'delete_phase': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c });
         return jsonResult(data);
       }
       case 'add_work_items': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items`, context: c,
           body: { workItems: args.work_items }
         });
         return jsonResult(data);
@@ -1421,14 +1903,14 @@ mcpToolRegistry.register({
       case 'update_work_item': {
         const { action: _a, plan_id: _p, phase_id: _ph, work_item_id: _w, ...updates } = args;
         const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items/${work_item_id}`, context: c,
+          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c,
           body: updates
         });
         return jsonResult(data);
       }
       case 'delete_work_item': {
         const data = await mcpFetch({
-          method: 'DELETE', path: `/api/gtm-plan/${plan_id}/phases/${phase_id}/work-items/${work_item_id}`, context: c
+          method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c
         });
         return jsonResult(data);
       }
@@ -1438,15 +1920,15 @@ mcpToolRegistry.register({
       }
       case 'add_common_items': {
         const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${plan_id}/add-common-items`, context: c,
+          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/add-common-items`, context: c,
           body: { items: args.items, targetPhaseId: args.target_phase_id, newPhaseName: args.new_phase_name }
         });
         return jsonResult(data);
       }
       case 'send_status_report': {
         const path = phase_id
-          ? `/api/gtm-plan/${plan_id}/phases/${phase_id}/send-status-report`
-          : `/api/gtm-plan/${plan_id}/send-status-report`;
+          ? `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/send-status-report`
+          : `/api/gtm-plan/${encodeURIComponent(plan_id)}/send-status-report`;
         const data = await mcpFetch({
           method: 'POST', path, context: c,
           body: { includeSummary: args.include_summary, includeDetails: args.include_details }
@@ -1526,6 +2008,223 @@ mcpToolRegistry.register({
       body: { files: args.files }
     });
     return jsonResult(data);
+  }
+});
+
+// ─── Knowledge base text-file writes, own account only (ENG-2892) ───────────
+//
+// Thin wrappers over the existing KB write routes (POST /api/emma/
+// create-knowledge-base, /attach-knowledge-base-files, /update-knowledge-base-
+// file and DELETE /api/tasks/:taskId/knowledge-base/files/:fileKey). No new
+// storage: the routes own the GCS write and the task record.
+//
+// Ownership is decided here, not by the routes: the delete route also admits
+// admins and org editors, and getTask admits org viewers. These tools act only
+// on a KB whose owner is the calling key's runtime identity, and answer a
+// foreign KB/file exactly like a missing one so existence never leaks. There
+// is no client_id/user override. Every write is read back from the task record
+// before the tool reports success.
+
+export const KB_TEXT_FILE_MAX_BYTES = 1024 * 1024;
+const KB_MAIN_FILE = 'knowledge-base.txt';
+const KB_TEXT_FILE_EXTENSION = /\.(txt|md|markdown)$/i;
+// Control characters other than tab/newline/CR mark binary data.
+const KB_BINARY_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const KB_NOT_FOUND = 'Knowledge base or file not found';
+
+function kbArg(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/** Returns an error string when `content` is not acceptable KB text, else null. */
+function kbTextContentError(content: unknown): string | null {
+  if (typeof content !== 'string' || content.trim().length === 0) return 'content must be a non-empty text string';
+  const size = Buffer.byteLength(content, 'utf8');
+  if (size > KB_TEXT_FILE_MAX_BYTES) return `content is ${size} bytes; the maximum is ${KB_TEXT_FILE_MAX_BYTES} bytes`;
+  if (KB_BINARY_CHARS.test(content)) return 'content looks binary; only plain text or markdown is accepted';
+  return null;
+}
+
+function kbFileNameError(fileName: string): string | null {
+  if (!fileName) return 'file_name is required';
+  if (!KB_TEXT_FILE_EXTENSION.test(fileName)) return 'file_name must end in .txt, .md or .markdown';
+  return null;
+}
+
+/** The caller's own KB task, or null for a missing or foreign one (indistinguishable). */
+async function loadOwnKnowledgeBase(kbId: string, context: any): Promise<any | null> {
+  const ownerId = context?.userId || context?.agentUserId;
+  if (!kbId || !ownerId) return null;
+  try {
+    const task = await mcpFetch({ method: 'GET', path: `/api/tasks/${encodeURIComponent(kbId)}`, context: ctx(context) });
+    return task && task.userId === ownerId ? task : null;
+  } catch (error: any) {
+    if (/API error \((403|404)\)/.test(String(error?.message))) return null;
+    throw error;
+  }
+}
+
+/** Read back one file's stored key + size from the caller's own KB task. */
+async function readBackKbFile(kbId: string, fileName: string, context: any): Promise<{ file_key: string; size_bytes: number } | null> {
+  const task = await loadOwnKnowledgeBase(kbId, context);
+  if (!task) return null;
+  if (fileName === KB_MAIN_FILE) {
+    return { file_key: `tasks/${task.taskId}/${KB_MAIN_FILE}`, size_bytes: Number(task.knowledgeBaseSize) || 0 };
+  }
+  const matches = (task.knowledgeBaseFiles || []).filter((f: any) => f?.filename === fileName);
+  const entry = matches[matches.length - 1];
+  return entry ? { file_key: entry.key, size_bytes: Number(entry.size) || 0 } : null;
+}
+
+async function verifiedKbWrite(kbId: string, fileName: string, content: string, context: any) {
+  const expected = Buffer.byteLength(content, 'utf8');
+  const stored = await readBackKbFile(kbId, fileName, context);
+  if (!stored || stored.size_bytes !== expected) {
+    return jsonResult({ success: false, error: 'Write could not be verified on read-back', kb_id: kbId, file_name: fileName });
+  }
+  return jsonResult({
+    success: true,
+    kb_id: kbId,
+    file_name: fileName,
+    file_key: stored.file_key,
+    size_bytes: stored.size_bytes,
+    sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+  });
+}
+
+function routeFailure(data: any) {
+  return jsonResult({ success: false, error: data?.error || data?.message || 'Knowledge base write failed' });
+}
+
+mcpToolRegistry.register({
+  name: 'create_knowledge_base_file',
+  definition: {
+    name: 'create_knowledge_base_file',
+    description: `Create a plain-text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). With kb_id, adds file_name to that knowledge base; without kb_id, creates a new private knowledge base named kb_name whose main file (${KB_MAIN_FILE}) holds the content. Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases). Omit to create a new knowledge base.' },
+        kb_name: { type: 'string', description: 'Name for the new knowledge base (only when kb_id is omitted)' },
+        file_name: { type: 'string', description: 'File name ending in .txt, .md or .markdown (required with kb_id)' },
+        content: { type: 'string', description: 'File text' }
+      },
+      required: ['content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const kbId = kbArg(args?.kb_id);
+
+    if (!kbId) {
+      const kbName = kbArg(args?.kb_name);
+      if (!kbName) return jsonResult({ success: false, error: 'kb_name is required when kb_id is omitted' });
+      const data = await mcpFetch({
+        method: 'POST', path: '/api/emma/create-knowledge-base', context: ctx(context),
+        body: { name: kbName, content, knowledge_base_type: 'private' }
+      });
+      if (!data?.success || !data.taskId) return routeFailure(data);
+      return verifiedKbWrite(data.taskId, KB_MAIN_FILE, content, context);
+    }
+
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbId, context);
+    if (!task) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const lowered = fileName.toLowerCase();
+    const existingName = lowered === KB_MAIN_FILE
+      // An attachment stored under this exact case-variant name wins over the main file.
+      ? (fileName !== KB_MAIN_FILE && (task.knowledgeBaseFiles || []).find((f: any) => f?.filename === fileName)?.filename) || KB_MAIN_FILE
+      : (task.knowledgeBaseFiles || []).find((f: any) => String(f?.filename ?? '').toLowerCase() === lowered)?.filename;
+    if (existingName) {
+      // Report the stored name: update_knowledge_base_file_content matches names exactly.
+      return jsonResult({ success: false, error: `"${existingName}" already exists; use update_knowledge_base_file_content with file_name "${existingName}" to change it` });
+    }
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/attach-knowledge-base-files', context: ctx(context),
+      body: { task_id: task.taskId, files: [{ name: fileName, content }] }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_knowledge_base_file_content',
+  definition: {
+    name: 'update_knowledge_base_file_content',
+    description: `Replace the full content of an existing text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). Returns the stored file key, size and sha256.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: `Existing file name (e.g. ${KB_MAIN_FILE})` },
+        content: { type: 'string', description: 'New file text (replaces the old content)' }
+      },
+      required: ['kb_id', 'file_name', 'content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const contentError = kbTextContentError(args?.content);
+    if (contentError) return jsonResult({ success: false, error: contentError });
+    const content: string = args.content;
+    const fileName = kbArg(args?.file_name);
+    const nameError = kbFileNameError(fileName);
+    if (nameError) return jsonResult({ success: false, error: nameError });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    const exists = fileName === KB_MAIN_FILE || (task?.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName);
+    if (!task || !exists) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/emma/update-knowledge-base-file', context: ctx(context),
+      body: { task_id: task.taskId, file_name: fileName, content, mode: 'replace' }
+    });
+    if (!data?.success) return routeFailure(data);
+    return verifiedKbWrite(task.taskId, fileName, content, context);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_knowledge_base_file',
+  definition: {
+    name: 'delete_knowledge_base_file',
+    description: `Delete one uploaded or attached file from one of your own knowledge bases. The main ${KB_MAIN_FILE} file cannot be deleted. Pass file_key when two files share a name. Returns confirmation that the file is gone.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
+        file_name: { type: 'string', description: 'File name to delete' },
+        file_key: { type: 'string', description: 'Stored file key (optional; disambiguates duplicate names)' }
+      },
+      required: ['kb_id', 'file_name']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const fileName = kbArg(args?.file_name);
+    const fileKey = kbArg(args?.file_key);
+    if (!fileName) return jsonResult({ success: false, error: 'file_name is required' });
+    if (fileName === KB_MAIN_FILE) return jsonResult({ success: false, error: `The main ${KB_MAIN_FILE} file cannot be deleted` });
+    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
+    // Only keys recorded on the caller's own task are ever sent to the delete route.
+    const matches = (task?.knowledgeBaseFiles || []).filter(
+      (f: any) => f?.filename === fileName && typeof f?.key === 'string' && (!fileKey || f.key === fileKey)
+    );
+    if (!task || matches.length === 0) return jsonResult({ success: false, error: KB_NOT_FOUND });
+    if (matches.length > 1) {
+      return jsonResult({ success: false, error: `${matches.length} files are named "${fileName}"; pass file_key`, file_keys: matches.map((f: any) => f.key) });
+    }
+    const key: string = matches[0].key;
+    await mcpFetch({
+      method: 'DELETE',
+      path: `/api/tasks/${encodeURIComponent(task.taskId)}/knowledge-base/files/${encodeURIComponent(key)}`,
+      context: ctx(context)
+    });
+    const after = await loadOwnKnowledgeBase(task.taskId, context);
+    const stillPresent = !after || (after.knowledgeBaseFiles || []).some((f: any) => f?.key === key);
+    if (stillPresent) return jsonResult({ success: false, error: 'Delete could not be confirmed on read-back', kb_id: task.taskId, file_key: key });
+    return jsonResult({ success: true, deleted: true, kb_id: task.taskId, file_name: fileName, file_key: key });
   }
 });
 
@@ -1663,6 +2362,145 @@ mcpToolRegistry.register({
   }
 });
 
+/** Allow-list projection of GET /api/crm/sender-emails shared by list/update sender tools. */
+function projectSenderSettings(data: any) {
+  const senders = Array.isArray(data?.senders) ? data.senders : [];
+  const mailboxes = Array.isArray(data?.connectedEmailAccounts) ? data.connectedEmailAccounts : [];
+  return {
+    senders: senders.map((s: any) => ({
+      id: s?.id ?? null,
+      email: s?.email ?? null,
+      from_name: s?.fromName ?? null,
+      sender_provider: s?.senderProvider ?? null,
+      connected_account_id: s?.connectedAccountId ?? null,
+      daily_limit: s?.dailyLimit ?? null,
+      effective_daily_limit: s?.effectiveDailyLimit ?? null,
+      // null = unknown (uncapped sender, or the usage read failed) — never a fake zero.
+      sent_today: s?.sentTodayKnown === false || typeof s?.sentToday !== 'number' ? null : s.sentToday,
+      warmup_started_at: s?.warmupStartedAt ?? null,
+    })),
+    default_sender_id: data?.defaultSenderId ?? null,
+    default_linkedin_account_id: data?.defaultLinkedInAccountId ?? null,
+    connected_email_accounts: mailboxes.map((a: any) => ({
+      account_id: a?.account_id ?? null,
+      account_name: a?.account_name ?? null,
+      email: a?.email ?? null,
+      platform: a?.platform ?? null,
+    })),
+  };
+}
+
+// ─── Sender Settings (ENG-2868) ─────────────────────────────────────────────
+
+/**
+ * ENG-2868 (ENG-2847.4 read half): read-only view of the caller's own CRM
+ * sender settings. Identity comes only from the runtime context — the tool
+ * accepts no arguments, so no account can be selected via args. The response
+ * is an explicit allow-list projection of GET /api/crm/sender-emails so a
+ * future field added to that route can never leak through here.
+ */
+mcpToolRegistry.register({
+  name: 'list_sender_settings',
+  readOnly: true,
+  definition: {
+    name: 'list_sender_settings',
+    description: "List your own CRM sender settings: configured email senders (with today's send usage and effective daily cap), the default email sender, the default LinkedIn sender account, and connected mailboxes that can be used as senders. Read-only; use before drafting or activating sequences.",
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: ctx(context) });
+    return jsonResult(projectSenderSettings(data));
+  }
+});
+
+// ENG-2897 (ENG-2847.7): set the caller's own default email / LinkedIn sender.
+// Identity is runtime-only (no client_id). Both ids are checked against the
+// caller's OWN config / OWN connected accounts before anything is written, and
+// the existing sender list is re-posted unchanged so only the defaults move.
+// Sequence activation state is never touched.
+mcpToolRegistry.register({
+  name: 'update_sender_settings',
+  definition: {
+    name: 'update_sender_settings',
+    description: 'Set your own default CRM email sender and/or default LinkedIn sender account. default_sender_id must be one of your configured senders (see list_sender_settings); default_linkedin_account_id must be a LinkedIn (unipile) account you own (see list_connected_accounts). Does not change sequences or their activation. Returns the resulting settings as list_sender_settings shows them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        default_sender_id: { type: 'string', description: 'Sender id from list_sender_settings.senders[].id' },
+        default_linkedin_account_id: { type: 'string', description: 'Your own LinkedIn (unipile) connected account_id' },
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // null / "" / whitespace mean "not set" (same as omitting the field), so a
+    // client that always sends both keys can still change just one default.
+    const blankToUndefined = (v: any) => (v === null || (typeof v === 'string' && !v.trim()) ? undefined : v);
+    const senderId = blankToUndefined(args?.default_sender_id);
+    const linkedInId = blankToUndefined(args?.default_linkedin_account_id);
+    if (senderId === undefined && linkedInId === undefined) {
+      throw new Error('Provide default_sender_id and/or default_linkedin_account_id');
+    }
+    if (senderId !== undefined && typeof senderId !== 'string') {
+      throw new Error('default_sender_id must be a string');
+    }
+    if (linkedInId !== undefined && typeof linkedInId !== 'string') {
+      throw new Error('default_linkedin_account_id must be a string');
+    }
+    const scoped = ctx(context);
+    if (linkedInId !== undefined) {
+      const conn = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: scoped, queryParams: { platform: 'unipile' } });
+      const accounts: any[] = Array.isArray(conn?.accounts) ? conn.accounts : [];
+      const ownsIt = accounts.some((a: any) => a?.platform === 'unipile' && a?.account_id === linkedInId && a?.owned === true);
+      if (!ownsIt) {
+        throw new Error(`default_linkedin_account_id "${linkedInId}" is not a LinkedIn account you own`);
+      }
+    }
+    // The settings route stores the whole config, so this is read-modify-write.
+    // Narrow the lost-update window: re-read right before writing and restart if
+    // anything moved, then verify the stored result and retry if a concurrent
+    // writer overwrote our defaults. Never report a default that is not stored.
+    const fingerprint = (c: any) => JSON.stringify({
+      senders: (Array.isArray(c?.senders) ? c.senders : []).map((s: any) => s),
+      d: c?.defaultSenderId ?? null,
+      l: c?.defaultLinkedInAccountId ?? null,
+    });
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const current = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const senders: any[] = Array.isArray(current?.senders) ? current.senders : [];
+      if (senderId !== undefined && !senders.some((s: any) => s?.id === senderId)) {
+        throw new Error(`default_sender_id "${senderId}" is not one of your configured senders`);
+      }
+      const wantSender = senderId ?? current?.defaultSenderId ?? null;
+      const wantLinkedIn = linkedInId ?? current?.defaultLinkedInAccountId ?? null;
+      const recheck = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      if (fingerprint(recheck) !== fingerprint(current)) continue;
+      await mcpFetch({
+        method: 'POST',
+        path: '/api/crm/sender-emails',
+        context: scoped,
+        body: {
+          // Unchanged senders pass the route's grandfather check, so no re-validation side effects.
+          senders: senders.map((s: any) => ({
+            id: s.id, email: s.email, fromName: s.fromName, notes: s.notes,
+            senderType: s.senderType, senderProvider: s.senderProvider,
+            connectedAccountId: s.connectedAccountId, gmailAccountId: s.gmailAccountId,
+            dailyLimit: s.dailyLimit, warmupStartedAt: s.warmupStartedAt,
+          })),
+          defaultSenderId: wantSender,
+          defaultLinkedInAccountId: wantLinkedIn,
+        },
+      });
+      const after = await mcpFetch({ method: 'GET', path: '/api/crm/sender-emails', context: scoped });
+      const stored = (senderId === undefined || after?.defaultSenderId === senderId)
+        && (linkedInId === undefined || after?.defaultLinkedInAccountId === linkedInId);
+      if (stored) return jsonResult(projectSenderSettings(after));
+    }
+    throw new Error('Sender settings changed concurrently and the update could not be applied; nothing was reported as saved. Re-read with list_sender_settings and retry.');
+  }
+});
+
 // ─── Connected Accounts ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -1715,7 +2553,8 @@ mcpToolRegistry.register({
       properties: {
         account_id: { type: 'string', description: 'Connected account ID' },
         content: { type: 'string', description: 'Post content' },
-        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' }
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to. Omit for a new post.' }
       },
       required: ['account_id', 'content']
     }
@@ -1726,7 +2565,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
-      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [], ...(args.in_reply_to_post_id ? { in_reply_to_post_id: args.in_reply_to_post_id } : {}) }
     });
     return jsonResult(data);
   }
@@ -1777,7 +2616,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/deploy`, context: ctx(context),
       body: {},
       timeoutMs: 25 * 60 * 1000, // 25 minutes — GitHub + Vercel deploy (extra headroom)
     });
@@ -1801,7 +2640,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/iterate`, context: ctx(context),
       body: { message: args.message },
       // An iteration is a full v0 generation round — it takes as long as a build. This passed
       // NO timeout, so it fell back to the ~5-min default and aborted while v0 was still
@@ -1842,7 +2681,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -1861,7 +2700,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}`, context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -1929,7 +2768,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PUT', path: `/api/crm/lists/${args.list_id}/public-access`, context: ctx(context),
+      method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}/public-access`, context: ctx(context),
       body: { enabled: true }
     });
     return jsonResult(data);
@@ -1952,7 +2791,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/duplicate`, context: ctx(context),
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/duplicate`, context: ctx(context),
       body: { name: args.name }
     });
     return jsonResult(data);
@@ -1975,7 +2814,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/context`, context: ctx(context),
       body: { context: args.context }
     });
     return jsonResult(data);
@@ -2052,10 +2891,73 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'PUT', path: `/api/landing-pages/v0/generated/${args.page_id}/github-edit`, context: ctx(context),
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/github-edit`, context: ctx(context),
       body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message, branch: args.branch }
     });
     return jsonResult(data);
+  }
+});
+
+export const MAX_LANDING_PAGE_FILES_PER_UPDATE = 20;
+export const LANDING_PAGE_DRAFT_BRANCH = 'draft/agentweb-preview';
+
+mcpToolRegistry.register({
+  name: 'update_landing_page_files',
+  definition: {
+    name: 'update_landing_page_files',
+    description: 'ENG-2896: commit up to 20 files to one of your landing pages in ONE atomic commit on the draft/preview branch (draft/agentweb-preview by default; main is rejected — publish with publish_landing_page_changes). Pass expected_base_sha (from a prior read) to fail with a conflict and write nothing if the branch moved. Returns the new commit SHA.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        files: {
+          type: 'array',
+          maxItems: MAX_LANDING_PAGE_FILES_PER_UPDATE,
+          description: 'Files to write (max 20). Each: { path, content }.',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Repo path, e.g. "src/app/page.tsx"' },
+              content: { type: 'string', description: 'Full new file content' }
+            },
+            required: ['path', 'content']
+          }
+        },
+        commit_message: { type: 'string', description: 'Commit message (optional)' },
+        branch: { type: 'string', description: 'Target branch. Defaults to "draft/agentweb-preview". "main" is rejected.' },
+        expected_base_sha: { type: 'string', description: 'Optional 40-char SHA the branch head must equal; otherwise the call fails with a conflict and writes nothing.' }
+      },
+      required: ['page_id', 'files']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const branch: string = args.branch || LANDING_PAGE_DRAFT_BRANCH;
+    if (branch === 'main' || branch === 'refs/heads/main') {
+      throw new Error('update_landing_page_files never writes to main. Omit branch to use the draft/preview branch, then publish with publish_landing_page_changes.');
+    }
+    const files = args.files;
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error('files must be a non-empty array of { path, content }.');
+    }
+    if (files.length > MAX_LANDING_PAGE_FILES_PER_UPDATE) {
+      throw new Error(`files must not exceed ${MAX_LANDING_PAGE_FILES_PER_UPDATE} entries per commit (got ${files.length}).`);
+    }
+    for (const f of files) {
+      if (!f || typeof f.path !== 'string' || !f.path || typeof f.content !== 'string') {
+        throw new Error('Each file requires a string path and string content.');
+      }
+    }
+    const data: any = await mcpFetch({
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/update-files`, context: ctx(context),
+      body: {
+        files: files.map((f: any) => ({ file_path: f.path, content: f.content })),
+        commit_message: args.commit_message || `Update ${files.length} file(s) via update_landing_page_files`,
+        branch,
+        ...(args.expected_base_sha ? { expected_base_sha: args.expected_base_sha } : {})
+      }
+    });
+    const commitSha = typeof data?.commit_url === 'string' ? data.commit_url.split('/commit/')[1] : undefined;
+    return jsonResult({ ...data, commit_sha: commitSha });
   }
 });
 
@@ -2067,14 +2969,15 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        page_id: { type: 'string', description: 'The landing page ID' }
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/files${args.branch ? `?branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2089,14 +2992,15 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
+        branch: { type: 'string', description: 'Branch to read from (e.g. "draft/agentweb-preview" to read back staged edits). Omit for "main". Never selects a different repo.' }
       },
       required: ['page_id', 'file_path']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/file-content?path=${encodeURIComponent(args.file_path)}${args.branch ? `&branch=${encodeURIComponent(args.branch)}` : ''}`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2117,7 +3021,7 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/deployment-status`, context: ctx(context)
+      method: 'GET', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/deployment-status`, context: ctx(context)
     });
     return jsonResult(data);
   }
@@ -2140,7 +3044,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/preview-url`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/preview-url`,
       queryParams: { branch: args.branch },
       context: ctx(context)
     });
@@ -2168,7 +3072,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/publish`,
       body: { branch: args.branch },
       context: ctx(context)
     });
@@ -2192,7 +3096,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST',
-      path: `/api/landing-pages/v0/generated/${args.page_id}/revert-publish`,
+      path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/revert-publish`,
       context: ctx(context)
     });
     return jsonResult(data);
@@ -2320,7 +3224,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'google_search_web',
-    description: 'Opt-in Google Custom Search web search. Not a default search tool. No hidden fallback provider is used.',
+    description: 'Legacy alias of you_search_web (Google Custom Search retired, ENG-1281). Returns You.com web results.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2547,6 +3451,56 @@ mcpToolRegistry.register({
   }
 });
 
+
+/** ENG-1992: summary of valid plans for an actionable not-found error. */
+function summarizeWorkPlans(plans: any[]): Array<{ id: string; title: string }> {
+  return plans
+    .map((p: any) => ({ id: p?.planId ?? p?.id, title: p?.title }))
+    .filter((p) => typeof p.id === 'string')
+    .slice(0, 50);
+}
+
+/**
+ * ENG-1992: resolve `plan_id` for get/update/delete. An id that matches a plan is
+ * used as-is. For get/update, a value matching exactly one plan TITLE
+ * (case-insensitive) resolves to that plan's id. Anything else — missing, unknown,
+ * or an ambiguous title — returns an actionable error listing the valid plans.
+ * If the plan list itself cannot be read, the original plan_id is passed through
+ * unchanged so the route's own answer (and error) stands.
+ */
+async function resolveWorkPlanTarget(args: any, c: any): Promise<{ planId: string } | { error: Record<string, unknown> }> {
+  const raw = typeof args.plan_id === 'string' ? args.plan_id.trim() : '';
+  let plans: any[] | undefined;
+  try {
+    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: c });
+    plans = Array.isArray(data) ? data : undefined;
+  } catch {
+    plans = undefined;
+  }
+  if (!plans) {
+    if (raw) return { planId: raw };
+    return { error: { error: `plan_id is required for action=${args.action}. Call list_predefined_work_plans to find it.` } };
+  }
+  if (raw && plans.some((p: any) => p?.planId === raw || p?.id === raw)) return { planId: raw };
+  if (raw && args.action !== 'delete') {
+    const needle = raw.toLowerCase();
+    const byTitle = plans.filter((p: any) => typeof p?.title === 'string' && p.title.trim().toLowerCase() === needle);
+    if (byTitle.length === 1) return { planId: byTitle[0].planId ?? byTitle[0].id };
+    if (byTitle.length > 1) {
+      return { error: {
+        error: `plan_id "${raw}" matches ${byTitle.length} work plans by title; pass the exact plan id.`,
+        matchingPlans: summarizeWorkPlans(byTitle),
+      } };
+    }
+  }
+  return { error: {
+    error: raw
+      ? `No work plan with id "${raw}"${args.action === 'delete' ? ' (delete requires the exact plan id, not a title)' : ''}. Use one of the ids below.`
+      : `plan_id is required for action=${args.action}. Use one of the ids below.`,
+    availablePlans: summarizeWorkPlans(plans),
+  } };
+}
+
 mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
@@ -2556,7 +3510,7 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'delete', 'get'], description: 'CRUD action' },
-        plan_id: { type: 'string', description: 'Plan ID (required for update/delete/get)' },
+        plan_id: { type: 'string', description: 'Plan ID from list_predefined_work_plans (required for update/delete/get). For get/update an exact, unique plan title is also accepted. An unknown value returns the list of valid plan ids.' },
         title: { type: 'string', description: 'Plan title (create/update)' },
         description: { type: 'string', description: 'Plan description (create/update)' },
         welcome_message: { type: 'string', description: 'Welcome message shown to users (create/update)' },
@@ -2582,7 +3536,8 @@ mcpToolRegistry.register({
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
               expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step\'s assets never count toward a later step\'s requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count.' },
-              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' }
+              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' },
+              model: { type: 'string', description: 'Optional model for THIS step (a canonical model id from the model picker). When set, the step runs on exactly this model and the plan pauses (never switches models) if it becomes unavailable. Omit to use the plan default_model, then the account default. Only stored while per-step models are enabled; a blank string clears it in steps_mode="merge". A model that is not served or not selectable is refused with a 422 naming the step.' }
             },
             required: ['title']
           },
@@ -2595,7 +3550,7 @@ mcpToolRegistry.register({
         },
         confirm_step_removal: {
           type: 'boolean',
-          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools, model) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2603,6 +3558,30 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1992: the dominant failure cluster (18/28) was `not_found` — the model
+    // passed a plan TITLE, a stale id, or nothing as plan_id, and the route's bare
+    // "Work plan not found" 404 gave it nothing to recover with. Resolve a unique
+    // exact title match to its real id (get/update only — never a destructive delete
+    // by title), and otherwise return the valid plans instead of an opaque 404.
+    // Resolution runs only on a missing plan_id or a 404, so the happy path is unchanged.
+    const targetsPlan = args.action === 'update' || args.action === 'delete' || args.action === 'get';
+    if (targetsPlan && !(typeof args.plan_id === 'string' && args.plan_id.trim())) {
+      const resolved = await resolveWorkPlanTarget(args, c);
+      return jsonResult('error' in resolved ? resolved.error : { error: 'plan_id is required' });
+    }
+    try {
+      return await runManagePredefinedWorkPlan(args, c);
+    } catch (error: any) {
+      if (!targetsPlan || !/API error \(404\)/.test(String(error?.message || ''))) throw error;
+      const resolved = await resolveWorkPlanTarget(args, c);
+      if ('error' in resolved) return jsonResult(resolved.error);
+      if (resolved.planId === args.plan_id) throw error;
+      return await runManagePredefinedWorkPlan({ ...args, plan_id: resolved.planId }, c);
+    }
+  }
+});
+
+async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
     switch (args.action) {
       case 'create': {
         const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
@@ -2645,13 +3624,16 @@ mcpToolRegistry.register({
 
           let existingSteps: any[] | undefined;
           try {
-            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
             existingSteps = Array.isArray(current?.steps) ? current.steps : [];
             // Stake the read: everything below is judged against these steps, so
             // a write that lands in between has to fail rather than quietly make
             // that judgement wrong (ENG-890).
             body.expectedStepsRev = current?.steps_rev ?? null;
           } catch (error: any) {
+            // A 404 means the plan_id itself is wrong: let it reach execute()'s
+            // title/candidate resolution (ENG-1992) instead of masking it here.
+            if (/API error \(404\)/.test(String(error?.message || ''))) throw error;
             // Fail closed in both modes: without the current steps we can
             // neither merge nor tell whether a replace would delete steps, and
             // writing blind is exactly the silent deletion this guards against.
@@ -2681,7 +3663,8 @@ mcpToolRegistry.register({
             }
             body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
           } else {
-            body.steps = incomingSteps;
+            // ENG-2378: a replace built from memory (the tool never shows a step's model) must not erase stored models.
+            body.steps = carryStoredStepModels(incomingSteps, existingSteps);
             if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
               const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
               return jsonResult({
@@ -2719,7 +3702,7 @@ mcpToolRegistry.register({
 
         let data: any;
         try {
-          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c, body });
         } catch (error: any) {
           // The stake above was rejected. Nothing was written, and a blind retry
           // would re-send a payload built from steps that no longer exist.
@@ -2739,18 +3722,17 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${encodeURIComponent(args.plan_id)}`, context: c });
         return jsonResult(data);
       }
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
-  }
-});
+}
 
 // ─── Skill Management (admin-only) ──────────────────────────────────────────
 
@@ -2848,17 +3830,17 @@ mcpToolRegistry.register({
         if (args.tool_names !== undefined) body.toolNames = args.tool_names;
         if (args.system_prompt !== undefined) body.systemPrompt = args.system_prompt;
         if (args.is_published !== undefined) body.isPublished = args.is_published;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/skills/${args.skill_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
         if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('delete') });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${args.skill_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
         if (!args.skill_id) return jsonResult({ error: resolveSkillInstruction('get') });
-        const data = await mcpFetch({ method: 'GET', path: `/api/skills/${args.skill_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/skills/${encodeURIComponent(args.skill_id)}`, context: c });
         return jsonResult(data);
       }
       default:
@@ -2868,6 +3850,24 @@ mcpToolRegistry.register({
 });
 
 // ─── Chat History (admin-only) ──────────────────────────────────────────────
+
+const CHAT_HISTORY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** ENG-2972: resolve an optional start/end window (default: trailing 24h ending now). */
+export function resolveChatHistoryWindow(
+  args: any,
+  now: Date = new Date()
+): { start_time: string; end_time: string } | { error: string } {
+  const endRaw = typeof args?.end_time === 'string' && args.end_time.trim() ? args.end_time.trim() : undefined;
+  const startRaw = typeof args?.start_time === 'string' && args.start_time.trim() ? args.start_time.trim() : undefined;
+  const endMs = endRaw ? Date.parse(endRaw) : now.getTime();
+  if (Number.isNaN(endMs)) return { error: `end_time "${endRaw}" is not a valid ISO 8601 timestamp` };
+  const startMs = startRaw ? Date.parse(startRaw) : endMs - CHAT_HISTORY_DEFAULT_WINDOW_MS;
+  if (Number.isNaN(startMs)) return { error: `start_time "${startRaw}" is not a valid ISO 8601 timestamp` };
+  if (startMs >= endMs) return { error: 'start_time must be before end_time' };
+  // Caller-supplied values pass through verbatim; only missing ends are filled.
+  return { start_time: startRaw ?? new Date(startMs).toISOString(), end_time: endRaw ?? new Date(endMs).toISOString() };
+}
 
 mcpToolRegistry.register({
   name: 'get_chat_history',
@@ -2904,11 +3904,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       properties: {
         start_time: {
           type: 'string',
-          description: 'Start time in ISO 8601 format (e.g., "2024-03-01T00:00:00.000Z")'
+          description: 'Start time in ISO 8601 format (e.g., "2024-03-01T00:00:00.000Z"). Optional: defaults to 24 hours before end_time.'
         },
         end_time: {
           type: 'string',
-          description: 'End time in ISO 8601 format (e.g., "2024-03-02T00:00:00.000Z")'
+          description: 'End time in ISO 8601 format (e.g., "2024-03-02T00:00:00.000Z"). Optional: defaults to now.'
         },
         limit: {
           type: 'number',
@@ -2921,15 +3921,16 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
           default: false
         }
       },
-      required: ['start_time', 'end_time']
+      required: []
     }
   },
-  execute: async (args: any, context: any) => {
-    if (!args.start_time || !args.end_time) {
-      return jsonResult({
-        error: 'start_time and end_time are required. Provide ISO 8601 timestamps, e.g. start_time="2024-03-01T00:00:00.000Z"'
-      });
-    }
+  execute: async (rawArgs: any, context: any) => {
+    // ENG-2972: the model routinely calls this with no window ("recent chats"),
+    // and the old required:['start_time','end_time'] rejected those at schema
+    // validation. Default to the trailing 24h ending now instead.
+    const window = resolveChatHistoryWindow(rawArgs);
+    if ('error' in window) return jsonResult({ error: window.error });
+    const args = { ...(rawArgs || {}), start_time: window.start_time, end_time: window.end_time };
     const queryParams = new URLSearchParams({
       startTime: args.start_time,
       endTime: args.end_time,
@@ -2986,7 +3987,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // spend from assistant turns timestamped inside [start_time, end_time).
       let inWindowCostMicro = 0;
       let timestampedAssistantTurns = 0;
-      for (const msg of messages) {
+      // ENG-2648: a branch's copied rows ran (with their models, waits and heap) in its SOURCE; attributing
+      // them to the branch would report models and turns that never ran here. Only its own rows count.
+      for (const msg of branchOwnMessages(messages)) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
@@ -3298,6 +4301,50 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
 });
 
 mcpToolRegistry.register({
+  name: 'read_client_meta_activity',
+  definition: {
+    name: 'read_client_meta_activity',
+    description: `Read the Meta ad account change history (who changed what, when) for one named client. Admin-only tool, read-only — nothing is written to Meta.
+
+Resolves the client the same way assess_client_health does, with one difference: a name that matches more than one client is refused, so pass the exact email when a name is ambiguous.
+
+Returns:
+- 'ad_account_id' and 'client': the account that was actually read and whose it is. Check these before quoting the history.
+- 'events': one page of Meta activity events (event_time, event_type, object_id, object_name, object_type, actor_name, extra_data). When Meta supplies old and new values (for example a budget change), they are also given as 'before' and 'after'. Fields Meta did not return are absent.
+- 'paging': cursors; pass paging.cursors.after as 'after' to read the next page.
+
+A result with success:false means nothing was read ('reason' says why: ambiguous_client, client_not_found, no_meta_connection, credential_pair_mismatch, invalid_argument, meta_read_failed). Never report a failed read as "no changes".`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: { type: 'string', description: 'ISO date or unix seconds; earliest event.' },
+        until: { type: 'string', description: 'ISO date or unix seconds; latest event.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Events per page (default 50).' },
+        after: { type: 'string', description: 'Paging cursor from a previous result.' }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const queryParams: Record<string, string> = {};
+    for (const key of ['since', 'until', 'limit', 'after']) {
+      if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') queryParams[key] = String(args[key]);
+    }
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-activity`,
+      context: ctx(context),
+      queryParams
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'check_account_tracking_health',
   definition: {
     name: 'check_account_tracking_health',
@@ -3402,7 +4449,7 @@ mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
     name: 'monitor_lead_volume',
-    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool. Pass the client's name or email as client_name_or_email; client_id and client_email are accepted aliases.
 
 Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
 
@@ -3473,14 +4520,51 @@ Returns matches with the page record (id, status, lead list), the owner (userId,
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'GET',
-      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
-      context: ctx(context)
-    });
-    return jsonResult(data);
+    // ENG-1628: the route answers "no match" with 404 and a bad url with 400, and
+    // mcpFetch turns both into a bare `Error` — so ordinary lookups were counted as
+    // bug-class runtime failures (4/4). Return typed results for those outcomes and
+    // reserve a thrown, specifically-named error for genuine faults.
+    const url = typeof args?.url === 'string' ? args.url.trim() : '';
+    if (!url) return jsonResult({ status: 'invalid_url', error: "'url' is required: pass a live page URL or bare hostname." });
+    let data: any;
+    try {
+      data = await mcpFetch({
+        method: 'GET',
+        path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(url)}`,
+        context: ctx(context)
+      });
+    } catch (error: any) {
+      const message = String(error?.message || error);
+      const status = Number(/API error \((\d{3})\)/.exec(message)?.[1]);
+      if (status === 404) {
+        const scannedAll = !/"scannedAll"\s*:\s*false/.test(message);
+        return jsonResult({
+          status: 'not_found',
+          matches: [],
+          scannedAll,
+          message: scannedAll
+            ? `No landing page matches "${url}".`
+            : `No landing page matched "${url}" within the scan cap; the result is inconclusive.`,
+        });
+      }
+      if (status === 400) {
+        return jsonResult({ status: 'invalid_url', error: `"${url}" is not a valid URL or hostname.` });
+      }
+      throw new LandingPageResolveError(message, Number.isFinite(status) ? status : undefined);
+    }
+    return jsonResult({ status: 'found', ...(data && typeof data === 'object' ? data : { data }) });
   }
 });
+
+/** ENG-1628: a genuine (non-404/400) failure of resolve_landing_page_by_url. */
+export class LandingPageResolveError extends Error {
+  readonly httpStatus?: number;
+  constructor(cause: string, httpStatus?: number) {
+    super(`resolve_landing_page_by_url failed${httpStatus ? ` (HTTP ${httpStatus})` : ''}: ${cause}`);
+    this.name = 'LandingPageResolveError';
+    this.httpStatus = httpStatus;
+  }
+}
 
 mcpToolRegistry.register({
   name: 'share_landing_page_with_org',
@@ -3734,8 +4818,8 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const path = args.action === 'freeze'
-      ? `/api/admin/users/${args.user_id}/deactivate`
-      : `/api/admin/users/${args.user_id}/reactivate`;
+      ? `/api/admin/users/${encodeURIComponent(args.user_id)}/deactivate`
+      : `/api/admin/users/${encodeURIComponent(args.user_id)}/reactivate`;
     const data = await mcpFetch({ method: 'POST', path, context: ctx(context) });
     return jsonResult(data);
   }
@@ -3784,17 +4868,17 @@ Actions:
 
     switch (action) {
       case 'list': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/admin/users/${user_id}/notes`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes`, context: ctx(context) });
         return jsonResult(data);
       }
       case 'add': {
         if (!content) return jsonResult({ error: 'content is required for add' });
-        const data = await mcpFetch({ method: 'POST', path: `/api/admin/users/${user_id}/notes`, context: ctx(context), body: { content } });
+        const data = await mcpFetch({ method: 'POST', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes`, context: ctx(context), body: { content } });
         return jsonResult(data);
       }
       case 'delete': {
         if (!note_id) return jsonResult({ error: 'note_id is required for delete' });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/users/${user_id}/notes/${note_id}`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/users/${encodeURIComponent(user_id)}/notes/${encodeURIComponent(note_id)}`, context: ctx(context) });
         return jsonResult(data);
       }
       default:
@@ -3850,12 +4934,12 @@ mcpToolRegistry.register({
       }
       case 'update': {
         if (!judge_id) return jsonResult({ error: 'judge_id is required for update' });
-        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/scoring-judges/${encodeURIComponent(judge_id)}`, context: ctx(context), body: { name, systemPrompt: system_prompt } });
         return jsonResult(data);
       }
       case 'delete': {
         if (!judge_id) return jsonResult({ error: 'judge_id is required for delete' });
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${judge_id}`, context: ctx(context) });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/scoring-judges/${encodeURIComponent(judge_id)}`, context: ctx(context) });
         return jsonResult(data);
       }
       default:
@@ -3890,14 +4974,41 @@ mcpToolRegistry.register({
 
 // ─── Account ─────────────────────────────────────────────────────────────────
 
+const USAGE_MONTH_SCHEMA_PROPERTY = {
+  type: 'string',
+  description: 'Optional YYYY-MM. When set, include usage_breakdown (tokens and calls by model/day, session count) for that month.',
+};
+
+/**
+ * ENG-758: optional usage breakdown. Absent month = no extra read (status stays cheap).
+ * An invalid month or a failed ledger read is reported in-band, never fabricated and
+ * never allowed to fail the status read itself.
+ */
+async function readUsageBreakdown(month: unknown, context: any): Promise<Record<string, unknown>> {
+  if (month === undefined || month === null || month === '') return {};
+  if (typeof month !== 'string' || !USAGE_MONTH_PATTERN.test(month)) {
+    return { usage_breakdown_error: 'usage_month must be YYYY-MM' };
+  }
+  try {
+    const payload = await mcpFetch({
+      method: 'GET',
+      path: `/api/subscription/usage/itemized?month=${encodeURIComponent(month)}`,
+      context,
+    });
+    return { usage_breakdown: summarizeItemizedUsage(payload, month) };
+  } catch {
+    return { usage_breakdown_error: 'Usage data is temporarily unavailable' };
+  }
+}
+
 mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    description: "Get the current user's account status, subscription plan, and usage. Pass usage_month (YYYY-MM) to also get that month's LLM token/call totals by model and by day plus a session count. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY, usage_month: USAGE_MONTH_SCHEMA_PROPERTY },
       required: []
     }
   },
@@ -3944,6 +5055,7 @@ mcpToolRegistry.register({
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,
+      ...(await readUsageBreakdown(args?.usage_month, c)),
     });
   }
 });

@@ -549,6 +549,82 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         );
       });
 
+      describe('ENG-2596 read-back of description / instagram_user_id', () => {
+        const base = {
+          name: 'RB Creative', page_id: 'page_123', image_hash: 'h', body: 'B', title: 'T',
+          link_url: 'https://example.com', description: 'The marketing OS', instagram_user_id: 'ig_1',
+        };
+        beforeEach(() => {
+          (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+          (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'c1', name: 'RB Creative' });
+        });
+
+        it('returns verified:false with unapplied_fields and the creative id when Meta stored neither', async () => {
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({ object_story_spec: { link_data: {} } });
+          const result = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(result.success).toBe(true);
+          expect(result.verified).toBe(false);
+          expect(result.unapplied_fields).toEqual(['instagram_user_id', 'description']);
+          expect(result.message).toContain('id c1');
+          expect(result.message).toContain('rather than creating another');
+        });
+
+        it('names the creative from the request when Meta\'s create response carries only the id (ENG-2624)', async () => {
+          (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'c1' });
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({ object_story_spec: { link_data: {} } });
+          const flagged = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(flagged.message).toContain('"RB Creative"');
+          expect(flagged.message).not.toContain('undefined');
+
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+            object_story_spec: { instagram_user_id: 'ig_1', link_data: { description: 'The marketing OS' } },
+          });
+          const ok = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(ok.message).toBe('Ad creative "RB Creative" created successfully');
+          expect(ok.creative.name).toBe('RB Creative');
+        });
+
+        it('is a plain success when Meta stored both', async () => {
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+            object_story_spec: { instagram_user_id: 'ig_1', link_data: { description: 'The marketing OS' } },
+          });
+          const result = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(result.verified).toBeUndefined();
+          expect(result.message).toBe('Ad creative "RB Creative" created successfully');
+        });
+
+        it('tells the model a carousel description cannot be applied and not to recreate', async () => {
+          (metaService.getAdCreative as jest.Mock).mockResolvedValue({ object_story_spec: { link_data: {} } });
+          const result = await agentModeService.createMetaAdsAdCreative('user123', {
+            ...base, instagram_user_id: undefined, image_hash: undefined,
+            carousel_cards: [{ image_hash: 'a' }, { image_hash: 'b' }],
+          });
+          expect(result.unapplied_fields).toEqual(['description']);
+          expect(result.message).toContain('carousel_cards[].description');
+          expect(result.message).toContain('Do not recreate');
+        });
+
+        it('reports readback_unavailable (still success) when the read-back throws', async () => {
+          (metaService.getAdCreative as jest.Mock).mockRejectedValue(new Error('timeout'));
+          const result = await agentModeService.createMetaAdsAdCreative('user123', base);
+          expect(result.success).toBe(true);
+          expect(result.verified).toBeUndefined();
+          expect(result.readback_unavailable).toBe(true);
+        });
+
+        it('does not read back, or check, an auto-resolved instagram_user_id the caller never asked for', async () => {
+          (metaService.getPageInstagramActor as jest.Mock).mockResolvedValue('auto_ig');
+          const { description: _d, instagram_user_id: _i, image_hash: _h, ...rest } = base;
+          const result = await agentModeService.createMetaAdsAdCreative('user123', {
+            ...rest, placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }],
+          });
+          expect(metaService.createAdCreative).toHaveBeenCalledWith('123456789', 'mock-access-token',
+            expect.objectContaining({ instagram_user_id: 'auto_ig' }));
+          expect(metaService.getAdCreative).not.toHaveBeenCalled();
+          expect(result.verified).toBeUndefined();
+        });
+      });
+
       it('should upload placement_assets given as image_url and resolve them to hashes', async () => {
         const params = {
           name: 'Placement Creative',
@@ -1137,6 +1213,92 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           expect(metaService.getAdCreative).toHaveBeenCalledTimes(1);
         });
 
+        it('carries the old link description and instagram_user_id over on a swap (ENG-2609)', async () => {
+          const spec = { ...OLD_LINK_SPEC, instagram_user_id: 'ig_old', link_data: { ...OLD_LINK_SPEC.link_data, description: 'Old desc' } };
+          mockSwap(spec, spec);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { link_url: 'https://new.com' });
+
+          expect(sentCreative().description).toBe('Old desc');
+          expect(sentCreative().instagram_user_id).toBe('ig_old');
+        });
+
+        it('treats description / instagram_user_id as creative content: swaps and keeps them off the ad-level update (ENG-2609)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { description: 'New desc', instagram_user_id: 'ig_new' });
+
+          expect(sentCreative().description).toBe('New desc');
+          expect(sentCreative().instagram_user_id).toBe('ig_new');
+          for (const call of jest.mocked(metaService.updateAd).mock.calls) {
+            expect(call[2]).not.toHaveProperty('description');
+            expect(call[2]).not.toHaveProperty('instagram_user_id');
+          }
+        });
+
+        it('refuses a carousel description update before creating a creative (ENG-2609)', async () => {
+          const carousel = { page_id: 'page_123', link_data: { message: 'm', link: 'https://old.com', child_attachments: [{ image_hash: 'a' }, { image_hash: 'b' }] } };
+          mockSwap(carousel, carousel);
+          jest.mocked(metaService.createAdCreative).mockClear();
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { description: 'x' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('CAROUSEL_DESCRIPTION_UNSUPPORTED');
+          expect(metaService.createAdCreative).not.toHaveBeenCalled();
+        });
+
+        it('carries the asset_feed_spec description when only placement_assets change (ENG-2609)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          jest.mocked(metaService.getAdCreative).mockReset().mockResolvedValue({
+            id: 'old_creative_123', name: 'Old', object_story_spec: { page_id: 'page_123', link_data: { link: 'https://old.com' } },
+            asset_feed_spec: { descriptions: [{ text: 'Feed desc' }] },
+          } as never);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }] });
+
+          expect(sentCreative().description).toBe('Feed desc');
+        });
+
+        it('carries link, body, title and CTA from asset_feed_spec when swapping a placement creative (ENG-2623)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          jest.mocked(metaService.getAdCreative).mockReset().mockResolvedValue({
+            id: 'old_creative_123', name: 'Old', object_story_spec: { page_id: 'page_123' },
+            asset_feed_spec: {
+              bodies: [{ text: 'AFS body' }], titles: [{ text: 'AFS title' }],
+              link_urls: [{ website_url: 'https://afs.example/' }], call_to_action_types: ['LEARN_MORE'],
+            },
+          } as never);
+
+          await agentModeService.updateMetaAdsAd('user123', 'ad_123', { placement_assets: [{ image_hash: 'a', is_default: true }, { image_hash: 'b', placements: ['story'] }] });
+
+          expect(sentCreative()).toEqual(expect.objectContaining({
+            link_url: 'https://afs.example/', body: 'AFS body', title: 'AFS title', call_to_action_type: 'LEARN_MORE',
+          }));
+        });
+
+        it('retries the attach while Meta still answers 1772103 for a just-created creative, but not other errors (ENG-2623)', async () => {
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          const sleep = jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+          const notReady = Object.assign(new Error('Invalid parameter'), { structuredError: { error_subcode: 1772103 } });
+          jest.mocked(metaService.updateAd).mockRejectedValueOnce(notReady).mockRejectedValueOnce(notReady);
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { title: 'New title' });
+
+          expect(result.success).toBe(true);
+          expect(attachCalls().length).toBeGreaterThanOrEqual(3);
+          expect(sleep).toHaveBeenCalledWith(30_000);
+
+          jest.mocked(metaService.updateAd).mockReset();
+          mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
+          sleep.mockClear();
+          jest.mocked(metaService.updateAd).mockRejectedValueOnce(new Error('Permissions error'));
+          const other = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { title: 'New title' });
+          expect(other.success).toBe(false);
+          expect(sleep).not.toHaveBeenCalledWith(30_000);
+          sleep.mockRestore();
+        });
+
         it('fails with SWAP_NOT_REFLECTED and does not attach when the new creative still has the old image', async () => {
           mockSwap(OLD_LINK_SPEC, OLD_LINK_SPEC);
 
@@ -1637,6 +1799,51 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           'mock-access-token',
           expect.objectContaining({ url_tags: 'utm_source=meta&utm_campaign=spring' })
         );
+      });
+
+      it('carries link description and instagram_user_id from the source creative (ENG-2609)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'src_ad', name: 'Source Ad', adset_id: 'as_1', creative: { creative_id: 'src_creative' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'src_creative', name: 'Source Creative',
+          object_story_spec: {
+            page_id: 'page_123', instagram_user_id: 'ig_src',
+            link_data: { message: 'Hi', link: 'https://src.com', name: 'T', image_hash: 'abc', description: 'Line under headline' },
+          },
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'copy_creative' });
+        (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'copy_ad' });
+
+        await agentModeService.copyMetaAdsAd('user123', 'src_ad', {});
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith('123456789', 'mock-access-token',
+          expect.objectContaining({ description: 'Line under headline', instagram_user_id: 'ig_src' }));
+      });
+
+      it('carries the video link_description, and only the instagram id for a carousel (ENG-2609)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'src_ad', name: 'Source Ad', adset_id: 'as_1', creative: { creative_id: 'src_creative' } });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'copy_creative' });
+        (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'copy_ad' });
+
+        (metaService.getAdCreative as jest.Mock).mockResolvedValueOnce({
+          id: 'src_creative', name: 'V',
+          object_story_spec: { page_id: 'page_123', instagram_user_id: 'ig_src',
+            video_data: { video_id: 'v1', image_hash: 'h', link_description: 'Vid desc' } },
+        });
+        await agentModeService.copyMetaAdsAd('user123', 'src_ad', {});
+        expect(metaService.createAdCreative).toHaveBeenLastCalledWith('123456789', 'mock-access-token',
+          expect.objectContaining({ video_id: 'v1', description: 'Vid desc', instagram_user_id: 'ig_src' }));
+
+        (metaService.getAdCreative as jest.Mock).mockResolvedValueOnce({
+          id: 'src_creative', name: 'C',
+          object_story_spec: { page_id: 'page_123', instagram_user_id: 'ig_src',
+            link_data: { message: 'm', link: 'https://src.com', description: 'ignored', child_attachments: [{ image_hash: 'a' }, { image_hash: 'b' }] } },
+        });
+        await agentModeService.copyMetaAdsAd('user123', 'src_ad', {});
+        const carouselArg = (metaService.createAdCreative as jest.Mock).mock.calls.at(-1)![2];
+        expect(carouselArg.instagram_user_id).toBe('ig_src');
+        expect(carouselArg).not.toHaveProperty('description');
       });
     });
 

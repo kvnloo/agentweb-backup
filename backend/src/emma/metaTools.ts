@@ -292,7 +292,7 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
   appears.
 
 ACTION MATRIX (entity_type → supported actions):
-  CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
+  CAMPAIGN      → LIST, CREATE, CREATE_PAUSED_BUNDLE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
   AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
   AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
@@ -381,7 +381,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
                         Dayparting/ad scheduling (adset_schedule, pacing_type) IS supported but requires lifetime_budget (never daily_budget) plus end_time — Meta silently ignores the schedule and delivers 24/7 on a daily-budget ad set, so that combination is REJECTED, naming the requirement. pacing_type defaults to ['day_parting'] automatically whenever adset_schedule is present and pacing_type is omitted. start_time/end_time are the flight window, not dayparting, and remain independent (ENG-842).
-                        After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
+                        After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode, and report the ad set status from the result (a PAUSED ad set is not delivering) (ENG-838).
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
@@ -455,6 +455,16 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
   OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
   OUTCOME_APP_PROMOTION → APP_INSTALLS
 
+PAUSED CAMPAIGN BRIEF:
+  For a new campaign with one ad set and multiple ads, use CAMPAIGN CREATE_PAUSED_BUNDLE.
+  Supply params={requested_ad_count, campaign:{...}, ad_set:{...}, ads:[{name,creative_id,status:"PAUSED"}, ...]}.
+  Include the exact objective, budget, targeting and every requested ad in the brief. Use existing creative IDs.
+  This presents ONE explicit approval card for the entire stored scope, including the objective.
+  Do not ask for the objective again or send separate creates after approval: the server executes the approved bundle.
+  All entities remain PAUSED. Activating delivery/spending always needs a separate UPDATE approval.
+  Changes to the account, settings, creatives or count require a new brief approval.
+  Report completion only when the execution result verifies every requested ad; partial/unconfirmed builds are incomplete.
+
 AD LIST COMPLETENESS:
   AD LIST returns ALL non-deleted ads including those paused at the campaign or adset level.
   Each ad includes effective_status which shows the true running state:
@@ -481,7 +491,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "PREVIEW", "CREATE", "CREATE_PAUSED_BUNDLE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -504,6 +514,12 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
           type: "object",
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
+            requested_ad_count: { type: 'integer', minimum: 1, maximum: 50, description: 'CREATE_PAUSED_BUNDLE: exact number of requested ads; must equal ads.length.' },
+            campaign: { type: 'object', description: 'CREATE_PAUSED_BUNDLE: exact CAMPAIGN CREATE fields, including name and objective. Status must be PAUSED. Campaign budget uses advantage_campaign_budget=true plus budget_amount.' },
+            ad_set: { type: 'object', description: 'CREATE_PAUSED_BUNDLE: exact ad set name, targeting, optimization_goal, billing_event, budget (unless campaign-budgeted), optional bidding/schedule/destination settings. Parent is the new campaign; no parent ID. Status must be PAUSED.' },
+            ads: { type: 'array', description: 'CREATE_PAUSED_BUNDLE: every requested ad, attached only to the new ad set.', items: { type: 'object', required: ['name', 'creative_id'], additionalProperties: false, properties: {
+              name: { type: 'string' }, creative_id: { type: 'string' }, status: { type: 'string', enum: ['PAUSED'] },
+            } } },
             // --- Confirmation gate (write actions) ---
             confirm: { type: "boolean", description: "Does nothing on its own — kept only so existing calls that still set it don't error. A CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD write only ever executes once the user has approved it through the approval-deck UI; this flag cannot authorize a write by itself, and re-calling with it set to true after a halt will NOT make the write execute. See MANDATORY TARGET CONFIRMATION above." },
 
@@ -585,7 +601,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
-            description: { type: "string", description: "Audience description." },
+            description: { type: "string", description: "CUSTOM_AUDIENCE CREATE: audience description. AD_CREATIVE CREATE: link description (the line under the headline) — written to link_data.description (video_data.link_description; asset_feed_spec.descriptions for placement_assets)." },
             customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
             lookalike_spec: { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
             id: { type: "string", description: "Audience ID for UPLOAD_USERS." },

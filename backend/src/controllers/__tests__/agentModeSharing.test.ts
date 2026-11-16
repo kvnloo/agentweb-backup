@@ -466,21 +466,18 @@ describe('AgentMode Sharing Controller', () => {
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(shareId);
       expect(res.status).toHaveBeenCalledWith(200);
+      // ENG-2645: the read-only view is exactly what ShareConversation reads (no share metadata, no model).
       expect(res.json).toHaveBeenCalledWith({
-        session: expect.objectContaining({
+        session: {
           sessionId: shareId,
           title: 'Test Session',
           messages: [
             { role: 'user', content: 'Hello' },
             { role: 'assistant', content: 'Hi there!' }
           ],
-          createdAt: '2024-01-01T00:00:00Z',
-          updatedAt: '2024-01-01T00:00:00Z',
-          shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-          interactiveShareMetadata: { isActive: false },
-          isConversable: false,
-          llmModel: 'gpt-5-chat-2'
-        })
+          workPlan: undefined,
+          pendingApprovalDeck: undefined,
+        }
       });
     });
 
@@ -520,27 +517,21 @@ describe('AgentMode Sharing Controller', () => {
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(shareId);
       expect(res.status).toHaveBeenCalledWith(200);
-      expect(res.json).toHaveBeenCalledWith({
-        session: expect.objectContaining({
-          sessionId: shareId,
-          title: 'Test Session',
-          messages: [
-            { role: 'user', content: 'Hello' },
-            { role: 'assistant', content: 'Hi there!' }
-          ],
-          createdAt: '2024-01-01T00:00:00Z',
-          updatedAt: '2024-01-01T00:00:00Z',
-          shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-          interactiveShareMetadata: {
-            isActive: true,
-            token: conversableToken,
-            sharedAt: '2024-01-01T00:00:00Z',
-            expiresAt: '2099-01-01T00:00:00Z'
-          },
-          isConversable: true,
-          llmModel: 'gpt-5-chat-2'
-        })
+      // ENG-2645: the conversable chat page never reads share metadata (only the owner's Share dialog does).
+      const served = (res.json as jest.Mock).mock.calls[0][0].session;
+      expect(served).toMatchObject({
+        sessionId: shareId,
+        title: 'Test Session',
+        messages: [
+          { role: 'user', content: 'Hello' },
+          { role: 'assistant', content: 'Hi there!' }
+        ],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+        llmModel: 'gpt-5-chat-2'
       });
+      expect(served).not.toHaveProperty('shareMetadata');
+      expect(served).not.toHaveProperty('interactiveShareMetadata');
     });
 
     it('should return 404 if session not found', async () => {

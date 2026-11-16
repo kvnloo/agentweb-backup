@@ -97,7 +97,6 @@ jest.mock('../config/integrations', () => ({
   },
   getLinkedInScopesForType: jest.fn().mockReturnValue([]),
 }));
-jest.mock('../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../services/resendService', () => ({ resendService: { sendEmail: jest.fn() } }));
 jest.mock('../services/settingsService', () => ({ settingsService: { getJsonArraySetting: jest.fn().mockResolvedValue([]) } }));
 jest.mock('../services/accountSummaryService', () => ({ getAccountSummary: jest.fn().mockResolvedValue(null) }));

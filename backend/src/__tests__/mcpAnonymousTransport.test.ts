@@ -60,8 +60,7 @@ describe('ENG-984: what a stranger may do', () => {
   });
 
   it('refuses a tools/call for a tool that is not explicitly allowlisted', () => {
-    // Every real tool today. The allowlist is empty until a demo tool with its
-    // own SSRF protection and caps ships.
+    // Every real tool except the one SSRF-guarded demo tool (ENG-1034).
     for (const name of [
       'emma_run_marketing_task',
       'emma_get_brand_profile',
@@ -72,7 +71,7 @@ describe('ENG-984: what a stranger may do', () => {
     ]) {
       expect(isAnonymouslyPermitted({ method: 'tools/call', params: { name } })).toBe(false);
     }
-    expect(ANONYMOUS_TOOLS.size).toBe(0);
+    expect([...ANONYMOUS_TOOLS]).toEqual(['emma_review_site']);
   });
 });
 

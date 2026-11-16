@@ -536,18 +536,18 @@ describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
     config: { account_type: 'ad_account', ...config },
   });
 
-  it('is incapable with the Page-specific warning when ads_read is granted but 0 Pages are accessible', () => {
+  it('stays read-capable but create-incapable (ENG-2822) with the Page-specific warning when ads_read is granted but 0 Pages are accessible', () => {
     // The exact production shape: ads_read granted, has_meta_pages confirmed false.
     expect(
       describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false }))
-    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+    ).toEqual({ ads_capable: true, can_create_ads: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
   });
 
-  it('is incapable with the Page-specific warning even when the ads scope state is unknown', () => {
+  it('is create-incapable with the Page-specific warning even when the ads scope state is unknown', () => {
     // No granted_scopes on record at all, but the Page probe still ran and found none.
     expect(
       describeMetaAdsCapability(adAccount({ has_meta_pages: false }))
-    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+    ).toEqual({ ads_capable: false, can_create_ads: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
   });
 
   it('stays capable when ads_read is granted and Pages are confirmed accessible', () => {
@@ -591,7 +591,7 @@ describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
       describeMetaAdsCapability(
         adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false, existing_ads_page_id: undefined })
       )
-    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+    ).toEqual({ ads_capable: true, can_create_ads: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
   });
 });
 

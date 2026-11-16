@@ -1,0 +1,126 @@
+{
+  "dryRun": true,
+  "valid": true,
+  "errors": [],
+  "objects": [
+    {
+      "type": "campaign",
+      "ref": "campaign_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/campaigns",
+      "payload": {
+        "name": "Fall Sneaker Drop",
+        "objective": "OUTCOME_SALES",
+        "status": "PAUSED",
+        "special_ad_categories": [],
+        "buying_type": "AUCTION"
+      }
+    },
+    {
+      "type": "adset",
+      "ref": "adset_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/adsets",
+      "payload": {
+        "name": "Fall Sneaker Drop — Ad set 1",
+        "campaign_id": "{campaign_1.id}",
+        "daily_budget": 5000,
+        "billing_event": "IMPRESSIONS",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "status": "PAUSED",
+        "targeting": {
+          "geo_locations": {
+            "countries": [
+              "US"
+            ]
+          },
+          "age_min": 21,
+          "age_max": 45,
+          "flexible_spec": [
+            {
+              "interests": [
+                {
+                  "name": "Sneakers"
+                },
+                {
+                  "name": "Streetwear"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "adcreative",
+      "ref": "creative_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/adcreatives",
+      "payload": {
+        "name": "Fall Sneaker Drop — Creative 1",
+        "object_story_spec": {
+          "page_id": "<PAGE_ID>",
+          "link_data": {
+            "message": "New fall colorways just landed.",
+            "name": "Shop the Drop",
+            "link": "https://example.com/shop",
+            "picture": "https://example.com/sneaker-1.jpg",
+            "call_to_action": {
+              "type": "SHOP_NOW",
+              "value": {
+                "link": "https://example.com/shop"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "ad",
+      "ref": "ad_1",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/ads",
+      "payload": {
+        "name": "Fall Sneaker Drop — Ad 1",
+        "adset_id": "{adset_1.id}",
+        "creative": {
+          "creative_id": "{creative_1.id}"
+        },
+        "status": "PAUSED"
+      }
+    },
+    {
+      "type": "adcreative",
+      "ref": "creative_2",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/adcreatives",
+      "payload": {
+        "name": "Fall Sneaker Drop — Creative 2",
+        "object_story_spec": {
+          "page_id": "<PAGE_ID>",
+          "link_data": {
+            "message": "Limited pairs. Free shipping.",
+            "name": "Limited Release",
+            "link": "https://example.com/shop",
+            "picture": "https://example.com/sneaker-2.jpg",
+            "call_to_action": {
+              "type": "SHOP_NOW",
+              "value": {
+                "link": "https://example.com/shop"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "ad",
+      "ref": "ad_2",
+      "endpoint": "POST /act_<AD_ACCOUNT_ID>/ads",
+      "payload": {
+        "name": "Fall Sneaker Drop — Ad 2",
+        "adset_id": "{adset_1.id}",
+        "creative": {
+          "creative_id": "{creative_2.id}"
+        },
+        "status": "PAUSED"
+      }
+    }
+  ]
+}

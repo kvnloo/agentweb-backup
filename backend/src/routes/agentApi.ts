@@ -1,6 +1,21 @@
 import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { agentApiKeyService } from "../services/agentApiKeyService";
+import {
+  API_KEY_SCOPE_EMAIL_READ,
+  API_KEY_SCOPE_EXECUTE,
+  API_KEY_SCOPE_READ,
+  API_KEY_SCOPE_SMARTLEAD_CONTROL,
+  API_KEY_SCOPE_SMARTLEAD_READ,
+} from "../mcp/server/apiKeyScopes";
+
+const GRANTABLE_API_KEY_SCOPES: readonly string[] = [
+  API_KEY_SCOPE_READ,
+  API_KEY_SCOPE_EXECUTE,
+  API_KEY_SCOPE_EMAIL_READ,
+  API_KEY_SCOPE_SMARTLEAD_READ,
+  API_KEY_SCOPE_SMARTLEAD_CONTROL,
+];
 
 const router = Router();
 
@@ -18,6 +33,34 @@ router.post(
         return res.status(400).json({ error: "keyName is required" });
       }
 
+      // Scopes are a closed set: an unknown string would be stored verbatim and
+      // later read as an opt-in scope, so reject it here rather than at use.
+      if (scopes !== undefined) {
+        if (
+          !Array.isArray(scopes) ||
+          scopes.length === 0 ||
+          scopes.some((s: unknown) => typeof s !== "string" || !GRANTABLE_API_KEY_SCOPES.includes(s))
+        ) {
+          return res.status(400).json({
+            error: `scopes must be a non-empty array of: ${GRANTABLE_API_KEY_SCOPES.join(", ")}`,
+          });
+        }
+        // Mailbox read is a personal grant: an admin acting through delegated
+        // access may not mint a key that reads the customer's email.
+        if (scopes.includes(API_KEY_SCOPE_EMAIL_READ) && authReq.delegateInfo?.isDelegated) {
+          return res.status(403).json({
+            error: `The '${API_KEY_SCOPE_EMAIL_READ}' scope cannot be granted from a delegated session.`,
+          });
+        }
+        // Same for the customer's own Smartlead account: the customer grants it, not someone acting for them.
+        const smartleadScope = [API_KEY_SCOPE_SMARTLEAD_READ, API_KEY_SCOPE_SMARTLEAD_CONTROL].find((s) => scopes.includes(s));
+        if (smartleadScope && authReq.delegateInfo?.isDelegated) {
+          return res.status(403).json({
+            error: `The '${smartleadScope}' scope cannot be granted from a delegated session.`,
+          });
+        }
+      }
+
       // API key access is available to all authenticated users.
       // Usage is controlled via per-key rate limiting (rateLimitPerMin)
       // and token usage tracking at the session level.
@@ -25,7 +68,7 @@ router.post(
       const { rawKey, keyRecord } = await agentApiKeyService.generateKey(
         authReq.user.userId,
         keyName,
-        scopes,
+        scopes === undefined ? undefined : Array.from(new Set<string>(scopes)),
         rateLimitPerMin,
         expiresAt
       );

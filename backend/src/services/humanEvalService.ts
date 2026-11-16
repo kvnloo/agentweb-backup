@@ -16,7 +16,7 @@ import { settingsService } from './settingsService';
 import type { CreativeGateCheck, CreativeGateResult } from './creativeGates';
 import type { CreativeRubricResult, StoredCreativePairwise } from './creativeRubricJudge';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
 const HUMAN_EVAL_TELEMETRY_LOOP_ID = asLoopId('human-eval');
 const MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024;

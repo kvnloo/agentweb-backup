@@ -86,14 +86,10 @@ describe('AgentModeService - ENG-1205 named-model acknowledgement', () => {
     expect(result.content).toContain(REPLY);
     expect(result.content).toContain('Claude Opus 5');
     expect(result.content).toContain('Gemini 3.1 Flash Lite');
-    // ENG-744/2028: Opus 5 is public; direct the user to the picker.
+    // ENG-2028: flipped. Opus is selectable by non-admins now (no name-based
+    // deny), so this is the picker-guidance branch, not the entitlement branch.
     expect(result.content).toMatch(/can't change models from a chat message/i);
-  });
-
-  it('still acknowledges an actually admin-only model as unavailable to a non-admin', async () => {
-    mockDeps({ isAdmin: false });
-    const result = await run('please use Opus 4.6 for this one', FLASH_LITE);
-    expect(result.content).toMatch(/can't be selected on your account/i);
+    expect(result.content).not.toMatch(/can't be selected on your account|not available/i);
   });
 
   it('tells an entitled user how to actually switch, rather than that it is unavailable', async () => {

@@ -58,7 +58,6 @@ jest.mock('../config/integrations', () => ({
   },
   getLinkedInScopesForType: jest.fn().mockReturnValue([]),
 }));
-jest.mock('../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../services/resendService', () => ({ resendService: { sendEmail: jest.fn() } }));
 jest.mock('../services/settingsService', () => ({ settingsService: { getJsonArraySetting: jest.fn().mockResolvedValue([]) } }));
 jest.mock('../services/accountSummaryService', () => ({ getAccountSummary: jest.fn().mockResolvedValue(null) }));
@@ -126,14 +125,14 @@ describe('resolveHubSpotService', () => {
   it('uses OAuth token when HubSpotService.create succeeds', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
     const result = await hubspot({ action: 'LIST' });
-    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, undefined);
+    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, undefined, 'own');
     expect(result.success).toBe(true);
   });
 
   it('passes account_id through to HubSpotService.create', async () => {
     mockListCampaigns.mockResolvedValue(RAW_LIST);
     const result = await hubspot({ action: 'LIST', account_id: 'acc-2' });
-    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, 'acc-2');
+    expect(mockHubSpotCreate).toHaveBeenCalledWith(USER, 'acc-2', 'own');
     expect(result.success).toBe(true);
   });
 
@@ -184,6 +183,84 @@ describe('resolveHubSpotService', () => {
     const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/no hubspot account connected/i);
+  });
+
+  // ENG-2605: order is own OAuth account -> own pasted token -> an account an org admin SHARED.
+  describe('org-shared accounts (ENG-2605)', () => {
+    const NOT_CONNECTED = new Error('HubSpot account not connected. Please connect your HubSpot account in Settings.');
+    const bySource = (own: () => any, shared: () => any) =>
+      mockHubSpotCreate.mockImplementation(async (_u: string, _a: any, source: string) => (source === 'shared' ? shared() : own()));
+
+    it('a teammate\'s shared account serves a caller with no OAuth account and no pasted token', async () => {
+      bySource(() => { throw NOT_CONNECTED; }, () => mockSvcInstance);
+      mockGetLeadLists.mockResolvedValue([]);
+      mockListCampaigns.mockResolvedValue(RAW_LIST);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(true);
+      expect(mockHubSpotCreate).toHaveBeenNthCalledWith(1, USER, undefined, 'own');
+      expect(mockHubSpotCreate).toHaveBeenNthCalledWith(2, USER, undefined, 'shared');
+    });
+
+    it('the caller\'s OWN pasted token is used BEFORE a shared account (never the teammate\'s portal)', async () => {
+      bySource(() => { throw NOT_CONNECTED; }, () => mockSvcInstance);
+      mockGetLeadLists.mockResolvedValue([{ externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'encrypted-key' } } }]);
+      jest.doMock('../utils/crypto', () => ({ decryptPassword: jest.fn().mockReturnValue({ password: 'plain-token' }) }));
+      mockListCampaigns.mockResolvedValue(RAW_LIST);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(true);
+      expect(mockHubSpotFromToken).toHaveBeenCalledWith('plain-token');
+      expect(mockHubSpotCreate.mock.calls.some(c => c[2] === 'shared')).toBe(false);
+    });
+
+    it('the caller\'s OWN OAuth account is used first and the shared lookup is never made', async () => {
+      bySource(() => mockSvcInstance, () => { throw new Error('must not be called'); });
+      mockListCampaigns.mockResolvedValue(RAW_LIST);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(true);
+      expect(mockHubSpotCreate.mock.calls.some(c => c[2] === 'shared')).toBe(false);
+    });
+
+    it('an own account that EXISTS but fails (e.g. needs reconnecting) does NOT quietly fall to a teammate\'s portal', async () => {
+      bySource(() => { throw new Error('Your HubSpot account needs to be reconnected.'); }, () => mockSvcInstance);
+      mockGetLeadLists.mockResolvedValue([]);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(false);
+      expect(mockHubSpotCreate.mock.calls.some(c => c[2] === 'shared')).toBe(false);
+    });
+
+    it('several shared accounts and none of the caller\'s: the ambiguity is surfaced', async () => {
+      bySource(() => { throw NOT_CONNECTED; }, () => { throw new Error('Multiple HubSpot accounts found: [A (ID: 1), B (ID: 2)]. Specify account_id.'); });
+      mockGetLeadLists.mockResolvedValue([]);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/multiple hubspot accounts/i);
+    });
+
+    it('a shared account that exists but cannot serve (owner\'s grant revoked) surfaces that error, not "not connected"', async () => {
+      bySource(() => { throw NOT_CONNECTED; }, () => { throw new Error('Your HubSpot account needs to be reconnected.'); });
+      mockGetLeadLists.mockResolvedValue([]);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/needs to be reconnected/i);
+    });
+
+    it('nothing own, no pasted token, nothing shared: the unchanged "No HubSpot account connected" message', async () => {
+      bySource(() => { throw NOT_CONNECTED; }, () => { throw NOT_CONNECTED; });
+      mockGetLeadLists.mockResolvedValue([]);
+      const result = await hubspot({ action: 'LIST' });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no hubspot account connected/i);
+    });
+
+    it('an explicit account_id that is a teammate\'s shared account is tried after the caller\'s own, never via a pasted token', async () => {
+      bySource(() => { throw new Error('HubSpot account "acc-9" not found. Please reconnect your account.'); }, () => mockSvcInstance);
+      mockGetLeadLists.mockResolvedValue([{ externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'encrypted-key' } } }]);
+      mockListCampaigns.mockResolvedValue(RAW_LIST);
+      const result = await hubspot({ action: 'LIST', account_id: 'acc-9' });
+      expect(result.success).toBe(true);
+      expect(mockHubSpotCreate).toHaveBeenNthCalledWith(2, USER, 'acc-9', 'shared');
+      expect(mockHubSpotFromToken).not.toHaveBeenCalled();
+    });
   });
 });
 

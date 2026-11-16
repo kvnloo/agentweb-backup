@@ -161,6 +161,78 @@ describe('findModelMention', () => {
   });
 });
 
+describe('findModelMention — auto-added double vendor-prefix (ENG-2293 Opslane finding)', () => {
+  // Shaped exactly like modelCatalogRefresh.ts's auto-added entries: the
+  // OpenRouter-sourced name is "<Vendor>: <Family> <Version>" (two leading
+  // vendor/family tokens), unlike a hand-curated entry's "<Family> <Version>"
+  // (one). A single-strip vendor alias left the longer entry unreachable and
+  // let the shorter sibling's "sonnet 5" key silently swallow the first two
+  // tokens of "Sonnet 5.5".
+  const sonnet55Catalog = [
+    ...CATALOG,
+    { id: 'openrouter/anthropic/claude-sonnet-5.5', name: 'Anthropic: Claude Sonnet 5.5', family: 'claude-sonnet' },
+  ];
+  const sonnet55Index = buildModelMentionIndex(sonnet55Catalog);
+  const SONNET_5 = 'anthropic.claude-sonnet-5';
+  const SONNET_5_5 = 'openrouter/anthropic/claude-sonnet-5.5';
+
+  it.each([
+    ['use Sonnet 5.5 for this', SONNET_5_5],
+    ['switch to Claude Sonnet 5.5', SONNET_5_5],
+    ['use Sonnet 5 for this', SONNET_5],
+    ['switch to Claude Sonnet 5', SONNET_5],
+  ])('reads %p as a request for the correct, distinct model', (text, expected) => {
+    expect(findModelMention(text, sonnet55Index)?.modelId).toBe(expected);
+  });
+});
+
+describe('findModelMention — vendor name with an internal dot (ENG-2293 Opslane finding)', () => {
+  // "Z.ai" is a real auto-added vendor name (modelCatalogRefresh.ts's
+  // PROVIDERS map). Its internal dot is not a sentence boundary, but
+  // EXPLANATORY_QUESTION_PATTERN's [^.!]* scan can't tell the difference and
+  // stops dead on it, same failure as a version dot — so the real trailing
+  // "?" is never reached and the question is misread as a request.
+  const glmCatalog = [
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+  ];
+  const glmIndex = buildModelMentionIndex(glmCatalog);
+
+  it.each([
+    'What does it mean to use Z.ai: GLM 5.3?',
+    'What would it cost to use Z.ai: GLM 5.3?',
+    'Why would I switch to Z.ai: GLM 5.3?',
+  ])('stays silent on the explanatory question %p', (text) => {
+    expect(findModelMention(text, glmIndex)).toBeNull();
+  });
+
+  it('still fires on a genuine request naming the same model', () => {
+    expect(findModelMention('use Z.ai: GLM 5.3 for this', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+  });
+});
+
+describe('findModelMention — Z.ai vendor-prefix stripping (ENG-2293 fresh-eyes review finding)', () => {
+  // "Z.ai" tokenizes to "z" + "ai" (the dot is a token separator, same as
+  // everywhere else here), so it never matched the combined "zai" entry in
+  // VENDOR_TOKENS and the strip loop stopped at position 0 — the bare family
+  // name people actually type ("GLM 5.3") was unreachable; only the fully
+  // vendor-prefixed form worked.
+  const glmCatalog = [
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+    { id: 'openrouter/z-ai/glm-5.3-flash', name: 'Z.ai: GLM 5.3 Flash', family: 'glm-flash' },
+  ];
+  const glmIndex = buildModelMentionIndex(glmCatalog);
+
+  it('resolves the bare family name with no vendor prefix', () => {
+    expect(findModelMention('switch to GLM 5.3', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+  });
+
+  it('distinguishes the bare family name from its Flash sibling', () => {
+    expect(findModelMention('switch to GLM 5.3 Flash', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3-flash');
+  });
+});
+
 describe('buildModelMentionAck', () => {
   const mention = { modelId: OPUS_5, matchedText: 'Opus 5' };
 
@@ -240,5 +312,52 @@ describe('reconcileModelMentionAck', () => {
     const out = reconcileModelMentionAck(reply, 'use Opus 5', FLASH_LITE, index, isSelectable);
     expect(isSelectable).toHaveBeenCalledWith(OPUS_5);
     expect(out).toMatch(/can't be selected on your account/i);
+  });
+});
+
+describe('findModelMention — a dot between two words is not a vendor abbreviation (ENG-2293 Opslane finding, run 151)', () => {
+  // The Z.ai exemption must stay narrow: a single-letter prefix ("Z.ai"), not
+  // any letter-dot-letter. "CSV.Opus 5" is a typo for "CSV. Opus 5" — a real
+  // sentence end with the space dropped — and must not turn the next
+  // sentence's model name into a request.
+  const idx = buildModelMentionIndex([
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+  ]);
+
+  it.each([
+    'Use the CSV.Opus 5 wrote the last one',
+    'Try the draft.Gemini 3.1 Flash Lite made it',
+  ])('stays silent when a spaceless sentence end precedes the model name: %p', (text) => {
+    expect(findModelMention(text, idx)).toBeNull();
+  });
+
+  it('still reads Z.ai as one vendor name', () => {
+    expect(findModelMention('switch to Z.ai: GLM 5.3', idx)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+    expect(findModelMention('What does it mean to use Z.ai: GLM 5.3?', idx)).toBeNull();
+  });
+});
+
+describe('findModelMention — a key never matches part of a dotted version (ENG-2646)', () => {
+  // "5.5" tokenizes to "5" + "5", and the scan is position-first, so the shorter sibling's id key
+  // "anthropic claude sonnet 5" used to match at "Anthropic" and win before the scan reached
+  // "Claude Sonnet 5.5". Only the auto-added entry's "Anthropic: ..." name happened to hide this.
+  const index = buildModelMentionIndex([
+    ...CATALOG,
+    { id: 'openrouter/anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', family: 'claude-sonnet' },
+  ]);
+  const SONNET_5 = 'anthropic.claude-sonnet-5';
+  const SONNET_5_5 = 'openrouter/anthropic/claude-sonnet-5.5';
+
+  it.each([
+    ['use Anthropic: Claude Sonnet 5.5 for this', SONNET_5_5],
+    ['use Anthropic Claude Sonnet 5.5', SONNET_5_5],
+    ['switch to Claude Sonnet 5.5', SONNET_5_5],
+    ['use Sonnet 5.5 for this', SONNET_5_5],
+    ['use Anthropic Claude Sonnet 5 for this', SONNET_5],
+    ['switch to Claude Sonnet 5. Then summarise.', SONNET_5],
+    ['use Sonnet 5', SONNET_5],
+  ])('reads %p as a request for the correct model', (text, expected) => {
+    expect(findModelMention(text, index)?.modelId).toBe(expected);
   });
 });

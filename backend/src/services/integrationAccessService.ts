@@ -46,9 +46,16 @@ async function getIdentity(accessToken: string): Promise<{ username: string | nu
   }
 }
 
+/**
+ * What goes into a response's `errors[]`. Only the HTTP status or a bare network code ever does: a provider's
+ * own message (token-refresh failures, `invalid_grant`, request bodies echoed back) stays in the server log.
+ */
 function describe(err: any): string {
   const status = err?.response?.status;
-  return status ? `HTTP ${status}` : (err?.message || 'unknown error');
+  if (status) return `HTTP ${status}`;
+  console.warn('[IntegrationAccess] provider call failed:', err?.message || err);
+  const code = typeof err?.code === 'string' && /^[A-Z][A-Z0-9_]{2,40}$/.test(err.code) ? err.code : null;
+  return code ?? 'request failed';
 }
 
 export async function buildClickUpAccessInventory(
@@ -163,6 +170,123 @@ export async function buildDriveAccessInventory(
     } while (pageToken);
   } catch (e) {
     result.errors.push(`folders: ${describe(e)}`);
+  }
+  return result;
+}
+
+// ── Google Drive browser (ENG-2118) ─────────────────────────────────────────
+// One folder level at a time, so the whole Drive never loads at once and the
+// admin UI can expand folders in place and page through them. Names and ids
+// only; no file content is read.
+
+export interface DriveBrowseItem {
+  id: string;
+  name: string;
+  kind: 'folder' | 'file' | 'drive';
+  /** Where it comes from, so the UI can tag it: shared with the account, or owned and shared out. */
+  shared?: 'with_me' | 'by_me';
+}
+
+export interface DriveBrowseResult {
+  source: 'google_drive';
+  connected: boolean;
+  identity: { email: string | null } | null;
+  checkedAt: string;
+  parent: string | null;
+  items: DriveBrowseItem[];
+  nextPageToken: string | null;
+  errors: string[];
+}
+
+export const DRIVE_BROWSE_PAGE_SIZES = [50, 100, 200] as const;
+export const DEFAULT_DRIVE_PAGE_SIZE = 50;
+const DRIVE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+const SHARED_DRIVES_CAP = 500;
+
+export function isValidDriveId(value: unknown): value is string {
+  return typeof value === 'string' && DRIVE_ID.test(value);
+}
+
+export function clampDrivePageSize(value: unknown): number {
+  const n = Number(value);
+  return (DRIVE_BROWSE_PAGE_SIZES as readonly number[]).includes(n) ? n : DEFAULT_DRIVE_PAGE_SIZE;
+}
+
+function toItem(f: any): DriveBrowseItem {
+  const item: DriveBrowseItem = {
+    id: String(f.id),
+    name: String(f.name),
+    kind: f.mimeType === FOLDER_MIME ? 'folder' : 'file',
+  };
+  if (f.ownedByMe === false) item.shared = 'with_me';
+  else if (f.shared === true) item.shared = 'by_me';
+  return item;
+}
+
+/**
+ * Lists one page of one level of the connected Drive. With no `parent` that is
+ * the top level: My Drive root plus anything shared with the account, and on the
+ * first page the shared drives too. With a `parent` it is that folder's
+ * children. `parent` must already be validated.
+ */
+export async function browseDrive(
+  drive: DriveListClient | null,
+  email: string | null,
+  opts: { parent?: string | null; pageSize?: number; pageToken?: string | null },
+  now: () => Date = () => new Date(),
+): Promise<DriveBrowseResult> {
+  const parent = opts.parent || null;
+  const base = {
+    source: 'google_drive' as const,
+    checkedAt: now().toISOString(),
+    parent,
+    items: [] as DriveBrowseItem[],
+    nextPageToken: null as string | null,
+    errors: [] as string[],
+  };
+  if (!drive) return { ...base, connected: false, identity: null };
+  const result: DriveBrowseResult = { ...base, connected: true, identity: { email } };
+  const pageSize = clampDrivePageSize(opts.pageSize);
+  const pageToken = opts.pageToken || undefined;
+  const list = (q: string) => drive.files.list({
+    q,
+    pageSize,
+    pageToken,
+    orderBy: 'folder,name',
+    fields: 'nextPageToken, files(id, name, mimeType, ownedByMe, shared)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
+  });
+  try {
+    if (parent) {
+      const { data } = await list(`'${parent}' in parents and trashed=false`);
+      result.items = (data.files || []).map(toItem);
+      result.nextPageToken = data.nextPageToken || null;
+      return result;
+    }
+    // Top level. Shared drives are few, so they ride along on the first page only.
+    if (!pageToken) {
+      try {
+        let driveToken: string | undefined;
+        let fetched = 0;
+        do {
+          const { data } = await drive.drives.list({ pageSize: 100, pageToken: driveToken, fields: 'nextPageToken, drives(id, name)' });
+          result.items.push(...(data.drives || []).map((d: any) => ({ id: String(d.id), name: String(d.name), kind: 'drive' as const })));
+          fetched += (data.drives || []).length;
+          driveToken = data.nextPageToken;
+        } while (driveToken && fetched < SHARED_DRIVES_CAP);
+        if (driveToken) result.errors.push(`shared drives: showing the first ${fetched}`);
+      } catch (e) {
+        result.errors.push(`shared drives: ${describe(e)}`);
+      }
+    }
+    const { data } = await list("('root' in parents or sharedWithMe=true) and trashed=false");
+    result.items.push(...(data.files || []).map(toItem));
+    result.nextPageToken = data.nextPageToken || null;
+  } catch (e) {
+    result.errors.push(`${parent ? 'folder' : 'top level'}: ${describe(e)}`);
   }
   return result;
 }

@@ -47,6 +47,8 @@ jobs:
     outputs:
       backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend || steps.push_fallback.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner || steps.push_fallback.outputs.partner }}
+      # ENG-2677: previous successful deploy head; empty when unresolved or manual.
+      base_sha: ${{ steps.base.outputs.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,7 +143,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -291,7 +293,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
@@ -381,6 +383,51 @@ jobs:
 
       # Artifact upload removed to save GitHub storage quota
       # Build artifacts are already uploaded to S3 for deployment
+
+  # ENG-2677 (ENG-2634): announce a SUCCESSFUL backend deploy in #feature-launches
+  # with the PRs shipped since the previous successful deploy. Own job, runs only
+  # after backend-deploy succeeded, nothing needs it: it cannot gate, alter or roll
+  # back the deploy. Channel comes from the FEATURE_LAUNCHES_CHANNEL repo variable;
+  # unset -> the script logs a notice and exits 0. Slack ok:false fails THIS job only.
+  notify-feature-launch:
+    name: Announce production deploy in #feature-launches
+    needs: [detect-changes, backend-deploy]
+    if: ${{ !cancelled() && needs.backend-deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    # The step still fails red on Slack ok:false, but the RUN conclusion stays the
+    # deploy's: trunk-deploy-state.sh reads run conclusion as deploy evidence.
+    continue-on-error: true
+    # AWS keys are prod environment secrets (see notify-deploy-failure).
+    environment: prod
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        if: ${{ vars.FEATURE_LAUNCHES_CHANNEL != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # PR titles are fetched inside the script and handled only as jq data;
+      # nothing user-controlled is interpolated into `run:`.
+      - name: Post shipped PRs to #feature-launches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_SECRET_ID: prod/AgentWeb/Slack
+          FEATURE_LAUNCHES_CHANNEL: ${{ vars.FEATURE_LAUNCHES_CHANNEL }}
+          BASE_SHA: ${{ needs.detect-changes.outputs.base_sha }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/deploy-launch-notify.sh
 
   # A failed production deploy used to be silent. eb-deploy.sh (ENG-734/837)
   # made the run go red honestly, but a red check in the Actions tab is not a

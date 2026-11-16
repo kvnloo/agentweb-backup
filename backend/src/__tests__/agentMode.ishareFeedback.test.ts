@@ -44,6 +44,8 @@ describe('Agent Mode iShare Feedback', () => {
       const mockUpdatedMessage = {
         role: 'assistant',
         content: 'Hi there!',
+        reasoning: 'SECRET CHAIN OF THOUGHT',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, estimated_cost: 0 },
         metadata: {
           feedback: {
             type: 'like',
@@ -67,14 +69,15 @@ describe('Agent Mode iShare Feedback', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
-      expect(response.body.message).toMatchObject({
-        role: 'assistant',
-        content: 'Hi there!',
+      // ENG-2645: only the feedback MessageFeedbackButtons reads back — never the stored row (its content can
+      // belong to a row the viewer's chat hides, and it carries the assistant's reasoning and usage).
+      // (and without the rater's userId).
+      expect(response.body.message).toEqual({
         metadata: {
           feedback: {
             type: 'like',
             comment: 'Very helpful!',
-            userId: 'anonymous-ishare',
+            timestamp: '2026-01-25T00:00:00Z',
           },
         },
       });

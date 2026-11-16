@@ -95,7 +95,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       toolsOfferedPerCall.push(options.tools !== undefined && options.tools !== null);
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -274,7 +274,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     await runRealLoop((call, isFinalSynthesis) => {
       const messages = (service as any).callLLM.mock.calls[call]?.[1] || [];
       const text = messages
-        .filter((m: any) => m.role === 'user' && typeof m.content === 'string')
+        .filter((m: any) => m.role === 'system' && typeof m.content === 'string')
         .map((m: any) => m.content)
         .join('\n');
       if (/\[SYSTEM\][^\n]*time budget/i.test(text)) sawWrapUpNudge = true;
@@ -376,7 +376,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -429,7 +429,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -475,7 +475,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -519,7 +519,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -689,7 +689,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -823,7 +823,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );
@@ -915,7 +915,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       const messages = args[1] || [];
       const isFinalSynthesis = messages.some(
         (m: any) =>
-          m?.role === 'user' &&
+          m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
           typeof m.content === 'string' &&
           /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
       );

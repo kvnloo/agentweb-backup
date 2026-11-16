@@ -41,6 +41,11 @@ export interface AgentFailureProposalPayload {
    * policy, which is why 35% of dispatches were not handler bugs.
    */
   failureType: string;
+  /**
+   * ENG-589: up to 3 representative traces (`run <runId>` + session when known)
+   * for this failure class, so a filed issue links straight to evidence.
+   */
+  sampleTraces?: string[];
   directive: string;
 }
 
@@ -78,7 +83,11 @@ interface ToolStats {
   /** Representative message per (failure class, error class) pair. */
   messagesByType: Map<string, string>;
   errorClassesByType: Map<string, Map<string, number>>;
+  /** ENG-589: up to MAX_SAMPLE_TRACES distinct trace refs per failure class. */
+  tracesByType: Map<string, string[]>;
 }
+
+const MAX_SAMPLE_TRACES = 3;
 
 /**
  * Failure classes that are NOT a handler defect, so they must never be dispatched
@@ -87,7 +96,34 @@ interface ToolStats {
  *   model_uninstalled_tool — the model called a tool it does not have; registry/prompt
  * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
  */
-export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
+export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool', 'not_connected']);
+
+/**
+ * ENG-2943: the never-connected precondition ("No Fathom account connected.
+ * Please connect...") means the user never linked the integration. There is no
+ * account to repair and no handler bug, so it must not file an oncall row.
+ * Genuine auth failures on a connected account (expired/revoked token, missing
+ * scope, invalid_grant) do not match and stay `config`.
+ */
+const NEVER_CONNECTED_RE = /\bno\s+[\w .\-/]{1,40}?\s+accounts?\s+(?:is\s+|are\s+)?connected\b/i;
+
+/**
+ * ENG-3037: the same precondition in its other wording, "<X> not connected.
+ * Connect ..." / "<X> account not connected. Please connect ...". This is an
+ * allow-list of the integrations whose throw site was read and fires only when
+ * no connected-account row exists (googleDriveAccess, hubspotService,
+ * gmailService, outlookService, attioService) — not a general "not connected"
+ * pattern. Deliberately left as `config`, because a connected account can
+ * produce them: LinkedIn Ads (adsApis also throws it for a row with no
+ * access_token), bare "ClickUp/Foreplay not connected" (returned when a stored
+ * token fails to decrypt), and any message naming one specific account.
+ */
+const NOT_CONNECTED_PRECONDITION_RE =
+  /\bGoogle Drive not connected\. Connect Google Drive in Settings\b|\b(?:Gmail|Outlook|HubSpot|Attio) account not connected\. Please connect\b/i;
+
+export function isNeverConnectedMessage(message: string): boolean {
+  return NEVER_CONNECTED_RE.test(message) || NOT_CONNECTED_PRECONDITION_RE.test(message);
+}
 
 /**
  * Directive per failure class. The whole defect was appending one sentence —
@@ -171,14 +207,15 @@ export class AgentFailureRuleSet
         failureTypes: new Map<string, number>(),
         messagesByType: new Map<string, string>(),
         errorClassesByType: new Map<string, Map<string, number>>(),
+        tracesByType: new Map<string, string[]>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
       } else {
         const ec = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
-        const ft = strDim(e.dimensions?.failureType) || '';
-        stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         const em = strDim(e.dimensions?.errorMessage) || '';
+        const ft = isNeverConnectedMessage(em) ? 'not_connected' : strDim(e.dimensions?.failureType) || '';
+        stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         // Store under this event's OWN (failure class, error class) pair, so
         // the directive can quote a message that actually belongs to both the
         // failure class AND the error class it is advising on.
@@ -187,6 +224,11 @@ export class AgentFailureRuleSet
         const perType = stats.errorClassesByType.get(ft) ?? new Map<string, number>();
         perType.set(ec, (perType.get(ec) ?? 0) + 1);
         stats.errorClassesByType.set(ft, perType);
+        const traces = stats.tracesByType.get(ft) ?? [];
+        const sid = strDim(e.dimensions?.sessionId);
+        const ref = `run ${String(e.subjectId)}${sid ? ` (session ${sid})` : ''}`;
+        if (traces.length < MAX_SAMPLE_TRACES && !traces.includes(ref)) traces.push(ref);
+        stats.tracesByType.set(ft, traces);
       }
       byTool.set(toolName, stats);
     }
@@ -262,6 +304,7 @@ export class AgentFailureRuleSet
             failureRate,
             topErrorClass,
             failureType,
+            sampleTraces: [...(stats.tracesByType.get(failureType) ?? [])],
             directive: directiveFor(
               failureType,
               stats.toolName,

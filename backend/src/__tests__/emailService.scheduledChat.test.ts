@@ -235,6 +235,47 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
     jest.clearAllMocks();
   });
 
+  // ENG-668: a pay-as-you-go account is past its plan pool by design, so "N% of your monthly allowance"
+  // is not what stopped it (and can read far above 100%). The email names the PAYG reason instead.
+  it.each([
+    [{ reason: 'payg_cap_reached' }, "You've reached your extra usage limit", 'Raise your extra usage limit or upgrade your plan'],
+    [{ reason: 'payg_suspended', paygSuspendedReason: 'payment_failed' }, 'Extra usage is on hold', 'Pay the open invoice to resume extra usage.'],
+    [{ reason: 'payg_suspended', paygSuspendedReason: 'dispute' }, 'Extra usage is on hold', 'Please contact us to resume extra usage.'],
+    [{ reason: 'payg_inactive', paygInactiveReason: 'no_payment_method' }, 'Extra usage needs a payment method', 'Add a payment method to keep working with extra usage.'],
+    [{ reason: 'payg_inactive', paygInactiveReason: 'subscription_inactive' }, 'Extra usage needs an active subscription', 'Reactivate your subscription to keep working with extra usage.'],
+  ] as const)('names the PAYG reason (%j), its own action, and no plan percentage', async (paygBlock, headline, action) => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail('user@example.com', 'My Schedule', 'schedule-123', {
+      used: 0,
+      allowance: null,
+      effectiveAllowance: null,
+      percentUsed: 0,
+      costUsed: 180,
+      costAllowance: 100,
+      costPercentUsed: 180,
+      costEnforced: true,
+      month: '2026-10',
+      paygBlock,
+    });
+
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain(headline);
+    expect(htmlContent).toContain(headline);
+    expect(textContent).toMatch(/extra usage/i);
+    expect(textContent).not.toMatch(/pay[- ]as[- ]you[- ]go|payg/i);
+    for (const body of [textContent, htmlContent]) {
+      expect(body).toContain(action);
+      expect(body).toContain('cannot execute because AI usage is paused');
+      expect(body).not.toContain('monthly usage limit');
+      expect(body).not.toContain('wait for your allowance to reset');
+      expect(body).not.toContain('180%');
+      expect(body).not.toContain('of your monthly allowance used');
+      expect(body).not.toContain('$');
+      expect(body).toContain('resets on November 1, 2026');
+    }
+  });
+
   it('renders a percentage-only message when the token cap is the cause — never the raw token count (ENG-1566)', async () => {
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
@@ -560,6 +601,48 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     const [recipients] = spy.mock.calls[0];
     expect(recipients).toEqual(['a@example.com', 'b@example.com']);
     expect(userDb.getUserByEmail).not.toHaveBeenCalled();
+  });
+
+  // ENG-2785: a customer (non-admin) owner's Meta Ads report only reads their own
+  // account, so it must reach their recipients instead of being withheld.
+  it('ENG-2785: delivers a non-admin owner Meta Ads report to configured recipients', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_meta_ads_campaigns: 1, get_meta_ads_metrics: 1, call_meta_ads_insights_api: 1 },
+    });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+      { role: 'tool', name: 'get_meta_ads_metrics', content: '...' },
+    ]);
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'sary@customer.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(['sary@customer.com'], 'Social Monitor', GUARD_BASE_RESULT, 'schedule-123');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, , textContent] = spy.mock.calls[0];
+    expect(recipients).toEqual(['sary@customer.com']);
+    expect(textContent).not.toContain('withheld');
+  });
+
+  it('ENG-2785 negative: an ADMIN owner Meta Ads report is still restricted to admins', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { get_meta_ads_metrics: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(['client@customer.com'], 'Meta Report', GUARD_BASE_RESULT, 'schedule-123');
+
+    const [recipients] = spy.mock.calls[0];
+    expect(recipients).not.toContain('client@customer.com');
+    expect(recipients).toContain('owner@example.com');
   });
 });
 

@@ -246,6 +246,7 @@ import {
   resolveLinkedInAccountForWrite,
   resolveLinkedInAccountFromList,
   setDailyInviteCap,
+  DailyInviteCapNotOwnerError,
   type ResolvedLinkedInAccount,
 } from '../../services/agentMode/linkedInDailyVolumeGate';
 import {
@@ -408,8 +409,14 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
   return match ? match[1] : null;
 }
 
+// ENG-2663: an error that declares its own tool-error class (FreshTokenRejectedError) keeps it
+// across the catch-and-return, so the dispatcher gives retry guidance instead of "auth".
+function declaredErrorClass(error: any): { errorClass?: string } {
+  return typeof error?.toolErrorClass === 'string' ? { errorClass: error.toolErrorClass } : {};
+}
+
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -516,7 +523,19 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     if (saveAsDraft && account.platform !== 'linkedin') {
       return { success: false, message: `save_as_draft is only supported for LinkedIn accounts, not ${account.platform}. Nothing was posted.` };
     }
-    const result = saveAsDraft
+    // ENG-976: replying to an existing post is an X-only capability here; refuse
+    // elsewhere rather than publishing a standalone post the caller did not ask for.
+    const inReplyToPostId = typeof options?.inReplyToPostId === 'string' && options.inReplyToPostId.trim()
+      ? options.inReplyToPostId.trim() : undefined;
+    if (inReplyToPostId && account.platform !== 'twitter') {
+      return { success: false, message: `in_reply_to_post_id is only supported for X (Twitter) accounts, not ${account.platform}. Nothing was posted.` };
+    }
+    const result = inReplyToPostId
+      ? await (adapter as any).createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized, { inReplyToPostId }
+      )
+      : saveAsDraft
       ? await (adapter as any).createPost(
         account, content, mediaUrls, ownerUserId,
         toolContext?.assertPublishStillAuthorized, { draft: true }
@@ -568,7 +587,7 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
     // real HTTP status as .code on the thrown error — carry it through so a
     // 401/403 classifies as auth/config instead of the generic bug fallback.
-    return { success: false, message: `Failed to post: ${message}`, code: error?.code };
+    return { success: false, message: `Failed to post: ${message}`, code: error?.code, ...declaredErrorClass(error) };
   }
 }
 
@@ -612,6 +631,8 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
       toolContext?.assertPublishStillAuthorized
     );
 
+    if (result.success === false) return { success: false, message: result.message };
+
     return {
       success: true,
       message: result.message,
@@ -623,7 +644,7 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
     if (message.includes('access token expired')) {
       message = 'Account token expired. Please reconnect the account in Settings.';
     }
-    return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
+    return { success: false, message: `Failed to repost: ${message}`, code: error?.code, ...declaredErrorClass(error) };
   }
 }
 
@@ -722,6 +743,8 @@ export async function commentOnLinkedInPost(userId: string, accountId: string, p
         toolContext?.assertPublishStillAuthorized
       );
 
+      if (result.success === false) return { success: false, message: result.message };
+
       return {
         success: true,
         message: result.message,
@@ -738,7 +761,8 @@ export async function commentOnLinkedInPost(userId: string, accountId: string, p
       return {
         success: false,
         message: `Failed to comment: ${message}`,
-        code: error?.code
+        code: error?.code,
+        ...declaredErrorClass(error)
       };
     }
 
@@ -914,7 +938,8 @@ export async function reactToLinkedInPost(userId: string, accountId: string, pos
       return {
         success: false,
         message: `Failed to react: ${message}`,
-        code: error?.code
+        code: error?.code,
+        ...declaredErrorClass(error)
       };
     }
 
@@ -1142,7 +1167,16 @@ export async function linkedinOutreach(
   // relative to a stranger's account. `usedSharedAccount` (+ `sharedAccountId`)
   // is threaded into every read-action response below so callers can caveat
   // or refuse degree-based logic instead of silently trusting it.
-  const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
+  const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters', 'list-post-engagers'];
+  // ENG-2739: validate post_id before account resolution/session preflight so a
+  // missing post id is reported as such, not as a disconnected account, and no
+  // Unipile call is spent on it.
+  if (action === 'list-post-engagers' && !(typeof args.post_id === 'string' && args.post_id.trim())) {
+    return {
+      success: false,
+      error: 'post_id is required for list-post-engagers (a LinkedIn post URL, urn:li:activity:… URN, or Unipile social id)',
+    };
+  }
   let usedSharedAccount = false;
   if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
     if (!account_id) {
@@ -2110,6 +2144,49 @@ export async function linkedinOutreach(
         return { success: true, data: withAccountMeta(companyResult.rawData) };
       }
 
+      case 'list-post-engagers': {
+        // ENG-2739: one row per distinct commenter on a post — a warm-lead source.
+        // Reactors are not covered: the Unipile SDK exposes no reactions listing.
+        const postId = typeof args.post_id === 'string' ? args.post_id.trim() : '';
+        if (!postId) throw new Error('post_id is required for list-post-engagers (a LinkedIn post URL, urn:li:activity:… URN, or Unipile social id)');
+        const rawLimit = Number(args.limit);
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.max(Math.floor(rawLimit), 1), 100) : undefined;
+        const comments = await linkedInOutreachService.listPostComments(postId, account_id, { cursor: args.cursor, limit });
+        const seen = new Set<string>();
+        const engagers: any[] = [];
+        let anonymizedSkipped = 0;
+        for (const comment of comments.items) {
+          const details = comment?.author_details ?? {};
+          const providerId = typeof details.id === 'string' ? details.id : null;
+          const profileUrl = usableProfileUrl(details.profile_url);
+          // ENG-1198 pattern: an out-of-network author has no profile we can reach
+          // or dedup on — drop it and report the count instead of a fake lead.
+          if (!providerId || !profileUrl || details.network_distance === 'OUT_OF_NETWORK') {
+            anonymizedSkipped++;
+            continue;
+          }
+          if (seen.has(providerId)) continue;
+          seen.add(providerId);
+          const text = typeof comment.text === 'string' ? comment.text : '';
+          engagers.push({
+            // `comment.author` can be a URN, not a display name — only surface a real name.
+            name: typeof details.name === 'string' && details.name.trim()
+              ? details.name.trim()
+              : typeof comment.author === 'string' && comment.author.trim() && !comment.author.startsWith('urn:')
+                ? comment.author.trim()
+                : null,
+            headline: details.headline ?? null,
+            profile_url: profileUrl,
+            provider_id: providerId,
+            comment_snippet: text.length > 200 ? `${text.slice(0, 197)}...` : text,
+          });
+        }
+        return {
+          success: true,
+          data: withAccountMeta({ post_id: comments.socialId, items: engagers, anonymizedSkipped, cursor: comments.cursor }),
+        };
+      }
+
       case 'cancel-invitation': {
         const invitationId = args.invitation_id;
         if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
@@ -2241,11 +2318,20 @@ export async function linkedinOutreach(
         // for an unattended/scheduled run (there's no one to ask).
         // Writes through the account OWNER's record, not necessarily the
         // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
-        const clampedCap = await setDailyInviteCap(
-          resolvedLinkedInAccount!,
-          account_id,
-          args.daily_invite_cap,
-        );
+        let clampedCap: number;
+        try {
+          clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+            userId,
+          );
+        } catch (err) {
+          if (err instanceof DailyInviteCapNotOwnerError) {
+            return { success: false, error: err.message };
+          }
+          throw err;
+        }
         return {
           success: true,
           data: {
@@ -2257,7 +2343,7 @@ export async function linkedinOutreach(
       }
 
       default: {
-        const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
+        const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap','withdraw-stale-invitations','list-post-engagers'];
         throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
       }
     }

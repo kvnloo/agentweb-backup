@@ -45,7 +45,31 @@ describe('ENG-2156 runOpenRouterKeyBudgetCheck', () => {
     expect(r.alerted).toBe(true);
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert.mock.calls[0][0].dedupeKey).toBe('openrouter-key-budget:0.95');
-    expect(alert.mock.calls[0][0].subject).toContain('100%');
+    expect(alert.mock.calls[0][0].subject).toBe('OpenRouter key past 95% of its monthly limit');
+    expect(alert.mock.calls[0][0].message).toContain('100%');
+  });
+
+  it('ENG-2706: keeps one stable subject within a threshold band (85% and 88%)', async () => {
+    const alert = jest.fn().mockResolvedValue(true);
+    await runOpenRouterKeyBudgetCheck({ apiKey: 'k', fetchImpl: okFetch({ usage: 340, limit: 400, limit_remaining: 60 }), alert });
+    await runOpenRouterKeyBudgetCheck({ apiKey: 'k', fetchImpl: okFetch({ usage: 352, limit: 400, limit_remaining: 48 }), alert });
+    expect(alert).toHaveBeenCalledTimes(2);
+    const [a, b] = alert.mock.calls.map((c: any[]) => c[0]);
+    expect(a.subject).toBe(b.subject);
+    expect(a.subject).not.toMatch(/8[58]%/);
+    expect(a.message).toContain('85%');
+    expect(b.message).toContain('88%');
+    expect(b.context['Used (%)']).toBe('88%');
+  });
+
+  it('ENG-2706: crossing 80% -> 95% still yields a distinct subject', async () => {
+    const alert = jest.fn().mockResolvedValue(true);
+    await runOpenRouterKeyBudgetCheck({ apiKey: 'k', fetchImpl: okFetch({ usage: 340, limit: 400, limit_remaining: 60 }), alert });
+    await runOpenRouterKeyBudgetCheck({ apiKey: 'k', fetchImpl: okFetch({ usage: 384, limit: 400, limit_remaining: 16 }), alert });
+    const [a, b] = alert.mock.calls.map((c: any[]) => c[0]);
+    expect(a.subject).toBe('OpenRouter key past 80% of its monthly limit');
+    expect(b.subject).toBe('OpenRouter key past 95% of its monthly limit');
+    expect(a.dedupeKey).not.toBe(b.dedupeKey);
   });
 
   it('does not page when healthy', async () => {

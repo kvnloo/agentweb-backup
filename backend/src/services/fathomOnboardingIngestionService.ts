@@ -5,7 +5,7 @@ import { getFathomAccessToken } from './fathomTokenService';
 
 type Confidence = 'manual' | 'high' | 'medium' | 'low';
 type MatchStatus = 'matched' | 'needs_review';
-type IngestionStatus = 'needs_review' | 'reviewed' | 'failed';
+type IngestionStatus = 'needs_review' | 'reviewed' | 'discarded' | 'failed';
 type ExtractionState = 'auto_extracted' | 'human_reviewed';
 type AutomationMode = 'manual' | 'auto_draft';
 type FathomCallClassification = 'onboarding' | 'prospect' | 'customer' | 'internal' | 'personal' | 'ignore' | 'unknown';
@@ -68,6 +68,8 @@ export interface FathomOnboardingIngestion {
   featureRequestDrafts?: string[];
   memoryIds: string[];
   orgMemoryIds: string[];
+  /** Org the orgMemoryIds were written under (rollback deletes from here, not the user's current org). */
+  orgMemoryOrgId?: string | null;
   reviewOwnerUserId: string;
   error?: string | null;
   createdAt: string;
@@ -99,8 +101,8 @@ interface IngestInput {
 interface IngestDeps {
   userDb: Pick<typeof userDb, 'getUserById' | 'getUserByEmail' | 'getUsersByEmailDomain' | 'updateUser' | 'createFathomDraftUser'>;
   crmDb: Pick<typeof crmDb, 'findLeadsByEmail'>;
-  accountMemoryDb: Pick<typeof accountMemoryDb, 'addMemory'>;
-  orgMemoryDb: Pick<typeof orgMemoryDb, 'addMemory'>;
+  accountMemoryDb: Pick<typeof accountMemoryDb, 'addMemory'> & Partial<Pick<typeof accountMemoryDb, 'deleteMemory'>>;
+  orgMemoryDb: Pick<typeof orgMemoryDb, 'addMemory'> & Partial<Pick<typeof orgMemoryDb, 'deleteMemory'>>;
   llm: Pick<LLMService, 'generateJsonRobust'>;
   getFathomAccessToken?: typeof getFathomAccessToken;
   FathomApiService?: typeof FathomApiService;
@@ -108,6 +110,7 @@ interface IngestDeps {
 }
 
 const MAX_INGESTIONS_PER_USER = 25;
+const INGEST_LEDGER_MAX_ATTEMPTS = 12;
 const AUTOMATION_CONFIDENCE_THRESHOLD = 0.75;
 const ACTIONABLE_CALL_CLASSIFICATIONS = new Set<FathomCallClassification>(['onboarding', 'prospect']);
 
@@ -502,63 +505,148 @@ export async function ingestFathomOnboardingRecording(
   }
 
   const ledgerUserId = target.userId || input.reviewOwnerUserId;
-  const ledgerUser = await deps.userDb.getUserById(ledgerUserId);
-  if (!ledgerUser) {
-    throw new Error(`Target/review user ${ledgerUserId} was not found.`);
-  }
-
-  const existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
-  const previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
   const reviewed = input.reviewed === true;
-  const status: IngestionStatus = reviewed ? 'reviewed' : 'needs_review';
-  const extractionState: ExtractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
-  const now = deps.now();
-  let memoryIds = previous?.memoryIds || [];
-  let orgMemoryIds = previous?.orgMemoryIds || [];
-
-  if (reviewed && target.userId) {
-    const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
-    if (memoryIds.length === 0) {
-      const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
-      memoryIds = [memory.memoryId];
+  let createdMemoryIds: string[] = [];
+  let createdOrgMemoryIds: string[] = [];
+  let createdOrgMemoryOrgId: string | null = null;
+  let ledgerUser: any;
+  let existing: FathomOnboardingIngestion[] | undefined;
+  let previous: FathomOnboardingIngestion | undefined;
+  let status: IngestionStatus = 'needs_review';
+  let extractionState: ExtractionState = 'auto_extracted';
+  let now = deps.now();
+  let memoryIds: string[] = [];
+  let orgMemoryIds: string[] = [];
+  let orgMemoryOrgId: string | null = null;
+  let next!: FathomOnboardingIngestion;
+  let written = false;
+  // ENG-270 (Opslane 1336): memories this call wrote must not outlive a refused/failed ledger write.
+  const deleteCreatedMemories = async () => {
+    if (target.userId) {
+      for (const memoryId of createdMemoryIds) {
+        try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to delete refused-approve account memory:', memoryId, error?.message);
+        }
+      }
+    }
+    if (createdOrgMemoryOrgId) {
+      for (const memoryId of createdOrgMemoryIds) {
+        try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to delete refused-approve org memory:', memoryId, error?.message);
+        }
+      }
+    }
+  };
+  for (let attempt = 0; attempt < INGEST_LEDGER_MAX_ATTEMPTS && !written; attempt += 1) {
+    // ENG-270 (Opslane 1336 #3): jittered backoff so bursts of ingests for one account converge.
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 25 * attempt)));
+    ledgerUser = await deps.userDb.getUserById(ledgerUserId);
+    if (!ledgerUser) {
+      throw new Error(`Target/review user ${ledgerUserId} was not found.`);
     }
 
-    const targetUser = target.userId === ledgerUserId ? ledgerUser : await deps.userDb.getUserById(target.userId);
-    if (targetUser?.orgId && orgMemoryIds.length === 0) {
-      try {
-        const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
-        orgMemoryIds = [orgMemory.memoryId];
-      } catch (error: any) {
-        console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
+    existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
+    previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
+    // ENG-270 (Opslane 962): approving a discarded recording would write memories while the
+    // draft account stays flagged discarded; refuse it before any memory write.
+    if (reviewed && previous?.status === 'discarded') {
+      // ENG-270 (Opslane 1336): a concurrent discard can land after an earlier attempt of
+      // this loop wrote memories; delete them so a refused approve leaves nothing behind.
+      await deleteCreatedMemories();
+      throw new FathomOnboardingReviewError(409, 'Discarded ingestion cannot be approved.');
+    }
+    // ENG-270 (Opslane 357): an admin discard sticks across unreviewed re-ingests, so the
+    // ledger never says needs_review while the draft account stays flagged discarded.
+    status = reviewed
+      ? 'reviewed'
+      : previous?.status === 'discarded' ? 'discarded' : 'needs_review';
+    extractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
+    now = deps.now();
+    memoryIds = previous?.memoryIds?.length ? previous.memoryIds : createdMemoryIds;
+    orgMemoryIds = previous?.orgMemoryIds?.length ? previous.orgMemoryIds : createdOrgMemoryIds;
+    orgMemoryOrgId = previous?.orgMemoryIds?.length ? (previous?.orgMemoryOrgId || null) : createdOrgMemoryOrgId;
+
+    if (reviewed && target.userId) {
+      const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
+      if (memoryIds.length === 0) {
+        const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
+        memoryIds = [memory.memoryId];
+        createdMemoryIds = memoryIds;
+      }
+
+      const targetUser = target.userId === ledgerUserId ? ledgerUser : await deps.userDb.getUserById(target.userId);
+      if (targetUser?.orgId && orgMemoryIds.length === 0) {
+        try {
+          const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
+          orgMemoryIds = [orgMemory.memoryId];
+          orgMemoryOrgId = targetUser.orgId;
+          createdOrgMemoryIds = orgMemoryIds;
+          createdOrgMemoryOrgId = orgMemoryOrgId;
+        } catch (error: any) {
+          console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
+        }
+      }
+    }
+
+    next = {
+      recordingId,
+      recordingUrl: input.recordingUrl,
+      status,
+      extractionState,
+      context,
+      targetUserId: target.userId,
+      targetLead: target.lead,
+      matchReason: target.reason,
+      matchConfidence: target.confidence,
+      automationState: automationState || (automationMode === 'manual' ? 'manual_review' : undefined),
+      draftUserId,
+      draftEmail,
+      safetyFlags,
+      featureRequestDrafts: context.featureRequestDrafts || [],
+      memoryIds,
+      orgMemoryIds,
+      orgMemoryOrgId,
+      reviewOwnerUserId: input.reviewOwnerUserId,
+      error: null,
+      createdAt: previous?.createdAt || now,
+      updatedAt: now,
+    };
+
+    const ledger = mergeLedger(existing, next);
+    // ENG-270 (Opslane 422): compare-and-set on the whole ledger read above, so a
+    // concurrent discard or ingest is never overwritten by this stale snapshot.
+    const condition = Array.isArray(existing)
+      ? { expression: '#ing = :prevLedger', names: { '#ing': 'fathomOnboardingIngestions' }, values: { ':prevLedger': existing } }
+      : { expression: 'attribute_not_exists(#ing)', names: { '#ing': 'fathomOnboardingIngestions' }, values: {} };
+    try {
+      await deps.userDb.updateUser(ledgerUserId, { fathomOnboardingIngestions: ledger } as any, { condition } as any);
+      written = true;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException' && error?.name !== 'ConditionalCheckFailedException') throw error;
+    }
+  }
+  if (!written) {
+    await deleteCreatedMemories();
+    throw new FathomOnboardingReviewError(409, 'Fathom onboarding ledger changed concurrently; retry the ingest.');
+  }
+
+  // ENG-270 (Opslane 443): a losing concurrent reviewed ingest adopts the winner's
+  // recorded memory ids on retry; delete the memories this call wrote that no ledger
+  // entry records, so rollback (which deletes only recorded ids) leaves nothing live.
+  if (target.userId) {
+    for (const memoryId of createdMemoryIds.filter((id) => !memoryIds.includes(id))) {
+      try { await deps.accountMemoryDb.deleteMemory?.(target.userId, memoryId); } catch (error: any) {
+        console.warn('[FathomOnboarding] Failed to delete orphaned account memory:', memoryId, error?.message);
       }
     }
   }
-
-  const next: FathomOnboardingIngestion = {
-    recordingId,
-    recordingUrl: input.recordingUrl,
-    status,
-    extractionState,
-    context,
-    targetUserId: target.userId,
-    targetLead: target.lead,
-    matchReason: target.reason,
-    matchConfidence: target.confidence,
-    automationState: automationState || (automationMode === 'manual' ? 'manual_review' : undefined),
-    draftUserId,
-    draftEmail,
-    safetyFlags,
-    featureRequestDrafts: context.featureRequestDrafts || [],
-    memoryIds,
-    orgMemoryIds,
-    reviewOwnerUserId: input.reviewOwnerUserId,
-    error: null,
-    createdAt: previous?.createdAt || now,
-    updatedAt: now,
-  };
-
-  const ledger = mergeLedger(existing, next);
-  await deps.userDb.updateUser(ledgerUserId, { fathomOnboardingIngestions: ledger } as any);
+  if (createdOrgMemoryOrgId) {
+    for (const memoryId of createdOrgMemoryIds.filter((id) => !orgMemoryIds.includes(id))) {
+      try { await deps.orgMemoryDb.deleteMemory?.(createdOrgMemoryOrgId, memoryId); } catch (error: any) {
+        console.warn('[FathomOnboarding] Failed to delete orphaned org memory:', memoryId, error?.message);
+      }
+    }
+  }
 
   if (reviewed && target.userId && input.reviewOwnerUserId !== ledgerUserId) {
     const reviewOwner = await deps.userDb.getUserById(input.reviewOwnerUserId);
@@ -570,4 +658,195 @@ export async function ingestFathomOnboardingRecording(
   }
 
   return { ...next, target, memoryIds, orgMemoryIds };
+}
+
+export type FathomOnboardingReviewAction = 'discard' | 'rollback';
+
+interface ReviewActionDeps {
+  userDb: Pick<typeof userDb, 'getUserById' | 'updateUser'>;
+  accountMemoryDb: Pick<typeof accountMemoryDb, 'deleteMemory'>;
+  orgMemoryDb: Pick<typeof orgMemoryDb, 'deleteMemory' | 'getMemory'>;
+  now: () => string;
+}
+
+const REVIEW_ACTION_MAX_ATTEMPTS = 5;
+
+export class FathomOnboardingReviewError extends Error {
+  constructor(public readonly statusCode: number, message: string) {
+    super(message);
+  }
+}
+
+/**
+ * ENG-270: admin discard / rollback of a generated onboarding artifact.
+ *
+ * - discard: a needs_review item is marked discarded; a draft account it created
+ *   stays disabled and is flagged fathomDraftStatus=discarded. Reviewed items must
+ *   be rolled back first so approved memories are never orphaned.
+ * - rollback: a reviewed item returns to needs_review and the account/org memories
+ *   written by its approval are removed (only the ids recorded on the ledger entry).
+ *
+ * Both are idempotent: repeating the action on an already-transitioned item is a no-op.
+ */
+async function flagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboardingIngestion): Promise<void> {
+  if (!item.draftUserId) return;
+  const draft = await deps.userDb.getUserById(item.draftUserId);
+  if ((draft as any)?.fathomDraftAccount !== true) return;
+  if ((draft as any).fathomDraftStatus === 'discarded' && (draft as any).isActive === false) return;
+  // Never disable an account an admin has since approved/activated (Opslane run 355, P1).
+  if ((draft as any).fathomDraftStatus === 'approved' || (draft as any).isActive === true) return;
+  await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
+}
+
+/** Clears the discarded flag a discard set; the draft stays inactive until an admin activates it. */
+async function unflagDiscardedDraft(deps: ReviewActionDeps, item: FathomOnboardingIngestion): Promise<void> {
+  if (!item.draftUserId) return;
+  const draft = await deps.userDb.getUserById(item.draftUserId);
+  if ((draft as any)?.fathomDraftAccount !== true) return;
+  if ((draft as any).fathomDraftStatus !== 'discarded') return;
+  await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'needs_review' } as any);
+}
+
+export async function applyFathomOnboardingReviewAction(
+  input: {
+    userId: string;
+    recordingId: string;
+    action: FathomOnboardingReviewAction;
+    actorUserId: string;
+    /** Admin-supplied org for a legacy entry whose user has since changed orgs (Opslane run 1336, P2). */
+    orgMemoryOrgId?: string;
+  },
+  injectedDeps?: Partial<ReviewActionDeps>,
+): Promise<FathomOnboardingIngestion> {
+  const deps: ReviewActionDeps = {
+    userDb,
+    accountMemoryDb,
+    orgMemoryDb,
+    now: () => new Date().toISOString(),
+    ...injectedDeps,
+  } as ReviewActionDeps;
+
+  // Each attempt reads the ledger and writes back ONLY the one entry it changed,
+  // conditioned on that slot still holding the same entry in the same state. A
+  // whole-list write would let two concurrent actions on different recordings of
+  // one user overwrite each other (Opslane run 352, P1).
+  for (let attempt = 0; attempt < REVIEW_ACTION_MAX_ATTEMPTS; attempt += 1) {
+    const user = await deps.userDb.getUserById(input.userId);
+    if (!user) throw new FathomOnboardingReviewError(404, 'User not found');
+    const ledger = Array.isArray((user as any).fathomOnboardingIngestions)
+      ? ((user as any).fathomOnboardingIngestions as FathomOnboardingIngestion[])
+      : [];
+    const index = ledger.findIndex((entry) => String(entry.recordingId) === String(input.recordingId));
+    if (index < 0) throw new FathomOnboardingReviewError(404, 'Ingestion not found');
+    const item = ledger[index];
+
+    const now = deps.now();
+    let next: FathomOnboardingIngestion;
+
+    if (input.action === 'discard') {
+      if (item.status === 'discarded') {
+        // A crash between the entry write and the draft flag leaves the draft
+        // unflagged; a retry must finish that step (Opslane run 353, P2).
+        await flagDiscardedDraft(deps, item);
+        return item;
+      }
+      const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
+      if (item.status === 'reviewed' || hasApprovedMemories) {
+        throw new FathomOnboardingReviewError(409, 'Reviewed ingestion must be rolled back before it can be discarded.');
+      }
+      next = { ...item, status: 'discarded', updatedAt: now };
+    } else {
+      // A reviewed item re-ingested with reviewed:false becomes needs_review but keeps its
+      // memory ids; rollback must still remove those approved memories.
+      const hasApprovedMemories = (item.memoryIds || []).length > 0 || (item.orgMemoryIds || []).length > 0;
+      if (item.status === 'discarded' && !hasApprovedMemories) {
+        // ENG-270 (Opslane 1336): rollback undoes a mistaken discard: the entry returns
+        // to needs_review so it can be approved again, and its draft is un-flagged below.
+        next = { ...item, status: 'needs_review', updatedAt: now };
+      } else {
+      if (item.status !== 'reviewed' && !hasApprovedMemories) {
+        // A retry after a lost race may find the entry already restored; finish the draft step.
+        await unflagDiscardedDraft(deps, item);
+        return item;
+      }
+      const targetUserId = item.targetUserId || input.userId;
+      // Resolve the org BEFORE deleting anything so a refused rollback changes
+      // nothing (Opslane run 355, P1).
+      let orgId: string | null = null;
+      if ((item.orgMemoryIds || []).length > 0) {
+        orgId = item.orgMemoryOrgId || null;
+        if (!orgId) {
+          const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
+          orgId = target?.orgId || null;
+          // Legacy entry (no recorded org): the user may have moved orgs since
+          // approval. Only trust the current org if it actually holds every
+          // memory; otherwise deleting there is a silent no-op that would report
+          // success while the old org's memory stays live (Opslane run 417, P1).
+          // An admin may name the original org; it is trusted only if it
+          // actually holds every recorded memory (Opslane run 1336, P2).
+          const candidates = [input.orgMemoryOrgId, orgId].filter((id): id is string => !!id);
+          orgId = null;
+          for (const candidate of candidates) {
+            let holdsAll = true;
+            for (const memoryId of item.orgMemoryIds || []) {
+              if (!(await deps.orgMemoryDb.getMemory(candidate, memoryId))) { holdsAll = false; break; }
+            }
+            if (holdsAll) { orgId = candidate; break; }
+          }
+          if (!orgId && candidates.length > 0) {
+            throw new FathomOnboardingReviewError(409, 'Org memories for this legacy ingestion are not in the user\'s current org; pass orgMemoryOrgId with the org they were written under. Rollback not applied.');
+          }
+        }
+        if (!orgId) {
+          // Never report success while org memories are still live: keep the ids on
+          // the entry so the rollback can be retried (Opslane run 353, P1).
+          throw new FathomOnboardingReviewError(409, 'Cannot resolve the org for this ingestion\'s org memories; rollback not applied.');
+        }
+      }
+      // Deletes are idempotent, so a retry after a lost write race is safe.
+      for (const memoryId of item.memoryIds || []) {
+        await deps.accountMemoryDb.deleteMemory(targetUserId, memoryId);
+      }
+      if (orgId) {
+        for (const memoryId of item.orgMemoryIds || []) {
+          await deps.orgMemoryDb.deleteMemory(orgId, memoryId);
+        }
+      }
+      next = {
+        ...item,
+        status: 'needs_review',
+        extractionState: 'auto_extracted',
+        memoryIds: [],
+        orgMemoryIds: [],
+        orgMemoryOrgId: null,
+        updatedAt: now,
+      };
+    }
+    }
+
+    const slot = `#ing[${index}]`;
+    const names: Record<string, string> = { '#ing': 'fathomOnboardingIngestions', '#rid': 'recordingId', '#st': 'status', '#upd': 'updatedAt' };
+    const values: Record<string, unknown> = { ':rid': item.recordingId, ':st': item.status };
+    let expression = `${slot}.#rid = :rid AND ${slot}.#st = :st AND `;
+    if (item.updatedAt) {
+      values[':upd'] = item.updatedAt;
+      expression += `${slot}.#upd = :upd`;
+    } else {
+      expression += `attribute_not_exists(${slot}.#upd)`;
+    }
+    try {
+      await deps.userDb.updateUser(input.userId, {} as any, {
+        elementSets: [{ path: ['fathomOnboardingIngestions'], index, value: next }],
+        condition: { expression, names, values },
+      });
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException' && error?.name !== 'ConditionalCheckFailedException') throw error;
+      continue; // Ledger changed under us: re-read and re-decide.
+    }
+
+    if (input.action === 'discard') await flagDiscardedDraft(deps, item);
+    if (input.action === 'rollback' && item.status === 'discarded') await unflagDiscardedDraft(deps, item);
+    return next;
+  }
+  throw new FathomOnboardingReviewError(409, 'Ingestion changed concurrently; retry the action.');
 }

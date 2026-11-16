@@ -115,23 +115,30 @@ interface Token {
  * was read as a REQUEST for that model. Caught by CodeRabbit on PR #2707 and
  * reproduced before fixing; pinned by tests below.
  *
- * A dot flanked by digits with no whitespace is a decimal point. Anything else
- * — including "3. 7" and the "3.7. Use..." that ends a real sentence — is a
- * break.
+ * A dot flanked by digits with no whitespace is a decimal point. A dot after a
+ * SINGLE letter with no whitespace (ENG-2293 Opslane finding on PR #3276:
+ * "Z.ai", a real auto-added vendor name) is a vendor abbreviation. It must stay
+ * that narrow: people do drop the space after a real sentence end ("the
+ * CSV.Opus 5 wrote it"), and a general letter-dot-letter rule let that read
+ * as a request for Opus 5 (Opslane run 151). Anything else — including "3. 7" and the "3.7. Use..." that ends a
+ * real sentence — is a break.
  */
 function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar: string): boolean {
   if (/[!?\n]/.test(gap)) return true;
   if (!gap.includes('.')) return false;
-  const isDecimalPoint =
+  const isAbbreviationPoint =
     gap === '.'
     && !!previousToken
-    && /\d$/.test(previousToken.text)
-    && /^\d/.test(nextChar);
-  return !isDecimalPoint;
+    && (
+      (/\d$/.test(previousToken.text) && /^\d/.test(nextChar))
+      || (previousToken.text.length === 1 && /^[a-z]$/i.test(previousToken.text) && /^[a-z]/i.test(nextChar))
+    );
+  return !isAbbreviationPoint;
 }
 
 /**
- * Remove the dot from a dotted version ("3.7" -> "37") for guard matching only.
+ * Remove the dot from a dotted version ("3.7" -> "37") and from a dotted
+ * vendor abbreviation ("Z.ai" -> "Zai"), for guard matching only.
  *
  * `EXPLANATORY_QUESTION_PATTERN` (ENG-1565) spans `[^.!]*` between its opening
  * phrase and the "?", deliberately, so it cannot reach across a sentence. A
@@ -140,11 +147,17 @@ function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar
  * fix and was still read as a request. Fixing it here rather than widening the
  * shared pattern keeps ENG-1565's detector untouched.
  *
+ * Same failure, different character class (ENG-2293 Opslane finding on PR
+ * #3276): "What does it mean to use Z.ai: GLM 5.3?" was read as a request
+ * because the dot inside the vendor name "Z.ai" stopped the scan before it
+ * ever reached the real "?". Only a dot after a single letter is stripped,
+ * matching `isSentenceBreak` (a longer word before the dot is a sentence end).
+ *
  * Used only to answer a yes/no question about the text; never for offsets or
  * for anything the customer sees.
  */
 function stripVersionDots(text: string): string {
-  return text.replace(/(\d)\.(?=\d)/g, '$1');
+  return text.replace(/(\d)\.(?=\d)/g, '$1').replace(/\b([A-Za-z])\.(?=[A-Za-z])/g, '$1');
 }
 
 function tokenize(text: string): Token[] {
@@ -201,8 +214,28 @@ export function buildModelMentionIndex(
 
     const nameTokens = tokenize(displayLabel).map((t) => t.text);
     register(nameTokens, entry.id);
-    if (nameTokens.length > 0 && VENDOR_TOKENS.has(nameTokens[0])) {
-      const stripped = nameTokens.slice(1);
+    // Register an alias at EVERY leading-vendor-token strip depth, not just
+    // the deepest one: an auto-added entry's name is "<Vendor>: <Family>
+    // <Version>" (e.g. "Anthropic: Claude Sonnet 5.5"), two vendor tokens
+    // deep, while a hand-curated entry is just "<Family> <Version>" (e.g.
+    // "Claude Sonnet 5"), one deep. Registering only the fully-stripped alias
+    // ("sonnet 5 5") left the natural middle form ("Claude Sonnet 5.5",
+    // company name dropped but family name kept) unregistered, so it fell
+    // through to the shorter, already-registered "claude sonnet 5" and
+    // silently matched the wrong, pre-existing sibling model instead.
+    let vendorRun = 0;
+    while (vendorRun < nameTokens.length) {
+      if (VENDOR_TOKENS.has(nameTokens[vendorRun])) { vendorRun++; continue; }
+      // "Z.ai" tokenizes to "z" + "ai" (the dot is a token separator, same as
+      // everywhere else in this file), so it never matches the combined "zai"
+      // entry above and the strip loop stopped at position 0 — "GLM 5.3" and
+      // "GLM 5.3 Flash" (the Z.ai-branded auto-added entries) were unreachable
+      // by their bare family name. Treat the pair as that one vendor token.
+      if (nameTokens[vendorRun] === 'z' && nameTokens[vendorRun + 1] === 'ai') { vendorRun += 2; continue; }
+      break;
+    }
+    for (let strippedStart = 1; strippedStart <= vendorRun; strippedStart++) {
+      const stripped = nameTokens.slice(strippedStart);
       if (stripped.some((t) => !isVersionToken(t))) register(stripped, entry.id);
     }
   }
@@ -226,6 +259,18 @@ function hasLeadingRequestVerb(tokens: Token[], index: number): boolean {
     if (REQUEST_VERBS.has(tokens[i - 1].text)) return true;
   }
   return false;
+}
+
+/**
+ * Does a key match stop part-way through a dotted version? "5.5" tokenizes to "5" + "5", so for
+ * "use Anthropic: Claude Sonnet 5.5" the key "anthropic claude sonnet 5" (Sonnet 5's id) matched at
+ * "Anthropic" before the scan ever reached "Claude Sonnet 5.5" (ENG-2646). A version is only complete
+ * when the next token is not another number joined to it by a dot.
+ */
+function endsInsideVersion(tokens: Token[], lastIndex: number, text: string): boolean {
+  const last = tokens[lastIndex];
+  const next = tokens[lastIndex + 1];
+  return !!next && isVersionToken(last.text) && /^\d/.test(next.text) && text.slice(last.end, next.start) === '.';
 }
 
 function matchLengthAt(tokens: Token[], index: number, key: string): number {
@@ -301,6 +346,7 @@ export function findModelMention(
     for (const { key, modelId } of index.keys) {
       const length = matchLengthAt(tokens, i, key);
       if (!length) continue;
+      if (endsInsideVersion(tokens, i + length - 1, messageContent)) continue;
       if (!hasLeadingRequestVerb(tokens, i)) continue;
 
       const sentence = sentenceBoundsAt(tokens, i, messageContent);

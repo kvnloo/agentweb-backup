@@ -15,6 +15,7 @@
 import express from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
+import { readUserForOwnership } from "../utils/readUserForOwnership";
 import {
   buildAutoFailPatchIfStuck,
   buildFailedPatch,
@@ -60,7 +61,7 @@ router.post("/design-system/start", authenticateToken, async (req, res) => {
       return res.status(401).json({ message: "User not authenticated" });
     }
 
-    const existing = await userDb.getUserById(userId);
+    const existing = await readUserForOwnership(userId);
     const existingStatus = (existing as any)?.designSystem?.status;
     const alreadyInFlight = existingStatus === "running" || existingStatus === "ready";
     if (alreadyInFlight) {
@@ -73,7 +74,7 @@ router.post("/design-system/start", authenticateToken, async (req, res) => {
     } catch (err: any) {
       if (err?.code === "ConditionalCheckFailedException") {
         // Lost the race — another concurrent /start already claimed it.
-        const current = await userDb.getUserById(userId);
+        const current = await readUserForOwnership(userId);
         return res.json({ status: snapshot((current as any)?.designSystem) });
       }
       throw err;
@@ -85,8 +86,9 @@ router.post("/design-system/start", authenticateToken, async (req, res) => {
       console.error("[designSystemBuild] background trigger crashed", e);
     });
 
-    const user = await userDb.getUserById(userId);
-    return res.json({ status: snapshot((user as any)?.designSystem ?? patch.designSystem) });
+    // The snapshot of the claim just written, not a read-back: the index can
+    // still show the previous (failed) state, which would tell the UI to stop.
+    return res.json({ status: snapshot(patch.designSystem) });
   } catch (err) {
     console.error("[designSystemBuild] start failed", err);
     return res.status(500).json({ message: "Failed to start design system build" });
@@ -104,7 +106,7 @@ router.get("/design-system/status", authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: "User not authenticated" });
     }
-    const user = await userDb.getUserById(userId);
+    const user = await readUserForOwnership(userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -118,7 +120,7 @@ router.get("/design-system/status", authenticateToken, async (req, res) => {
     const autoFail = buildAutoFailPatchIfStuck((user as any).designSystem);
     if (autoFail) {
       await userDb.updateUser(userId, autoFail as any);
-      const refreshed = await userDb.getUserById(userId);
+      const refreshed = await readUserForOwnership(userId);
       return res.json({ status: snapshot((refreshed as any)?.designSystem ?? autoFail.designSystem) });
     }
 
@@ -144,10 +146,10 @@ router.post("/design-system/fail", authenticateToken, async (req, res) => {
       return res.status(401).json({ message: "User not authenticated" });
     }
     const errorMsg = typeof req.body?.error === "string" ? req.body.error : "design system build timed out";
-    const user = await userDb.getUserById(userId);
+    const user = await readUserForOwnership(userId);
     const patch = buildFailedPatch((user as any)?.designSystem, errorMsg);
     await userDb.updateUser(userId, patch as any);
-    const updated = await userDb.getUserById(userId);
+    const updated = await readUserForOwnership(userId);
     return res.json({ status: snapshot((updated as any)?.designSystem ?? patch.designSystem) });
   } catch (err) {
     console.error("[designSystemBuild] fail failed", err);

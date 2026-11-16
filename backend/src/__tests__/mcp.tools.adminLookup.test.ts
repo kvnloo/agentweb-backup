@@ -108,4 +108,31 @@ describe('ENG-481 admin lookup tools', () => {
         .rejects.toThrow(/403/);
     });
   });
+
+  describe('inspect_client_usage (ENG-2771)', () => {
+    it('is registered and gated as an admin-only, cross-account tool', () => {
+      expect(mcpToolRegistry.getTool('inspect_client_usage')).toBeDefined();
+      expect(ADMIN_SKILL_TOOL_NAMES).toContain('inspect_client_usage');
+      expect(CROSS_ACCOUNT_USER_DATA_TOOLS).toContain('inspect_client_usage');
+    });
+
+    it('reads the admin enforcement route by email with GET only', async () => {
+      mockFetch.mockResolvedValue({ billingUserId: 'o1', enforcement: { available: true, paused: true, gatedBy: 'cost' } });
+      const out = parse(await mcpToolRegistry.execute('inspect_client_usage', { email: ' a@b.com ' }, context));
+      expect(mockFetch).toHaveBeenCalledWith(expect.objectContaining({ method: 'GET', path: '/api/admin/usage/enforcement?email=a%40b.com' }));
+      expect(out).toMatchObject({ found: true, internalAdminOnly: true, billingUserId: 'o1', enforcement: { paused: true } });
+    });
+
+    it('requires an identifier and maps 404 to found=false', async () => {
+      expect(parse(await mcpToolRegistry.execute('inspect_client_usage', {}, context))).toEqual({ error: 'email or user_id is required.' });
+      mockFetch.mockRejectedValue(new Error('API error (404): User not found'));
+      expect(parse(await mcpToolRegistry.execute('inspect_client_usage', { user_id: 'x' }, context))).toEqual({ found: false, userId: 'x' });
+    });
+
+    it('propagates the server-side admin denial (403) for a non-admin caller', async () => {
+      mockFetch.mockRejectedValue(new Error('API error (403): Admin access required'));
+      await expect(mcpToolRegistry.execute('inspect_client_usage', { user_id: 'u1' }, { userId: 'cust', agentUserId: 'cust' }))
+        .rejects.toThrow(/403/);
+    });
+  });
 });

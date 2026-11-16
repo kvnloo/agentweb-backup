@@ -137,6 +137,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -213,6 +214,7 @@ describe('fathomOnboardingIngestionService', () => {
           expect.objectContaining({ recordingId: 'ambiguous-1', status: 'needs_review' }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -396,6 +398,195 @@ describe('fathomOnboardingIngestionService', () => {
     expect(updatedLedger[0].createdAt).toBe('2026-07-08T19:00:00.000Z');
   });
 
+  it('keeps a discarded entry discarded when the same recording is re-ingested unreviewed (Opslane 357)', async () => {
+    const prior = {
+      recordingId: 'disc-1',
+      recordingUrl: 'https://fathom.video/calls/disc-1',
+      status: 'discarded',
+      extractionState: 'auto_extracted',
+      context: baseContext,
+      automationState: 'draft_account_created',
+      draftUserId: 'fathom-draft-disc-1',
+      draftEmail: 'fathom+disc-1@agentweb.internal',
+      memoryIds: [],
+      orgMemoryIds: [],
+      createdAt: '2026-07-08T19:00:00.000Z',
+      updatedAt: '2026-07-08T19:00:00.000Z',
+    };
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId,
+          email: userId === 'fathom-draft-disc-1' ? 'fathom+disc-1@agentweb.internal' : 'harsha@agentweb.pro',
+          fathomDraftStatus: userId === 'fathom-draft-disc-1' ? 'discarded' : undefined,
+          isActive: false,
+          fathomOnboardingIngestions: userId === 'fathom-draft-disc-1' ? [prior] : [],
+        })),
+        getUserByEmail: jest.fn(async (email: string) => (
+          email === 'fathom+disc-1@agentweb.internal'
+            ? { userId: 'fathom-draft-disc-1', email, isActive: false, fathomDraftAccount: true, fathomDraftStatus: 'discarded' }
+            : null
+        )),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'disc-1',
+      recordingUrl: 'https://fathom.video/calls/disc-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: { ...baseContext, primaryContactEmail: 'buyer@disc.com', website: 'https://disc.com', companyName: 'Disc Co' },
+    }, deps as any);
+
+    expect(result.status).toBe('discarded');
+    const ledger = deps.userDb.updateUser.mock.calls[0][1].fathomOnboardingIngestions;
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0].status).toBe('discarded');
+  });
+
+  it('refuses a reviewed ingest of a discarded entry without writing memories (Opslane 962)', async () => {
+    const prior = {
+      recordingId: 'disc-2', status: 'discarded', extractionState: 'auto_extracted', context: baseContext,
+      automationState: 'draft_account_created', draftUserId: 'fathom-draft-disc-2', memoryIds: [], orgMemoryIds: [],
+      createdAt: '2026-07-08T19:00:00.000Z', updatedAt: '2026-07-08T19:00:00.000Z',
+    };
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId, email: 'fathom+disc-2@agentweb.internal', isActive: false, fathomDraftStatus: 'discarded',
+          fathomOnboardingIngestions: [prior],
+        })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_u: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'disc-2', reviewOwnerUserId: 'review-owner', targetUserId: 'fathom-draft-disc-2',
+      reviewed: true, meetingText: 'notes',
+    } as any, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(deps.userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('re-reads and re-merges the ledger when a concurrent write lands between read and write (Opslane 422)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const before = [{ recordingId: 'rv3-f', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const after = [
+      { recordingId: 'rv3-h', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp },
+      { ...before[0], status: 'discarded', updatedAt: '2026-07-08T19:00:01.000Z' },
+    ];
+    let reads = 0;
+    const updateUser = jest.fn(async (_userId: string, updates: Record<string, any>, options?: any) => {
+      if (updateUser.mock.calls.length === 1) {
+        expect(options?.condition?.values?.[':prevLedger']).toEqual(before);
+        throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      }
+      return updates;
+    });
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'a@agentweb.pro', fathomOnboardingIngestions: (reads++ === 0) ? before : after })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser,
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    await ingestFathomOnboardingRecording({
+      recordingId: 'rv3-g', targetUserId: 'admin-1', reviewOwnerUserId: 'admin-1', reviewed: false, extractedContext: baseContext,
+    }, deps as any);
+
+    expect(updateUser).toHaveBeenCalledTimes(2);
+    const ledger = updateUser.mock.calls[1][1].fathomOnboardingIngestions;
+    expect(ledger.map((i: any) => i.recordingId).sort()).toEqual(['rv3-f', 'rv3-g', 'rv3-h']);
+    expect(ledger.find((i: any) => i.recordingId === 'rv3-f').status).toBe('discarded');
+  });
+
+  it('deletes memories a losing concurrent reviewed ingest created when it adopts the winner ids (Opslane 443)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const winner = [{ recordingId: 'dbl-1', status: 'reviewed', context: baseContext, memoryIds: ['mem-win'], orgMemoryIds: ['org-mem-win'], orgMemoryOrgId: 'org-1', createdAt: stamp, updatedAt: stamp }];
+    let reads = 0;
+    const updateUser = jest.fn(async (_u: string, updates: Record<string, any>) => {
+      if (updateUser.mock.calls.length === 1) throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' });
+      return updates;
+    });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: (userId === 'target-user' && reads++ > 0) ? winner : [] })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-lose' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-lose' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'dbl-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.memoryIds).toEqual(['mem-win']);
+    expect(result.orgMemoryIds).toEqual(['org-mem-win']);
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-lose');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-lose');
+  });
+
+  it('deletes memories a refused approve wrote when a concurrent discard lands mid-retry (Opslane 1336)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const pending = [{ recordingId: 'race-1', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const discarded = [{ ...pending[0], status: 'discarded' }];
+    let reads = 0;
+    const updateUser = jest.fn(async () => { throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }); });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: (userId === 'target-user' && reads++ > 0) ? discarded : pending })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-race' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-race' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'race-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-race');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-race');
+  });
+
+  it('answers 409 and deletes its memories when ledger contention never clears (Opslane 1336 #3)', async () => {
+    const stamp = '2026-07-08T19:00:00.000Z';
+    const pending = [{ recordingId: 'burst-1', status: 'needs_review', context: baseContext, memoryIds: [], orgMemoryIds: [], createdAt: stamp, updatedAt: stamp }];
+    const updateUser = jest.fn(async () => { throw Object.assign(new Error('cond'), { code: 'ConditionalCheckFailedException' }); });
+    const base = makeDeps();
+    const deps = makeDeps({
+      userDb: {
+        ...base.userDb,
+        getUserById: jest.fn(async (userId: string) => ({ userId, email: 'owner@acme.ai', orgId: 'org-1', fathomOnboardingIngestions: pending })),
+        updateUser,
+      },
+      accountMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'mem-burst' })), deleteMemory: jest.fn(async () => undefined) },
+      orgMemoryDb: { addMemory: jest.fn(async () => ({ memoryId: 'org-mem-burst' })), deleteMemory: jest.fn(async () => undefined) },
+    });
+
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'burst-1', targetUserId: 'target-user', reviewOwnerUserId: 'target-user', reviewed: true, extractedContext: baseContext,
+    }, deps as any)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(updateUser.mock.calls.length).toBeGreaterThan(5);
+    expect((deps.accountMemoryDb as any).deleteMemory).toHaveBeenCalledWith('target-user', 'mem-burst');
+    expect((deps.orgMemoryDb as any).deleteMemory).toHaveBeenCalledWith('org-1', 'org-mem-burst');
+  });
+
   it('routes existing account matches to review without creating another user', async () => {
     const deps = makeDeps();
 
@@ -452,6 +643,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
   });
 
@@ -487,6 +679,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
     expect(warn).toHaveBeenCalledWith(
       '[FathomOnboarding] Failed to write org memory; preserving account memory ledger:',
@@ -671,6 +864,7 @@ describe('fathomOnboardingIngestionService', () => {
           }),
         ],
       }),
+      expect.objectContaining({ condition: expect.any(Object) }),
     );
     expect(deps.userDb.updateUser).toHaveBeenNthCalledWith(
       2,

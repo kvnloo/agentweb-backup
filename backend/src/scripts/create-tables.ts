@@ -1361,6 +1361,7 @@ const createLeadsTable = async () => {
       { AttributeName: 'nameCompanyKey', AttributeType: 'S' },
       { AttributeName: 'updatedAt', AttributeType: 'S' },
       { AttributeName: 'companyId', AttributeType: 'S' },
+      { AttributeName: 'phoneKey', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -1375,6 +1376,21 @@ const createLeadsTable = async () => {
         ],
         Projection: {
           ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        // ENG-2123: sparse lookup of an email-less form capture by normalised phone (utils/phoneLeadDedupe.ts).
+        IndexName: 'PhoneKeyIndex',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'phoneKey', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'KEYS_ONLY'
         },
         ProvisionedThroughput: {
           ReadCapacityUnits: 5,
@@ -2062,6 +2078,247 @@ const createSpendProjectionTable = async () => {
 // on the `ttl` attribute MANUALLY -- CreateTable does not configure it, and
 // nothing at runtime will report that it is missing. Same manual step as the
 // UsageRecords/LoopEvents/AgentRuns tables.
+// Create LLM Connections table (ENG-2105 — customer LLM provider keys, KMS
+// envelope-encrypted). Must stay identical to LLM_CONNECTIONS_TABLE_SPEC in
+// services/funding/llmConnectionDb.ts, which is what the boot-time
+// ensureCriticalTables creates; llmConnectionTable.test.ts fails if they differ.
+// Delete-protected. Point-in-time recovery is deliberately left off: revoking a
+// connection deletes its encrypted key, and a recovery window would keep that
+// ciphertext restorable for up to 35 days after the customer revoked it.
+export const createLlmConnectionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LlmConnections`,
+    AttributeDefinitions: [
+      { AttributeName: 'connectionId', AttributeType: 'S' },
+      { AttributeName: 'ownerUserId', AttributeType: 'S' },
+      { AttributeName: 'orgId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'provider', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'connectionId', KeyType: 'HASH' }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'OwnerIndex',
+        KeySchema: [
+          { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'OrgIndex',
+        KeySchema: [
+          { AttributeName: 'orgId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'ProviderIndex',
+        KeySchema: [
+          { AttributeName: 'provider', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
+// Create Attempt Usage table (ENG-2106 — customer-funded usage journal; append-only, no
+// secrets). Must stay identical to ATTEMPT_USAGE_TABLE_SPEC in
+// services/funding/dynamoAttemptUsageJournal.ts, which is what the boot-time
+// ensureCriticalTables creates; attemptUsageTable.test.ts fails if they differ. TTL
+// (attribute `ttl`, 400 days) and point-in-time recovery are separate calls CreateTable
+// cannot make; they are attempted below, non-fatally, like the model-change audit table.
+export const createAttemptUsageTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AttemptUsage`,
+    AttributeDefinitions: [
+      { AttributeName: 'attemptId', AttributeType: 'S' },
+      { AttributeName: 'runId', AttributeType: 'S' },
+      { AttributeName: 'connectionId', AttributeType: 'S' },
+      { AttributeName: 'fundingPrincipalId', AttributeType: 'S' },
+      { AttributeName: 'startedAt', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'attemptId', KeyType: 'HASH' }],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'RunIndex',
+        KeySchema: [
+          { AttributeName: 'runId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'ConnectionIndex',
+        KeySchema: [
+          { AttributeName: 'connectionId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+      {
+        IndexName: 'PrincipalIndex',
+        KeySchema: [
+          { AttributeName: 'fundingPrincipalId', KeyType: 'HASH' },
+          { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  // TTL and recovery can only be set on an ACTIVE table.
+  await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (!(error.code === 'ValidationException' && /already enabled/i.test(error.message || ''))) {
+      console.warn(`[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-time-to-live --table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`);
+    }
+  }
+  try {
+    await dynamodb.updateContinuousBackups({
+      TableName: params.TableName,
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+    }).promise();
+    console.log(`Enabled point-in-time recovery on ${params.TableName}`);
+  } catch (error: any) {
+    console.warn(`[create-tables] Could not enable point-in-time recovery on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-continuous-backups --table-name ${params.TableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`);
+  }
+};
+
+// Create Smartlead push runs table (ENG-673 — a run item and a lock item per list and campaign, written by
+// services/smartleadPushRunDb.ts). Must stay identical to SMARTLEAD_PUSH_RUNS_TABLE_SPEC there, which is what the boot-time
+// ensureCriticalTables creates; smartleadPushRunsTable.test.ts fails if they differ. No deletion protection yet: indexes cannot
+// be changed after creation, so protection is added once the table is proven. TTL (attribute `ttl`) and point-in-time recovery
+// are separate calls CreateTable cannot make; they are attempted below, non-fatally, like the attempt-usage table.
+export const createSmartleadPushRunsTable = async () => {
+  const summary = ['status', 'campaignId', 'campaignName', 'counts', 'startedAt', 'finishedAt', 'pushedBy', 'channel', 'ttl'];
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SmartleadPushRuns`,
+    AttributeDefinitions: [
+      { AttributeName: 'pk', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' },
+      { AttributeName: 'listId', AttributeType: 'S' },
+      { AttributeName: 'ownerId', AttributeType: 'S' },
+      { AttributeName: 'kind', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'active', AttributeType: 'S' },
+      { AttributeName: 'leaseUntil', AttributeType: 'N' },
+    ],
+    KeySchema: [
+      { AttributeName: 'pk', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'ListRunsIndex',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: summary },
+      },
+      {
+        IndexName: 'OwnerRunsIndex',
+        KeySchema: [
+          { AttributeName: 'ownerId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: [...summary, 'listId'] },
+      },
+      {
+        IndexName: 'RunsByTimeIndex',
+        KeySchema: [
+          { AttributeName: 'kind', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: [...summary, 'listId', 'ownerId'] },
+      },
+      {
+        IndexName: 'ActiveRunsIndex',
+        KeySchema: [
+          { AttributeName: 'active', KeyType: 'HASH' },
+          { AttributeName: 'leaseUntil', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'INCLUDE', NonKeyAttributes: ['status', 'listId', 'campaignId'] },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  // TTL and recovery can only be set on an ACTIVE table.
+  await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (!(error.code === 'ValidationException' && /already enabled/i.test(error.message || ''))) {
+      console.warn(`[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-time-to-live --table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`);
+    }
+  }
+  try {
+    await dynamodb.updateContinuousBackups({
+      TableName: params.TableName,
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+    }).promise();
+    console.log(`Enabled point-in-time recovery on ${params.TableName}`);
+  } catch (error: any) {
+    console.warn(`[create-tables] Could not enable point-in-time recovery on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-continuous-backups --table-name ${params.TableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`);
+  }
+};
+
+
+/**
+ * ENG-2496: Zoma device-flow onboarding (mcp/zomaDeviceStore.ts, the only module that touches it). Single-table: PK `pk` (S), no sort key,
+ * no GSI. Items are `device#<sha256>`, `usercode#<CODE>` and `token#<sha256>`; device and user-code items carry a `ttl` (epoch seconds).
+ * The table was first created by hand, so this definition only matters for a fresh environment; an existing table is left as it is.
+ */
+export const createZomaDeviceAuthTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ZomaDeviceAuth`,
+    AttributeDefinitions: [{ AttributeName: 'pk', AttributeType: 'S' }],
+    KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  // TTL can only be set on an ACTIVE table. Never fatal (nothing after this table may be skipped): the role running setup may not be allowed
+  // to describe the table or to set TTL.
+  try {
+    await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (!(error.code === 'ValidationException' && /already enabled/i.test(error.message || ''))) {
+      console.warn(`[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-time-to-live --table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`);
+    }
+  }
+};
+
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -2697,6 +2954,10 @@ const main = async () => {
     await createSpendEventsTable();
     await createSpendProjectionTable();
     await createModelChangeAuditTable();
+    await createZomaDeviceAuthTable();
+    await createLlmConnectionsTable();
+    await createAttemptUsageTable();
+    await createSmartleadPushRunsTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();

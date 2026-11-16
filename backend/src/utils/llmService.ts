@@ -32,6 +32,14 @@ export interface LLMServiceOptions {
   streaming?: boolean;
   /** Product task class for independent gateway canary and rollback. */
   taskClass?: GatewayTaskClass;
+  /** Models OpenRouter tries, in order, if the primary model fails. */
+  fallbackModels?: string[];
+  /** Providers OpenRouter must skip on web-search calls (ENG-2720: Azure errors on the search tool). */
+  providerIgnoreForWebSearch?: string[];
+  /** Retry a 200 with no answer instead of returning an empty string (ENG-2720). */
+  requireContent?: boolean;
+  /** Parameters for the web-search tool on this service's web-search calls (ENG-2720). */
+  webSearchParameters?: Record<string, string | number>;
 }
 
 type InvokeResponse = {
@@ -44,6 +52,8 @@ type InvokeResponse = {
   };
   /** callLLM already recorded this response, so the compatibility wrapper must not double-charge it. */
   __agentwebGatewayMetered?: boolean;
+  /** Provider finish reason (ENG-2679); undefined when the transport omits it. */
+  finishReason?: string;
 };
 
 /**
@@ -62,6 +72,10 @@ export class LLMService {
   private readonly maxTokens?: number;
   private readonly longRunning: boolean;
   private readonly taskClass: GatewayTaskClass;
+  private readonly fallbackModels?: string[];
+  private readonly providerIgnoreForWebSearch?: string[];
+  private readonly requireContent: boolean;
+  private readonly webSearchParameters?: Record<string, string | number>;
 
   constructor(
     modelName?: string,
@@ -79,6 +93,10 @@ export class LLMService {
     this.maxTokens = maxTokens;
     this.longRunning = options.streaming === true;
     this.taskClass = options.taskClass || 'nonstandard_consumer';
+    this.fallbackModels = options.fallbackModels;
+    this.providerIgnoreForWebSearch = options.providerIgnoreForWebSearch;
+    this.requireContent = options.requireContent === true;
+    this.webSearchParameters = options.webSearchParameters;
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -100,8 +118,12 @@ export class LLMService {
       max_completion_tokens: this.maxTokens,
       timeoutMs: requestOptions.timeoutMs ?? (this.longRunning ? 30 * 60 * 1000 : undefined),
       webSearch: requestOptions.webSearch,
+      ...(requestOptions.webSearch && this.webSearchParameters ? { webSearchParameters: this.webSearchParameters } : {}),
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: this.taskClass,
+      ...(this.fallbackModels?.length ? { fallbackModels: this.fallbackModels } : {}),
+      ...(requestOptions.webSearch && this.providerIgnoreForWebSearch?.length ? { providerIgnore: this.providerIgnoreForWebSearch } : {}),
+      ...(this.requireContent ? { requireContent: true } : {}),
     });
     const usage: any = response?.usage;
     const hasUsage = !!usage && typeof usage === 'object';
@@ -120,6 +142,7 @@ export class LLMService {
         },
       } : undefined,
       __agentwebGatewayMetered: hasUsage ? true : undefined,
+      finishReason: response?.choices?.[0]?.finish_reason || undefined,
     };
   }
 
@@ -180,6 +203,16 @@ export class LLMService {
     onUsage?: OnUsageCallback,
     requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
   ): Promise<string> {
+    return (await this.invokeWithMeta(systemPrompt, userPrompt, usageContext, onUsage, requestOptions)).content;
+  }
+
+  private async invokeWithMeta(
+    systemPrompt: string,
+    userPrompt: string,
+    usageContext?: LLMUsageContext,
+    onUsage?: OnUsageCallback,
+    requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
+  ): Promise<{ content: string; finishReason?: string }> {
     const messages = [
       new SystemMessage(systemPrompt),
       new HumanMessage(userPrompt),
@@ -188,7 +221,8 @@ export class LLMService {
       ? await this.invokeGateway(messages, usageContext, requestOptions)
       : await this.requireChatModel().invoke(messages);
     this.observeUsage(response, usageContext, onUsage);
-    return typeof response.content === 'string' ? response.content : String(response.content || '');
+    const content = typeof response.content === 'string' ? response.content : String(response.content || '');
+    return { content, finishReason: response.finishReason };
   }
 
   async generateContent(
@@ -277,7 +311,13 @@ export class LLMService {
     onUsage?: OnUsageCallback,
     usageContext?: LLMUsageContext,
   ): Promise<string> {
-    const raw = await this.invoke(`${systemPrompt}\n\nCRITICAL: You MUST wrap your HTML output in the following XML tags:\n<actual_html_content>\n[Your complete HTML code here]\n</actual_html_content>\n\nThe HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`, userPrompt, usageContext, onUsage);
+    const { content: raw, finishReason } = await this.invokeWithMeta(`${systemPrompt}\n\nCRITICAL: You MUST wrap your HTML output in the following XML tags:\n<actual_html_content>\n[Your complete HTML code here]\n</actual_html_content>\n\nThe HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`, userPrompt, usageContext, onUsage);
+    // ENG-2679: a max-token cutoff is never a usable document or fragment.
+    if (finishReason === 'length') {
+      const err = new Error(`HTML generation truncated (finish_reason=length, model=${this.modelName})`);
+      err.name = 'IncompleteHtmlRenderError';
+      throw err;
+    }
     const tagged = raw.match(/<actual_html_content>([\s\S]*?)<\/actual_html_content>/i)?.[1];
     if (tagged) return tagged.trim();
     const htmlStart = raw.search(/<!DOCTYPE|<html/i);

@@ -132,7 +132,7 @@ describe('ENG-973: /api/emma/* enforces the monthly token quota', () => {
 
     // No second, divergent quota rule — enforcement calls the one existing gate
     // with the authenticated user, and resolveBillingUserId does the rest.
-    expect(mockCheckTokenUsage).toHaveBeenCalledWith('user-1');
+    expect(mockCheckTokenUsage).toHaveBeenCalledWith('user-1', { recordAdmission: true });
   });
 
   // ── The two fail-closed branches (Greptile P2 on #2298) ───────────────────

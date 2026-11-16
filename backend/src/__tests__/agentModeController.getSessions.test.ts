@@ -54,7 +54,6 @@ jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn() }
 jest.mock('../services/voiceService', () => ({ transcribeSpeech: jest.fn() }));
 jest.mock('../utils/s3Utils', () => ({ uploadFileToS3: jest.fn(), uploadScreenshotToS3: jest.fn() }));
 jest.mock('../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn() }));
-jest.mock('../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../docs/agentModeSystemPrompt', () => ({ ABOUT_AGENTWEB_TEAM: '' }));
 jest.mock('../middleware/auth', () => ({ getUserFromToken: jest.fn() }));
 
@@ -102,6 +101,16 @@ describe('agentModeController.getSessions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockSummarize.mockResolvedValue(null);
+  });
+
+  test('ENG-112: the owner list passes branchedFrom through on each session', async () => {
+    const branchedFrom = { sessionId: 'a', rootSessionId: 'root', messageIndex: 4, branchedAt: '2026-10-12T00:00:00.000Z' };
+    mockGetUserSessions.mockResolvedValue({ sessions: [makeSession({ branchedFrom }), makeSession()], lastEvaluatedKey: null });
+    const res = makeResponse();
+    await agentModeController.getSessions(makeRequest(), res);
+    const body = res.json.mock.calls[0][0];
+    expect(body.sessions[0].branchedFrom).toEqual(branchedFrom);
+    expect(body.sessions[1].branchedFrom).toBeUndefined();
   });
 
   // --- FAIL CASES ---

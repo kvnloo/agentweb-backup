@@ -39,10 +39,10 @@ describe('get_account_status in-app (AgentMode) exposure', () => {
     expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('get_account_status');
   });
 
-  it('remains a no-arg self tool (no email/client param leaks in)', () => {
+  it('remains a self tool (no email/client param leaks in; only the ENG-758 usage_month filter)', () => {
     const def = emmaToolRegistry.getTool('get_account_status')!.definition as any;
     const props = def.inputSchema?.properties ?? {};
-    expect(Object.keys(props)).toHaveLength(0);
+    expect(Object.keys(props)).toEqual(['usage_month']);
     expect(def.inputSchema?.required ?? []).toHaveLength(0);
   });
 

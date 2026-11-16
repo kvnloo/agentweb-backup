@@ -16,7 +16,7 @@
  *     ledger, so a synthesis failure can never erase the record of what ran.
  */
 
-import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
+import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE } from './termination';
 import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 
@@ -95,7 +95,8 @@ const INTERNAL_DIRECTIVE_ECHO_RE =
  * so a collapse that echoes either of THOSE back is just as real a failure and was,
  * before this, just as unguarded.
  */
-const INJECTED_NUDGES = [SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE];
+// ENG-2778: the step-cap forced-synthesis warning is loop-injected too; an echo of it is not an answer.
+const INJECTED_NUDGES = [SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE, STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE];
 
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;

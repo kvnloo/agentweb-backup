@@ -267,3 +267,30 @@ describe('aw.js: the served source itself', () => {
     expect(AW_SDK_SOURCE.length).toBeLessThan(20_000);
   });
 });
+
+describe('aw.js: ENG-2689 super properties', () => {
+  it('attaches presets and pre-load registered super properties to every event; later registrations win', () => {
+    const { sent, second } = got('superProps');
+    expect(sent.length).toBeGreaterThanOrEqual(3);
+    for (const b of sent) {
+      expect(b.super).toMatchObject({
+        '#lib': 'js', '#device_id': b.visitorId, '#url': URL_, site_domain: 'go.example.com', is_login: false, session_intent_score: 3,
+      });
+      expect(Number.isSafeInteger(b.super['#event_time'])).toBe(true);
+      expect(b.super).not.toHaveProperty('bad');
+    }
+    expect(sent[0].super.funnel_type).toBe('free_trial');
+    expect(sent[sent.length - 1].super.funnel_type).toBe('funnel_review');
+    expect(sent[0].super.session_page_num).toBe(1);
+    expect(second[0].super.session_page_num).toBe(2);
+  });
+
+  it('non-ASCII registered values over the byte cap are shed by BYTES, keeping presets and the event', () => {
+    const { sizes, sent } = got('superNonAscii');
+    expect(sent).toHaveLength(1);
+    expect(sizes[0]).toBeLessThan(16 * 1024);
+    expect(sent[0].event).toBe('lp_view');
+    expect(sent[0].super).not.toHaveProperty('k0');
+    expect(sent[0].super).toMatchObject({ '#lib': 'js', '#url': URL_ });
+  });
+});

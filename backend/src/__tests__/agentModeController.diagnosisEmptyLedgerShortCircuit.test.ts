@@ -36,7 +36,6 @@ jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn() }
 jest.mock('../services/voiceService', () => ({ transcribeSpeech: jest.fn() }));
 jest.mock('../utils/s3Utils', () => ({ uploadFileToS3: jest.fn(), uploadScreenshotToS3: jest.fn() }));
 jest.mock('../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn() }));
-jest.mock('../services/notionService', () => ({ createOncallItem: jest.fn() }));
 jest.mock('../docs/agentModeSystemPrompt', () => ({ ABOUT_AGENTWEB_TEAM: '' }));
 jest.mock('../middleware/auth', () => ({ getUserFromToken: jest.fn() }));
 

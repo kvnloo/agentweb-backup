@@ -13,6 +13,7 @@
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
 import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
+import { isPushedToSmartlead } from './smartleadMarkers';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -23,10 +24,44 @@ import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
+import { isSuspectedMachineEngagement, parseResendTimestamp } from './machineEngagement';
+import { selectEngagementExitTrigger } from './dripEngagementExit';
 
 // Identifies this process for the claimedBy field — mirrors
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
 const INSTANCE_ID = uuidv4();
+
+const PINNED_ACCOUNT_SNOOZE_MS = 30 * 60 * 1000;
+
+/**
+ * ENG-2529: the shared LinkedIn write gate (daily volume cap + hourly pacer) refused this step's send.
+ * Not a failure of the step: the enrollment is deferred (snoozed, step NOT advanced) and retried later.
+ */
+export class LinkedInWriteDeferredError extends Error {
+  constructor(public readonly gate: string, public readonly reason: string, public readonly accountId: string) {
+    super(`LinkedIn write deferred by ${gate} on account ${accountId}: ${reason}`);
+    this.name = 'LinkedInWriteDeferredError';
+  }
+}
+
+/** How long to defer an enrollment whose LinkedIn send was refused by the hourly pacer. */
+export const LINKEDIN_PACER_DEFER_MS = 30 * 60 * 1000;
+
+/** Retry time for a deferred LinkedIn send: next UTC midnight for the daily cap, else a short pacer backoff. */
+export function linkedInDeferRetryAt(gate: string, now: Date = new Date()): string {
+  if (gate === 'daily_volume') {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+  }
+  return new Date(now.getTime() + LINKEDIN_PACER_DEFER_MS).toISOString();
+}
+
+/** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
+export class PinnedLinkedInAccountNotConnectedError extends Error {
+  constructor(stepNumber: number, userId: string) {
+    super(`LinkedIn step ${stepNumber} references an account that is not connected to user ${userId}`);
+    this.name = 'PinnedLinkedInAccountNotConnectedError';
+  }
+}
 
 export async function processDueEnrollments(): Promise<{
   processed: number;
@@ -73,6 +108,20 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else if (err instanceof PinnedLinkedInAccountNotConnectedError) {
+        // A config problem the owner has to fix (re-pick or reconnect the account). Retrying every 5-minute
+        // tick cannot succeed and only burns claims and log noise, so back off. Deliberately SHORT (30 min,
+        // not the 6h used for 'not yet connected'): editing a sequence does not reset an enrollment's
+        // nextSendAt, so a long snooze would delay sending long after the user has fixed the step.
+        const retryAt = new Date(Date.now() + PINNED_ACCOUNT_SNOOZE_MS).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
+      } else if (err instanceof LinkedInWriteDeferredError) {
+        // ENG-2529: the shared LinkedIn gate refused the send. Defer — do not fail, do not advance —
+        // so the step is sent once the pacer/daily cap has room.
+        const retryAt = linkedInDeferRetryAt(err.gate);
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Deferred enrollment ${enrollment.enrollmentId} until ${retryAt} (LinkedIn ${err.gate} refused on ${err.accountId}: ${err.reason})`);
       } else if (err instanceof SenderDailyLimitExceededError) {
         // ENG-265: the sender's daily counter resets at UTC midnight — releasing
         // the claim here would just re-fail on the very next 5-minute tick until
@@ -149,7 +198,21 @@ async function processEnrollment(
     (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
-  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
+  // A failed READ is not "no such lead": sending on with no lead would skip every per-lead check (do-not-contact, a Smartlead marker). It throws,
+  // so the enrollment is neither sent nor advanced and is retried on the next pass. (A lead that is simply gone still reads as null.)
+  let leadReadFailed = false;
+  const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId, { consistentRead: true }).catch(() => { leadReadFailed = true; return null; });
+  if (leadReadFailed) throw new Error(`Could not read lead ${enrollment.leadId} for enrollment ${enrollment.enrollmentId}; will retry`);
+
+  // ENG-673: this send must not reach a contact that is gone or marked do-not-contact, whatever the sequence's exit settings say (a sequence saved
+  // with onUnsubscribe off, or an older one without the field, used to skip the check in checkExitConditions). Checked on the lead just read,
+  // right before the send, so it cannot be skipped by a second read failing.
+  if (!lead || isDoNotContact(lead)) {
+    console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: ${lead ? 'lead is marked do-not-contact' : 'lead no longer exists'}`);
+    await dripSequenceDb.exitEnrollment(enrollment.enrollmentId, lead ? 'unsubscribed' : 'manual');
+    stats.exited++;
+    return;
+  }
 
   // Check enrollment condition — exit (not just skip) if lead no longer meets it
   if (sequence.enrollmentCondition) {
@@ -246,6 +309,15 @@ async function sendEmailStep(
     return false;
   }
 
+  // ENG-673: a lead pushed to a customer's Smartlead campaign is being emailed from there. AgentWeb's own sequence must not also write to
+  // them (two senders, and Smartlead's unsubscribe and bounce handling would not see these emails). Checked HERE, at send time, not at
+  // enrolment, because a lead can be pushed after it was enrolled. The step is skipped like any step the lead cannot receive; LinkedIn
+  // steps are unaffected.
+  if (isPushedToSmartlead(lead)) {
+    console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead is being emailed through Smartlead`);
+    return false;
+  }
+
   // Load configured senders for this user
   const senderConfig = await loadSenderConfig(enrollment.userId);
 
@@ -326,6 +398,16 @@ async function sendLinkedInStep(
   }
 
   // Resolve which LinkedIn account to send from
+  if (step.linkedInAccountId) {
+    // ENG-2205: a pinned account must be the sequence owner's own or org-shared one. Checked here
+    // as well as on sequence write because sequences saved before that check may name any account.
+    // A config problem, so it throws (retried once the user fixes the step) rather than skipping.
+    const { resolveLinkedInAccountForWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+    if (!(await resolveLinkedInAccountForWrite(enrollment.userId, step.linkedInAccountId))) {
+      console.error(`[dripWorker] LinkedIn step ${step.stepNumber} for enrollment ${enrollment.enrollmentId}: pinned account is not connected to user ${enrollment.userId}`);
+      throw new PinnedLinkedInAccountNotConnectedError(step.stepNumber, enrollment.userId);
+    }
+  }
   const accountId = step.linkedInAccountId
     || await linkedInOutreachService.resolveAccountId(enrollment.userId);
 
@@ -339,7 +421,16 @@ async function sendLinkedInStep(
     throw new Error(`LinkedIn step ${step.stepNumber} has empty message text`);
   }
 
-  await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  const releaseSlot = await paceDripLinkedInWrite(enrollment.userId, accountId, 'send-message');
+
+  try {
+    await linkedInOutreachService.sendMessage(accountId, linkedInUrl, true, messageText);
+  } catch (err) {
+    // ENG-2529: a send that failed must not keep its daily slot, or a repeatedly failing
+    // enrollment drains the account's daily budget with nothing sent.
+    await releaseSlot();
+    throw err;
+  }
   console.log(`[dripWorker] Sent LinkedIn step ${step.stepNumber} to ${linkedInUrl} (account: ${accountId})`);
 
   // Cache the provider_id so reply-exit checks don't need to re-resolve the URL
@@ -350,6 +441,31 @@ async function sendLinkedInStep(
     } catch { /* non-critical */ }
   }
   return true;
+}
+
+/**
+ * ENG-2529: every drip LinkedIn write goes through the same gate as the agent tool and CRM routes.
+ * An account the sequence owner owns or shares gets the full gate (daily cap + hourly pacer);
+ * a shared-pool fallback account has no owner record to reserve a daily slot against, so it is
+ * still held to the per-account hourly pacer. Which account is used stays with ENG-1759/ENG-2347.
+ * Throws LinkedInWriteDeferredError on refusal so the caller never sends.
+ */
+export async function paceDripLinkedInWrite(userId: string, accountId: string, action: 'send-message' | 'send-invite'): Promise<() => Promise<void>> {
+  const { resolveLinkedInAccountForWrite, paceLinkedInWrite, releaseLinkedInDailySlot } = await import('./agentMode/linkedInDailyVolumeGate');
+  const resolved = await resolveLinkedInAccountForWrite(userId, accountId);
+  if (resolved) {
+    const paced = await paceLinkedInWrite(action, resolved, accountId);
+    if (paced.refusal) {
+      throw new LinkedInWriteDeferredError(paced.refusal.gate, paced.refusal.error.split('\n')[0], accountId);
+    }
+    return () => releaseLinkedInDailySlot(action, resolved, accountId, paced.reservedWindowStartedAt);
+  }
+  const { reserveWriteSlot } = await import('./linkedInWritePacer');
+  const slot = await reserveWriteSlot(accountId);
+  if (!slot.allowed) {
+    throw new LinkedInWriteDeferredError('write_pacer', String(slot.reason ?? 'write pacer refused'), accountId);
+  }
+  return async () => {};
 }
 
 async function checkExitConditions(
@@ -372,7 +488,7 @@ async function checkExitConditions(
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
-  // Check if lead has unsubscribed — always enforced (onUnsubscribe is always true)
+  // Check if lead has unsubscribed. (processEnrollment also checks right before the send, whatever this setting says.)
   if (exitConditions.onUnsubscribe && lead && isDoNotContact(lead)) {
     console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} has unsubscribed`);
     return 'unsubscribed';
@@ -393,7 +509,18 @@ async function checkExitConditions(
   // 'opened' and 'clicked': a sequence set to stop when a lead REPLIED kept on sending.
   if (exitConditions.onEmailEngagement?.length) {
     const user = await userDb.getUserById(enrollment.userId).catch(() => null);
-    const emailDomain = (user as any)?.emailDomain;
+    // Opslane run 1268 P2: CRM sending domains live in emailDomains[] (ENG-265); the
+    // legacy single emailDomain may be empty for accounts set up after that. Read events
+    // for every domain the account sends from, deduped.
+    const domainSet = new Set<string>();
+    const legacyDomain = String((user as any)?.emailDomain ?? '').trim();
+    if (legacyDomain) domainSet.add(legacyDomain);
+    for (const d of ((user as any)?.emailDomains ?? []) as Array<{ domain?: string }>) {
+      const name = String(d?.domain ?? '').trim();
+      if (name) domainSet.add(name);
+    }
+    const emailDomains = [...domainSet];
+    const emailDomain = emailDomains[0];
 
     // A mailbox-only sender (Gmail/Outlook) has no Resend domain, and Resend webhooks are
     // the only source of these events — so there is nothing to find. Skip rather than
@@ -401,7 +528,7 @@ async function checkExitConditions(
     if (!emailDomain) {
       console.log(
         `[dripWorker] Skipping engagement exit check for enrollment ${enrollment.enrollmentId}: ` +
-        `user ${enrollment.userId} has no emailDomain, so no email events exist`,
+        `user ${enrollment.userId} has no sending domain, so no email events exist`,
       );
     } else {
       // Keyed on the address Resend actually saw, not on the enrollment identity. For a
@@ -409,9 +536,13 @@ async function checkExitConditions(
       // matched nothing and a sequence set to stop on 'replied' kept sending to someone
       // who had already replied. `lead` is loaded above for the unsubscribe check.
       const engagementKey = String((lead as any)?.email ?? '').trim() || enrollment.leadEmail;
-      const events = await emailEventsDb
-        .getEventsByEmailDomainAndLeadEmail(emailDomain, engagementKey)
-        .catch(() => []);
+      const events = (
+        await Promise.all(
+          emailDomains.map((d) =>
+            emailEventsDb.getEventsByEmailDomainAndLeadEmail(d, engagementKey).catch(() => []),
+          ),
+        )
+      ).flat();
 
       // Scope to engagement that happened AFTER this enrollment started.
       //
@@ -424,17 +555,22 @@ async function checkExitConditions(
       // count — better to keep sending than to silently kill a live sequence.
       const enrolledAt = new Date(enrollment.enrolledAt).getTime();
       const wanted = exitConditions.onEmailEngagement;
-      const trigger = events.find((e: any) => {
-        const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
-        if (!Number.isFinite(at) || at <= enrolledAt) return false;
-
-        if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
-        if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
-        // An inbound reply is stored as email.received, with leadEmail set to the SENDER
-        // (i.e. the lead) — see emailEventsDb.extractLeadEmail.
-        if (wanted.includes('replied') && e.eventType === 'email.received') return true;
-        return false;
+      // ENG-2548: opens/clicks go through dripEngagementClassifier — link scanners and
+      // image proxies no longer exit a lead. Replies always count.
+      const { trigger, suppressed } = selectEngagementExitTrigger(events, enrolledAt, wanted, {
+        emailEverSent: !!(enrollment as any).lastEmailSentAt,
       });
+      for (const s of suppressed) {
+        const detail = s.event?.data?.click || s.event?.data?.open || {};
+        console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
+          enrollmentId: enrollment.enrollmentId,
+          sequenceId: enrollment.sequenceId,
+          eventType: s.event?.eventType,
+          reason: s.reason,
+          exitSuppressed: true,
+          userAgent: detail.userAgent || null,
+        }));
+      }
 
       if (trigger) {
         // Name the exact event that caused this, and carry the two fields that would expose
@@ -453,7 +589,7 @@ async function checkExitConditions(
         // starts appearing, we will know rather than infer. Tracked separately.
         const t = trigger as any;
         const detail = t.data?.click || t.data?.open || {};
-        const sentAt = t.data?.created_at ? new Date(String(t.data.created_at).replace(' ', 'T')).getTime() : NaN;
+        const sentAt = parseResendTimestamp(t.data?.created_at) ?? NaN;
         const eventAt = new Date(t.createdAt).getTime();
         const gapSeconds = Number.isFinite(sentAt) ? Math.round((eventAt - sentAt) / 1000) : null;
 
@@ -464,6 +600,18 @@ async function checkExitConditions(
           `gapFromSend=${gapSeconds === null ? 'unknown' : `${gapSeconds}s`}; ` +
           `userAgent=${detail.userAgent || 'n/a'})`,
         );
+        // ENG-2524: make the tripwire observable. Logging only — the exit is unchanged.
+        const gapMs = Number.isFinite(sentAt) ? eventAt - sentAt : null;
+        if (isSuspectedMachineEngagement(t.eventType, gapMs)) {
+          console.warn('[dripWorker] suspected_machine_engagement', JSON.stringify({
+            enrollmentId: enrollment.enrollmentId,
+            sequenceId: enrollment.sequenceId,
+            eventType: t.eventType,
+            gapFromSendMs: gapMs,
+            userAgent: detail.userAgent || null,
+            ipAddress: detail.ipAddress || null,
+          }));
+        }
         return 'engagement';
       }
     }

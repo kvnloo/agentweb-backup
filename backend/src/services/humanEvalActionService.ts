@@ -70,6 +70,19 @@ async function reviseAgentModeImage(
       );
       return;
     }
+    // ENG-669 PR-C: the chat's model was refused (runVerifiedChat saved the refusal to the chat). The ack promised a
+    // post-back, so post the refusal and what to do instead of dropping it.
+    const { isModelUnavailableError } = await import('./agentMode/modelUnavailable');
+    if (isModelUnavailableError(error)) {
+      if (!candidate.slackChannel) return;
+      const { postSlackMessage } = await import('./slackService');
+      const { modelRefusalReviewerNotice } = await import('../utils/modelRefusalReviewerNotice');
+      await postSlackMessage(candidate.slackChannel, await modelRefusalReviewerNotice(error), candidate.slackMessageTs)
+        .catch((slackErr: any) =>
+          console.warn('[human-eval] failed to post model-refusal notice:', slackErr?.message || slackErr),
+        );
+      return;
+    }
     throw error;
   }
 }

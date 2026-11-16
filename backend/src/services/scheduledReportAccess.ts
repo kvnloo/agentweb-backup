@@ -32,10 +32,12 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_chat_history',
   'get_session_transcript',
   'get_user_by_id',
+  'inspect_client_usage',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
   'check_account_tracking_health',
+  'read_client_meta_activity',
   'diagnose_leads_at_zero',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
@@ -45,19 +47,48 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_meta_ads_metrics',
 ];
 
+// ENG-2785: the ENG-1801 Meta Ads tools are customer-facing. They can only read
+// another account's data when the CALLER is a platform admin passing client_id
+// (getMetaCredentials ignores client_id for everyone else), so for a run owned
+// by a positively-verified NON-admin they read only the owner's own account and
+// must not make the report sensitive. Unknown owner admin status stays on the
+// safe side (full list).
+export const ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS = [
+  'list_meta_ads_campaigns',
+  'call_meta_ads_insights_api',
+  'get_meta_ads_metrics',
+];
+
+export interface CrossAccountClassifyOptions {
+  /**
+   * The run/schedule owner's platform admin status. Only an explicit `false`
+   * (owner looked up and verified non-admin) relaxes classification.
+   */
+  ownerIsAdmin?: boolean;
+}
+
+function crossAccountToolsFor(opts?: CrossAccountClassifyOptions): string[] {
+  if (opts?.ownerIsAdmin === false) {
+    return CROSS_ACCOUNT_USER_DATA_TOOLS.filter((t) => !ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS.includes(t));
+  }
+  return CROSS_ACCOUNT_USER_DATA_TOOLS;
+}
+
 /**
  * True when the run called any tool that reads cross-account user data, so its
  * report must be treated as sensitive for distribution. Accepts the session's
  * `calledFunctions` in either shape (map of name->count, or an array of names).
  */
 export function reportContainsCrossAccountData(
-  calledFunctions?: Record<string, number> | string[] | null
+  calledFunctions?: Record<string, number> | string[] | null,
+  opts?: CrossAccountClassifyOptions,
 ): boolean {
   if (!calledFunctions) return false;
   const names = Array.isArray(calledFunctions)
     ? calledFunctions
     : Object.keys(calledFunctions);
-  return names.some((n) => CROSS_ACCOUNT_USER_DATA_TOOLS.includes(n));
+  const tools = crossAccountToolsFor(opts);
+  return names.some((n) => tools.includes(n));
 }
 
 /**
@@ -72,19 +103,21 @@ export function reportContainsCrossAccountData(
  * message's `tool_calls[].function.name` or a tool-result message's `name`.
  */
 export function messagesReferenceCrossAccountTool(
-  messages: Array<Record<string, any>> | null | undefined
+  messages: Array<Record<string, any>> | null | undefined,
+  opts?: CrossAccountClassifyOptions,
 ): boolean {
   if (!messages || messages.length === 0) return false;
+  const tools = crossAccountToolsFor(opts);
   for (const m of messages) {
     const toolCalls = m?.tool_calls;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
         const name = tc?.function?.name ?? tc?.name;
-        if (name && CROSS_ACCOUNT_USER_DATA_TOOLS.includes(name)) return true;
+        if (name && tools.includes(name)) return true;
       }
     }
     const directName = m?.name; // tool-result messages carry the tool name
-    if (directName && CROSS_ACCOUNT_USER_DATA_TOOLS.includes(directName)) return true;
+    if (directName && tools.includes(directName)) return true;
   }
   return false;
 }
@@ -279,9 +312,9 @@ export function buildRecipientRemediation(params: {
 export function scheduleLikelySensitive(schedule: {
   lastKnownSensitive?: boolean;
   requiredFunctionCalls?: string[] | null;
-} | null | undefined): boolean {
+} | null | undefined, opts?: CrossAccountClassifyOptions): boolean {
   if (!schedule) return false;
-  return schedule.lastKnownSensitive === true || reportContainsCrossAccountData(schedule.requiredFunctionCalls || null);
+  return schedule.lastKnownSensitive === true || reportContainsCrossAccountData(schedule.requiredFunctionCalls || null, opts);
 }
 
 /**
@@ -318,9 +351,10 @@ export async function checkScheduleActivationRecipients(params: {
   recipients: string[];
   ownerEmail?: string | null;
   schedule: { lastKnownSensitive?: boolean; requiredFunctionCalls?: string[] | null };
+  ownerIsAdmin?: boolean;
 }): Promise<RecipientRemediation | null> {
   const recipients = (params.recipients || []).filter(Boolean);
-  if (recipients.length === 0 || !scheduleLikelySensitive(params.schedule)) return null;
+  if (recipients.length === 0 || !scheduleLikelySensitive(params.schedule, { ownerIsAdmin: params.ownerIsAdmin })) return null;
   const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail: params.ownerEmail, isSensitive: true });
   if (authz.authorized.length > 0) return null;
   return buildRecipientRemediation({

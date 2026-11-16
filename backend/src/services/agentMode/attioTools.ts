@@ -33,6 +33,38 @@ async function runWithConcurrency<T, R>(items: T[], concurrency: number, fn: (it
   return results;
 }
 
+const RECORD_ENTITY_ALIASES: Record<string, 'people' | 'companies'> = {
+  PERSON: 'people', PEOPLE: 'people', CONTACT: 'people', CONTACTS: 'people',
+  COMPANY: 'companies', COMPANIES: 'companies',
+};
+const SEARCH_ACTION_ALIASES = new Set(['SEARCH', 'SEARCH_RECORDS', 'FIND', 'FIND_RECORDS']);
+
+/**
+ * Repairs the model's common call_attio_api record-lookup shapes (ENG-2580,
+ * prod agent_tool_failed): `{action:'search_records', params:{query}}` with no
+ * entity_type, and `{entity_type:'person', action:'list'}`. Hoists `params.*`
+ * fields that are not already set at the top level.
+ */
+export function normalizeAttioArgs(raw: any): { args: any; entityType: string; action: string } {
+  const args: any = { ...(raw ?? {}) };
+  if (args.params && typeof args.params === 'object' && !Array.isArray(args.params)) {
+    for (const [k, v] of Object.entries(args.params)) if (args[k] === undefined) args[k] = v;
+  }
+  let entityType = String(args.entity_type ?? '').toUpperCase();
+  let action = String(args.action ?? '').toUpperCase();
+  if (SEARCH_ACTION_ALIASES.has(action)) action = 'SEARCH';
+  if (RECORD_ENTITY_ALIASES[entityType]) {
+    if (args.object_type === undefined) args.object_type = RECORD_ENTITY_ALIASES[entityType];
+    entityType = 'RECORDS';
+  }
+  if (!entityType && action === 'SEARCH' && args.query !== undefined) entityType = 'RECORDS';
+  // No workspace endpoint is exposed by this service. Reach the actionable
+  // handler diagnostic rather than failing required-field validation.
+  if (!entityType && action === 'GET_WORKSPACE') entityType = 'WORKSPACE';
+  delete args.params;
+  return { args, entityType, action };
+}
+
 async function resolveAttioService(userId: string, accountId?: string): Promise<AttioService> {
   try {
     return await AttioService.create(userId, accountId);
@@ -116,8 +148,16 @@ async function isAttioCompanyList(svc: AttioService, attioListId: string): Promi
  * (emma/tools.ts) for the full ENTITY_TYPE + ACTION matrix.
  */
 export async function handleAttioApi(userId: string, args: any): Promise<any> {
-  const entityType: string = (args?.entity_type ?? '').toUpperCase();
-  const action: string = (args?.action ?? '').toUpperCase();
+  const normalized = normalizeAttioArgs(args);
+  args = normalized.args;
+  const entityType: string = normalized.entityType;
+  const action: string = normalized.action;
+  if (!entityType) {
+    return { success: false, error: 'entity_type is required. Valid: RECORDS (SEARCH/LIST people or companies), LIST_ENTRIES, LISTS.' };
+  }
+  if (!['RECORDS', 'LIST_ENTRIES', 'LISTS'].includes(entityType)) {
+    return { success: false, error: `Unknown entity_type "${entityType}". Valid: RECORDS (SEARCH/LIST people or companies), LIST_ENTRIES (LIST/COUNT/ADD_ENTRIES/REMOVE_ENTRIES), LISTS. Workspace lookup is not supported; use LISTS LIST to discover lists.` };
+  }
   try {
     const svc = await resolveAttioService(userId, args?.account_id);
 
@@ -139,16 +179,32 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
               : {}),
           };
         }
+        case 'LIST': {
+          // Read one page of the list's entries (ENG-2578). Agents asked for
+          // this and got "Unknown action" — there was no read path at all.
+          if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES LIST.' };
+          const rawOffset = Number(args?.offset ?? 0);
+          const offset = Number.isInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+          const attioListId = await resolveAttioListId(userId, args.list_id, false);
+          const { entries, nextOffset } = await svc.listListEntriesDetailed(attioListId, offset);
+          return {
+            success: true,
+            entries: entries.map(e => ({ entryId: e.entryId, recordId: e.personRecordId, values: e.values })),
+            ...(nextOffset !== undefined ? { next_offset: nextOffset } : {}),
+          };
+        }
         case 'ADD_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES ADD_ENTRIES.' };
           // record_ids comes from model-generated tool arguments and is never
           // type-checked against the schema — a string here (e.g. a single id
           // passed without brackets) has a truthy .length and would otherwise
           // be iterated character-by-character.
-          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
-          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+          const rawAddIds: unknown[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!rawAddIds.length || rawAddIds.some(id => typeof id !== 'string' || !id.trim())) {
             return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES ADD_ENTRIES.' };
           }
+          // Dedupe within the call — each add is otherwise its own entry (ENG-2632).
+          const recordIds: string[] = [...new Set((rawAddIds as string[]).map(id => id.trim()))];
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -159,9 +215,9 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           const isCompanyList = await isAttioCompanyList(svc, attioListId);
           const results = await runWithConcurrency(recordIds, LIST_ENTRY_CONCURRENCY, async recordId => {
             try {
-              const entryId = isCompanyList
-                ? await svc.addCompanyToList(attioListId, recordId)
-                : await svc.addPersonToList(attioListId, recordId);
+              // Upsert (PUT) so re-adding a record already on the list is a
+              // no-op rather than a second entry (ENG-2632).
+              const entryId = await svc.upsertListEntry(attioListId, recordId, isCompanyList ? 'companies' : 'people');
               return { recordId, success: true, entryId };
             } catch (err: any) {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
@@ -173,10 +229,11 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
         }
         case 'REMOVE_ENTRIES': {
           if (!args?.list_id) return { success: false, error: 'list_id is required for LIST_ENTRIES REMOVE_ENTRIES.' };
-          const recordIds: string[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
-          if (!recordIds.length || recordIds.some(id => typeof id !== 'string' || !id.trim())) {
+          const rawRemoveIds: unknown[] = Array.isArray(args?.record_ids) ? args.record_ids : [];
+          if (!rawRemoveIds.length || rawRemoveIds.some(id => typeof id !== 'string' || !id.trim())) {
             return { success: false, error: 'record_ids must be a non-empty array of record id strings for LIST_ENTRIES REMOVE_ENTRIES.' };
           }
+          const recordIds: string[] = [...new Set((rawRemoveIds as string[]).map(id => id.trim()))];
           if (recordIds.length > MAX_LIST_ENTRY_RECORD_IDS) {
             return { success: false, error: `record_ids exceeds the maximum of ${MAX_LIST_ENTRY_RECORD_IDS} per call.` };
           }
@@ -185,10 +242,12 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           const objectSlug: 'people' | 'companies' = isCompanyList ? 'companies' : 'people';
           const results = await runWithConcurrency(recordIds, LIST_ENTRY_CONCURRENCY, async recordId => {
             try {
-              const entryId = await svc.findListEntry(attioListId, recordId, objectSlug);
-              if (!entryId) return { recordId, success: false, error: 'No list entry found for this record.' };
-              await svc.deleteListEntry(attioListId, entryId);
-              return { recordId, success: true };
+              // A record can hold several entries in one list; remove them all
+              // or the record stays on the list after a "remove" (ENG-2632).
+              const entryIds = await svc.findListEntries(attioListId, recordId, objectSlug);
+              if (!entryIds.length) return { recordId, success: false, error: 'No list entry found for this record.' };
+              for (const entryId of entryIds) await svc.deleteListEntry(attioListId, entryId);
+              return { recordId, success: true, removedEntries: entryIds.length };
             } catch (err: any) {
               return { recordId, success: false, error: err?.response?.data?.message ?? err?.message };
             }
@@ -196,7 +255,7 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
           return { success: results.some(r => r.success), results };
         }
         default:
-          return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, ADD_ENTRIES, REMOVE_ENTRIES.` };
+          return { success: false, error: `Unknown action "${action}" for LIST_ENTRIES. Valid: COUNT, LIST, ADD_ENTRIES, REMOVE_ENTRIES.` };
       }
     }
 
@@ -234,7 +293,36 @@ export async function handleAttioApi(userId: string, args: any): Promise<any> {
       }
     }
 
-    return { success: false, error: `Unknown entity_type "${entityType}". Valid: LIST_ENTRIES, LISTS.` };
+    // ─── RECORDS (ENG-2580) ────────────────────────────────────────────────
+    // Read-only People/Company lookup. Agents tried search_records / PERSON
+    // LIST and had no read path at all.
+    if (entityType === 'RECORDS') {
+      const objectSlug: 'people' | 'companies' = args?.object_type === 'companies' ? 'companies' : 'people';
+      switch (action) {
+        case 'SEARCH': {
+          const query = typeof args?.query === 'string' ? args.query.trim() : '';
+          if (!query) return { success: false, error: 'query is required for RECORDS SEARCH.' };
+          const records = await svc.searchRecords(objectSlug, query);
+          return { success: true, object_type: objectSlug, records };
+        }
+        case 'LIST': {
+          const rawOffset = Number(args?.offset ?? 0);
+          const offset = Number.isInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+          const page = objectSlug === 'companies' ? await svc.listCompanies(offset) : await svc.listPeople(offset);
+          const records = 'companies' in page ? page.companies : page.people;
+          return {
+            success: true,
+            object_type: objectSlug,
+            records,
+            ...(page.nextOffset !== undefined ? { next_offset: page.nextOffset } : {}),
+          };
+        }
+        default:
+          return { success: false, error: `Unknown action "${action}" for RECORDS. Valid: SEARCH, LIST.` };
+      }
+    }
+
+    return { success: false, error: `Unknown entity_type "${entityType}". Valid: RECORDS, LIST_ENTRIES, LISTS.` };
   } catch (err: any) {
     return { success: false, error: err?.message ?? 'Attio API call failed.', attioError: err?.response?.data ?? null, status: err?.response?.status ?? null };
   }

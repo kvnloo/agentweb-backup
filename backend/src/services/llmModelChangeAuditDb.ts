@@ -71,6 +71,12 @@ export interface ModelChangeAuditRecord {
    * not.
    */
   modelBefore: string | null;
+  /**
+   * ENG-669: who chose `modelBefore` when it was not the owner ('system' = inherited from an admin-authored schedule
+   * template, exempt from the tier model allowlist), so an undo restores that origin too. Absent = the owner's pin or
+   * inheritance (the apply did not touch the origin), and on rows written before this field existed.
+   */
+  modelSourceBefore?: 'system';
   modelAfter: string;
   /** What we told the customer this would recover, at the moment they agreed. */
   estimatedDaysRecoveredAtDecision: number | null;

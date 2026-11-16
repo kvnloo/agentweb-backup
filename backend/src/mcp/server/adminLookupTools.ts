@@ -132,3 +132,32 @@ mcpToolRegistry.register({
     }
   },
 });
+
+mcpToolRegistry.register({
+  name: 'inspect_client_usage',
+  definition: {
+    name: 'inspect_client_usage',
+    description: "ENG-2771: a named client's effective usage allowance for the CURRENT month — billing owner, paused, gatedBy, used, limit, percentUsed, resetsOn, usagePolicyVersion — exactly as the usage enforcer decided it. Admin-only, read-only, internal: never relay the raw output to a customer-facing channel. Cannot change tiers, bonuses, or counters. Pass email or user_id.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Account email of the client.' },
+        user_id: { type: 'string', description: 'Internal userId of the client (or an org member; resolved to the billing owner).' },
+      },
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const email = typeof args?.email === 'string' ? args.email.trim() : '';
+    const userId = typeof args?.user_id === 'string' ? args.user_id.trim() : '';
+    if (!email && !userId) return jsonResult({ error: 'email or user_id is required.' });
+    const qs = userId ? `userId=${encodeURIComponent(userId)}` : `email=${encodeURIComponent(email)}`;
+    try {
+      const data: any = await mcpFetch({ method: 'GET', path: `/api/admin/usage/enforcement?${qs}`, context: ctx(context) });
+      return jsonResult({ found: true, internalAdminOnly: true, ...data });
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (/^API error \(404\)/.test(msg)) return jsonResult({ found: false, ...(userId ? { userId } : { email }) });
+      throw err;
+    }
+  },
+});

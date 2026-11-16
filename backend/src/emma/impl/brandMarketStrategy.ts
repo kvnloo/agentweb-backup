@@ -82,6 +82,13 @@ import {
   getPersistedBrandLogoAssetUrl,
 } from '../../services/agentMode/brandLogo';
 import { buildReadyPatch, logCompletionMetric } from '../../services/brandBuildStatusService';
+import {
+  brandBuildOwnershipCondition,
+  countHumanMessages,
+  isClaimSuperseded,
+  parseBrandBuildSessionClaim,
+  shouldRefuseBrandBuildSessionWrite,
+} from '../../services/brandBuildSessionMarker';
 
   // Read current user's brand guidelines
 export async function readBrandGuidelines(userId: string): Promise<any> {
@@ -278,7 +285,7 @@ export async function readMarketStrategy(
   }
 
   // Update user's market strategy
-export async function updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean } = {}): Promise<any> {
+export async function updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean; sessionId?: string } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('../../services/db');
       const { canEditItem } = await import('../../services/orgShareService');
@@ -291,6 +298,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
           error: 'User not found'
         };
       }
+
+      // ENG-2308: refuse / condition writes from a superseded brand-build session.
+      const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
+      if (guard.refuse) return supersededResult();
 
       // Org members: only the org owner or a listed marketingStrategy editor
       // may update. Solo users are unaffected.
@@ -386,9 +397,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
 
       // Update org-level or personal market strategy
       if (user.orgId) {
+        await guard.assertStillCurrent();
         await orgDb.updateOrg(user.orgId, { marketStrategy: marketStrategyData });
       } else {
-        await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
+        await guard.userWrite({ marketStrategy: marketStrategyData });
       }
 
       // ENG-2103 (F2): lazily required — brandGuidelinesPopulation.ts
@@ -452,6 +464,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
         formattedContent
       };
     } catch (error) {
+      if (error instanceof SupersededBrandBuildWrite) {
+        console.warn('[brandBuild] dropping market-strategy update from a superseded brand-build session: a newer claim took over mid-call');
+        return supersededResult();
+      }
       console.error('AgentMode: Error updating market strategy:', error);
       return {
         success: false,
@@ -462,7 +478,261 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
   }
 
   // Update user's brand guidelines (supports both brandData and attachments)
-export async function updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
+/** A write made for a brand-build session lost the race to a reclaim (ENG-2308). */
+class SupersededBrandBuildWrite extends Error {
+  constructor() {
+    super('brand build superseded');
+    this.name = 'SupersededBrandBuildWrite';
+  }
+}
+
+const SUPERSEDED_MESSAGE =
+  'This brand build was superseded by a newer run, so this update was not applied. Stop now: do not retry, do not change the arguments, and end your turn.';
+
+/**
+ * Result for a refused write. Shaped as a deliberate policy refusal
+ * (`blocked` + `reason`, ENG-1636) so the dispatcher does not count it as a tool
+ * malfunction. The stop instruction is in `error`, not only `message`, because
+ * extractToolResultMessage prefers `error` and that is all the model is shown.
+ */
+function supersededResult() {
+  return {
+    success: false,
+    blocked: true,
+    reason: 'superseded_brand_build',
+    superseded: true,
+    error: SUPERSEDED_MESSAGE,
+    message: SUPERSEDED_MESSAGE,
+  };
+}
+
+interface BrandBuildSessionGuard {
+  /** The session's writes must be refused outright. */
+  refuse: boolean;
+  /** Set when the session belongs to the CURRENT build: its writes carry this claim as a condition. */
+  claim?: string;
+  /** Writes made for the guarded session; throws SupersededBrandBuildWrite if a reclaim lands first. */
+  userWrite: (patch: Record<string, unknown>) => Promise<any>;
+  /** Org-level writes cannot be conditioned on the user's claim, so re-check it consistently just before. */
+  assertStillCurrent: () => Promise<void>;
+  /**
+   * ENG-2875: true while this is the automated brand-build turn (current claim,
+   * and either the build is still running or no human has written in the
+   * session yet). A later tool call in the same automated turn stays additive
+   * even after an earlier call flipped the status to ready.
+   */
+  automatedTurn: boolean;
+  /**
+   * ENG-2875: the session history needed to decide automatedTurn could not be
+   * read. Founder updates must fail (retryable) rather than guess.
+   */
+  historyReadFailed: boolean;
+}
+
+/**
+ * ENG-2308: decide how a brand-guidelines / market-strategy write from `sessionId`
+ * must behave, BEFORE anything is written. A brand build's Emma session is not
+ * aborted when the build times out, so a superseded ("zombie") session can still
+ * call these tools after a retry reclaimed the build; it must not overwrite the
+ * newer run's data. Only sessions marked as brand-build sessions are affected
+ * (see brandBuildSessionMarker); ordinary chat, REST saves, no session id, and
+ * old brand-build sessions reopened long after keep the original behavior.
+ */
+async function guardBrandBuildSession(
+  user: any,
+  userDb: any,
+  userId: string,
+  sessionId: string | undefined,
+): Promise<BrandBuildSessionGuard> {
+  const currentStartedAt: string | undefined = user?.brandBuildStartedAt;
+  let sessionClaim: string | undefined;
+  if (sessionId && currentStartedAt) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      sessionClaim = parseBrandBuildSessionClaim(session?.pageIdentifier);
+    } catch (lookupErr: any) {
+      // Cannot tell: treat as an ordinary session (original behavior).
+      console.warn('[brandBuild] session lookup failed; treating as a non-brand-build session', {
+        userId,
+        error: lookupErr?.message ?? String(lookupErr),
+      });
+    }
+  }
+
+  // Whether a human has written in this session is only needed to tell a
+  // zombie from a reopened chat, i.e. when its claim is superseded and no newer
+  // build is in flight. Rare, so reading the history here costs nothing in the
+  // normal case.
+  let humanMessages: number | undefined;
+  if (
+    sessionId &&
+    isClaimSuperseded(sessionClaim, currentStartedAt) &&
+    user?.brandBuildStatus !== 'building'
+  ) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      humanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
+    } catch (historyErr: any) {
+      console.warn('[brandBuild] session history read failed; cannot tell a zombie from a reopened chat', {
+        userId,
+        error: historyErr?.message ?? String(historyErr),
+      });
+    }
+  }
+
+  const refuse = shouldRefuseBrandBuildSessionWrite(
+    sessionClaim,
+    { startedAt: currentStartedAt, status: user?.brandBuildStatus },
+    humanMessages,
+  );
+  if (refuse) {
+    console.warn('[brandBuild] dropping update from a superseded brand-build session', {
+      userId,
+      sessionId,
+      sessionClaim,
+      currentStartedAt,
+    });
+  }
+  // A marked session whose claim is no longer current but is not refused is an
+  // old session reopened later: ordinary chat, so no claim condition either.
+  const claim = !refuse && sessionClaim && sessionClaim === currentStartedAt ? sessionClaim : undefined;
+
+  // ENG-2875: once the build is ready, a current-claim session is still the
+  // automated turn until a human writes in it. Unknown history defaults to
+  // automated (additive); an unreadable history fails founder updates instead.
+  let turnHumanMessages: number | undefined;
+  let historyReadFailed = false;
+  if (claim && user?.brandBuildStatus !== 'building') {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      turnHumanMessages = countHumanMessages(await chatbotDb.getMessagesFromMessagesTable(sessionId, true));
+    } catch (historyErr: any) {
+      console.warn('[brandBuild] session history read failed; founder updates in this call will be refused', {
+        userId,
+        error: historyErr?.message ?? String(historyErr),
+      });
+      historyReadFailed = true;
+      turnHumanMessages = 0;
+    }
+  }
+  const automatedTurn = isScrapeFounderWrite(claim, user?.brandBuildStatus, turnHumanMessages);
+
+  return {
+    refuse,
+    claim,
+    automatedTurn,
+    historyReadFailed,
+    userWrite: async (patch) => {
+      if (!claim) return userDb.updateUser(userId, patch as any);
+      try {
+        return await userDb.updateUser(userId, patch as any, {
+          condition: brandBuildOwnershipCondition(claim),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === 'ConditionalCheckFailedException') throw new SupersededBrandBuildWrite();
+        throw condErr;
+      }
+    },
+    assertStillCurrent: async () => {
+      if (!claim) return;
+      const fresh = user?.email ? await userDb.getUserByEmailConsistent(user.email) : null;
+      if (fresh && fresh.brandBuildStartedAt !== claim) throw new SupersededBrandBuildWrite();
+    },
+  };
+}
+
+/** ENG-2875: a founders entry without a non-blank name would silently drop. */
+export function hasBlankFounderName(founders: unknown[]): boolean {
+  return founders.some((f: any) => !f || typeof f.name !== 'string' || !f.name.trim());
+}
+
+/**
+ * ENG-2875: founders writes are additive only from the current brand-build
+ * session during its automated turn (the site scrape): while the build is
+ * running, or after it is ready but before any human message in the session.
+ * Once a user writes in that session, edits are ordinary (authoritative).
+ */
+export function isScrapeFounderWrite(
+  sessionClaim: string | undefined,
+  brandBuildStatus: unknown,
+  humanMessages?: number,
+): boolean {
+  if (!sessionClaim) return false;
+  if (brandBuildStatus === 'building') return true;
+  return humanMessages === 0;
+}
+
+/**
+ * ENG-2875: merge an incoming founders list onto the stored one.
+ * The incoming array is authoritative for membership (founders it omits are
+ * removed, order follows the incoming list); each incoming founder is
+ * shallow-merged onto the existing founder with the same normalized name so a
+ * partial update (e.g. only voiceExamples) keeps the untouched fields.
+ *
+ * With `additive: true` (the automated onboarding brand build, which only sees
+ * what a site scrape found) no stored founder is removed: matches are merged,
+ * new founders appended, and founders the incoming list omits are kept.
+ */
+export function mergeFounders(
+  existing: unknown,
+  incoming: unknown,
+  opts: { additive?: boolean } = {},
+): any[] {
+  const normalize = (name: any) => (typeof name === 'string' ? name.trim().toLowerCase() : '');
+  const existingFounders: any[] = Array.isArray(existing) ? existing : [];
+  const incomingFounders: any[] = Array.isArray(incoming) ? incoming : [];
+  // Index existing founders by normalized name once (first match wins).
+  const existingByName = new Map<string, any>();
+  for (const f of existingFounders) {
+    const k = f ? normalize(f.name) : '';
+    if (k && !existingByName.has(k)) existingByName.set(k, f);
+  }
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  for (const founder of incomingFounders) {
+    if (!founder || !founder.name) continue;
+    const key = normalize(founder.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const match = existingByName.get(key);
+    merged.push(match ? { ...match, ...founder } : founder);
+  }
+  if (!opts.additive) return merged;
+  // Additive: stored order kept, matched founders updated in place, omitted
+  // founders kept, new founders appended.
+  const mergedByName = new Map(merged.map(m => [normalize(m.name), m] as [string, any]));
+  const out = existingFounders.map(f => {
+    const k = f ? normalize(f.name) : '';
+    const m = k ? mergedByName.get(k) : undefined;
+    if (m) mergedByName.delete(k);
+    return m ?? f;
+  });
+  return [...out, ...merged.filter(m => !existingByName.has(normalize(m.name)))];
+}
+
+/**
+ * ENG-2875: founders update for update_brand_guidelines. An empty incoming
+ * list keeps the stored founders unless clearAll is set (models send
+ * `founders: []` as a default while editing other fields).
+ */
+export function resolveFounderUpdate(
+  existing: unknown,
+  incoming: unknown[],
+  opts: { additive?: boolean; clearAll?: boolean } = {},
+): any[] {
+  if (incoming.length === 0 && !opts.clearAll) return Array.isArray(existing) ? existing : [];
+  return mergeFounders(existing, incoming, { additive: opts.additive });
+}
+
+export async function updateBrandGuidelines(
+  updateData: any,
+  userId: string,
+  opts: { sessionId?: string } = {},
+): Promise<any> {
     try {
       const { userDb, orgDb } = await import('../../services/db');
       const { canEditItem } = await import('../../services/orgShareService');
@@ -475,6 +745,31 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
           error: 'User not found'
         };
       }
+
+      // ENG-2875: reject blank founder names before any write (incl. initial guidelines).
+      const incomingFoundersRaw = (updateData as any)?.brandData?.founders;
+      if (Array.isArray(incomingFoundersRaw) && hasBlankFounderName(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Every founder needs a non-empty name. To remove every founder, pass founders: [] with clearAllFounders: true.',
+          error: 'Invalid founders',
+        };
+      }
+
+      // ENG-2308: refuse / condition writes from a superseded brand-build session.
+      const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
+      if (guard.refuse) return supersededResult();
+      // ENG-2875: without the session history we cannot tell a human removal
+      // from the automated scrape, so fail the founders update (retryable).
+      if (guard.historyReadFailed && Array.isArray(incomingFoundersRaw)) {
+        return {
+          success: false,
+          message: 'Could not verify this session before changing founders. Retry the update.',
+          error: 'Session history unavailable',
+        };
+      }
+      const userWrite = guard.userWrite;
+      const sessionClaim = guard.claim;
 
       // Org members: only the org owner or a listed brandGuidelines editor
       // may update. Solo users are unaffected.
@@ -529,9 +824,10 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
 
         // Update org or user with initial brand guidelines
         if (user.orgId) {
+          await guard.assertStillCurrent();
           await orgDb.updateOrg(user.orgId, { brandGuidelines: initialBrandGuidelines });
         } else {
-          await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
+          await userWrite({ brandGuidelines: initialBrandGuidelines });
         }
 
         // Use the initial structure as the base for updates
@@ -539,7 +835,7 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
       }
 
       // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
-      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
+      const { brandData, brandAssets, refreshMarketStrategy, clearAllFounders, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -547,36 +843,21 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
         ...brandData
       } as any;
 
-      // Special merge logic for founder profiles (merge by normalized founder name)
+      // ENG-2875: a provided founders array is authoritative for membership;
+      // fields are merged onto matching existing founders by normalized name.
+      // The current onboarding brand-build session (sessionClaim set) is a
+      // site scrape, not a user edit, so it never removes stored founders.
+      // Only while the build is still running is the claimed session the
+      // scrape; a user reopening it after the build is ready edits normally.
       if (brandData && Array.isArray((brandData as any).founders)) {
-        const normalize = (name: any) =>
-          typeof name === 'string' ? name.trim().toLowerCase() : '';
-
-        const existingFounders: any[] = Array.isArray((existingBrand.brandData as any)?.founders)
-          ? (existingBrand.brandData as any).founders
-          : [];
-        const incomingFounders: any[] = (brandData as any).founders || [];
-
-        const mergedFounders: any[] = [...existingFounders];
-        for (const newFounder of incomingFounders) {
-          if (!newFounder || !newFounder.name) continue;
-          const key = normalize(newFounder.name);
-          if (!key) continue;
-
-          const idx = mergedFounders.findIndex(
-            f => f && normalize(f.name) === key
-          );
-          if (idx >= 0) {
-            // Merge fields so a partial update (e.g. only voiceExamples) preserves other fields
-            mergedFounders[idx] = { ...mergedFounders[idx], ...newFounder };
-          } else {
-            // Append as new founder
-            mergedFounders.push(newFounder);
-          }
-        }
-
-        // Assign the merged array back
-        updatedBrandData.founders = mergedFounders;
+        const incomingFounders: any[] = (brandData as any).founders;
+        // ENG-2875: an empty founders array alongside another edit is a model
+        // default, not a removal. Clearing every founder needs clearAllFounders.
+        updatedBrandData.founders = resolveFounderUpdate(
+          (existingBrand.brandData as any)?.founders,
+          incomingFounders,
+          { additive: guard.automatedTurn, clearAll: clearAllFounders === true },
+        );
       }
 
       // Reject SVG files for logo/secondaryLogo assets
@@ -782,13 +1063,14 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
       };
 
       if (user.orgId) {
+        await guard.assertStillCurrent();
         await orgDb.updateOrg(user.orgId, { brandGuidelines: updatedGuidelines });
       } else {
-        await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
+        await userWrite({ brandGuidelines: updatedGuidelines });
       }
 
       const marketStrategyRefresh = refreshMarketStrategy === true
-        ? await regenerateMarketStrategy(userId)
+        ? await regenerateMarketStrategy(userId, {}, { sessionId: opts.sessionId })
         : undefined;
 
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
@@ -797,8 +1079,26 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
       try {
         const readyPatch = buildReadyPatch(user as any);
         if (readyPatch) {
-          await userDb.updateUser(userId, readyPatch);
-          logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+          // A brand-build session completes only its own claim (the superseded
+          // case returned above); the condition covers a reclaim landing since.
+          let landed = false;
+          if (sessionClaim) {
+            try {
+              await userDb.updateUser(userId, readyPatch, {
+                condition: brandBuildOwnershipCondition(sessionClaim),
+              });
+              landed = true;
+            } catch (condErr: any) {
+              if (condErr?.code !== 'ConditionalCheckFailedException') throw condErr;
+              console.warn('[brandBuild] dropping stale ready flip: a newer claim owns the build', { userId });
+            }
+          } else {
+            await userDb.updateUser(userId, readyPatch);
+            landed = true;
+          }
+          if (landed) {
+            logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+          }
         }
       } catch (e) {
         console.warn("[brandBuild] ready-patch failed (agentMode path)", e);
@@ -847,6 +1147,10 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
         formattedContent
       };
     } catch (error) {
+      if (error instanceof SupersededBrandBuildWrite) {
+        console.warn('[brandBuild] dropping update from a superseded brand-build session: a newer claim took over mid-call');
+        return supersededResult();
+      }
       console.error('AgentMode: Error updating brand guidelines:', error);
       return {
         success: false,
@@ -888,6 +1192,7 @@ export async function regenerateMarketStrategy(
       llm?: any;
       webSearchFn?: any;
     } = {},
+    opts: { sessionId?: string } = {},
   ): Promise<any> {
     try {
       const { userDb } = await import('../../services/db');
@@ -941,7 +1246,7 @@ export async function regenerateMarketStrategy(
 
       // Persist via updateMarketStrategy with replace:true so org-vs-user routing,
       // permission checks, and businessOverview preservation are all reused.
-      const writeResult = await updateMarketStrategy({ icp, competitors }, userId, { replace: true });
+      const writeResult = await updateMarketStrategy({ icp, competitors }, userId, { replace: true, sessionId: opts.sessionId });
       if (!writeResult.success) return writeResult;
 
       return {

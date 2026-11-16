@@ -383,6 +383,24 @@ check_workflow() {
   fi
 }
 
+# check_alert_job: like check_workflow, but scoped to the notify-deploy-failure
+# job block. ENG-2677 added a separate success-only notify-feature-launch job;
+# AC2/AC4 are claims about the FAILURE alert, not the whole file.
+check_alert_job() {
+  local desc="$1" pattern="$2" expectation="$3" block
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  block="$(awk '/^  notify-deploy-failure:$/{f=1;print;next} f&&/^  [a-z0-9-]+:$/{f=0} f' "${DEPLOY_WORKFLOW}" | sed -e 's/^[[:space:]]*#.*$//')"
+  if [ -z "${block}" ]; then
+    record_fail "${desc}" "notify-deploy-failure job block not found"
+    return
+  fi
+  if printf '%s\n' "${block}" | grep -E "${pattern}" >/dev/null; then
+    if [ "${expectation}" = 'present' ]; then pass "${desc}"; else record_fail "${desc}" "notify-deploy-failure unexpectedly matches: ${pattern}"; fi
+  else
+    if [ "${expectation}" = 'absent' ]; then pass "${desc}"; else record_fail "${desc}" "notify-deploy-failure does not match: ${pattern}"; fi
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -673,6 +691,24 @@ set_slack_response "$M" ''
 run_alert "$M"
 check 'AC4: an empty Slack response body fails the step' 1 'delivery cannot be confirmed'
 
+# Whitespace and JSON streams are not a single response/secret object.
+for invalid in '   ' '{} {}'; do
+  M=$(new_mock_dir)
+  set_slack_response "$M" "$invalid"
+  run_alert "$M"
+  check 'AC4: whitespace/JSON-stream response fails validation' 1 'delivery cannot be confirmed'
+
+  M=$(new_mock_dir)
+  set_secret_string "$M" "$invalid"
+  run_alert "$M"
+  if [ "$invalid" = '   ' ]; then
+    check 'AC4: whitespace secret fails before JSON validation' 1 'returned an empty SecretString'
+  else
+    check 'AC4: JSON-stream secret fails validation' 1 'is not a JSON object'
+  fi
+  check_nothing_posted 'AC4: invalid secret never reaches Slack'
+done
+
 # Misconfiguration fails closed rather than posting a half-formed alert.
 M=$(new_mock_dir)
 run_alert "$M" REPO=''
@@ -853,9 +889,9 @@ if grep -q 'detect-changes' <<<"${NOTIFY_IF}"; then
 else
   pass 'it does NOT fire on detect-changes, which deploys nothing'
 fi
-check_workflow 'AC2: it never fires on a skipped job' \
+check_alert_job 'AC2: it never fires on a skipped job' \
   "result == 'skipped'" 'absent'
-check_workflow 'AC2: it never fires on a successful job' \
+check_alert_job 'AC2: it never fires on a successful job' \
   "result == 'success'" 'absent'
 check_workflow 'it runs in the prod environment, where the AWS secrets live' \
   '^    environment: prod$' 'present'
@@ -863,7 +899,7 @@ check_workflow 'it can list the run jobs and read their annotations' \
   '^      actions: read$' 'present'
 check_workflow 'the Slack secret id is passed in, not guessed' \
   'SLACK_SECRET_ID: prod/AgentWeb/Slack' 'present'
-check_workflow 'AC4: the notify step is not allowed to fail quietly' \
+check_alert_job 'AC4: the notify step is not allowed to fail quietly' \
   'continue-on-error *:' 'absent'
 
 # The bot can only post where it is already a member, so the channel has to be

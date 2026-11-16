@@ -614,11 +614,12 @@ describe('SEO Agent Mode Tools', () => {
         expect(result.key_event_semantics).toContain('scroll');
       });
 
-      it('tells Emma no tool reads key-event configuration and how to verify it', async () => {
+      // ENG-896 supersedes the ENG-829 "no tool reads it" wording: the config is now readable.
+      it('routes key-event configuration questions to get_ga4_key_events', async () => {
         const result = await runAnalytics();
 
-        expect(result.key_event_semantics).toContain('No tool available here reads');
-        expect(result.key_event_semantics).toContain('browser tools');
+        expect(result.key_event_semantics).toContain('get_ga4_key_events');
+        expect(result.key_event_semantics).toContain('Never infer');
       });
 
       it('does not advertise conversionsBySource as key-event configuration', () => {
@@ -629,6 +630,99 @@ describe('SEO Agent Mode Tools', () => {
         expect(description).toContain('historical');
         expect(description).toContain('not which events are currently marked as key events');
       });
+    });
+  });
+
+  // ENG-896 acceptance criteria.
+  describe('zero-data preflight (ENG-896)', () => {
+    it('flags a property that returned no rows with its ID and date range', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user', googleAnalyticsPropertyId: '277333489' });
+      mockRunReport.mockResolvedValue([{ rows: [] }]);
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+      const m = result.metrics[0];
+      expect(m.noData).toBe(true);
+      expect(m.noDataNote).toContain('277333489');
+      expect(m.noDataNote).toContain(m.dateRange.startDate);
+      expect(m.noDataNote).toContain(m.dateRange.endDate);
+    });
+
+    it('does not flag a property that has data', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user', googleAnalyticsPropertyId: '123456' });
+      mockRunReport.mockResolvedValue([{ rows: [{ dimensionValues: [{ value: '20260101' }], metricValues: [{ value: '5' }, { value: '4' }, { value: '9' }, { value: '10' }, { value: '0.5' }] }] }]);
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+      expect(result.metrics[0].noData).toBeUndefined();
+    });
+  });
+
+  describe('get_ga4_key_events (ENG-896)', () => {
+    const okJson = (body: any, status = 200) => ({ ok: status < 400, status, json: async () => body });
+    beforeEach(() => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user', googleAnalyticsPropertyId: '277333489' });
+    });
+
+    it('is registered and read-only', () => {
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      expect(tool).toBeDefined();
+      expect(tool!.definition.description).toContain('Read-only');
+    });
+
+    it('answers "is X a key event" in one call from the Admin API', async () => {
+      mockFetch.mockResolvedValueOnce(okJson({ keyEvents: [
+        { name: 'properties/277333489/keyEvents/1', eventName: 'generate_lead', createTime: '2026-01-01T00:00:00Z', countingMethod: 'ONCE_PER_EVENT', custom: true },
+        { name: 'properties/277333489/keyEvents/2', eventName: 'purchase', custom: false },
+      ] }));
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      const yes = await tool!.execute({ event_name: 'generate_lead' }, { userId: 'test-user' });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = String(mockFetch.mock.calls[0][0]);
+      expect(url).toContain('analyticsadmin.googleapis.com/v1beta/properties/277333489/keyEvents');
+      expect(mockFetch.mock.calls[0][1].method ?? 'GET').toBe('GET');
+      expect(yes.properties[0].keyEventNames).toEqual(['generate_lead', 'purchase']);
+      expect(yes.properties[0].isKeyEvent).toBe(true);
+
+      mockFetch.mockResolvedValueOnce(okJson({ keyEvents: [{ eventName: 'generate_lead' }] }));
+      const no = await tool!.execute({ event_name: 'page_view' }, { userId: 'test-user' });
+      expect(no.properties[0].isKeyEvent).toBe(false);
+    });
+
+    it('follows pagination', async () => {
+      mockFetch
+        .mockResolvedValueOnce(okJson({ keyEvents: [{ eventName: 'a' }], nextPageToken: 't2' }))
+        .mockResolvedValueOnce(okJson({ keyEvents: [{ eventName: 'b' }] }));
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      const r = await tool!.execute({}, { userId: 'test-user' });
+      expect(r.properties[0].keyEventNames).toEqual(['a', 'b']);
+      expect(String(mockFetch.mock.calls[1][0])).toContain('pageToken=t2');
+    });
+
+    it('returns a clear permission message with the manual check path, never a guess', async () => {
+      mockFetch.mockResolvedValueOnce(okJson({ error: { status: 'PERMISSION_DENIED', message: 'denied' } }, 403));
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      const r = await tool!.execute({ event_name: 'page_view' }, { userId: 'test-user' });
+      const p = r.properties[0];
+      expect(p.errorReason).toBe('permission_denied');
+      expect(p.error).toContain('277333489');
+      expect(p.error).toContain('Admin > Data display > Events');
+      expect(p.isKeyEvent).toBeUndefined();
+      expect(p.keyEventNames).toBeUndefined();
+    });
+
+    it('rejects an unconfigured property id', async () => {
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      const r = await tool!.execute({ property_id: '999' }, { userId: 'test-user' });
+      expect(r.error).toContain('not found in configured properties');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('requests only the analytics.readonly scope', async () => {
+      const { JWT } = require('google-auth-library');
+      mockFetch.mockResolvedValueOnce(okJson({ keyEvents: [] }));
+      const tool = emmaToolRegistry.getTool('get_ga4_key_events');
+      await tool!.execute({}, { userId: 'test-user' });
+      const scopes = (JWT as jest.Mock).mock.calls.at(-1)[0].scopes;
+      expect(scopes).toEqual(['https://www.googleapis.com/auth/analytics.readonly']);
     });
   });
 

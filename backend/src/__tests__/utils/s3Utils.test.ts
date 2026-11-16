@@ -66,6 +66,13 @@ describe('s3Utils', () => {
       expect(result.key).toBeDefined();
     });
 
+    it.each(['.', '..'])('maps dot-only filename %p to a safe key segment (ENG-2408)', async (name) => {
+      mockUploadPromise.mockResolvedValue({ Location: 'loc', Key: 'k' });
+      await uploadFileToS3(Buffer.from('x'), name, 'user-123', 'image/png');
+      const key: string = (mockUpload.mock.calls as any[]).at(-1)[0].Key;
+      expect(key).toMatch(/^users\/user-123\/files\/\d+\/[0-9a-f]+\/file$/);
+    });
+
     it('should handle upload errors gracefully', async () => {
       mockUploadPromise.mockRejectedValue(new Error('Upload failed'));
 

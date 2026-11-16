@@ -146,6 +146,75 @@ describe('LinkedInAdapter', () => {
       expect(result.postId).toBe('urn:li:share:111222');
     });
 
+    it('retries an image upload that gets a 401 on a token refreshed in the same call (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expired = {
+          ...mockCompanyAccount,
+          config: { ...mockCompanyAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        } as any;
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-org-token', expires_in: 5184000 });
+        mockLinkedInService.uploadImageFromUrl
+          .mockRejectedValueOnce(new Error('LinkedIn access token expired or invalid'))
+          .mockResolvedValueOnce('urn:li:image:123');
+        mockLinkedInService.createPost.mockResolvedValue('urn:li:share:333444');
+
+        const pending = adapter.createPost(expired, 'Post with image', ['https://example.com/image1.png']);
+        await jest.advanceTimersByTimeAsync(11000);
+        const result: any = await pending;
+
+        expect(result.success).toBe(true);
+        expect(result.failedUploads).toBeUndefined();
+        expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(2);
+        expect(mockLinkedInService.createPost).toHaveBeenCalledWith(
+          'fresh-org-token', 'urn:li:organization:123456', 'Post with image', ['urn:li:image:123'], undefined
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not publish without the image when the upload keeps getting 401 on a fresh token (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expired = {
+          ...mockCompanyAccount,
+          config: { ...mockCompanyAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        } as any;
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-org-token', expires_in: 5184000 });
+        mockLinkedInService.uploadImageFromUrl.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createPost(expired, 'Post with image', ['https://example.com/a.png', 'https://example.com/b.png']).catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        const err: any = await pending;
+
+        expect(err.name).toBe('FreshTokenRejectedError');
+        expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+        expect(mockLinkedInService.uploadImageFromUrl).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('throws FreshTokenRejectedError when createPost keeps getting 401 on a refreshed token (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expired = {
+          ...mockCompanyAccount,
+          config: { ...mockCompanyAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        } as any;
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-org-token', expires_in: 5184000 });
+        mockLinkedInService.createPost.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createPost(expired, 'Hello').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        expect(((await pending) as any).name).toBe('FreshTokenRejectedError');
+        expect(mockLinkedInService.createPost).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('should create a post with images for company account', async () => {
       mockLinkedInService.uploadImageFromUrl.mockResolvedValue('urn:li:image:123');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:333444');
@@ -1310,6 +1379,108 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('createComment', () => {
+    it('retries once when LinkedIn 401s a token refreshed in the same call (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expiredAccount = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        };
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createComment
+          .mockRejectedValueOnce(new Error('LinkedIn access token expired or invalid'))
+          .mockResolvedValueOnce('urn:li:comment:(urn:li:share:123,789)');
+
+        const pending = adapter.createComment(expiredAccount as any, 'urn:li:share:123', 'Great post!');
+        await jest.advanceTimersByTimeAsync(11000);
+        const result = await pending;
+
+        expect(result.success).toBe(true);
+        expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(2);
+        expect(mockLinkedInService.createComment).toHaveBeenLastCalledWith(
+          'fresh-token', 'urn:li:share:123', 'urn:li:person:abc123', 'Great post!', undefined
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('throws the retryable FreshTokenRejectedError, not the reconnect error, when a refreshed token keeps getting 401 (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expiredAccount = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        };
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createComment(expiredAccount as any, 'urn:li:share:123', 'Great post!').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        const err: any = await pending;
+
+        expect(err.name).toBe('FreshTokenRejectedError');
+        expect(err.freshTokenRejected).toBe(true);
+        expect(err.message).not.toMatch(/access token expired/);
+        expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('treats a token refreshed by an earlier call a minute ago as still fresh (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const DAY = 24 * 60 * 60 * 1000;
+        const recentlyMinted = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() + 60 * DAY - 60_000 },
+        };
+        mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createComment(recentlyMinted as any, 'urn:li:share:123', 'Great post!').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        const err: any = await pending;
+
+        expect(err.name).toBe('FreshTokenRejectedError');
+        expect(mockLinkedInService.refreshAccessToken).not.toHaveBeenCalled();
+        expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('re-checks publish consent before the retried comment and does not send it once withdrawn (ENG-827)', async () => {
+      jest.useFakeTimers();
+      try {
+        const DAY = 24 * 60 * 60 * 1000;
+        const recentlyMinted = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() + 60 * DAY },
+        };
+        mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+        const assertStillAuthorized = jest.fn()
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ success: false as const, error: 'consent withdrawn' });
+
+        const pending = adapter.createComment(recentlyMinted as any, 'urn:li:share:123', 'Great post!', undefined, undefined, assertStillAuthorized);
+        await jest.advanceTimersByTimeAsync(11000);
+
+        await expect(pending).resolves.toEqual({ success: false, message: 'consent withdrawn' });
+        expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not retry a 401 when the stored token was not refreshed', async () => {
+      mockLinkedInService.createComment.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+      await expect(adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Great post!'))
+        .rejects.toThrow('access token expired');
+      expect(mockLinkedInService.createComment).toHaveBeenCalledTimes(1);
+    });
+
     it('should create a comment successfully for personal account', async () => {
       mockLinkedInService.createComment.mockResolvedValue('urn:li:comment:(urn:li:share:123,456)');
 
@@ -1435,6 +1606,25 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('createReaction', () => {
+    it('throws FreshTokenRejectedError when a refreshed token keeps getting 401 (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        const expired = {
+          ...mockPersonalAccount,
+          config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+        } as any;
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createReaction.mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createReaction(expired, 'urn:li:share:123', 'LIKE').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        expect(((await pending) as any).name).toBe('FreshTokenRejectedError');
+        expect(mockLinkedInService.createReaction).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('should create a LIKE reaction successfully for personal account', async () => {
       mockLinkedInService.createReaction.mockResolvedValue('urn:li:reaction:(urn:li:person:abc123,urn:li:share:123)');
 
@@ -1629,6 +1819,52 @@ describe('LinkedInAdapter', () => {
   describe('createRepost', () => {
     const originalPostUrn = 'urn:li:share:999888777';
     const repostUrn = 'urn:li:share:111222333';
+
+    const expiredAccount = () => ({
+      ...mockPersonalAccount,
+      config: { ...mockPersonalAccount.config, token_expires_at: Date.now() - 1000, refresh_token: 'rt' },
+    }) as any;
+
+    it('retries once when LinkedIn 401s a token refreshed in the same call (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createRepost = jest.fn()
+          .mockRejectedValueOnce(new Error('LinkedIn access token expired or invalid'))
+          .mockResolvedValueOnce(repostUrn);
+
+        const pending = adapter.createRepost(expiredAccount(), originalPostUrn, undefined, 'user-1');
+        await jest.advanceTimersByTimeAsync(11000);
+
+        await expect(pending).resolves.toMatchObject({ success: true, postId: repostUrn });
+        expect(mockLinkedInService.createRepost).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('throws FreshTokenRejectedError when a refreshed token keeps getting 401 (ENG-2663)', async () => {
+      jest.useFakeTimers();
+      try {
+        mockLinkedInService.refreshAccessToken.mockResolvedValue({ access_token: 'fresh-token', expires_in: 5184000 });
+        mockLinkedInService.createRepost = jest.fn().mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+        const pending = adapter.createRepost(expiredAccount(), originalPostUrn, undefined, 'user-1').catch((e) => e);
+        await jest.advanceTimersByTimeAsync(11000);
+        expect(((await pending) as any).name).toBe('FreshTokenRejectedError');
+        expect(mockLinkedInService.createRepost).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not retry a 401 when the stored token was not refreshed', async () => {
+      mockLinkedInService.createRepost = jest.fn().mockRejectedValue(new Error('LinkedIn access token expired or invalid'));
+
+      await expect(adapter.createRepost(mockPersonalAccount, originalPostUrn, undefined, 'user-1'))
+        .rejects.toThrow('access token expired');
+      expect(mockLinkedInService.createRepost).toHaveBeenCalledTimes(1);
+    });
 
     it('should repost without commentary', async () => {
       mockLinkedInService.createRepost = jest.fn().mockResolvedValue(repostUrn);

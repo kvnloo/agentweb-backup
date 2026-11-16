@@ -26,6 +26,19 @@ export interface RunFunding {
   fallback: "stop" | "agentweb";
   ownerUserId: string;
   billingUserId: string;
+  /**
+   * The account whose provider credential pays for this run's calls: the owner of
+   * `connectionId`. It differs from `ownerUserId` (the person running the turn) when an
+   * org owner has shared a key with the org. Set by whatever resolves the connection
+   * (A2); until then usage falls back to `ownerUserId`.
+   */
+  fundingPrincipalId?: string;
+  /** `claude_subscription` only: the credential epoch of the connection this run was admitted under (the host fences on it). */
+  hostEpoch?: number;
+  /** `claude_subscription` only: the CLI model alias the plan runs (haiku|sonnet|opus|fable). */
+  planModel?: string;
+  /** Names the run these calls belong to, e.g. "claude_plan:<runId>": the explicit AgentWeb scope of a plan turn's tool-internal calls. Carried for attribution; the AgentWeb meter does not record it yet. */
+  runLabel?: string;
   resolvedAt: string;
 }
 

@@ -57,14 +57,14 @@ describe('Emma tool contracts match dispatch behavior', () => {
     const contentSchema = emmaToolRegistry.getTool('save_memory')!
       .definition.inputSchema.properties.content;
 
-    expect(contentSchema.maxLength).toBe(2000);
+    expect(contentSchema.maxLength).toBe(8000); // ENG-2574: auto-split ceiling
   });
 
   it('rejects over-length save_memory content at the gateway', () => {
     const tool = emmaToolRegistry.getTool('save_memory')!;
     const result = validateAndRepairToolArgs({
       toolName: 'save_memory',
-      args: { content: 'x'.repeat(2001), category: 'insight' },
+      args: { content: 'x'.repeat(8001), category: 'insight' },
       inputSchema: tool.definition.inputSchema,
       effect: 'internal_write',
     });
@@ -85,10 +85,10 @@ describe('Emma tool contracts match dispatch behavior', () => {
   it('accepts astral content that fits the declared character limit', () => {
     const tool = emmaToolRegistry.getTool('save_memory')!;
     // 1,001 astral characters: 1,001 code points, 2,002 UTF-16 code units.
-    // Under `maxLength: 2000` this is valid, so it must dispatch.
-    const emoji = '😀'.repeat(1001);
-    expect(Array.from(emoji).length).toBe(1001);
-    expect(emoji.length).toBe(2002); // the misleading measure
+    // Under `maxLength: 8000` this is valid, so it must dispatch.
+    const emoji = '😀'.repeat(4001);
+    expect(Array.from(emoji).length).toBe(4001);
+    expect(emoji.length).toBe(8002); // the misleading measure
 
     const result = validateAndRepairToolArgs({
       toolName: 'save_memory',
@@ -102,8 +102,8 @@ describe('Emma tool contracts match dispatch behavior', () => {
 
   it('rejects astral content that exceeds the declared character limit', () => {
     const tool = emmaToolRegistry.getTool('save_memory')!;
-    const emoji = '😀'.repeat(2001); // 2,001 characters — over by one
-    expect(Array.from(emoji).length).toBe(2001);
+    const emoji = '😀'.repeat(8001); // 8,001 characters — over by one
+    expect(Array.from(emoji).length).toBe(8001);
 
     const result = validateAndRepairToolArgs({
       toolName: 'save_memory',
@@ -122,27 +122,27 @@ describe('Emma tool contracts match dispatch behavior', () => {
     const contentSchema = emmaToolRegistry.getTool('save_org_memory')!
       .definition.inputSchema.properties.content;
 
-    expect(contentSchema.maxLength).toBe(2000);
+    expect(contentSchema.maxLength).toBe(8000); // ENG-2574: auto-split ceiling
   });
 
   it('rejects over-length org memory before execution with an exact recovery count', () => {
     const tool = emmaToolRegistry.getTool('save_org_memory')!;
     const result = validateAndRepairToolArgs({
       toolName: 'save_org_memory',
-      args: { content: 'x'.repeat(2001), category: 'insight' },
+      args: { content: 'x'.repeat(8001), category: 'insight' },
       inputSchema: tool.definition.inputSchema,
       effect: 'internal_write',
     });
 
     expect(result).toMatchObject({
       status: 'invalid',
-      modelMessage: expect.stringContaining('received 2001; remove at least 1'),
+      modelMessage: expect.stringContaining('received 8001; remove at least 1'),
     });
   });
 
   it('uses Unicode code points for the org-memory boundary too', () => {
     const tool = emmaToolRegistry.getTool('save_org_memory')!;
-    const emoji = '😀'.repeat(2001);
+    const emoji = '😀'.repeat(8001);
     const result = validateAndRepairToolArgs({
       toolName: 'save_org_memory',
       args: { content: emoji, category: 'insight' },
@@ -152,7 +152,7 @@ describe('Emma tool contracts match dispatch behavior', () => {
 
     expect(result).toMatchObject({
       status: 'invalid',
-      modelMessage: expect.stringContaining('received 2001; remove at least 1'),
+      modelMessage: expect.stringContaining('received 8001; remove at least 1'),
     });
   });
 

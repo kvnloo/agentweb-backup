@@ -24,7 +24,12 @@ export type PaymentEventType =
   | 'subscription_created'
   | 'subscription_updated'
   | 'subscription_canceled'
-  | 'subscription_downgraded';
+  | 'subscription_downgraded'
+  // ENG-668: a pay-as-you-go overage charge. Its own types, because consumers of the plain
+  // payment_succeeded / payment_failed (accountHealthClassifier) model SUBSCRIPTION payments: an overage
+  // failure is not a subscription at risk, and an overage success must not mask a subscription failure.
+  | 'payg_overage_payment_succeeded'
+  | 'payg_overage_payment_failed';
 
 export interface PaymentHistoryRecord {
   userId: string;

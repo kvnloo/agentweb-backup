@@ -1,7 +1,9 @@
 import {
+  AI_LABEL_NOTE_PREFIX,
   buildCaseId,
   GOLDEN_CRITERIA,
   GoldenCaseValidationError,
+  isAiLabelled,
   isFullyLabelled,
   newCreativePairCase,
   newGoldenCase,
@@ -51,6 +53,14 @@ describe('golden case schema (ENG-2135)', () => {
     expect(() => parseGoldenCase({ ...agentCase(), surface: 'ads' })).toThrow(GoldenCaseValidationError);
     expect(() => parseGoldenCase({ ...agentCase(), split: 'train' })).toThrow(/split/);
     expect(() => parseGoldenCase({ ...agentCase(), version: -1 })).toThrow(/version/);
+  });
+
+  it('keeps an exclusion with its reason, admin and time, and rejects a malformed one (ENG-2608)', () => {
+    const excluded = { reason: 'empty_session', by: 'admin@example.com', at: NOW.toISOString() };
+    expect(parseGoldenCase({ ...agentCase(), excluded })).toMatchObject({ excluded });
+    expect(parseGoldenCase(agentCase())).not.toHaveProperty('excluded');
+    expect(() => parseGoldenCase({ ...agentCase(), excluded: { reason: '', by: 'a', at: 'b' } })).toThrow(/excluded.reason/);
+    expect(() => parseGoldenCase({ ...agentCase(), excluded: 'yes' })).toThrow(/excluded must be an object/);
   });
 
   it('allows a replay link only on agent cases', () => {
@@ -141,5 +151,15 @@ describe('deterministic dev/test split', () => {
 
   it('pins known ids so a hashing change cannot silently reshuffle the split', () => {
     expect(['agent#sessionId#a', 'agent#sessionId#b', 'agent#sessionId#c', 'agent#sessionId#d'].map(splitForCaseId)).toEqual(['dev', 'dev', 'test', 'test']);
+  });
+});
+
+describe('AI-written labels (ENG-2135)', () => {
+  it('recognises a case whose note starts with the AI-label marker, and only that', () => {
+    expect(AI_LABEL_NOTE_PREFIX).toBe('[AI-LABEL]');
+    expect(isAiLabelled({ notes: `${AI_LABEL_NOTE_PREFIX} Written by Claude. Confidence: low.` })).toBe(true);
+    expect(isAiLabelled({ notes: 'Looked fine to me. [AI-LABEL] is a marker used elsewhere' })).toBe(false);
+    expect(isAiLabelled({ notes: '' })).toBe(false);
+    expect(isAiLabelled({})).toBe(false);
   });
 });

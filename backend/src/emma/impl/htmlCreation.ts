@@ -219,6 +219,57 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   return hasOpen && hasClose;
 }
 
+// ENG-2679 — the single-pass render can come back cut off (upstream stream ends
+// early, or finish_reason=length) while still containing the opening of a valid
+// document. sanitize-html then auto-closes every open tag, so the stub uploads as
+// a "complete" file and create_html_file reports success — a 3-person brief
+// shipped with only the first person's header. Reject such renders BEFORE
+// sanitizing so the retry/deterministic-fallback paths (ENG-203/ENG-873) run.
+export class IncompleteHtmlRenderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IncompleteHtmlRenderError';
+  }
+}
+
+/** Visible text of an HTML (or markdown-ish) string, whitespace-collapsed. */
+function visibleTextLength(s: string): number {
+  return s
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[#*_`>|-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim().length;
+}
+
+// The render prompt tells the model to carry every fact from the draft over
+// verbatim, so a finished document's visible text is never a small fraction of
+// the draft's. Generous floor: styling may tighten wording, truncation drops
+// whole sections (the ENG-2679 file kept ~17% of its draft's text).
+export const CREATE_HTML_MIN_TEXT_COVERAGE = 0.4;
+// Tiny drafts legitimately expand or reshape; only apply the coverage check
+// where losing a whole section is possible.
+export const CREATE_HTML_COVERAGE_MIN_DRAFT_CHARS = 1500;
+
+export function assertCompleteHtmlRender(html: string, contentDraft: string): void {
+  if (!/<\/html\s*>/i.test(html)) {
+    throw new IncompleteHtmlRenderError('HTML render is incomplete: missing closing </html> (output truncated)');
+  }
+  const draftLen = visibleTextLength(contentDraft);
+  if (draftLen >= CREATE_HTML_COVERAGE_MIN_DRAFT_CHARS) {
+    const outLen = visibleTextLength(html);
+    if (outLen < draftLen * CREATE_HTML_MIN_TEXT_COVERAGE) {
+      throw new IncompleteHtmlRenderError(
+        `HTML render is incomplete: ${outLen} visible chars for a ${draftLen}-char draft (content dropped)`,
+      );
+    }
+  }
+}
+
+export function isIncompleteHtmlRenderError(error: unknown): boolean {
+  return (error as any)?.name === 'IncompleteHtmlRenderError';
+}
+
 /**
  * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
  * (human-written, arbitrary-content) title.
@@ -471,11 +522,17 @@ Please generate a complete, professional HTML document that properly formats and
       const singlePassAttempts = renderInSections ? 0 : maxRenderAttempts;
       for (let attempt = 1; attempt <= singlePassAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          const rendered = await llmService.generateHTML(systemPrompt, userPrompt, makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          // ENG-2679: never accept a truncated render as the deliverable.
+          if (!isEmail && rendered && rendered.trim()) assertCompleteHtmlRender(rendered, contentDraft);
+          htmlContent = rendered;
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
-          const isTransient = isTransientLLMError(renderError);
+          const isTransient = isTransientLLMError(renderError) || isIncompleteHtmlRenderError(renderError);
+          if (isIncompleteHtmlRenderError(renderError)) {
+            console.warn(`AgentMode: ENG-2679 incomplete HTML render (attempt ${attempt}/${maxRenderAttempts}, session ${sessionId}): ${(renderError as Error).message}`);
+          }
           const renderErrorText = renderError instanceof Error ? renderError.message : renderError;
           if (timeoutIsDeterministic && isRenderTimeoutError(renderError)) {
             console.error(`AgentMode: HTML render timed out on a ${contentDraft.length}-char draft (session ${sessionId}) — too large to re-render inside the per-call budget, degrading instead of retrying:`, renderErrorText);
@@ -661,7 +718,7 @@ Return the HTML body fragment for this section only.`;
           // because of no activity for 300000 ms" with no name or code, so
           // isTransientLLMError alone does not recognise it — but on a section
           // this small a timeout really is a blip, so it is worth one retry.
-          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError);
+          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError) || isIncompleteHtmlRenderError(sectionError);
           if (attempt === maxSectionAttempts || !isTransient) throw sectionError;
           console.warn(`AgentMode: section ${index + 1}/${chunks.length} render failed transiently, retrying once:`, sectionError instanceof Error ? sectionError.message : sectionError);
           await sleep(1000);
@@ -1185,21 +1242,29 @@ async function computeSafeTextRanges(html: string): Promise<Array<{ start: numbe
  * `createHtmlFromTemplate` (confirmed by a whole-backend grep), so it's a
  * local, non-exported helper here rather than a public export.
  */
-async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean, available: Array<{ template_id: string, template_name?: string }> }> {
   const { userTemplates, publicTemplates } = await getTemplatesForUser(userId);
+  // ENG-1888: on a miss the caller returns these so the model can self-correct
+  // instead of retrying an invalid id (the dominant prod failure class).
+  const available = [...userTemplates, ...publicTemplates]
+    .filter((t: any) => t && typeof t.template_id === 'string')
+    .slice(0, MAX_AVAILABLE_TEMPLATES_IN_ERROR)
+    .map((t: any) => ({ template_id: t.template_id, template_name: t.template_name }));
 
   const userMatch = userTemplates.find((t: any) => t.template_id === templateId);
   if (userMatch) {
-    return { template: userMatch, isPublic: false };
+    return { template: userMatch, isPublic: false, available };
   }
 
   const publicMatch = publicTemplates.find((t: any) => t.template_id === templateId);
   if (publicMatch) {
-    return { template: publicMatch, isPublic: true };
+    return { template: publicMatch, isPublic: true, available };
   }
 
-  return { template: null, isPublic: false };
+  return { template: null, isPublic: false, available };
 }
+
+const MAX_AVAILABLE_TEMPLATES_IN_ERROR = 25;
 
 /**
  * ENG-46: structured, greppable, observability-only signal for a model
@@ -1322,12 +1387,17 @@ export async function createHtmlFromTemplate(
   ): Promise<any> {
     try {
       // Get the template from user or public store
-      const { template } = await findTemplateById(templateId, userId);
+      const { template, available } = await findTemplateById(templateId, userId);
 
       if (!template) {
+        // ENG-1888: structured, actionable not_found instead of a bare message.
         return {
           success: false,
-          message: `Template '${templateId}' not found`
+          errorClass: 'not_found',
+          error_code: 'TEMPLATE_NOT_FOUND',
+          missing_template_id: templateId,
+          available_templates: available,
+          message: `Template '${templateId}' not found. Call list_html_templates and retry with one of the available template_id values${available.length ? ` (e.g. ${available.slice(0, 5).map((t) => t.template_id).join(', ')})` : '; no templates are available for this user'}.`
         };
       }
 
@@ -1335,7 +1405,11 @@ export async function createHtmlFromTemplate(
       if (!template.html_content || !template.subject) {
         return {
           success: false,
-          message: 'Invalid template structure: missing html_content or subject'
+          // ENG-1888: a stored template with no body/subject is a template
+          // configuration defect, not a tool bug — the caller must pick another template.
+          errorClass: 'not_found',
+          error_code: 'TEMPLATE_INVALID',
+          message: `Invalid template structure: missing html_content or subject (template '${templateId}'). Call list_html_templates and choose a different template_id.`
         };
       }
       if (!llmModel) {
@@ -1410,6 +1484,9 @@ export async function createHtmlFromTemplate(
       if (validationErrors.length > 0) {
         return {
           success: false,
+          // ENG-1888: caller-supplied variables did not match the template — an
+          // argument error the model fixes by retrying, never a tool bug.
+          errorClass: 'invalid_args',
           message: validationErrors.join('; '),
           errors: validationErrors,
           template_variables: templateVariables,
@@ -1666,12 +1743,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         } else if (error.message.includes('LLM returned invalid JSON')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM did not return substitution result')) {
+          return {
+            success: false,
+            errorClass: 'invalid_output',
+            message: 'LLM returned empty substitution result',
             error: error.message
           };
         } else if (error.message.includes('missing final_html or final_subject')) {
           return {
             success: false,
+            errorClass: 'invalid_output',
             message: 'LLM response missing final_html',
             error: error.message
           };

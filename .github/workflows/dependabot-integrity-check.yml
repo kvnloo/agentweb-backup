@@ -42,7 +42,7 @@ permissions:
 jobs:
   integrity-check:
     name: Dependabot Integrity Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim  # API-only check; slim is ~1/3 the per-minute cost (Actions budget, 2026-10)
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     steps:
       - name: Checkout base ref (deliberately NOT the PR head)

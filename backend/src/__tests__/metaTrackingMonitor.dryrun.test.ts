@@ -13,6 +13,11 @@
  * Identifiers are synthetic.
  */
 
+const mockExpiredAlert = jest.fn().mockResolvedValue(true);
+jest.mock('../services/metaConnectionExpiredAlert', () => ({
+  sendMetaConnectionExpiredAlert: (...a: any[]) => mockExpiredAlert(...a),
+}));
+
 const buildAlertContextForAccount = jest.fn();
 jest.mock('../services/metaAlertContext', () => ({
   buildAlertContextForAccount: (...a: any[]) => buildAlertContextForAccount(...a),
@@ -95,6 +100,7 @@ describe('dry run is safe WITHOUT an injected transport', () => {
 
   it('a REAL run with no injected transport still uses the real path', async () => {
     // The capture fallback must apply to dry runs only, or the cron would go silent.
+    // A dead token in production goes to the Meta connection list, not oncall (2026-11-07).
     const emailService = require('../services/emailService').emailService;
     const send = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined as any);
 
@@ -103,7 +109,8 @@ describe('dry run is safe WITHOUT an injected transport', () => {
 
     await monitorUserTracking(user(), deps);
 
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(mockExpiredAlert).toHaveBeenCalledWith(expect.objectContaining({ accountId: ACCOUNT, customerEmail: 'owner@example.test' }));
+    expect(send).not.toHaveBeenCalled();
     send.mockRestore();
   });
 });

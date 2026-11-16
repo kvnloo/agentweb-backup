@@ -475,7 +475,7 @@ function verifiedInTool(call: LedgerCall): boolean {
 /** CRM lead writes: create (no id returned — see the account-only match below) and update. */
 const CRM_LEAD_WRITE_TOOLS = new Set(['add_leads_to_list', 'update_lead']);
 /** Reads that confirm a CRM write: list-scoped, some with no id filter at all. */
-const CRM_LEAD_READ_TOOLS = new Set(['get_leads', 'search_leads', 'get_lead_details', 'get_leads_needing_followup']);
+const CRM_LEAD_READ_TOOLS = new Set(['get_leads', 'search_leads', 'get_lead_details', 'get_leads_needing_followup', 'get_lead_conversation_statuses']);
 /** Sends whose own response carries the provider message id (verifiedInTool above); no read-back tool exists. */
 const EMAIL_SEND_TOOLS = new Set(['send_email_to_lead', 'send_email_from_sender']);
 /** Publishes whose own response carries the post id/URL (verifiedInTool above); no read-back tool exists. */

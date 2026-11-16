@@ -56,6 +56,38 @@ describe('LLMService shared gateway adapter', () => {
     );
   });
 
+  it('passes fallback models to callLLM, and sends none when none are configured (ENG-2720)', async () => {
+    await new LLMService('openrouter/openai/gpt-5.6-luna', 0, undefined, { fallbackModels: ['gpt-5.5'] })
+      .generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ fallbackModels: ['gpt-5.5'] }));
+
+    mockCallLLM.mockClear();
+    await new LLMService('gpt-5.5', 0).generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('fallbackModels');
+  });
+
+  it('skips configured providers on web-search calls only (ENG-2720: Azure errors on the search tool)', async () => {
+    const service = new LLMService('openrouter/openai/gpt-5.6-luna', 0, undefined, { providerIgnoreForWebSearch: ['Azure'] });
+    mockCallLLM.mockResolvedValue(completion('{"value":"x"}'));
+    await service.generateJSONContentWithWebSearch('system', 'user', { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ webSearch: true, providerIgnore: ['Azure'] }));
+
+    mockCallLLM.mockClear();
+    await service.generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('providerIgnore');
+  });
+
+  it('passes web-search tool parameters on web-search calls only (ENG-2720)', async () => {
+    const service = new LLMService('openrouter/openai/gpt-5.6-luna', 0, undefined, { webSearchParameters: { max_uses: 2 } });
+    mockCallLLM.mockResolvedValue(completion('{"value":"x"}'));
+    await service.generateJSONContentWithWebSearch('system', 'user', { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ webSearch: true, webSearchParameters: { max_uses: 2 } }));
+
+    mockCallLLM.mockClear();
+    await service.generateRaw('system', 'user', undefined, { feature: 'enrichment' });
+    expect(mockCallLLM.mock.calls[0][2]).not.toHaveProperty('webSearchParameters');
+  });
+
   it('preserves null temperature so callLLM omits it from the wire request', async () => {
     await new LLMService('gpt-5.5', null).generateRaw('system', 'user');
     expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ temperature: null }));

@@ -11,6 +11,16 @@ import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
+import { buildUsageBlockCopy, paygBlockActionSentence, type UsageBlockPaygInput } from '../utils/usageBlockCopy';
+import {
+  paygInvoiceCreatedEmailCopy,
+  paygPaymentActionRequiredEmailCopy,
+  paygPaymentFailedEmailCopy,
+  paygPaymentUnconfirmedEmailCopy,
+  type PaygSettlementEmailCopy,
+} from '../utils/paygSettlementCopy';
+import { buildScheduleModelNotice, buildWorkPlanStepModelNotice, type ModelNoticeCopy } from '../utils/unattendedModelNoticeCopy';
+import type { ModelUnavailableReason } from './agentMode/modelUnavailable';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -60,6 +70,21 @@ const SUPPORT_REPLY_TO = 'support@agentweb.pro';
 export const WITHHELD_REPORT_ALERT_CLASS = 'scheduled-report-withheld-no-recipients';
 
 export type EmailSendOutcome = 'sent' | 'suppressed' | 'failed';
+
+/**
+ * What sendScheduledRunFailedEmail reports. The first three classes are a schedule that keeps producing nothing after
+ * every automatic retry (ENG-826); `model_unavailable` (ENG-669 PR-D) is a run refused before it started because the
+ * schedule's saved model is outside the owner's plan or no longer available. `modelLabel` is already sanitized.
+ */
+export type ScheduledRunFailureNotice =
+  | { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
+  | {
+      failureClass: 'model_unavailable'; modelLabel: string; reason: ModelUnavailableReason;
+      /** ENG-669 PR-C: the saved model is the AgentWeb Model and the router is unavailable right now (not "gone"). */
+      routerUnavailable?: boolean;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
+    };
 
 const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
 
@@ -417,7 +442,7 @@ You're receiving this because you just signed up for AgentWeb.
       subject: 'A personal note from the AgentWeb founders',
       html,
       text,
-      cc: 'founders@agentweb.pro',
+      cc: ['founders@agentweb.pro', 'francisco@agentweb.pro'],
       replyTo: 'founders@agentweb.pro',
     });
     console.log(`Team introduction email sent to: ${email}`);
@@ -1002,12 +1027,26 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   // customer's schedule (e.g. the gemini-3.5-flash "LinkedIn Post Factory" runs in
   // ENG-826) could keep failing silently. Best-effort: never throws (a notification
   // failure must not break the run).
+  //
+  // ENG-669 PR-D: `model_unavailable` is a different failure with its own copy: the run never started because the
+  // schedule's saved model is outside the owner's plan (or no longer available). It is the owner's to fix, so the
+  // "keeps failing / contact support" wording above would be wrong; it says which model and how to fix it instead.
   async sendScheduledRunFailedEmail(
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
-    opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
+    opts: ScheduledRunFailureNotice
   ) {
+    if (opts.failureClass === 'model_unavailable') {
+      await this.sendModelUnavailableNoticeEmail(
+        toEmails,
+        buildScheduleModelNotice({
+          scheduleName, modelLabel: opts.modelLabel, reason: opts.reason, routerUnavailable: opts.routerUnavailable, upgradeRequired: opts.upgradeRequired,
+        }),
+        `schedule ${scheduleId}`,
+      );
+      return;
+    }
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const currentDate = new Date().toLocaleDateString('en-US', {
@@ -1084,6 +1123,84 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled run-failed email to ${emailList.join(', ')}:`, error);
       // Don't throw — a notification failure must not break the scheduled chat flow.
+    }
+  },
+
+  /**
+   * ENG-669 PR-D: tell the owner an unattended session's work plan paused because a step's model is outside their
+   * plan (or no longer available). Sent once per session and step (see pauseWorkPlanForUnavailableStepModel).
+   * Best-effort: never throws.
+   */
+  async sendWorkPlanStepModelUnavailableEmail(
+    toEmails: string | string[],
+    opts: {
+      sessionId: string;
+      stepCount: number;
+      modelLabel: string;
+      reason: ModelUnavailableReason;
+      /** ENG-669 PR-C: the step is on the AgentWeb Model and its router is unavailable right now. */
+      routerUnavailable?: boolean;
+      scheduleName?: string | null;
+      sessionTitle?: string | null;
+      /** The plans that include the model (the refusal's `upgradeRequired`); empty = none, so no upgrade is offered. */
+      upgradeRequired?: string[];
+    },
+  ) {
+    await this.sendModelUnavailableNoticeEmail(toEmails, buildWorkPlanStepModelNotice(opts), `session ${opts.sessionId}`);
+  },
+
+  /** Renders and sends one unattendedModelNoticeCopy notice. Every string in it is plain text and escaped here. */
+  async sendModelUnavailableNoticeEmail(toEmails: string | string[], notice: ModelNoticeCopy, logContext: string) {
+    const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const [primary, ...secondary] = notice.actions;
+      const linkHtml = (path: string) => this.escapeHtml(`${customerFrontendUrl}${path}`);
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #ffc107; color: #664d03; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .info-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>⚠️ ${this.escapeHtml(notice.headline)}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${this.escapeHtml(notice.subheading)}</p>
+            </div>
+            <div class="content">
+              <div class="info-section">
+                ${notice.paragraphs.map((p, i) => `<p style="margin: ${i === 0 ? '0' : '10px 0 0 0'}; line-height: 1.6;">${this.escapeHtml(p)}</p>`).join('\n                ')}
+              </div>
+            </div>
+            <div class="footer">
+              ${primary ? `<a class="button" href="${linkHtml(primary.path)}">${this.escapeHtml(primary.label)}</a>` : ''}
+              ${secondary.map((a) => `<p style="margin: 10px 0 0 0;"><a href="${linkHtml(a.path)}">${this.escapeHtml(a.label)}</a></p>`).join('')}
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">${this.escapeHtml(notice.footer)}</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+      const text = `${notice.headline}: ${notice.subheading}
+
+${notice.paragraphs.join('\n\n')}
+
+---
+${notice.actions.map((a) => `${a.label}: ${customerFrontendUrl}${a.path}`).join('\n')}`;
+      await this.sendEmail(emailList, notice.subject, text, html);
+      console.log(`Model-unavailable notice sent to recipients: ${emailList.join(', ')} (${logContext})`);
+    } catch (error) {
+      console.error(`Error sending model-unavailable notice to ${emailList.join(', ')} (${logContext}):`, error);
+      // Don't throw — a notification failure must not break the run.
     }
   },
 
@@ -1364,6 +1481,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       // Optional only because this type under-declared the `TokenUsageStatus` the
       // sole caller has always passed whole — every runtime call already carries it.
       month?: string;
+      // ENG-668: set when the block is pay-as-you-go's own (cap reached / suspended / not covered).
+      paygBlock?: UsageBlockPaygInput;
     }
   ) {
     try {
@@ -1387,10 +1506,22 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
         blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
       );
 
-      const limitLabel = 'Monthly Usage Limit Reached';
-      const limitReasonText = 'monthly usage limit';
-      const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
-      const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
+      // ENG-668: a pay-as-you-go account is past its plan pool by design, so "N% of your monthly
+      // allowance" is not what stopped it (and can read far above 100%). Name the PAYG reason instead,
+      // in the same words as the 429.
+      const paygCopy = usageStatus.paygBlock
+        ? buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock })
+        : null;
+      const limitLabel = paygCopy ? paygCopy.headline : 'Monthly Usage Limit Reached';
+      // The PAYG reason is already the headline and the body; the cause just says usage is paused, and
+      // the call to action is the reason's own (raise the limit / update or add a card / reactivate).
+      const limitCause = paygCopy ? 'AI usage is paused' : 'you have reached your monthly usage limit';
+      const continueAction = (paygCopy && paygBlockActionSentence(usageStatus.paygBlock))
+        || 'To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.';
+      const usageLine = paygCopy
+        ? this.escapeHtml(paygCopy.body)
+        : `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
+      const usageLineText = paygCopy ? paygCopy.body : `Usage: ${limitPercent}% of your monthly allowance used.`;
       const allowanceResetNoun = 'usage allowance';
       // ENG-1344: "resets at the start of each billing period" is the exact
       // vagueness the escalating customer could not decode. Name the day when we
@@ -1427,13 +1558,13 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                 <h3>⚠️ ${limitLabel}</h3>
                 <p style="margin: 0; line-height: 1.6;">
                   Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>,
-                  but it cannot execute because you have reached your ${limitReasonText}.
+                  but it cannot execute because ${limitCause}.
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
                   ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  ${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  ${allowanceResetClause} ${continueAction}
                 </p>
               </div>
             </div>
@@ -1451,11 +1582,11 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const text = `
 Scheduled Chat Error: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your ${limitReasonText}.
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because ${limitCause}.
 
 ${usageLineText}
 
-${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+${allowanceResetClause} ${continueAction}
 
 ---
 This is an automated email from your scheduled chat.
@@ -1969,13 +2100,28 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     let ownerUserId: string | undefined;
     try {
       let isSensitive = false;
+      // ENG-2785: owner admin status scopes classification — the Meta Ads tools
+      // only read cross-account data for admin callers. undefined = unknown →
+      // full (safe) classification.
+      let ownerIsAdmin: boolean | undefined;
+      let ownerResolved = false;
+      const resolveOwner = async () => {
+        if (ownerResolved || !ownerUserId) return;
+        ownerResolved = true;
+        try {
+          const owner: any = await userDb.getUserById(ownerUserId);
+          ownerEmail = owner?.email;
+          if (typeof owner?.isAdmin === 'boolean') ownerIsAdmin = owner.isAdmin; // legacy records without isAdmin stay unknown → full classification
+        } catch { /* owner unknown → full classification; resolver restricts to verified admins */ }
+      };
       for (const sessionId of sessionIds) {
         let sessionSensitive = true;
         try {
           const session: any = await chatbotDb.getChatSession(sessionId);
           if (session) {
             ownerUserId = ownerUserId || session.userId;
-            if (!reportContainsCrossAccountData(session.calledFunctions)) {
+            await resolveOwner();
+            if (!reportContainsCrossAccountData(session.calledFunctions, { ownerIsAdmin })) {
               // calledFunctions is a best-effort counter (its write errors are
               // swallowed at the call site), so a successful cross-account tool
               // call can be missing from it. Confirm against the authoritative
@@ -1983,7 +2129,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
               // send fires immediately after the run wrote these messages, so an
               // eventually-consistent read could miss a just-written call.
               const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
-              sessionSensitive = messagesReferenceCrossAccountTool(messages as any);
+              sessionSensitive = messagesReferenceCrossAccountTool(messages as any, { ownerIsAdmin });
             }
           }
           // session falsy → cannot verify → sessionSensitive stays true (closed).
@@ -1995,10 +2141,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       }
       // Resolve the owner up front — used both to authorize the owner and to
       // notify them if delivery ends up blocked.
-      try {
-        const owner = ownerUserId ? await userDb.getUserById(ownerUserId) : undefined;
-        ownerEmail = (owner as any)?.email;
-      } catch { /* owner unknown → resolver still restricts to verified admins */ }
+      await resolveOwner();
       const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail, isSensitive });
       if (authz.withheld.length > 0) {
         console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
@@ -2710,6 +2853,123 @@ View Session: ${sessionUrl}`;
     }
   },
 
+  /**
+   * ENG-668 PR-2: the billing owner's email when the month's pay-as-you-go overage invoice is created.
+   * A percentage of the cap only — never dollars; the Stripe invoice it links to carries the amount.
+   * Best-effort (`sendEmail` never throws): settlement does not depend on it.
+   */
+  async sendPaygOverageInvoiceEmail(input: {
+    to: string;
+    month: string;
+    percentOfCap: number;
+    invoiceUrl?: string | null;
+    /** Stripe already collected the invoice when the email goes out (the paid wording). */
+    paid?: boolean;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygInvoiceCreatedEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /** ENG-668 PR-2: the billing owner's email when the month's overage charge fails and PAYG is put on hold. */
+  async sendPaygOveragePaymentFailedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentFailedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** ENG-668 PR-2: the owner's email when their bank holds the overage charge for confirmation (3-D Secure). */
+  async sendPaygOveragePaymentActionRequiredEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentActionRequiredEmailCopy(input), input.invoiceUrl, '#1976d2');
+  },
+
+  /**
+   * ENG-668 PR-2: the owner's email when a payment waiting for their confirmation (3-D Secure) was not
+   * confirmed within the grace period and pay-as-you-go is put on hold. Sent once per month.
+   */
+  async sendPaygOveragePaymentUnconfirmedEmail(input: {
+    to: string;
+    month: string;
+    invoiceUrl?: string | null;
+  }): Promise<EmailSendOutcome | void> {
+    return this.sendPaygSettlementEmail(input.to, paygPaymentUnconfirmedEmailCopy(input), input.invoiceUrl, '#dc3545');
+  },
+
+  /** Renders the copy from `utils/paygSettlementCopy.ts`; no wording lives here. */
+  async sendPaygSettlementEmail(
+    to: string,
+    copy: PaygSettlementEmailCopy,
+    invoiceUrl: string | null | undefined,
+    accent: string,
+  ): Promise<EmailSendOutcome | void> {
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const settingsUrl = `${customerFrontendUrl}/settings`;
+    const invoiceLink = invoiceUrl && /^https:\/\//.test(invoiceUrl) ? invoiceUrl : null;
+    const paragraphsHtml = copy.paragraphs
+      .map((p) => `<p style="margin: 0 0 12px 0; line-height: 1.6;">${this.escapeHtml(p)}</p>`)
+      .join('');
+    const html = `
+      <html>
+      <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa;">
+        <div style="max-width: 640px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+          <div style="background-color: ${accent}; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h1 style="margin: 0; font-size: 22px;">${this.escapeHtml(copy.headline)}</h1>
+          </div>
+          <div style="padding: 20px;">
+            ${paragraphsHtml}
+            ${invoiceLink && copy.invoiceLinkLabel
+              ? `<p style="margin: 16px 0;"><a href="${this.escapeHtml(invoiceLink)}" style="display: inline-block; background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">${this.escapeHtml(copy.invoiceLinkLabel)}</a></p>`
+              : ''}
+            <p style="margin: 16px 0 0 0;"><a href="${this.escapeHtml(settingsUrl)}" style="color: #1976d2;">${this.escapeHtml(copy.settingsLinkLabel)}</a></p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    const text = [
+      copy.headline,
+      '',
+      ...copy.paragraphs,
+      '',
+      ...(invoiceLink && copy.invoiceLinkLabel ? [`${copy.invoiceLinkLabel}: ${invoiceLink}`] : []),
+      `${copy.settingsLinkLabel}: ${settingsUrl}`,
+    ].join('\n');
+    return this.sendEmail(to, copy.subject, text, html);
+  },
+
+  /**
+   * ENG-2743: email the oncall list (`oncall_emails` setting, or ONCALL_EMAIL_LIST) WITHOUT filing a tracked
+   * issue. For low-urgency daily digests the owner asked to receive by email rather than as a Linear item.
+   * Production only (elsewhere it is logged and skipped). Returns whether the email was handed to the sender;
+   * never throws.
+   */
+  async sendOncallEmailOnly(subject: string, message: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV] Suppressed oncall email: ${subject}`);
+      return false;
+    }
+    try {
+      const oncallEmails = await getAlertEmails('oncall_emails', ['ruiw@agentweb.pro']);
+      if (oncallEmails.length === 0) return false;
+      const html =
+        `<div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">` +
+        `<h2 style="margin-top: 0;">${this.escapeHtml(subject)}</h2>` +
+        `<p style="white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(message)}</p></div>`;
+      // sendEmail never throws; only a real send counts as sent (a failed or suppressed one returns false).
+      const outcome = await this.sendEmail(oncallEmails, `[PROD] ${subject}`, `${subject}\n\n${message}`, html);
+      if (outcome !== 'sent') return false;
+      console.log(`Oncall email sent to ${oncallEmails.length} recipient(s): ${subject}`);
+      return true;
+    } catch (error) {
+      console.error('Error sending oncall email:', (error as Error)?.message);
+      return false;
+    }
+  },
+
   async sendOncallAlert(
     subject: string,
     message: string,
@@ -2746,6 +3006,14 @@ View Session: ${sessionUrl}`;
         } catch (fileError) {
           console.error('Failed to file oncall item, falling back to full email:', fileError);
         }
+      }
+
+      // The tracked issue is the canonical record. Founders asked (2026-11-07) to stop the
+      // redundant "Oncall Alert" emails (e.g. "Meta connection: … token expired"): they were
+      // noise, not actionable. Email only when filing failed, so nothing is silently lost.
+      if (resolvedTrackerUrl) {
+        console.log(`Oncall alert tracked, email skipped: ${resolvedTrackerUrl}`);
+        return;
       }
 
       let html: string;

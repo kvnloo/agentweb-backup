@@ -7,6 +7,8 @@ import {
 } from '../services/llmUsageDeclineService';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { agentModeService } from '../services/agentModeService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { toCustomerRunway } from '../services/llmUsageForecastService';
 import { resolveUsageDrivers, toCustomerDrivers, previewUsageRunway } from '../services/llmUsageDriversResolverService';
@@ -18,10 +20,12 @@ import {
   ModelChangeForbiddenError,
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
+import { recordUsageAlertEvent, InvalidAlertEventError } from '../services/llmUsageAlertEventService';
 import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { readItemizationChargeEvents } from '../services/ledgerItemizationReader';
 import { reconcileItemizedUsage } from '../services/usageItemization';
+import { getPaygOverageView, updatePaygOverage, PaygOverageRequestError } from '../services/paygOverageService';
 
 const router = express.Router();
 
@@ -44,6 +48,48 @@ router.get('/usage', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting token usage:', error);
     res.status(500).json({ error: 'Failed to get token usage' });
+  }
+});
+
+/**
+ * ENG-668 — pay-as-you-go overage settings for the caller's usage pool.
+ *
+ * Same authentication as `/usage`. Anyone on the pool may read it; only the billing owner
+ * (`resolveBillingUserId(caller) === caller`) may change it — an org member who pools onto the owner
+ * gets 403, a member paying for their own plan owns their own pool. Percentages only: the cap and the
+ * overage in dollars never leave the server.
+ */
+router.get('/payg', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    return res.json(await getPaygOverageView(userId));
+  } catch (error) {
+    console.error('Error getting pay-as-you-go settings:', error);
+    return res.status(500).json({ error: 'Failed to get extra usage settings' });
+  }
+});
+
+router.put('/payg', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const { enabled, capPercentOfPool } = req.body || {};
+    return res.json(await updatePaygOverage({
+      userId,
+      // A delegated admin acts AS the customer (req.user is the customer): record who actually did it,
+      // and let the service refuse consent that only the customer can give.
+      actorId: (req as any).delegateInfo?.adminUserId || userId,
+      isDelegated: (req as any).delegateInfo?.isDelegated === true,
+      enabled,
+      capPercentOfPool,
+    }));
+  } catch (error) {
+    if (error instanceof PaygOverageRequestError) {
+      return res.status(error.status).json({ error: error.code, message: error.message });
+    }
+    console.error('Error updating pay-as-you-go settings:', error);
+    return res.status(500).json({ error: 'Failed to update extra usage settings' });
   }
 });
 
@@ -201,6 +247,26 @@ router.post('/usage-runway/decline', authenticateToken, async (req, res) => {
   }
 });
 
+/**
+ * ENG-2769 — record an outcome of the usage-alert modal (shown / dismissed /
+ * see_options / book_call / upgrade / contact). Writes nothing but a telemetry line.
+ */
+router.post('/usage-runway/alert-event', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const { action, reason, estimatedDaysRemaining, percentUsed } = req.body || {};
+    const result = await recordUsageAlertEvent(userId, { action, reason, estimatedDaysRemaining, percentUsed });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof InvalidAlertEventError) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Error recording a usage alert event:', error);
+    return res.status(500).json({ error: 'Failed to record the alert event' });
+  }
+});
+
 router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
   try {
     const userId = (req as any).user?.userId;
@@ -237,6 +303,13 @@ router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
     }
     if (error instanceof ModelNotAvailableError) {
       return res.status(400).json({ error: error.message });
+    }
+    // ENG-669: the model is outside the schedule owner's plan: the same 422 body every model refusal uses.
+    if (isModelUnavailableError(error)) {
+      const displayName = typeof agentModeService.getModelDisplayName === 'function'
+        ? agentModeService.getModelDisplayName(error.requestedModel)
+        : undefined;
+      return res.status(422).json(buildModelUnavailableBody(error, displayName));
     }
     // 409, not 500: nothing failed. Someone else changed the schedule first, so
     // the client's own view is stale — reload-and-retry is the fix, which a 500

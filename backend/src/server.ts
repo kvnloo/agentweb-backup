@@ -30,6 +30,7 @@ import {
   getEffectiveLiveUserId,
   registerLiveCloseHandler,
   registerLiveStartHandler,
+  authenticateConversableSocket,
 } from './services/liveVoiceSocket';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
@@ -166,22 +167,10 @@ io.use(async (socket, next) => {
 
   // Allow conversable (iShare) sockets — validate token against session in DynamoDB
   if (conversableToken && conversableSessionId) {
-    try {
-      const session = await chatbotDb.getChatSession(conversableSessionId);
-      if (!session) return next(new Error('Session not found'));
-      const interactiveToken = session.interactiveShareMetadata?.token;
-      if (!interactiveToken || interactiveToken !== conversableToken) {
-        return next(new Error('Invalid conversable token'));
-      }
-      if (!session.interactiveShareMetadata?.isActive) {
-        return next(new Error('Interactive share is not active'));
-      }
-      socket.data.conversableSessionId = conversableSessionId;
-      socket.data.conversableUserId = session.userId;
-      return next();
-    } catch (err: any) {
-      return next(new Error('Conversable auth error'));
-    }
+    const result = await authenticateConversableSocket(socket.handshake.auth, (id) => chatbotDb.getChatSession(id));
+    if (!result.ok) return next(new Error(result.error));
+    Object.assign(socket.data, result.data);
+    return next();
   }
 
   return next(new Error('Authentication error'));
@@ -433,6 +422,22 @@ const runDrain = async (reason: string): Promise<void> => {
     drainLiveVoiceToolExecutions(remainingDrainMs()),
   ]);
   await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());
+  // ENG-2113: a Claude-plan tool call that was still running when its turn ended is looked for one last time and saved, so it is not lost with the process.
+  await import('./services/funding/claudeCodeBackendInstance')
+    .then((m) => m.claudeCodeBackend.flush())
+    .catch(() => undefined);
+  // ENG-2906: flush queued product-journey events (PostHog batches in memory).
+  await import('./services/journeyTracking')
+    .then((m) => m.flushJourney())
+    .catch(() => undefined);
+  // ENG-2110: pending Claude sign-ins hold a child process and a private temp dir.
+  await import('./services/funding/claudeSubscriptionService')
+    .then((m) => m.shutdownClaudeSubscriptionService())
+    .catch(() => undefined);
+  // ENG-2110 1c: stops the hosted sign-in timers. Pending sign-ins are NOT cancelled on the login host: any instance can finish them, and the host expires abandoned ones itself.
+  await import('./services/funding/hostedSubscriptionService')
+    .then((m) => m.shutdownHostedSubscriptionService())
+    .catch(() => undefined);
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
@@ -594,6 +599,16 @@ createTestAccount().then(async () => {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
   }
 
+  // ENG-2271: load the admin vendor-rate overrides BEFORE listening, so no usage recording
+  // (HTTP request or queue processor) prices a Twilio unit at the defaults while an override
+  // exists. Bounded by the read's own 1.5s timeout; a settings outage must not block boot.
+  // Skipped under Jest (shouldBootstrapBackgroundJobs), where no settings I/O may happen.
+  // (refresh never rejects and logs its own failure once.)
+  if (shouldBootstrapBackgroundJobs()) {
+    const { refreshVendorRateOverrides } = await import('./utils/vendorRateCard');
+    await refreshVendorRateOverrides();
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
@@ -643,6 +658,12 @@ createTestAccount().then(async () => {
     void import('./services/ensureCriticalTables')
       .then(({ ensureCriticalTables }) => ensureCriticalTables())
       .catch((err) => console.error('[startup] ensureCriticalTables failed (non-fatal):', err?.message || err));
+
+    // Register app-wide HubSpot webhook subscriptions once per build (one instance wins the claim).
+    import('./utils/hubspotWebhookSubscriptionsBoot')
+      .then(({ ensureWebhookSubscriptionsOncePerBuild }) => ensureWebhookSubscriptionsOncePerBuild())
+      .then((outcome) => console.log(`[startup] HubSpot webhook subscription sync: ${outcome}`))
+      .catch((err) => console.error('[startup] HubSpot webhook subscription sync failed (non-fatal):', err?.message || err));
 
     // Proactively refresh OAuth tokens for outbound MCP servers before they expire.
     import('./mcp/client/mcpOAuthRefreshService')
@@ -786,6 +807,54 @@ createTestAccount().then(async () => {
         }, msUntilReach);
       } catch (error) {
         console.error('[DomainReachability] Failed to initialize:', error);
+      }
+
+      // ENG-673: the Smartlead push resumer. Every minute it claims push runs whose worker is gone (a crash or a deploy) and cancels runs
+      // left paused for a week. It does nothing unless SMARTLEAD_PUSH_ENABLED=true. In-flight work is drained at shutdown by the registry.
+      try {
+        const { getSmartleadPushService } = await import('./services/smartleadPushRuntime');
+        const { pollSmartleadEvents } = await import('./services/smartleadEventRuntime');
+        setInterval(() => {
+          // The tick itself does nothing but retry cancels of unsettled starts while the push is switched off.
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('SmartleadPushResumer', getSmartleadPushService().resumerTick())
+            .catch(e => console.error('[SmartleadPush] Resumer error:', e));
+        }, 60 * 1000);
+        console.log('[SmartleadPush] Resumer initialized — every minute (active only when SMARTLEAD_PUSH_ENABLED=true)');
+
+        // The withdrawal sweep: an opt-out recorded here must reach Smartlead. Hourly, and deliberately NOT behind the kill switch (stopping
+        // pushes must never stop opt-outs); it only has work when a push has ever run.
+        setTimeout(() => {
+          let sweeping = false; // a pass over many lists can outlast the hour: never overlap two
+          const sweep = () => {
+            if (!isCronEnabled() || sweeping) return;
+            sweeping = true;
+            cronJobRegistry.track('SmartleadWithdrawalSweep', getSmartleadPushService().sweepWithdrawals())
+              .catch(e => console.error('[SmartleadWithdrawal] Sweep error:', e))
+              .finally(() => { sweeping = false; });
+          };
+          sweep();
+          setInterval(sweep, 60 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        console.log('[SmartleadWithdrawal] Sweep initialized — hourly, first pass in 5 minutes');
+
+        // The event poll: backs up the Smartlead event webhook, so a missed unsubscribe or bounce still blocks the contact. Hourly, offset from the
+        // withdrawal sweep, and like it NOT behind the kill switch.
+        setTimeout(() => {
+          let polling = false; // a pass over many campaigns can outlast the hour: never overlap two
+          const poll = () => {
+            if (!isCronEnabled() || polling) return;
+            polling = true;
+            cronJobRegistry.track('SmartleadEventPoll', pollSmartleadEvents())
+              .catch(e => console.error('[SmartleadPoll] Poll error:', e))
+              .finally(() => { polling = false; });
+          };
+          poll();
+          setInterval(poll, 60 * 60 * 1000);
+        }, 20 * 60 * 1000);
+        console.log('[SmartleadPoll] Event poll initialized — hourly, first pass in 20 minutes');
+      } catch (error) {
+        console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }
 
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
@@ -1091,6 +1160,102 @@ createTestAccount().then(async () => {
         console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
       }
 
+      // ENG-668 PR-2 — month-end pay-as-you-go settlement. Dark behind the AW-Settings switch
+      // `payg_settlement_enabled` (exact 'true'); off = the sweep returns without reading anything.
+      // Same fixed-UTC-hour anchoring as the seat-credit sweep above, and after it, so the closed
+      // month's credit ledger has already been kept as `llmUsageCreditsClosed` when it runs. Every
+      // month's settlement record makes an extra fire a no-op.
+      try {
+        const { runPaygSettlement } = await import('./cron/paygSettlementCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const PAYG_SETTLEMENT_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstPaygSettlementRun = msUntilNextUtcHour(PAYG_SETTLEMENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+            .catch(e => console.error('[paygSettlementCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('paygSettlementCron', runPaygSettlement())
+              .catch(e => console.error('[paygSettlementCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstPaygSettlementRun);
+        console.log(
+          `[paygSettlementCron] Initialized — first run at ${PAYG_SETTLEMENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstPaygSettlementRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[paygSettlementCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call number rent (ENG-2614) — daily sweep that meters the current
+      // month's rent of every org's caller number. Anchored to a fixed UTC hour
+      // (a bare 24h setInterval never elapses with redeploys every 1-2 hours); the
+      // month-scoped idempotency key makes any extra fire a safe no-op. Switch off
+      // with HOT_LEAD_CALL_RENT_METERING=false.
+      try {
+        const { runNumberRentCron } = await import('./cron/numberRentCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const NUMBER_RENT_HOUR_UTC = 11;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstNumberRentRun = msUntilNextUtcHour(NUMBER_RENT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('numberRentCron', runNumberRentCron())
+            .catch(e => console.error('[numberRentCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('numberRentCron', runNumberRentCron())
+              .catch(e => console.error('[numberRentCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstNumberRentRun);
+        console.log(
+          `[numberRentCron] Initialized — first run at ${NUMBER_RENT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstNumberRentRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[numberRentCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call stuck-record sweep (ENG-2271) — daily. Finds call records that stayed
+      // live longer than a call can last and settles them from Twilio's own record. Anchored to
+      // a fixed UTC hour like the rent sweep. REPORT-ONLY unless HOT_LEAD_CALL_STUCK_SWEEP=close;
+      // =off disables it.
+      try {
+        const { runStuckCallSweepCron } = await import('./cron/stuckCallSweepCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const STUCK_CALL_SWEEP_HOUR_UTC = 12;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstStuckCallSweepRun = msUntilNextUtcHour(STUCK_CALL_SWEEP_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+            .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('stuckCallSweepCron', runStuckCallSweepCron())
+              .catch(e => console.error('[stuckCallSweepCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstStuckCallSweepRun);
+        console.log(
+          `[stuckCallSweepCron] Initialized — first run at ${STUCK_CALL_SWEEP_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstStuckCallSweepRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[stuckCallSweepCron] Failed to initialize:', error);
+      }
+
+      // Hot-lead call due-retries (ENG-2783): every 5 minutes, places the one retry of a lead who pressed 2 ("not available
+      // now") once it is due; the job queue cannot run a job later. Does nothing while the global hot_lead_call_mode kill
+      // switch is off. HOT_LEAD_CALL_RETRY=off|0|false does not arm it.
+      try {
+        const { startHotLeadCallRetryCron } = await import('./cron/hotLeadCallRetryCron');
+        startHotLeadCallRetryCron({ enabled: isCronEnabled, track: (name, run) => cronJobRegistry.track(name, run) });
+      } catch (error) {
+        console.error('[hotLeadCallRetryCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
@@ -1200,6 +1365,26 @@ createTestAccount().then(async () => {
         console.log('[skillReviewQueueDigestCron] Initialized — running daily');
       } catch (error) {
         console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
+      }
+
+      // Scheduled-run cost jump flag (ENG-2743). Read-only: once a day, during one UTC hour
+      // (SCHEDULE_COST_JUMP_SEND_HOUR_UTC), compares each schedule's cost on the last complete
+      // UTC day with its own previous 7 days and emails the oncall list when any jumped
+      // (>= 2x its median and >= $3). Ticks every 15 minutes; outside that hour a tick does nothing.
+      try {
+        const { scheduleCostJumpTick, SCHEDULE_COST_JUMP_TICK_MS } = await import('./cron/scheduleCostJumpCron');
+        if (isCronEnabled()) {
+          cronJobRegistry.track('scheduleCostJumpCron', scheduleCostJumpTick())
+            .catch(e => console.error('[scheduleCostJumpCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('scheduleCostJumpCron', scheduleCostJumpTick())
+            .catch(e => console.error('[scheduleCostJumpCron] Error:', e));
+        }, SCHEDULE_COST_JUMP_TICK_MS);
+        console.log('[scheduleCostJumpCron] Initialized — 15-minute tick, acts once a day in its UTC hour');
+      } catch (error) {
+        console.error('[scheduleCostJumpCron] Failed to initialize:', error);
       }
 
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
@@ -1581,9 +1766,38 @@ createTestAccount().then(async () => {
         console.error('[EvalMarkerSuite] Failed to initialize:', error);
       }
 
+      // Claude subscription logins (ENG-2110): daily expiry pass (no-op unless the claudeSubscription
+      // funding flag is on), and recovery of any refreshed login a previous process died holding
+      // (runs whatever the flag says, and does nothing unless such a dir exists).
+      try {
+        const { scheduleClaudeSubscriptionExpiry } = await import('./cron/claudeSubscriptionExpiryCron');
+        scheduleClaudeSubscriptionExpiry({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+        const { recoverClaudeSubscriptionOrphansAtBoot } = await import('./services/funding/claudeSubscriptionService');
+        // Not awaited: a slow store must never hold up the rest of boot.
+        void recoverClaudeSubscriptionOrphansAtBoot()
+          .then((recovered) => recovered && console.log('[ClaudeSubscription] boot recovery:', recovered))
+          .catch((error) => console.error('[ClaudeSubscription] boot recovery failed:', (error as { code?: string })?.code || 'error'));
+      } catch (error) {
+        console.error('[ClaudeSubscription] Failed to initialize:', (error as { code?: string })?.code || 'error');
+      }
+
+      // Hosted subscription logins (ENG-2110 1c/1d): finish unconfirmed disconnects. Not flag-gated on purpose.
+      try {
+        const { scheduleHostedSubscriptionSweep } = await import('./cron/hostedSubscriptionSweepCron');
+        scheduleHostedSubscriptionSweep({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[HostedSubscription] Failed to initialize sweep:', (error as { code?: string })?.code || 'error');
+      }
+
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
-      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear bug stats,
       // DMs Harsha through the existing loop Slack rail, and appends one
       // snapshot for restart-safe trend rendering.
       if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {

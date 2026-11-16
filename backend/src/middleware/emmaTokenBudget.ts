@@ -19,7 +19,7 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from './auth';
-import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, TURN_ADMISSION, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 
 export type EmmaRouteBudget = 'metered' | 'exempt';
@@ -118,6 +118,8 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
 
   // ─── Leads, activity, misc ────────────────────────────────────────────────
   'POST /search-leads': 'metered',
+  'POST /leads': 'metered',
+  'POST /lead-details': 'metered',
   'GET /actions': 'exempt',
   'POST /repair-blog': 'metered',
 };
@@ -171,7 +173,7 @@ export async function requireEmmaTokenBudget(
   }
 
   try {
-    const usageStatus = await checkTokenUsage(user.userId);
+    const usageStatus = await checkTokenUsage(user.userId, TURN_ADMISSION);
     if (!usageStatus.allowed) {
       // Same contract as controllers/chatbot.ts, so an MCP caller that runs out
       // of quota is indistinguishable from a web caller that does — now enforced
@@ -187,7 +189,7 @@ export async function requireEmmaTokenBudget(
       //    since ENG-1116 flipped enforcement to cost, and "contact support or
       //    upgrade your plan" is the dead end ENG-1035 was raised about: no
       //    reset date, no remedy an agent can relay.
-      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
+      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month, paygBlock: usageStatus.paygBlock });
       res.status(429).json({
         error: blockCopy.message,
         usageBlock: blockCopy,

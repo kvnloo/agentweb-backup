@@ -688,6 +688,45 @@ describe('TwitterService.searchTweets', () => {
     await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 999);
     expect(mockSearch).toHaveBeenCalledWith('agentweb', expect.objectContaining({ max_results: 100 }));
   });
+
+  // ENG-2474: v1.1 operators (min_faves, filter:) 400 on X API v2 recent search.
+  it('translates filter:replies/retweets to v2 is: operators', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, '"AI agents" -filter:replies -filter:nativeretweets filter:retweets lang:en');
+    expect(mockSearch).toHaveBeenCalledWith('"AI agents" -is:reply -is:retweet is:retweet lang:en', expect.anything());
+  });
+
+  it('strips min_* operators and applies them as a public_metrics post-filter', async () => {
+    mockSearch.mockResolvedValue({ data: { data: [
+      { id: 'a', public_metrics: { like_count: 80, retweet_count: 5, reply_count: 1 } },
+      { id: 'b', public_metrics: { like_count: 10, retweet_count: 50, reply_count: 1 } },
+      { id: 'c' },
+    ] } });
+    const res = await twitterService.searchTweets(OWNER, ACCOUNT_ID, '(GPU OR "AI infra") (min_faves:50) min_retweets:2 lang:en');
+    expect(mockSearch).toHaveBeenCalledWith('(GPU OR "AI infra") lang:en', expect.anything());
+    expect(res.map((t: any) => t.id)).toEqual(['a']);
+  });
+
+  it('drops filter: tokens with no v2 equivalent', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agents filter:safe');
+    expect(mockSearch).toHaveBeenCalledWith('agents', expect.anything());
+  });
+
+  it('throws instead of calling X when only unsupported operators remain', async () => {
+    await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'min_faves:50 filter:safe')).rejects.toThrow(/no searchable terms/);
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
+
+  it('keeps operator-like text inside quoted phrases literal', async () => {
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 'a', public_metrics: { like_count: 0 } }] } });
+    const res = await twitterService.searchTweets(OWNER, ACCOUNT_ID, '"min_faves:10 filter:links" agents');
+    expect(mockSearch).toHaveBeenCalledWith('"min_faves:10 filter:links" agents', expect.anything());
+    expect(res.map((t: any) => t.id)).toEqual(['a']);
+  });
+
+  it('rejects a query whose OR lost an operand to translation', async () => {
+    await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'cats OR (filter:safe)')).rejects.toThrow(/incomplete/);
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
 });
 
 // ─── getUserTweets max_results clamping ────────────────────────────────────────
@@ -1210,10 +1249,45 @@ describe('TwitterService — pre-write scope guard', () => {
 // ─── getLikedTweets (ENG-979) ─────────────────────────────────────────────────
 
 describe('TwitterService.getLikedTweets', () => {
+  it('follows liked timeline next tokens up to the requested result bound', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserLikedTweets.mockReset();
+    mockUserLikedTweets
+      .mockResolvedValueOnce({ data: { data: [{ id: 'page1' }], meta: { next_token: 'cursor2' } } })
+      .mockResolvedValueOnce({ data: { data: [{ id: 'page2' }] } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toEqual([{ id: 'page1' }, { id: 'page2' }]);
+    expect(mockUserLikedTweets).toHaveBeenNthCalledWith(2, '12345', expect.objectContaining({ pagination_token: 'cursor2' }));
+  });
+
   beforeEach(() => {
     mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
     mockUserLikedTweets.mockReset();
     mockUserLikedTweets.mockResolvedValue({ data: { data: [{ id: 'lk1', text: 'liked', author_id: 'a1' }] } });
+  });
+
+  it('stops when X repeats a pagination token', async () => {
+    mockUserLikedTweets.mockResolvedValue({ data: { data: [{ id: 'repeat' }], meta: { next_token: 'same' } } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toHaveLength(2);
+    expect(mockUserLikedTweets).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds results and stops fetching after reaching the requested count', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({ id: String(i) }));
+    mockUserLikedTweets.mockResolvedValue({ data: { data: rows, meta: { next_token: 'unused' } } });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toEqual(rows);
+    expect(mockUserLikedTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a disconnected account before calling X', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([]);
+    await expect(twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).rejects.toThrow();
+    expect(mockUserLikedTweets).not.toHaveBeenCalled();
+  });
+
+  it('refuses missing like.read before calling X', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: ['tweet.read'] })]);
+    await expect(twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).rejects.toThrow(/like.read/);
+    expect(mockUserLikedTweets).not.toHaveBeenCalled();
   });
 
   it('defaults to the connected account own user id (no handle lookup)', async () => {

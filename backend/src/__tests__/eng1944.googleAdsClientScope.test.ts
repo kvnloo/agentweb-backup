@@ -107,16 +107,26 @@ describe('ENG-1944 — admin client_id scoping on Google Ads tools', () => {
     });
   });
 
-  it('call_google_ads_api: refuses client_id on a non-read action (WRITE) rather than mutating on the admin\'s behalf', async () => {
+  it('call_google_ads_api: allows an admin client-scoped WRITE, audited, using the client\'s credentials', async () => {
     const result = await service.handleCallGoogleAdsApi(
       'admin-1',
-      { customer_id: '123', entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: 'customers/123/campaigns/1', status: 'ENABLED' },
-      { clientScope: { clientId: 'client@example.com', toolName: 'call_google_ads_api' } }
+      { customer_id: '123', entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: 'customers/123/campaigns/1', status: 'PAUSED' },
+      { clientScope: { clientId: 'client@example.com', callerIsAdmin: true, toolName: 'call_google_ads_api' } }
     );
-    expect(result).toEqual(expect.objectContaining({ success: false, error: expect.stringMatching(/only supports read actions/i) }));
-    // Refused before any credential resolution happens at all.
-    expect(userDb.getUserById).not.toHaveBeenCalled();
-    expect(recordAdminAudit).not.toHaveBeenCalled();
+    expect(result?.error ?? '').not.toMatch(/only supports read actions/i);
+    expect(recordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({
+      actorUserId: 'admin-1', action: 'google_ads_client_scope', targetUserId: 'target-1',
+    }));
+  });
+
+  it('call_google_ads_api: still refuses a client-scoped WRITE from a non-admin', async () => {
+    const result = await service.handleCallGoogleAdsApi(
+      'user-1',
+      { customer_id: '123', entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: 'customers/123/campaigns/1', status: 'PAUSED' },
+      { clientScope: { clientId: 'client@example.com', callerIsAdmin: false, toolName: 'call_google_ads_api' } }
+    );
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).toMatch(/admin-only/i);
   });
 
   it('unscoped calls (no client_id) are completely unaffected — zero admin gate, zero audit, act as the caller', async () => {

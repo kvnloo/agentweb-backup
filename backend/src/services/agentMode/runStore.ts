@@ -39,8 +39,8 @@
  */
 import AWS from 'aws-sdk';
 import crypto from 'crypto';
+import { TABLE_PREFIX } from '../../config/constants';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const AGENT_RUNS_TABLE = `${TABLE_PREFIX}AW-AgentRuns`;
 
 /** Idempotency lock TTLs (seconds). */
@@ -118,6 +118,17 @@ export function scheduledIdempotencyKey(scheduleId: string, fireTime: string): s
  */
 export function createSessionIdempotencyKey(userId: string, clientKey: string): string {
   return crypto.createHash('sha256').update(`create-session|${userId}|${clientKey}`).digest('hex');
+}
+
+/**
+ * ENG-2773: plan-launch lock key. Distinct `plan-session|` namespace so no client key sent to
+ * createSession (whose hash input is `create-session|...`) can ever collide with a plan launch.
+ */
+export function planSessionIdempotencyKey(userId: string, normalizedPlanTitle: string, clientKey: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`plan-session|${userId}|${normalizedPlanTitle}|${clientKey}`)
+    .digest('hex');
 }
 
 /**

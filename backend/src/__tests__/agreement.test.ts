@@ -141,6 +141,8 @@ describe('bootstrapCI and agreementReport', () => {
     const r = agreementReport(textbookTable(), { seed: 1, iterations: 50 });
     expect(toGraderValidation(r, 'https://linear.app/x', new Date('2026-09-25T10:00:00Z')))
       .toEqual({ kappa: r.kappa, n: 50, date: '2026-09-25', evidence: 'https://linear.app/x' });
+    expect(toGraderValidation(r, 'https://linear.app/x', new Date('2026-09-25T10:00:00Z'), 'human'))
+      .toEqual({ kappa: r.kappa, n: 50, date: '2026-09-25', evidence: 'https://linear.app/x', labelSource: 'human' });
   });
 });
 

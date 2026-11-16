@@ -58,6 +58,10 @@ export interface ShadowJudgeSamplerResult {
   shadowJudgeCount?: number;
   scored?: number;
   errors?: number;
+  /** Sessions whose scoring failed on the first pass and were attempted once more. */
+  retried?: number;
+  /** Of `retried`, those that scored on the retry (counted in `scored`, not in `errors`). */
+  recovered?: number;
 }
 
 export interface ShadowJudgeSamplerOptions {
@@ -106,6 +110,10 @@ export async function runShadowJudgeSample(
 
   let scored = 0;
   let errors = 0;
+  // ENG-2138: a failed session is never re-sampled (tomorrow draws a different date), so a
+  // transient judge failure would permanently skew stored scores toward short, clean
+  // transcripts. Failures are held back here and retried once, after the main loop.
+  const failed: Array<{ session: ChatSession; judge: ScoringJudge; error: unknown }> = [];
   for (const item of picked) {
     let session: ChatSession | null;
     try {
@@ -123,10 +131,29 @@ export async function runShadowJudgeSample(
         const result = await scoreSessionWithJudgeIfNeeded(session, judge);
         if (result) scored++;
       } catch (error) {
-        errors++;
-        console.error(`[ShadowJudgeSampler] judge ${judge.id} failed on session ${item.sessionId}:`, error);
+        failed.push({ session, judge, error });
       }
     }
+  }
+
+  // One retry pass, sequential. Safe: scoreSessionWithJudgeIfNeeded writes the score only after
+  // the model call succeeds and skips a session already scored by this judge, so only sessions
+  // that never persisted a score are re-attempted. A null on retry is not a recovery.
+  let recovered = 0;
+  for (const { session, judge, error: firstError } of failed) {
+    let error = firstError;
+    try {
+      const result = await scoreSessionWithJudgeIfNeeded(session, judge);
+      if (result) {
+        scored++;
+        recovered++;
+        continue;
+      }
+    } catch (retryError) {
+      error = retryError;
+    }
+    errors++;
+    console.error(`[ShadowJudgeSampler] judge ${judge.id} failed on session ${session.sessionId}:`, error);
   }
 
   return {
@@ -137,6 +164,8 @@ export async function runShadowJudgeSample(
     shadowJudgeCount: shadowJudges.length,
     scored,
     errors,
+    retried: failed.length,
+    recovered,
   };
 }
 

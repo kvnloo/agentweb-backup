@@ -26,6 +26,8 @@ interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string;
+  /** ENG-1271: derived customer-vs-staff activity signal from GET /api/admin/users. */
+  selfActivity?: { selfActiveRecently: boolean; lastSelfActiveAt: string | null; staffOperatedSuspect: boolean } | null;
   displayName?: string;
   funnelStatus?: string | null;
   supportNote?: string;
@@ -46,6 +48,14 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  // ENG-273: one messaging platform per customer, derived by the backend policy.
+  messagingPlatform?: "slack" | "whatsapp" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
+  whatsappNumberMasked?: string | null; // last four digits only
+  // Why this account has no WhatsApp number any more, and whether the connected number has
+  // texted STOP (an account that could not be matched to its number at the time).
+  whatsappDisconnect?: { reason: "stop" | "customer" | "admin"; at: string; last4?: string } | null;
+  whatsappOptedOut?: boolean;
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -59,6 +69,14 @@ interface User {
   subscriptionType?: string; // Subscription type for customer portal users
   /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
   spendThisMonthUsd?: number;
+  /** ENG-2906: product attribution (attribution only; never restricts access). */
+  signupProduct?: string;
+  signupClient?: string;
+  signupRef?: string;
+  attributionConfidence?: "tracked" | "inferred" | "verified";
+  products?: Record<string, { firstAt?: string; lastAt?: string }>;
+  zomaStage?: string;
+  zomaStageAt?: string;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -100,9 +118,9 @@ interface AdminContextType {
   agentModeAnalytics: any;
   gtmAnalytics: any;
   crmAnalytics: any;
-  loadUsers: (hideBotLike?: boolean) => Promise<void>;
-  loadWaitlist: () => Promise<void>;
-  loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
+  loadUsers: (hideBotLike?: boolean) => Promise<boolean>;
+  loadWaitlist: () => Promise<boolean>;
+  loadAnalytics: (startDate: string, endDate: string) => Promise<boolean>;
   updateWaitlistStatus: (email: string, status: string) => Promise<void>;
   updateWaitlistSupportNote: (
     email: string,
@@ -169,8 +187,10 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
       });
       setUsers(response.data);
       setError(null);
+      return true;
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to load users");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -188,8 +208,10 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
       });
       setWaitlist(sortedWaitlist);
       setError(null);
+      return true;
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to load waitlist");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -235,6 +257,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
         setGtmAnalytics(gtmResponse.data);
         setCrmAnalytics(crmResponse.data);
         setError(null);
+        return true;
       } catch (err: any) {
         console.error('Error loading analytics:', err);
         const errorMessage = err.response?.data?.message || err.message || "Failed to load analytics";
@@ -317,6 +340,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
           topToolsInRange: [],
           dailyGrowth: [],
         });
+        return false;
       } finally {
         setLoading(false);
       }

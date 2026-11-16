@@ -129,7 +129,7 @@ describe('runFinalizeGuard', () => {
   it('email_sent claim with NO successful email tool in ledger → corrective turn issued (failure path)', async () => {
     const { ports, judge, correct } = makePorts();
     judge
-      .mockResolvedValueOnce([{ claimClass: 'email_sent' }]); // initial check
+      .mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]); // initial check
     correct.mockResolvedValue('I was unable to complete the email step — the send did not succeed. Want me to retry?');
 
     const outcome = await runFinalizeGuard({
@@ -148,7 +148,7 @@ describe('runFinalizeGuard', () => {
 
   it('detectOnly (shadow): mismatch found → detected_mismatch, text unchanged, correction port never called (ENG-2150 fix)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]); // initial check
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]); // initial check
 
     const outcome = await runFinalizeGuard({
       finalText: CLAIMING_TEXT,
@@ -166,7 +166,7 @@ describe('runFinalizeGuard', () => {
 
   it('detectOnly (shadow): a backed claim is still clean, and the judge alone decides — no correction attempted either way', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
 
     const outcome = await runFinalizeGuard({
       finalText: CLAIMING_TEXT,
@@ -184,8 +184,8 @@ describe('runFinalizeGuard', () => {
     const { ports, judge, correct } = makePorts();
     const stillLying = 'The email was sent earlier today as requested.';
     judge
-      .mockResolvedValueOnce([{ claimClass: 'email_sent' }]) // initial check
-      .mockResolvedValueOnce([{ claimClass: 'email_sent' }]); // re-check on corrected text
+      .mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]) // initial check
+      .mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]); // re-check on corrected text
     correct.mockResolvedValue(stillLying);
 
     const outcome = await runFinalizeGuard({
@@ -205,7 +205,7 @@ describe('runFinalizeGuard', () => {
 
   it('claim backed by a successful send_email ledger entry → clean, no correction (happy path)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'send_email', status: 'success', result: { success: true, messageId: 'm-1' } },
     ];
@@ -220,7 +220,7 @@ describe('runFinalizeGuard', () => {
 
   it('a send_email "success" that ENCODES a failure does not back the claim', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue('The email could not be delivered — the provider rejected it.');
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'send_email', status: 'success', result: { success: false, error: 'SMTP rejected' } },
@@ -234,7 +234,7 @@ describe('runFinalizeGuard', () => {
 
   it('a FAILED send_email ledger entry does not back the claim', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue('The email step failed and nothing was delivered.');
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'send_email', status: 'error' },
@@ -248,7 +248,7 @@ describe('runFinalizeGuard', () => {
 
   it('asset claim: a generate_image confirmation-gate pause (no asset) does not back asset_generated', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'asset_generated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'asset_generated', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue('No new visuals exist yet — the run paused for your confirmation before producing anything.');
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'generate_image', status: 'success', result: { success: true, awaitingUserConfirmation: true } },
@@ -270,7 +270,7 @@ describe('runFinalizeGuard', () => {
 
   it('asset claim: a real generate_image asset backs asset_generated (happy path)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'asset_generated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'asset_generated', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'generate_image', status: 'success', result: { success: true, imageUrl: 'https://s3/img.png' } },
     ];
@@ -289,7 +289,7 @@ describe('runFinalizeGuard', () => {
     const { ports, judge, claimCheckErrors } = makePorts({
       requestCorrection: jest.fn().mockRejectedValue(new Error('correction model down')),
     });
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
 
     const outcome = await runFinalizeGuard({ finalText: CLAIMING_TEXT, ledger: emptyLedger, ports });
 
@@ -304,7 +304,7 @@ describe('runFinalizeGuard', () => {
     const { ports, judge, correct, claimCheckErrors } = makePorts();
     const stillLying = 'The email was sent earlier today as requested.';
     judge
-      .mockResolvedValueOnce([{ claimClass: 'email_sent' }])
+      .mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }])
       .mockRejectedValueOnce(new Error('judge flake on re-check'));
     correct.mockResolvedValue(stillLying);
 
@@ -317,7 +317,7 @@ describe('runFinalizeGuard', () => {
 
   it('settings_saved claim with NO successful memory/config tool in ledger → corrective turn (ENG-143 gap)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue("I wasn't able to save that setup — nothing was persisted this session. Want me to try again?");
 
     const outcome = await runFinalizeGuard({
@@ -333,7 +333,7 @@ describe('runFinalizeGuard', () => {
 
   it('settings_saved claim backed by a successful save_memory ledger entry → clean (happy path)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'save_memory', status: 'success', result: { success: true } },
     ];
@@ -350,7 +350,7 @@ describe('runFinalizeGuard', () => {
 
   it('settings_saved claim backed by a successful update_brand_guidelines ledger entry → clean', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'update_brand_guidelines', status: 'success', result: { success: true } },
     ];
@@ -367,7 +367,7 @@ describe('runFinalizeGuard', () => {
 
   it('"landed in ClickUp" claim end-to-end: no ClickUp task tool exists → unbacked → corrective turn (ENG-143 literal example)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue('The task was not actually created in ClickUp this session — I do not have a tool to do that yet. I can create it as an internal task instead, or you can add it manually.');
 
     const outcome = await runFinalizeGuard({
@@ -383,7 +383,7 @@ describe('runFinalizeGuard', () => {
 
   it('task claim backed by a successful create_task_from_prompt ledger entry → clean (happy path)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'create_task_from_prompt', status: 'success', result: { success: true, taskId: 't-1' } },
     ];
@@ -423,7 +423,7 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
   // and just surface the gap for review instead of rewriting the message.
   it('a claim with only a LOOSE tool-name match (no strict match) is left unchanged: action ambiguous_unmatched', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated', statement: 'asserted in the reply' }]);
     // "sync_task_from_calendar" contains "task" but doesn't start with
     // create_/update_/manage_/add_/execute_ — strict matcher misses it.
     const ledger: FinalizeLedgerEntry[] = [
@@ -445,7 +445,7 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
 
   it('a claim with NO match at all (not even loose) still gets corrected as before (no regression)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated', statement: 'asserted in the reply' }]);
     correct.mockResolvedValue('The task was not actually created this session.');
 
     const outcome = await runFinalizeGuard({
@@ -462,8 +462,8 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
   it('mixed: a confidently-unbacked class still corrects, an ambiguous class in the same reply is left out of the correction and reported separately', async () => {
     const { ports, judge, correct } = makePorts();
     judge.mockResolvedValueOnce([
-      { claimClass: 'email_sent' },
-      { claimClass: 'task_created_or_updated' },
+      { claimClass: 'email_sent', statement: 'asserted in the reply' },
+      { claimClass: 'task_created_or_updated', statement: 'asserted in the reply' },
     ]);
     correct.mockResolvedValue('I was not able to send the email this session.');
     const ledger: FinalizeLedgerEntry[] = [
@@ -485,7 +485,7 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
 
   it('strict match still wins cleanly when both strict and loose would match (no behavior change for the common case)', async () => {
     const { ports, judge, correct } = makePorts();
-    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent', statement: 'asserted in the reply' }]);
     const ledger: FinalizeLedgerEntry[] = [
       { toolName: 'send_email', status: 'success', result: { success: true, messageId: 'm-1' } },
     ];
@@ -495,6 +495,83 @@ describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, E
     expect(outcome.action).toBe('clean');
     expect(outcome.ambiguousClaimClasses).toEqual([]);
     expect(correct).not.toHaveBeenCalled();
+  });
+});
+
+describe('a saved draft does not back a "published" claim (ENG-2459)', () => {
+  const PUBLISHED = 'The LinkedIn post was published.';
+  const post = (extra: Partial<FinalizeLedgerEntry>): FinalizeLedgerEntry => ({
+    toolName: 'post_on_connected_account', status: 'success', result: {}, ...extra,
+  });
+
+  it.each([
+    ['the call asked for save_as_draft', post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: true } })],
+    ['the stored result is flagged draft', post({ result: { success: true, draft: true } })],
+  ])('is a mismatch when %s', async (_name, entry) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({ finalText: PUBLISHED, ledger: [entry], ports, detectOnly: true });
+
+    // Not 'ambiguous_unmatched': the loose tier must not swallow it either.
+    expect(outcome.action).toBe('detected_mismatch');
+    expect(outcome.mismatchedClaimClasses).toEqual(['post_published']);
+  });
+
+  it.each([
+    ['no status (the tool defaults to draft)', {}],
+    ['status draft', { status: 'draft' }],
+  ])('a publish_blog_article call with %s does not back a "published" claim', async (_name, args) => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args }],
+      ports,
+      detectOnly: true,
+    });
+
+    expect(outcome.action).toBe('detected_mismatch');
+  });
+
+  it('a publish_blog_article call with status published still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: 'The blog article was published.' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The blog article was published.',
+      ledger: [{ toolName: 'publish_blog_article', status: 'success', result: {}, args: { status: 'published' } }],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
+  it('a normal post call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { platform: 'linkedin', content: 'Hi', save_as_draft: false } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+  });
+
+  it('a published call next to a draft call still backs the claim', async () => {
+    const { ports, judge } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'post_published', statement: PUBLISHED }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: PUBLISHED,
+      ledger: [post({ args: { save_as_draft: true } }), post({ args: { content: 'Hi' } })],
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
   });
 });
 

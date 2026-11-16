@@ -1,5 +1,5 @@
 import { supersession } from './agentMode/modelSupersession';
-import { LLM_MODEL_REGISTRY, type LLMModelConfig } from './agentMode/llmModelRegistry';
+import { LLM_MODEL_REGISTRY, LEGACY_MODEL_ALIASES, type LLMModelConfig } from './agentMode/llmModelRegistry';
 import { IMAGE_MODEL_IDS } from './imageModelRegistry';
 
 export const MODEL_ROLES = ['chat', 'enrichment', 'image', 'embedding', 'scoring_judge', 'content_generation', 'research', 'voice'] as const;
@@ -25,14 +25,25 @@ export function getRoleModelOptions(role: ModelRole): string[] {
   // Same dimensions alone do NOT make two embedding spaces compatible. Only the
   // existing OpenRouter model is selectable until a separate reindex migration exists.
   if (role === 'embedding') return ['openai/text-embedding-3-large'];
-  return Object.entries(LLM_MODEL_REGISTRY).filter(([id, m]) =>
+  const options = Object.entries(LLM_MODEL_REGISTRY).filter(([id, m]) =>
     !successors.has(id) && !m.legacy && llmCanRunRole(m, role),
   ).map(([id]) => id);
+  // The role's own default is always a valid choice, even when the picker would hide it as
+  // superseded. Otherwise an org cannot save the default (the PUT 400s) and an override of it
+  // resolves to its successor (ENG-2720: gpt-5.6-luna -> gpt-6-luna).
+  const roleDefault = FALLBACKS[role];
+  return options.includes(roleDefault) || !canRunPersistedDefault(role, roleDefault) ? options : [...options, roleDefault];
 }
 
 // A persisted admin default is honoured even when the picker hides it (a legacy
 // model, or the image preview alias), as long as the role can still run it.
-function canRunPersistedDefault(role: ModelRole, id: string): boolean {
+function canonicalModelId(id: string): string {
+  return Object.prototype.hasOwnProperty.call(LEGACY_MODEL_ALIASES, id) ? LEGACY_MODEL_ALIASES[id] : id;
+}
+
+function canRunPersistedDefault(role: ModelRole, rawId: string): boolean {
+  // A stored default may hold a renamed model's old id; callLLM maps it forward, so judge the canonical id.
+  const id = canonicalModelId(rawId);
   if (role === 'image') return (IMAGE_MODEL_IDS as readonly string[]).includes(id);
   if (role === 'embedding') return false; // Only the compatible space in getRoleModelOptions.
   // Own keys only: a setting value such as "constructor" must not match Object.prototype.
@@ -46,11 +57,12 @@ export function modelCapabilities(id: string): ModelCapability[] {
   return !m ? [] : m.isLive ? ['live-audio'] : m.supportsVision ? ['text', 'vision'] : ['text'];
 }
 
-// enrichment keeps what it ran before model roles: gpt-5-chat-2, which callLLM
-// aliases to gpt-5.5 (ENG-2184). The picker hides gpt-5.5 as superseded, so the
-// default is honoured through the same runnable check as a persisted default.
+// enrichment ran on gpt-5-chat-2 (aliased to gpt-5.5) before model roles (ENG-2184). ENG-2720 moved
+// it to gpt-5.6-luna for cost; the benchmark and its quality trade-offs are on that ticket. The picker
+// may hide a superseded model, so the default is honoured through the same runnable check as a
+// persisted default.
 const FALLBACKS: Record<ModelRole, string> = {
-  chat: 'gemini-3.8-flash', enrichment: 'gpt-5.5',
+  chat: 'gemini-3.8-flash', enrichment: 'openrouter/openai/gpt-5.6-luna',
   image: 'gemini-3-pro-image-preview', embedding: 'openai/text-embedding-3-large',
   scoring_judge: 'gemini-3.1-flash-lite', content_generation: 'gemini-3.8-flash',
   research: 'gemini-3.8-flash', voice: 'gemini-3.1-flash-live-preview',
@@ -61,7 +73,11 @@ const SETTING_KEYS: Partial<Record<ModelRole, readonly string[]>> = {
 };
 
 export async function getRoleDefault(role: ModelRole): Promise<string> {
-  let candidate = role === 'embedding' ? getRoleModelOptions(role)[0] : FALLBACKS[role];
+  // CRM_ENRICH_V3_DEFAULT_MODEL is the enrichment rollback: set it on the environment to move every
+  // org without its own override back to e.g. gpt-5.5 without a code deploy. Unusable values fall
+  // through to FALLBACKS below.
+  const enrichmentOverride = role === 'enrichment' ? process.env.CRM_ENRICH_V3_DEFAULT_MODEL?.trim() : undefined;
+  let candidate = role === 'embedding' ? getRoleModelOptions(role)[0] : enrichmentOverride || FALLBACKS[role];
   const keys = SETTING_KEYS[role];
   if (keys) {
     try {
@@ -72,6 +88,7 @@ export async function getRoleDefault(role: ModelRole): Promise<string> {
       }
     } catch { console.warn(`[modelRoles] Default lookup unavailable for ${role}; using registry default`); }
   }
+  candidate = canonicalModelId(candidate);
   const options = getRoleModelOptions(role);
   if (options.includes(candidate) || canRunPersistedDefault(role, candidate)) return candidate;
   if (options.includes(FALLBACKS[role])) return FALLBACKS[role];

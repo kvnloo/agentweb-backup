@@ -3,6 +3,16 @@ name: Build
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # ENG-3038: the dev.md consolidation PR is opened with GITHUB_TOKEN, which
+  # cannot start a pull_request run, so dev-md-fragments.yml dispatches this
+  # workflow on that PR's branch instead. Only that branch is honoured: its
+  # diff is held to dev.md plus removed fragments by the fragment guard, so
+  # there is nothing to build and the path filter is not consulted. A dispatch
+  # on any other ref fails `Detect changed projects`, so it cannot stand in for
+  # a PR's real run. That job's `if:` is deliberately untouched (merge-evidence
+  # pins it): a dispatch has no pull_request payload, and GitHub's loose
+  # equality reads `null == false` as true, so the job runs.
+  workflow_dispatch:
 
 # Product test suites run on Atem only when they protect a retained invariant or
 # a reproduced regression. GitHub Actions proves buildability and CI/deploy
@@ -26,14 +36,19 @@ jobs:
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
-      relay: ${{ steps.filter.outputs.relay }}
       remotion: ${{ steps.filter.outputs.remotion }}
     steps:
+      - name: Refuse a dispatch off the consolidation branch
+        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'automation/dev-md-consolidate'
+        run: |
+          echo "Build is dispatched only on automation/dev-md-consolidate (ENG-3038); open a pull request instead." >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
       - id: filter
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -46,15 +61,9 @@ jobs:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
-            # ENG-1377: local-agent-relay and remotion-lambda had no CI of any
-            # kind — not dormant projects, 20 commits between them in the six
-            # months to 2026-08-21. Under ENG-1463 these get build checks, not
-            # a product test suite (see relay-build/remotion-build below).
-            # Included here for the ENG-743 reason: what gates a project's
-            # merges has to gate its own changes.
-            relay:
-              - 'local-agent-relay/**'
-              - '.github/workflows/tests.yml'
+            # ENG-1377: remotion-lambda had no CI of any kind. Under ENG-1463
+            # it gets a build check, not a product test suite (see
+            # remotion-build below). ENG-381 removed local-agent-relay.
             remotion:
               - 'remotion-lambda/**'
               - '.github/workflows/tests.yml'
@@ -77,7 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: npm
           cache-dependency-path: backend/package-lock.json
@@ -90,6 +99,10 @@ jobs:
       - name: Agent Mode wiring invariant
         working-directory: backend
         run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/loops.agentModeWiring.test.ts
+      # Mock-only (no secrets, no database). Every registered tool must fit the plan route's limits: docs/plan-route-tool-limits.md
+      - name: Plan route tool limits
+        working-directory: backend
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/services/funding/__tests__/relayManifest.registry.test.ts
 
   partner-build:
     name: Partner portal build
@@ -105,7 +118,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: npm
           cache-dependency-path: partner-portal/package-lock.json
@@ -144,55 +157,22 @@ jobs:
           bash .github/scripts/dependabot-config.test.sh
           bash .github/scripts/merge-evidence.test.sh
           bash .github/scripts/trunk-deploy-state.test.sh
+          bash .github/scripts/login-host-run-deploy.test.sh
+          bash .github/scripts/login-host-verify-build.test.sh
           bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
+          bash .github/scripts/rollout-note.test.sh
+          bash .github/scripts/deploy-launch-notify.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
+          bash .github/scripts/staging-env-override.test.sh
+          bash .github/scripts/sha-jest.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
           bash .github/scripts/paths-filter-hygiene.test.sh
+          bash .github/scripts/idor-probe.test.sh
           bash .github/scripts/offline-eval-report.test.sh
           bash .github/scripts/dev-md-fragments.test.sh
 
-  # ENG-1377: local-agent-relay and remotion-lambda had no CI of any kind.
-  # Under ENG-1463, GitHub Actions proves buildability, not correctness, so
-  # these are build checks, not the product test suites an earlier version of
-  # this change ran directly in Actions. local-agent-relay's existing 35-test
-  # unittest suite is exactly the kind of thing that now belongs on Atem
-  # instead, if it is ever selected as protecting a retained invariant.
-  relay-build:
-    name: Local agent relay build
-    needs: detect-changes
-    if: needs.detect-changes.outputs.relay == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: ${{ github.workflow }}-relay-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
-      cancel-in-progress: true
-    steps:
-      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
-      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
-      # job then builds the PR-authored code (the setuptools build backend runs
-      # from the PR head), which could read the credential back out. Nothing
-      # here needs it afterwards.
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-
-      # local-agent-relay is a setuptools package (pyproject.toml), not an
-      # application with its own build script. `pip install .` runs that build
-      # backend end to end — packaging metadata, `src/`-layout module
-      # discovery, dependency resolution — the same class of proof `npm run
-      # build` gives the Node projects here.
-      - name: Build package
-        working-directory: local-agent-relay
-        run: python -m pip install --disable-pip-version-check .
-
+  # ENG-1377 / ENG-1463: build check only, not a product test suite.
   remotion-build:
     name: Remotion lambda build
     needs: detect-changes
@@ -225,7 +205,7 @@ jobs:
       # any workflow. Every other job floats too. Pinning one new job is worth
       # doing on its own, but it is not the fix for that.
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: 'npm'

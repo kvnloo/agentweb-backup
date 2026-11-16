@@ -6,6 +6,7 @@ import {
   getIssueCommentsDetailed,
   listOpenBugCanonicals,
   listOpenIssuesByLabel,
+  findMostRecentClosedIssueByLabel,
   listRecentlyResolvedBugCanonicals,
   recordLoopAttributionOutcome,
   reopenIssue,
@@ -299,6 +300,63 @@ describe('linearService.listOpenIssuesByLabel', () => {
   });
 });
 
+describe('linearService.listOpenIssuesByLabel — pagination (ENG-2766)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const page = (start: number, n: number, hasNextPage: boolean, endCursor: string | null) => ({
+    ok: true, status: 200, json: () => Promise.resolve({ data: { issues: {
+      nodes: Array.from({ length: n }, (_, i) => ({ id: `u${start + i}`, identifier: `ENG-${start + i}`, title: 't', description: '' })),
+      pageInfo: { hasNextPage, endCursor },
+    } } }),
+  });
+
+  it('follows endCursor past the first page so an older open canonical stays a dedupe candidate', async () => {
+    (global.fetch as any) = jest.fn()
+      .mockResolvedValueOnce(page(1, 100, true, 'c1'))
+      .mockResolvedValueOnce(page(101, 30, false, 'c2'));
+    const res = await listOpenIssuesByLabel('Auto');
+    expect(res).toHaveLength(130);
+    expect(res[129].identifier).toBe('ENG-130');
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body).variables);
+    expect(calls[0].after).toBeNull();
+    expect(calls[1].after).toBe('c1');
+  });
+
+  it('stops at the cap even if Linear keeps reporting more pages', async () => {
+    (global.fetch as any) = jest.fn().mockImplementation(() => Promise.resolve(page(1, 100, true, 'c')));
+    const res = await listOpenIssuesByLabel('Auto', 250);
+    expect(res).toHaveLength(250);
+    expect((global.fetch as jest.Mock).mock.calls.length).toBe(3);
+  });
+});
+
+describe('linearService.findMostRecentClosedIssueByLabel — pagination (ENG-589)', () => {
+  afterEach(() => jest.clearAllMocks());
+  const page = (start: number, n: number, hasNextPage: boolean, endCursor: string | null) => ({
+    ok: true, status: 200, json: () => Promise.resolve({ data: { issues: {
+      nodes: Array.from({ length: n }, (_, i) => ({ id: `u${start + i}`, identifier: `ENG-${start + i}`, title: `t${start + i}`, description: '' })),
+      pageInfo: { hasNextPage, endCursor },
+    } } }),
+  });
+
+  it('finds a closed canonical beyond the first page instead of returning null', async () => {
+    (global.fetch as any) = jest.fn()
+      .mockResolvedValueOnce(page(1, 100, true, 'c1'))
+      .mockResolvedValueOnce(page(101, 100, true, 'c2'));
+    const res = await findMostRecentClosedIssueByLabel('Auto', (i) => i.title === 't150');
+    expect(res?.identifier).toBe('ENG-150');
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body).variables);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].after).toBe('c1');
+  });
+
+  it('returns null after the scan cap when nothing matches', async () => {
+    (global.fetch as any) = jest.fn().mockImplementation(() => Promise.resolve(page(1, 100, true, 'c')));
+    const res = await findMostRecentClosedIssueByLabel('Auto', () => false, 250);
+    expect(res).toBeNull();
+    expect((global.fetch as jest.Mock).mock.calls.length).toBe(3);
+  });
+});
+
 describe('linearService.listOpenBugCanonicals — open-state whitelist (ENG-358)', () => {
   afterEach(() => jest.clearAllMocks());
 
@@ -573,6 +631,51 @@ describe('linearService.recordLoopAttributionOutcome (ENG-535)', () => {
 
     await expect(recordLoopAttributionOutcome(outcome)).resolves.toEqual({ status: 'already_applied' });
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds a How to verify section from the linked GitHub PR attachment inside the marker comment (ENG-590)', async () => {
+    sequence(
+      { data: { issue: {
+        id: 'uuid-600',
+        attachments: { nodes: [
+          { url: 'https://github.com/AgentWebPro/agentweb/pull/4242', title: 'fix: capture (ENG-600)' },
+          { url: 'https://github.com/AgentWebPro/agentweb/pull/4242', title: 'dup' },
+          { url: 'https://example.com/doc', title: 'Not a PR' },
+        ] },
+        comments: { nodes: [], pageInfo: { hasNextPage: false } },
+      } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+
+    await recordLoopAttributionOutcome(outcome);
+
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    expect(calls[0].query).toContain('attachments');
+    const comments = calls.filter((c) => c.query.includes('commentCreate'));
+    expect(comments).toHaveLength(1);
+    const body: string = comments[0].variables.input.body;
+    expect(body).toContain('### How to verify');
+    expect(body).toContain('[fix: capture (ENG-600)](https://github.com/AgentWebPro/agentweb/pull/4242)');
+    expect(body.match(/pull\/4242/g)).toHaveLength(1);
+    expect(body).not.toContain('example.com');
+    expect(body).toContain('eval_to_signup_rate: 0.1000 → 0.4000 (+300.0%; n=20)');
+    expect(body.indexOf('### How to verify')).toBeLessThan(body.indexOf('<!-- loop-attribution:'));
+  });
+
+  it('still writes How to verify from the metric when no PR is attached', async () => {
+    sequence(
+      { data: { issue: { id: 'uuid-600', comments: { nodes: [], pageInfo: { hasNextPage: false } } } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+    await recordLoopAttributionOutcome(outcome);
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    const body: string = calls.find((c) => c.query.includes('commentCreate')).variables.input.body;
+    expect(body).toContain('### How to verify');
+    expect(body).toContain('No linked GitHub PR');
   });
 
   it('returns missing_issue without issuing a mutation', async () => {

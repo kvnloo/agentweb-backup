@@ -698,29 +698,11 @@ export async function openRejectModal(
 export async function sendApprovalRequestWithTracking(
   request: ApprovalRequest & { channelName?: string }
 ): Promise<{ messageTs: string | null; approvalId: string }> {
-  // Send to Slack
-  const result = await sendApprovalRequest(request);
-
-  // Store in database for tracking
-  const { approvalDb } = await import('./approvalDb');
-  const approval = await approvalDb.createApproval({
-    assetUrl: request.imageUrl,
-    filename: request.filename,
-    assetType: request.assetType as any, // Cast to any to handle string to AssetType
-    executionId: request.executionId || '',
-    userId: request.userId,
-    slackChannel: request.channel,
-    slackChannelName: request.channelName || request.channel,
-    slackMessageTs: result.messageTs,
-    note: request.note,
-  });
-
-  console.log("✅ Approval request sent to Slack and stored in database");
-  
-  return {
-    messageTs: result.messageTs,
-    approvalId: approval.assetUrl // Use assetUrl as the ID since that's the primary key
-  };
+  // ENG-273: the orchestration lives in approvalRequestService, which is channel-neutral.
+  // This name is kept so the existing Slack-side callers do not have to change.
+  const { requestApproval } = await import('./approvalRequestService');
+  const { messageTs, approvalId } = await requestApproval(request);
+  return { messageTs, approvalId };
 }
 
 /**
@@ -879,6 +861,38 @@ export interface LeadNotificationPayload {
   crmUrl?: string;
   eventType?: string;
   timestamp?: string;
+  /** Compact format (ENG-2391): render only name, phone, email; missing values shown as "—". */
+  compact?: boolean;
+  /**
+   * A finished plain-language sentence for the header, used instead of the raw event name (a Smartlead reply sets it). It carries a
+   * contact's own words, so the fallback text escapes it for Slack. Absent for every other alert, which keeps its output unchanged.
+   */
+  headline?: string;
+}
+
+/** Slack reads &, < and > in message text as markup (a link, a mention): send them as the entities Slack documents. */
+const escapeSlackText = (value: string): string => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function formatCompactLeadNotificationPayload(lead: LeadNotificationPayload): {
+  text: string;
+  blocks: any[];
+} {
+  const dash = '—';
+  const value = (v?: string) => (typeof v === 'string' && v.trim() ? v.trim() : dash);
+  const name = [lead.firstName, lead.lastName].filter((v) => typeof v === 'string' && v.trim()).join(' ').trim() || dash;
+  const phone = value(lead.phone);
+  const email = value(lead.email);
+  const blocks = [
+    {
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*Name:*\n${name}` },
+        { type: 'mrkdwn', text: `*Phone:*\n${phone}` },
+        { type: 'mrkdwn', text: `*Email:*\n${email}` },
+      ],
+    },
+  ];
+  return { text: `Name: ${name} | Phone: ${phone} | Email: ${email}`, blocks };
 }
 
 /**
@@ -889,31 +903,50 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
   text: string;
   blocks: any[];
 } {
+  if (lead.compact) {
+    return formatCompactLeadNotificationPayload(lead);
+  }
   const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
   const timestamp = lead.timestamp || new Date().toISOString();
-  const eventLabel = lead.eventType || 'New lead added';
+  const eventLabel = lead.headline || lead.eventType || 'New lead added';
+
+  // A Smartlead reply alert (headline set) escapes the values it shows, since a contact's details are not ours to trust as Slack markup.
+  // Every other alert keeps its values exactly as they were.
+  const val = (v: string): string => (lead.headline ? escapeSlackText(String(v)) : v);
 
   const fields: Array<{ type: string; text: string }> = [];
 
-  fields.push({ type: 'mrkdwn', text: `*Name:*\n${fullName}` });
+  fields.push({ type: 'mrkdwn', text: `*Name:*\n${val(fullName)}` });
 
   if (lead.email) {
-    fields.push({ type: 'mrkdwn', text: `*Email:*\n${lead.email}` });
+    fields.push({ type: 'mrkdwn', text: `*Email:*\n${val(lead.email)}` });
   }
 
   if (lead.company) {
-    fields.push({ type: 'mrkdwn', text: `*Company:*\n${lead.company}` });
+    fields.push({ type: 'mrkdwn', text: `*Company:*\n${val(lead.company)}` });
   }
 
   if (lead.phone) {
-    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${lead.phone}` });
+    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${val(lead.phone)}` });
   }
 
   if (lead.linkedin) {
-    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    if (lead.headline) {
+      // A Smartlead reply alert only links an http(s) address, with & < > | and spaces escaped so it stays one link. Anything else (such as
+      // `!channel` or `@U123`, which Slack reads as a broadcast or a mention inside <...>) is shown as plain escaped text, never as a link.
+      const raw = String(lead.linkedin);
+      fields.push({
+        type: 'mrkdwn',
+        text: /^https?:\/\//i.test(raw)
+          ? `*LinkedIn:*\n<${escapeSlackText(raw).replace(/[|\s]/g, (c) => encodeURIComponent(c))}|Profile>`
+          : `*LinkedIn:*\n${escapeSlackText(raw)}`,
+      });
+    } else {
+      fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+    }
   }
 
-  fields.push({ type: 'mrkdwn', text: `*List:*\n${lead.listName}` });
+  fields.push({ type: 'mrkdwn', text: `*List:*\n${val(lead.listName)}` });
 
   const blocks: any[] = [
     {
@@ -953,7 +986,9 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
     });
   }
 
-  const fallbackText = `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
+  const fallbackText = lead.headline
+    ? `${escapeSlackText(lead.headline)}. List: ${escapeSlackText(lead.listName)}`
+    : `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
 
   return { text: fallbackText, blocks };
 }
@@ -1574,6 +1609,11 @@ export function getUserAllowedChannels(user: { slackChannels?: string[]; slackCh
 export async function getEffectiveAllowedChannels(
   user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined,
 ): Promise<string[]> {
+  // One platform per customer (ENG-273): an account on WhatsApp has no Slack channels, so
+  // none of Emma's Slack tools may reach one on its behalf — own or inherited.
+  const { hasVerifiedWhatsApp } = await import('./messagingChannelService');
+  if (hasVerifiedWhatsApp(user as any)) return [];
+
   const { userDb, orgDb } = await import('./db');
   const personal = getUserAllowedChannels(user ?? {});
   if (personal.length > 0) return personal;

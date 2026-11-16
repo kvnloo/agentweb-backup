@@ -21,6 +21,7 @@ import {
   recordMcpFirstToolUse,
   recordMcpToolUse,
 } from '../../services/mcpUsageEventsService';
+import { noteProductUse } from '../../services/journeyMilestones';
 import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
@@ -32,9 +33,12 @@ import './workflowTools';
 // ENG-1004: tranche 2 (landing pages). Same additive contract.
 import './landingWorkflowTools';
 import './publishWorkflowTools';
+// ENG-1034: the single anonymous-callable demo tool.
+import './reviewSiteTool';
 // ENG-983: progressive disclosure — tools/list returns the workflow layer plus
 // emma_search_tools; the granular catalogue stays callable and discoverable.
 import { getListedToolDefinitions } from './toolDiscovery';
+import { API_KEY_SCOPE_EMAIL_READ } from './apiKeyScopes';
 import { sanitizePublicToolResult, shouldSanitizePublicResponse } from './publicResponseSanitizer';
 
 export interface McpSessionContext {
@@ -47,6 +51,10 @@ export interface McpSessionContext {
   oauthClientName?: string;
   clientType?: McpClientType;
   userAgent?: string;
+  /** Caller address at session creation (req.ip, trust-proxy aware). Used only to rate-limit anonymous calls (ENG-1034). */
+  clientIp?: string;
+  /** Effective scopes of the authenticating aw_ key (api_key auth only). Drives which opt-in tools tools/list shows. */
+  apiKeyScopes?: string[];
 }
 
 /**
@@ -87,7 +95,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: getListedToolDefinitions() };
+    return { tools: getListedToolDefinitions(
+      sessionContext?.authMethod === 'api_key' ? sessionContext.apiKeyScopes
+        : sessionContext?.authMethod === 'oauth' ? [API_KEY_SCOPE_EMAIL_READ]
+        : undefined
+    ) };
   });
   /**
    * Handler for tool execution.
@@ -116,10 +128,12 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       isInternal: sessionContext?.isInternal,
       authMethod: sessionContext?.authMethod,
       apiKeyId: sessionContext?.apiKeyId,
+      apiKeyScopes: sessionContext?.apiKeyScopes,
       oauthClientId: sessionContext?.oauthClientId,
       oauthClientName: sessionContext?.oauthClientName,
       clientType: sessionContext?.clientType,
       userAgent: sessionContext?.userAgent,
+      clientIp: sessionContext?.clientIp,
       // True only for external MCP clients (API key / OAuth) — in-process
       // portal callers never set this. Tools use it for source attribution.
       externalMcp: sessionContext ? sessionContext.isInternal !== true : false,
@@ -129,11 +143,14 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       const rawResult = await mcpToolRegistry.execute(name, toolArgs, context);
       // ENG-2335: public (external, non-admin) responses never carry internal IDs.
       const result = shouldSanitizePublicResponse(name, toolArgs, context)
-        ? sanitizePublicToolResult(rawResult)
+        ? sanitizePublicToolResult(rawResult, name)
         : rawResult;
       if (context.externalMcp && effectiveUserId) {
+        // ENG-2906: this server is the Emma /mcp surface.
+        void noteProductUse(effectiveUserId, 'emma_mcp');
         void Promise.all([
           recordMcpToolUse({
+            product: 'emma_mcp',
             userId: effectiveUserId,
             toolName: name,
             authMethod: sessionContext?.authMethod,
@@ -146,6 +163,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
             userAgent: sessionContext?.userAgent,
           }),
           recordMcpFirstToolUse({
+            product: 'emma_mcp',
             userId: effectiveUserId,
             toolName: name,
             authMethod: sessionContext?.authMethod,

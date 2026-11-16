@@ -84,7 +84,8 @@ class StagingContract(unittest.TestCase):
         prod = Path('.github/workflows/deploy.yml').read_text()
         self.assertIn('push:\n    branches: [main]', prod)
         self.assertIn('group: deploy-production', prod)
-        self.assertEqual(prod.count('environment: prod'), 3)
+        # ENG-2677: notify-feature-launch is the 4th prod-env job (reads prod Slack secret only, continue-on-error).
+        self.assertEqual(prod.count('environment: prod'), 4)
         self.assertNotIn('inputs.ref', prod)
 
     def test_record_actual_sha_and_unique_version(self):

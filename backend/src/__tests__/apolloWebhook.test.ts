@@ -30,7 +30,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import apolloWebhookRouter from '../routes/apolloWebhook';
+import apolloWebhookRouter, { cleanCallbackEmail, extractApolloEmail } from '../routes/apolloWebhook';
 import { crmDb } from '../services/db';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
@@ -144,6 +144,36 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(mockCrmDb.updateLead).not.toHaveBeenCalled();
   });
 
+  it('treats a padded request_id as the same id: same placeholder lookup, trimmed stored id, idempotent replay', async () => {
+    mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+      cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+    } as any);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: '', enrichmentMetadata: {} } as any);
+    (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: true });
+
+    await send({ request_id: 'r1', person: { email: 'apollo@b.com', email_status: 'verified' } });
+    const plainLookup = mockCrmDb.getEnrichmentCacheItem.mock.calls[0];
+    mockCrmDb.getEnrichmentCacheItem.mockClear();
+    (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+    await send({ request_id: ' r1\n ', person: { email: 'apollo@b.com', email_status: 'verified' } });
+    expect(mockCrmDb.getEnrichmentCacheItem.mock.calls[0]).toEqual(plainLookup);
+    expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].apolloRequestId).toBe('r1');
+
+    // A replay of the same id with padding must hit the idempotency early-out, not rewrite.
+    (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'LD1', email: 'apollo@b.com', enrichmentMetadata: { email: { apolloRequestId: 'r1' } },
+    } as any);
+    const replay = await send({ request_id: '  r1  ', person: { email: 'other@b.com' } });
+    expect(replay.body.alreadyProcessed).toBe(true);
+    expect((mockCrmDb as any).setLeadEmailIfMissing).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only request_id with 400', async () => {
+    const res = await send({ request_id: '   ', person: { email: 'a@b.com' } });
+    expect(res.status).toBe(400);
+  });
+
   it('skips when lead already has a different email', async () => {
     mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
       cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
@@ -180,6 +210,221 @@ describe('POST /api/crm/webhooks/apollo — payload handling', () => {
     expect(email).toBe('apollo@b.com');
     expect(meta.confidence).toBe('high');
     expect(meta.apolloRequestId).toBe('r1');
+  });
+
+  // ENG-2801: the matched path is now reachable in production, so what a callback may put on a customer lead is gated.
+  describe('callback email validation', () => {
+    function placeholderAndLead() {
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: '', enrichmentMetadata: {} } as any);
+      (mockCrmDb as any).setLeadEmailIfMissing.mockResolvedValue({ written: true });
+    }
+    const wf = (...emails: any[]) => ({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: 'VERIFIED', emails }] }] } }] });
+    const stamped = () => (mockCrmDb.putEnrichmentCacheItem as jest.Mock).mock.calls.map((c) => c[0].rawData?.status);
+
+    const REJECTED: Array<[string, any]> = [
+      ['not an address', 'not-an-email'],
+      ['no TLD', 'a@b'],
+      ['whitespace', 'a b@c.com'],
+      ['CRLF header injection', 'a@b.com\r\nBcc: victim@y.com'],
+      ['markup', '<script>alert(1)@x.com'],
+      ['two addresses', 'a@b.com,c@d.com'],
+      ['quoted display name', '"Bob" <bob@x.com>'],
+      ['300 characters', 'x'.repeat(300) + '@a.com'],
+      ['object', { email: 'a@b.com' }],
+      ['nested array that would stringify to a valid address', ['a@b.com']],
+      ['259 characters (fits the shape, exceeds 254)', 'a'.repeat(64) + '@' + 'b'.repeat(190) + '.com'],
+      ['null', null],
+      ['number', 12345],
+      ['empty', ''],
+      // ENG-2803: the shared strict validator (utils/sendEligibility) plus the callback-only rules.
+      ['doubled dot', 'a..b@x.com'],
+      ['leading dot', '.a@x.com'],
+      ['trailing dot in the local part', 'a.@x.com'],
+      ['domain label starting with a hyphen', 'a@x.-y.com'],
+      ['one-letter TLD', 'a@b.c'],
+      ['numeric TLD', 'a@b.123'],
+      ['CSV formula lead =', '=cmd@x.com'],
+      ['CSV formula lead +', '+tag@x.com'],
+      ['CSV formula lead -', '-x@x.com'],
+    ];
+    it.each(REJECTED)('does not write a %s and treats the callback as no_email', async (_label, bad) => {
+      placeholderAndLead();
+      const res = await send(wf(bad));
+      expect(res.status).toBe(200);
+      expect(res.body.hadEmail).toBe(false);
+      expect((mockCrmDb as any).setLeadEmailIfMissing).not.toHaveBeenCalled();
+      expect(stamped()).toEqual(['no_email']); // the placeholder is never stamped completed with a junk value
+    });
+
+    it('falls through to the next group when the first holds nothing usable', async () => {
+      placeholderAndLead();
+      const body = { request_id: 'r1', people: [{ waterfall: { emails: [
+        { vendors: [{ name: 'a', status: 'VERIFIED', emails: ['garbage'] }] },
+        { vendors: [{ name: 'b', status: 'VERIFIED', emails: ['good@acme.com'] }] },
+      ] } }] };
+      const res = await send(body);
+      expect(res.status).toBe(200);
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][2]).toBe('good@acme.com');
+    });
+
+    it('takes the first usable address inside one vendor entry', async () => {
+      placeholderAndLead();
+      await send(wf('junk', 'second@acme.com'));
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][2]).toBe('second@acme.com');
+    });
+
+    it('a non-string flat email or status no longer 500s (flat shape)', async () => {
+      placeholderAndLead();
+      const a = await send({ request_id: 'r1', person: { email: { x: 1 } } });
+      expect(a.status).toBe(200);
+      expect(a.body.hadEmail).toBe(false);
+      placeholderAndLead();
+      const b = await send({ request_id: 'r2', person: { email: 'ok@acme.com', email_status: 5 } });
+      expect(b.status).toBe(200);
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls.pop()[2]).toBe('ok@acme.com');
+    });
+
+    it('caps a forged oversized status so it cannot bloat the lead (a 390 KB status was written verbatim before; this harness body limit is 100 KB)', async () => {
+      placeholderAndLead();
+      const huge = 'X'.repeat(90_000);
+      const res = await send({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: huge, emails: ['good@acme.com'] }] }] } }] });
+      expect(res.status).toBe(200);
+      const meta = (mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3];
+      expect(meta.sourceQuote.length).toBeLessThan(100);
+      const stampedRow = (mockCrmDb.putEnrichmentCacheItem as jest.Mock).mock.calls[0][0];
+      expect(String(stampedRow.rawData.result.emailStatus ?? '').length).toBeLessThanOrEqual(40);
+      // flat shape too
+      placeholderAndLead();
+      (mockCrmDb.putEnrichmentCacheItem as jest.Mock).mockClear();
+      await send({ request_id: 'r2', person: { email: 'ok@acme.com', email_status: 'Y'.repeat(90_000) } });
+      const flatRow = (mockCrmDb.putEnrichmentCacheItem as jest.Mock).mock.calls[0][0];
+      expect(String(flatRow.rawData.result.emailStatus ?? '').length).toBeLessThanOrEqual(40);
+    });
+
+    it('stores only plain status characters and ignores a non-string status', async () => {
+      placeholderAndLead();
+      await send({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: { a: 1 }, emails: ['good@acme.com'] }] }] } }] });
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].sourceQuote).toBe('Apollo waterfall (unknown)');
+      placeholderAndLead();
+      (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+      await send({ request_id: 'r2', person: { email: 'ok@acme.com', email_status: '<b>Verified</b>\r\n' } });
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].sourceQuote).toBe('Apollo waterfall (bverifiedb)');
+    });
+
+    it('a forged non-string verifier status cannot 500 the handler and never counts as validated', async () => {
+      const forged = (status: any) => ({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [
+        { name: 'f', status: 'GUESSED', emails: ['good@acme.com'] },
+        { name: 'v', status, usedForVerification: true },
+      ] }] } }] });
+      for (const status of [{ toString: 1 }, { a: 1 }, ['validated'], 123, null]) {
+        placeholderAndLead();
+        (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+        const res = await send(forged(status));
+        expect(res.status).toBe(200);
+        const meta = (mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3];
+        expect(meta.sourceQuote).toBe('Apollo waterfall (guessed)'); // not upgraded to verified
+      }
+      placeholderAndLead();
+      (mockCrmDb as any).setLeadEmailIfMissing.mockClear();
+      await send(forged('Validated'));
+      expect((mockCrmDb as any).setLeadEmailIfMissing.mock.calls[0][3].sourceQuote).toBe('Apollo waterfall (verified)');
+    });
+
+    it('logs (without the value) when an email is rejected, and stays quiet when there is simply no email', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        placeholderAndLead();
+        await send(wf('secret-garbage-value'));
+        const rejectedCalls = warn.mock.calls.filter((c) => String(c[0]).includes('failed validation'));
+        expect(rejectedCalls).toHaveLength(1);
+        expect(rejectedCalls[0]).toContain('r1');
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('secret-garbage-value');
+        warn.mockClear();
+        placeholderAndLead();
+        await send({ request_id: 'r3', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: 'VERIFIED', emails: [] }] }] } }] });
+        expect(warn.mock.calls.filter((c) => String(c[0]).includes('failed validation'))).toHaveLength(0);
+      } finally { warn.mockRestore(); }
+    });
+
+    it('a transient list-read error answers 500 (so Apollo retries) and writes nothing', async () => {
+      placeholderAndLead();
+      (mockCrmDb as any).getLeadListById = jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+      const res = await send(wf('good@acme.com'));
+      expect(res.status).toBe(500);
+      expect((mockCrmDb as any).setLeadEmailIfMissing).not.toHaveBeenCalled();
+      expect(mockCrmDb.putEnrichmentCacheItem).not.toHaveBeenCalled();
+    });
+
+    it('cleanCallbackEmail: every excluded character in the local part is rejected on its own', () => {
+      const excluded = [' ', '<', '>', '"', '\\', ',', ';', ':', '(', ')', '[', ']', '\u0000', '\n', '\r', '\t', '‮', '​', ' ', 'é'];
+      for (const c of excluded) expect(cleanCallbackEmail(`a${c}b@x.com`)).toBeUndefined();
+      expect(cleanCallbackEmail("a!#$%&'*+/=?^_`{|}~-b@x.com")).toBe("a!#$%&'*+/=?^_`{|}~-b@x.com");
+      expect(cleanCallbackEmail('a@b.c')).toBeUndefined(); // TLD needs 2+ letters (callback-only rule)
+      expect(cleanCallbackEmail('a@x.xn--p1ai')).toBe('a@x.xn--p1ai'); // punycode TLD is legal (ENG-2803)
+      expect(cleanCallbackEmail('a@b.co')).toBe('a@b.co');
+      expect(cleanCallbackEmail('a@.b.com')).toBeUndefined();
+      expect(cleanCallbackEmail('a@b-.com')).toBeUndefined();
+      expect(cleanCallbackEmail('a@münchen.de')).toBeUndefined(); // IDN must arrive as punycode
+      expect(cleanCallbackEmail('a@xn--mnchen-3ya.de')).toBe('a@xn--mnchen-3ya.de');
+    });
+
+    it('stops at the first usable address in a group and never reads the rest (ENG-2803)', () => {
+      const emails = new Proxy(['junk', 'first@acme.com', 'second@acme.com'], {
+        get(target, prop, recv) {
+          if (prop === '2') throw new Error('read past the first usable address');
+          return Reflect.get(target, prop, recv);
+        },
+      });
+      const out = extractApolloEmail({ request_id: 'r1', people: [{ waterfall: { emails: [{ vendors: [{ name: 'p', status: 'verified', emails }] }] } }] });
+      expect(out.email).toBe('first@acme.com');
+    });
+
+    // Typed handle on the mocked late write (ENG-2803 tests).
+    const lateWrite = () => (mockCrmDb as unknown as { setLeadEmailIfMissing: jest.Mock }).setLeadEmailIfMissing;
+
+    it('skips junk before the first usable address and writes that one', async () => {
+      placeholderAndLead();
+      const res = await send(wf('not-an-email', '=cmd@x.com', 'real@acme.com', 'later@acme.com'));
+      expect(res.status).toBe(200);
+      expect(lateWrite()).toHaveBeenCalledWith('L1', 'LD1', 'real@acme.com', expect.any(Object));
+    });
+
+    it('refuses a callback whose placeholder has expired, and writes nothing (ENG-2803)', async () => {
+      placeholderAndLead();
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', expiresAt: Math.floor(Date.now() / 1000) - 60, rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as unknown as Awaited<ReturnType<typeof mockCrmDb.getEnrichmentCacheItem>>);
+      const res = await send(wf('good@acme.com'));
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({ matched: false, expired: true });
+      expect(lateWrite()).not.toHaveBeenCalled();
+      expect(mockCrmDb.putEnrichmentCacheItem).not.toHaveBeenCalled();
+    });
+
+    it('accepts a callback whose placeholder has not expired yet', async () => {
+      placeholderAndLead();
+      mockCrmDb.getEnrichmentCacheItem.mockResolvedValue({
+        cacheType: 'apollo', expiresAt: Math.floor(Date.now() / 1000) + 3600, rawData: { listId: 'L1', leadId: 'LD1', userId: 'u1' },
+      } as unknown as Awaited<ReturnType<typeof mockCrmDb.getEnrichmentCacheItem>>);
+      const res = await send(wf('good@acme.com'));
+      expect(res.status).toBe(200);
+      expect(lateWrite()).toHaveBeenCalledWith('L1', 'LD1', 'good@acme.com', expect.any(Object));
+    });
+
+    it('cleanCallbackEmail keeps ordinary and unusual-but-legal addresses', () => {
+      for (const ok of ['avery@example.com', 'first.last+tag@sub.example.co.uk', "o'brien@company.com", '  padded@x.com  ']) {
+        expect(cleanCallbackEmail(ok)).toBe(ok.trim());
+      }
+      // Normalized the way the lead write stores it (ENG-2803).
+      expect(cleanCallbackEmail('A@B.IO')).toBe('a@b.io');
+      expect(cleanCallbackEmail(' Mixed.Case@Example.COM ')).toBe('mixed.case@example.com');
+      expect(cleanCallbackEmail(undefined)).toBeUndefined();
+      expect(cleanCallbackEmail('a'.repeat(64) + '@x.com')).toBe('a'.repeat(64) + '@x.com');
+      expect(cleanCallbackEmail('a'.repeat(65) + '@x.com')).toBeUndefined();
+    });
   });
 
   it('reports written:false when the conditional update silently lost the race', async () => {

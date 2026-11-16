@@ -8,9 +8,12 @@ import {
   HumanEvalStatus,
 } from '../services/humanEvalService';
 import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
+import { chatbotDb } from '../services/chatbotService';
 
 const HUMAN_EVAL_STATUSES: readonly HumanEvalStatus[] = ['pending', 'reviewed'];
 const HUMAN_EVAL_REVIEW_TYPES: readonly HumanEvalReviewType[] = ['creative_image', 'landing_page', 'lead_enrichment'];
+
+const MAX_SESSION_ID_LENGTH = 200;
 
 const router = express.Router();
 
@@ -36,6 +39,32 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
+    // ENG-2651: the sessionId decides whose chat createCandidate mints an iShare link for (returned
+    // below as candidate.chatUrl, a token that lets anyone open and chat in that session) and whose
+    // chat later receives the reviewer's feedback. So it must be a chat the caller may open: the
+    // owner, or an admin — the rule agentModeController.getSession and routes/emmaApi.ts apply (a
+    // delegate token resolves req.user to the target account, so a delegate passes on exactly the
+    // target's chats). A missing and a foreign session both answer 404, so the response never
+    // confirms that another account's session id exists. Checked before the artifact claim so a
+    // refused request leaves no claim behind. Record-only, strongly consistent read.
+    if (sessionId !== undefined && sessionId !== null && sessionId !== '') {
+      if (typeof sessionId !== 'string') {
+        res.status(400).json({ error: 'sessionId must be a string' });
+        return;
+      }
+      const caller = authReq.user;
+      // Real ids are uuids (36 chars); an oversized key would make DynamoDB throw (a 500), so it is
+      // simply not a session.
+      const session = sessionId.length <= MAX_SESSION_ID_LENGTH
+        ? await chatbotDb.getChatSessionRecord(sessionId, true)
+        : null;
+      const isOwner = !!caller?.userId && session?.userId === caller.userId;
+      if (!session || !(isOwner || caller?.isAdmin === true)) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+    }
+
     // ENG-1854: this route calls createCandidate directly, same as the manual Emma tool did —
     // same cross-path duplicate risk if the given artifactUrl was already auto-posted.
     if (typeof artifactUrl === 'string' && artifactUrl) {
@@ -54,7 +83,7 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
     const candidate = await humanEvalService.createCandidate({
       reviewType: reviewType as HumanEvalReviewType,
       outputSummary: String(outputSummary),
-      sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+      sessionId: sessionId || undefined,
       agentRunId: typeof agentRunId === 'string' ? agentRunId : undefined,
       artifactUrl: typeof artifactUrl === 'string' ? artifactUrl : undefined,
       chatUrl: typeof chatUrl === 'string' ? chatUrl : undefined,

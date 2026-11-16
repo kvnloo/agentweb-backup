@@ -236,6 +236,10 @@ export class OutlookService implements IEmailService {
         .map((r: any) => r?.emailAddress?.address)
         .filter(Boolean)
         .join(', '),
+      cc: (m.ccRecipients || [])
+        .map((r: any) => r?.emailAddress?.address)
+        .filter(Boolean)
+        .join(', '),
       body: m?.body?.content || '',
       hasAttachments: !!m.hasAttachments,
     };

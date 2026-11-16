@@ -1,13 +1,13 @@
 import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TABS } from '../adminNavigation';
 
 describe('admin navigation taxonomy', () => {
-  it('keeps every deep-link slug exactly once (26 existing plus eval-v2, ENG-2144)', () => {
+  it('keeps every deep-link slug exactly once (27 existing plus vendor-rates, ENG-2271, and zoma, ENG-2902)', () => {
     const expected = [
       'overview', 'announcements', 'users', 'waitlist', 'tasks', 'workflows',
       'chat-history', 'knowledge-base', 'agent-mode', 'image-models', 'default-prompts',
       'benchmarks', 'subscriptions', 'mcp-servers', 'result-endpoints', 'scoring-judges',
       'crm', 'revenue', 'funnel', 'alert-emails', 'onboarding', 'connected-accounts',
-      'contractors', 'emma-mcp', 'costs', 'usage-cost', 'eval-v2',
+      'contractors', 'emma-mcp', 'costs', 'usage-cost', 'eval-v2', 'vendor-rates', 'zoma',
     ];
     expect(ADMIN_TABS.map(({ slug }) => slug).sort()).toEqual(expected.sort());
   });
@@ -25,6 +25,6 @@ describe('admin navigation taxonomy', () => {
 
   it('has unique numeric values so deep links select one panel', () => {
     const values = ADMIN_TABS.map(({ value }) => value);
-    expect(new Set(values).size).toBe(27);
+    expect(new Set(values).size).toBe(29);
   });
 });

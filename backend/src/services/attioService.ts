@@ -380,6 +380,32 @@ export class AttioService {
     return records.length > 0 ? this.mapCompany(records[0]) : null;
   }
 
+  /**
+   * Read-only record search for call_attio_api RECORDS SEARCH (ENG-2580).
+   * People: an `@` query filters by email; otherwise name contains. Companies:
+   * name contains. One page of up to 25 records.
+   */
+  async searchRecords(
+    objectSlug: 'people' | 'companies',
+    query: string,
+    limit: number = 25,
+  ): Promise<Array<AttioPerson | AttioCompany>> {
+    const q = query.trim();
+    const filter =
+      objectSlug === 'people'
+        ? q.includes('@')
+          ? { email_addresses: { email_address: { $eq: q.toLowerCase() } } }
+          : { name: { full_name: { $contains: q } } }
+        : { name: { $contains: q } };
+    const res = await axiosInstance.post(
+      `${this.baseUrl}/objects/${objectSlug}/records/query`,
+      { filter, limit },
+      { headers: this.headers() }
+    );
+    const records = (res.data as any)?.data ?? [];
+    return records.map((r: any) => (objectSlug === 'people' ? this.mapPerson(r) : this.mapCompany(r)));
+  }
+
   async getCompanyById(recordId: string): Promise<AttioCompany | null> {
     try {
       const res = await axiosInstance.get(
@@ -425,12 +451,33 @@ export class AttioService {
     return this.objectSlugCache.get(objectId) ?? null;
   }
 
-  async getAllLists(): Promise<Array<{ id: string; name: string; parentObject: 'people' | 'companies' | string }>> {
+  /**
+   * Attio returns a list's `parent_object` as an ARRAY of object slugs or
+   * object UUIDs (legacy lists may allow several parents); only list entries
+   * carry it as a string (ENG-2631). Normalise to slugs, and report
+   * `parentObject: 'companies'` whenever companies is an allowed parent.
+   */
+  async getAllLists(): Promise<Array<{ id: string; name: string; parentObject: 'people' | 'companies' | string; parentObjects: string[] }>> {
     const res = await axiosInstance.get(`${this.baseUrl}/lists`, { headers: this.headers() });
-    return ((res.data as any)?.data ?? []).map((l: any) => ({
-      id: l.id?.list_id as string,
-      name: l.name as string,
-      parentObject: l.parent_object as string,
+    const raw: any[] = (res.data as any)?.data ?? [];
+    const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+    return Promise.all(raw.map(async (l: any) => {
+      const rawParents: string[] = (Array.isArray(l.parent_object) ? l.parent_object : [l.parent_object])
+        .filter((v: any): v is string => typeof v === 'string' && !!v);
+      const parentObjects: string[] = [];
+      for (const v of rawParents) {
+        let slug = v;
+        if (isUuid(v)) {
+          try { slug = (await this.getObjectSlug(v)) ?? v; } catch { /* keep raw id */ }
+        }
+        parentObjects.push(slug);
+      }
+      return {
+        id: l.id?.list_id as string,
+        name: l.name as string,
+        parentObject: parentObjects.includes('companies') ? 'companies' : (parentObjects[0] ?? ''),
+        parentObjects,
+      };
     }));
   }
 
@@ -597,16 +644,66 @@ export class AttioService {
     recordId: string,
     objectSlug: 'people' | 'companies' = 'people'
   ): Promise<string | null> {
-    const res = await axiosInstance.get(
-      `${this.baseUrl}/objects/${objectSlug}/records/${recordId}/entries`,
-      { headers: this.headers() }
-    );
-    const entries = (res.data as any)?.data ?? [];
+    const ids = await this.findListEntries(listId, recordId, objectSlug);
+    return ids[0] ?? null;
+  }
 
-    const match = entries.find((e: any) =>
-      e?.id?.list_id === listId || e?.list_id === listId || e?.parent_list?.id === listId
-    );
-    return match?.id?.entry_id ?? match?.entry_id ?? null;
+  /**
+   * Every entry id this record has in `listId`. Attio allows several entries
+   * for the same parent record in one list (ENG-2632), and the record-entries
+   * endpoint pages at 100 by default, so walk all pages.
+   */
+  async findListEntries(
+    listId: string,
+    recordId: string,
+    objectSlug: 'people' | 'companies' = 'people'
+  ): Promise<string[]> {
+    const PAGE = 500;
+    const MAX_PAGES = 20;
+    const ids: string[] = [];
+    for (let page = 0, offset = 0; page < MAX_PAGES; page++, offset += PAGE) {
+      const res = await axiosInstance.get(
+        `${this.baseUrl}/objects/${objectSlug}/records/${recordId}/entries`,
+        { headers: this.headers(), params: { limit: PAGE, offset } }
+      );
+      const entries: any[] = (res.data as any)?.data ?? [];
+      for (const e of entries) {
+        if (e?.id?.list_id === listId || e?.list_id === listId || e?.parent_list?.id === listId) {
+          const id = e?.id?.entry_id ?? e?.entry_id;
+          if (id && !ids.includes(id)) ids.push(id);
+        }
+      }
+      if (entries.length < PAGE) break;
+    }
+    return ids;
+  }
+
+  /**
+   * Idempotent add: `PUT /lists/{list}/entries` upserts by parent record, so
+   * repeating it never creates a duplicate entry (POST does — ENG-2632).
+   * Attio returns MULTIPLE_MATCH_RESULTS when duplicates already exist; in
+   * that case the record is already on the list, so return its first entry.
+   */
+  async upsertListEntry(
+    listId: string,
+    recordId: string,
+    objectSlug: 'people' | 'companies'
+  ): Promise<string | undefined> {
+    try {
+      const res = await axiosInstance.put(
+        `${this.baseUrl}/lists/${listId}/entries`,
+        { data: { parent_record_id: recordId, parent_object: objectSlug, entry_values: {} } },
+        { headers: this.headers() }
+      );
+      return (res.data as any)?.data?.id?.entry_id;
+    } catch (err: any) {
+      const code = err?.response?.data?.code;
+      if (code === 'MULTIPLE_MATCH_RESULTS' || /multiple/i.test(err?.response?.data?.message ?? '')) {
+        const existing = await this.findListEntries(listId, recordId, objectSlug);
+        if (existing.length) return existing[0];
+      }
+      throw err;
+    }
   }
 
   async updateListEntry(

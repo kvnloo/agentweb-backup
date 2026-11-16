@@ -61,6 +61,7 @@ jest.mock('../utils/sseProgress', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
   incrementUserTokenUsage: jest.fn(),
 }));
@@ -70,7 +71,7 @@ import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { progressStore } from '../utils/sseProgress';
 import { checkTokenUsage } from '../services/tokenUsageService';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, sessionGenerationOwners } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -227,7 +228,7 @@ describe('ENG-705 — share-token generate routes are usage-gated before any spe
     const res = makeRes();
     await agentModeController.generateSharedResponse(makeReq(), res);
 
-    expect(mockCheckTokenUsage).toHaveBeenCalledWith(OWNER_USER_ID);
+    expect(mockCheckTokenUsage).toHaveBeenCalledWith(OWNER_USER_ID, { recordAdmission: true });
   });
 
   it('AC2: spend from a share-token request is booked to the owner — the worker runs under the owner userId', async () => {
@@ -237,6 +238,17 @@ describe('ENG-705 — share-token generate routes are usage-gated before any spe
     expect(mockWorkerService.runInWorker).toHaveBeenCalled();
     const workerArg = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
     expect(JSON.stringify(workerArg)).toContain(OWNER_USER_ID);
+  });
+
+  it('ENG-110: the share-token generate records the session OWNER (not the anonymous visitor) as the lock owner, and clears it after', async () => {
+    let ownerDuring: string | undefined;
+    (mockWorkerService.runInWorker as jest.Mock).mockImplementationOnce(async () => {
+      ownerDuring = sessionGenerationOwners.get(SESSION_ID);
+      return workerResponse;
+    });
+    await agentModeController.generateSharedResponse(makeReq(), makeRes());
+    expect(ownerDuring).toBe(OWNER_USER_ID);
+    expect(sessionGenerationOwners.size).toBe(0);
   });
 
   // ── AC6 + boundary ───────────────────────────────────────────────────────

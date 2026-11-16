@@ -23,7 +23,7 @@ import { dynamodb } from '../config/aws';
 import { crmDb } from './db';
 import { buildLeadCrmUpdateFragments } from '../utils/leadSchema';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const TABLE_NAME = `${TABLE_PREFIX}AW-Deals`;
 
 export const DEAL_STAGES = [
@@ -169,7 +169,10 @@ class DealDb {
       ...(typeof input.dealValue === 'number' ? { dealValue: input.dealValue } : {}),
       ...(input.dealCurrency ? { dealCurrency: input.dealCurrency } : {}),
       ...(input.expectedClose ? { expectedClose: input.expectedClose } : {}),
-      ...(typeof input.heatScore === 'number' ? { heatScore: input.heatScore } : {}),
+      // ENG-2340: heatScore is the SK of ownerUserId-heatScore-index. DynamoDB never projects
+      // an item missing a GSI key into that index, so an omitted score made the deal
+      // permanently invisible to getDealsByOwner (GET /api/crm/deals). Default to 0.
+      heatScore: typeof input.heatScore === 'number' ? input.heatScore : 0,
       ...(input.source ? { source: input.source } : {}),
       ...(input.notes ? { notes: input.notes } : {}),
       ...(input.tenantId?.trim() ? { tenantId: input.tenantId.trim() } : {}),
@@ -270,7 +273,13 @@ class DealDb {
     nullable('dealCurrency', ':dealCurrency');
     nullable('expectedClose', ':expectedClose');
     nullable('closedDate', ':closedDate');
-    nullable('heatScore', ':heatScore');
+    // ENG-2340: never REMOVE heatScore — it is the owner GSI's sort key, and removing it
+    // drops the deal out of getDealsByOwner. Clearing it resets to 0 instead.
+    if (updates.heatScore === null || (updates.heatScore as unknown) === '') {
+      push('heatScore', ':heatScore', 0);
+    } else {
+      nullable('heatScore', ':heatScore');
+    }
     nullable('source', ':source', true);
     nullable('notes', ':notes', true);
 

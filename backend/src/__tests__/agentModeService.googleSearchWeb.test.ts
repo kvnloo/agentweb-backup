@@ -13,8 +13,9 @@ jest.mock('../services/chatbotService', () => ({
 }));
 
 const mockSearch = jest.fn();
-jest.mock('../search/googleSearchProvider', () => ({
-  GoogleSearchProvider: jest.fn().mockImplementation(() => ({
+// ENG-1281: google_search_web is now served by You.com (Google CSE retired).
+jest.mock('../search/youSearchProvider', () => ({
+  YouSearchProvider: jest.fn().mockImplementation(() => ({
     search: (...args: any[]) => mockSearch(...args),
   })),
 }));
@@ -38,6 +39,7 @@ describe('AgentModeService - googleSearchWeb', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    process.env.SEARCH_WEB_MAX_RETRIES = '1';
     agentModeService = new AgentModeService();
     await agentModeService.initialize();
   });
@@ -53,6 +55,46 @@ describe('AgentModeService - googleSearchWeb', () => {
     const result = await agentModeService.googleSearchWeb('test', 5);
     expect(result.success).toBe(true);
     expect(result.totalResults).toBe(1);
+  });
+
+  it('ENG-1281: keeps the caller-facing shape and tool name, reports the real provider', async () => {
+    mockSearch.mockResolvedValue({
+      provider: 'you',
+      query: 'acme',
+      results: [{ title: 'A', url: 'https://a.com', snippet: '...', sourceType: 'web' }],
+      metadata: { provider: 'you', resultSource: 'web' },
+    });
+
+    const viaGoogleAlias = await agentModeService.googleSearchWeb('acme', 5);
+    const viaYou = await agentModeService.youSearchWeb('acme', 5);
+
+    expect(viaGoogleAlias.toolName).toBe('google_search_web');
+    expect(viaGoogleAlias.provider).toBe('you');
+    expect(viaGoogleAlias.resultSource).toBe('web');
+    const { toolName: _a, ...aliasRest } = viaGoogleAlias;
+    const { toolName: _b, ...youRest } = viaYou;
+    expect(aliasRest).toEqual(youRest);
+    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ query: 'acme', resultSource: 'web' }));
+  });
+
+  it('ENG-1281: no source file can reach the Google Custom Search endpoint', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const srcDir = path.resolve(__dirname, '..');
+    const pattern = /customsearch\(|googleapis\.com\/customsearch|search\/googleSearchProvider/;
+    const hits: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== '__tests__' && entry.name !== 'node_modules') walk(full);
+        } else if (entry.name.endsWith('.ts') && !entry.name.includes('.test.') && pattern.test(fs.readFileSync(full, 'utf8'))) {
+          hits.push(path.relative(srcDir, full));
+        }
+      }
+    };
+    walk(srcDir);
+    expect(hits).toEqual([]);
   });
 
   // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose .code

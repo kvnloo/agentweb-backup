@@ -43,6 +43,7 @@ import { DynamoDB } from 'aws-sdk';
 import { agentModeService } from '../services/agentModeService';
 import { settingsService } from '../services/settingsService';
 import { paginatedScan } from '../utils/dynamoPagination';
+import { AGENTWEB_MODEL_ID } from '../services/agentMode/modelAccess';
 
 // ── Pure planning logic (unit-testable without AWS) ────────────────────────
 
@@ -55,7 +56,7 @@ export const SAME_FAMILY_MODEL_REPLACEMENTS: Record<string, string> = {
   'openrouter/x-ai/grok-4.3': 'openrouter/x-ai/grok-4.6',
   'openrouter/mistralai/mistral-large-2512': 'openrouter/mistralai/mistral-small-2603',
   'openrouter/moonshotai/kimi-k2.6': 'openrouter/moonshotai/kimi-k2.7-code',
-  'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max',
+  'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max-0902',
   // openrouter/meta-llama/llama-4-maverick, llama-4-scout, llama-3.1-8b-instruct:
   // deliberately NOT mapped — no current-gen Llama entrant exists on OpenRouter
   // (checked live 2026-08-17, no meta-llama/llama-5* listed). Records referencing
@@ -112,6 +113,9 @@ export function planModelMigration(
   replacements: Record<string, string> = SAME_FAMILY_MODEL_REPLACEMENTS
 ): MigrationPlan {
   if (!modelId || !modelId.trim()) return { action: 'ok' };
+  // ENG-669 PR-C: the AgentWeb Model is a selection (a router), never a registry id: a session, schedule or plan pinned
+  // to it is not stale, whether or not its router is switched on right now.
+  if (modelId.trim() === AGENTWEB_MODEL_ID) return { action: 'ok' };
   const normalized = normalizeModelId(modelId);
   if (validModelIds.has(normalized)) return { action: 'ok' };
   const replacement = replacements[modelId] ?? replacements[normalized];

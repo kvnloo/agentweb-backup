@@ -104,6 +104,8 @@ describe('invoice.payment_succeeded handler', () => {
     };
     (userDb.scanWithFilter as jest.Mock).mockResolvedValue([mockUser]);
     (userDb.updateUser as jest.Mock).mockResolvedValue(undefined);
+    // ENG-2599: the id is only backfilled from a subscription Stripe reports live.
+    mockSubscriptionsRetrieve.mockResolvedValue({ id: 'sub_new_123', status: 'active', items: { data: [] } });
 
     await handleInvoicePaymentSucceeded({
       customer: 'cus_def',

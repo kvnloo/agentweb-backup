@@ -4,11 +4,14 @@ import crypto from "crypto";
 import { createStripeClient } from "../services/stripeClientFactory";
 import dotenv from "dotenv";
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from "../middleware/auth";
-import { userDb } from "../services/db";
+import { userDb, orgDb } from "../services/db";
+import { stripeService } from "../services/stripeService";
+import { inheritsOrgBilling } from "../services/orgAuthz";
 import * as stripeController from "../controllers/stripeController";
 import { resolveBillingUserId } from '../services/tokenUsageService';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
 import { getActiveLlmUsageTopUpPackages, resolveLlmUsageTopUpPackage } from '../services/llmUsageTopUpService';
+import { emitAccountSignal } from '../services/serverSignalEmitter';
 
 dotenv.config();
 
@@ -255,6 +258,13 @@ router.post(
       };
 
       const session = await stripe.checkout.sessions.create(sessionParams);
+
+      // ENG-2684: fire-and-forget hireemma.ai session-list signal (this is the live
+      // billing route; the controller variant is not mounted here). Never affects the reply.
+      void emitAccountSignal(user ? { ...user, userId } : { userId }, "checkout_started", {
+        checkoutSessionId: session.id || "",
+        priceId: String(priceId).slice(0, 120),
+      }).catch(() => undefined);
 
       res.json({ clientSecret: session.client_secret });
     } catch (error: any) {
@@ -610,6 +620,51 @@ router.post(
 );
 
 /**
+ * Subscription statuses whose billing portal is the user row's own customer: every
+ * non-terminal Stripe status we store, so a subscription that still needs managing (e.g.
+ * `incomplete`/`unpaid`) never opens another customer.
+ */
+const SUBSCRIBED_STATUSES = new Set(["active", "trialing", "past_due", "canceling", "incomplete", "unpaid", "paused"]);
+
+/**
+ * @route GET /api/stripe/billing-summary
+ * @desc ENG-2571: whether the user has a card on file (on any of their Stripe customers),
+ *       its brand/last4, and whether it was saved through Zoma's setup Checkout. Read-only;
+ *       never returns a Stripe customer id. Org members billed through the owner get the
+ *       empty summary without a Stripe call. A Stripe error is a 503, never "no card".
+ * @access Private (requires authentication)
+ */
+router.get("/billing-summary", authenticateToken, async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) {
+    return res.status(401).json({ error: "User not authenticated." });
+  }
+
+  let user;
+  let orgManaged: boolean;
+  try {
+    user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: "User not found." });
+    const org = user.orgId ? await orgDb.getOrgById(user.orgId) : null;
+    orgManaged = inheritsOrgBilling({ userId, orgId: user.orgId, subscription_status: user.subscription_status }, org);
+  } catch (error: any) {
+    console.error("[billing-summary] user lookup failed:", error?.message);
+    return res.status(500).json({ error: "Failed to load billing summary." });
+  }
+  if (orgManaged) {
+    return res.json({ hasPaymentMethod: false, isZoma: false, card: null });
+  }
+
+  try {
+    const pm = await stripeService.resolveUserPaymentMethod(user, userId);
+    res.json({ hasPaymentMethod: pm.hasPaymentMethod, isZoma: pm.isZoma, card: pm.card });
+  } catch (error: any) {
+    console.error("[billing-summary] Stripe lookup failed:", error?.message);
+    res.status(503).json({ error: "Could not load your payment method from Stripe. Try again shortly." });
+  }
+});
+
+/**
  * @route POST /api/stripe/create-customer-portal-session
  * @desc Create a Stripe Customer Portal session for the authenticated user
  * @access Private (requires authentication)
@@ -635,8 +690,23 @@ router.post(
 
     try {
       const user = await userDb.getUserById(userId);
-      if (!user || !user.stripe_customer_id) {
-        console.error(`User ${userId} does not have a Stripe customer ID.`);
+      // ENG-2571: a non-subscriber's card (e.g. saved through Zoma's setup Checkout) lives
+      // on whichever customer holds it, which need not be user.stripe_customer_id. With no
+      // card anywhere, the row's customer still opens (e.g. a churned user's invoice history),
+      // and a failed lookup falls back to it rather than blocking a portal that opened before.
+      let customerId: string | undefined | null = user?.stripe_customer_id;
+      if (user && !SUBSCRIBED_STATUSES.has(user.subscription_status)) {
+        try {
+          customerId =
+            (await stripeService.resolveUserPaymentMethod(user, userId)).customerId ??
+            (await stripeService.findLiveCustomerIdForUser(user, userId));
+        } catch (lookupError: any) {
+          if (!user.stripe_customer_id) throw lookupError;
+          console.error(`[portal-session] card lookup failed for ${userId}; using the row's customer:`, lookupError?.message);
+        }
+      }
+      if (!customerId) {
+        console.error(`User ${userId} has no Stripe customer to open the portal for.`);
         return res.status(404).json({
           message:
             "Stripe customer ID not found for this user. Cannot open portal.",
@@ -644,7 +714,7 @@ router.post(
       }
 
       const portalSession = await stripe.billingPortal.sessions.create({
-        customer: user.stripe_customer_id,
+        customer: customerId,
         return_url: `${CUSTOMER_FRONTEND_URL}/settings`, // Or any other relevant page
       });
 

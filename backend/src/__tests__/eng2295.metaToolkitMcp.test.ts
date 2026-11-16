@@ -41,8 +41,11 @@ const rpc = (body: any, auth?: string) => {
 describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('initialize returns server info and tools capability without auth', async () => {
-    const res = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } }).expect(200);
+  // ENG-2303 P1: initialize used to be served anonymously, which left MCP clients "connected"
+  // without ever starting OAuth. It now requires a bearer and answers 401 + RFC 9728 challenge.
+  it('initialize returns server info and tools capability for an authenticated caller', async () => {
+    mockAuthenticate.mockResolvedValue({ userId: 'u1' });
+    const res = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } }, 'Bearer aw_x').expect(200);
     expect(res.body.id).toBe(1);
     expect(res.body.result.protocolVersion).toBe('2025-03-26');
     expect(res.body.result.capabilities.tools).toBeDefined();
@@ -54,10 +57,26 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     expect(res.text).toBe('');
   });
 
+  const CHALLENGE =
+    'Bearer resource_metadata="https://api.agentweb.pro/.well-known/oauth-protected-resource/api/meta-toolkit/mcp", scope="mcp:tools"';
+
+  it('unauthenticated initialize is 401 with an RFC 9728 challenge pointing at the toolkit metadata', async () => {
+    mockAuthenticate.mockRejectedValue(new MockAuthError('Missing access token.', 401));
+    const res = await rpc({ jsonrpc: '2.0', id: 20, method: 'initialize', params: {} }).expect(401);
+    expect(res.headers['www-authenticate']).toBe(CHALLENGE);
+    expect(res.body.result).toBeUndefined();
+  });
+
+  it('a presented-but-invalid token gets error="invalid_token" in the challenge', async () => {
+    mockAuthenticate.mockRejectedValue(new MockAuthError('Invalid access token.', 401));
+    const res = await rpc({ jsonrpc: '2.0', id: 21, method: 'initialize', params: {} }, 'Bearer bogus').expect(401);
+    expect(res.headers['www-authenticate']).toBe(`${CHALLENGE}, error="invalid_token"`);
+  });
+
   it('tools/list requires a valid bearer (401, manifest not exposed)', async () => {
     mockAuthenticate.mockRejectedValue(new MockAuthError('Missing access token.', 401));
     const res = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' }).expect(401);
-    expect(res.headers['www-authenticate']).toBe('Bearer');
+    expect(res.headers['www-authenticate']).toBe(CHALLENGE);
     expect(res.body.error.message).toBe('Missing access token.');
     expect(mockManifest).not.toHaveBeenCalled();
   });
@@ -66,7 +85,21 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     mockAuthenticate.mockResolvedValue({ userId: 'u1' });
     const res = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/list' }, 'Bearer aw_x').expect(200);
     expect(mockAuthenticate).toHaveBeenCalledWith('Bearer aw_x');
-    expect(res.body.result.tools).toEqual([{ name: 'meta_get_insights', inputSchema: { type: 'object' } }]);
+    // ENG-2747: an unclassified tool is advertised with the conservative (destructive) annotations.
+    expect(res.body.result.tools).toEqual([
+      { name: 'meta_get_insights', inputSchema: { type: 'object' }, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
+    ]);
+  });
+
+  it('tools/list shows a Databricks-origin caller only allowed tools, labelled (ENG-2747)', async () => {
+    mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'oauth', databricksOrigin: true });
+    mockManifest.mockReturnValueOnce([
+      { name: 'list_meta_ads_campaigns', inputSchema: { type: 'object' } },
+      { name: 'zoma_custom_audiences', inputSchema: { type: 'object' } },
+    ]);
+    const res = await rpc({ jsonrpc: '2.0', id: 9, method: 'tools/list' }, 'Bearer t').expect(200);
+    expect(res.body.result.tools.map((t: { name: string }) => t.name)).toEqual(['list_meta_ads_campaigns']);
+    expect(res.body.result.tools[0].annotations.readOnlyHint).toBe(true);
   });
 
   it('tools/call routes through the gateway and wraps the result as text content', async () => {
@@ -120,6 +153,7 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
   });
 
   it('protocol negotiation, id validation, array arguments and GET follow the MCP spec', async () => {
+    mockAuthenticate.mockResolvedValue({ userId: 'u1' });
     let res = await rpc({ jsonrpc: '2.0', id: 12, method: 'initialize', params: { protocolVersion: '2099-01-01' } }).expect(200);
     expect(res.body.result.protocolVersion).toBe('2025-06-18');
     res = await rpc({ jsonrpc: '2.0', id: null, method: 'initialize', params: {} }).expect(400);
@@ -128,5 +162,14 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     expect(res.body.error.code).toBe(-32602);
     expect(mockHandle).not.toHaveBeenCalled();
     await request(app).get('/api/meta-toolkit/mcp').expect(405);
+  });
+
+  it('ENG-2303 P5: serves the agent skill guide publicly as markdown', async () => {
+    const res = await request(app).get('/api/meta-toolkit/skill.md').expect(200);
+    expect(res.headers['content-type']).toMatch(/text\/markdown/);
+    expect(res.text).toContain('zoma_status');
+    expect(res.text).toContain('preview_token');
+    expect(res.text).toContain('always created PAUSED');
+    expect(mockAuthenticate).not.toHaveBeenCalled();
   });
 });

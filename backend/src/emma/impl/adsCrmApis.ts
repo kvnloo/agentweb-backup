@@ -152,8 +152,10 @@
  * four names; none matched.
  */
 import { googleAdsService } from '../../services/googleAdsService';
+import { stampGoogleAssetUpload, stampGoogleAdCreated } from '../../services/creativeLineage';
 import {
   NegativeCampaignCriteriaValidationError,
+  validateDeviceBidAdjustments,
   validateNegativeCampaignCriteria,
 } from '../../services/googleAdsCampaignCriteria';
 import { preflightTrackingGate } from '../../services/googleAdsTrackingPreflight';
@@ -181,10 +183,7 @@ function makeGoogleAdsAuthError(message: string): Error {
  *
  * Deliberately read-only in effect: only wired into the two reporting/list surfaces
  * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
- * A client-scoped WRITE would let an admin session mutate a client's live campaign
- * without that client's own fresh authorization decision — the same risk ENG-1801
- * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
- * non-read action rather than pass it here.
+ * Writes are allowed too (admin-only, audited per call); see handleCallGoogleAdsApi.
  */
 async function resolveGoogleAdsCredentialScope(
   callerUserId: string,
@@ -513,22 +512,19 @@ async function runGoogleAdsTrackingGate(
 
 export async function handleCallGoogleAdsApi(userId: string, args: {
   customer_id: string;
-  entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
+  entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION' | 'CAMPAIGN_CONVERSION_GOAL' | 'CUSTOMER_CONVERSION_GOAL';
   action: string;
   [key: string]: any;
 }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
   try {
     const { customer_id, entity_type, action } = args;
-    // ENG-1944: client_id is admin-only and read-only-scoped here (see
-    // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
-    // session mutate a client's live campaign without that client's own authorization.
+    // ENG-1944 originally limited client_id here to LIST/SEARCH. That restriction was
+    // removed by engineering-lead decision: managed-client operators (admins) need to
+    // make audited changes in a client's account. The scope stays admin-only, requires a
+    // real customer target, and every use is recorded via recordAdminAudit
+    // (resolveGoogleAdsCredentialScope). All normal write gates (tracking pre-flight,
+    // override tokens) still run against the client's credentials.
     if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
-      if (action !== 'LIST' && action !== 'SEARCH') {
-        return {
-          success: false,
-          error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
-        };
-      }
       const scope = await resolveGoogleAdsCredentialScope(
         userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
       );
@@ -600,6 +596,23 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
     if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
       const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
       return { success: true, biddingStrategies };
+    }
+
+    if (entity_type === 'CAMPAIGN_CRITERION' && action === 'SET_DEVICE_BID_ADJUSTMENT') {
+      // ENG-2036: validate fully before credentials/mutation; one atomic mutate.
+      const normalized = validateDeviceBidAdjustments(
+        customer_id,
+        args.campaign_resource_name,
+        args.ad_group_resource_name,
+        args.device_bid_adjustments,
+      );
+      await googleAdsService.setDeviceBidAdjustments(userId, normalized);
+      return {
+        success: true,
+        scope: normalized.scope,
+        adjustments: normalized.adjustments,
+        message: `Set ${normalized.adjustments.length} device bid adjustment(s) at ${normalized.scope.toLowerCase()} level`,
+      };
     }
 
     if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
@@ -820,6 +833,61 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
       };
     }
 
+    // ENG-2804: conversion GOAL biddability. Codeless / UA actions refuse
+    // CONVERSION_ACTION UPDATE (MUTATE_NOT_ALLOWED); demoting their goal is the API path.
+    if (entity_type === 'CAMPAIGN_CONVERSION_GOAL' || entity_type === 'CUSTOMER_CONVERSION_GOAL') {
+      const level = entity_type === 'CAMPAIGN_CONVERSION_GOAL' ? 'CAMPAIGN' : 'CUSTOMER';
+      if (action === 'LIST') {
+        const goals = await googleAdsService.listConversionGoals(
+          userId, customer_id, level, level === 'CAMPAIGN' && args.campaign_id != null ? String(args.campaign_id) : undefined,
+        );
+        return { success: true, conversionGoals: goals };
+      }
+      if (action === 'UPDATE') {
+        if (typeof args.biddable !== 'boolean') {
+          return { success: false, error: `biddable (true/false) is required for ${entity_type} UPDATE.` };
+        }
+        let resourceName = args.resource_name ? String(args.resource_name).trim() : '';
+        if (!resourceName && args.category && args.origin) {
+          const cat = String(args.category).trim().toUpperCase();
+          const origin = String(args.origin).trim().toUpperCase();
+          if (level === 'CAMPAIGN') {
+            if (!args.campaign_id || !/^\d+$/.test(String(args.campaign_id))) {
+              return { success: false, error: 'campaign_id (numeric) is required with category + origin for CAMPAIGN_CONVERSION_GOAL UPDATE.' };
+            }
+            resourceName = `customers/${customer_id}/campaignConversionGoals/${args.campaign_id}~${cat}~${origin}`;
+          } else {
+            resourceName = `customers/${customer_id}/customerConversionGoals/${cat}~${origin}`;
+          }
+        }
+        if (!resourceName) {
+          return {
+            success: false,
+            error: `resource_name (or category + origin${level === 'CAMPAIGN' ? ' + campaign_id' : ''}) is required for ${entity_type} UPDATE. Get it from ${entity_type} LIST.`,
+          };
+        }
+        const expectedPath = level === 'CAMPAIGN' ? 'campaignConversionGoals' : 'customerConversionGoals';
+        const m = /^customers\/(\d+)\/([A-Za-z]+)\//.exec(resourceName);
+        if (!m || m[2] !== expectedPath) {
+          return { success: false, error: `resource_name ${resourceName} is not a ${expectedPath} resource name.` };
+        }
+        if (m[1] !== String(customer_id)) {
+          return { success: false, error: `resource_name ${resourceName} belongs to customer ${m[1]}, not customer_id ${customer_id}.` };
+        }
+        const updated = await googleAdsService.updateConversionGoalBiddable(userId, customer_id, level, resourceName, args.biddable);
+        return {
+          success: updated.drift.length === 0,
+          resourceName: updated.resourceName,
+          stored: updated.stored,
+          drift: updated.drift,
+          ...(updated.drift.length > 0
+            ? { error: `Google did not store biddable=${args.biddable} for ${resourceName} — see drift/stored.` }
+            : {}),
+        };
+      }
+      return { success: false, error: `${entity_type} supports LIST and UPDATE (biddable) only, not ${action}.` };
+    }
+
     if (entity_type === 'CONVERSION_ACTION') {
       if (action === 'LIST') {
         const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
@@ -852,8 +920,28 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         };
       }
       if (action === 'UPDATE') {
+        // ENG-2809: the model names the action the way LIST output and the Google UI
+        // do — a bare id, or under resource_name / conversion_action_id. Normalise
+        // those; a missing one is a model-facing error, not a thrown failure.
+        const raw = args.conversion_action_resource_name ?? args.resource_name ?? args.conversion_action_id;
+        const ident = raw === undefined || raw === null ? '' : String(raw).trim();
+        if (!ident) {
+          return {
+            success: false,
+            error: 'conversion_action_resource_name is required for CONVERSION_ACTION UPDATE '
+              + `(e.g. customers/${customer_id}/conversionActions/<id>). Get it from CONVERSION_ACTION LIST.`,
+          };
+        }
+        const resourceName = /^\d+$/.test(ident) ? `customers/${customer_id}/conversionActions/${ident}` : ident;
+        const owner = /^customers\/(\d+)\//.exec(resourceName)?.[1];
+        if (owner && owner !== String(customer_id)) {
+          return {
+            success: false,
+            error: `conversion_action_resource_name ${resourceName} belongs to customer ${owner}, not customer_id ${customer_id}.`,
+          };
+        }
         const updated = await googleAdsService.updateConversionAction(
-          userId, customer_id, args.conversion_action_resource_name, {
+          userId, customer_id, resourceName, {
             name: args.name,
             status: args.status,
             category: args.category,
@@ -1107,12 +1195,20 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
           // moment its campaign is enabled.
           status: args.status || 'PAUSED',
         });
+        // ENG-2235: fire-and-forget lineage stamp (inert unless CREATIVE_LINEAGE_ENABLED).
+        if (ad?.resourceName && Array.isArray(args.image_asset_resource_names)) {
+          void stampGoogleAdCreated({ userId, customerId: String(customer_id), adResourceName: ad.resourceName, assetResourceNames: args.image_asset_resource_names });
+        }
         return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
       if (action === 'UPDATE') {
         if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
         const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
           status: args.status,
+          // ENG-2979: RSA content edits (headlines/descriptions/final_url), read back by the service.
+          ...(Array.isArray(args.headlines) ? { headlines: args.headlines } : {}),
+          ...(Array.isArray(args.descriptions) ? { descriptions: args.descriptions } : {}),
+          ...(typeof args.final_url === 'string' ? { finalUrl: args.final_url } : {}),
         });
         if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
         return { success: true, message: 'Ad updated' };
@@ -1153,6 +1249,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         name: args.name,
         data: args.data,
       });
+      // ENG-2235: only a URL upload can resolve to a generated creative.
+      if (resourceName && typeof args.data === 'string' && args.data.startsWith('https://')) {
+        void stampGoogleAssetUpload({ userId, imageUrl: args.data, assetResourceName: resourceName });
+      }
       return { success: true, assetResourceName: resourceName };
     }
 
@@ -1195,6 +1295,31 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
       return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
     }
 
+    if (entity_type === 'ASSET_GROUP' && action === 'UPDATE') {
+      // ENG-2928: asset groups are created PAUSED, so a PMax launch needs this. Enabling one
+      // under an ENABLED campaign serves paid traffic instantly — gated like ASSET_GROUP CREATE.
+      if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP UPDATE' };
+      if (args.status !== 'ENABLED' && args.status !== 'PAUSED') return { success: false, error: 'This tool does not support updating the field(s) requested for ASSET_GROUP — nothing was sent to Google Ads, no changes were made.' };
+      let creativeTrackingWarning: string | undefined;
+      if (args.status === 'ENABLED') {
+        const assetGroup = await googleAdsService.getAssetGroup(userId, customer_id, args.asset_group_resource_name);
+        const gate = await guardCreativeAddition({
+          customerId: customer_id,
+          action: 'ASSET_GROUP_UPDATE',
+          override: overrideTrackingCheck,
+          sessionId: opts?.sessionId,
+          finalUrls: assetGroup?.finalUrls ?? [],
+          resolveParent: async () => (assetGroup
+            ? { campaignResourceName: assetGroup.campaignResourceName, campaignStatus: await googleAdsService.getCampaignStatus(userId, customer_id, assetGroup.campaignResourceName) }
+            : null),
+        });
+        if (!gate.proceed) return gate.blockResult;
+        creativeTrackingWarning = gate.warning;
+      }
+      await googleAdsService.updateAssetGroup(userId, customer_id, args.asset_group_resource_name, { status: args.status });
+      return { success: true, message: 'Asset group updated', ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
+    }
+
     if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
       // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
       if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
@@ -1229,6 +1354,10 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         error: error.message,
         code,
       };
+    }
+    if (error?.name === 'GoogleAdsReadBackError' && error?.code === 'unsupported_field') {
+      // ENG-592: mutate said success, read-back says unchanged. Never relay as success.
+      return { success: false, errorType: error.code, errorCode: error.code, fields: error.fields, error: error.message };
     }
     if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
     console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
@@ -1313,24 +1442,44 @@ export async function handleCallGoogleAdsReportingApi(userId: string, args: {
 // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
 
 export async function resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
+  // Order matters (ENG-2605): the caller's OWN OAuth account, then a private-app token pasted on one
+  // of their own lead lists, and only then an account an org admin shared. A shared account must never
+  // pre-empt something the caller connected themselves, or a call lands in a teammate's portal.
+  let ownErr: any;
   try {
-    return await HubSpotService.create(userId, accountId);
+    return await HubSpotService.create(userId, accountId, 'own');
   } catch (err: any) {
+    ownErr = err;
     // An explicit account_id or a multi-account ambiguity is actionable by the
     // caller — surface it instead of silently falling back to token-paste.
-    if (accountId || /multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
+    if (/multiple hubspot accounts/i.test(err?.message ?? '')) throw err;
     // Fall back to token-paste: scan lead lists for HubSpot apiKeyEncrypted
   }
-  const { crmDb } = await import('../../services/db');
-  const lists = await crmDb.getLeadListsByUserId(userId);
-  for (const list of lists as any[]) {
-    const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
-    if (hubspotConfig?.apiKeyEncrypted) {
-      const { decryptPassword } = await import('../../utils/crypto');
-      const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
-      return HubSpotService.fromToken(password);
+  if (!accountId) {
+    const { crmDb } = await import('../../services/db');
+    const lists = await crmDb.getLeadListsByUserId(userId);
+    for (const list of lists as any[]) {
+      const hubspotConfig = list?.externalCrmSyncConfigs?.hubspot;
+      if (hubspotConfig?.apiKeyEncrypted) {
+        const { decryptPassword } = await import('../../utils/crypto');
+        const { password } = decryptPassword(hubspotConfig.apiKeyEncrypted);
+        return HubSpotService.fromToken(password);
+      }
     }
   }
+  // A shared account only stands in when the caller has NONE of their own. An own account that exists
+  // but fails (a revoked grant, a refresh error) keeps its old outcome: quietly switching to a teammate's
+  // portal would send the call somewhere the caller never chose.
+  if (/not connected|not found/i.test(ownErr?.message ?? '')) {
+    try {
+      return await HubSpotService.create(userId, accountId, 'shared');
+    } catch (err: any) {
+      // Anything but "there is none" is actionable and surfaces (several shared accounts, or one whose
+      // owner's grant needs reconnecting); "there is none" falls through to the original messages.
+      if (!/not connected|not found/i.test(err?.message ?? '')) throw err;
+    }
+  }
+  if (accountId) throw ownErr;
   throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
 }
 
@@ -1458,7 +1607,10 @@ async function hubspotMarketingPreflight(
   }
 }
 
+import { normalizeHubSpotArgs } from '../../services/agentMode/crmToolArgs';
+
 export async function handleHubspotApi(userId: string, args: any): Promise<any> {
+  args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
   const action: string = (args?.action ?? '').toUpperCase();
   try {
@@ -1484,6 +1636,11 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
     // setups.
     const preflight = await hubspotMarketingPreflight(userId, svc, entityType, action);
     if (preflight) return preflight;
+
+    if (entityType === 'CONTACTS') {
+      if (action !== 'LIST') return { success: false, error: 'Valid CONTACTS action: LIST (cursor optional).' };
+      return { success: true, ...await svc.listContacts(args?.cursor) };
+    }
 
     // ─── CONTACT_LIST ──────────────────────────────────────────────────────
     if (entityType === 'CONTACT_LIST') {

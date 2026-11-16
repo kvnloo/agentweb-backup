@@ -5,6 +5,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { runVerifiedChat, RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS } from './agentModeController';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { isValidRecipientEmail } from '../services/resultEndpointReview';
 
 export interface WaitingContent {
   type: 'youtube' | 'url' | 'html';
@@ -113,6 +114,12 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
     const leadId = allParams.leadId;
     const externalSessionId = allParams.sessionId;
 
+    // ENG-2650: leadEmail is public input and later becomes the To: of the skipReview auto-send.
+    if (leadEmail !== undefined && leadEmail !== '' && !isValidRecipientEmail(leadEmail)) {
+      res.status(400).json({ error: 'leadEmail must be a single valid email address' });
+      return;
+    }
+
     // Remove special params from args
     const args: Record<string, string> = {};
     for (const [key, value] of Object.entries(allParams)) {
@@ -148,12 +155,14 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       args,
     });
 
-    // 5. Enable interactive sharing
-    const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
+    // 5. Enable interactive sharing. The link is a conversable (chat-as-owner) credential for
+    // the reviewer, so it is NOT returned to the anonymous caller (ENG-2669); the reviewer gets
+    // it from the token-gated GET /review/:sessionId.
+    await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
 
     // 6. Set LLM model (use default)
     const llmModel = await agentModeService.getDefaultModel();
-    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
+    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel, undefined, 'system');
 
     // 7. Substitute URL params into prompt template
     const resolvedPrompt = applyVariableValues(config.prompt, args);
@@ -200,7 +209,6 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
     res.status(200).json({
       success: true,
       sessionId: session.sessionId,
-      ishareUrl,
       configName: config.name,
       resultTitle: config.resultTitle || config.name,
     });

@@ -450,6 +450,38 @@ describe('HubSpotService — batchUpdateContacts', () => {
     );
   });
 
+  // ENG-2635. A real HubSpot answers a batch update for a MERGED-AWAY contact id with HTTP 200 and an
+  // empty `results` array, no `errors` (recorded 2026-10-22). Nothing was updated, so the caller must be
+  // told which ids HubSpot actually echoed back.
+  it('returns the ids HubSpot echoed in results', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: { status: 'COMPLETE', results: [{ id: 'c-1' }, { id: 'c-2' }] } });
+    await expect(svc.batchUpdateContacts([
+      { id: 'c-1', properties: {} }, { id: 'c-2', properties: {} },
+    ])).resolves.toEqual(['c-1', 'c-2']);
+  });
+
+  it('returns an empty list for the real merged-away shape (200, results: [], no errors)', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: { status: 'COMPLETE', results: [] } });
+    await expect(svc.batchUpdateContacts([{ id: 'merged-away', properties: {} }])).resolves.toEqual([]);
+  });
+
+  it('returns only the ids that were actually updated when some were not echoed', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: { results: [{ id: 'c-1' }] } });
+    await expect(svc.batchUpdateContacts([
+      { id: 'c-1', properties: {} }, { id: 'merged-away', properties: {} },
+    ])).resolves.toEqual(['c-1']);
+  });
+
+  it('matches numeric ids in results against string ids, and ignores results without an id', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: { results: [{ id: 123 }, { id: null }, {}] } });
+    await expect(svc.batchUpdateContacts([{ id: '123', properties: {} }])).resolves.toEqual(['123']);
+  });
+
+  it('returns undefined (no information) when the response carries no results array', async () => {
+    mockAxiosPost.mockResolvedValue({ status: 200, data: {} });
+    await expect(svc.batchUpdateContacts([{ id: 'c-1', properties: {} }])).resolves.toBeUndefined();
+  });
+
   it('throws when inputs.length > 100 (does not call the API)', async () => {
     const inputs = Array.from({ length: 101 }, (_, i) => ({ id: `c-${i}`, properties: {} }));
     await expect(svc.batchUpdateContacts(inputs)).rejects.toThrow(/100/);

@@ -1,13 +1,15 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import { isEvaluationUser } from './evaluationPolicy';
 import type { DailyVolumeState } from './linkedInWritePacer';
+import { emitAppSignal } from './serverSignalEmitter';
 
 // ============================================
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma' | 'smartlead';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -282,6 +284,31 @@ export interface FathomConfig {
   token_expires_at: number;
 }
 
+/**
+ * Luma calendar API key (ENG-2338). Keys are scoped to ONE Luma calendar and need
+ * a Luma Plus subscription. Like Fathom, the key itself lives in `access_token`
+ * (so the shared secret redaction already covers it); there is no expiry, so
+ * `token_expires_at` is pinned far in the future and a dead key is flagged via
+ * `needs_reconnect` instead.
+ */
+export interface LumaConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+  calendar_url?: string;
+  needs_reconnect?: boolean;
+}
+
+/**
+ * A customer's own Smartlead API key (ENG-673). Smartlead sends their cold email in their account;
+ * AgentWeb only holds the key. Like Luma the key itself lives in `access_token` (so the shared
+ * secret redaction covers it) and never expires; one connection per user.
+ */
+export interface SmartleadConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+  mailbox_count: number;
+  /** Set when Smartlead rejected the key on a probe (revoked, or the plan lapsed); cleared by a reconnect. See services/smartleadConnection.ts. */
+  needs_reconnect?: boolean;
+}
+
 export interface LinkedInAdsAdAccountConfig extends BaseOAuthConfig {
   account_type: 'ad_account';
   currency: string;
@@ -406,7 +433,7 @@ export interface SlackConfig extends BaseOAuthConfig {
   team_id: string;
 }
 
-export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig | SmartleadConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -469,7 +496,12 @@ export interface CreateAccountInput {
 export const createAccount = async (
   userId: string,
   platform: PlatformType,
-  input: CreateAccountInput
+  input: CreateAccountInput,
+  // ENG-2686: false when the provider could not confirm the account (e.g. a Unipile
+  // ID that getAccount refused); the row is still saved but no integration_connected
+  // signal fires for an integration that never happened.
+  // ENG-673: resetSharing makes a reconnect private again (a replaced API key must not stay org-shared).
+  opts: { providerVerified?: boolean; resetSharing?: boolean } = {}
 ): Promise<ConnectedAccount> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -494,6 +526,7 @@ export const createAccount = async (
     account_id: input.account_id,
     account_name: input.account_name,
     config: input.config,
+    ...(opts.resetSharing ? { sharedWithOrg: false } : {}),
     created_at: existingAccount?.created_at || now,
     updated_at: now,
   };
@@ -517,6 +550,10 @@ export const createAccount = async (
   // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
   // page. See services/metaPixelsCache.ts.
   invalidateCachedPixels(userId);
+  if (platform === 'hubspot') clearHubSpotPortalCache();
+
+  // ENG-2686: first connection only (a re-OAuth of the same account is not a new integration).
+  if (existingIndex < 0 && opts.providerVerified !== false) void emitAppSignal(user as any, 'integration_connected', { platform });
 
   return accountConfig;
 };
@@ -1007,40 +1044,145 @@ export const getAccountByIdConsistent = async (
   platform?: PlatformType | PlatformType[]
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
-    const user = await userDb.getUserByIdConsistent(userId);
-    return findAccountForUser(user as User | undefined, accountId, userId, platform);
+    return await getAccountByIdConsistentOrThrow(accountId, userId, platform);
   } catch (error) {
     console.error('Error in getAccountByIdConsistent:', error);
     return null;
   }
 };
 
+/** The same read for a caller that must tell "no such account" from "could not read": a failed read throws instead of returning null. */
+export const getAccountByIdConsistentOrThrow = async (
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): Promise<ConnectedAccountWithUser | null> => {
+  const user = await userDb.getUserByIdConsistent(userId);
+  return findAccountForUser(user as User | undefined, accountId, userId, platform);
+};
+
 /**
  * Find the User ID that owns a specific HubSpot Portal.
  * Required for mapping HubSpot webhooks back to local users.
+ *
+ * ENG-2605. There is no GSI on connected_accounts, so resolving a portal means reading every user.
+ * The webhook handler called this once per changed contact: a delivery of N contacts was N full
+ * scans of AW-Users (~4 MB each). One snapshot of portal -> owner is now shared by every caller on
+ * the instance. It is rebuilt when it is older than HUBSPOT_PORTAL_MAP_TTL_MS (5 min), or when a
+ * lookup MISSES on a snapshot older than HUBSPOT_PORTAL_MISS_REFRESH_MS (30 s): portals that
+ * installed the app but are unknown here are the common case, so a miss may not rescan on every
+ * event, but a portal connected on another instance must be found within seconds. Concurrent
+ * rebuilds are shared; if a rebuild fails a stale snapshot still answers; connecting a HubSpot
+ * account clears it at once on that instance.
+ *
+ * A cached HIT is verified before it is returned: one by-id read of the cached owner confirms that
+ * user still holds the portal. A portal that moved to another user or was disconnected therefore
+ * resolves correctly at once instead of routing events to the former owner for the rest of the TTL.
+ * If that read fails, the snapshot is trusted.
  */
-export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
-  try {
-    // Note: If you have millions of users, you'd want a GSI on connected_accounts.
-    // For now, scanning or iterating is necessary to find the nested config property.
-    // The most efficient way right now is using userDb.scanAllItems
-    // Wait, let's just scan the users table where connected_accounts contains the given portalId
-    const { userDb } = await import('./db');
-    const users = await userDb.getAllUsers();
+const HUBSPOT_PORTAL_MAP_TTL_MS = 5 * 60 * 1000;
+// A miss on a snapshot older than this rebuilds once: a portal connected on another instance is then
+// found within seconds, not minutes (the webhook handler drops events for an unknown portal).
+const HUBSPOT_PORTAL_MISS_REFRESH_MS = 30 * 1000;
+let hubspotPortalMapGeneration = 0;
+type HubSpotPortalMap = { byPortal: Map<unknown, string>; at: number; invalidated?: boolean };
+let hubspotPortalMap: HubSpotPortalMap | null = null;
+let hubspotPortalMapInflight: Promise<HubSpotPortalMap> | null = null;
 
-    for (const user of users) {
-      if (user.connected_accounts) {
-        for (const account of user.connected_accounts) {
-          if (account.platform === 'hubspot' && (account.config as any).hub_id === portalId) {
-            return user.userId;
+/** Drops the portal -> user snapshot (tests; a new HubSpot connection on this instance). */
+export const clearHubSpotPortalCache = (): void => {
+  hubspotPortalMap = null;
+  // A rebuild already reading users must not publish its pre-change view after this clear.
+  hubspotPortalMapGeneration++;
+  hubspotPortalMapInflight = null;
+};
+
+const loadHubSpotPortalMap = (): Promise<HubSpotPortalMap> => {
+  if (!hubspotPortalMapInflight) {
+    const generation = hubspotPortalMapGeneration;
+    const inflight = (async () => {
+      const { userDb } = await import('./db');
+      // scanWithFilter, not getAllUsers(): the latter also runs three per-user count scans (tasks, workflows,
+      // chat sessions) for the admin dashboard, which this lookup does not need and which let an unrelated
+      // table's throttling fail the rebuild. Same population as before: tombstoned (deleted_) users are
+      // excluded by scanWithFilter, evaluation users are excluded here, as getAllUsers did by default.
+      const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+      const byPortal = new Map<unknown, string>();
+      for (const user of users) {
+        if (!user || typeof user.userId !== 'string' || isEvaluationUser(user.userId)) continue;
+        if (!user.connected_accounts) continue;
+        try {
+          for (const account of user.connected_accounts) {
+            if (account.platform !== 'hubspot') continue;
+            const hubId = (account.config as any)?.hub_id;
+            // The first user holding a portal wins, as the per-event scan did.
+            if (hubId !== undefined && hubId !== null && !byPortal.has(hubId)) byPortal.set(hubId, user.userId);
           }
+        } catch {
+          // One malformed record must not hide every other user's portals.
         }
       }
+      const snapshot = { byPortal, at: Date.now() };
+      // Only publish if nothing cleared the cache while we were reading.
+      if (generation === hubspotPortalMapGeneration) hubspotPortalMap = snapshot;
+      return snapshot;
+    })().finally(() => {
+      if (hubspotPortalMapInflight === inflight) hubspotPortalMapInflight = null;
+    });
+    hubspotPortalMapInflight = inflight;
+  }
+  return hubspotPortalMapInflight;
+};
+
+/** false = the user is gone or no longer holds the portal; undefined = could not tell (trust the snapshot). */
+const ownerStillHoldsPortal = async (ownerId: string, portalId: unknown): Promise<boolean | undefined> => {
+  try {
+    const { userDb } = await import('./db');
+    const owner: any = await userDb.getUserById(ownerId);
+    if (!owner) return false;
+    return (Array.isArray(owner.connected_accounts) ? owner.connected_accounts : []).some(
+      (a: any) => a?.platform === 'hubspot' && a?.config?.hub_id === portalId,
+    );
+  } catch {
+    return undefined;
+  }
+};
+
+export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<string | null> => {
+  const cached = hubspotPortalMap;
+  let cachedOwnerIsStale = false;
+  if (cached && Date.now() - cached.at < HUBSPOT_PORTAL_MAP_TTL_MS) {
+    const hit = cached.byPortal.get(portalId);
+    if (hit !== undefined) {
+      if ((await ownerStillHoldsPortal(hit, portalId)) !== false) return hit;
+      // The cached owner no longer holds this portal. Invalidate THIS snapshot once, however many
+      // callers notice: the first one drops any rebuild that started before the change (so it can
+      // neither be joined nor published) and starts a fresh one; the rest join that rebuild instead
+      // of each forcing another full scan. The snapshot itself is kept as the fallback, so other
+      // portals keep resolving if the rebuild fails.
+      cachedOwnerIsStale = true;
+      if (!cached.invalidated) {
+        cached.invalidated = true;
+        hubspotPortalMapGeneration++;
+        hubspotPortalMapInflight = null;
+      }
+    } else if (Date.now() - cached.at < HUBSPOT_PORTAL_MISS_REFRESH_MS) {
+      return null;
     }
-    return null;
+    // A miss on a snapshot older than the refresh age falls through to one shared rebuild.
+  }
+  try {
+    return (await loadHubSpotPortalMap()).byPortal.get(portalId) ?? null;
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
-    return null;
+    // A stale answer beats dropping a webhook delivery because one rebuild was throttled, but never
+    // an owner we have just seen no longer holds the portal, and an expired snapshot's owner is
+    // verified like any other hit (this path skips the fresh-snapshot check above). If that read
+    // fails too, the snapshot is trusted.
+    if (cachedOwnerIsStale) return null;
+    const fallback = cached?.byPortal.get(portalId);
+    if (fallback === undefined) return null;
+    return (await ownerStillHoldsPortal(fallback, portalId)) === false ? null : fallback;
   }
 };
 
@@ -1161,7 +1303,7 @@ export const getAccountsByAttioWorkspaceId = async (
  * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
  * the exception is explicit rather than implied.
  */
-const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter']);
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter', 'luma', 'smartlead']);
 
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();

@@ -352,6 +352,9 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                     for (const insight of insights) {
                         const val = insight.values?.[0]?.value || 0;
                         switch (insight.name) {
+                            // `views` replaces the retired impressions/plays; it also counts replays, so it will not
+                            // match historical impressions exactly (ENG-2636).
+                            case 'views':
                             case 'impressions':
                             case 'plays':
                             case 'carousel_album_impressions':
@@ -373,6 +376,11 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                         }
                     }
 
+                    // An unsupported metric is dropped from the request rather than failing it, so say so
+                    // instead of presenting the resulting 0 as a measured value (ENG-2636).
+                    const hasViews = insights.some((i: any) => ['views', 'impressions', 'plays', 'carousel_album_impressions'].includes(i.name));
+                    const metricErrors = hasViews ? undefined : [{ metric: 'views', error: 'Instagram did not return views for this media type; impressions is 0 because it is unavailable, not because there were none.' }];
+
                     // Fall back to media object counts if insights don't include likes/comments
                     let likes = insightLikes || postData?.like_count || 0;
                     let comments = insightComments || postData?.comments_count || 0;
@@ -385,6 +393,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                         impressions,
                         engagement: totalInteractions || (likes + comments + saved),
                         fetchedAt,
+                        ...(metricErrors ? { metricErrors } : {}),
                         extendedMetrics: {
                             saved,
                             totalInteractions,

@@ -52,7 +52,8 @@ const ADMIN_TAB_DESCRIPTIONS: Readonly<Record<string, string>> = {
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
-import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
+import { buildApiUrl, CUSTOMER_FRONTEND_URL, CUSTOM_SUBSCRIPTION_LINKS_ENABLED } from "../config";
+import CustomSubscriptionLinkButton from "../components/admin/CustomSubscriptionLinkButton";
 import { buildAgentRunInspectorUrl } from "../utils/agentRunLinks";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
@@ -75,6 +76,8 @@ import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLe
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
+import VendorRatesTab from "../components/admin/VendorRatesTab";
+import ZomaScoreboardTab from "../components/admin/ZomaScoreboardTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
@@ -116,6 +119,11 @@ import {
   ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
+import { staffOperatedBadge, type SelfActivitySignal } from "../utils/selfActivityBadge";
+import { matchesProductFilter, type ProductFilter } from "../utils/productBadges";
+import ProductPills from "../components/admin/ProductPills";
+import { ErrorState } from "../components/StatusState";
+import { withoutAgentWebModel } from "../utils/agentWebModel";
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -280,6 +288,11 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
+  // ENG-273: one messaging platform per customer. Derived by the backend from the same
+  // policy that enforces the rule, so this never disagrees with what an edit will allow.
+  messagingPlatform?: "slack" | "whatsapp" | null;
+  messagingPlatformSource?: "account" | "organisation" | null;
+  whatsappNumberMasked?: string | null; // last four digits only
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -293,6 +306,16 @@ interface User {
   subscriptionType?: string; // Subscription type for customer portal users
   /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
   spendThisMonthUsd?: number;
+  /** ENG-2906: product attribution (attribution only; never restricts access). */
+  signupProduct?: string;
+  signupClient?: string;
+  signupRef?: string;
+  attributionConfidence?: "tracked" | "inferred" | "verified";
+  products?: Record<string, { firstAt?: string; lastAt?: string }>;
+  zomaStage?: string;
+  zomaStageAt?: string;
+  /** ENG-1271: derived customer-vs-staff activity signal; absent on older backends. */
+  selfActivity?: SelfActivitySignal | null;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -792,6 +815,7 @@ export default function AdminDashboard() {
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
   const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [userFilterHasUsage, setUserFilterHasUsage] = useState(false);
+  const [userFilterProduct, setUserFilterProduct] = useState<ProductFilter>("all");
   const [userFilterHideBotLike, setUserFilterHideBotLike] = useState(true);
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
@@ -984,6 +1008,8 @@ export default function AdminDashboard() {
   const [editWaitlistLoading, setEditWaitlistLoading] = useState(false);
 
   const { token, user, setToken } = useAuth();
+  // ENG-2488: captured before row maps shadow `user`.
+  const viewerIsAdmin = !!user?.isAdmin;
 
   const {
     users: contextUsers,
@@ -1843,6 +1869,8 @@ export default function AdminDashboard() {
       if (userFilterHasUsage) {
         if ((user.spendThisMonthUsd ?? 0) <= 0) return false;
       }
+      // ENG-2906 product filter: signupProduct or the products map
+      if (!matchesProductFilter(user, userFilterProduct)) return false;
       return true;
     });
     return filtered.sort((a, b) => {
@@ -1859,7 +1887,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid, userFilterHasUsage]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid, userFilterHasUsage, userFilterProduct]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -2681,7 +2709,15 @@ export default function AdminDashboard() {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
             user.userId === editingSlackChannelUserId
-              ? { ...user, slackChannels: response.data.slackChannels ?? [] }
+              ? {
+                  ...user,
+                  slackChannels: response.data.slackChannels ?? [],
+                  // Clearing an account's own channels can leave an organisation member on the
+                  // organisation's channel, so take the platform the server worked out.
+                  messagingPlatform: response.data.messagingPlatform ?? null,
+                  messagingPlatformSource: response.data.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data.whatsappNumberMasked ?? null,
+                }
               : user
           )
         );
@@ -2696,6 +2732,64 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update slack channel");
     } finally {
       setSlackChannelEditLoading(false);
+    }
+  };
+
+  // ENG-273: disconnect a customer's WhatsApp on their behalf. A customer is on one
+  // messaging platform, so this is also the only way support can move one to Slack.
+  const handleDisconnectWhatsApp = async (userId: string, maskedNumber?: string | null) => {
+    const which = maskedNumber ? ` (${maskedNumber})` : "";
+    if (!window.confirm(
+      `Disconnect this customer's WhatsApp number${which}?\n\n` +
+      "They will stop receiving AgentWeb notifications and approval requests on WhatsApp. " +
+      "They can reconnect from their own Settings, or you can then assign a Slack channel."
+    )) {
+      return;
+    }
+    try {
+      const response = await axios.delete(
+        buildApiUrl(`/api/admin/users/${userId}/whatsapp`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              // The server says what the account is on now. Removing WhatsApp can leave a member
+              // of an organisation on the organisation's Slack channel, not on nothing.
+              ? {
+                  ...user,
+                  // null = the server looked and found nothing; absent = it could not work it out,
+                  // which the table shows as "Unknown" rather than claiming "Not connected".
+                  messagingPlatform: response.data?.messagingPlatform,
+                  messagingPlatformSource: response.data?.messagingPlatformSource ?? null,
+                  whatsappNumberMasked: response.data?.whatsappNumberMasked ?? null,
+                }
+              : user
+          )
+        );
+        setSuccess(
+          response.data?.customerNotified
+            ? "WhatsApp disconnected. The customer was told on WhatsApp."
+            : "WhatsApp disconnected. The customer could not be told on WhatsApp (outside the 24-hour window)."
+        );
+      }
+    } catch (error: unknown) {
+      console.error("Error disconnecting WhatsApp:", error);
+      const message = axios.isAxiosError(error) ? error.response?.data?.message : undefined;
+      setError(typeof message === "string" && message ? message : "Failed to disconnect WhatsApp");
+      // 404 / 409 mean the account no longer has a number, so the row on screen is stale
+      // (someone else disconnected it, or the customer did). Stop claiming WhatsApp.
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 404 || status === 409) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, messagingPlatform: undefined, messagingPlatformSource: null, whatsappNumberMasked: null }
+              : user
+          )
+        );
+      }
     }
   };
 
@@ -3391,7 +3485,26 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
   const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
 
   if (adminError) {
-    return <Alert severity="error">{adminError}</Alert>;
+    return (
+      <ErrorState
+        title="We couldn't load the admin dashboard"
+        description={adminError}
+        onRetry={async () => {
+          // ENG-2526: retry every load sequentially and stop at the first failure.
+          // Each loader clears the shared error on success, so parallel retries let
+          // a successful load hide a still-failing one (e.g. waitlist/analytics).
+          if (!(await loadUsers(userFilterHideBotLike))) return;
+          if (!(await loadWaitlist())) return;
+          // Analytics only loads on the Overview tab (matches the analytics effect).
+          if (tabValue === 0 && startDate && endDate) {
+            const startDateStr = format(startDate, "yyyy-MM-dd");
+            const endDateStr = format(endDate, "yyyy-MM-dd");
+            lastLoadedDatesRef.current = { startDate: startDateStr, endDate: endDateStr };
+            await loadAnalytics(startDateStr, endDateStr);
+          }
+        }}
+      />
+    );
   }
 
   return (
@@ -4389,6 +4502,15 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 <MenuItem value="unpaid">Not Paying</MenuItem>
               </Select>
             </FormControl>
+            <FormControl size="small" sx={{ minWidth: 130 }}>
+              <InputLabel>Product</InputLabel>
+              <Select value={userFilterProduct} label="Product" onChange={(e) => setUserFilterProduct(e.target.value as ProductFilter)}>
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="zoma">Zoma</MenuItem>
+                <MenuItem value="emma_mcp">Emma MCP</MenuItem>
+                <MenuItem value="emma_web">Web</MenuItem>
+              </Select>
+            </FormControl>
             <FormControlLabel
               control={
                 <Checkbox
@@ -4414,8 +4536,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
               label={<Typography variant="body2">Hide bots</Typography>}
               sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
-            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
-              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterProduct !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterProduct("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
@@ -4549,6 +4671,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                       return format(d, "MMM d");
                     })() : "Never";
                     const spendUsd = user.spendThisMonthUsd;
+                    const staffBadge = staffOperatedBadge(user);
 
                     return (
                       <React.Fragment key={user.userId}>
@@ -4591,6 +4714,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                           <Box>
                             <Typography variant="body2" sx={{ fontWeight: 500 }}>
                               {user.email}
+                              <ProductPills user={user} />
                             </Typography>
                             {user.orgId ? (
                               <Typography variant="caption" color="text.secondary">
@@ -4656,6 +4780,11 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
+                          {staffBadge && (
+                            <Tooltip title={staffBadge.tooltip}>
+                              <Chip size="small" color="warning" variant="outlined" label={staffBadge.label} sx={{ mt: 0.5, height: 20, fontSize: "0.7rem" }} />
+                            </Tooltip>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
@@ -4729,6 +4858,17 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                       <Typography variant="caption" color="text.disabled" sx={{ fontFamily: "monospace", fontSize: "0.7rem" }}>
                                         {user.orgId}
                                       </Typography>
+                                      <CustomSubscriptionLinkButton
+                                        orgId={user.orgId}
+                                        viewerIsAdmin={viewerIsAdmin}
+                                        enabled={CUSTOM_SUBSCRIPTION_LINKS_ENABLED}
+                                        submit={async (body) => {
+                                          const res = await axios.post(buildApiUrl("/api/admin/custom-subscription-links"), body, {
+                                            headers: { Authorization: `Bearer ${token}` },
+                                          });
+                                          return { url: res.data.url };
+                                        }}
+                                      />
                                     </Box>
                                   </Grid>
                                 )}
@@ -4855,30 +4995,74 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                   </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack Channels</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
-                                    <Typography variant="body2">
-                                      {(() => {
-                                        const ids = user.slackChannels && user.slackChannels.length > 0
+                                  <Typography variant="caption" color="text.secondary">Messaging Platform</Typography>
+                                  {user.messagingPlatform === "whatsapp" ? (
+                                    // A customer is on ONE platform. On WhatsApp there is no Slack
+                                    // channel to edit, and the backend would refuse one — so the
+                                    // editor is not offered rather than offered and then rejected.
+                                    <Box>
+                                      <Typography variant="body2">
+                                        WhatsApp{user.whatsappNumberMasked ? ` (${user.whatsappNumberMasked})` : ""}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                                        Slack can't be added while WhatsApp is connected.
+                                      </Typography>
+                                      {user.whatsappOptedOut && (
+                                        <Typography variant="caption" color="error" sx={{ display: "block" }}>
+                                          This number texted STOP, so nothing can reach it. Disconnect it.
+                                        </Typography>
+                                      )}
+                                      <Button
+                                        size="small"
+                                        color="error"
+                                        sx={{ mt: 0.5, p: 0, minWidth: 0, textTransform: "none" }}
+                                        onClick={() => handleDisconnectWhatsApp(user.userId, user.whatsappNumberMasked)}
+                                      >
+                                        Disconnect WhatsApp
+                                      </Button>
+                                    </Box>
+                                  ) : (
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                                      <Typography variant="body2">
+                                        {(() => {
+                                          const ids = user.slackChannels && user.slackChannels.length > 0
+                                            ? user.slackChannels
+                                            : user.slackChannel ? [user.slackChannel] : [];
+                                          if (ids.length === 0) {
+                                            if (user.messagingPlatformSource === "organisation") return "Slack (via organisation)";
+                                            // null = looked up, nothing connected. undefined = the lookup failed
+                                            // (or an older backend), which is not the same as "not connected".
+                                            if (user.messagingPlatform === undefined) return "Unknown";
+                                            const gone = user.whatsappDisconnect;
+                                            if (gone) {
+                                              const when = new Date(gone.at).toLocaleDateString();
+                                              const why =
+                                                gone.reason === "stop"
+                                                  ? "customer texted STOP"
+                                                  : gone.reason === "admin"
+                                                    ? "removed by support"
+                                                    : "customer removed it";
+                                              return `Not connected (WhatsApp: ${why}, ${when})`;
+                                            }
+                                            return "Not connected";
+                                          }
+                                          return "Slack: " + ids.map((id) =>
+                                            slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
+                                          ).join(", ");
+                                        })()}
+                                      </Typography>
+                                      <IconButton size="small" aria-label="Edit Slack channels" onClick={() => {
+                                        setEditingSlackChannelUserId(user.userId);
+                                        const channels = user.slackChannels && user.slackChannels.length > 0
                                           ? user.slackChannels
                                           : user.slackChannel ? [user.slackChannel] : [];
-                                        if (ids.length === 0) return "—";
-                                        return ids.map((id) =>
-                                          slackChannelNames[id] ? `${slackChannelNames[id]} (${id})` : id
-                                        ).join(", ");
-                                      })()}
-                                    </Typography>
-                                    <IconButton size="small" onClick={() => {
-                                      setEditingSlackChannelUserId(user.userId);
-                                      const channels = user.slackChannels && user.slackChannels.length > 0
-                                        ? user.slackChannels
-                                        : user.slackChannel ? [user.slackChannel] : [];
-                                      setCurrentSlackChannels(channels);
-                                      setSlackChannelInputText("");
-                                      setSlackChannelDialogOpen(true);
-                                      resolveSlackChannelNames(channels);
-                                    }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
-                                  </Box>
+                                        setCurrentSlackChannels(channels);
+                                        setSlackChannelInputText("");
+                                        setSlackChannelDialogOpen(true);
+                                        resolveSlackChannelNames(channels);
+                                      }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                    </Box>
+                                  )}
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
@@ -6682,6 +6866,14 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={26}>
           <EvalV2Tab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={27}>
+          <VendorRatesTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={28}>
+          <ZomaScoreboardTab />
         </TabPanel>
         </Box>
       </Box>
@@ -8589,8 +8781,11 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (Array.isArray(response.data) && response.data.length > 0) {
-        setSupportedModels(response.data);
-        return response.data;
+        // ENG-669 PR-C: the configured default stands in when nothing was chosen, so it must be one concrete model, never
+        // the AgentWeb Model (a per-turn router).
+        const models = withoutAgentWebModel(response.data);
+        setSupportedModels(models);
+        return models;
       }
     } catch (error) {
       console.error('Error loading supported models:', error);
@@ -8983,7 +9178,10 @@ const AgentModeSettings = () => {
     }
   };
 
-  const VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview'];
+  const VIDEO_API_MODELS = ['gemini-omni-1.1-flash', 'seedance-2.0'];
+  // Retired Veo ids (Google shutdown 2026-10-22) may still be stored in the setting;
+  // the backend resolves them to gemini-omni-1.1-flash, so show them that way.
+  const LEGACY_VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3.1-fast-generate-preview', 'veo-3-generate-preview', 'veo-3.0-generate-preview'];
 
   const loadVideoApiDefaultModel = async () => {
     try {
@@ -8991,7 +9189,8 @@ const AgentModeSettings = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (response.data && response.data.settingValue) {
-        const configuredModel = response.data.settingValue.trim();
+        const storedModel = response.data.settingValue.trim();
+        const configuredModel = LEGACY_VIDEO_API_MODELS.includes(storedModel) ? 'gemini-omni-1.1-flash' : storedModel;
         if (configuredModel && VIDEO_API_MODELS.includes(configuredModel)) {
           setVideoApiDefaultModel(configuredModel);
           return;
@@ -9014,7 +9213,7 @@ const AgentModeSettings = () => {
       if (videoApiDefaultModel) {
         await axios.put(buildApiUrl('/api/settings/agent_mode_video_api_default_model'), {
           settingValue: videoApiDefaultModel,
-          description: 'Default video API model for generate_video tool (e.g. veo-3.1-generate-preview)'
+          description: 'Default video API model for generate_video tool (e.g. seedance-2.0 or gemini-omni-1.1-flash)'
         }, {
           headers: { Authorization: `Bearer ${token}` }
         });
@@ -9978,7 +10177,7 @@ const AgentModeSettings = () => {
               onChange={(e) => setVideoApiDefaultModel(e.target.value as string)}
             >
               <MenuItem value="">
-                <em>Use hardcoded default (veo-3.1-generate-preview)</em>
+                <em>Use hardcoded default (seedance-2.0, falls back to gemini-omni-1.1-flash)</em>
               </MenuItem>
               {VIDEO_API_MODELS.map((model) => (
                 <MenuItem key={model} value={model}>

@@ -20,13 +20,13 @@ it('respects overrides and isolates short-lived cache by organization', async ()
   expect(await resolveModelForRole('a', 'enrichment')).toBe('gemini-3.8-flash');
   (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: {} });
   expect(await resolveModelForRole('a', 'enrichment')).toBe('gemini-3.8-flash');
-  expect(await resolveModelForRole('b', 'enrichment')).toBe('gpt-5.5');
+  expect(await resolveModelForRole('b', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
   invalidateModelRoles('a');
-  expect(await resolveModelForRole('a', 'enrichment')).toBe('gpt-5.5');
+  expect(await resolveModelForRole('a', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
 });
 it.each(['retired-model', 'gpt-5-chat-2', 'gpt-image-1', {}, [], 42])('falls back for invalid/legacy override %j', async value => {
   (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: { enrichment: value } });
-  expect(await resolveModelForRole('a', 'enrichment')).toBe('gpt-5.5');
+  expect(await resolveModelForRole('a', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
 });
 it('uses a usable supersession successor for a legacy override', async () => {
   (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: { enrichment: 'gemini-3.7-flash' } });
@@ -44,6 +44,31 @@ it('filters role capabilities and restricts embeddings to the existing 1536-dime
   }
   expect(getRoleModelOptions('embedding')).toEqual(['openai/text-embedding-3-large']);
   expect(getRoleModelOptions('chat')).not.toContain('openrouter/perplexity/sonar-pro-search');
+});
+it('lets an org save the enrichment default even though the picker hides it as superseded (ENG-2720)', async () => {
+  const luna = 'openrouter/openai/gpt-5.6-luna';
+  expect(getRoleModelOptions('enrichment')).toContain(luna);
+  (orgDb.updateModelRoles as jest.Mock).mockResolvedValue('next');
+  expect((await request(app).put('/').send({ modelRoles: { enrichment: luna }, revision: 'rev' })).status).toBe(200);
+  expect(orgDb.updateModelRoles).toHaveBeenCalledWith('a', { enrichment: luna }, 'rev');
+  (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: { enrichment: luna } });
+  expect(await resolveModelForRole('a', 'enrichment')).toBe(luna);
+  const enrichment = (await request(app).get('/')).body.roles.find((r: any) => r.role === 'enrichment');
+  expect(enrichment.allowedModels).toContain(luna);
+  expect(enrichment.effectiveModel).toBe(luna);
+});
+it('CRM_ENRICH_V3_DEFAULT_MODEL rolls the enrichment default back without a deploy, and a bad value is ignored (ENG-2720)', async () => {
+  const luna = 'openrouter/openai/gpt-5.6-luna';
+  try {
+    delete process.env.CRM_ENRICH_V3_DEFAULT_MODEL;
+    expect(await getRoleDefault('enrichment')).toBe(luna);
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'gpt-5.5';
+    expect(await getRoleDefault('enrichment')).toBe('gpt-5.5');
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'not-a-model';
+    expect(await getRoleDefault('enrichment')).toBe(luna);
+    process.env.CRM_ENRICH_V3_DEFAULT_MODEL = 'gpt-5.5';
+    expect(await getRoleDefault('chat')).toBe('gemini-3.8-flash');
+  } finally { delete process.env.CRM_ENRICH_V3_DEFAULT_MODEL; }
 });
 it.each(['get', 'put'])('rejects non-admin %s before touching settings', async method => {
   (userDb.getUserById as jest.Mock).mockResolvedValue({ orgId: 'a', orgRole: 'member' });
@@ -72,7 +97,7 @@ it('requires a revision, surfaces conflicts and storage errors, and allows reset
 
 it('degrades workload reads on storage failure without caching the failure', async () => {
   (orgDb.getOrgById as jest.Mock).mockRejectedValueOnce(new Error('offline'));
-  expect(await resolveModelForRole('a', 'enrichment')).toBe('gpt-5.5');
+  expect(await resolveModelForRole('a', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
   expect(await resolveModelForRole('a', 'enrichment')).toBe('gemini-3.8-flash');
   (settingsService.getSetting as jest.Mock).mockRejectedValueOnce(new Error('offline'));
   expect(await resolveModelForRole(undefined, 'chat')).toBe('gemini-3.8-flash');
@@ -88,7 +113,7 @@ it('expires cached org overrides after 15 seconds', async () => {
     expect(await resolveModelForRole('a', 'enrichment')).toBe('gemini-3.8-flash');
     (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: {} });
     now.mockReturnValue(16001);
-    expect(await resolveModelForRole('a', 'enrichment')).toBe('gpt-5.5');
+    expect(await resolveModelForRole('a', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
   } finally { now.mockRestore(); }
 });
 
@@ -97,7 +122,7 @@ it('caches membership briefly and never caches lookup failures', async () => {
   expect(await resolveModelForUser('cached-member', 'enrichment')).toBe('gemini-3.8-flash');
   expect(userDb.getUserById).toHaveBeenCalledTimes(1);
   (userDb.getUserById as jest.Mock).mockRejectedValueOnce(new Error('offline'));
-  expect(await resolveModelForUser('retry-member', 'enrichment')).toBe('gpt-5.5');
+  expect(await resolveModelForUser('retry-member', 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
   expect(await resolveModelForUser('retry-member', 'enrichment')).toBe('gemini-3.8-flash');
   expect(userDb.getUserById).toHaveBeenCalledTimes(3);
 });
@@ -123,6 +148,12 @@ describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
     expect(await resolveModelForRole(undefined, 'content_generation')).toBe('anthropic.claude-opus-4-8');
   });
 
+  it('maps a renamed model stored under its old id to the new id (alias-aware persisted default)', async () => {
+    setting('agent_mode_content_model', 'openrouter/qwen/qwen3.8-max');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('openrouter/qwen/qwen3.8-max-0902');
+    expect(await getRoleDefault('content_generation')).toBe('openrouter/qwen/qwen3.8-max-0902');
+  });
+
   it.each(['retired-model', 'constructor', 'gpt-image-1'])('falls back for an unknown or wrong-kind content setting %s', async value => {
     setting('agent_mode_content_model', value);
     expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
@@ -133,9 +164,20 @@ describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
     expect(await resolveModelForRole(undefined, 'image')).toBe('gemini-3-pro-image-preview');
   });
 
-  it('falls back for an adminOnly model', async () => {
+  it('honours Opus 4.6 stored as the content model: it was the last adminOnly model and is open to everyone now', async () => {
     setting('agent_mode_content_model', 'anthropic.claude-opus-4-6-v1');
-    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('anthropic.claude-opus-4-6-v1');
+  });
+
+  it('still falls back for a model that IS flagged adminOnly (the mechanism is kept; synthetic entry, none is flagged in the registry)', async () => {
+    const id = '__synthetic-admin-only__';
+    (LLM_MODEL_REGISTRY as Record<string, unknown>)[id] = { ...LLM_MODEL_REGISTRY['anthropic.claude-opus-4-6-v1'], adminOnly: true };
+    try {
+      setting('agent_mode_content_model', id);
+      expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+    } finally {
+      delete (LLM_MODEL_REGISTRY as Record<string, unknown>)[id];
+    }
   });
 
   it('falls back for an internalOnly model', async () => {
@@ -144,17 +186,17 @@ describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
   });
 });
 
-describe('enrichment keeps its pre-model-roles default (ENG-2184)', () => {
-  it('defaults to gpt-5.5, the model gpt-5-chat-2 resolved to, although the picker hides it', async () => {
+describe('enrichment default is gpt-5.6-luna, not gpt-5.5 (ENG-2720)', () => {
+  it('defaults to gpt-5.6-luna, which fills ~99% of gpt-5.5\'s fields at ~5% of the LLM cost', async () => {
     expect(getRoleModelOptions('enrichment')).not.toContain('gpt-5.5');
-    expect(await getRoleDefault('enrichment')).toBe('gpt-5.5');
-    expect(await resolveModelForRole(undefined, 'enrichment')).toBe('gpt-5.5');
-    expect(await resolveModelForUser(undefined, 'enrichment')).toBe('gpt-5.5');
+    expect(await getRoleDefault('enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
+    expect(await resolveModelForRole(undefined, 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
+    expect(await resolveModelForUser(undefined, 'enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
   });
 
   it('reads no admin setting for enrichment', async () => {
     (settingsService.getSetting as jest.Mock).mockResolvedValue({ settingValue: 'gemini-3.8-flash' });
-    expect(await getRoleDefault('enrichment')).toBe('gpt-5.5');
+    expect(await getRoleDefault('enrichment')).toBe('openrouter/openai/gpt-5.6-luna');
     expect(settingsService.getSetting).not.toHaveBeenCalled();
   });
 

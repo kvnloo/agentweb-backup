@@ -33,6 +33,7 @@ import requests
 from google.cloud import storage
 from openrouter_gateway import get_openrouter_llm
 from task_utils import create_jwt_token
+from slack_utils import APPROVAL_SENT, APPROVAL_FAILED, request_task_approval_without_slack, should_hold_results_for_approval  # ENG-273
 from knowledge_base_utils import get_knowledge_base_manager
 
 # Increase file descriptor limit
@@ -611,6 +612,7 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                     slack_channel = execution.get('slack_channel') or task.get('slackChannel')
                     # Use execution-level requireApproval if available (for revisions), otherwise use task-level
                     requires_approval = execution.get('requireApproval') if execution.get('requireApproval') is not None else task.get('requireApproval')
+                    approval_outcome_without_slack = None
                     if requires_approval and slack_channel and asset_file:
                         # Send Slack approval request instead of emails
                         logger.info(f"Task {execution['taskId']} requires approval. Sending Slack approval request.")
@@ -632,14 +634,39 @@ def update_execution_status(execution_id, status, result=None, error=None, detai
                         except Exception as e:
                             logger.error(f"Failed to send Slack approval request for task {execution['taskId']}: {e}")
                     else:
-                        if requires_approval and not slack_channel:
-                            logger.warning(f"Task {execution['taskId']} requires approval but no Slack channel configured")
+                        if requires_approval and not slack_channel and asset_file:
+                            # ENG-273: no Slack channel does not mean no way to ask. The
+                            # customer may be on WhatsApp instead — the two are separate
+                            # features and a customer connects one. Ask on whatever they have.
+                            # Asked for even when an email-friendly revision was made
+                            # (asset_file already points at the revised asset). The Slack path
+                            # skips asking then because the revision flow posts its own approval
+                            # — but that flow only does so when the execution has a Slack
+                            # channel, so for any other customer nobody would have asked, and
+                            # holding the results would leave them with nothing to release them.
+                            approval_outcome_without_slack = request_task_approval_without_slack(
+                                task_id=execution['taskId'],
+                                execution_id=execution_id,
+                                asset_url=asset_file['url'],
+                                filename=asset_file['filename'],
+                                asset_type=asset_type,
+                                user_id=task['userId']
+                            )
+                            if approval_outcome_without_slack == APPROVAL_SENT:
+                                logger.info(f"📤 APPROVAL SENT: For task {execution['taskId']} on the customer's connected channel")
+                            elif approval_outcome_without_slack == APPROVAL_FAILED:
+                                logger.error(f"Task {execution['taskId']} requires approval and the customer has a channel, but the request could not be delivered. Holding the results rather than sending them unreviewed.")
+                            else:
+                                logger.warning(f"Task {execution['taskId']} requires approval but the customer has no channel connected to ask on")
                         elif requires_approval and not asset_file:
                             expected_msg = f" (expected: {expected_asset_type})" if expected_asset_type else ""
                             logger.warning(f"No {expected_asset_type or 'HTML report'} found for task {execution['taskId']} that requires approval{expected_msg}")
                     
                     # Send detailed results to all subscribers (if any and not requiring approval)
-                    if has_subscribers and not (requires_approval and slack_channel):
+                    # Results are held back while an approval is pending — on Slack as before,
+                    # or on another channel when the request was delivered there.
+                    # See should_hold_results_for_approval for why a failed send also holds.
+                    if has_subscribers and not should_hold_results_for_approval(requires_approval, slack_channel, approval_outcome_without_slack):
                         # If an email-friendly revision was created, send only that asset file
                         files_for_email = [asset_file] if (asset_file and asset_type == 'html' and revisionDone) else (execution.get('result_files', []) or [])
 

@@ -792,14 +792,39 @@ export async function createGoogleDoc(title: string, content: string, userId: st
     const code = driveErrorCode(error);
     const throttled = driveThrottleRefusal(error);
     if (throttled) return throttled;
-    if (code === 403 || code === 401) {
-      return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
+    // ENG-1539: a 401 / invalid_grant / missing connection is an expired or absent Drive
+    // authorization, NOT a folder-access problem — the old branch told a root-Drive call with no
+    // folder_id to "try without a folder_id", a fix that cannot work. Classify it first.
+    if (isDriveAuthExpired(error, code)) {
+      return {
+        success: false,
+        error_type: 'auth_expired',
+        message: 'Google Drive authorization has expired or is not connected. Reconnect Google Drive in Settings → Connected Accounts, then retry.',
+        code,
+      };
     }
-    if (code === 404) {
-      return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
+    if (code === 403) {
+      return folderId
+        ? { success: false, error_type: 'permission', message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code }
+        : { success: false, error_type: 'permission', message: 'Google Drive refused to create the Doc (permission denied). Reconnect Google Drive with Docs access in Settings → Connected Accounts.', code };
     }
-    return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
+    if (code === 404 && folderId) {
+      return { success: false, error_type: 'not_found', message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
+    }
+    if (code !== undefined && code >= 400 && code < 500) {
+      return { success: false, error_type: 'validation', message: `Google Drive rejected the Doc request (${code}): ${error instanceof Error ? error.message : 'invalid request'}`, code };
+    }
+    return { success: false, error_type: code !== undefined ? 'api' : 'internal', message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
   }
+}
+
+/** ENG-1539: true when a Drive failure means the user's Drive authorization is expired/absent. */
+function isDriveAuthExpired(error: any, code: number | undefined): boolean {
+  if (code === 401) return true;
+  const oauthErr = error?.response?.data?.error;
+  if (oauthErr === 'invalid_grant' || oauthErr === 'invalid_token') return true;
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  return /invalid_grant|google drive not connected|no refresh token/i.test(msg);
 }
 
 export async function updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {

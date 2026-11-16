@@ -30,7 +30,8 @@ const WHATSAPP_CAPABILITIES: ChannelCapabilities = {
   canReadHistory: false,
   hasDirectory: false,
   addressing: 'phone',
-  // Up to 3 reply buttons, and only inside an approved template.
+  // Up to 3 reply buttons: free-form interactive messages inside the 24h window, or a
+  // quick-reply template outside it (see TEMPLATES.APPROVAL_REQUEST_BUTTONS).
   supportsInteractive: true,
   requiresTemplateOutsideWindow: true,
   requiresOptIn: true,

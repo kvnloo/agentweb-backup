@@ -1,15 +1,20 @@
 /**
- * ENG-1816 F1 — LlmConnection: type and store interface only.
+ * ENG-1816 F1 — LlmConnection: the shape shared by every connection kind.
  *
- * A1 builds the real DynamoDB-backed CRUD for the `api_key` kind (KMS envelope
- * encryption, live-validate, list masked, revoke). B3 adds the `claude_subscription`
- * kind on the same store. Nothing in F1 constructs or reads a real `LlmConnection` —
- * this file exists so A1/A2/B3 build against one agreed shape instead of three.
+ * A1 (ENG-2105) implements the `api_key` kind: `llmConnectionDb.ts` (store),
+ * `llmConnectionCrypto.ts` (KMS envelope encryption) and `llmConnectionService.ts`
+ * (add, validate, list masked, share, revoke). B3 adds `claude_subscription` on the
+ * same store.
  */
 
 export type LlmConnectionKind = "api_key" | "claude_subscription" | "codex_subscription";
 
-export type LlmConnectionStatus = "active" | "invalid" | "revoked" | "expired";
+/**
+ * `revoking` and `disabled` exist only for hosted subscription logins (ENG-2110 1c): `revoking` = the owner disconnected and the
+ * login host has not yet confirmed the wipe (the slot is already released); `disabled` = fenced but kept. Everything that routes
+ * funding requires `=== "active"`, so both fail closed. "Needs reconnect" is `invalid` plus `subNeedsReconnect`.
+ */
+export type LlmConnectionStatus = "active" | "invalid" | "revoked" | "expired" | "revoking" | "disabled";
 
 export interface LlmConnectionHealth {
   lastOkAt?: string;
@@ -30,11 +35,9 @@ export interface LlmConnection {
   secretRef: string;
   status: LlmConnectionStatus;
   health?: LlmConnectionHealth;
-}
-
-/** Real implementation lands in A1 (api_key) and B3 (claude_subscription). */
-export interface LlmConnectionStore {
-  get(connectionId: string): Promise<LlmConnection | null>;
-  listForUser(ownerUserId: string): Promise<LlmConnection[]>;
-  revoke(connectionId: string): Promise<void>;
+  /** Last four characters of the key, for display. */
+  keyLast4?: string;
+  /** Set while the owner shares this connection with their org. */
+  sharedWithOrgId?: string;
+  createdAt?: string;
 }

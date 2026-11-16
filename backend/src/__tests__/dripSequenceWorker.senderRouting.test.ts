@@ -192,3 +192,54 @@ describe('dripSequenceWorker sender routing — SUCCESS cases', () => {
     );
   });
 });
+
+// ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own sequence must not also email it.
+describe('dripSequenceWorker — leads pushed to Smartlead (ENG-673)', () => {
+  const marker = (state: string) => ({ state, pushedAt: '2026-10-28T00:00:00Z', runId: 'r1', payloadHash: 'h' });
+  const pushed = (state = 'pushed') => ({ ...lead, system: { smartlead_77: marker(state) } });
+
+  beforeEach(() => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'user-1' } as any);
+    senderConfigWith([{ id: 's1', email: 'hi@acme.com', fromName: 'Acme' }], 's1');
+    mockSendAsSender.mockResolvedValue({ provider: 'resend', messageId: 'resend-1' });
+    mockDripSequenceDb.advanceEnrollment.mockResolvedValue(undefined as any);
+  });
+
+  it('control: the same lead WITHOUT a marker is emailed', async () => {
+    const stats = await processDueEnrollments();
+    expect(stats.sent).toBe(1);
+    expect(mockSendAsSender).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['pushed', 'withdrawn'])('does not email a lead whose Smartlead marker is %s, and skips the step', async state => {
+    mockCrmDb.getLeadById.mockResolvedValue(pushed(state) as any);
+    const stats = await processDueEnrollments();
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+    expect(stats.sent).toBe(0);
+    expect(stats.skipped).toBe(1);
+    expect(mockDripSequenceDb.completeEnrollment).toHaveBeenCalledWith('enroll-1', 'completed_no_sends', 'completed', 'email', false); // the only step, skipped, delivered nothing
+  });
+
+  it('does NOT email, and does not advance, when the lead could not be read (failing open would skip every per-lead check)', async () => {
+    mockCrmDb.getLeadById.mockRejectedValue(new Error('throttled'));
+    const stats = await processDueEnrollments();
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+    expect(stats.errors).toBe(1);
+    expect(mockDripSequenceDb.advanceEnrollment).not.toHaveBeenCalled();
+    expect(mockDripSequenceDb.completeEnrollment).not.toHaveBeenCalled();
+  });
+
+  it('emails the lead again once a list editor released the marker', async () => {
+    mockCrmDb.getLeadById.mockResolvedValue(pushed('released') as any);
+    const stats = await processDueEnrollments();
+    expect(stats.sent).toBe(1);
+  });
+
+  it('also stops a pushed lead on a LATER email step of a longer sequence, but does not end the enrollment', async () => {
+    mockDripSequenceDb.getSequence.mockResolvedValue({ ...sequenceWithStep, steps: [...sequenceWithStep.steps, { ...sequenceWithStep.steps[0], stepId: 'step-2', stepNumber: 2, delayDays: 3 }] } as any);
+    mockCrmDb.getLeadById.mockResolvedValue(pushed() as any);
+    await processDueEnrollments();
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+    expect(mockDripSequenceDb.advanceEnrollment).toHaveBeenCalledWith('enroll-1', 1, expect.any(String), 'email', false);
+  });
+});

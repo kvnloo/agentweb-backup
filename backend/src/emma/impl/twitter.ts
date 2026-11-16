@@ -99,7 +99,11 @@ export async function twitterManagePost(userId: string, args: any, toolContext?:
 async function _twitterManagePostImpl(userId: string, args: any, toolContext?: any): Promise<any> {
   let { account_id } = args;
   const action = (args.action as string)?.replace(/_/g, '-');
-  const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
+  const { text, in_reply_to_tweet_id, tweet_id, handle, recipient_handle, list_id, lead_id, lead_email, query, max_results } = args;
+  // ENG-1607: models frequently pass array args as a JSON-encoded string or a single
+  // string; that used to fail a valid request as a handler error. Coerce once here.
+  const tweets = coerceStringArray(args.tweets);
+  const tweet_ids = coerceStringArray(args.tweet_ids);
   console.log(`[AgentMode] twitterManagePost called: action=${action}, account_id=${account_id}`);
 
   const { getAccountsWithOwnerIncludingOrgShared } = await import('../../services/connectedAccountsDb');
@@ -109,6 +113,8 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
   if (twitterAccounts.length === 0) {
     return {
       success: false,
+      error_type: 'auth_required',
+      retryable: false,
       error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
     };
   }
@@ -167,8 +173,8 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
   try {
     switch (action) {
       case 'reply': {
-        if (!text) throw new Error('text is required for reply');
-        if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+        if (!text) throw new TwitterManagePostValidationError('text is required for reply');
+        if (!in_reply_to_tweet_id) throw new TwitterManagePostValidationError('in_reply_to_tweet_id is required for reply');
         // ENG-827: the hook goes down so the check also covers the client resolution
         // and any token refresh inside the call — the last work before the write.
         const result = await twitterService.postTweet(ownerUserId, account_id, text, {
@@ -180,10 +186,10 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
 
       case 'post-thread': {
         if (!Array.isArray(tweets) || tweets.length === 0) {
-          throw new Error('tweets (non-empty array of strings) is required for post-thread');
+          throw new TwitterManagePostValidationError('tweets (non-empty array of strings) is required for post-thread');
         }
         if (tweets.length < 2) {
-          throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
+          throw new TwitterManagePostValidationError('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
         }
         // ENG-827 (Greptile): a thread is N separate public writes. The check above
         // covers the first tweet only, so consent is re-read before each subsequent
@@ -211,69 +217,69 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
       }
 
       case 'quote-tweet': {
-        if (!text) throw new Error('text is required for quote_tweet');
-        if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
+        if (!text) throw new TwitterManagePostValidationError('text is required for quote_tweet');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for quote_tweet');
         const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id, toolContext?.assertPublishStillAuthorized);
         await logCrm('twitter.tweet.sent', result.id, result.text);
         return { success: true, data: result };
       }
 
       case 'delete-tweet': {
-        if (!tweet_id) throw new Error('tweet_id is required for delete-tweet');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for delete-tweet');
         const result = await twitterService.deleteTweet(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'like': {
-        if (!tweet_id) throw new Error('tweet_id is required for like');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for like');
         const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'unlike': {
-        if (!tweet_id) throw new Error('tweet_id is required for unlike');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for unlike');
         const result = await twitterService.unlikeTweet(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'retweet': {
-        if (!tweet_id) throw new Error('tweet_id is required for retweet');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for retweet');
         const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id, toolContext?.assertPublishStillAuthorized);
         return { success: true, data: result };
       }
 
       case 'unretweet': {
-        if (!tweet_id) throw new Error('tweet_id is required for unretweet');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for unretweet');
         const result = await twitterService.unretweetTweet(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'get-tweet-metrics': {
-        if (!tweet_ids?.length) throw new Error('tweet_ids is required for get_tweet_metrics');
+        if (!tweet_ids?.length) throw new TwitterManagePostValidationError('tweet_ids is required for get_tweet_metrics');
         const result = await twitterService.getTweetMetrics(ownerUserId, account_id, tweet_ids);
         return { success: true, data: result };
       }
 
       case 'list-replies': {
-        if (!tweet_id) throw new Error('tweet_id is required for list_replies');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for list_replies');
         const result = await twitterService.listReplies(ownerUserId, account_id, tweet_id, max_results);
         return { success: true, data: result };
       }
 
       case 'get-retweeters': {
-        if (!tweet_id) throw new Error('tweet_id is required for get_retweeters');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for get_retweeters');
         const result = await twitterService.getRetweeters(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'get-liking-users': {
-        if (!tweet_id) throw new Error('tweet_id is required for get_liking_users');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for get_liking_users');
         const result = await twitterService.getLikingUsers(ownerUserId, account_id, tweet_id);
         return { success: true, data: result };
       }
 
       case 'get-quote-tweets': {
-        if (!tweet_id) throw new Error('tweet_id is required for get_quote_tweets');
+        if (!tweet_id) throw new TwitterManagePostValidationError('tweet_id is required for get_quote_tweets');
         const result = await twitterService.getQuoteTweets(ownerUserId, account_id, tweet_id, max_results);
         return { success: true, data: result };
       }
@@ -286,7 +292,7 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
           'list-replies', 'get-tweet-metrics',
           'get-retweeters', 'get-liking-users', 'get-quote-tweets',
         ];
-        throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        throw new TwitterManagePostValidationError(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
       }
     }
   } catch (error) {
@@ -308,8 +314,56 @@ async function _twitterManagePostImpl(userId: string, args: any, toolContext?: a
     // (e.g. a reply blocked by X's engagement-gate scope) never classifies as
     // auth/config either.
     const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
-    return { success: false, message: 'Twitter action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
+    const errorType = classifyTwitterManagePostError(error, code);
+    return {
+      success: false,
+      message: TWITTER_ERROR_MESSAGES[errorType],
+      error: errorMessage,
+      error_type: errorType,
+      retryable: errorType === 'rate_limited' || errorType === 'api',
+      ...(code !== undefined ? { code } : {}),
+    };
   }
+}
+
+/** ENG-1607: thrown by the handler for missing/malformed inputs: a caller error, not an X failure. */
+class TwitterManagePostValidationError extends Error {
+  constructor(message: string) { super(message); this.name = 'TwitterManagePostValidationError'; }
+}
+
+export type TwitterManagePostErrorType = 'auth_required' | 'rate_limited' | 'validation' | 'credits_exhausted' | 'api';
+
+const TWITTER_ERROR_MESSAGES: Record<TwitterManagePostErrorType, string> = {
+  auth_required: 'X authorization failed (expired token or missing scope). Reconnect the X account in Settings → Connected Accounts; do not retry until it is reconnected.',
+  rate_limited: 'X rate limit reached. Wait and retry later.',
+  validation: 'Invalid twitter_manage_post input. Fix the arguments and retry.',
+  credits_exhausted: 'X API credits are exhausted. Do not retry.',
+  api: 'Twitter action failed',
+};
+
+/** ENG-1607: separate auth/config failures from handler/API failures so they cluster honestly. */
+export function classifyTwitterManagePostError(error: unknown, code: number | undefined): TwitterManagePostErrorType {
+  if (error instanceof TwitterManagePostValidationError) return 'validation';
+  if (code === 402 || (error as any)?.name === 'XCreditsExhaustedError') return 'credits_exhausted';
+  if (code === 429) return 'rate_limited';
+  if (code === 401 || code === 403) return 'auth_required';
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  if (/no (access|refresh) token|token (has )?expired|invalid_grant|reconnect/i.test(msg)) return 'auth_required';
+  return 'api';
+}
+
+/** ENG-1607: accept a real array, a JSON-encoded array string, or a single string. */
+function coerceStringArray(v: unknown): string[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (t.startsWith('[')) {
+      try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) return parsed.map(String); } catch { /* fall through */ }
+    }
+    return t ? [t] : [];
+  }
+  return undefined;
 }
 
 // Public entry: bind the acting user into the X metering context (see twitterManagePost).

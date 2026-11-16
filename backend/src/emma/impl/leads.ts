@@ -196,7 +196,7 @@
  * `getSenderForLead` is bound off the singleton the same way.
  */
 import { suppressLeadSideEffects } from '../../utils/sessionList';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType, missingReviewDraftError } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
@@ -205,10 +205,13 @@ import { getCrmSenders } from './shared/crmSenders';
 import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DETAIL } from './brandMarketStrategy';
+import { brandMessagingContextFromGuidelines } from '../../services/brandMessagingContext';
+import { logOutreachClaimCheckShadow } from '../../services/outreachClaimCheck';
 import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { matchLifecyclePresenceFilter } from '../../utils/lifecycleFilterSemantics';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../../utils/linkedInInfraError';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -356,6 +359,7 @@ export async function addLeadsToList(
 
       const { leadImportWriteBudgetMs } = await import('../../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        origin: 'enrichment_import',
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
@@ -364,6 +368,13 @@ export async function addLeadsToList(
         // run's remaining budget: a full-length budget started late in a turn
         // would outlive the turn and lose the ledger it exists to produce.
         deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
+      });
+
+      // ENG-2996: new rows inherit the owner's do-not-contact flags and get
+      // their emails validated, same as the portal's CSV/bulk import.
+      const { applyLeadImportFollowups } = await import('../../services/leadImportFollowups');
+      const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
       });
 
       // ENG-1133: report the import row by row, not just in aggregate. A large
@@ -510,6 +521,8 @@ export async function addLeadsToList(
         // Two counts of the same thing is exactly the "numbers don't add up"
         // the ticket is about, so there is now one (ENG-1133).
         reconciliation,
+        ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: followups.inheritedDoNotContact.length } : {}),
+        ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
         ...(unimportedRows.length > 0
           ? { ...resume, unimportedRowRanges }
@@ -525,6 +538,15 @@ export async function addLeadsToList(
       };
     }
   }
+
+// Preserve stored evidence only: missing suppression values must not imply active.
+function projectLeadSuppression(lead: Record<string, any>): Record<string, any> {
+  const fields = ['contactStatus', 'contactStatusReason', 'contactStatusNote',
+    'contactStatusUpdatedAt', 'contactStatusUpdatedBy',
+    'unsubscribedFromGroupEmail', 'unsubscribedFromGroupEmailAt'];
+  return Object.fromEntries(fields.filter(field => lead[field] !== undefined)
+    .map(field => [field, lead[field]]));
+}
 
 export async function getLeads(listId: string, userId: string, options: {
     search?: string;
@@ -676,6 +698,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
           ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
@@ -804,9 +827,18 @@ export async function searchLeads(
       const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
-        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
+      // ENG-2360: a list-scoped read (non-empty list_id or list_ids) with no
+      // filters/search is a valid "page through these lists" intent. Only a
+      // call with no filters, no search AND no list scope is rejected.
+      const hasListScope = Boolean(listId) || Boolean(options?.listIds && options.listIds.length > 0);
+      if ((!filters || filters.length === 0) && !options?.search?.trim() && !hasListScope) {
+        return {
+          success: false,
+          message: 'At least one filter, a search query, or a list_id/list_ids is required',
+          error: 'Provide at least one filter criterion, a search query, or list_id/list_ids to scope the read',
+        };
       }
+      filters = Array.isArray(filters) ? filters : [];
 
       // Resolve target list set. list_ids takes precedence over single list_id.
       let targetListIds: string[];
@@ -1005,6 +1037,7 @@ export async function searchLeads(
             // reads a lead with no attribution in it and reports a BLOCK on a
             // correctly-attributed lead.
             ...projectLeadAttribution(entry.lead),
+            ...projectLeadSuppression(entry.lead),
           };
         }),
         matchCount: matchingLeads.length,
@@ -1205,6 +1238,7 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
           // entirely when it does not. Never an empty object: that would report
           // "capture ran and found nothing" for a lead capture never touched.
           ...projectLeadAttribution(lead),
+          ...projectLeadSuppression(lead),
         },
         engagementSummary: {
           total: engagementCount.total,
@@ -1261,12 +1295,19 @@ export async function getLeadsNeedingFollowup(listId: string, userId: string, op
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      // ENG-2937: most lists never get an explicit linkedInAccountId, which made
+      // this tool fail 100% of the time. Fall back to the caller's own connected
+      // LinkedIn account — the same resolution the CRM routes use (crm.ts).
+      let accountId: string | null = (list as any).linkedInAccountId ?? null;
+      if (!accountId) {
+        const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+        accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+      }
       if (!accountId) {
         return {
           success: false,
-          message: 'This list has no LinkedIn account assigned',
-          error: 'Follow-up detection requires a LinkedIn account (list.linkedInAccountId) so connection status can be resolved. Assign one in the list settings.',
+          message: 'No LinkedIn account connected',
+          error: 'Follow-up detection needs a connected LinkedIn account to resolve connection status. Ask the user to connect LinkedIn (or assign an account to this list in its settings), then retry. Do not retry before that.',
         };
       }
 
@@ -1390,6 +1431,187 @@ export async function getLeadsNeedingFollowup(listId: string, userId: string, op
   }
 
   /**
+   * ENG-2811: batched, read-only conversation-status audit for a lead list.
+   *
+   * Audit-style asks ("what's the LinkedIn status of these 64 leads?") used to
+   * fan out one get_lead_details / linkedin_outreach call per lead; every turn
+   * resent the whole history, so one Opiner audit ran 549 turns. This returns a
+   * compact status row per lead in ONE call, loading the cross-lead signal with
+   * the same constant query set as getLeadsNeedingFollowup (connections table,
+   * LinkedIn events, email events) — no per-lead Unipile calls, no writes.
+   *
+   * Scoping: access is checked on the requested list exactly like
+   * getLeadDetails. Explicit lead_ids are looked up ONLY inside that list, so an
+   * id from another list/tenant comes back as {status:'not_found'} and never
+   * leaks data. Per-lead lookup failures are reported per item.
+   */
+export async function getLeadConversationStatuses(listId: string, userId: string, options: {
+    leadIds?: string[];
+    limit?: number;
+    cursor?: string;
+  } = {}): Promise<any> {
+    try {
+      const { crmDb, userDb } = await import('../../services/db');
+      const limit = Math.min(Math.max(Math.floor(options.limit || 100), 1), 200);
+      const MAX_LEAD_IDS = 200;
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      if (!hasAccess) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const selectionMode = Array.isArray(options.leadIds);
+      const rawIds = selectionMode ? (options.leadIds as string[]) : [];
+      const leadIds = Array.from(new Set(rawIds.map((id) => String(id || '').trim()).filter(Boolean)));
+      if (leadIds.length > MAX_LEAD_IDS) {
+        return {
+          success: false,
+          message: `Too many lead_ids (${leadIds.length}); max ${MAX_LEAD_IDS} per call`,
+          error: `Split lead_ids into batches of at most ${MAX_LEAD_IDS}, or omit lead_ids and page the whole list with cursor.`,
+        };
+      }
+
+      // --- Constant-query signal loading (NO per-lead fan-out) ---
+      const accountId: string | null = (list as any).linkedInAccountId ?? null;
+      const { emailEventsDb } = await import('../../services/emailEventsDb');
+      const { getAllConnectionsByAccount, normalizeLinkedInUrl } = await import('../../services/unipileConnectionsDb');
+      const user = await userDb.getUserById(userId);
+      const emailDomain = user?.emailDomain?.trim();
+      // A failed signal read must never masquerade as a confirmed negative
+      // (not_connected / no_messages): record it and report those fields as unknown.
+      const unavailableSignals: string[] = [];
+      const guard = <T,>(name: string, p: Promise<T[]>): Promise<T[]> =>
+        p.catch((err) => {
+          console.warn(`AgentMode: lead status signal '${name}' unavailable:`, err);
+          unavailableSignals.push(name);
+          return [] as T[];
+        });
+      const [connections, linkedInEvents, emailEvents] = await Promise.all([
+        accountId ? guard('linkedin_connections', getAllConnectionsByAccount(accountId) as Promise<any[]>) : Promise.resolve([]),
+        guard('linkedin_messages', emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`) as Promise<any[]>),
+        emailDomain ? guard('email_messages', emailEventsDb.getEventsByEmailDomain(emailDomain) as Promise<any[]>) : Promise.resolve([]),
+      ]);
+      const connectionsUnavailable = unavailableSignals.includes('linkedin_connections');
+      const messagesUnavailable = unavailableSignals.some((n) => n !== 'linkedin_connections');
+
+      const connectedAtByUrl = new Map<string, number>();
+      for (const c of connections as any[]) {
+        const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
+        if (!url) continue;
+        const ts = typeof c?.connectedAt === 'number' ? c.connectedAt : 0;
+        const existing = connectedAtByUrl.get(url);
+        if (existing === undefined || ts < existing) connectedAtByUrl.set(url, ts);
+      }
+      type Signal = { at: number; type: string; direction: 'inbound' | 'outbound' };
+      const directionOf = (eventType: string): 'inbound' | 'outbound' =>
+        /received|replied/i.test(eventType) ? 'inbound' : 'outbound';
+      const linkedInSignalByUrl = new Map<string, Signal>();
+      for (const e of linkedInEvents as any[]) {
+        const url = String(e?.leadEmail || '').trim().toLowerCase();
+        if (url) foldEngagementSignal(linkedInSignalByUrl, url, e, directionOf);
+      }
+      const emailSignalByEmail = new Map<string, Signal>();
+      for (const e of emailEvents as any[]) {
+        const email = String(e?.leadEmail || '').trim().toLowerCase();
+        if (email) foldEngagementSignal(emailSignalByEmail, email, e, directionOf);
+      }
+
+      const toRow = (lead: any) => {
+        const url = lead.linkedin ? normalizeLinkedInUrl(String(lead.linkedin)).toLowerCase() : '';
+        const connectedAt = url ? connectedAtByUrl.get(url) : undefined;
+        const leadEmail = String(lead.email || '').trim().toLowerCase();
+        const liSig = url ? linkedInSignalByUrl.get(url) : undefined;
+        const emSig = leadEmail ? emailSignalByEmail.get(leadEmail) : undefined;
+        const last = [liSig, emSig].filter((x): x is Signal => !!x).sort((a, b) => b.at - a.at)[0];
+        const connectionState = !accountId || !url || connectionsUnavailable ? 'unknown' : connectedAt !== undefined ? 'connected' : 'not_connected';
+        return {
+          leadId: lead.leadId,
+          status: 'ok',
+          name: [lead.firstName, lead.lastName].filter(Boolean).join(' '),
+          company: lead.company || '',
+          leadStatus: lead.status || null,
+          linkedin: lead.linkedin || '',
+          connectionState,
+          connectedAt: connectedAt !== undefined ? new Date(connectedAt).toISOString() : null,
+          lastMessageChannel: last ? (last === liSig ? 'linkedin' : 'email') : null,
+          lastMessageType: last?.type ?? null,
+          lastMessageDirection: last?.direction ?? null,
+          lastMessageAt: last ? new Date(last.at).toISOString() : null,
+          replyState: messagesUnavailable ? 'unknown' : !last ? 'no_messages' : last.direction === 'inbound' ? 'replied_awaiting_us' : 'awaiting_their_reply',
+        };
+      };
+
+      const base = {
+        listName: list.name,
+        linkedInAccountAssigned: !!accountId,
+        ...(accountId ? {} : { note: 'No LinkedIn account on this list, so connectionState is "unknown"; message history is still reported.' }),
+        ...(unavailableSignals.length ? { unavailableSignals, warning: `Signal read failed (${unavailableSignals.join(', ')}); affected fields are reported as "unknown", not as confirmed negatives.` } : {}),
+      };
+
+      if (selectionMode) {
+        const rows: any[] = [];
+        const CONCURRENCY = 10;
+        for (let i = 0; i < leadIds.length; i += CONCURRENCY) {
+          const chunk = leadIds.slice(i, i + CONCURRENCY);
+          const settled = await Promise.allSettled(chunk.map((id) => crmDb.getLeadById(listId, id)));
+          settled.forEach((r, j) => {
+            const id = chunk[j];
+            if (r.status === 'rejected') {
+              rows.push({ leadId: id, status: 'error', error: r.reason instanceof Error ? r.reason.message : 'Lookup failed' });
+            } else if (!r.value || (r.value as any).listId && (r.value as any).listId !== listId) {
+              rows.push({ leadId: id, status: 'not_found' });
+            } else {
+              rows.push(toRow(r.value));
+            }
+          });
+        }
+        const ok = rows.filter((r) => r.status === 'ok').length;
+        return {
+          success: true,
+          message: `Status for ${ok}/${rows.length} requested lead(s)`,
+          ...base,
+          leads: rows,
+          count: rows.length,
+          notFound: rows.filter((r) => r.status === 'not_found').length,
+          errors: rows.filter((r) => r.status === 'error').length,
+          hasMore: false,
+          nextCursor: null,
+        };
+      }
+
+      // Whole-list mode: one page of up to `limit` leads, resumable via cursor.
+      let startKey: any = undefined;
+      if (options.cursor) {
+        try {
+          startKey = JSON.parse(Buffer.from(String(options.cursor), 'base64').toString('utf8'));
+        } catch {
+          return { success: false, message: 'Invalid cursor', error: 'Pass back nextCursor exactly as returned by the previous call.' };
+        }
+      }
+      const page = await crmDb.getLeadsByListId(listId, limit, startKey);
+      const items: any[] = page.items || [];
+      const rows = items.map(toRow);
+      const nextKey = page.lastEvaluatedKey;
+      return {
+        success: true,
+        message: `Status for ${rows.length} lead(s)${nextKey ? ' (more available — call again with nextCursor)' : ''}`,
+        ...base,
+        leads: rows,
+        count: rows.length,
+        hasMore: !!nextKey,
+        nextCursor: nextKey ? Buffer.from(JSON.stringify(nextKey), 'utf8').toString('base64') : null,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead conversation statuses:', error);
+      return { success: false, message: 'Failed to get lead conversation statuses', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Fold a single engagement event into a per-key "last engagement" signal map,
    * keeping only the most-recent engagement per key. Shared by the
    * LinkedIn-URL-keyed and email-keyed signal builders.
@@ -1407,6 +1629,29 @@ function foldEngagementSignal(
       map.set(key, { at, type: String(event?.eventType || ''), direction: directionOf(String(event?.eventType || '')) });
     }
   }
+
+/**
+ * ENG-2996: Emma suppresses a lead by moving its pipeline `status` to
+ * "do-not-contact" (any case/spacing). Send paths only read `contactStatus`, so
+ * the same write must set it too. A lead already unsubscribed/DNC keeps its
+ * existing contact status and reason.
+ */
+export function suppressionContactStatusUpdates(status: unknown, existingLead: any, userId: string): Record<string, any> {
+  if (typeof status !== 'string') return {};
+  const normalized = status.trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (normalized !== 'do-not-contact' && normalized !== 'dnc') return {};
+  if (existingLead?.contactStatus === 'do-not-contact' || existingLead?.contactStatus === 'unsubscribed') return {};
+  const now = new Date().toISOString();
+  return {
+    contactStatus: 'do-not-contact',
+    contactStatusReason: 'admin-flagged',
+    contactStatusNote: 'Set from pipeline status "do-not-contact"',
+    contactStatusUpdatedAt: now,
+    contactStatusUpdatedBy: userId,
+    unsubscribedFromGroupEmail: true,
+    unsubscribedFromGroupEmailAt: now,
+  };
+}
 
 export async function updateLead(listId: string, leadId: string, updates: Record<string, any>, userId: string): Promise<any> {
     try {
@@ -1453,6 +1698,9 @@ export async function updateLead(listId: string, leadId: string, updates: Record
           { source: 'agentMode.updateLead', listId, leadId },
         );
       }
+
+      // ENG-2996: a do-not-contact pipeline status is a suppression, not a label.
+      Object.assign(dbUpdates, suppressionContactStatusUpdates(dbUpdates.status, lead, userId));
 
       // Auto-create status change engagement if status changed
       if (dbUpdates.status !== undefined && (lead.status || null) !== dbUpdates.status) {
@@ -1889,7 +2137,8 @@ export async function updateLeadStatus(
     userId: string,
     dealValue?: number | null,
     dealCurrency?: string,
-    notes?: string
+    notes?: string,
+    drafts?: { messageDraft?: string; emailSubject?: string; emailBody?: string; sessionId?: string }
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1912,9 +2161,51 @@ export async function updateLeadStatus(
       }
 
       const previousStatus = existingLead.status || null;
-      const updates: any = { status };
+      // ENG-2996: a do-not-contact pipeline status also sets contactStatus, which
+      // is what every send path (isDoNotContact / contactGuard) actually reads.
+      const updates: any = { status, ...suppressionContactStatusUpdates(status, existingLead, userId) };
       if (dealValue !== undefined) updates.dealValue = dealValue;
       if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
+
+      // ENG-2361: a drafting agent that moves a lead to review must be able to put the
+      // exact text it wrote on the lead in the same write — otherwise the Pending Review
+      // queue lists the lead with nothing to approve. Stored in the same shapes the
+      // portal's lead panel and queue already read. Empty strings are ignored, never
+      // used to clear an existing draft.
+      const now = new Date().toISOString();
+      const savedDrafts: string[] = [];
+      const dm = typeof drafts?.messageDraft === 'string' ? drafts.messageDraft.trim() : '';
+      if (dm) {
+        updates.messageDraft = {
+          content: dm,
+          createdAt: existingLead.messageDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        savedDrafts.push('messageDraft');
+      }
+      const subj = typeof drafts?.emailSubject === 'string' ? drafts.emailSubject.trim() : '';
+      const body = typeof drafts?.emailBody === 'string' ? drafts.emailBody.trim() : '';
+      if (subj || body) {
+        if (!subj || !body) {
+          return { success: false, message: 'Email draft needs both email_subject and email_body', error: 'Provide both email_subject and email_body, or neither' };
+        }
+        updates.emailDraft = {
+          subject: subj,
+          textContent: body,
+          createdAt: existingLead.emailDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        updates.emailDraftFormat = 'text';
+        savedDrafts.push('emailDraft');
+      }
+
+      // ENG-2966: never put a lead in the review queue without a draft to review.
+      const draftError = missingReviewDraftError(status, { ...existingLead, ...updates });
+      if (draftError) {
+        return { success: false, message: 'No draft saved on this lead', error: draftError };
+      }
 
       await crmDb.updateLead(listId, leadId, updates);
 
@@ -1940,6 +2231,7 @@ export async function updateLeadStatus(
         previousStatus,
         newStatus: status,
         leadName,
+        ...(savedDrafts.length ? { savedDrafts } : {}),
       };
     } catch (error) {
       console.error('AgentMode: Error updating lead status:', error);
@@ -2180,7 +2472,13 @@ export async function addLeadEngagement(
 
       const lead = await crmDb.getLeadById(listId, leadId);
       if (!lead) {
-        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+        // ENG-2808: tell the model how to recover instead of retrying the same pair.
+        return {
+          success: false,
+          message: 'Lead not found',
+          error: 'The specified lead does not exist in this list',
+          hint: 'Do not retry with the same lead_id/list_id. Look the lead up with search_leads (by name or email) to get its current lead_id and list_id, then call add_lead_engagement again.',
+        };
       }
 
       await crmDb.addLeadEngagement(listId, leadId, {
@@ -2230,6 +2528,12 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
       if (isDoNotContact(lead)) {
         const reason = getDoNotContactReason(lead);
         return { success: false, message: 'Do not contact', error: `Cannot send email to this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.` };
+      }
+
+      // ENG-673: a lead pushed to the customer's Smartlead campaign is emailed from there; AgentWeb does not also email it on the agent's say-so.
+      const { isPushedToSmartlead } = await import('../../services/smartleadMarkers');
+      if (isPushedToSmartlead(lead)) {
+        return { success: false, message: 'Lead is in a Smartlead campaign', error: "This lead is being emailed through the customer's Smartlead campaign, so AgentWeb does not also email it. Do not try to reach this person another way: tell the user, and let them decide." };
       }
 
       if (!lead.emailDraft) {
@@ -2704,6 +3008,16 @@ ${emailDraftFormat === 'text'
         } else {
           emailDraft.htmlContent = emailData.htmlContent;
         }
+
+        // Shadow only (ENG-3067): counts specifics the brand facts do not contain.
+        // Logs counts, never draft text; cannot change or fail the draft.
+        logOutreachClaimCheckShadow({
+          channel: 'email',
+          listId,
+          draft: { subject: emailData.subject, body: emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent },
+          facts: { brandData: brandGuidelines?.brandData, marketStrategyText: marketStrategy?.exists ? marketStrategy.formattedContent : '' },
+          recipient: lead,
+        });
       }
 
       // Build activity history section for message prompt (reuse already-fetched engagements)
@@ -2756,9 +3070,12 @@ ${emailDraftFormat === 'text'
       const emailSummary = emailData
         ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
         : '';
+      // Same compact brand block as the CRM invite-note route (ENG-2967) — the
+      // full formattedContent above is sized for the email prompt, not a 300-char note.
+      const senderBrand = brandMessagingContextFromGuidelines(brandGuidelines);
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
-Recipient: ${leadDesc}
+Recipient: ${leadDesc}${senderBrand ? `\nSender context (who is writing — do not pitch):\n${senderBrand}` : ''}
 ${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 
@@ -2832,6 +3149,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
           updatedAt: now,
           sessionId: sessionId
         };
+        logOutreachClaimCheckShadow({
+          channel: 'linkedin_note',
+          listId,
+          draft: { body: messageDraft.content },
+          facts: { brandData: brandGuidelines?.brandData, marketStrategyText: marketStrategy?.exists ? marketStrategy.formattedContent : '' },
+          recipient: lead,
+        });
       }
 
       // Update lead with whichever drafts were actually produced. With both gated off
@@ -3145,7 +3469,13 @@ export async function importLeadsFromSearch(
         cursor: lastFetchCursor ?? undefined,
       });
     } catch (e: any) {
-      searchError = e?.message ? String(e.message) : String(e);
+      const infraFailure = isLinkedInInfraError(e);
+      if (infraFailure) {
+        console.warn('[importLeadsFromSearch] LinkedIn search unavailable (infrastructure):', e?.message);
+      }
+      searchError = infraFailure
+        ? LINKEDIN_UNAVAILABLE_MESSAGE
+        : (e?.message ? String(e.message) : String(e));
       // ENG-2205: resolveAccountId can now hand back an account whose probe was
       // merely indeterminate (not proven dead — see linkedInOutreachService's
       // probeAccountSession), so a real failure here is the backstop that proves
@@ -3157,8 +3487,18 @@ export async function importLeadsFromSearch(
       // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
       // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
       // excludes a bare 403 — a permission/plan restriction, not a dead session.
-      if (isProvenDisconnectError(e)) {
+      let provenDead = isProvenDisconnectError(e);
+      if (provenDead) {
         linkedInOutreachService.clearStatusCache(accountId);
+        // Unipile's explicit `errors/disconnected_account` is conclusive. A bare 401 is not (it can be a one-off
+        // auth blip), and recording a disconnect pauses scheduled runs and emails the owner, so take a fresh
+        // second opinion first; the sync cron still catches a genuinely dead session on its next pass.
+        const explicitDisconnect = (e?.structuredError?.code || e?.body?.code || e?.code) === 'errors/disconnected_account';
+        if (!explicitDisconnect) {
+          provenDead = (await linkedInOutreachService.probeAccountSession(accountId)) === 'disconnected';
+        }
+      }
+      if (provenDead) {
         const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
         // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
         // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
@@ -3357,7 +3697,7 @@ export async function importLeadsFromSearch(
       continue;
     }
 
-    const result = await crmDb.batchCreateLeads(listId, importable);
+    const result = await crmDb.batchCreateLeads(listId, importable, { origin: 'linkedin' });
     cumulativeNew += result.newCount ?? 0;
     cumulativeMerged += result.mergedCount ?? 0;
     if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);

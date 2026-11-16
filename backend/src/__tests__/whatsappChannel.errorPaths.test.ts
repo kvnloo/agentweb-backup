@@ -207,7 +207,7 @@ describe('webhook failure handling', () => {
 
   it('ignores an inbound message with no usable sender', async () => {
     const body = JSON.stringify({
-      entry: [{ changes: [{ value: { messages: [{ id: 'x', type: 'text' }] } }] }],
+      entry: [{ changes: [{ value: { metadata: { phone_number_id: '111' }, messages: [{ id: 'x', type: 'text' }] } }] }],
     });
     const res = await request(webhookApp)
       .post('/wh')

@@ -1189,6 +1189,35 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     );
   });
 
+  it("ENG-2896: expected base SHA mismatch throws BaseShaConflictError and writes nothing", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    await expect(
+      commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "other-sha")
+    ).rejects.toMatchObject({ name: "BaseShaConflictError", expectedSha: "other-sha", actualSha: "main-sha" });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(mockAxiosPatch).not.toHaveBeenCalled();
+  });
+
+  it("ENG-2896: matching expected base SHA commits normally", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "main-sha");
+    expect(res.pushedCommitSha).toBe("new-sha");
+  });
+
+  it("ENG-2896: a concurrent push after the check surfaces as a conflict on retry, not a rebase", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce(ref)
+      .mockResolvedValue({ data: { object: { sha: "moved-sha" } } });
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockRejectedValueOnce({ response: { status: 422, data: { message: "Update is not a fast forward" } } });
+    await expect(
+      commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview", "main-sha")
+    ).rejects.toMatchObject({ name: "BaseShaConflictError", actualSha: "moved-sha" });
+    expect(mockAxiosPatch).toHaveBeenCalledTimes(1);
+  });
+
   it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
     mockAxiosGet.mockResolvedValue(ref);
     mockAxiosPost.mockResolvedValue(post);
@@ -1361,6 +1390,63 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     });
 
     expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-9");
+  });
+});
+
+// ENG-2673: the flag-off (legacy) branch used to pass a literal `undefined` where the originating
+// session belongs, so completion messages / review candidates were never tied to the chat. The
+// route has already verified the id belongs to the caller (resolveOriginatingSessionId); the
+// service only has to carry it through, exactly as the flag-on branch does.
+describe("v0Service - originatingSessionId (DURABLE_LANDING_GENERATION=off, ENG-2673)", () => {
+  const ORIG = process.env.DURABLE_LANDING_GENERATION;
+  beforeEach(() => {
+    delete process.env.DURABLE_LANDING_GENERATION;
+  });
+  afterEach(() => {
+    if (ORIG === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+    else process.env.DURABLE_LANDING_GENERATION = ORIG;
+  });
+
+  it("stamps originatingSessionId on a first page", async () => {
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_first" });
+
+    await generateLandingPage("user-1", "p", "n", {}, undefined, undefined, {
+      originatingSessionId: "sess-legacy",
+    });
+
+    expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-legacy");
+  });
+
+  it("stamps originatingSessionId on a sub-page added to the existing site", async () => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+    };
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [item] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_sub" });
+
+    await generateLandingPage("user-1", "Variant", "Pricing", {}, undefined, undefined, {
+      originatingSessionId: "sess-legacy",
+    });
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.slug).toBeDefined();
+    expect(put.originatingSessionId).toBe("sess-legacy");
+  });
+
+  it("leaves originatingSessionId unset when none is supplied", async () => {
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_legacy_none" });
+
+    await generateLandingPage("user-1", "p", "n", {});
+
+    expect(mockPut.mock.calls[0][0].Item).not.toHaveProperty("originatingSessionId");
   });
 });
 

@@ -3,6 +3,24 @@
 // pre-push can be unit-tested without spawning git/tsc/jest. logic.test.mjs covers it.
 
 export const ZERO = '0000000000000000000000000000000000000000';
+/** The Node major CI runs (tests.yml `node-version: '22'`). Older Nodes make jest fail with errors that say nothing about the code (e.g. the ES-modules VM API). */
+export const REQUIRED_NODE_MAJOR = 22;
+
+/**
+ * Whether `version` (e.g. process.versions.node) is new enough to trust a local tsc/jest result.
+ * Returns { ok, major, message }; `message` is the instruction to print when not ok.
+ */
+export function checkNodeVersion(version, required = REQUIRED_NODE_MAJOR) {
+  const major = Number.parseInt(String(version ?? '').split('.')[0], 10);
+  if (Number.isInteger(major) && major >= required) return { ok: true, major, message: '' };
+  const shown = Number.isInteger(major) ? `v${version}` : `an unknown version (${JSON.stringify(version)})`;
+  return {
+    ok: false,
+    major: Number.isInteger(major) ? major : null,
+    message: `this shell runs node ${shown}, but CI runs node ${required} and the checks here fail on older Nodes with errors that are not about your code. Put node ${required} on PATH (for example: nvm use ${required}) and push again.`,
+  };
+}
+
 export const BACKEND_PREFIXES = ['backend/', '.github/workflows/tests.yml', '.github/scripts/eb-deploy.sh'];
 
 /**

@@ -14,6 +14,8 @@
  * models to Sonnet pricing, which hides pricing gaps).
  */
 
+import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoModels';
+
 /**
  * Version stamp for every price in this file (ENG-1250 §5: "A price change
  * creates a new version; historical events retain the rate version used").
@@ -26,7 +28,7 @@
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-09-26";
+export const LLM_PRICE_BOOK_VERSION = "2026-11-15";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -144,6 +146,18 @@ const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), ca
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  "openrouter/anthropic/claude-haiku-5.5": {"inPerM":0.1,"outPerM":0.5,"cacheReadPerM":0.01,"cacheWritePerM":0.125},
+
+  // Cache read $0.10/1M per OpenRouter's record (input_cache_read 0.0000001), 5% of input like Opus 5.5 —
+  // was $0.20 (the 10% convention), 2x the provider rate. Model-upgrade audit 2026-11-15.
+  "openrouter/anthropic/claude-sonnet-5.5": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":2.5},
+  "openrouter/deepseek/deepseek-v4-pro-0813": {"inPerM":1.32,"outPerM":3.96,"cacheReadPerM":0.044},
+  "openrouter/deepseek/deepseek-v4.1-flash": {"inPerM":0.05,"outPerM":1.2,"cacheReadPerM":0.02},
+  "openrouter/google/gemini-3.5-flash-lite": {"inPerM":0.3,"outPerM":2.5,"cacheReadPerM":0.03,"cacheWritePerM":0.0833333333333333},
+  "openrouter/openai/gpt-6.1-sol": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":2.5},
+  "openrouter/z-ai/glm-5.3": {"inPerM":0.07,"outPerM":7,"cacheReadPerM":0.065},
+  "openrouter/z-ai/glm-5.3-flash": {"inPerM":0.15,"outPerM":0.5,"cacheReadPerM":0.03},
+
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
   // ENG-893: every cacheWritePerM here is the DEFAULT-TTL (1.25x) rate, even
   // for models agent-mode invokes with `ttl: '1h'`. The 1-hour rate is 2x, but
@@ -297,6 +311,10 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
+  'openrouter/qwen/qwen3.8-max-0902': withDerivedCache(2.0, 6.0),
+  // DEPRECATED ALIAS, not a registry model: the pre-rename id (LEGACY_MODEL_ALIASES maps it to
+  // -0902). Kept, same $2/$6, so late/in-flight/engine-posted usage rows still stamped with the
+  // old id meter at the real rate instead of $0. Safe to drop once no usage rows carry it.
   'openrouter/qwen/qwen3.8-max': withDerivedCache(2.0, 6.0),
   // 2026-08-26: NOT the $0.35/$2.75 headline listing price — OpenRouter
   // aggregates 10 upstream providers for this model ($0.35-$0.48 in,
@@ -343,10 +361,16 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
 };
 
 /**
- * Video generation models — USD per 8s clip (longer videos bill as multiple clips).
+ * Video generation models — USD per clip (longer videos bill as multiple clips; clip
+ * length per model is VIDEO_CLIP_MAX_SECONDS, default 8s).
  * Ported from agentModeService.estimateVideoGenerationCost().
  */
 export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
+  // gemini-omni-1.1-flash: a full 10s clip at GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND.
+  // videoGenerationCostUsd prices Omni per actual second; this entry marks it as
+  // per-generation priced. Real cost comes from usage — see omniVideoUsageCostUsd.
+  'gemini-omni-1.1-flash': 1.014,
+  // Retired Veo ids (shut down 2026-10-22) — kept so historical records still price.
   'veo-3.1-generate-preview': 3.2, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.8
   'veo-3.1-fast-generate-preview': 1.4, // within official fast range ($0.10-0.30/s)
   'veo-3-generate-preview': 3.2, // $0.40/s x 8s (ai.google.dev); was unpriced -> recorded $0
@@ -403,12 +427,28 @@ export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
 }
 
 /**
- * Per-generation USD cost for a video model. Video is billed per 8s clip; a longer
- * requested duration bills as ceil(seconds / 8) clips.
+ * gemini-omni-1.1-flash estimate when the API reports no usage: $17.50/M video
+ * output tokens x 5,792 tokens/s at 720p. Billed on the actual requested seconds.
+ */
+export const GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND = 0.1014;
+
+/** Max seconds a single generated clip covers, per model (default 8s). */
+export const VIDEO_CLIP_MAX_SECONDS: Record<string, number> = {
+  'gemini-omni-1.1-flash': 10,
+};
+
+/**
+ * Per-generation USD cost for a video model. Video is billed per clip; a longer
+ * requested duration bills as ceil(seconds / clipSeconds) clips.
  */
 export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
+  if (model === GEMINI_OMNI_VIDEO_MODEL) {
+    // Omni is asked for each clip's exact length, so the estimate is per actual second.
+    const seconds = omniClipDurations(durationSeconds).reduce((a, b) => a + b, 0);
+    return seconds * GEMINI_OMNI_VIDEO_ESTIMATE_USD_PER_SECOND;
+  }
   const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
-  return clipPrice * videoClipCount(durationSeconds);
+  return clipPrice * videoClipCount(durationSeconds, model);
 }
 
 /**
@@ -416,11 +456,45 @@ export function videoGenerationCostUsd(model: string, durationSeconds?: number):
  * (ENG-1934), so an event's generation quantity is the same number the cost
  * was multiplied by.
  */
-export function videoClipCount(durationSeconds?: number): number {
-  const VEO_MAX_SECONDS = 8;
-  return durationSeconds && durationSeconds > VEO_MAX_SECONDS
-    ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+export function videoClipCount(durationSeconds?: number, model?: string): number {
+  if (model === GEMINI_OMNI_VIDEO_MODEL) return omniClipDurations(durationSeconds).length;
+  const clipSeconds = (model && VIDEO_CLIP_MAX_SECONDS[model]) || 8;
+  return durationSeconds && durationSeconds > clipSeconds
+    ? Math.ceil(durationSeconds / clipSeconds)
     : 1;
+}
+
+/** gemini-omni-1.1-flash token rates (USD per 1M tokens), ai.google.dev, 2026-10-08. */
+export const GEMINI_OMNI_VIDEO_TOKEN_PRICING = {
+  inputPerM: 1.5,
+  textOutputPerM: 9,
+  videoOutputPerM: 17.5,
+} as const;
+
+/**
+ * Actual USD cost of one gemini-omni-1.1-flash interaction from its `usage` block.
+ * Video output tokens bill at the video rate, other output tokens at the text rate,
+ * input at the input rate. When there is no per-modality breakdown, every output
+ * token is billed at the (higher) video rate. Returns undefined when the response
+ * carries no usable usage — the caller then falls back to the per-clip estimate.
+ */
+export function omniVideoUsageCostUsd(usage: unknown): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const u = usage as Record<string, unknown>;
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const totalOut = n(u.total_output_tokens);
+  if (totalOut === undefined) return undefined;
+  const input = n(u.total_input_tokens) ?? 0;
+  const byModality = Array.isArray(u.output_tokens_by_modality) ? u.output_tokens_by_modality : undefined;
+  let videoOut = totalOut;
+  if (byModality) {
+    videoOut = byModality
+      .filter((m: any) => m?.modality === 'video')
+      .reduce((sum: number, m: any) => sum + (n(m?.tokens) ?? 0), 0);
+  }
+  const otherOut = Math.max(0, totalOut - videoOut);
+  const p = GEMINI_OMNI_VIDEO_TOKEN_PRICING;
+  return (input * p.inputPerM + otherOut * p.textOutputPerM + videoOut * p.videoOutputPerM) / 1e6;
 }
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */
@@ -525,4 +599,74 @@ export function costScoreFromPrice(price: ModelPrice): number {
     (Math.log10(blended) - Math.log10(FLOOR_USD_PER_M)) /
     (Math.log10(CEILING_USD_PER_M) - Math.log10(FLOOR_USD_PER_M));
   return Math.round(100 * Math.max(0, Math.min(1, frac)));
+}
+
+
+/**
+ * ENG-2957: Gemini Live bills each modality at its own rate, and a voice call is mostly AUDIO tokens, which the text
+ * entry above (the approximation used before) under-prices about 4x on input and 2.7x on output. USD per 1M tokens,
+ * paid tier, from Google's pricing page (aistudio.google.com/docs/pricing, read 2026-11-12): input text 0.75, audio 3.00,
+ * image/video 1.00; output (thinking included) text 4.50, audio 12.00. Keyed by the bare model id.
+ */
+export const LIVE_MODALITY_PRICES: Readonly<Record<string, { input: Readonly<Record<string, number>>; output: Readonly<Record<string, number>> }>> = {
+  'gemini-3.1-flash-live-preview': {
+    input: { TEXT: 0.75, AUDIO: 3.0, IMAGE: 1.0, VIDEO: 1.0 },
+    output: { TEXT: 4.5, AUDIO: 12.0 },
+  },
+};
+
+interface LiveModalityTokens { modality?: unknown; tokenCount?: unknown }
+/** The parts of a Gemini Live `usageMetadata` that carry billable tokens. */
+export interface LiveUsageMetadata {
+  promptTokenCount?: number;
+  responseTokenCount?: number;
+  candidatesTokenCount?: number;
+  toolUsePromptTokenCount?: number;
+  thoughtsTokenCount?: number;
+  promptTokensDetails?: LiveModalityTokens[];
+  responseTokensDetails?: LiveModalityTokens[];
+  candidatesTokensDetails?: LiveModalityTokens[];
+  toolUsePromptTokensDetails?: LiveModalityTokens[];
+}
+
+const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+
+/** Tokens per modality from a details list, plus the remainder of `total` the details do not cover. */
+function splitByModality(total: number, details: LiveModalityTokens[] | undefined): { byModality: Record<string, number>; uncovered: number } {
+  const byModality: Record<string, number> = {};
+  let covered = 0;
+  for (const d of Array.isArray(details) ? details : []) {
+    const n = count(d?.tokenCount);
+    if (!n) continue;
+    const m = typeof d?.modality === 'string' ? d.modality.toUpperCase() : 'UNKNOWN';
+    byModality[m] = (byModality[m] ?? 0) + n;
+    covered += n;
+  }
+  return { byModality, uncovered: Math.max(0, total - covered) };
+}
+
+/**
+ * USD cost of one Gemini Live usage report, priced per modality. Null when the model has no per-modality rates (the
+ * caller then falls back to token pricing). A modality without a listed rate is billed at the highest rate of its
+ * direction, so an unknown kind of token is never under-charged; tokens a report does not break down are billed as
+ * text; thinking tokens are output text. No cache discount is applied (Google does not list one for Live).
+ */
+export function computeLiveModalityCostUsd(model: string, usage: LiveUsageMetadata | null | undefined): number | null {
+  const rates = LIVE_MODALITY_PRICES[String(model || '').replace(/^models\//, '')];
+  if (!rates || !usage) return null;
+  const maxIn = Math.max(...Object.values(rates.input));
+  const maxOut = Math.max(...Object.values(rates.output));
+  const price = (tokens: Record<string, number>, table: Record<string, number>, max: number) =>
+    Object.entries(tokens).reduce((sum, [m, n]) => sum + n * (table[m] ?? max), 0);
+
+  const prompt = splitByModality(count(usage.promptTokenCount), usage.promptTokensDetails);
+  const toolUse = splitByModality(count(usage.toolUsePromptTokenCount), usage.toolUsePromptTokensDetails);
+  const outputTotal = count(usage.responseTokenCount) || count(usage.candidatesTokenCount);
+  const output = splitByModality(outputTotal, usage.responseTokensDetails ?? usage.candidatesTokensDetails);
+
+  const inputUsd = price(prompt.byModality, rates.input, maxIn) + prompt.uncovered * rates.input.TEXT
+    + price(toolUse.byModality, rates.input, maxIn) + toolUse.uncovered * rates.input.TEXT;
+  const outputUsd = price(output.byModality, rates.output, maxOut) + output.uncovered * rates.output.TEXT
+    + count(usage.thoughtsTokenCount) * rates.output.TEXT;
+  return (inputUsd + outputUsd) / 1_000_000;
 }

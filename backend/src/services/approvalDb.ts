@@ -10,7 +10,7 @@ const dynamodbConfig = {
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamodbConfig);
 
 // Determine environment prefix for table names
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const ASSET_APPROVALS_TABLE = `${TABLE_PREFIX}AW-AssetApprovals`;
 
 export type AssetType = 'image' | 'video' | 'html' | 'text' | 'pdf' | 'other';
@@ -165,6 +165,73 @@ export class ApprovalDB {
   /**
    * Get approval by asset URL
    */
+  /**
+   * Record a verdict only if the approval is still open, atomically (ENG-273).
+   *
+   * `updateApprovalStatus` is an unconditional SET: it will overwrite any status, and it
+   * upserts — a row that does not exist is created as a stub holding only the verdict.
+   * That is tolerable behind Slack, where answering strips the buttons so nothing is left
+   * to click. WhatsApp cannot remove buttons: every tap, however late, arrives as a fresh
+   * message, and the customer may also have answered on another surface. So the check and
+   * the write have to be one operation, or two taps (or a tap and a portal click) can
+   * each pass a separate check and both write.
+   *
+   * "Open" is pending or needs_changes — Slack deliberately keeps its buttons live after
+   * "Request changes" so a reviewer can still approve later, and that transition is
+   * legitimate. Anything else (approved, rejected, revision_submitted) is final here.
+   *
+   * Never creates a row: a verdict for an approval that does not exist is refused.
+   */
+  async answerIfOpen(
+    assetUrl: string,
+    status: 'approved' | 'rejected',
+    reviewedBy: string,
+    /** When given, the record must belong to this user (a stale button must not answer
+     * someone else's approval for the same asset URL). */
+    ownerUserId?: string,
+  ): Promise<
+    | { answered: true; approval: AssetApproval }
+    | { answered: false; current: AssetApproval['status'] | null | 'unknown' }
+  > {
+    try {
+      const result = await dynamodb
+        .update({
+          TableName: ASSET_APPROVALS_TABLE,
+          Key: { assetUrl },
+          UpdateExpression: 'SET #status = :status, reviewedBy = :reviewedBy, updatedAt = :updatedAt',
+          ConditionExpression:
+            'attribute_exists(assetUrl) AND (#status = :pending OR #status = :needsChanges)' +
+            (ownerUserId ? ' AND userId = :owner' : ''),
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':status': status,
+            ':reviewedBy': reviewedBy,
+            ':updatedAt': new Date().toISOString(),
+            ':pending': 'pending',
+            ':needsChanges': 'needs_changes',
+            ...(ownerUserId ? { ':owner': ownerUserId } : {}),
+          },
+          ReturnValues: 'ALL_NEW',
+        })
+        .promise();
+      return { answered: true, approval: result.Attributes as AssetApproval };
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        // Report what stands, so the caller can say it rather than guess. A failed read is
+        // 'unknown', NOT null: null means the approval does not exist, and telling someone
+        // their request is gone because a read blipped would be wrong.
+        try {
+          const existing = await this.getApproval(assetUrl);
+          return { answered: false, current: existing?.status ?? null };
+        } catch {
+          return { answered: false, current: 'unknown' };
+        }
+      }
+      console.error('❌ Error answering approval:', error);
+      throw new Error('Failed to answer approval');
+    }
+  }
+
   async getApproval(assetUrl: string): Promise<AssetApproval | null> {
     const params = {
       TableName: ASSET_APPROVALS_TABLE,
@@ -235,12 +302,52 @@ export class ApprovalDB {
       ...(limit && { Limit: limit }),
     };
 
+    const items: AssetApproval[] = [];
+    let startKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     try {
-      const result = await dynamodb.query(params).promise();
-      return (result.Items as AssetApproval[]) || [];
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(limit && { Limit: limit - items.length }),
+          ...(startKey && { ExclusiveStartKey: startKey }),
+        }).promise();
+        items.push(...((result.Items as AssetApproval[]) || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey && (!limit || items.length < limit));
+      return limit ? items.slice(0, limit) : items;
     } catch (error) {
       console.error('❌ Error getting approvals by user ID:', error);
       throw new Error('Failed to get approvals by user ID');
+    }
+  }
+
+  /**
+   * Every PENDING approval of a user, following the index to the end. Filter in
+   * DynamoDB rather than loading approvals of every status into memory.
+   */
+  async getPendingApprovalsByUserId(userId: string): Promise<AssetApproval[]> {
+    const items: AssetApproval[] = [];
+    let startKey: Record<string, any> | undefined;
+    try {
+      do {
+        const result = await dynamodb
+          .query({
+            TableName: ASSET_APPROVALS_TABLE,
+            IndexName: 'UserApprovalsIndex',
+            KeyConditionExpression: 'userId = :userId',
+            FilterExpression: '#status = :pending',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':userId': userId, ':pending': 'pending' },
+            ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+          })
+          .promise();
+        items.push(...((result.Items as AssetApproval[]) || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey);
+      return items;
+    } catch (error) {
+      console.error('❌ Error getting pending approvals by user ID:', error);
+      throw new Error('Failed to get pending approvals by user ID');
     }
   }
 
@@ -292,6 +399,54 @@ export class ApprovalDB {
     } catch (error) {
       console.error('❌ Error getting approvals by asset type:', error);
       throw new Error('Failed to get approvals by asset type');
+    }
+  }
+
+  /**
+   * Put a previously read approval back exactly as it was. Used when a re-request replaced a
+   * record and then reached nobody: the earlier verdict must survive, not be deleted.
+   */
+  async restoreApproval(approval: AssetApproval, replacingCreatedAt: string): Promise<void> {
+    try {
+      // Only over the record WE wrote, and only while it is still unanswered: a newer
+      // concurrent re-request, or a customer's tap on our buttons, must not be reverted by
+      // a failed older request.
+      await dynamodb
+        .put({
+          TableName: ASSET_APPROVALS_TABLE,
+          Item: approval,
+          ConditionExpression:
+            'attribute_not_exists(assetUrl) OR (createdAt = :ours AND #status = :pending)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':ours': replacingCreatedAt, ':pending': 'pending' },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      console.error('❌ Error restoring approval:', error);
+      throw new Error('Failed to restore approval');
+    }
+  }
+
+  /**
+   * Delete a record only if it is still the one this request wrote and is unanswered.
+   * Used to undo an unsent approval without deleting a concurrent request's record.
+   */
+  async deleteApprovalIfUnanswered(assetUrl: string, createdAt: string): Promise<void> {
+    try {
+      await dynamodb
+        .delete({
+          TableName: ASSET_APPROVALS_TABLE,
+          Key: { assetUrl },
+          ConditionExpression: 'createdAt = :ours AND #status = :pending',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':ours': createdAt, ':pending': 'pending' },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      console.error('❌ Error deleting unsent approval:', error);
+      throw new Error('Failed to delete approval');
     }
   }
 

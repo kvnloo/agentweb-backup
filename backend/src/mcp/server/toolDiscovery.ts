@@ -37,13 +37,37 @@ export function listedToolNames(): string[] {
     ...(LANDING_WORKFLOW_TOOL_NAMES ?? []),
     ...(PUBLISH_WORKFLOW_TOOL_NAMES ?? []),
     ...SESSION_TOOL_NAMES,
+    // ENG-1034: the anonymous demo tool must be visible to be tried.
+    'emma_review_site',
     SEARCH_TOOL_NAME,
   ];
 }
 
-/** What an external client sees in `tools/list`. */
-export function getListedToolDefinitions(): any[] {
+/**
+ * Tools listed only for an aw_ key that explicitly holds their opt-in scope.
+ * Most MCP clients can only call tools that appear in tools/list, so a scope
+ * grant is useless unless the gated tool (and what it needs) is listed too.
+ * Listing is still not authorization: the scope gate in mcpServer.ts and
+ * registry.execute() decides every call.
+ */
+const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
+  'email:read': ['read_email', 'list_connected_accounts'],
+  // list_lead_lists gives the listId a preview needs.
+  'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status'],
+  // A runId comes from get_smartlead_push_status, which needs smartlead:read: agents get both scopes.
+  'smartlead:control': ['pause_smartlead_push', 'cancel_smartlead_push'],
+};
+
+/** What an external client sees in `tools/list`. `grantedScopes` is set only for api_key sessions. */
+export function getListedToolDefinitions(grantedScopes?: string[]): any[] {
   const listed = new Set(listedToolNames());
+  for (const scope of grantedScopes ?? []) {
+    for (const name of SCOPE_LISTED_TOOL_NAMES[scope] ?? []) listed.add(name);
+  }
+  // A Smartlead agent needs a listId for a preview: list_lead_lists (a read) is listed with smartlead:read only when the key can call it.
+  if ((grantedScopes ?? []).includes('smartlead:read') && (grantedScopes ?? []).some(s => s === 'tools:read' || s === 'tools:execute')) {
+    listed.add('list_lead_lists');
+  }
   return mcpToolRegistry.getToolDefinitions().filter((d: any) => listed.has(d.name));
 }
 
@@ -55,13 +79,20 @@ function tokens(s: string): string[] {
  * Rank externally visible, unlisted tools against a free-text query.
  * Name-token hits weigh more than description hits; ties keep registry order.
  */
-export function searchTools(query: string, limit = 8): any[] {
+export function searchTools(query: string, limit = 8, caller?: { externalMcp?: boolean; authMethod?: string; apiKeyScopes?: string[] }): any[] {
   const q = tokens(query);
   if (q.length === 0) return [];
   const listed = new Set(listedToolNames());
+  // An `apiKeyOnly` tool (Smartlead) is shown only to an in-process caller or to an aw_ key holding its scope: a search must not
+  // advertise tools the caller is going to be refused.
+  const callable = (name: string) => {
+    const h = mcpToolRegistry.getTool(name);
+    if (!h?.apiKeyOnly || caller?.externalMcp !== true) return true;
+    return caller.authMethod === 'api_key' && !!h.requiredScope && (caller.apiKeyScopes ?? []).includes(h.requiredScope);
+  };
   const scored = mcpToolRegistry
     .getToolDefinitions()
-    .filter((d: any) => !listed.has(d.name))
+    .filter((d: any) => !listed.has(d.name) && callable(d.name))
     .map((d: any, i: number) => {
       const name = tokens(String(d.name).replace(/_/g, ' '));
       const desc = new Set(tokens(String(d.description ?? '')));
@@ -96,8 +127,8 @@ mcpToolRegistry.register({
       required: ['query'],
     },
   },
-  execute: async (args: any) => {
-    const tools = searchTools(String(args?.query ?? ''), Number(args?.limit) || 8);
+  execute: async (args: any, context?: any) => {
+    const tools = searchTools(String(args?.query ?? ''), Number(args?.limit) || 8, context);
     return jsonResult({
       query: args?.query,
       count: tools.length,

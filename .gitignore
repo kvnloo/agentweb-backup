@@ -147,3 +147,6 @@ customer-portal/
 .notion-page-id
 # a worktree may symlink this rather than have a real dir; `node_modules/` does not match a symlink
 node_modules
+
+# ENG-1076: deploy zips are CI build output (deploy.yml/staging-backend.yml create them at runtime); never commit them.
+backend/builds/*.zip

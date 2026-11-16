@@ -3,7 +3,11 @@ import request from 'supertest';
 import fathomOnboardingAdminRoutes from '../fathomOnboardingAdmin';
 import { authenticateToken } from '../../middleware/auth';
 import { isAdmin } from '../../middleware/admin';
-import { ingestFathomOnboardingRecording } from '../../services/fathomOnboardingIngestionService';
+import {
+  applyFathomOnboardingReviewAction,
+  FathomOnboardingReviewError,
+  ingestFathomOnboardingRecording,
+} from '../../services/fathomOnboardingIngestionService';
 import { userDb } from '../../services/db';
 
 jest.mock('../../middleware/auth', () => ({
@@ -17,9 +21,16 @@ jest.mock('../../middleware/admin', () => ({
   isAdmin: jest.fn((_req: any, _res: any, next: any) => next()),
 }));
 
-jest.mock('../../services/fathomOnboardingIngestionService', () => ({
-  ingestFathomOnboardingRecording: jest.fn(),
-}));
+jest.mock('../../services/fathomOnboardingIngestionService', () => {
+  class FathomOnboardingReviewError extends Error {
+    constructor(public readonly statusCode: number, message: string) { super(message); }
+  }
+  return {
+    ingestFathomOnboardingRecording: jest.fn(),
+    applyFathomOnboardingReviewAction: jest.fn(),
+    FathomOnboardingReviewError,
+  };
+});
 
 jest.mock('../../services/db', () => ({
   userDb: {
@@ -131,5 +142,41 @@ describe('fathomOnboardingAdminRoutes', () => {
       status: 'needs_review',
       extractionState: 'auto_extracted',
     });
+  });
+
+  it.each(['discard', 'rollback'])('routes %s to the review action with the admin as actor', async (action) => {
+    (applyFathomOnboardingReviewAction as jest.Mock).mockResolvedValue({ recordingId: 'rec-1', status: 'x' });
+    const res = await request(app).post(`/api/admin/fathom-onboarding/users/u1/ingestions/rec-1/${action}`);
+    expect(res.status).toBe(200);
+    expect(applyFathomOnboardingReviewAction).toHaveBeenCalledWith({
+      userId: 'u1', recordingId: 'rec-1', action, actorUserId: 'admin-user',
+    });
+  });
+
+  it('maps review errors to their status code', async () => {
+    (applyFathomOnboardingReviewAction as jest.Mock).mockRejectedValue(new (FathomOnboardingReviewError as any)(409, 'roll back first'));
+    const res = await request(app).post('/api/admin/fathom-onboarding/users/u1/ingestions/rec-1/discard');
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('roll back first');
+  });
+
+  it('requires admin middleware for review actions', async () => {
+    (isAdmin as jest.Mock).mockImplementationOnce((_req: any, res: any) => res.status(403).json({ error: 'forbidden' }));
+    const res = await request(app).post('/api/admin/fathom-onboarding/users/u1/ingestions/rec-1/rollback');
+    expect(res.status).toBe(403);
+    expect(applyFathomOnboardingReviewAction).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed path ids before calling the review service', async () => {
+    const res = await request(app).post(`/api/admin/fathom-onboarding/users/${'x'.repeat(200)}/ingestions/rec-1/discard`);
+    expect(res.status).toBe(400);
+    expect(applyFathomOnboardingReviewAction).not.toHaveBeenCalled();
+  });
+
+  it('accepts recording ids with spaces or plus signs (ingest accepts any id)', async () => {
+    (applyFathomOnboardingReviewAction as jest.Mock).mockResolvedValue({ recordingId: 'call 42+x', status: 'needs_review' });
+    const res = await request(app).post('/api/admin/fathom-onboarding/users/u1/ingestions/call%2042%2Bx/rollback');
+    expect(res.status).toBe(200);
+    expect(applyFathomOnboardingReviewAction).toHaveBeenCalledWith(expect.objectContaining({ recordingId: 'call 42+x' }));
   });
 });

@@ -1,0 +1,9 @@
+{
+  "name": "Water Heater Install Leads",
+  "objective": "OUTCOME_LEADS",
+  "dailyBudget": 25,
+  "audience": { "countries": ["US"], "ageMin": 30, "ageMax": 65 },
+  "creatives": [
+    { "primaryText": "Same-week water heater installs.", "headline": "Get a Free Quote", "imageUrl": "https://example.com/heater.jpg", "linkUrl": "https://example.com/quote", "callToAction": "GET_QUOTE" }
+  ]
+}

@@ -124,3 +124,41 @@ describe('triggerAutoRevision — session-busy contention (ENG-1719)', () => {
     );
   });
 });
+
+// ENG-669 PR-C (rv-3681): runVerifiedChat refuses a stored AgentWeb Model selection it cannot serve (rollback, router
+// unavailable for the tier, a pick outside the plan) instead of silently running a task default. That is not an outage:
+// the reviewer is told what is wrong and what to do, and on-call is not paged. (runVerifiedChat itself saves the
+// refusal to the chat: agentModeController.agentWebModelRouter.test.ts.)
+import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+
+describe('triggerAutoRevision — the chat\'s model refused (model_unavailable)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetChatSession.mockResolvedValue({ sessionId: 'exec-1', userId: 'user-1', messages: [], llmModel: 'agentweb-model' });
+  });
+
+  it.each([
+    ['not_served', "AgentWeb Model isn't available right now"],
+    ['not_in_plan', "isn't included in your plan"],
+  ] as const)('%s: posts the refusal and what to do to the thread; no page, no generic notice', async (reason, sentence) => {
+    mockRunVerifiedChat.mockRejectedValueOnce(new ModelUnavailableError('agentweb-model', reason));
+
+    await expect(triggerAutoRevision(approval, 'brighter')).resolves.toBeUndefined();
+
+    expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+    expect(mockPostSlackMessage).toHaveBeenCalledTimes(1);
+    const [channel, text, ts] = mockPostSlackMessage.mock.calls[0];
+    expect([channel, ts]).toEqual([approval.slackChannel, approval.slackMessageTs]);
+    expect(text).toContain(sentence);
+    expect(text).toContain('choose another model for this chat in AgentWeb, then retry the feedback');
+    expect(text).not.toContain("didn't go through");
+    expect(text).not.toContain('agentweb-model');
+  });
+
+  it('batch revision (no thread ts): still posted to the channel, no page', async () => {
+    mockRunVerifiedChat.mockRejectedValueOnce(new ModelUnavailableError('agentweb-model', 'not_served'));
+    await triggerAutoRevision({ ...approval, slackMessageTs: null } as any, 'brighter', 'batch-1');
+    expect(mockSendAgentModeOncallAlert).not.toHaveBeenCalled();
+    expect(mockPostSlackMessage).toHaveBeenCalledWith('C1', expect.stringContaining("AgentWeb Model isn't available right now"), undefined);
+  });
+});

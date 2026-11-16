@@ -38,6 +38,7 @@ import { crmDb } from '../services/db';
 import { apolloAsyncRequestCacheKey } from '../services/apolloCacheKeys';
 import { apolloEmailStatusToConfidence } from '../services/apolloFieldMapper';
 import { getApolloWebhookSecret } from '../utils/secretsManager';
+import { isValidAddress, normalizeEmail } from '../utils/sendEligibility';
 
 /**
  * Constant-time secret check. Returns false for length mismatches
@@ -82,6 +83,35 @@ interface ApolloWebhookPayload {
   email_status?: string;
 }
 
+/** A status label from a callback body (stored in sourceQuote / the placeholder): lower-case [a-z0-9 _.-], at most 40 characters. */
+function cleanStatus(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.toLowerCase().replace(/[^a-z0-9 _.-]/g, '').trim().slice(0, 40);
+  return t || undefined;
+}
+
+/**
+ * Gate for an email arriving in a callback body before it is stored on a customer lead (ENG-2801, ENG-2803).
+ * The address is trimmed and lower-cased (as the lead write stores it), then must pass the same strict check
+ * the send path uses (utils/sendEligibility isValidAddress: unquoted RFC 5322 dot-atom local part, LDH domain
+ * labels, RFC 5321 lengths). That excludes whitespace, control and bidi characters, quotes, angle brackets,
+ * commas and other multi-address or injection shapes, empty or doubled dots, and non-ASCII domains (an IDN
+ * must arrive as punycode). On top of it, two callback-only rules: the top-level label is 2-63 letters or a
+ * punycode `xn--` label (no `a@b.c` or numeric TLDs from a vendor), and the local part may not start with `=`,
+ * `+` or `-`: the lead's email is exported to CSV unescaped, where a leading one of those is read as a formula.
+ * Apostrophes and plus-tags
+ * stay legal (o'brien@x.com, a+b@x.co.uk). Anything else is treated as "no email", so a malformed or forged
+ * value is never written. The length cap runs first, so the regex input is bounded.
+ */
+const CSV_FORMULA_LEAD = /^[=+-]/;
+const CALLBACK_TLD = /\.(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
+export function cleanCallbackEmail(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 1024) return undefined;
+  const e = normalizeEmail(value);
+  if (e.length === 0 || e.length > 254 || CSV_FORMULA_LEAD.test(e) || !CALLBACK_TLD.test(e)) return undefined;
+  return isValidAddress(e) ? e : undefined;
+}
+
 /**
  * Pull the first finder-vendor email out of Apollo's nested waterfall payload.
  * Falls back to the flat `person.email` / `email` shape if `people[]` is absent
@@ -89,7 +119,8 @@ interface ApolloWebhookPayload {
  * (ZeroBounce et al.) reports `validated`, the resulting status is upgraded
  * to `verified` regardless of the finder's self-claim.
  */
-function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string } {
+export function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; emailStatus?: string; rejected: number } {
+  let rejected = 0; // candidate email values that were present but failed the shape gate
   const person = Array.isArray(payload.people) ? payload.people[0] : null;
   const groups = person?.waterfall?.emails;
   if (Array.isArray(groups)) {
@@ -97,15 +128,23 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
       const vendors = Array.isArray(grp?.vendors) ? grp.vendors : [];
       const finder = vendors.find((v) => Array.isArray(v?.emails) && v.emails.length > 0);
       if (!finder || !finder.emails || finder.emails.length === 0) continue;
+      // Stop at the first usable address: a large authenticated body must not be validated in full.
+      let email: string | undefined;
+      for (const candidate of finder.emails as unknown[]) {
+        email = cleanCallbackEmail(candidate);
+        if (email) break;
+        if (candidate !== null && candidate !== undefined && candidate !== '') rejected += 1;
+      }
+      if (!email) continue; // nothing in this group is a usable address; try the next group
       const verified = vendors.some(
-        (v) => v?.usedForVerification && String(v?.status ?? '').toLowerCase() === 'validated',
+        (v) => v?.usedForVerification && typeof v?.status === 'string' && v.status.toLowerCase() === 'validated',
       );
-      const finderStatus = String(finder.status ?? '').toLowerCase();
+      const finderStatus = cleanStatus(finder.status) ?? '';
       const emailStatus =
         verified || finderStatus === 'verified' ? 'verified' :
         finderStatus === 'guessed' ? 'guessed' :
         finderStatus || undefined;
-      return { email: String(finder.emails[0]), emailStatus };
+      return { email, emailStatus, rejected };
     }
   }
   // Flat-shape fallback. Lowercase the status so downstream confidence
@@ -113,10 +152,9 @@ function extractApolloEmail(payload: ApolloWebhookPayload): { email?: string; em
   // Apollo returns mixed case (e.g. "VERIFIED").
   const flatEmail = payload.person?.email ?? payload.email;
   const flatStatus = payload.person?.email_status ?? payload.email_status;
-  return {
-    email: flatEmail,
-    emailStatus: typeof flatStatus === 'string' ? flatStatus.toLowerCase() : flatStatus,
-  };
+  const flat = cleanCallbackEmail(flatEmail);
+  if (!flat && flatEmail !== null && flatEmail !== undefined && flatEmail !== '') rejected += 1;
+  return { email: flat, emailStatus: cleanStatus(flatStatus), rejected };
 }
 
 router.post('/:secret', async (req: Request, res: Response) => {
@@ -132,8 +170,10 @@ router.post('/:secret', async (req: Request, res: Response) => {
     }
 
     const payload: ApolloWebhookPayload = req.body ?? {};
-    const requestId = payload.request_id;
-    if (!requestId || typeof requestId !== 'string') {
+    // Trimmed once here (the cache key builder trims too), so the idempotency check, the stored apolloRequestId and the
+    // logs all see the same id as the placeholder lookup.
+    const requestId = typeof payload.request_id === 'string' ? payload.request_id.trim() : '';
+    if (!requestId) {
       return res.status(400).json({ message: 'missing request_id' });
     }
 
@@ -146,6 +186,14 @@ router.post('/:secret', async (req: Request, res: Response) => {
     }
     const { listId, leadId, userId: placeholderUserId } = placeholder.rawData;
 
+    // ENG-2803: the placeholder carries an expiry (epoch seconds, 7 days after Tier 3 wrote it). TTL is not
+    // enabled on the table, so the row outlives it; refuse late or replayed callbacks against an expired one.
+    const expiresAt = Number((placeholder as { expiresAt?: unknown }).expiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt * 1000 < Date.now()) {
+      console.warn('[apollo webhook] placeholder expired — refusing', requestId);
+      return res.status(202).json({ accepted: true, matched: false, expired: true });
+    }
+
     // C1: re-verify ownership. The placeholder is our own write (Tier 3 stamps
     // userId before handing the URL to Apollo), so a missing or mismatched
     // userId means: legacy placeholder pre-this-fix, the lead/list moved
@@ -154,7 +202,9 @@ router.post('/:secret', async (req: Request, res: Response) => {
       console.warn('[apollo webhook] placeholder missing userId — refusing to write', requestId);
       return res.status(202).json({ accepted: true, matched: false });
     }
-    const list: any = await crmDb.getLeadListById(listId).catch(() => null);
+    // No .catch here: a transient read error must surface as a 500 so Apollo retries the callback. A deleted list
+    // resolves to null/undefined (not a throw) and is answered 202 below.
+    const list: any = await crmDb.getLeadListById(listId);
     if (!list || list.userId !== placeholderUserId) {
       console.warn('[apollo webhook] list missing or owner changed since Tier 3 — refusing', requestId);
       return res.status(202).json({ accepted: true, matched: false });
@@ -173,7 +223,12 @@ router.post('/:secret', async (req: Request, res: Response) => {
       return res.status(200).json({ accepted: true, matched: true, alreadyProcessed: true });
     }
 
-    const { email, emailStatus } = extractApolloEmail(payload);
+    const { email, emailStatus, rejected } = extractApolloEmail(payload);
+    if (!email && rejected > 0) {
+      // Visible on purpose: a systematic false rejection would otherwise look exactly like "Apollo found nothing".
+      // Logs the count and request id only, never the rejected value.
+      console.warn('[apollo webhook] callback email value(s) failed validation; treating as no_email', requestId, 'rejected:', rejected);
+    }
 
     // Stamp the result onto the placeholder so the waterfall poller (running
     // in the original Tier 3 caller) can pick it up and skip Tier 4. Best-

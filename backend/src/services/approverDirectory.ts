@@ -76,6 +76,27 @@ export async function getApproverChannel(approver: ApprovalDecisionApprover): Pr
   return channel.trim();
 }
 
+/** Channel for the Approval Desk's one-line packet reminder only. Same as getApproverChannel, plus a
+ *  last-resort fallback to the eval-queue channel (humanEvalService's getEvalChannel keys) so the reminder
+ *  lands where Matt and Fangfang already look for review pings even when no approval-inbox channel was
+ *  ever configured. Deliberately NOT folded into getApproverChannel: that one also feeds the interactive
+ *  queue message (Approve/Reject buttons), resolution/expiry notices and plan_choice staging, which must
+ *  stay dormant until someone configures a channel for them on purpose. */
+export async function getApproverReminderChannel(approver: ApprovalDecisionApprover): Promise<string> {
+  try {
+    return await getApproverChannel(approver);
+  } catch (err) {
+    if (!(err instanceof ApproverDirectoryError)) throw err;
+    const evalQueue = await settingsService.getSetting('human_eval_slack_channel');
+    const channel = evalQueue?.settingValue
+      || process.env.HUMAN_EVAL_SLACK_CHANNEL
+      || process.env.EVAL_QUEUE_SLACK_CHANNEL
+      || process.env.SLACK_EVAL_CHANNEL;
+    if (!channel?.trim()) throw err;
+    return channel.trim();
+  }
+}
+
 /** Optional configured fallback approver(s) who may act on ANY decision, so
  *  one absent named approver can't permanently stall it. Comma-separated
  *  Slack user ids, same DB-setting-with-env-fallback convention as
@@ -119,6 +140,19 @@ export async function getApproverEmail(approver: ApprovalDecisionApprover): Prom
     console.warn(`[approver-directory] failed to resolve ${approver}'s email, continuing without it:`, err?.message || err);
     return undefined;
   }
+}
+
+/** Who a newly-created decision is assigned to when the producer doesn't name
+ *  a specific person — one routing rule in one place, same idea as the eval
+ *  queue's getReviewerForType (humanEvalService.ts): the TYPE of work decides
+ *  the reviewer. Meta Ads writes (campaign/ad set/budget/status) are Matt's —
+ *  matching where creative/landing-page evals already go in #eval-queue.
+ *  Fangfang owns lead-enrichment review there; no Approval Desk gate type
+ *  covers that yet, so nothing routes to her until one does. Never Harsha by
+ *  default — he's only ever assigned explicitly. */
+export function getDefaultApproverForGate(gateType: 'meta_write' | 'plan_choice' | string): ApprovalDecisionApprover {
+  void gateType;
+  return 'matt';
 }
 
 /** The reverse lookup every new Approval Desk route needs: a logged-in

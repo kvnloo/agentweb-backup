@@ -10,6 +10,32 @@ import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
 import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
+import { assertModelInOwnerPlan } from '../services/agentMode/modelAccessInstance';
+import { buildModelUnavailableBody, isModelUnavailableError, ModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+
+/**
+ * ENG-669: a model named in the request body runs on the caller's account, so it must be in the caller's plan (the
+ * tier model allowlist; switch off => no read). Answers the shared 422 and returns false when refused.
+ */
+async function modelInCallerPlan(req: Request, res: Response, rawModel: unknown): Promise<boolean> {
+  if (typeof rawModel !== 'string' || !rawModel.trim()) return true;
+  // ENG-669 PR-C: these routes call one model directly (no resolver, no router), so the AgentWeb Model can never run
+  // here; refused visibly (with the switch on or off) instead of silently running a default model.
+  if (isAgentWebModelId(rawModel)) {
+    res.status(422).json(buildModelUnavailableBody(new ModelUnavailableError(rawModel.trim(), 'not_selectable')));
+    return false;
+  }
+  try {
+    await assertModelInOwnerPlan({ ownerUserId: userId(req), model: rawModel });
+    return true;
+  } catch (error) {
+    if (!isModelUnavailableError(error)) throw error;
+    const svc = await getAgentModeService();
+    res.status(422).json(buildModelUnavailableBody(error, svc.getModelDisplayName?.(error.requestedModel)));
+    return false;
+  }
+}
 
 const router = Router();
 
@@ -32,6 +58,43 @@ async function getAgentModeService() {
 
 function userId(req: Request): string {
   return (req as AuthenticatedRequest).user.userId;
+}
+
+/**
+ * Session-access gate for routes that act on a chat session named by `session_id` in the body.
+ *
+ * These routes are thin delegates to agentModeService, whose implementations load the session by
+ * id and read or write it (work plan, review metadata, transcript, cost) without knowing who is
+ * asking. The rule is the one agentModeController.getSession / generateResponse apply to the same
+ * sessions: the owner, or an admin. Delegate (support) tokens resolve `req.user` to the TARGET
+ * account in middleware/auth.ts, so a delegate passes on exactly the chats it can open and run.
+ *
+ * A missing session and a session the caller may not access both answer 404, so the response
+ * never confirms that another account's session id exists. Reads the session record only
+ * (getChatSessionRecord), never the message table, so a refused caller triggers no transcript read.
+ *
+ * `required`: the route cannot do anything without a session (400 when absent). Otherwise an
+ * absent/empty session_id keeps the route's existing no-session behaviour (MCP self-calls send none).
+ * Returns false when it has already answered the request.
+ */
+async function sessionAccessAllowed(req: Request, res: Response, sessionId: unknown, required: boolean): Promise<boolean> {
+  if (sessionId === undefined || sessionId === null || sessionId === '') {
+    if (!required) return true;
+    res.status(400).json({ message: 'session_id is required' });
+    return false;
+  }
+  if (typeof sessionId !== 'string') {
+    res.status(400).json({ message: 'session_id must be a string' });
+    return false;
+  }
+  const user = (req as AuthenticatedRequest).user;
+  // Strongly consistent: a session created just before this call must not read as missing (false 404).
+  const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+  if (!session || (session.userId !== user.userId && !user.isAdmin)) {
+    res.status(404).json({ message: 'Session not found' });
+    return false;
+  }
+  return true;
 }
 
 // ─── Search & Research ──────────────────────────────────────────────────────
@@ -176,6 +239,7 @@ router.post('/generate-image', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image, category } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.generateImage(
       prompt, filename, size || '1024x1024', quality || 'medium',
       input_images || [], userId(req), session_id || '',
@@ -191,6 +255,7 @@ router.post('/generate-video', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { prompt, filename, session_id, video_model, start_frame, end_frame } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.generateVideo(prompt, filename, userId(req), session_id, video_model, start_frame, end_frame);
     res.json(result);
   } catch (err: any) {
@@ -202,6 +267,7 @@ router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
+    if (type !== 'video' && !(await modelInCallerPlan(req, res, llm_model))) return;
     let result;
     if (type === 'video') {
       // ENG-1961: carry the session too, so analysis run through this API is
@@ -235,6 +301,8 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 // ─── Email ──────────────────────────────────────────────────────────────────
 
+const MAX_GET_MESSAGE_IDS = 50;
+
 router.post('/email', async (req: Request, res: Response) => {
   try {
     const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
@@ -245,6 +313,11 @@ router.post('/email', async (req: Request, res: Response) => {
     const operation = req.body.action === 'send' ? 'send' : 'read';
     const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
     const { provider, ownerUserId } = resolved;
+    // External MCP read_email sets own_mailbox_only: the caller's own mailbox is
+    // the only one an external API key may read — never a teammate's shared one.
+    if (req.body.own_mailbox_only === true && ownerUserId !== userId(req)) {
+      return res.status(403).json({ message: 'This mailbox is shared by a teammate and cannot be read by external clients. Only your own connected accounts are available.' });
+    }
     // Every provider call runs inside withAccessGuard: a teammate's shared
     // mailbox is re-checked immediately before the call AND before the result is
     // returned, so a share revoked mid-read discloses nothing.
@@ -267,11 +340,24 @@ router.post('/email', async (req: Request, res: Response) => {
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
+        if (ids.length > MAX_GET_MESSAGE_IDS || ids.some((id) => typeof id !== 'string')) {
+          return res.status(400).json({ message: `message_ids must be at most ${MAX_GET_MESSAGE_IDS} strings` });
+        }
         const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;
       }
       case 'send': {
+        // ENG-673: an address-only send must not reach a contact marked do-not-contact.
+        const { blockedRecipients, blockedMessage } = await import('../services/contactGuard');
+        let blocked: string[];
+        try {
+          blocked = await blockedRecipients([userId(req), ownerUserId], req.body.to, req.body.cc, req.body.bcc);
+        } catch (e) {
+          console.error('[emmaApi] do-not-contact check failed, not sending:', e);
+          return res.status(503).json({ code: 'do_not_contact_unverified', message: 'Could not check whether the recipient is marked do-not-contact, so nothing was sent.' });
+        }
+        if (blocked.length > 0) return res.status(409).json({ code: 'do_not_contact', message: blockedMessage(blocked), blocked });
         const sendResult = await provider.sendEmail(ownerUserId, req.body.account_id, {
           to: req.body.to,
           subject: req.body.subject,
@@ -339,7 +425,10 @@ router.post('/post-on-account', async (req: Request, res: Response) => {
     const toolContext = buildScheduledPublishContext(req);
     const result = await svc.postOnConnectedAccount(
       userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
-      undefined, toolContext, req.body.save_as_draft === true ? { saveAsDraft: true } : undefined
+      undefined, toolContext,
+      req.body.save_as_draft === true || req.body.in_reply_to_post_id
+        ? { ...(req.body.save_as_draft === true ? { saveAsDraft: true } : {}), ...(typeof req.body.in_reply_to_post_id === 'string' && req.body.in_reply_to_post_id ? { inReplyToPostId: req.body.in_reply_to_post_id } : {}) }
+        : undefined
     );
     res.json(result);
   } catch (err: any) {
@@ -549,7 +638,7 @@ router.post('/data-analysis', async (req: Request, res: Response) => {
 router.post('/read-file', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.readFileContent(req.body.file_url);
+    const result = await svc.readFileContent(req.body.file_url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -563,7 +652,7 @@ router.post('/read-page', async (req: Request, res: Response) => {
       const result = await svc.extractCSSFromURL(req.body, userId(req));
       return res.json(result);
     }
-    const result = await svc.readFileContent(req.body.url);
+    const result = await svc.readFileContent(req.body.url, { userId: userId(req) });
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -584,6 +673,7 @@ router.post('/save-file', async (req: Request, res: Response) => {
 
 router.post('/create-html', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, false))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFile(
       req.body.title, req.body.content_draft,
@@ -608,6 +698,7 @@ router.get('/html-templates', async (req: Request, res: Response) => {
 
 router.post('/create-html-from-template', async (req: Request, res: Response) => {
   try {
+    if (!(await modelInCallerPlan(req, res, req.body.llm_model))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlFromTemplate(
       req.body.llm_model, req.body.template_id,
@@ -622,6 +713,7 @@ router.post('/create-html-from-template', async (req: Request, res: Response) =>
 
 router.post('/create-html-template', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, false))) return;
     const svc = await getAgentModeService();
     const result = await svc.createHtmlTemplate(
       req.body.html_source, req.body.template_id,
@@ -748,6 +840,7 @@ router.post('/books/:bookId/characters', async (req: Request, res: Response) => 
 
 router.post('/work-plans', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.createWorkPlan(req.body.title, req.body.steps, req.body.session_id);
     res.json(result);
@@ -758,6 +851,7 @@ router.post('/work-plans', async (req: Request, res: Response) => {
 
 router.put('/work-plans', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.modifyWorkPlan(req.body.steps, req.body.remove_step_counts || [], req.body.session_id);
     res.json(result);
@@ -768,6 +862,7 @@ router.put('/work-plans', async (req: Request, res: Response) => {
 
 router.patch('/work-plans/status', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.setWorkPlanStatus(req.body.updates, req.body.session_id);
     res.json(result);
@@ -780,6 +875,7 @@ router.patch('/work-plans/status', async (req: Request, res: Response) => {
 
 router.post('/send-for-review', async (req: Request, res: Response) => {
   try {
+    if (!(await sessionAccessAllowed(req, res, req.body.session_id, true))) return;
     const svc = await getAgentModeService();
     const result = await svc.sendForReview(
       req.body.subject, req.body.session_id || '',
@@ -807,6 +903,7 @@ router.post('/task-from-template', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { template_id, parameters_json, session_id, attach_previous_task_results, attached_file_urls } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createTaskFromTemplate(
       template_id, parameters_json, userId(req), session_id || '',
       attach_previous_task_results, attached_file_urls || [], req.body.async ?? false
@@ -821,6 +918,7 @@ router.post('/task-from-prompt', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { task_name, prompt, category, session_id, attach_previous_task_results, attached_file_urls } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createTaskFromPrompt(
       task_name, prompt, category, userId(req), session_id || '',
       attach_previous_task_results, attached_file_urls || [], req.body.async ?? false
@@ -835,6 +933,7 @@ router.post('/image-task-from-prompt', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const { task_name, prompt, category, session_id, attach_previous_task_results } = req.body;
+    if (!(await sessionAccessAllowed(req, res, session_id, false))) return;
     const result = await svc.createImageTaskFromPrompt(
       task_name, prompt, category, userId(req), session_id || '',
       attach_previous_task_results
@@ -887,6 +986,43 @@ router.post('/search-leads', async (req: Request, res: Response) => {
     const svc = await getAgentModeService();
     const result = await svc.searchLeads(req.body.list_id, req.body.filters, userId(req), req.body.limit);
     res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── CRM (lead readback, ENG-3021) ──────────────────────────────────────────
+// Read-only. The same handlers Emma's get_leads / get_lead_details tools call, reachable
+// without a model run so a verifier can read stored fields (contactStatus and the
+// unsubscribe evidence) back. The caller is always the authenticated user; the
+// handlers enforce list access, so nothing here trusts an identity from the body.
+
+const isId = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+router.post('/leads', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id)) return res.status(400).json({ message: 'list_id is required' });
+  try {
+    const svc = await getAgentModeService();
+    const options = {
+      ...(typeof body.limit === 'number' ? { limit: body.limit } : {}),
+      ...(typeof body.cursor === 'string' ? { cursor: body.cursor } : {}),
+      ...(typeof body.status === 'string' ? { status: body.status } : {}),
+      ...(typeof body.search === 'string' ? { search: body.search } : {}),
+      ...(body.include_all_fields === true ? { includeAllFields: true } : {}),
+    };
+    res.json(await svc.getLeads(body.list_id, userId(req), options));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/lead-details', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
+  try {
+    const svc = await getAgentModeService();
+    res.json(await svc.getLeadDetails(body.list_id, body.lead_id, userId(req)));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

@@ -5,7 +5,23 @@ import { remotionService, RemotionComposeParams } from "./remotionService";
 import { imageService } from "./imageGeneration";
 import { McpClientService } from "../mcp/client/mcpClientService";
 import { meterUserUsage } from "./usageRecorderService";
-import { videoGenerationCostUsd, videoClipCount, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+import {
+  videoGenerationCostUsd,
+  videoClipCount,
+  omniVideoUsageCostUsd,
+  LLM_PRICE_BOOK_PROVENANCE,
+} from "../utils/llmPricing";
+import {
+  GEMINI_OMNI_VIDEO_MODEL,
+  SEEDANCE_VIDEO_MODEL,
+  VIDEO_MODELS,
+  isSupportedVideoModel,
+  normalizeVideoModel,
+  omniClipDurations,
+  omniDurationParam,
+  OMNI_MAX_CLIP_SECONDS,
+  DEFAULT_VIDEO_SECONDS,
+} from "./videoModels";
 
 interface VideoGenerationResult {
   success: boolean;
@@ -14,16 +30,20 @@ interface VideoGenerationResult {
   /** Present when the video was post-processed by Remotion */
   composedVideoUrl?: string;
   error?: string;
+  /** The model that actually produced the video (after any fallback). */
+  model?: string;
+  /** Actual provider cost in USD when the provider reported usage (Omni). */
+  costUsd?: number;
 }
 
-// Supported video generation models
-const SUPPORTED_MODELS = [
-  "veo-3.1-generate-preview",
-  "veo-3.1-fast-generate-preview",
-  "seedance-2.0",
-] as const;
-
-type SupportedModel = typeof SUPPORTED_MODELS[number];
+// Gemini Interactions API — the only API gemini-omni-1.1-flash accepts
+// (generateContent / predictLongRunning are rejected for it).
+const GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
+// Omni output resolutions. Seedance's 480p (and anything unknown) maps to 720p.
+export const OMNI_RESOLUTIONS = ["360p", "720p", "1080p", "4k"] as const;
+// Omni clips are at most 10s; each is requested at its exact length via
+// response_format.duration ("5s" — see omniDurationParam / omniClipDurations).
+const OMNI_CLIP_SECONDS = OMNI_MAX_CLIP_SECONDS;
 
 // Seedance 2.0 is served only through Higgsfield's hosted MCP server (registered in
 // the admin MCP Servers tab as "higgsfield", OAuth). The name is overridable via env.
@@ -43,7 +63,7 @@ export const SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"] as const;
 export const SEEDANCE_ASPECT_RATIOS = ["auto", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] as const;
 const SEEDANCE_MIN_DURATION = 4;
 const SEEDANCE_MAX_DURATION = 15;
-const DEFAULT_VIDEO_MODEL = "seedance-2.0";
+const DEFAULT_VIDEO_MODEL = SEEDANCE_VIDEO_MODEL;
 
 // Time budgets are LENGTH-DRIVEN — generation time scales with output length (more
 // frames = more compute), so the budget does too. No env knobs: duration is the only
@@ -58,26 +78,30 @@ const DEFAULT_VIDEO_MODEL = "seedance-2.0";
 const budgetSeconds = (durationSeconds?: number): number =>
   Math.max(SEEDANCE_MIN_DURATION, Math.min(SEEDANCE_MAX_DURATION, Math.round(durationSeconds ?? 8)));
 
-/** Veo fallback reserve (ms): scales with clip count (Veo caps at 8s/clip → ceil(secs/8) clips). */
-export function veoFallbackReserveMs(durationSeconds?: number): number {
+/**
+ * Omni fallback reserve (ms): scales with clip count (Omni returns ~10s/clip →
+ * ceil(secs/10) clips). A 360p clip measured 25s end-to-end; 150s/clip leaves room
+ * for 720p+ and frame downloads.
+ */
+export function omniFallbackReserveMs(durationSeconds?: number): number {
   const secs = budgetSeconds(durationSeconds);
-  const clips = secs > 8 ? Math.ceil(secs / 8) : 1;
-  return clips * 150_000; // ~150s per Veo clip (generate + poll)
+  const clips = secs > OMNI_CLIP_SECONDS ? Math.ceil(secs / OMNI_CLIP_SECONDS) : 1;
+  return clips * 150_000;
 }
 
-/** Whole-op wall-clock budget (ms): generous Seedance allowance (base + per-second) plus the Veo reserve. */
+/** Whole-op wall-clock budget (ms): generous Seedance allowance (base + per-second) plus the Omni reserve. */
 export function videoTotalBudgetMs(durationSeconds?: number): number {
   const secs = budgetSeconds(durationSeconds);
   const seedance = 150_000 + secs * 45_000; // base overhead + generous per output-second
-  return seedance + veoFallbackReserveMs(secs);
+  return seedance + omniFallbackReserveMs(secs);
 }
 
 /**
  * Poll budget (ms) for the Seedance attempt: whatever's left before the deadline after
- * reserving the (length-scaled) Veo fallback time. Returns 0 → skip polling, go to Veo.
+ * reserving the (length-scaled) Omni fallback time. Returns 0 → skip polling, go to Omni.
  */
 export function seedancePollBudgetMs(now: number, deadlineMs: number, durationSeconds?: number): number {
-  return Math.max(0, deadlineMs - now - veoFallbackReserveMs(durationSeconds));
+  return Math.max(0, deadlineMs - now - omniFallbackReserveMs(durationSeconds));
 }
 
 /** Time (ms) left until `deadlineMs`, floored at 0. */
@@ -85,20 +109,20 @@ export function remainingBudgetMs(now: number, deadlineMs: number): number {
   return Math.max(0, deadlineMs - now);
 }
 
-// Veo 3.1 only supports a subset of Seedance's aspect ratios (auto / 16:9 / 9:16).
-// The UI offers the full Seedance set; when Seedance fails and we fall back to Veo,
-// map the chosen ratio to the closest Veo-supported one so orientation is preserved.
-export const VEO_ASPECT_RATIOS = ["auto", "16:9", "9:16"] as const;
+// Omni only supports a subset of Seedance's aspect ratios (auto / 16:9 / 9:16).
+// The UI offers the full Seedance set; when Seedance fails and we fall back to Omni,
+// map the chosen ratio to the closest Omni-supported one so orientation is preserved.
+export const OMNI_ASPECT_RATIOS = ["auto", "16:9", "9:16"] as const;
 
 const aspectToNumber = (a: string): number => {
   const [w, h] = a.split(":").map(Number);
   return w && h ? w / h : NaN;
 };
 
-/** Map any Seedance aspect ratio to the nearest Veo-supported ratio (auto/16:9/9:16). */
-export function closestVeoAspectRatio(aspect?: string): string {
+/** Map any Seedance aspect ratio to the nearest Omni-supported ratio (auto/16:9/9:16). */
+export function closestOmniAspectRatio(aspect?: string): string {
   if (!aspect || aspect === "auto") return "auto";
-  if ((VEO_ASPECT_RATIOS as readonly string[]).includes(aspect)) return aspect;
+  if ((OMNI_ASPECT_RATIOS as readonly string[]).includes(aspect)) return aspect;
   const target = aspectToNumber(aspect);
   if (!isFinite(target)) return "auto";
   let best = "16:9";
@@ -169,11 +193,11 @@ interface VideoGenerationParams {
   videoModel?: string; // Optional model parameter - must be one of the supported models
   startFrame?: string; // Optional: URL of the first frame image
   endFrame?: string; // Optional: URL of the last frame image
-  /** Requested duration in seconds (passed to Veo API). Veo supports 5–8s; defaults to 8. */
+  /** Requested total duration in seconds; defaults to 8. */
   durationSeconds?: number;
   /**
    * When true and clipCount > 1, generate N+1 keyframe images before generating clips.
-   * Clip[i] gets startFrame=keyframes[i], endFrame=keyframes[i+1], so Veo interpolates
+   * Clip[i] gets startFrame=keyframes[i], endFrame=keyframes[i+1], so Omni interpolates
    * between AI-generated visual waypoints — producing smooth, visually coherent transitions.
    */
   useKeyframes?: boolean;
@@ -183,12 +207,12 @@ interface VideoGenerationParams {
   composeParams?: Omit<RemotionComposeParams, "clipUrl" | "filename" | "userId">;
   /** Seedance aspect ratio (one of SEEDANCE_ASPECT_RATIOS). Defaults to "auto". */
   aspectRatio?: string;
-  /** Seedance output resolution (one of SEEDANCE_RESOLUTIONS). Defaults to "720p". */
+  /** Output resolution (Seedance: SEEDANCE_RESOLUTIONS; Omni: OMNI_RESOLUTIONS). Defaults to "720p". */
   resolution?: string;
   /**
-   * Internal: absolute epoch-ms hard stop for the WHOLE video op (Seedance + Veo
+   * Internal: absolute epoch-ms hard stop for the WHOLE video op (Seedance + Omni
    * fallback). Set once by generateVideo and propagated through the Seedance attempt
-   * and the Veo fallback so their combined wall-clock stays under the turn cap.
+   * and the Omni fallback so their combined wall-clock stays under the turn cap.
    */
   deadlineMs?: number;
 }
@@ -199,34 +223,22 @@ export class VideoService {
   }
 
   /**
-   * Get the API key from Secrets Manager for a specific model
+   * Get the Google video API key from Secrets Manager (Omni uses the same secret the
+   * retired Veo models did).
    */
-  private async getApiKey(model: string): Promise<string> {
+  private async getApiKey(): Promise<string> {
+    const secretName = process.env.NODE_ENV === "development"
+      ? "dev/AgentWeb/Google/Video"
+      : "prod/AgentWeb/Google/Video";
     try {
-      let secretName: string;
-
-      if (model === "veo-3.1-generate-preview" || model === "veo-3.1-fast-generate-preview") {
-        // Google Veo (both standard and fast models use the same API key)
-        secretName = process.env.NODE_ENV === "development"
-          ? "dev/AgentWeb/Google/Video"
-          : "prod/AgentWeb/Google/Video";
-      } else {
-        // Default to Google Video
-        secretName = process.env.NODE_ENV === "development" 
-          ? "dev/AgentWeb/Google/Video" 
-          : "prod/AgentWeb/Google/Video";
-      }
-      
       const apiKey = await getSecret(secretName);
-      
       if (!apiKey) {
-        throw new Error(`API key not found for model ${model} in secret ${secretName}`);
+        throw new Error(`API key not found in secret ${secretName}`);
       }
-      
       return apiKey;
     } catch (error: any) {
-      console.error(`❌ Failed to get API key for ${model}:`, error.message);
-      throw new Error(`Failed to get API key for ${model}: ${error.message}`);
+      console.error(`❌ Failed to get Google video API key:`, error.message);
+      throw new Error(`Failed to get Google video API key: ${error.message}`);
     }
   }
 
@@ -258,362 +270,144 @@ export class VideoService {
   }
 
   /**
-   * Download a file from Google GenAI and upload to S3
+   * Upload an already-generated (already PAID for) video buffer to S3, retrying a
+   * transient failure so a blip never discards the clip.
    */
-  private async downloadAndUploadVideo(
-    ai: any,
-    file: any,
+  private async uploadVideoBuffer(
+    buffer: Buffer,
     filename: string,
     userId: string
   ): Promise<{ success: boolean; url?: string; error?: string }> {
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const os = require('os');
-      
-      // Create a temporary file path
-      const tempDir = os.tmpdir();
-      const tempFilePath = path.join(tempDir, `video-${Date.now()}-${Math.random().toString(36).substring(7)}.mp4`);
-      
+    const MAX_ATTEMPTS = 3;
+    let lastError = "Failed to upload video to S3";
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        // Use the SDK's download method to save the file
-        // Based on the sample: ai.files.download({ file, downloadPath })
-        await ai.files.download({
-          file: file,
-          downloadPath: tempFilePath,
-        });
-
-        // Read the downloaded file
-        const videoBuffer = fs.readFileSync(tempFilePath);
-        
-        // Upload to S3
-        const uploadResult = await uploadFileToS3(
-          videoBuffer,
-          filename,
-          userId,
-          'video/mp4'
-        );
-
-        // Clean up temporary file
-        try {
-          fs.unlinkSync(tempFilePath);
-        } catch (cleanupError) {
-          console.warn('Failed to cleanup temp file:', cleanupError);
-        }
-
+        const uploadResult = await uploadFileToS3(buffer, filename, userId, "video/mp4");
         if (uploadResult.success && uploadResult.url) {
-          return {
-            success: true,
-            url: uploadResult.url
-          };
-        } else {
-          return {
-            success: false,
-            error: uploadResult.error || 'Failed to upload video to S3'
-          };
+          return { success: true, url: uploadResult.url };
         }
-      } catch (downloadError: any) {
-        // Clean up temp file if it was created
-        try {
-          if (fs.existsSync(tempFilePath)) {
-            fs.unlinkSync(tempFilePath);
-          }
-        } catch (cleanupError) {
-          // Ignore cleanup errors
-        }
-        
-        // Fallback: try to download via HTTP if SDK download fails
-        if (file.uri) {
-          console.log('Falling back to HTTP download...');
-          const apiKey = await this.getApiKey('veo-3.1-generate-preview');
-          const downloadResponse = await axios.get(file.uri, {
-            responseType: 'arraybuffer',
-            headers: {
-              'Authorization': `Bearer ${apiKey}`
-            },
-            timeout: 300000, // 5 minutes timeout for video downloads
-          });
-          
-          const buffer = Buffer.from(downloadResponse.data as ArrayBuffer);
-          
-          // Upload to S3
-          const uploadResult = await uploadFileToS3(
-            buffer,
-            filename,
-            userId,
-            'video/mp4'
-          );
-
-          if (uploadResult.success && uploadResult.url) {
-            return {
-              success: true,
-              url: uploadResult.url
-            };
-          } else {
-            return {
-              success: false,
-              error: uploadResult.error || 'Failed to upload video to S3'
-            };
-          }
-        } else {
-          throw downloadError;
-        }
+        lastError = uploadResult.error || lastError;
+      } catch (error: any) {
+        lastError = `Failed to upload video to S3: ${error.message}`;
       }
-    } catch (error: any) {
-      console.error('❌ Failed to download and upload video:', error.message);
-      return {
-        success: false,
-        error: `Failed to download and upload video: ${error.message}`
-      };
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`VideoService: S3 upload attempt ${attempt}/${MAX_ATTEMPTS} failed (${lastError}); retrying`);
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
     }
+    return { success: false, error: lastError };
   }
 
   /**
-   * Generate a video using Google Veo 3.1
+   * Generate ONE clip with gemini-omni-1.1-flash via the Gemini Interactions API.
+   *
+   * The call is synchronous: the response carries the finished clip as base64 in
+   * steps[].content[] ({type:"video", data}). Image parts go first (start frame,
+   * then end frame for interpolation), followed by the text prompt. There is no
+   * fallback model: a quota or API error fails clearly.
    */
-  private async generateWithVeo31(params: VideoGenerationParams): Promise<VideoGenerationResult> {
+  private async generateWithOmni(params: VideoGenerationParams): Promise<VideoGenerationResult> {
+    const model = GEMINI_OMNI_VIDEO_MODEL;
     try {
-      const { GoogleGenAI } = require('@google/genai');
-      
-      const apiKey = await this.getApiKey("veo-3.1-generate-preview");
-      let ai = new GoogleGenAI({
-        apiKey: apiKey,
-      });
-
-      const model = 'veo-3.1-generate-preview';
-      
-      // Prepare the generation config
-      const config: any = {};
-      
-      // Process start frame (first_frame) if provided
-      // The generateVideos API expects image as Image type with imageBytes (base64) and mimeType
-      let firstFrameImage: { imageBytes: string; mimeType: string } | null = null;
-      if (params.startFrame) {
-        try {
-          const processedImage = await this.processInputImage(params.startFrame);
-          
-          // Convert buffer to base64 for the API
-          // The SDK expects Image type with imageBytes (base64) and mimeType
-          const base64String = processedImage.buffer.toString('base64');
-          
-          firstFrameImage = {
-            imageBytes: base64String,
-            mimeType: processedImage.mimeType,
-          };
-        } catch (error: any) {
-          console.error(`❌ Failed to process start frame:`, error.message);
-          return {
-            success: false,
-            error: `Failed to process start frame: ${error.message}`
-          };
-        }
-      }
-
-      // Process end frame (lastFrame) if provided
-      // The generateVideos API expects lastFrame in config (camelCase for Node SDK)
-      // Using imageBytes like the start frame - both use Image_2 type with {imageBytes: string, mimeType: string}
-      let lastFrameImage: { imageBytes: string; mimeType: string } | null = null;
-      if (params.endFrame) {
-        try {
-          const processedImage = await this.processInputImage(params.endFrame);
-          
-          // Convert buffer to base64 for the API
-          const base64String = processedImage.buffer.toString('base64');
-          
-          lastFrameImage = {
-            imageBytes: base64String,
-            mimeType: processedImage.mimeType,
-          };
-        } catch (error: any) {
-          console.error(`❌ Failed to process end frame:`, error.message);
-          return {
-            success: false,
-            error: `Failed to process end frame: ${error.message}`
-          };
-        }
-      }
-
-      // Build the generation request
-      // Based on the Python sample: client.models.generate_videos(model="veo-3.1-generate-preview", prompt=prompt, image=first_image, config=types.GenerateVideosConfig(last_frame=last_image))
-      // Note: In Node.js SDK, use camelCase 'lastFrame' (not snake_case 'last_frame') and 'imageBytes' (not 'bytesBase64Encoded')
-      const generateRequest: any = {
-        model: model,
-        prompt: params.prompt,
-      };
-
-      // Add start frame (image) if provided
-      if (firstFrameImage) {
-        generateRequest.image = firstFrameImage;
-      }
-
-      // Add end frame to config if provided
-      // Note: Use camelCase 'lastFrame' (not 'last_frame')
-      if (lastFrameImage) {
-        config.lastFrame = lastFrameImage;
-      }
-
-      // Honor the requested aspect ratio, mapped to the nearest Veo-supported value
-      // (the UI offers the full Seedance set; Veo only does 16:9/9:16). 'auto' is left
-      // unset so Veo defaults / matches the input frame.
-      const veoAspect = closestVeoAspectRatio(params.aspectRatio);
-      if (veoAspect === "16:9" || veoAspect === "9:16") {
-        config.aspectRatio = veoAspect;
-        console.log(`VideoService: Veo aspect ratio set to ${veoAspect} (from requested "${params.aspectRatio ?? "auto"}")`);
-      }
-
-      // Add duration if provided (Veo supports 5–8 seconds)
-      if (params.durationSeconds) {
-        config.durationSeconds = Math.min(8, Math.max(5, params.durationSeconds));
-        console.log(`VideoService: Requesting durationSeconds=${config.durationSeconds} from Veo`);
-      }
-
-      // Add config if we have any config options (including lastFrame)
-      if (Object.keys(config).length > 0) {
-        generateRequest.config = config;
-      }
-
-      // Start the video generation operation
-      let operation;
-      try {
-        operation = await ai.models.generateVideos(generateRequest);
-      } catch (error: any) {
-        // Check if it's a quota exhausted error (429)
-        // Error can be: error.status === 429, error.error?.code === 429, or error.message contains quota/exceeded
-        const isQuotaError = error.status === 429 || 
-                             error.error?.code === 429 || 
-                             (error.message && typeof error.message === 'string' && error.message.includes('quota') && error.message.includes('exceeded'));
-        
-        if (isQuotaError) {
-          console.log('⚠️ Quota exhausted for veo-3.1-generate-preview, falling back to veo-3.1-fast-generate-preview...');
-          
-          // Fallback to fast model
-          const fastModel = 'veo-3.1-fast-generate-preview';
-          const fastApiKey = await this.getApiKey(fastModel);
-          const fastAi = new GoogleGenAI({
-            apiKey: fastApiKey,
-          });
-          
-          // Update the request to use the fast model
-          generateRequest.model = fastModel;
-          
-          console.log('Retrying with fast model:', fastModel);
-          operation = await fastAi.models.generateVideos(generateRequest);
-          
-          // Use the fast AI client for polling too
-          ai = fastAi;
-        } else {
-          // Re-throw if it's not a quota error
-          throw error;
-        }
-      }
-      
-      // Poll the operation status until the video is ready.
-      // Bound by the whole-op deadline (shared with any Seedance attempt that ran
-      // first) so the turn never overruns the agent-mode cap; the attempt count is a
-      // secondary safety cap. When called standalone (no deadline) fall back to 20 min.
-      const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
       const deadlineMs = params.deadlineMs ?? (Date.now() + videoTotalBudgetMs(params.durationSeconds));
-      let pollAttempts = 0;
-
-      while (!operation.done && pollAttempts < maxPollAttempts && Date.now() < deadlineMs) {
-        console.log(`Waiting for video generation to complete... (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
-        await new Promise((resolve) => setTimeout(resolve, 10000)); // Wait 10 seconds
-
-        operation = await ai.operations.getVideosOperation({
-          operation: operation,
-        });
-
-        pollAttempts++;
+      if (remainingBudgetMs(Date.now(), deadlineMs) <= 0) {
+        return { success: false, model, error: "Video generation exceeded its time budget" };
       }
 
-      if (!operation.done) {
-        const budgetExceeded = Date.now() >= deadlineMs;
-        console.warn(
-          `VideoService: Veo generation did not finish — ${budgetExceeded ? 'exceeded its time budget' : 'timed out after 20 minutes'} ` +
-          `(${pollAttempts} poll attempts)`
-        );
-        return {
-          success: false,
-          error: budgetExceeded
-            ? 'Video generation exceeded its time budget'
-            : 'Video generation timed out after 20 minutes'
-        };
+      const apiKey = await this.getApiKey();
+
+      // Frames, in order: first, then last (interpolation) — then the prompt text.
+      const imageParts: Array<{ type: "image"; data: string; mime_type: string }> = [];
+      for (const [label, url] of [["start", params.startFrame], ["end", params.endFrame]] as const) {
+        if (!url) continue;
+        try {
+          const img = await this.processInputImage(url);
+          imageParts.push({ type: "image", data: img.buffer.toString("base64"), mime_type: img.mimeType });
+        } catch (error: any) {
+          return { success: false, model, error: `Failed to process ${label} frame: ${error.message}` };
+        }
+      }
+      const input = imageParts.length
+        ? [...imageParts, { type: "text", text: params.prompt }]
+        : params.prompt;
+
+      const responseFormat: Record<string, string> = {
+        type: "video",
+        resolution: (OMNI_RESOLUTIONS as readonly string[]).includes(params.resolution as string)
+          ? (params.resolution as string)
+          : "720p",
+      };
+      if (typeof params.durationSeconds === "number" && Number.isFinite(params.durationSeconds)) {
+        responseFormat.duration = omniDurationParam(params.durationSeconds);
+      }
+      // 'auto' is left unset so Omni defaults / matches the input frame.
+      const aspect = closestOmniAspectRatio(params.aspectRatio);
+      if (aspect === "16:9" || aspect === "9:16") {
+        responseFormat.aspect_ratio = aspect;
       }
 
-      // Check if there was an error
-      if (operation.error) {
-        return {
-          success: false,
-          error: `Video generation failed: ${JSON.stringify(operation.error)}`
-        };
-      }
-
-      // Check if videos were filtered by RAI policies
-      if (operation.response?.raiMediaFilteredCount && operation.response.raiMediaFilteredCount > 0) {
-        const reasons = operation.response.raiMediaFilteredReasons || [];
-        const errorMessage = reasons.length > 0 
-          ? reasons.join(' ') 
-          : 'Video generation was filtered by content policies';
-        return {
-          success: false,
-          error: errorMessage
-        };
-      }
-
-      // Check if generation was successful
-      if (!operation.response || !operation.response.generatedVideos || operation.response.generatedVideos.length === 0) {
-        return {
-          success: false,
-          error: 'Video generation completed but no video was returned'
-        };
-      }
-
-      // Get the generated video
-      const generatedVideo = operation.response.generatedVideos[0];
-      if (!generatedVideo.video) {
-        return {
-          success: false,
-          error: 'Video generation completed but video file is missing'
-        };
-      }
-
-      // Download and upload the video to S3
-      console.log('Downloading generated video...');
-      const uploadResult = await this.downloadAndUploadVideo(
-        ai,
-        generatedVideo.video,
-        params.filename,
-        params.userId
+      const timeoutMs = remainingBudgetMs(Date.now(), deadlineMs);
+      console.log(
+        `VideoService: Omni request (${imageParts.length} frame(s), ${responseFormat.resolution}, ` +
+        `duration=${responseFormat.duration ?? "default"}, ` +
+        `aspect=${responseFormat.aspect_ratio ?? "auto"}, timeout=${Math.round(timeoutMs / 1000)}s)`
+      );
+      const response = await axios.post(
+        GEMINI_INTERACTIONS_URL,
+        { model, input, response_format: responseFormat },
+        {
+          params: { key: apiKey },
+          headers: { "Content-Type": "application/json" },
+          timeout: timeoutMs,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+        }
       );
 
-      if (!uploadResult.success || !uploadResult.url) {
+      const data: any = response.data;
+      if (data?.status !== "completed") {
         return {
           success: false,
-          error: uploadResult.error || 'Failed to upload video to S3'
+          model,
+          error: `Omni video generation did not complete (status: ${data?.status ?? "unknown"})`,
         };
       }
+      const video = (Array.isArray(data.steps) ? data.steps : [])
+        .flatMap((step: any) => (Array.isArray(step?.content) ? step.content : []))
+        .find((part: any) => part?.type === "video" && typeof part.data === "string" && part.data.length > 0);
+      if (!video) {
+        return { success: false, model, error: "Video generation completed but no video was returned" };
+      }
 
+      const costUsd = omniVideoUsageCostUsd(data.usage);
+      const upload = await this.uploadVideoBuffer(Buffer.from(video.data, "base64"), params.filename, params.userId);
+      if (!upload.success || !upload.url) {
+        return { success: false, model, error: upload.error || "Failed to upload video to S3" };
+      }
       return {
         success: true,
-        videoUrl: uploadResult.url,
-        filename: params.filename
+        model,
+        videoUrl: upload.url,
+        filename: params.filename,
+        costUsd,
       };
-
     } catch (error: any) {
-      // Check if it's a quota exhausted error that wasn't caught earlier
-      if (error.status === 429 || (error.error?.code === 429) || (error.message?.includes('quota') && error.message?.includes('exceeded'))) {
-        console.log('⚠️ Quota exhausted error caught in outer catch, this should have been handled earlier');
+      const status = error?.response?.status;
+      const apiMessage = error?.response?.data?.error?.message;
+      if (status === 429) {
+        console.error(`❌ ${model} quota exhausted (HTTP 429): ${apiMessage ?? error.message}`);
         return {
           success: false,
-          error: `Video generation quota exhausted. Please try again later or contact support.`
+          model,
+          error: `Video generation quota exhausted for ${model}. Please try again later or contact support.`,
         };
       }
-      
-      console.error('❌ Error generating video with Veo 3.1:', error);
-      return {
-        success: false,
-        error: `Failed to generate video: ${error.message || 'Unknown error'}`
-      };
+      if (error?.code === "ECONNABORTED") {
+        return { success: false, model, error: "Video generation exceeded its time budget" };
+      }
+      const detail = apiMessage || error?.message || "Unknown error";
+      console.error(`❌ Error generating video with ${model}${status ? ` (HTTP ${status})` : ""}:`, detail);
+      return { success: false, model, error: `Failed to generate video: ${detail}` };
     }
   }
 
@@ -629,7 +423,7 @@ export class VideoService {
   ): Promise<{ success: boolean; url?: string; error?: string }> {
     // The source clip is already generated (and, for Seedance, already PAID for) by the
     // time we get here. A transient download/S3 hiccup must not bubble up as a generation
-    // failure — that would trigger a full Veo regen and double-charge. Retry a few times
+    // failure — that would trigger a full Omni regen and double-charge. Retry a few times
     // with backoff so only a persistent failure surfaces.
     const MAX_ATTEMPTS = 3;
     let lastError = "Failed to download video to S3";
@@ -727,15 +521,15 @@ export class VideoService {
         }
 
         // Poll job_status until terminal. completed = done; failed/canceled/nsfw =
-        // terminal failure; ip_detected = gated (treated as failure → Veo fallback).
+        // terminal failure; ip_detected = gated (treated as failure → Omni fallback).
         // Bounded by a wall-clock budget that stays under the agent-mode cap.
         const maxPollAttempts = 240; // safety cap; the real bound is the time budget
         const failStates = new Set(["failed", "canceled", "nsfw"]);
-        // Grant Seedance only what we can spend while still reserving time for a Veo
-        // fallback before the whole-op deadline — so a Seedance hang can't starve Veo.
+        // Grant Seedance only what we can spend while still reserving time for an Omni
+        // fallback before the whole-op deadline — so a Seedance hang can't starve Omni.
         const pollBudgetMs = params.deadlineMs !== undefined
           ? seedancePollBudgetMs(Date.now(), params.deadlineMs, params.durationSeconds)
-          : (videoTotalBudgetMs(params.durationSeconds) - veoFallbackReserveMs(params.durationSeconds));
+          : (videoTotalBudgetMs(params.durationSeconds) - omniFallbackReserveMs(params.durationSeconds));
         const deadline = Date.now() + pollBudgetMs;
         console.log(`VideoService: Seedance job ${jobId} polling with a ${Math.round(pollBudgetMs / 1000)}s budget (requested ${params.durationSeconds ?? 8}s video)`);
         let status = (submitGen?.status || "").toString().toLowerCase();
@@ -764,10 +558,10 @@ export class VideoService {
         }
 
         if (timedOut && status !== "completed") {
-          const remainingForVeo = params.deadlineMs !== undefined ? remainingBudgetMs(Date.now(), params.deadlineMs) : 0;
+          const remainingForOmni = params.deadlineMs !== undefined ? remainingBudgetMs(Date.now(), params.deadlineMs) : 0;
           console.warn(
             `VideoService: Seedance job ${jobId} exceeded its ${Math.round(pollBudgetMs / 1000)}s budget ` +
-            `(last status "${status}") — failing over to Veo with ~${Math.round(remainingForVeo / 1000)}s left`
+            `(last status "${status}") — failing over to Omni with ~${Math.round(remainingForOmni / 1000)}s left`
           );
           return {
             ok: false as const,
@@ -814,7 +608,7 @@ export class VideoService {
     } catch (error: any) {
       const detail = error?.message || String(error);
       console.error("❌ Error generating video with Seedance (Higgsfield MCP):", detail);
-      // Surface auth/credit problems clearly so the Veo fallback can engage.
+      // Surface auth/credit problems clearly so the Omni fallback can engage.
       return { success: false, error: `Seedance (Higgsfield MCP) failed: ${detail}` };
     }
   }
@@ -905,32 +699,31 @@ export class VideoService {
   ): Promise<VideoGenerationResult> {
     try {
       // Determine which model to use before validation.
-      // Seedance 2.0 is the default for all video generation; Veo 3.1 is an
-      // automatic fallback if Seedance fails (see the generation branch below).
-      if (!params.videoModel) {
-        params.videoModel = DEFAULT_VIDEO_MODEL;
-      }
+      // Seedance 2.0 is the default for all video generation; gemini-omni-1.1-flash is
+      // an automatic fallback if Seedance fails (see the generation branch below).
+      // Retired Veo ids (stored settings / old callers) resolve to Omni.
+      params.videoModel = normalizeVideoModel(params.videoModel) || DEFAULT_VIDEO_MODEL;
 
-      // Establish the whole-op deadline ONCE, on the first (Seedance) call. The Veo
+      // Establish the whole-op deadline ONCE, on the first (Seedance) call. The Omni
       // fallback re-enters generateVideo with the same params, so this carries over —
-      // Seedance + Veo together are bounded by VIDEO_TOTAL_BUDGET_MS (< the turn cap).
+      // Seedance + Omni together are bounded by videoTotalBudgetMs (< the turn cap).
       if (params.deadlineMs === undefined) {
         const total = videoTotalBudgetMs(params.durationSeconds);
-        const veoReserve = veoFallbackReserveMs(params.durationSeconds);
+        const omniReserve = omniFallbackReserveMs(params.durationSeconds);
         params.deadlineMs = Date.now() + total;
         console.log(
           `VideoService: length-driven budget for ${params.durationSeconds ?? 8}s video → ` +
           `total=${Math.round(total / 1000)}s ` +
-          `(Seedance up to ~${Math.round((total - veoReserve) / 1000)}s, ` +
-          `~${Math.round(veoReserve / 1000)}s reserved for Veo fallback)`
+          `(Seedance up to ~${Math.round((total - omniReserve) / 1000)}s, ` +
+          `~${Math.round(omniReserve / 1000)}s reserved for Omni fallback)`
         );
       }
 
       // Validate the provided model
-      if (!SUPPORTED_MODELS.includes(params.videoModel as SupportedModel)) {
+      if (!isSupportedVideoModel(params.videoModel)) {
         return {
           success: false,
-          error: `Invalid videoModel '${params.videoModel}'. Must be one of: ${SUPPORTED_MODELS.join(", ")}`,
+          error: `Invalid videoModel '${params.videoModel}'. Must be one of: ${VIDEO_MODELS.join(", ")}`,
         };
       }
       
@@ -957,59 +750,47 @@ export class VideoService {
       // Determine which model to use for generation
       const modelToUse = params.videoModel;
       
-      // Determine how many clips to generate
-      // Veo supports max 8s per clip; for longer videos generate multiple clips in parallel.
-      // Per-clip playback durations can be variable (e.g. [8,8,8,6] for a 30s video).
-      const VEO_MAX_SECONDS = 8;
-      const VEO_MIN_SECONDS = 4;
-      const requestedDuration = params.durationSeconds ?? VEO_MAX_SECONDS;
-
-      // Each Veo clip is generated at VEO_MAX_SECONDS (snapped up per spec).
-      // The playback duration per clip may be shorter for the last clip to hit the exact target.
-      const clipCount = requestedDuration > VEO_MAX_SECONDS ? Math.ceil(requestedDuration / VEO_MAX_SECONDS) : 1;
-      const veoGenerateDuration = VEO_MAX_SECONDS; // always ask Veo for 8s per clip
-      // Playback durations: all full-length except possibly the last
-      const remainder = requestedDuration - (clipCount - 1) * VEO_MAX_SECONDS;
-      const lastClipPlayback = Math.max(VEO_MIN_SECONDS, Math.min(VEO_MAX_SECONDS, remainder));
-      const clipPlaybackDurations: number[] = Array.from({ length: clipCount }, (_, i) =>
-        i === clipCount - 1 ? lastClipPlayback : VEO_MAX_SECONDS
-      );
-
-      console.log(`VideoService: Generating ${clipCount} clip(s) for requested ${requestedDuration}s, playback=[${clipPlaybackDurations.join(',')}]s`);
+      // Determine how many clips to generate.
+      // Omni clips are <=10s; longer videos are split into clips generated in parallel,
+      // each requested at its exact length (e.g. [10,10,10] / [10,4] / [10,8,3] for 30s / 14s / 21s).
+      const requestedDuration = params.durationSeconds ?? DEFAULT_VIDEO_SECONDS;
+      const clipPlaybackDurations = omniClipDurations(requestedDuration);
+      const clipCount = clipPlaybackDurations.length;
 
       // Generate video
       let result: VideoGenerationResult;
       try {
         let clipUrls: string[] = [];
         // Per-clip playback durations + the max-clip cap passed to Remotion.
-        // Default to the Veo per-8s-clip model; Seedance overrides both below since it
+        // Default to the Omni per-10s-clip model; Seedance overrides both below since it
         // returns ONE clip of the full (≤15s) length.
         let composeClipDurations: number[] = clipPlaybackDurations;
-        let composeMaxClipSeconds = VEO_MAX_SECONDS;
+        let composeMaxClipSeconds = OMNI_CLIP_SECONDS;
 
         if (isHiggsfieldModel(modelToUse)) {
           // Seedance (Higgsfield MCP) generates a single clip per request and handles its
-          // own duration; multi-clip Veo composition does not apply here.
+          // own duration; multi-clip Omni composition does not apply here.
           result = await this.generateWithHiggsfield({ ...params, durationSeconds: requestedDuration });
           if (!result.success) {
             // Automatic fallback: if Seedance fails (auth/credits/job error/timeout),
-            // regenerate with Veo 3.1 so video generation still succeeds.
+            // regenerate with gemini-omni-1.1-flash so video generation still succeeds.
             console.warn(
-              `VideoService: Seedance generation failed (${result.error}); falling back to Veo 3.1`
+              `VideoService: Seedance generation failed (${result.error}); falling back to ${GEMINI_OMNI_VIDEO_MODEL}`
             );
-            return await this.generateVideo({ ...params, videoModel: "veo-3.1-generate-preview" });
+            return await this.generateVideo({ ...params, videoModel: GEMINI_OMNI_VIDEO_MODEL });
           }
           if (result.videoUrl) {
             clipUrls = [result.videoUrl];
             // ONE real clip of the full requested length (clamped to Seedance's range).
-            // Override the Veo [8,6]-style split so compose renders all paid seconds,
-            // and lift the 8s clip cap to Seedance's 15s max.
+            // Override the Omni [10,4]-style split so compose renders all paid seconds,
+            // and lift the clip cap to Seedance's 15s max.
             composeClipDurations = [budgetSeconds(requestedDuration)];
             composeMaxClipSeconds = SEEDANCE_MAX_DURATION;
           }
-        } else if (modelToUse === "veo-3.1-generate-preview") {
+        } else if (modelToUse === GEMINI_OMNI_VIDEO_MODEL) {
+          console.log(`VideoService: Generating ${clipCount} Omni clip(s) for requested ${requestedDuration}s, playback=[${clipPlaybackDurations.join(',')}]s`);
           if (clipCount === 1) {
-            result = await this.generateWithVeo31({ ...params, durationSeconds: veoGenerateDuration });
+            result = await this.generateWithOmni({ ...params, durationSeconds: clipPlaybackDurations[0] });
             if (result.success && result.videoUrl) {
               clipUrls = [result.videoUrl];
             }
@@ -1021,13 +802,13 @@ export class VideoService {
               keyframes = await this.generateKeyframes(params.prompt, clipCount, filenameBase, params.userId);
             }
 
-            // Generate all clips concurrently at full Veo duration; playback trimming happens in Remotion
+            // Generate all clips concurrently; playback trimming happens in Remotion
             const clipResults = await Promise.all(
               Array.from({ length: clipCount }, (_, i) =>
-                this.generateWithVeo31({
+                this.generateWithOmni({
                   ...params,
-                  durationSeconds: veoGenerateDuration,
                   filename: `${filenameBase}_clip${i + 1}.mp4`,
+                  durationSeconds: clipPlaybackDurations[i],
                   // Keyframe steering: clip[i] goes from frame[i] to frame[i+1]
                   startFrame: keyframes ? keyframes[i] : params.startFrame,
                   endFrame: keyframes ? keyframes[i + 1] : params.endFrame,
@@ -1041,7 +822,11 @@ export class VideoService {
               result = failed;
             } else {
               clipUrls = clipResults.map((r) => r.videoUrl!);
-              result = { success: true, videoUrl: clipUrls[0], filename: params.filename };
+              // Actual cost only when EVERY clip reported usage; otherwise estimate.
+              const costUsd = clipResults.every((r) => typeof r.costUsd === "number")
+                ? clipResults.reduce((acc, r) => acc + (r.costUsd as number), 0)
+                : undefined;
+              result = { success: true, videoUrl: clipUrls[0], filename: params.filename, costUsd };
             }
           }
         } else {
@@ -1053,8 +838,8 @@ export class VideoService {
 
         // Stitch/compose with Remotion when needed:
         //  - branded composition when compose+composeParams are supplied, OR
-        //  - a plain concatenation whenever there is >1 clip (e.g. a >8s Veo fallback),
-        //    so multi-clip videos aren't silently truncated to the first 8s clip.
+        //  - a plain concatenation whenever there is >1 clip (e.g. a >10s Omni fallback),
+        //    so multi-clip videos aren't silently truncated to the first clip.
         // For the plain-concat case we pass empty branding; the composition skips the
         // intro overlay when brandName is empty (acts as a pure concatenator).
         const needsBranding = !!(params.compose && params.composeParams);
@@ -1067,9 +852,9 @@ export class VideoService {
             clipUrl: clipUrls[0],
             extraClipUrls: clipUrls.slice(1),
             // Pass per-clip playback durations so Remotion places each clip exactly
-            // (e.g. [8,8,8,6] for a 30s Veo video; [14] for a single 14s Seedance clip)
+            // (e.g. [10,10,10] for a 30s Omni video; [14] for a single 14s Seedance clip)
             clipDurationsSeconds: composeClipDurations,
-            // Max single-clip length (Veo=8s, Seedance=15s) so Remotion's clamp matches the provider
+            // Max single-clip length (Omni=10s, Seedance=15s) so Remotion's clamp matches the provider
             maxClipSeconds: composeMaxClipSeconds,
             filename: params.filename,
             userId: params.userId,
@@ -1091,20 +876,24 @@ export class VideoService {
         }
 
         // Meter ONCE per successful generation at the source so every caller is charged
-        // exactly once. The Seedance->Veo fallback re-enters generateVideo, so only the
-        // terminal successful model reaches here. Video bills per 8s clip; charge the per-clip
-        // dollar cost to the user's cap when a userId is present (all-cost-to-user policy).
+        // exactly once. The Seedance->Omni fallback re-enters generateVideo, so only the
+        // terminal successful model reaches here. Omni bills on the provider-reported
+        // usage when present; otherwise (and for Seedance) the per-clip price book applies.
         if (result.success && result.videoUrl) {
+          const costUsd = result.costUsd ?? videoGenerationCostUsd(modelToUse, requestedDuration);
+          result = { ...result, model: modelToUse, costUsd };
           void meterUserUsage({
             userId: params.userId,
             model: modelToUse,
             provider: isHiggsfieldModel(modelToUse) ? "higgsfield" : "google",
             feature: "video_generation",
+            // Tokens stay 0: video is per-generation priced and its output tokens
+            // must not count against the user's token allowance (ENG-1691).
             inputTokens: 0,
             outputTokens: 0,
-            costUsdOverride: videoGenerationCostUsd(modelToUse, requestedDuration),
+            costUsdOverride: costUsd,
             costProvenance: LLM_PRICE_BOOK_PROVENANCE,
-            generationCount: videoClipCount(requestedDuration),
+            generationCount: videoClipCount(requestedDuration, modelToUse),
           });
         }
 
@@ -1131,7 +920,7 @@ export class VideoService {
   async isAvailable(): Promise<boolean> {
     try {
       // Try to get the API key to verify the service is configured
-      await this.getApiKey("veo-3.1-generate-preview");
+      await this.getApiKey();
       return true;
     } catch (error: any) {
       console.warn("⚠️ Video generation service not available:", error.message);

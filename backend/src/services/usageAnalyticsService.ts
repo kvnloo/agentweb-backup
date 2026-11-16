@@ -323,7 +323,6 @@ export const METERED_VENDOR_PROVIDERS = [
   "twitter",
   "v0",
   "you.com",
-  "google_cse",
   "apollo",
   "enrich.so",
   "enigma",
@@ -331,6 +330,7 @@ export const METERED_VENDOR_PROVIDERS = [
   "elevenlabs",
   "2captcha",
   "placid",
+  "twilio",
 ] as const;
 
 /** Non-vendor scopes the aggregation accepts alongside a vendor key. */

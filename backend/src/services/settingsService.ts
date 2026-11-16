@@ -74,6 +74,11 @@ export class SettingsService {
     this.tableName = `${TABLE_PREFIX}AW-Settings`;
   }
 
+  /** The AW-Settings table this service reads and writes (Dev- prefixed only when NODE_ENV is 'development'). */
+  getTableName(): string {
+    return this.tableName;
+  }
+
   async getSetting(settingName: string): Promise<Setting | null> {
     try {
       const params = {
@@ -89,6 +94,12 @@ export class SettingsService {
       console.error('Error getting setting:', error);
       throw error;
     }
+  }
+
+  /** Like `getSetting` but strongly consistent: for decisions that must see a change made a moment ago (a kill switch). */
+  async getSettingConsistent(settingName: string): Promise<Setting | null> {
+    const result = await dynamodb.get({ TableName: this.tableName, Key: { settingName }, ConsistentRead: true }).promise();
+    return (result.Item as Setting) || null;
   }
 
   async getSettings(settingNames: string[]): Promise<Setting[]> {
@@ -317,6 +328,42 @@ export class SettingsService {
     }).promise();
     // Only reached when the conditional write succeeded (ENG-2145).
     void recordSettingChange(settingName, 'set', settingValue);
+  }
+
+  /**
+   * Create a setting only if no row exists. Returns false (and writes nothing) when one
+   * does, so two concurrent callers can never both win.
+   */
+  async setSettingIfAbsent(
+    settingName: string,
+    settingValue: string,
+    description?: string,
+    updatedBy: string = 'system',
+    ttl?: number,
+  ): Promise<boolean> {
+    if (ttl !== undefined && !Number.isFinite(ttl)) {
+      throw new Error(`Invalid ttl for setting "${settingName}": must be a finite epoch-second number, got ${ttl}`);
+    }
+    const setting: Setting = {
+      settingName,
+      settingValue,
+      description,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+      ...(ttl !== undefined ? { ttl } : {}),
+    };
+    try {
+      await dynamodb.put({
+        TableName: this.tableName,
+        Item: setting,
+        ConditionExpression: 'attribute_not_exists(settingName)',
+      }).promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+    void recordSettingChange(settingName, 'set', settingValue);
+    return true;
   }
 
   /** Delete counterpart of `setSettingIfValueMatches` — see its doc comment. */

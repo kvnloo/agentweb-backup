@@ -23,6 +23,12 @@ jest.mock('../services/resendService', () => ({
   resendService: { sendEmail: jest.fn() },
 }));
 
+// ENG-2205: LinkedIn step account ids are checked against the caller's own/org-shared accounts.
+const mockResolveLinkedInAccountForWrite = jest.fn();
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+}));
+
 jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
 }));
@@ -293,6 +299,177 @@ describe('POST / - create sequence', () => {
   it('rejects empty string name', async () => {
     const res = await request(app).post('/').send({ name: '   ' });
     expect(res.status).toBe(400);
+  });
+
+  describe('LinkedIn step account authorization (ENG-2205)', () => {
+    const liStep = (linkedInAccountId?: unknown) => ({
+      stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0, messageText: 'hi',
+      ...(linkedInAccountId !== undefined ? { linkedInAccountId } : {}),
+    });
+    beforeEach(() => {
+      mockResolveLinkedInAccountForWrite.mockReset();
+      (dripSequenceDb.createSequence as jest.Mock).mockClear();
+    });
+
+    it('creates the sequence when the pinned account is the caller\'s own or org-shared', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('my-acct')] });
+      expect(res.status).toBe(201);
+      expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('user-123', 'my-acct');
+    });
+
+    it('refuses with 403 and stores nothing when a step names an account the caller does not own (e.g. the pool)', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('pool-or-foreign-acct')] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+    });
+
+    it('refuses a non-string account id', async () => {
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep({ $ne: null })] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+    });
+
+    it('does not run the check for auto-resolved steps (no pinned account), email steps, or no steps', async () => {
+      for (const body of [
+        { name: 'A', steps: [liStep()] },
+        { name: 'B', steps: [liStep(''), { stepNumber: 2, name: 'Mail', delayDays: 1, subject: 's', bodyHtml: '<p>x</p>' }] },
+        { name: 'C' },
+      ]) {
+        const res = await request(app).post('/').send(body);
+        expect(res.status).toBe(201);
+      }
+      expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    });
+
+    it('PUT refuses with 403 and does not update when a step names a foreign account', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+      (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+      const res = await request(app).put('/seq_1').send({ steps: [liStep('foreign-acct')] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+    });
+
+    it('PUT accepts an owned pinned account', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+      const res = await request(app).put('/seq_1').send({ steps: [liStep('my-acct')] });
+      expect(res.status).toBe(200);
+    });
+
+    // A pin already stored on the caller's own sequence must not block an unrelated edit just because the
+    // account was disconnected since (it no longer resolves). Sending is still blocked: the drip worker
+    // re-checks the pin at send time.
+    describe('PUT with a pin already stored on the sequence', () => {
+      const storedWith = (pin: string, userId = 'user-123') => ({
+        ...mockSequence,
+        userId,
+        steps: [{ stepId: 's1', stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0, messageText: 'hi', linkedInAccountId: pin }],
+      });
+
+      it('saves an unrelated edit when the stored pin no longer resolves (account since disconnected)', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('disconnected-acct'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ name: 'Renamed', steps: [liStep('disconnected-acct')] });
+        expect(res.status).toBe(200);
+        expect(dripSequenceDb.updateSequence).toHaveBeenCalled();
+        expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+      });
+
+      it('still refuses CHANGING a step to a different account the caller does not own', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('disconnected-acct'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('pool-or-foreign-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it('does not trust pins stored on someone else\'s sequence', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('pool-or-foreign-acct', 'other-user'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('pool-or-foreign-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it('PUT: a pin left on an EMAIL step (e.g. after switching a step to email) is inert - saving is not blocked', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce({ ...mockSequence, userId: 'user-123', steps: [] });
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const emailStepWithStalePin = { stepNumber: 1, name: 'Mail', channel: 'email', delayDays: 0, subject: 's', bodyHtml: '<p>x</p>', linkedInAccountId: 'stale-disconnected-acct' };
+        const res = await request(app).put('/seq_1').send({ steps: [emailStepWithStalePin] });
+        expect(res.status).toBe(200);
+        expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+        expect(dripSequenceDb.updateSequence).toHaveBeenCalled();
+      });
+
+      it('PUT: a pin stored on an EMAIL step is not trusted when that step is switched to LinkedIn', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce({
+          ...mockSequence, userId: 'user-123',
+          steps: [{ stepId: 's1', stepNumber: 1, name: 'Mail', channel: 'email', delayDays: 0, subject: 's', bodyHtml: '<p>x</p>', linkedInAccountId: 'pool-or-foreign-acct' }],
+        });
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('pool-or-foreign-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it('POST: a stale pin on an email step (e.g. a duplicated sequence) is accepted - the worker never uses it', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        (dripSequenceDb.createSequence as jest.Mock).mockClear();
+        const res = await request(app).post('/').send({ name: 'Copy', steps: [{ stepNumber: 1, name: 'Mail', channel: 'email', delayDays: 0, subject: 's', bodyHtml: '<p>x</p>', linkedInAccountId: 'stale-disconnected-acct' }] });
+        expect(res.status).toBe(201);
+        expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+      });
+
+      it('a channel written with odd casing/whitespace is still validated as LinkedIn (same normalisation as the worker)', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        (dripSequenceDb.createSequence as jest.Mock).mockClear();
+        const res = await request(app).post('/').send({ name: 'Seq', steps: [{ stepNumber: 1, name: 'DM', channel: ' LinkedIn ', delayDays: 0, messageText: 'x', linkedInAccountId: 'pool-or-foreign-acct' }] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+      });
+
+      it('PUT: a transient read failure is a retryable 500, not a misleading 403 about the account', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+        dripSequenceDb.getSequence.mockRejectedValueOnce(new Error('DynamoDB throttled'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('my-acct')] });
+        expect(res.status).toBe(500);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it("with main's optimistic-concurrency guard: a foreign pin is refused (403) before any conflict check", async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('foreign-acct')], expectedUpdatedAt: '2020-01-01T00:00:00.000Z' });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it("with main's optimistic-concurrency guard: an owned pin + stale expectedUpdatedAt still yields main's 409, and the guard is forwarded", async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+        const conflict: any = new Error('Sequence seq_1 changed since it was read'); conflict.name = 'SequenceConflictError';
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        (dripSequenceDb.updateSequence as jest.Mock).mockRejectedValueOnce(conflict);
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('my-acct')], expectedUpdatedAt: '2020-01-01T00:00:00.000Z' });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('sequence_conflict');
+        expect(dripSequenceDb.updateSequence).toHaveBeenCalledWith('seq_1', 'user-123', expect.anything(), { expectedUpdatedAt: '2020-01-01T00:00:00.000Z' });
+      });
+
+      it('POST stays strict: there is no stored pin to exempt', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        (dripSequenceDb.createSequence as jest.Mock).mockClear();
+        const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('disconnected-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it('passes through all optional fields', async () => {
@@ -1618,5 +1795,13 @@ describe('verify-variables counts the SAME population enrol does', () => {
     // counts) — getLeadsByListId returns only a single ~1MB page."
     expect(crmDbMock.getAllLeadsByListId).toHaveBeenCalledWith('list-1');
     expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /load-from-url SSRF guard (ENG-2425)', () => {
+  it.each(['http://169.254.169.254/latest/meta-data/', 'http://127.0.0.1:8080/'])('rejects %s with 400', async (url) => {
+    const res = await request(app).post('/load-from-url').send({ url });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/public internet address/);
   });
 });

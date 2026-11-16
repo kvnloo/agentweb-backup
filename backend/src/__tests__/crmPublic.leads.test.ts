@@ -113,7 +113,7 @@ describe('POST /leads/:listId — public lead creation', () => {
   test('creates lead and returns 201 on valid request', async () => {
     const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(201);
-    expect(crmDb.createLead).toHaveBeenCalledWith('list_abc123', expect.objectContaining({ email: 'test@example.com' }));
+    expect(crmDb.createLead).toHaveBeenCalledWith('list_abc123', expect.objectContaining({ email: 'test@example.com' }), 'form_fill');
     expect(res.body).toHaveProperty('leadId');
   });
 
@@ -142,12 +142,15 @@ describe('POST /leads/:listId — public lead creation', () => {
   test('strips unknown dangerous fields before creating lead', async () => {
     const res = await request(server).post('/leads/list_abc123').send({
       ...validBody,
+      origin: 'linkedin',
       userId: 'hacker',
       listId: 'hacker',
       isAdmin: true,
     });
     expect(res.status).toBe(201);
     const callArgs = (crmDb.createLead as jest.Mock).mock.calls[0][1];
+    expect(callArgs).not.toHaveProperty('origin');
+    expect((crmDb.createLead as jest.Mock).mock.calls[0][2]).toBe('form_fill');
     expect(callArgs).not.toHaveProperty('userId');
     expect(callArgs).not.toHaveProperty('isAdmin');
   });

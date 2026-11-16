@@ -60,13 +60,13 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
   });
 
   // ENG-1953 follow-up: the original guidance only offered CSV once a
-  // bot-protection gate wouldn't clear, even though Browser Sessions manual
+  // bot-protection gate wouldn't clear, even though Session Cookies manual
   // import exists specifically for sites Emma can't log into automatically —
   // it just was never mentioned as an option on a domain's FIRST such failure
   // (only after a later re-check of an already-imported cookie died, covered
   // by the "Manually-imported sessions" guidance below). A first-time Luma-style
   // Cloudflare block should offer this path too, not just CSV.
-  it('offers Browser Sessions manual import, with a direct link, as an option alongside CSV when a bot-protection gate will not clear', () => {
+  it('offers Session Cookies manual import, with a direct link, as an option alongside CSV when a bot-protection gate will not clear', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
       'manually import a session cookie for this domain, which skips this gate entirely on the next run'
     );
@@ -80,12 +80,12 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
   // out here too, not just pointed at.
   it('spells out both re-import steps here too, rather than only pointing back at the guidance above', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      "log into the site in their own browser to get a fresh authenticated session, AND (b) copy that session's cookie into **Settings > Browser Sessions** themselves"
+      "log into the site in their own browser to get a fresh authenticated session, AND (b) copy that session's cookie into **Settings > Session Cookies** themselves"
     );
   });
 });
 
-// ENG-494 follow-up: a manually-imported Browser Sessions cookie can die
+// ENG-494 follow-up: a manually-imported Session Cookies cookie can die
 // server-side at any time, independent of the synthetic expiry estimate shown
 // in Settings. Without this guidance, load_browser_cookies reporting "success"
 // (a cookie was injected) would be mistaken for "still authenticated" — Emma
@@ -123,7 +123,7 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('worse outcome than an occasional missed report');
   });
 
-  // ENG-1953 follow-up: a manually-imported Browser Sessions cookie only exists
+  // ENG-1953 follow-up: a manually-imported Session Cookies cookie only exists
   // because credentialed auto-login already failed for that domain. Without this
   // guidance, Emma reported a dead session and then offered "save your Login
   // Credentials" as an equally-weighted fix — a path that was already known not
@@ -133,7 +133,7 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
       "Don't offer \"save your Login Credentials\" as the recommended fix in the same breath as this report"
     );
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'A domain usually ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
+      'A domain usually ends up as a manually-imported Session Cookies cookie because credentialed auto-login already didn\'t work for it'
     );
   });
 
@@ -142,11 +142,43 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
   // to reach Emma on its own. Emma's own instructions must make the second,
   // actually-load-bearing step (copying the cookie into Settings) impossible to
   // miss, with a direct link so there's no ambiguity about where that happens.
-  it('requires both re-import steps to be stated together, with a direct link to the Browser Sessions settings page', () => {
+  it('requires both re-import steps to be stated together, with a direct link to the Session Cookies settings page', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('logging into the site is not enough on its own');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'copy that session\'s cookie into **Settings > Browser Sessions** themselves'
+      'copy that session\'s cookie into **Settings > Session Cookies** themselves'
     );
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
+  });
+});
+
+// ENG-2338: a user was told to import a cookie but not how; the agent also gave
+// up on a gate it never re-checked after its final wait.
+describe('ENG-2338 bot-gate handoff', () => {
+  it('requires a final snapshot after the last wait before declaring the gate stuck', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never declare the gate stuck from a wait you did not re-check');
+  });
+
+  it('gives the cookie-header how-to inline instead of leaving the user to ask', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Do not make the user ask how');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('DevTools → Network');
+  });
+});
+
+// ENG-2338: Luma's API is the reliable path; the browser is the fallback.
+describe('ENG-2338 Luma API-first guidance', () => {
+  it('tells the agent to try the Luma API tools before a browser, and never to take a key in chat', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('luma_get_guests');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('before opening a browser');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never ask the user to paste an API key into the chat');
+  });
+});
+
+// ENG-2338: the Luma key is NOT in Connected Accounts (OAuth only); Emma must send users to the card.
+describe('ENG-2338 Luma key placement', () => {
+  it('tells the agent the key goes on Login Credentials, with a direct link, never Connected Accounts', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('saved on the "Luma API key" card in Settings > Login Credentials');
+    // The exact markdown link renders clickable in chat (checked in the preview); a bare path does not.
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('[Settings → Login Credentials](/settings/login-credentials)');
+    expect(AGENT_MODE_SYSTEM_PROMPT).not.toMatch(/Connected Accounts[^\n]{0,40}Luma|Luma[^\n]{0,40}Connected Accounts/);
   });
 });

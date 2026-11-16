@@ -1,0 +1,37 @@
+# ENG-2110: one login host per environment (instance = env name, e.g. aw-login-host@test1, aw-login-host@prod). Runs as root: it starts
+# per-customer transient units. DARK until the backend flag is on. Installed by the test installer (install-test-host.sh) and by the production
+# installer (prod/install.sh). In production /opt/aw-login-host/dist is a symlink to current/dist (the active release), so a release switch is one atomic rename.
+[Unit]
+Description=AgentWeb login host (%i)
+# network-online: the production host binds a fixed private address (EADDRNOTAVAIL if it starts before the interface is configured).
+After=local-fs.target network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/aw-login-host/%i/u
+# A host that cannot start (bad config, bad key, missing mount) stops retrying after 5 attempts in 2 minutes instead of looping forever, and
+# says so exactly once in the journal (aw-login-host-failed@%i: `host_start_failed`), which the CloudWatch metric filter alarms on.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+OnFailure=aw-login-host-failed@%i.service
+
+[Service]
+Type=simple
+# After an unclean shutdown systemd-quotacheck may remount the homes filesystem and drop nosuid/nodev (AL2023), and the host refuses to start without
+# them: assert the flags again right before every start. If the filesystem is not mounted, this fails the start, which is correct.
+ExecStartPre=/usr/bin/mount -o remount,nosuid,nodev,usrquota /var/lib/aw-login-host/%i/u
+ExecStart=/usr/bin/node /opt/aw-login-host/dist/loginHost/host/start.js /etc/aw-login-host/%i.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# The host's own hardening (customer units are hardened separately by the host).
+NoNewPrivileges=no
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=no
+# Customer units are NOT in this service's cgroup (own transient units in aw-<env>-<uid>.slice), so stopping the host
+# never stops them by itself: the host's shutdown and its next start-up stop them explicitly before serving.
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -452,3 +452,27 @@ describe('Benchmark Controller - Model Selection', () => {
     });
   });
 });
+
+describe('ENG-669 PR-C: the AgentWeb Model cannot be benchmarked (refused, never run on the default)', () => {
+  const res = () => {
+    const json = jest.fn().mockReturnThis();
+    const status = jest.fn().mockReturnValue({ json });
+    return { status, json } as any;
+  };
+  const admin = { userId: 'admin-123', isAdmin: true, email: 'admin@test.com' };
+  const refusal = { message: 'AgentWeb Model picks a model per chat turn and can\'t be benchmarked. Choose a specific model.', code: 'agentweb_model_not_benchmarkable' };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it.each([
+    ['create', () => createBenchmarkTest({ user: admin, body: { sessionId: 's', testName: 't', llmModel: 'agentweb-model' }, params: {} } as any, (globalThis as any).__r = res())],
+    ['update', () => updateBenchmarkTest({ user: admin, body: { llmModel: 'agentweb-model' }, params: { testId: 't1' } } as any, (globalThis as any).__r = res())],
+    ['run', () => runBenchmarkTest({ user: admin, body: { llmName: 'agentweb-model' }, params: { testId: 't1' } } as any, (globalThis as any).__r = res())],
+  ])('%s: 400 before any read or run', async (_label, call) => {
+    await call();
+    const r = (globalThis as any).__r;
+    expect(r.status).toHaveBeenCalledWith(400);
+    expect(r.status.mock.results[0].value.json).toHaveBeenCalledWith(refusal);
+    expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+  });
+});

@@ -1,7 +1,7 @@
 import { WebClient } from '@slack/web-api';
 import { resolveSlackApiUrl } from './slackService';
 import { settingsService } from './settingsService';
-import { getApproverChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from './approverDirectory';
+import { getApproverChannel, getApproverReminderChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from './approverDirectory';
 import {
   approvalInboxService,
   type ApprovalDecision,
@@ -340,15 +340,43 @@ async function postApproverNotice(
   approver: ApprovalDecisionApprover,
   buildText: () => Promise<string> | string,
   failureLabel: string,
+  resolveChannel: (a: ApprovalDecisionApprover) => Promise<string> = getApproverChannel,
 ): Promise<void> {
   if (!slackClient) return;
   try {
     const text = await buildText();
-    const channel = await getApproverChannel(approver);
+    const channel = await resolveChannel(approver);
     await slackClient.chat.postMessage({ channel, text });
   } catch (err: any) {
     console.warn(`[approval-inbox-slack] failed to post ${failureLabel}:`, err?.message || err);
   }
+}
+
+/**
+ * ENG-1853: the Approval Desk's one concise reminder per packet — an @-mention of the assigned
+ * reviewer plus the portal link, in the same channel and style as the eval queue's "one concise
+ * reviewer assignment/link" message. Deliberately no per-item text or buttons: the Desk is where the
+ * context and the decision live, Slack only says "something is waiting for you".
+ */
+export async function postManifestReadyNotice(
+  approver: ApprovalDecisionApprover,
+  packet: { manifestId: string; itemCount: number; accountLabel?: string },
+): Promise<void> {
+  await postApproverNotice(
+    approver,
+    async () => {
+      const slackUserId = await getApproverSlackUserId(approver);
+      const mention = slackUserId ? `<@${slackUserId}>` : approver;
+      // A reviewer must never get a dead localhost link: outside dev, no portal URL means no message.
+      const configured = process.env.FRONTEND_URL;
+      if (!configured && process.env.NODE_ENV === 'production') throw new Error('FRONTEND_URL is not set, so the Approval Desk link would be wrong');
+      const base = (configured || 'http://localhost:5173').replace(/\/+$/, '');
+      const what = `${packet.itemCount} Meta Ads change${packet.itemCount === 1 ? '' : 's'}${packet.accountLabel ? ` for ${packet.accountLabel}` : ''}`;
+      return `🔔 ${mention} — ${what} waiting for your review in the Approval Desk: ${base}/approval-desk/${encodeURIComponent(packet.manifestId)}`;
+    },
+    'packet-ready notice',
+    getApproverReminderChannel,
+  );
 }
 
 export async function postDecisionResolvedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {

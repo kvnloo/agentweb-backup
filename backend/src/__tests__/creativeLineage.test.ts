@@ -9,6 +9,8 @@ import {
   hashPrompt,
   readCreativeLineageConfig,
   recordGeneratedCreative,
+  stampGoogleAdCreated,
+  stampGoogleAssetUpload,
   stampMetaAdCreated,
   stampMetaAdCreativeChanged,
   stampMetaCreativeCreated,
@@ -60,6 +62,11 @@ class FakeLineageTable implements CreativeLineageDb {
       if (!item) throw conditionFailed();
     } else if (condition === 'attribute_exists(creativeId) AND userId = :userId') {
       if (!item || item.userId !== values[':userId']) throw conditionFailed();
+    } else if (
+      condition === 'attribute_exists(creativeId) AND userId = :userId AND NOT contains(googleAdResourceNames, :adName)'
+    ) {
+      if (!item || item.userId !== values[':userId']) throw conditionFailed();
+      if (setValues(item.googleAdResourceNames).includes(String(values[':adName']))) throw conditionFailed();
     } else {
       throw new Error(`fake: unsupported condition ${condition}`);
     }
@@ -462,5 +469,58 @@ describe('write ordering and lookup retry (CodeRabbit: sequence the creative and
     const never = new Promise<{ candidateId: string } | null>(() => undefined);
     void recordGeneratedCreative(generated(), never, base);
     await expect(stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, base)).resolves.toBe(creativeIdForS3Key(S3_KEY));
+  });
+});
+
+describe('Google Ads stamping (ENG-2235)', () => {
+  const deps = (db: FakeLineageTable) => ({ env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] });
+  const ASSET = 'customers/123/assets/456';
+  const AD = 'customers/123/adGroupAds/789~1011';
+
+  async function seeded(): Promise<{ db: FakeLineageTable; id: string }> {
+    const db = new FakeLineageTable();
+    const id = (await recordGeneratedCreative(generated(), undefined, { env: ON, db, now: () => NOW }))!;
+    return { db, id };
+  }
+
+  it('links generated image -> Google asset -> Google ad', async () => {
+    const { db, id } = await seeded();
+    await expect(stampGoogleAssetUpload({ userId: USER, imageUrl: S3_URL, assetResourceName: ASSET }, deps(db))).resolves.toBe(id);
+    await expect(stampGoogleAdCreated({ userId: USER, customerId: '123', adResourceName: AD, assetResourceNames: [ASSET] }, deps(db)))
+      .resolves.toEqual([id]);
+    const record = db.record(id);
+    expect(setValues(record.googleAssetResourceNames)).toEqual([ASSET]);
+    expect(setValues(record.googleAdResourceNames)).toEqual([AD]);
+    expect(record.googleAdLinks).toEqual([{ customerId: '123', adResourceName: AD, assetResourceName: ASSET, linkedAt: NOW.toISOString() }]);
+  });
+
+  it('is idempotent: re-stamping the same ad does not duplicate the link', async () => {
+    const { db, id } = await seeded();
+    await stampGoogleAssetUpload({ userId: USER, imageUrl: S3_URL, assetResourceName: ASSET }, deps(db));
+    await stampGoogleAdCreated({ userId: USER, customerId: '123', adResourceName: AD, assetResourceNames: [ASSET, ASSET] }, deps(db));
+    await stampGoogleAdCreated({ userId: USER, customerId: '123', adResourceName: AD, assetResourceNames: [ASSET] }, deps(db));
+    expect(db.record(id).googleAdLinks).toHaveLength(1);
+  });
+
+  it('never stamps another user\'s creative, an unknown URL, or an asset we never uploaded', async () => {
+    const { db, id } = await seeded();
+    await expect(stampGoogleAssetUpload({ userId: 'intruder', imageUrl: S3_URL, assetResourceName: ASSET }, deps(db))).resolves.toBeNull();
+    await expect(stampGoogleAssetUpload({ userId: USER, imageUrl: 'https://example.com/x.png', assetResourceName: ASSET }, deps(db))).resolves.toBeNull();
+    await stampGoogleAssetUpload({ userId: USER, imageUrl: S3_URL, assetResourceName: ASSET }, deps(db));
+    await expect(stampGoogleAdCreated({ userId: 'intruder', customerId: '9', adResourceName: AD, assetResourceNames: [ASSET] }, deps(db))).resolves.toEqual([]);
+    await expect(stampGoogleAdCreated({ userId: USER, customerId: '123', adResourceName: AD, assetResourceNames: ['customers/123/assets/999'] }, deps(db))).resolves.toEqual([]);
+    expect(db.record(id).googleAdLinks).toBeUndefined();
+  });
+
+  it('is inert when lineage is off and never throws on DynamoDB failure', async () => {
+    const db = new FakeLineageTable();
+    await expect(stampGoogleAssetUpload({ userId: USER, imageUrl: S3_URL, assetResourceName: ASSET }, { env: {}, db })).resolves.toBeNull();
+    await expect(stampGoogleAdCreated({ userId: USER, customerId: '1', adResourceName: AD, assetResourceNames: [ASSET] }, { env: {}, db })).resolves.toEqual([]);
+    expect(db.calls).toEqual([]);
+    const { db: db2 } = await seeded();
+    jest.spyOn(db2, 'update').mockRejectedValue(new Error('boom'));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(stampGoogleAssetUpload({ userId: USER, imageUrl: S3_URL, assetResourceName: ASSET }, deps(db2))).resolves.toBeNull();
+    warn.mockRestore();
   });
 });

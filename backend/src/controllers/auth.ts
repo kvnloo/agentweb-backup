@@ -1,4 +1,7 @@
 import { Request, Response } from "express";
+import { isZomaSignup } from '../services/zomaSignupIntent';
+import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
+import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
@@ -17,6 +20,9 @@ import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { metaService } from "../services/metaService";
+import { emitAppSignal } from "../services/serverSignalEmitter";
+import { MCP_CONSENT_SIGNUP_SOURCE, validateRef } from "../services/journeyAttribution";
+import { noteProductUse, noteSignup } from "../services/journeyMilestones";
 
 // ENG-1402: server-side half of the CompleteRegistration conversion for our OWN
 // customer-portal signup (not a customer's ad account — reuses sendCapiLeadEvent's
@@ -108,6 +114,23 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
   }
 }
 
+/**
+ * ENG-2906: web signup attribution (Emma web app). A password signup made on the MCP OAuth
+ * consent page (portal sends signupSource "mcp") is left unattributed here on purpose: the row
+ * is stamped signupSource "mcp" and the consent decision attributes it moments later, once the
+ * OAuth client and product are known (it requires that marker; account age is never used).
+ * Google sign-ups cannot tell where they started, so they are webapp with confidence "inferred".
+ */
+function attributeWebSignup(userId: string, opts: { ref?: unknown; confidence: "explicit" | "inferred" }) {
+  void noteSignup(userId, {
+    product: "emma_web",
+    path: "webapp",
+    client: "web",
+    ref: validateRef(opts.ref),
+    confidence: opts.confidence,
+  }).then(() => noteProductUse(userId, "emma_web"));
+}
+
 export const register = async (req: Request, res: Response) => {
   try {
     let {
@@ -144,14 +167,26 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    if (zomaAdmissionEnabled() && req.body.signupIntent !== undefined && !isZomaSignup(req.body)) {
+      return res.status(400).json({ code: 'invalid_signup_intent', message: 'Please try again later.' });
+    }
+    if (zomaAdmissionEnabled() && isZomaSignup(req.body)) {
+      try {
+        if (await admitZomaSignup(email) !== 'approved') return res.status(202).json(waitlistedResponse);
+      } catch (error) {
+        console.error('Zoma admission unavailable', error);
+        return res.status(503).json({ code: 'admission_unavailable', message: 'Please try again later.' });
+      }
+    }
+
     // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
     const finalRoles =
       reqRoles && Array.isArray(reqRoles) && reqRoles.length > 0
         ? reqRoles
         : ["customer"];
 
-    // Check waitlist status only for non-free users (feature-flagged via SKIP_WAITLIST_CHECK)
-    const skipWaitlist = process.env.SKIP_WAITLIST_CHECK === 'true';
+    // Legacy waitlist metadata is separate from Zoma admission; SKIP_WAITLIST_CHECK
+    // must not bypass the capacity gate above.
     let waitlistEntry = null;
     let stripe_customer_id = undefined;
     let companyNameFromWaitlist = undefined;
@@ -183,6 +218,7 @@ export const register = async (req: Request, res: Response) => {
     // attribution is known and the enrolled lead is missing UTM data.
     const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
 
+    let createUserError: unknown;
     const newUser = await userDb.createUser(
       email,
       userId,
@@ -196,10 +232,26 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist, // from waitlist
       touch // attribution — passes through onUserSignup hook
-    ).catch(() => undefined);
+    ).catch((err: unknown) => {
+      createUserError = err;
+      return undefined;
+    });
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {
+      // A concurrent duplicate submit loses the conditional account write;
+      // answer it exactly like a later repeat would.
+      const raced = await userDb.getUserByEmail(email).catch(() => undefined);
+      if (raced) {
+        return res.status(400).json({ message: "User already exists" });
+      }
+      // ENG-2899: the email occupies the PK but no account resolves for it
+      // (e.g. a tombstone left by an email change). Say what to do instead
+      // of a retry-forever 503.
+      if (isConditionalCheckFailed(createUserError)) {
+        const mapped = mapCreateUserError(createUserError);
+        return res.status(mapped.status).json(mapped.body);
+      }
       console.error("Registration persistence failed before post-create side effects");
       return res.status(503).json({
         message: "We could not create your account. Please try again.",
@@ -213,6 +265,7 @@ export const register = async (req: Request, res: Response) => {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
+      ...(req.body.signupSource === MCP_CONSENT_SIGNUP_SOURCE && { signupSource: MCP_CONSENT_SIGNUP_SOURCE }),
       ...(touch && {
         firstTouch: touch,
         lastTouch: touch,
@@ -220,6 +273,7 @@ export const register = async (req: Request, res: Response) => {
         ...(touch.utm?.medium && { utmMedium: touch.utm.medium }),
       }),
     });
+    if (req.body.signupSource !== MCP_CONSENT_SIGNUP_SOURCE) attributeWebSignup(userId, { ref: req.body.ref, confidence: "explicit" });
 
     // If a pending org invite exists for this email, stamp it on the new user so
     // ProtectedRoute redirects them to accept-invite instead of onboarding.
@@ -286,6 +340,8 @@ export const register = async (req: Request, res: Response) => {
     // must never affect the registration response the user is waiting on.
     const metaEventId = crypto.randomUUID();
     sendCompleteRegistrationCapiEvent(metaEventId, email).catch(() => {});
+    // ENG-2738: hireemma.ai signal plan — fire-and-forget, never affects the response.
+    void emitAppSignal({ userId, createdAt: new Date().toISOString() }, "registration_completed", { method: "password" });
 
     res.status(201).json({
       token,
@@ -301,7 +357,8 @@ export const register = async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error("Error in register:", error);
-    res.status(500).json({ message: "Error creating user" });
+    const mapped = mapCreateUserError(error);
+    res.status(mapped.status).json(mapped.body);
   }
 };
 
@@ -374,6 +431,8 @@ export const login = async (req: Request, res: Response) => {
       { expiresIn: "90d" }
     );
 
+    void emitAppSignal(user as any, "login", { method: "password" });
+
     const { password: _, ...userWithoutPassword } = user;
     res.json({
       token,
@@ -434,6 +493,9 @@ export const googleCallback = async (
       }, null);
     }
 
+    // Google registration has no Zoma product intent; these are Emma portal signups.
+    // Zoma setup/MCP registers on the consent page with a product-scoped signup intent.
+
     if (!user) {
       if (portalOrigin === "genius") {
         // For genius portal, automatically create user using existing signup logic
@@ -477,6 +539,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfig?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({
@@ -543,6 +606,7 @@ export const googleCallback = async (
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
           signupSource: "oauth",
         });
+        attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({
@@ -668,6 +732,9 @@ export const googleCallback = async (
       getJwtSecret(),
       { expiresIn: "90d" }
     );
+
+    void emitAppSignal(user as any, "login", { method: "google", isNewUser: isNewUser ? 1 : 0 });
+    if (isNewUser) void emitAppSignal(user as any, "registration_completed", { method: "google" });
 
     const resultUserObject = {
       token,
@@ -856,6 +923,21 @@ export const resetPassword = async (req: Request, res: Response) => {
 // long-term password, so it MUST clear the temporary password lifecycle flags.
 // On success, all OTHER sessions are terminated and the caller receives a fresh
 // token minted with the new sessionVersion so the current device stays signed in.
+/**
+ * ENG-2686: records the `logout` lifecycle signal. Auth is a stateless JWT, so the
+ * client still clears its token itself; this endpoint only observes the event.
+ * Delegated sessions do not emit (the account owner did not log out). Always 204 —
+ * a signal failure must never make logout look broken.
+ */
+export const logout = async (req: Request, res: Response) => {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  if (userId && !authReq.delegateInfo?.isDelegated) {
+    void emitAppSignal(userId, "logout", { method: "user" }).catch(() => undefined);
+  }
+  return res.status(204).end();
+};
+
 export const changePassword = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthenticatedRequest;

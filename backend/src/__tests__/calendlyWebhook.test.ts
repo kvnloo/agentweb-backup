@@ -635,7 +635,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLeadList).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-      expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('falls back to resolveOrCreateBookingList when the explicitly configured list no longer exists (gap 2)', async () => {
@@ -659,7 +659,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     // Confirmed live: crmDb.createLead's list-metadata update has no attribute_exists
@@ -690,7 +690,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
@@ -706,7 +706,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
         USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-auto-created' },
       );
-      expect(mockCreateLead).toHaveBeenCalledWith('list-auto-created', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-auto-created', expect.objectContaining({ email: 'lead@example.com' }), 'booking');
     });
 
     it('creates a new lead and auto-syncs as "created" when no existing lead matches the email', async () => {

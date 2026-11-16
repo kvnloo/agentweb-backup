@@ -110,6 +110,71 @@ describe('Agent API Routes', () => {
     });
   });
 
+  describe('POST /api/v1/agent/api-keys scope validation', () => {
+    beforeEach(() => {
+      mockGenerateKey.mockResolvedValue({ rawKey: 'aw_key', keyRecord: { keyId: 'k', keyName: 'K', status: 'active' } });
+    });
+
+    it.each([
+      [['tools:read', 'admin:all']],
+      [['EMAIL:READ']],
+      [[]],
+      ['tools:read'],
+      [[42]],
+    ])('rejects scopes %j with 400 and creates no key', async (scopes) => {
+      const res = await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes });
+      expect(res.status).toBe(400);
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+    });
+
+    it('grants email:read on a regular session (deduped)', async () => {
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'K', scopes: ['tools:read', 'email:read', 'email:read'] });
+      expect(res.status).toBe(201);
+      expect(mockGenerateKey).toHaveBeenCalledWith('test-user-id', 'K', ['tools:read', 'email:read'], undefined, undefined);
+    });
+
+    it('refuses email:read from a delegated (admin-as-customer) session with 403', async () => {
+      const delegated = express();
+      delegated.use(express.json());
+      delegated.use((req: any, _res, next) => {
+        req.delegateInfo = { adminUserId: 'admin-1', adminEmail: 'a@x.com', isDelegated: true };
+        next();
+      });
+      delegated.use('/api/v1/agent', agentApiRoutes);
+
+      const res = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['email:read'] });
+      expect(res.status).toBe(403);
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+
+      const ok = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read'] });
+      expect(ok.status).toBe(201);
+    });
+
+    it('grants smartlead:read and smartlead:control on a regular session', async () => {
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'Hermes', scopes: ['tools:read', 'smartlead:read', 'smartlead:control'] });
+      expect(res.status).toBe(201);
+      expect(mockGenerateKey).toHaveBeenCalledWith('test-user-id', 'Hermes', ['tools:read', 'smartlead:read', 'smartlead:control'], undefined, undefined);
+    });
+
+    it.each([['smartlead:read'], ['smartlead:control']])('refuses %s from a delegated (admin-as-customer) session with 403', async (scope) => {
+      const delegated = express();
+      delegated.use(express.json());
+      delegated.use((req: any, _res, next) => {
+        req.delegateInfo = { adminUserId: 'admin-1', adminEmail: 'a@x.com', isDelegated: true };
+        next();
+      });
+      delegated.use('/api/v1/agent', agentApiRoutes);
+      const res = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read', scope] });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain(scope);
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+    });
+  });
+
   describe('GET /api/v1/agent/api-keys (list keys)', () => {
     it('should return user keys without hashes', async () => {
       mockGetKeysByUserId.mockResolvedValue([

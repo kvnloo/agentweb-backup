@@ -80,7 +80,8 @@ it('ENG-2028 offered picker models obey the same permission policy as selection'
 it('ENG-744/2028 permits public Opus models while preserving actual registry restrictions', () => {
   expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-5', false)).toBe(true);
   expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-8', false)).toBe(true);
-  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-6-v1', false)).toBe(false);
+  // main opened Opus 4.6 to every user after this test was written (bc8faa4ca, ENG-2028).
+  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-6-v1', false)).toBe(true);
   expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-6-v1', true)).toBe(true);
   expect(agentModeService.isModelSelectableBy('gemini-3.1-flash-live-preview', true)).toBe(false);
   expect(agentModeService.isModelSelectableBy('unknown-model', true)).toBe(false);

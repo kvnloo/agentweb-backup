@@ -70,11 +70,13 @@ const mockAttioServiceInstance = {
   deleteListEntry: jest.fn().mockResolvedValue(undefined),
 };
 
+const mockFindOrgSharedHubSpotAccountById = jest.fn();
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
     create: jest.fn(),
     fromToken: jest.fn(),
   },
+  findOrgSharedHubSpotAccountById: (...args: any[]) => mockFindOrgSharedHubSpotAccountById(...args),
 }));
 
 jest.mock('../services/attioService', () => ({
@@ -161,6 +163,7 @@ describe('ExternalCrmSyncService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockFindOrgSharedHubSpotAccountById.mockReset().mockResolvedValue(null);
     mockHubSpotCreate.mockResolvedValue(mockHubSpotServiceInstance);
     mockHubSpotFromToken.mockReturnValue(mockHubSpotServiceInstance);
     mockAttioCreate.mockResolvedValue(mockAttioServiceInstance);
@@ -833,6 +836,30 @@ describe('ExternalCrmSyncService', () => {
       mockGetAccountById.mockResolvedValue({ account_id: 'acct1', platform: 'hubspot', userId: 'user1' });
       const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
       expect(await service.isAccountConnected(cfg)).toBe(true);
+    });
+
+    // ENG-2605. HubSpotService.create falls back to an account an org admin shared, so a list linked
+    // to a teammate's shared portal pushes fine. The reconnect banner must agree with push.
+    it('returns true for a HubSpot account an org admin shared (not in the caller\'s own record)', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockFindOrgSharedHubSpotAccountById.mockResolvedValue({ account_id: 'acct1', platform: 'hubspot', userId: 'owner9', config: {} });
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(true);
+      expect(mockFindOrgSharedHubSpotAccountById).toHaveBeenCalledWith('user1', 'acct1');
+    });
+
+    it('returns false for a shared HubSpot account flagged needs_reconnect', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockFindOrgSharedHubSpotAccountById.mockResolvedValue({ account_id: 'acct1', platform: 'hubspot', userId: 'owner9', config: { needs_reconnect: true } });
+      const cfg = makeConfig({ accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+    });
+
+    it('does not look for a shared account for Attio, which has no sharing', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      const cfg = makeConfig({ provider: 'attio', accountId: 'acct1', apiKeyEncrypted: undefined });
+      expect(await service.isAccountConnected(cfg)).toBe(false);
+      expect(mockFindOrgSharedHubSpotAccountById).not.toHaveBeenCalled();
     });
 
     it('returns false when account resolution throws', async () => {

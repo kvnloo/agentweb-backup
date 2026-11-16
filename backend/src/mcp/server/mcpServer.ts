@@ -18,8 +18,14 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { buildMcpAuthChallenge, MCP_RESOURCE_PATH } from '../oauth/authChallenge';
+import { validateRef } from '../../services/journeyAttribution';
+
+export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
+import { effectiveApiKeyScopes, findApiKeyOnlyToolCall, findApiKeyOnlyToolCallForNonKey, findScopeDenial } from './apiKeyScopes';
+import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -69,7 +75,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     }
 
     console.error("[MCP] Access denied: Missing Authorization header");
-    setMcpAuthChallenge(res, baseUrl);
+    setMcpAuthChallenge(req, res, baseUrl);
     return res.status(401).json({
       error: "Unauthorized: Missing access token",
       hint: `Authentication is required. Use OAuth sign-in from your MCP client, or pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
@@ -82,7 +88,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
   const providedToken = tokenMatch ? tokenMatch[1] : authHeader;
 
   if (!providedToken) {
-    setMcpAuthChallenge(res, baseUrl, "invalid_token");
+    setMcpAuthChallenge(req, res, baseUrl, "invalid_token");
     return res.status(401).json({
       error: "Unauthorized: Empty access token",
       hint: `Use OAuth sign-in from your MCP client, or pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
@@ -96,7 +102,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
       const keyRecord = await agentApiKeyService.validateKey(providedToken);
       if (!keyRecord) {
         console.error("[MCP] Access denied: Invalid agent API key");
-        setMcpAuthChallenge(res, baseUrl, "invalid_token");
+        setMcpAuthChallenge(req, res, baseUrl, "invalid_token");
         return res.status(401).json({
           error: "Unauthorized: Invalid API key",
           hint: "This API key is not recognized. It may have been revoked or is incorrect.",
@@ -117,6 +123,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
       (req as any)._mcpIsInternal = false;  // External client
       (req as any)._mcpAuthMethod = 'api_key';
       (req as any)._mcpApiKeyId = keyRecord.keyId;
+      (req as any)._mcpApiKeyScopes = effectiveApiKeyScopes(keyRecord.scopes);
       (req as any)._mcpClientType = classifyMcpClient({ authMethod: 'api_key', userAgent: req.get('user-agent') });
       return next();
     } catch (error) {
@@ -162,7 +169,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
 
   // All auth methods failed
   console.error("[MCP] Access denied: No valid credentials");
-  setMcpAuthChallenge(res, baseUrl, "invalid_token");
+  setMcpAuthChallenge(req, res, baseUrl, "invalid_token");
   return res.status(401).json({
     error: "Unauthorized: Invalid access token",
     hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
@@ -170,17 +177,9 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
   });
 }
 
-export function buildMcpAuthChallenge(baseUrl: string, error?: string): string {
-  const params = [
-    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
-    `scope="mcp:tools"`,
-  ];
-  if (error) params.push(`error="${error}"`);
-  return `Bearer ${params.join(", ")}`;
-}
-
-function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {
-  res.setHeader("WWW-Authenticate", buildMcpAuthChallenge(baseUrl, error));
+function setMcpAuthChallenge(req: Request, res: Response, baseUrl: string, error?: string) {
+  // ENG-2906: `?ref=` on the MCP URL rides the challenge into the protected-resource metadata.
+  res.setHeader("WWW-Authenticate", buildMcpAuthChallenge(baseUrl, error, MCP_RESOURCE_PATH, validateRef(req.query.ref)));
 }
 
 export function setupMcpServer(
@@ -277,6 +276,8 @@ export function setupMcpServer(
       oauthClientName: sessionEntry?.oauthClientName || (req as any)?._mcpOAuthClientName,
       clientType: sessionEntry?.clientType || (req as any)?._mcpClientType,
       userAgent: sessionEntry?.userAgent || req?.get('user-agent'),
+      clientIp: req?.ip,
+      apiKeyScopes: (req as any)?._mcpApiKeyScopes,
     });
   };
 
@@ -304,6 +305,54 @@ export function setupMcpServer(
       !isCronEnabled()
     ) {
       return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
+
+    // ENG-1083: API key scopes are enforced. Checked per request (the auth
+    // middleware re-validates the key on every POST), so a reused or
+    // rehydrated session cannot outlive a scope restriction.
+    if ((req as any)._mcpAuthMethod === 'api_key') {
+      const denial = findScopeDenial(req.body, (req as any)._mcpApiKeyScopes ?? [], (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: API key lacks scope '${denial.requiredScope}' required for tool '${denial.tool}'. Create a key with that scope at https://agentweb.pro (Settings > API Keys).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
+    }
+    // Smartlead tools and other `apiKeyOnly` tools: only an aw_ key holding the scope (checked above) may call them. Every other
+    // external caller, OAuth included, is refused here on the request's own auth method.
+    if ((req as any)._mcpIsInternal !== true && (req as any)._mcpAuthMethod !== 'api_key') {
+      const denial = findApiKeyOnlyToolCallForNonKey(req.body, (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: tool '${denial.tool}' needs an AgentWeb API key that holds the '${denial.requiredScope}' scope (Settings > API Keys at https://agentweb.pro).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
+    }
+    // Opt-in-scope tools (e.g. read_email / email:read): aw_ keys need the scope
+    // explicitly (checked above); signed-in OAuth users get the same access as a
+    // fully scoped key (OAuth parity, 2026-10-31). Anonymous callers are refused.
+    if ((req as any)._mcpIsInternal !== true && !['api_key', 'oauth'].includes((req as any)._mcpAuthMethod)) {
+      const denial = findApiKeyOnlyToolCall(req.body, (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: tool '${denial.tool}' requires signing in to Emma (OAuth).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
     }
 
     // Log all incoming requests
@@ -335,6 +384,7 @@ export function setupMcpServer(
           oauthClientName: (req as any)._mcpOAuthClientName,
           clientType: (req as any)._mcpClientType as McpClientType | undefined,
           userAgent: req.get('user-agent'),
+          apiKeyScopes: (req as any)._mcpApiKeyScopes as string[] | undefined,
           sessionId: undefined as string | undefined,
         };
 
@@ -370,6 +420,8 @@ export function setupMcpServer(
               });
             if (!sharedState.isInternal) {
               void recordMcpConnectionAttempt({
+                product: 'emma_mcp',
+                ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
                 userId: sharedState.agentUserId,
                 authMethod: sharedState.authMethod,
                 apiKeyId: sharedState.apiKeyId,

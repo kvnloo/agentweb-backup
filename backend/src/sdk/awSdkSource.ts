@@ -128,6 +128,8 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
         Date.now() - st.startMs > SESSION_MAX_AGE_MS || st.startMs > Date.now() + 60000) {
       st = newSession();
     }
+    // ENG-2689: pages viewed this session including this one (super property session_page_num).
+    st.pages = (typeof st.pages === 'number' && st.pages >= 0 ? st.pages : 0) + 1;
     function save() { try { ssSet(sk, JSON.stringify(st)); } catch (e) {} }
     save();
 
@@ -136,13 +138,28 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
     var videoPrev = [];
     var videoPrevEls = [];
 
+    // UTF-8 byte size of a string: the ingest limit is in bytes, and non-ASCII registered values take 2-4
+    // bytes per character, so a character count under-measures them (Opslane run 1360).
+    function utf8Bytes(str) {
+      var n = 0;
+      for (var bi = 0; bi < str.length; bi++) {
+        var c = str.charCodeAt(bi);
+        n += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xd800 && c < 0xe000) ? 2 : 3;
+      }
+      return n;
+    }
+
     function transmit(body) {
       var s = JSON.stringify(body);
-      // The ingest rejects > 16kb. Every field is ASCII (labels are folded above, URLs arrive percent-encoded)
-      // except props, so length is within 2x of bytes; the worst case (all-quote labels, which JSON doubles)
-      // is what this guards: shed the cumulative strings, keep the event.
-      if (s.length > 15000) {
+      // The ingest rejects > 16kb (bytes). Shed the cumulative strings first, keep the event.
+      if (utf8Bytes(s) > 15000) {
         body.journey = ''; body.clickLog = ''; body.showsClicked = '';
+        s = JSON.stringify(body);
+      }
+      // Registered super values (site-owner awSuper/awRegister) can still push it over: drop them, keep
+      // the automatic ones (#url, #title, ...) and the event.
+      if (utf8Bytes(s) > 15000 && body['super']) {
+        body['super'] = superProps(false);
         s = JSON.stringify(body);
       }
       try {
@@ -167,6 +184,51 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
       return false;
     }
 
+    // ENG-2689: super properties attached to every event. Presets the browser knows, plus whatever the
+    // host page registers with awRegister({...}) (registered values win). The ingest keeps only the names
+    // in its fixed super-property table, typed and bounded, so unknown keys here are harmless.
+    var superReg = {}, superN = 0;
+    function superProps(includeRegistered) {
+      var o = {}, k;
+      try {
+        o['#event_time'] = Date.now();
+        o['#lib'] = 'js'; o['#lib_version'] = '1';
+        o['#device_id'] = vid;
+        o['#url'] = String(win.location.href).slice(0, 1000);
+        if (doc.referrer) o['#referrer'] = String(doc.referrer).slice(0, 1000);
+        if (doc.title) o['#title'] = String(doc.title).slice(0, 300);
+        if (nav.userAgent) o['#ua'] = String(nav.userAgent).slice(0, 300);
+        if (nav.language) o['#system_language'] = String(nav.language).slice(0, 2).toLowerCase();
+        if (win.screen && win.screen.width) { o['#screen_width'] = win.screen.width; o['#screen_height'] = win.screen.height; }
+        o['#zone_offset'] = -new Date().getTimezoneOffset() / 60;
+        o.site_domain = String(win.location.hostname).replace(/^www\./, '').slice(0, 120);
+        o.session_page_num = st.pages || 1;
+      } catch (e) {}
+      if (includeRegistered !== false) {
+        for (k in superReg) if (Object.prototype.hasOwnProperty.call(superReg, k)) o[k] = superReg[k];
+      }
+      return o;
+    }
+    function register(p) {
+      try {
+        if (!p || typeof p !== 'object') return false;
+        for (var k in p) {
+          if (!Object.prototype.hasOwnProperty.call(p, k) || typeof k !== 'string' || k.length > 40) continue;
+          var v = p[k], ok;
+          if (typeof v === 'string') { v = v.slice(0, 300); ok = true; }
+          else ok = (typeof v === 'number' && isFinite(v)) || typeof v === 'boolean';
+          // Count a key only once its value is accepted, so invalid values never consume a slot.
+          if (!ok) continue;
+          if (!Object.prototype.hasOwnProperty.call(superReg, k)) { if (superN >= 60) continue; superN++; }
+          superReg[k] = v;
+        }
+        return true;
+      } catch (e) { return false; }
+    }
+    win.awRegister = register;
+    // Registered before the script loaded: window.awSuper = { funnel_type: 'free_trial', ... }
+    try { if (win.awSuper) register(win.awSuper); } catch (e) {}
+
     function baseBody(ev) {
       // clientNowMs: the device clock NOW, so the server can tell a clock that is ahead (its startMs is rejected as
       // future until the clock catches up, which would move the session to a new row mid-session) from a normal one.
@@ -184,6 +246,7 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
       // Cumulative on EVERY event, like journey: the server guards them with eventCount, so a click that
       // is overtaken on the wire by a later event must not be the only carrier of the click log.
       if (st.nclicks) { b.clickCount = st.nclicks; b.clickLog = st.clicks.join(' > ').slice(-4000); }
+      b['super'] = superProps();
       return b;
     }
 

@@ -13,6 +13,9 @@ const USER_FUNNEL_STATUS_LABELS: Record<string, string> = {
   parked: 'Parked',
 };
 
+/** Approved funnel stage vocabulary (ENG-752): the only non-null values Emma may write. */
+export const USER_FUNNEL_STATUS_VALUES: readonly string[] = Object.freeze(Object.keys(USER_FUNNEL_STATUS_LABELS));
+
 const USER_FUNNEL_STATUS_PRIORITY_TAGS: Record<string, string> = {
   follow_up: 'Sales',
   call_booking: 'Sales',

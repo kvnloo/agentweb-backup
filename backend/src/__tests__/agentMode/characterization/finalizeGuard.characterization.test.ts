@@ -41,7 +41,7 @@ jest.mock('../../../services/subscriptionService', () => ({
 }));
 
 const UNTRUE_CLAIM = "Done! I've sent the email to the client with the report attached.";
-const JUDGE_VERDICT = '[{"claimClass":"email_sent"}]';
+const JUDGE_VERDICT = '[{"claimClass":"email_sent","statement":"sent the email"}]';
 const CORRECTED = 'I was not able to complete the email step — the send_email tool did not run in this session. Ask me to retry and I will send it.';
 
 describe('AgentMode finalize guard — ON-path characterization (flag pinned before flip)', () => {

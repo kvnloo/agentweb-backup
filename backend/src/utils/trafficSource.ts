@@ -28,7 +28,7 @@
  */
 
 /** Bump on ANY change that can alter an output for an existing input; stored with every row. */
-export const TRAFFIC_CLASSIFIER_VERSION = '2.0.0';
+export const TRAFFIC_CLASSIFIER_VERSION = '2.3.0';
 
 export type ChannelGroup =
   | 'Paid'
@@ -262,6 +262,20 @@ export const CHANNELS: readonly ChannelDef[] = [
     brandLabels: ['yahoo', 'yandex', 'baidu', 'naver'],
   },
   {
+    // NewsBreak's in-platform paid ads (DramaBreak runs these). Paid by construction: a link tagged
+    // utm_source=nova is an ad placement even when the medium says nothing (2.2.0).
+    key: 'nova', name: 'Nova (NewsBreak Ads)', group: 'Paid', utmSource: 'nova',
+    utmAliases: ['nova', 'newsbreaknova', 'nbnova', 'newsbreakads'],
+    hosts: [],
+  },
+  {
+    // newsbreak.com itself (organic web visits from the NewsBreak site, not Nova ads).
+    key: 'newsbreak', name: 'NewsBreak.com', group: 'Referral', utmSource: 'newsbreak',
+    utmAliases: ['newsbreak'],
+    hosts: ['newsbreak.com'],
+    appPackages: ['com.particlenews.newsbreak'],
+  },
+  {
     // Placements by an external agency. utm_source is `agency-<slug>`; it OUTRANKS the referrer
     // because the platform an agency posts on is not the attribution we want to report.
     key: 'agency', name: 'Agency', group: 'Agency', utmSource: `${AGENCY_SOURCE_PREFIX}<name>`,
@@ -324,6 +338,7 @@ export type MatchedBy =
   | 'referrer'
   | 'user_agent'
   | 'click_id'
+  | 'url:nova'
   | 'fallback_utm_source'
   | 'fallback_referrer'
   | 'none';
@@ -343,6 +358,10 @@ export interface TrafficClassification {
   sourceDetail: string;
   /** Which signal decided the channel (diagnostic; not a stable analytics dimension). */
   matchedBy: MatchedBy;
+  /** Channel the LINK claims (from utm_source), '' when untagged/unknown. Reported beside `channel`. */
+  linkChannel: string;
+  /** Channel observed from the visit itself (in-app UA, then referrer), '' when nothing observable. */
+  detectedChannel: string;
   /** What made it paid, e.g. 'click_id:gclid' or 'utm_medium:cpc'; null when organic. */
   paidSignal: string | null;
   classifierVersion: string;
@@ -613,6 +632,21 @@ function isInternal(refHost: string, ownHost: string): boolean {
 
 const SOURCE_DETAIL_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref', 'src', 'post'] as const;
 
+/** Paid variants of channels whose organic and paid traffic must read differently in reports. */
+export const PAID_CHANNEL_SPLIT: Readonly<Record<string, { key: string; name: string }>> = {
+  google_search: { key: 'google_ads', name: 'Google Ads' },
+  youtube: { key: 'youtube_ads', name: 'YouTube Ads' },
+};
+
+/**
+ * Maps a (channel, channelKey, paid) triple to its split channel. Pure and idempotent, so the same
+ * function serves live classification and a retroactive backfill of stored rows.
+ */
+export function splitPaidChannel(channel: string, channelKey: string, paid: boolean): { channel: string; channelKey: string } {
+  const split = paid ? PAID_CHANNEL_SPLIT[channelKey] : undefined;
+  return split ? { channel: split.name, channelKey: split.key } : { channel, channelKey };
+}
+
 export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassification {
   const safe = input && typeof input === 'object' ? input : {};
 
@@ -660,7 +694,6 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   if (!paidSignal && clickIds.has('fbclid') && !(ORGANIC_MEDIUMS as readonly string[]).includes(utm.utm_medium.toLowerCase())) {
     paidSignal = 'click_id:fbclid';
   }
-  const paid = paidSignal !== null;
 
   // 3. Referrer (internal ones are not a source at all).
   const ownHost = (hostOf(safe.hostname) || hostOf(safe.landingUrl)).replace(/:\d+$/, '');
@@ -668,23 +701,47 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   if (ref && ref.kind === 'web' && isInternal(ref.host, ownHost)) ref = null;
   const referrerHost = ref ? ref.host : '';
 
-  // 4. Channel: utm_source -> referrer -> in-app UA -> click id -> fallback.
+  // 4. Channel (2.2.0). One link per creator is the norm (DramaBreak tags most links 'tiktok' even
+  // when posted on YouTube), so what we OBSERVE about the visit beats what the link claims:
+  //   observed = in-app browser UA (the visitor is physically inside that app) -> referrer.
+  //   Exceptions where the link wins: agency-<slug> (attribution is the agency, not the platform)
+  //   and paid traffic (the ad platform in utm_source is the spend we must attribute: Meta, Nova).
+  // Then link (utm_source) -> click id -> fallback. linkChannel/detectedChannel expose both signals.
   const sourceLower = utm.utm_source.toLowerCase();
   let def: ChannelDef | undefined;
   let matchedBy: MatchedBy = 'none';
 
-  def = matchUtmSource(sourceLower);
-  if (def) matchedBy = 'utm_source';
-
-  if (!def && ref) {
-    def = findChannelByReferrer(ref);
-    if (def) matchedBy = 'referrer';
+  // 2.3.0: NewsBreak Nova ads that omit utm_source=nova still carry their own URL signals
+  // (is_nova=true, nb_cid, utm_content=nvss_*). Without this they classified as organic
+  // newsbreak.com / Direct traffic and were routed into organic-only lists.
+  const novaUrlSignal = param('is_nova').toLowerCase() === 'true' || Boolean(param('nb_cid'))
+    || utm.utm_content.toLowerCase().startsWith('nvss_');
+  const utmLinkDef = matchUtmSource(sourceLower);
+  const novaUrlDef = !utmLinkDef && !sourceLower && novaUrlSignal ? CHANNEL_BY_KEY.get('nova') : undefined;
+  const linkDef = utmLinkDef ?? novaUrlDef;
+  if (linkDef?.key === 'nova' && !paidSignal) paidSignal = utmLinkDef ? 'utm_source:nova' : 'url:nova';
+  const paidFinal = paidSignal !== null;
+  let detectedDef: ChannelDef | undefined;
+  let detectedBy: MatchedBy = 'none';
+  if (typeof safe.userAgent === 'string') {
+    const ua = safe.userAgent.slice(0, MAX_INPUT_LEN);
+    detectedDef = IN_APP_UA_MATCHERS.find((m) => m.re.test(ua))?.def;
+    if (detectedDef) detectedBy = 'user_agent';
+  }
+  if (!detectedDef && ref) {
+    detectedDef = findChannelByReferrer(ref);
+    if (detectedDef) detectedBy = 'referrer';
   }
 
-  if (!def && typeof safe.userAgent === 'string') {
-    const ua = safe.userAgent.slice(0, MAX_INPUT_LEN);
-    def = IN_APP_UA_MATCHERS.find((m) => m.re.test(ua))?.def;
-    if (def) matchedBy = 'user_agent';
+  if (linkDef && (linkDef.key === 'agency' || paidFinal)) {
+    def = linkDef;
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
+  } else if (detectedDef) {
+    def = detectedDef;
+    matchedBy = detectedBy;
+  } else if (linkDef) {
+    def = linkDef;
+    matchedBy = novaUrlDef ? 'url:nova' : 'utm_source';
   }
 
   // New vs V1: a platform click id with no other source signal names its platform, instead of the
@@ -713,7 +770,12 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     group = sourceLower || referrerHost ? 'Referral' : 'Direct';
     matchedBy = sourceLower ? 'fallback_utm_source' : referrerHost ? 'fallback_referrer' : 'none';
   }
+  const paid = paidSignal !== null;
   if (paid) group = 'Paid';
+  // 2.1.0: paid Google / YouTube traffic gets its own channel so CRM rows and reports separate
+  // Google Ads from organic Google Search (and YouTube ads from organic YouTube) without needing
+  // the trafficType column.
+  ({ channel, channelKey } = splitPaidChannel(channel, channelKey, paid));
 
   // 5. Exact source: the referrer URL when it says more than the origin; else the placement tag.
   let sourceLink = '';
@@ -736,6 +798,8 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
     sourceLink,
     sourceDetail,
     matchedBy,
+    linkChannel: utmLinkDef ? utmLinkDef.name : '',
+    detectedChannel: detectedDef ? detectedDef.name : '',
     paidSignal,
     classifierVersion: TRAFFIC_CLASSIFIER_VERSION,
   };

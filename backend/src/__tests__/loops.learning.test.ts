@@ -314,6 +314,7 @@ describe('runAttribution', () => {
     const store = new InMemoryLearningStore();
     await seedShipped(store);
     const issueLifecycle = { recordOutcome: jest.fn() };
+    const logger = { log: jest.fn() };
 
     const summary = await runAttribution({
       manifest,
@@ -322,10 +323,16 @@ describe('runAttribution', () => {
       clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
       issueLifecycle,
       verifierId: 'linear-harsha',
+      logger,
     } as any);
 
     expect(issueLifecycle.recordOutcome).not.toHaveBeenCalled();
     expect(summary.outcomes[0]).toMatchObject({ issueSync: 'missing_issue' });
+    // ENG-590 AC3: fail loud with exactly one flagged log line, not a silent skip.
+    const warns = logger.log.mock.calls.filter(
+      ([level, msg]) => level === 'warn' && msg === '[attribution] shipped mutation has no linked Linear issue',
+    );
+    expect(warns).toHaveLength(1);
   });
 
   it('retries Linear writeback after a transient failure without duplicating attribution', async () => {

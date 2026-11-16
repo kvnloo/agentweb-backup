@@ -88,17 +88,55 @@ export function extractAffordableTokens(error: unknown): number | null {
   return parseAffordableTokens(message) ?? parseAffordableTokens(originalMessage);
 }
 
+export const DRAIN_CEILING_SHUTDOWN_MESSAGE = 'Worker shutdown — drain ceiling exceeded';
+
+/** ENG-2750: true only for the deploy-timing drain-ceiling kill, never a crash. */
+export function isDrainCeilingShutdownError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return message === DRAIN_CEILING_SHUTDOWN_MESSAGE;
+}
+
 export function isWorkerShutdownError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
   // Graceful shutdown (server stopping)
   if (message === 'Worker shutdown') return true;
+  // ENG-2750: drain ceiling hit during graceful shutdown — the worker was killed
+  // mid-run by deploy timing, the same class (generateMarketingResponseWorkerService).
+  if (message === 'Worker shutdown — drain ceiling exceeded') return true;
   // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
   if (message.startsWith('Worker process exited with code')) return true;
   // Dispatch raced a graceful-shutdown drain window (deploy/restart) — same
   // deploy-timing class as the two patterns above (ENG-1166).
   if (message === 'Worker is draining — no new requests accepted') return true;
   return false;
+}
+
+/**
+ * ENG-2293 (Opslane finding on PR #3276): `require_parameters: true` means a
+ * single requested parameter unsupported by every eligible provider leaves no
+ * routable endpoint at all — OpenRouter's 404 reads literally "No endpoints
+ * found that can handle the requested parameters" (see
+ * openRouterRequestParams.ts, same failure class as ENG-199). That's a
+ * provider-routing condition, not an unknown server error, and deserves its
+ * own handled, user-readable outcome instead of falling through to a generic
+ * 500.
+ */
+export function isProviderNoEndpointsError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  const text = [error instanceof Error ? error.message : String(error), e.originalMessage, e.originalError?.message]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  // Primary signal: OpenRouter's own wording, case-insensitive and tolerant of
+  // "found"/"available". Fallback for a reworded message: a 404 whose text still
+  // names the unmet "requested parameters". A bare 404 deliberately does NOT
+  // match — that could be a wrong slug or URL, which must stay a loud 500.
+  if (/no (?:allowed )?endpoints? (?:found|available)/.test(text)) return true;
+  const is404 = e.status === 404 || e.code === 404 || e.originalError?.status === 404;
+  return is404 && text.includes('requested parameters');
 }
 
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
@@ -119,6 +157,10 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /econnreset/i,
   /etimedout/i,
   /socket hang up/i,
+  // ENG-2427: node-fetch/undici stream cut mid-body — "Invalid response body while
+  // trying to fetch <url>: Premature close". Same class as a socket hang up.
+  /premature close/i,
+  /invalid response body/i,
   /aborted.*timeout/i,
   /TimeoutError/i,
   /request aborted/i,
@@ -133,8 +175,35 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /status code \(no body\)/i,
 ];
 
+/**
+ * ENG-503: the AWS SDK / provider client failed to parse a truncated response
+ * body ("Unterminated string in JSON at position 8735 ... Deserialization
+ * error: to see the raw response, inspect the hidden field {error}.$response").
+ * The request itself was valid — the body was cut mid-stream — so one retry is
+ * the right recovery, and repeats share one oncall class instead of each paging
+ * as a new "Unknown Error".
+ */
+export const PROVIDER_DESERIALIZATION_ERROR_CLASS = 'provider_deserialization';
+const PROVIDER_DESERIALIZATION_PATTERNS = [
+  /deserialization error/i,
+  /unterminated string in json/i,
+  /unexpected end of json input/i,
+];
+
+export function isProviderDeserializationError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  const texts = [
+    error instanceof Error ? error.message : String(error),
+    typeof e?.originalMessage === 'string' ? e.originalMessage : '',
+    e?.originalError instanceof Error ? e.originalError.message : '',
+  ];
+  return texts.some((t) => PROVIDER_DESERIALIZATION_PATTERNS.some((p) => p.test(t)));
+}
+
 export function isTransientLLMError(error: unknown): boolean {
   if (!error) return false;
+  if (isProviderDeserializationError(error)) return true;
 
   // Don't retry context-limit errors — they need message trimming, not retries
   if (isContextLimitError(error)) return false;
@@ -156,4 +225,28 @@ export function isTransientLLMError(error: unknown): boolean {
   if (typeof e?.code === 'string' && TRANSIENT_STRING_CODES.has(e.code)) return true;
 
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
+}
+
+/**
+ * ENG-2381: user-facing message for a final upstream 5xx from the LLM provider.
+ * agentModeService wraps such errors with this message; the controller matches it
+ * via isProviderUnavailableError to answer 503 instead of an "Unknown Error" page.
+ */
+export const PROVIDER_UNAVAILABLE_USER_MESSAGE =
+  'The AI provider is temporarily unavailable. Please try again in a moment.';
+
+export function isProviderUnavailableError(error: unknown): boolean {
+  return error instanceof Error && error.message === PROVIDER_UNAVAILABLE_USER_MESSAGE;
+}
+
+/**
+ * ENG-2763: user-facing message when the OpenRouter key/credits are exhausted until a
+ * reset (`403 Key limit exceeded (monthly limit)` / 402 credits). Retrying is guaranteed
+ * to fail, so this deliberately does NOT say "please try again".
+ */
+export const QUOTA_EXHAUSTED_USER_MESSAGE =
+  'Our AI service is temporarily at capacity. Our team has been notified and is restoring it — no need to resend your message right now.';
+
+export function isQuotaExhaustedError(error: unknown): boolean {
+  return error instanceof Error && error.message === QUOTA_EXHAUSTED_USER_MESSAGE;
 }

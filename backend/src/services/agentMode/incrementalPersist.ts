@@ -42,9 +42,8 @@ export function stripImageDataForPersistence(messages: any[]): any[] {
  * messages have already been checkpointed, compute the next batch of settled
  * response messages to persist.
  *
- * "Response messages" = everything after the boundary that is NOT a user message —
- * identical to the controller's final-batch selection
- * (`messages.slice(initialMessageCount).filter(m => m.role !== 'user')`), so the
+ * "Response messages" = everything after the boundary that passes
+ * `isPersistedResponseMessage` — identical to the final-batch selection, so the
  * incremental and final persistence never disagree on the set or its order. The
  * caller only invokes this at a point where the CURRENT in-flight turn has not yet
  * been appended (the top of each loop iteration), so every returned message is
@@ -55,6 +54,17 @@ export function stripImageDataForPersistence(messages: any[]): any[] {
  * empty batch and the unchanged cursor. Defensive against a cursor that already
  * meets/exceeds the tail (never returns a short/duplicated slice).
  */
+/**
+ * Whether a working message after the response boundary is persisted to the session.
+ * User messages are saved by the controller; system messages are in-turn control
+ * text (anti-loop / budget / recovery nudges) the customer must never see in the
+ * transcript (Opslane 2026-10-13). Single definition so the checkpoint, the final
+ * batch and the error-path usage accounting can never disagree.
+ */
+export function isPersistedResponseMessage(m: any): boolean {
+  return !!m && m.role !== 'user' && m.role !== 'system';
+}
+
 export function computeCheckpointBatch(
   messages: any[],
   initialMessageCount: number,
@@ -62,7 +72,7 @@ export function computeCheckpointBatch(
 ): { toPersist: any[]; newPersistedCount: number } {
   const responseMessages = (messages || [])
     .slice(initialMessageCount)
-    .filter((m: any) => m && m.role !== 'user');
+    .filter(isPersistedResponseMessage);
   if (responseMessages.length <= alreadyPersistedCount) {
     return { toPersist: [], newPersistedCount: alreadyPersistedCount };
   }

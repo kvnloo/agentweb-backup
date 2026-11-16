@@ -1,5 +1,6 @@
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
 jest.mock('axios', () => ({
   post: (...args: any[]) => mockAxiosPost(...args),
   get: (...args: any[]) => mockAxiosGet(...args),
@@ -53,6 +54,11 @@ jest.mock('../services/connectedAccountsDb', () => ({
 const mockAssertPublicHostname = jest.fn();
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: (...args: any[]) => mockAssertPublicHostname(...args),
+  // ENG-2928: uploadAsset resolves once and pins; the same mock decides allow/block.
+  resolvePinnedPublicAddress: async (...args: any[]) => {
+    await mockAssertPublicHostname(...args);
+    return { hostname: 'example.com', address: '93.184.216.34', family: 4 };
+  },
   SsrfBlockedError: class SsrfBlockedError extends Error {
     constructor(message = 'URL resolves to a private/internal address') {
       super(message);
@@ -68,6 +74,7 @@ let service: GoogleAdsService;
 beforeEach(() => {
   jest.clearAllMocks();
   mockAssertPublicHostname.mockResolvedValue(undefined);
+  echoCampaignReadBack(mockAxiosPost);
   service = new GoogleAdsService();
 });
 describe('API version', () => {
@@ -769,7 +776,8 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
       .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
       .mockResolvedValueOnce({ data: { results: [{}] } });
     await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
-    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    // type check, remove, then ENG-2398 remove read-back
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
     const removeBody = mockAxiosPost.mock.calls[1][1];
     expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
   });
@@ -1701,6 +1709,16 @@ describe('uploadAsset — SSRF protection', () => {
     expect(opts.maxBodyLength).toBeGreaterThan(0);
   });
 
+  it('pins the fetch to the validated address, so DNS cannot be rebound between check and connect (ENG-2928)', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: Buffer.from('img') });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/assets/10' }] } });
+    await service.uploadAsset('user-123', '1234567890', { type: 'IMAGE', name: 'hero.jpg', data: 'https://rebind.example.com/hero.jpg' });
+    const opts = mockAxiosGet.mock.calls[0][1];
+    expect(typeof opts.lookup).toBe('function');
+    const resolved = await new Promise<any[]>((resolve) => opts.lookup('rebind.example.com', {}, (...r: any[]) => resolve(r)));
+    expect(resolved).toEqual([null, '93.184.216.34', 4]);
+  });
+
   it('rejects when the SSRF guard blocks the URL and never fetches', async () => {
     mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
     await expect(service.uploadAsset('user-123', '1234567890', {
@@ -1839,5 +1857,188 @@ describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', ()
     const calls = src.match(/await axios\.(get|post)\(/g) || [];
     const bounded = src.match(/timeout: (GOOGLE_ADS_HTTP_TIMEOUT_MS|15000)/g) || [];
     expect(bounded.length).toBeGreaterThanOrEqual(calls.length);
+  });
+});
+
+describe('setDeviceBidAdjustments (ENG-2036)', () => {
+  it('updates the campaign device criteria bid_modifier in one atomic mutation', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { bidModifier: 0 } }] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'CAMPAIGN',
+      customerId: '1234567890',
+      campaignId: '555',
+      adjustments: [
+        { device: 'MOBILE', bidModifier: 0 },
+        { device: 'TABLET', bidModifier: 0 },
+      ],
+    });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3); // mutate + one read-back per criterion (ENG-2398)
+    const [url, body] = mockAxiosPost.mock.calls[0];
+    expect(url).toMatch(/campaignCriteria:mutate$/);
+    expect(body.operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30001', bidModifier: 0 }, updateMask: 'bid_modifier' },
+      { update: { resourceName: 'customers/1234567890/campaignCriteria/555~30002', bidModifier: 0 }, updateMask: 'bid_modifier' },
+    ]);
+  });
+
+  it('creates ad-group device bid modifiers', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1234567890/adGroupBidModifiers/77~30000' }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.25 } }] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'DESKTOP', bidModifier: 1.25 }],
+    });
+    const [url, body] = mockAxiosPost.mock.calls[1];
+    expect(url).toMatch(/adGroupBidModifiers:mutate$/);
+    expect(body.operations).toEqual([
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.25, device: { type: 'DESKTOP' } } },
+    ]);
+  });
+
+  it('updates ad-group device modifiers that already exist and creates the rest', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { adGroupBidModifier: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', device: { type: 'MOBILE' } } },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001' },
+      { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30002' },
+    ] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 0.5 } }] } });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ adGroupBidModifier: { bidModifier: 1.1 } }] } });
+    await service.setDeviceBidAdjustments('user-123', {
+      scope: 'AD_GROUP',
+      customerId: '1234567890',
+      adGroupResourceName: 'customers/1234567890/adGroups/77',
+      adjustments: [{ device: 'MOBILE', bidModifier: 0.5 }, { device: 'TABLET', bidModifier: 1.1 }],
+    });
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("ad_group_bid_modifier.ad_group = 'customers/1234567890/adGroups/77'");
+    expect(mockAxiosPost.mock.calls[1][1].operations).toEqual([
+      { update: { resourceName: 'customers/1234567890/adGroupBidModifiers/77~30001', bidModifier: 0.5 }, updateMask: 'bid_modifier' },
+      { create: { adGroup: 'customers/1234567890/adGroups/77', bidModifier: 1.1, device: { type: 'TABLET' } } },
+    ]);
+  });
+});
+
+describe('getCampaignDelivery (ENG-2143)', () => {
+  const NOW = Date.parse('2026-10-13T12:00:00.000Z');
+  const campaignRow = (id: string, over: Record<string, any> = {}, budget: Record<string, any> = {}) => ({
+    campaign: { id, status: 'ENABLED', startDateTime: '2026-09-01 00:00:00', ...over },
+    campaignBudget: { amountMicros: '33000000', status: 'ENABLED', ...budget },
+  });
+  const changeRow = (id: string, at: string) => ({ changeEvent: { campaign: `customers/1234567890/campaigns/${id}`, changeDateTime: at } });
+  const reply = (results: any[], total: number = results.length) => ({ data: { results, totalResultsCount: String(total) } });
+
+  // Routes each GAQL search by its FROM clause: config, metrics, change_event.
+  function mockReads(opts: { config?: any[]; metrics?: any[]; changes?: any[]; metricsTotal?: number }) {
+    mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
+      const q: string = body?.query ?? '';
+      if (/FROM change_event/.test(q)) return reply(opts.changes ?? []);
+      if (/metrics\.impressions/.test(q)) return reply(opts.metrics ?? [], opts.metricsTotal);
+      return reply(opts.config ?? []);
+    });
+  }
+  const queries = () => mockAxiosPost.mock.calls.map((c: any[]) => c[1]?.query as string);
+
+  it('joins config with 7-day metrics and treats a campaign absent from metrics as zero delivery', async () => {
+    mockReads({
+      config: [campaignRow('1'), campaignRow('2')],
+      metrics: [
+        { campaign: { id: '1' }, metrics: { impressions: '100', clicks: '4' } },
+        { campaign: { id: '1' }, metrics: { impressions: '50', clicks: '1' } },
+      ],
+    });
+    const out = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(out).toEqual([
+      expect.objectContaining({ campaignId: '1', status: 'ENABLED', approvedDailyBudget: 33, impressions: 150, clicks: 5 }),
+      expect.objectContaining({ campaignId: '2', status: 'ENABLED', approvedDailyBudget: 33, impressions: 0, clicks: 0 }),
+    ]);
+  });
+
+  it('is read-only: only GAQL search calls, nothing mutating', async () => {
+    mockReads({ config: [campaignRow('1')] });
+    await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(3);
+    for (const call of mockAxiosPost.mock.calls) expect(call[0]).toMatch(/googleAds:search$/);
+    expect(queries().every((q) => /^SELECT /.test(q))).toBe(true);
+  });
+
+  it('reports a non-enabled budget as approvedDailyBudget 0', async () => {
+    mockReads({ config: [campaignRow('1', {}, { status: 'PAUSED' })] });
+    const [c] = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(c.approvedDailyBudget).toBe(0);
+  });
+
+  it('parses liveSince from the start date-time, pushed 12h late for timezone skew', async () => {
+    mockReads({ config: [campaignRow('1', { startDateTime: '2026-09-01 08:30:00' })] });
+    const [c] = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(c.liveSince).toBe('2026-09-01T20:30:00.000Z');
+  });
+
+  it('leaves liveSince empty when the start is missing or malformed', async () => {
+    mockReads({ config: [campaignRow('1', { startDateTime: undefined }), campaignRow('2', { startDateTime: 'garbage' })] });
+    const out = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(out.map((c) => c.liveSince)).toEqual(['', '']);
+  });
+
+  it('MAJOR 1: a recent campaign change (re-enable) restarts go-live, ignoring the old start', async () => {
+    mockReads({
+      config: [campaignRow('1'), campaignRow('2')],
+      changes: [changeRow('1', '2026-10-13 10:30:00.000000'), changeRow('1', '2026-10-12 09:00:00.000000')],
+    });
+    const out = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(out[0].liveSince).toBe('2026-10-13T22:30:00.000Z'); // 10:30 + 12h skew: still inside the 24h grace
+    expect(out[1].liveSince).toBe('2026-09-01T12:00:00.000Z'); // untouched campaign keeps its start
+    expect(queries().find((q) => /FROM change_event/.test(q))).toMatch(/change_resource_type = 'CAMPAIGN'.*LIMIT 10000/);
+  });
+
+  it('MAJOR 2: an ENABLED campaign whose end date has passed is reported ENDED', async () => {
+    mockReads({
+      config: [
+        campaignRow('1', { endDateTime: '2026-10-10 23:59:59' }),
+        campaignRow('2', { endDateTime: '2026-12-31 23:59:59' }),
+        campaignRow('3', { endDateTime: '2026-10-13 20:00:00' }), // ends within the timezone skew: abstain
+        campaignRow('4', { status: 'PAUSED', endDateTime: '2026-10-10 23:59:59' }),
+      ],
+    });
+    const out = await service.getCampaignDelivery('user-123', '1234567890', NOW);
+    expect(out.map((c) => c.status)).toEqual(['ENDED', 'ENABLED', 'ENDED', 'PAUSED']);
+    expect(queries()[0]).toContain('campaign.end_date_time');
+  });
+
+  it('throws (unread) when the config read is truncated', async () => {
+    mockAxiosPost.mockResolvedValue({ data: { results: [campaignRow('1')], totalResultsCount: '5' } });
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Incomplete Google Ads read');
+  });
+
+  it('throws when the metrics read is truncated by the page cap', async () => {
+    mockAxiosPost.mockImplementation(async (_u: string, body: any) => /metrics\.impressions/.test(body.query)
+      ? { data: { results: [{ campaign: { id: '1' }, metrics: {} }], totalResultsCount: '1', nextPageToken: 'more' } }
+      : reply([campaignRow('1')]));
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Incomplete Google Ads read');
+  });
+
+  it('throws when the change_event read hits its LIMIT', async () => {
+    mockReads({ config: [campaignRow('1')], changes: Array.from({ length: 10_000 }, () => changeRow('1', '2026-10-12 09:00:00')) });
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Incomplete Google Ads read');
+  });
+
+  it('throws on malformed config, metrics and change rows', async () => {
+    mockReads({ config: [{ campaign: {} }] });
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Malformed Google Ads campaign row');
+    mockReads({ config: [campaignRow('1')], metrics: [{ metrics: { impressions: '1' } }] });
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Malformed Google Ads metrics row');
+    mockReads({ config: [campaignRow('1')], changes: [{ changeEvent: { campaign: 'nope', changeDateTime: 'x' } }] });
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('Malformed Google Ads change event row');
+  });
+
+  it('propagates an API failure such as a 429 (the caller treats it as unread)', async () => {
+    mockAxiosPost.mockRejectedValue(Object.assign(new Error('Request failed with status code 429'), { response: { status: 429, data: {} } }));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(service.getCampaignDelivery('user-123', '1234567890', NOW)).rejects.toThrow('429');
   });
 });

@@ -40,6 +40,16 @@ export function isProvenDisconnectError(error: any): boolean {
   );
 }
 
+export interface ResolveAccountOptions {
+  /**
+   * Only return an account whose session was PROVEN live. An indeterminate account is
+   * never handed back, so the result is null exactly as before ENG-2205. For callers that
+   * can gracefully skip LinkedIn (e.g. CRM enrichment) instead of running a real call
+   * against an unproven account.
+   */
+  verifiedOnly?: boolean;
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -1495,6 +1505,74 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * ENG-2739: list the comments on a LinkedIn post.
+   *
+   * Unipile's comments endpoint keys on the post's social id
+   * (`urn:li:activity:…` / `urn:li:ugcPost:…`). A URN — bare or embedded in a
+   * `/feed/update/…` URL — is used as-is; anything else (a `/posts/…-activity-<n>-…`
+   * URL or a bare numeric id) is resolved through `getPost`, which reports the
+   * authoritative social id (a share URL's activity number can belong to a ugcPost).
+   */
+  async listPostComments(
+    postId: string,
+    accountId: string,
+    opts: { cursor?: string; limit?: number } = {},
+  ): Promise<{ socialId: string; items: any[]; cursor: string | null }> {
+    try {
+      const client = await this.getClient();
+      let resolvedId = LinkedInOutreachService.extractPostUrn(postId);
+      if (!resolvedId) {
+        const lookupId = LinkedInOutreachService.extractPostLookupId(postId);
+        if (!lookupId) {
+          throw new Error(`Could not read a LinkedIn post id from "${postId}". Pass a post URL, a urn:li:activity:… URN, or a Unipile social id.`);
+        }
+        const post: any = await LinkedInOutreachService.withTimeout(
+          client.users.getPost({ account_id: accountId, post_id: lookupId }),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          'getPost',
+        );
+        resolvedId = typeof post?.social_id === 'string' ? post.social_id : null;
+      }
+      if (!resolvedId) {
+        throw new Error(`Unipile returned no social id for LinkedIn post "${postId}".`);
+      }
+      const socialId: string = resolvedId;
+      this.log(`Listing post comments: ${socialId}`, { accountId, cursor: opts.cursor });
+      const result: any = await LinkedInOutreachService.withTimeout(
+        client.users.getAllPostComments({
+          account_id: accountId,
+          post_id: socialId,
+          ...(opts.limit ? { limit: opts.limit } : {}),
+          ...(opts.cursor ? { cursor: opts.cursor } : {}),
+        }),
+        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+        'getAllPostComments',
+      );
+      return { socialId, items: Array.isArray(result?.items) ? result.items : [], cursor: result?.cursor ?? null };
+    } catch (error: any) {
+      return this.handleError(error, 'listPostComments');
+    }
+  }
+
+  private static extractPostUrn(postId: string): string | null {
+    let decoded = postId.trim();
+    try { decoded = decodeURIComponent(decoded); } catch { /* keep raw */ }
+    return decoded.match(/urn:li:(?:activity|ugcPost|share):\d+/)?.[0] ?? null;
+  }
+
+  /**
+   * Id for Unipile `getPost`: numeric for `activity-<n>` URLs / bare numbers;
+   * `ugcPost-<n>` and `share-<n>` URLs need their documented URN form.
+   */
+  private static extractPostLookupId(postId: string): string | null {
+    const trimmed = postId.trim();
+    if (/^\d+$/.test(trimmed)) return trimmed;
+    const typed = trimmed.match(/(ugcPost|share)-(\d+)/);
+    if (typed) return `urn:li:${typed[1]}:${typed[2]}`;
+    return trimmed.match(/activity-(\d+)/)?.[1] ?? null;
+  }
+
+  /**
    * Cancel a pending connection invitation.
    */
   async cancelInvitation(invitationId: string, accountId: string): Promise<any> {
@@ -1613,7 +1691,11 @@ export class LinkedInOutreachService {
         text: messageText,
         subject,
         options: {
+          // unipile-node-sdk only serialises linkedin[inmail] when api === 'classic'
+          // (types/input/input-messaging.js); without it the flag is silently
+          // dropped and this becomes a plain new chat (ENG-2630).
           linkedin: {
+            api: 'classic',
             inmail: true,
           },
         },
@@ -1663,8 +1745,8 @@ export class LinkedInOutreachService {
    * 2. Falls back to a randomly-selected site-wide Unipile account configured in settings.
    * Returns null if no account can be found.
    */
-  async resolveAccountId(userId: string): Promise<string | null> {
-    const { accountId } = await this.resolveAccountIdWithSource(userId);
+  async resolveAccountId(userId: string, opts?: ResolveAccountOptions): Promise<string | null> {
+    const { accountId } = await this.resolveAccountIdWithSource(userId, opts);
     return accountId;
   }
 
@@ -1675,7 +1757,7 @@ export class LinkedInOutreachService {
    * (network_distance, dedup-against-pending-invites) need this to avoid
    * silently presenting another account's network as the user's own (ENG-1198).
    */
-  async resolveAccountIdWithSource(userId: string): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
+  async resolveAccountIdWithSource(userId: string, opts?: ResolveAccountOptions): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
     // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
     //    session is still live. A single disconnected account must not shadow a
     //    working one, nor force a needless fall-through to the shared site-wide
@@ -1740,7 +1822,9 @@ export class LinkedInOutreachService {
     // 3. Nothing came back definitively connected. Prefer an unverifiable own
     //    account over an unverifiable shared one — still the user's own account
     //    first — rather than returning null and blaming a missing connection
-    //    that was never the actual fault.
+    //    that was never the actual fault. verifiedOnly callers opt out: they have a
+    //    graceful "skip" path and must not run a real call against an unproven account.
+    if (opts?.verifiedOnly) return { accountId: null, usedSharedAccount: false };
     if (ownUnknown) return { accountId: ownUnknown, usedSharedAccount: false };
     if (sharedUnknown) return { accountId: sharedUnknown, usedSharedAccount: true };
 
@@ -1762,8 +1846,23 @@ export class LinkedInOutreachService {
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
-      if (userAccount?.account_id) return userAccount.account_id;
+      const ids = (accounts as any[])
+        .filter((a) => a.platform === 'unipile' && a.account_id)
+        .map((a) => a.account_id as string);
+      if (ids.length <= 1) return ids[0] ?? null;
+      // ENG-2468: a LinkedIn reconnect mints a NEW Unipile account_id and appends
+      // it, leaving the dead row first. Returning the first row blindly pinned
+      // message sync / invites to the dead session (401 "Disconnected account")
+      // even though the user had just reconnected. Prefer a live session, then an
+      // unverifiable one (Unipile 5xx), and only fall back to the first row when
+      // every account is proven dead so the real disconnect error still surfaces.
+      let firstUnknown: string | null = null;
+      for (const id of ids) {
+        const state = await this.probeAccountSession(id);
+        if (state === 'connected') return id;
+        if (state === 'unknown' && !firstUnknown) firstUnknown = id;
+      }
+      return firstUnknown ?? ids[0];
     } catch { /* ignore */ }
     return null;
   }
@@ -1808,13 +1907,7 @@ export class LinkedInOutreachService {
       return accountId;
     };
 
-    // 1. User's own accounts — try all, first live one wins. Uses the tri-state
-    //    probeAccountSession, not the binary isAccountConnected (ENG-2205): an
-    //    indeterminate probe (Unipile-side 5xx/timeout, not a dead session) must
-    //    not be discarded the same way a proven-dead one is, or a Unipile outage
-    //    collapses enrichment's whole account pool to null exactly like it did
-    //    for resolveAccountIdWithSource.
-    let ownUnknown: string | null = null;
+    // 1. User's own accounts — try all, first live one wins
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
@@ -1822,18 +1915,13 @@ export class LinkedInOutreachService {
       for (const account of userAccounts) {
         if (!account.account_id) continue;
         if (skip && skipAccountIds!.has(account.account_id)) continue;
-        const state = await this.probeAccountSession(account.account_id);
-        if (state === 'connected') {
+        if (await this.isAccountConnected(account.account_id)) {
           return setCache(account.account_id);
-        }
-        if (state === 'unknown' && !ownUnknown) {
-          ownUnknown = account.account_id;
         }
       }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts (last resort) — verify connectivity before returning
-    let sharedUnknown: string | null = null;
     try {
       const { settingsService } = await import('./settingsService');
       const setting = await settingsService.getSetting('site-wide-unipile-accounts');
@@ -1843,22 +1931,13 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (skip && skipAccountIds!.has(account.account_id)) continue;
-          const state = await this.probeAccountSession(account.account_id);
-          if (state === 'connected') {
+          if (await this.isAccountConnected(account.account_id)) {
             return setCache(account.account_id);
           }
-          if (state === 'unknown' && !sharedUnknown) {
-            sharedUnknown = account.account_id;
-          }
-          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore */ }
-
-    // 3. Nothing came back definitively connected — prefer an unverifiable own
-    //    account over an unverifiable shared one rather than returning null.
-    if (ownUnknown) return setCache(ownUnknown);
-    if (sharedUnknown) return setCache(sharedUnknown);
 
     return null;
   }

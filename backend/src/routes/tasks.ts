@@ -1,4 +1,5 @@
 import express, { Request, RequestHandler, Response } from 'express';
+import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -18,6 +19,9 @@ import { paginatedQuery } from '../utils/dynamoPagination';
 import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
+import { parseWithImagesQuery, applyWithImagesQuery } from '../utils/withImagesQuery';
+import { approvalDb } from '../services/approvalDb';
+import { getWorkspaceAssets, resolveWorkspaceMembers, getWorkspaceApprovalStatusByUrl, WorkspaceCaller } from '../utils/workspaceAssets';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -838,6 +842,12 @@ router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
 router.delete('/:taskId/subscribers/:email', async (req, res) => {
   try {
     const { taskId, email } = req.params;
+    // ENG-2989: same permission as adding a subscriber (the task's owner or an admin). This used to need only a login.
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
+
     await subscriberDb.removeSubscriber(taskId, email);
     res.status(204).send();
   } catch (error: any) {
@@ -885,6 +895,13 @@ router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: Authe
     }
     if (task.userId !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized to modify this task' });
+    }
+
+    // ENG-2986: only an attachment listed on THIS task may be deleted. The key used to go straight to S3, so an owner of any task could
+    // delete another account's object in the same bucket by naming its key.
+    const attachments: any[] = Array.isArray((task as any).attachments) ? (task as any).attachments : [];
+    if (!attachments.some((a: any) => typeof a?.key === 'string' && a.key === key)) {
+      return res.status(404).json({ error: 'Attachment not found on this task' });
     }
 
     await taskDb.deleteAttachment(taskId, key);
@@ -1639,8 +1656,19 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
       }
     }
 
-    // Decode the file key (it's URL encoded)
-    const decodedKey = decodeURIComponent(fileKey);
+    // ENG-2986: only a file that is listed on THIS task may be deleted. The key used to come straight from the URL, so anyone who could
+    // edit their own task could delete any object in the bucket (another account's file) by naming its key. Express has already decoded
+    // the param once; older clients also sent it double-encoded, so both forms are matched against the listed keys, and the LISTED key
+    // is what reaches storage (never the URL text).
+    const listedFiles: any[] = Array.isArray((task as any).knowledgeBaseFiles) ? (task as any).knowledgeBaseFiles : [];
+    let secondDecode: string | undefined;
+    try { secondDecode = decodeURIComponent(fileKey); } catch { secondDecode = undefined; }
+    const listed = listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === fileKey)
+      ?? (secondDecode !== undefined ? listedFiles.find((f: any) => typeof f?.key === 'string' && f.key === secondDecode) : undefined);
+    if (!listed) {
+      return res.status(404).json({ message: 'File not found in this knowledge base' });
+    }
+    const decodedKey: string = listed.key;
     if (decodedKey.startsWith(S3_KEY_PREFIX)) {
       try {
         await s3
@@ -2068,8 +2096,14 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 export async function getExecutionsWithAssets(
   userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
-  errorMessage: string
+  errorMessage: string,
+  // ENG-2874: the html-reports read lazily backfills searchableText/reportType and
+  // writes it back to the owner's records (and bills the classifier call). Only the
+  // owner's own read may do that; teammate reads in the shared workspace must be
+  // read-only so they never rewrite another member's result_files or incur their LLM cost.
+  options: { backfill?: boolean } = {},
 ): Promise<Record<string, any>> {
+  const backfill = options.backfill !== false;
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
 
@@ -2309,7 +2343,7 @@ export async function getExecutionsWithAssets(
   // Enrich HTML report result files with searchable text content (fire-and-forget —
   // the result object is mutated in-place, but we don't block the response on it;
   // cached values are already populated so this only runs for brand-new reports).
-  if (assetType === 'html-reports') {
+  if (assetType === 'html-reports' && backfill) {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
       .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
@@ -2627,6 +2661,31 @@ function addCachedHtmlReportsToResult(
   }
 }
 
+// ENG-2874: creative library is workspace-wide. Same-org members see each
+// other's assets (stamped with createdBy); users without an org see their own.
+async function workspaceCallerFor(userId: string): Promise<WorkspaceCaller> {
+  try {
+    const user = await userDb.getUserById(userId);
+    return { userId, orgId: user?.orgId || undefined };
+  } catch (err) {
+    console.error('[ENG-2874] getUserById failed; falling back to own assets:', err);
+    return { userId };
+  }
+}
+
+async function getWorkspaceExecutionsWithAssets(
+  userId: string,
+  assetType: 'images' | 'videos' | 'html-reports',
+  errorMessage: string,
+): Promise<Record<string, any>> {
+  const caller = await workspaceCallerFor(userId);
+  return getWorkspaceAssets(caller, {
+    getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
+    fetchForUser: (memberId) =>
+      getExecutionsWithAssets(memberId, assetType, errorMessage, { backfill: memberId === userId }),
+  });
+}
+
 // Get all executions with images for the current user
 router.get('/executions/with-images', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -2636,8 +2695,29 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
-    res.json(result);
+    // ENG-2386: optional favorites/approved/limit/cursor; no params = unchanged response.
+    const parsed = parseWithImagesQuery(req.query as Record<string, unknown>);
+    if (parsed && 'error' in parsed) {
+      return res.status(400).json({ message: parsed.error });
+    }
+
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
+    if (!parsed) {
+      return res.json(result);
+    }
+
+    let approvalStatusByUrl: Record<string, string | undefined> = {};
+    if (parsed.approved) {
+      const members = await resolveWorkspaceMembers(await workspaceCallerFor(userId), {
+        getOrgMembers: (orgId) => orgDb.getOrgMembers(orgId),
+      });
+      approvalStatusByUrl = await getWorkspaceApprovalStatusByUrl(members, (id) => approvalDb.getApprovalsByUserId(id));
+    }
+    const { tasks, nextCursor, total } = applyWithImagesQuery(result, parsed, approvalStatusByUrl);
+    // Paging metadata travels in headers so the body shape stays Record<taskId, task>.
+    res.setHeader('X-Total-Tasks', String(total));
+    if (nextCursor !== null) res.setHeader('X-Next-Cursor', String(nextCursor));
+    res.json(tasks);
   } catch (error) {
     console.error('Error getting executions with images:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -2653,7 +2733,7 @@ router.get('/executions/with-videos', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with videos:', error);
@@ -2670,7 +2750,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
+    const result = await getWorkspaceExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
     res.json(buildHtmlReportsResponsePayload(result));
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);

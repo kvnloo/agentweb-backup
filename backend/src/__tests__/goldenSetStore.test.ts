@@ -3,6 +3,7 @@ import { newGoldenCase, type GoldenCase } from '../loops/eval/goldenSet';
 import {
   createGoldenSetStore,
   documentClientDb,
+  GoldenCaseNotFoundError,
   GoldenCaseVersionConflictError,
   GoldenSetStoreNotProvisionedError,
   goldenSetStoreFromEnv,
@@ -34,6 +35,14 @@ function fakeDb(pageSize = 100) {
       const id = String(p.Key.caseId);
       const item = items.get(id);
       const v = p.ExpressionAttributeValues ?? {};
+      if (p.UpdateExpression?.includes('#excluded')) {
+        if (!item) throw conditionalFailure();
+        const next: Record<string, unknown> = { ...item };
+        if (':excluded' in v) next.excluded = v[':excluded'];
+        else delete next.excluded;
+        items.set(id, next);
+        return { Attributes: next };
+      }
       if (!item || item.version !== v[':expected']) throw conditionalFailure();
       const next: Record<string, unknown> = { ...item, labels: v[':labels'], labeller: v[':labeller'], labelledAt: v[':labelledAt'], version: v[':next'] };
       if (':notes' in v) next.notes = v[':notes'];
@@ -137,6 +146,28 @@ describe('goldenSetStore (ENG-2135)', () => {
     const test = await store.listCases('agent', { split: 'test' });
     expect(test.map((c) => c.caseId).sort()).toEqual(cases.filter((c) => c.split === 'test').map((c) => c.caseId).sort());
     warn.mockRestore();
+  });
+
+  it('excludes a case and restores it, leaving its labels and version alone (ENG-2608)', async () => {
+    const { db } = fakeDb();
+    const store = createGoldenSetStore({ tableName: 'T', db });
+    const kept = agentCase('kept');
+    const empty = agentCase('empty');
+    await store.createCase(kept);
+    await store.createCase(empty);
+    await store.saveLabels(empty.caseId, { labels: { task_success: 'fail' }, expectedVersion: 0 }, 'a@example.com', NOW);
+
+    const exclusion = { reason: 'empty_session', by: 'admin@example.com', at: NOW.toISOString() };
+    const excluded = await store.setExclusion(empty.caseId, exclusion);
+    expect(excluded).toMatchObject({ excluded: exclusion, labels: { task_success: 'fail' }, version: 1 });
+    expect((await store.listCases('agent')).map((c) => c.caseId)).toEqual([kept.caseId]);
+    expect((await store.listCases('agent', { includeExcluded: true })).map((c) => c.caseId).sort()).toEqual([empty.caseId, kept.caseId].sort());
+    expect(await store.getCase(empty.caseId)).toMatchObject({ excluded: exclusion });
+
+    const restored = await store.setExclusion(empty.caseId, null);
+    expect(restored).not.toHaveProperty('excluded');
+    expect((await store.listCases('agent')).map((c) => c.caseId).sort()).toEqual([empty.caseId, kept.caseId].sort());
+    await expect(store.setExclusion('agent#sessionId#missing', exclusion)).rejects.toBeInstanceOf(GoldenCaseNotFoundError);
   });
 
   it('wraps a DocumentClient, passing params through and awaiting .promise()', async () => {

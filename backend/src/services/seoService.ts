@@ -103,6 +103,136 @@ export async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataC
   }
 }
 
+const GA4_KEY_EVENTS_MANUAL_CHECK =
+  "Manual check: in GA4 open Admin > Data display > Events (or Admin > Key events) and look at the \"Mark as key event\" toggle for each event.";
+
+async function getGa4AdminAccessToken(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+    const serviceAccount = JSON.parse(await getSecret(secretName));
+    if (!serviceAccount.private_key || !serviceAccount.client_email) return null;
+    // Same read-only scope family the Data API client already relies on; no new grant.
+    const client = new JWT({
+      email: serviceAccount.client_email,
+      key: serviceAccount.private_key,
+      scopes: ["https://www.googleapis.com/auth/analytics.readonly"],
+    });
+    const token = await client.getAccessToken();
+    return token.token || null;
+  } catch (error: any) {
+    console.error("Error fetching GA4 Admin access token:", error?.message || error);
+    return null;
+  }
+}
+
+/**
+ * ENG-896: read the GA4 key-event (conversion) CONFIGURATION for the user's
+ * configured properties via the GA4 Admin API (v1beta keyEvents.list). This is
+ * the current configuration, unlike the historical conversion counts returned by
+ * fetchGoogleAnalyticsMetrics. Read-only.
+ */
+export async function fetchGa4KeyEvents(
+  userId: string,
+  filterPropertyId?: string,
+  eventName?: string,
+  resolvedConfig?: ResolvedAnalyticsConfig,
+): Promise<any> {
+  const user = await userDb.getUserById(userId);
+  if (!user) return { error: "User not found" };
+
+  const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
+  const gaProperties = resolved.properties;
+  if (gaProperties.length === 0) {
+    return { message: "Google Analytics (GA4) is not configured. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo) by granting the AgentWeb service account Viewer access and adding the numeric GA4 Property ID." };
+  }
+
+  let propertiesToFetch = gaProperties;
+  if (filterPropertyId) {
+    propertiesToFetch = gaProperties.filter(p => p.propertyId === filterPropertyId);
+    if (propertiesToFetch.length === 0) {
+      return { error: `GA4 property "${filterPropertyId}" not found in configured properties: ${gaProperties.map(p => `${p.label} (${p.propertyId})`).join(", ")}` };
+    }
+  }
+
+  const token = await getGa4AdminAccessToken();
+  if (!token) {
+    return { error: `Google Analytics Admin API not configured. Please contact support. ${GA4_KEY_EVENTS_MANUAL_CHECK}` };
+  }
+
+  const wanted = eventName?.trim();
+  const results = await Promise.all(propertiesToFetch.map(async (prop) => {
+    const { propertyId, label } = prop;
+    try {
+      const keyEvents: Array<{ eventName: string; createTime?: string; countingMethod?: string; custom?: boolean; deletable?: boolean }> = [];
+      let pageToken: string | undefined;
+      let pages = 0;
+      do {
+        const url = new URL(`https://analyticsadmin.googleapis.com/v1beta/properties/${encodeURIComponent(propertyId)}/keyEvents`);
+        url.searchParams.set("pageSize", "200");
+        if (pageToken) url.searchParams.set("pageToken", pageToken);
+        const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15_000) });
+        let body: any;
+        try {
+          body = await res.json();
+        } catch {
+          if (res.ok) {
+            return { propertyId, label, error: `Unreadable key-event response from the GA4 Admin API for property ${propertyId}. ${GA4_KEY_EVENTS_MANUAL_CHECK}`, errorReason: "error" };
+          }
+          body = {};
+        }
+        if (!res.ok) {
+          const status = body?.error?.status || "";
+          const msg = body?.error?.message || `HTTP ${res.status}`;
+          if (res.status === 403 || status === "PERMISSION_DENIED") {
+            return {
+              propertyId, label,
+              error: `Permission denied reading key-event configuration for GA4 property ${propertyId}. The AgentWeb service account needs at least Viewer access on this property (GA4 Admin > Property access management). ${GA4_KEY_EVENTS_MANUAL_CHECK}`,
+              errorReason: "permission_denied",
+            };
+          }
+          if (res.status === 404 || status === "NOT_FOUND") {
+            return { propertyId, label, error: `GA4 property ${propertyId} was not found by the Admin API. ${GA4_KEY_EVENTS_MANUAL_CHECK}`, errorReason: "not_found" };
+          }
+          return { propertyId, label, error: `Could not read key-event configuration for GA4 property ${propertyId}: ${msg}. ${GA4_KEY_EVENTS_MANUAL_CHECK}`, errorReason: "error" };
+        }
+        for (const ke of body?.keyEvents || []) {
+          if (!ke?.eventName) continue;
+          keyEvents.push({
+            eventName: ke.eventName,
+            ...(ke.createTime && { createTime: ke.createTime }),
+            ...(ke.countingMethod && { countingMethod: ke.countingMethod }),
+            ...(typeof ke.custom === "boolean" && { custom: ke.custom }),
+            ...(typeof ke.deletable === "boolean" && { deletable: ke.deletable }),
+          });
+        }
+        pageToken = body?.nextPageToken || undefined;
+        pages++;
+      } while (pageToken && pages < 10);
+
+      const keyEventNames = keyEvents.map(k => k.eventName);
+      return {
+        propertyId,
+        label,
+        keyEventCount: keyEvents.length,
+        keyEventNames,
+        keyEvents,
+        ...(wanted && { queriedEvent: wanted, isKeyEvent: keyEventNames.includes(wanted) }),
+      };
+    } catch (error: any) {
+      return { propertyId, label, error: `Could not read key-event configuration for GA4 property ${propertyId}: ${error?.message || error}. ${GA4_KEY_EVENTS_MANUAL_CHECK}`, errorReason: "error" };
+    }
+  }));
+
+  return {
+    source: "GA4 Admin API keyEvents.list (current configuration, not historical counts)",
+    semantics: "keyEventNames is the authoritative CURRENT list of events marked as key events. An event not in the list is not currently a key event. createTime is when it was marked; GA4 key-event changes are not retroactive. If a property has an error, do not guess its configuration — relay the error and the manual check.",
+    properties: results,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 export async function getPageSpeedApiKey(): Promise<string | null> {
   try {
     const secretName = process.env.NODE_ENV === "production"
@@ -814,6 +944,11 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         topPagesBySessions,
         ...(topPagesBySessionsError && { topPagesBySessionsError }),
         dateRange: { startDate: startDateStr, endDate: endDateStr },
+        // ENG-896: zero-data preflight — say so up front, with property + range.
+        ...(totalSessions === 0 && totalPageViews === 0 && dailyData.length === 0 && {
+          noData: true,
+          noDataNote: `GA4 property ${propertyId} (${label}) returned ZERO data for ${startDateStr} to ${endDateStr}. State this in your first reply, with the property ID and date range: either tracking is not sending data to this property or the range predates collection. Do not present empty metrics as real zeros for traffic.`,
+        }),
       };
     } catch (error: any) {
       console.error(`Error fetching Google Analytics metrics for property ${label} (${propertyId}):`, error);
@@ -828,7 +963,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   const metrics = await Promise.all(metricsPromises);
   return {
     ga4_integration_status: "GA4 is configured and connected. If a page or subdomain shows 0 sessions, it means that domain/subdomain is not sending data to this property — GA4 tracking is not installed there. Do NOT ask the user for a Measurement ID; instead, offer to add GA4 tracking to the missing pages.",
-    key_event_semantics: "The `conversions` numbers (both in `trafficSources` and in `conversionsBySource`) are historical counts of events that were flagged as key events AT COLLECTION TIME. In GA4, marking or un-marking a key event is not retroactive: already-collected rows keep their conversion counts, and newly-marked events have none before the date they were marked. So an event appearing here with conversions > 0 — commonly `page_view` or `scroll` — does NOT mean it is currently marked as a key event, and an event missing from this list does not mean it isn't. No tool available here reads the property's key-event configuration. Do not state, and do not advise un-marking or marking, which events are key events based on this payload: read the GA4 Admin UI (Admin > Events / Key events) with browser tools, or ask the user.",
+    key_event_semantics: "The `conversions` numbers (both in `trafficSources` and in `conversionsBySource`) are historical counts of events that were flagged as key events AT COLLECTION TIME. In GA4, marking or un-marking a key event is not retroactive: already-collected rows keep their conversion counts, and newly-marked events have none before the date they were marked. So an event appearing here with conversions > 0 — commonly `page_view` or `scroll` — does NOT mean it is currently marked as a key event, and an event missing from this list does not mean it isn't. To answer which events are CURRENTLY marked as key events, call get_ga4_key_events if it is among your available tools (reads the configuration directly via the GA4 Admin API). Never infer key-event configuration from this payload; if get_ga4_key_events is not available in this session, is refused, or returns an error, say plainly that the current key-event configuration could not be checked here and give the manual check (GA4 Admin > Events / Key events).",
     configured_properties: gaProperties.map(p => ({ propertyId: p.propertyId, label: p.label })),
     metrics,
     timeframe,

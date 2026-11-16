@@ -51,6 +51,7 @@ describe('Agent Mode Controller - Session Loading', () => {
     const res: any = {};
     res.status = jest.fn().mockReturnValue(res);
     res.json = jest.fn().mockReturnValue(res);
+    res.setHeader = jest.fn();
     return res;
   };
 
@@ -60,6 +61,36 @@ describe('Agent Mode Controller - Session Loading', () => {
   });
 
   describe('getSession', () => {
+    it('sends Cache-Control: no-store on the owner response', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      const res = mockResponse();
+      await agentModeController.getSession(mockRequest(mockUser, 'session-123'), res);
+      expect(res.setHeader).toHaveBeenCalledWith('Cache-Control', 'no-store');
+      expect(res.json).toHaveBeenCalled();
+    });
+
+    it('does not set the cache header on a refused (403) or missing (404) session', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ ...mockSession, userId: 'someone-else' });
+      const forbidden = mockResponse();
+      await agentModeController.getSession(mockRequest(mockUser, 'session-123'), forbidden);
+      expect(forbidden.status).toHaveBeenCalledWith(403);
+      expect(forbidden.setHeader).not.toHaveBeenCalled();
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
+      const missing = mockResponse();
+      await agentModeController.getSession(mockRequest(mockUser, 'session-123'), missing);
+      expect(missing.status).toHaveBeenCalledWith(404);
+      expect(missing.setHeader).not.toHaveBeenCalled();
+    });
+
+    it('ENG-112: the owner view passes branchedFrom through', async () => {
+      const branchedFrom = { sessionId: 'a', rootSessionId: 'root', messageIndex: 4, branchedAt: '2026-10-12T00:00:00.000Z' };
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ ...mockSession, branchedFrom });
+      const res = mockResponse();
+      await agentModeController.getSession(mockRequest(mockUser, 'session-123'), res);
+      expect(res.json.mock.calls[0][0].branchedFrom).toEqual(branchedFrom);
+    });
+
     it('should return session with filtered messages for regular user', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
@@ -80,6 +111,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         // ENG-1579: no fixture message carries `.llm` and the fixture has no
         // `llmModel`, so there is nothing to attribute — all null.
@@ -227,6 +259,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,
@@ -267,6 +300,7 @@ describe('Agent Mode Controller - Session Loading', () => {
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
         hasActiveProgress: false,
+        isGenerating: false,
         skills: [],
         generationModels: null,
         attributedModels: null,

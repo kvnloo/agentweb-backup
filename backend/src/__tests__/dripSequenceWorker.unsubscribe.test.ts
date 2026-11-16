@@ -167,6 +167,36 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     expect(stats.exited).toBe(1);
   });
 
+  it.each([
+    ['onUnsubscribe is switched off', { onUnsubscribe: false }],
+    ['the exit settings are empty (an older sequence)', {}],
+  ])('still exits and sends nothing to a do-not-contact lead when %s (ENG-673)', async (_label, exitConditions) => {
+    mockDripSequenceDb.getAllDueEnrollments.mockResolvedValue([baseEnrollment as any]);
+    mockDripSequenceDb.getSequence.mockResolvedValue({ ...baseSequence, exitConditions } as any);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'test@acme.io', contactStatus: 'do-not-contact' } as any);
+    mockDripSequenceDb.exitEnrollment.mockResolvedValue(undefined as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockDripSequenceDb.exitEnrollment).toHaveBeenCalledWith('enroll-1', 'unsubscribed');
+    expect(mockResendService.sendEmail).not.toHaveBeenCalled();
+    expect(stats.sent).toBe(0);
+    expect(stats.exited).toBe(1);
+  });
+
+  it('exits and sends nothing when the lead no longer exists (ENG-673)', async () => {
+    mockDripSequenceDb.getAllDueEnrollments.mockResolvedValue([baseEnrollment as any]);
+    mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
+    mockCrmDb.getLeadById.mockResolvedValue(null as any);
+    mockDripSequenceDb.exitEnrollment.mockResolvedValue(undefined as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockDripSequenceDb.exitEnrollment).toHaveBeenCalledWith('enroll-1', 'manual');
+    expect(mockResendService.sendEmail).not.toHaveBeenCalled();
+    expect(stats.exited).toBe(1);
+  });
+
   it('sends email normally when lead is active (not unsubscribed)', async () => {
     mockDripSequenceDb.getAllDueEnrollments.mockResolvedValue([baseEnrollment as any]);
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);

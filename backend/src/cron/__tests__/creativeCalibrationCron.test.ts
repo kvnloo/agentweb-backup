@@ -30,7 +30,8 @@ function memoryStore(provisioned = true): GoldenSetStore & { rows: Map<string, G
     tableName: provisioned ? 'T' : null,
     isProvisioned: () => provisioned,
     getCase: async (id) => rows.get(id) ?? null,
-    listCases: async (surface) => [...rows.values()].filter((c) => c.surface === surface),
+    // Like the real store: excluded cases only when asked for.
+    listCases: async (surface, opts = {}) => [...rows.values()].filter((c) => c.surface === surface && (opts.includeExcluded || !c.excluded)),
     createCase: async (c) => {
       if (rows.has(c.caseId)) return 'exists';
       rows.set(c.caseId, c);
@@ -40,6 +41,9 @@ function memoryStore(provisioned = true): GoldenSetStore & { rows: Map<string, G
       throw new Error('not used');
     },
     saveDraft: async () => {
+      throw new Error('not used');
+    },
+    setExclusion: async () => {
       throw new Error('not used');
     },
   };
@@ -138,6 +142,16 @@ describe('runCreativeCalibration: weekly batch', () => {
     const again = await runCreativeCalibration({}, { ...d, now: new Date('2026-09-25T09:00:00Z') });
     expect(again).toMatchObject({ status: 'already_complete', existing: 20 });
     expect(d.post).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts an excluded pair toward a complete batch, so the batch is not drawn again (ENG-2608)', async () => {
+    const d = deps();
+    await runCreativeCalibration({}, d);
+    const store = d.store as ReturnType<typeof memoryStore>;
+    const [first] = store.rows.values();
+    store.rows.set(first.caseId, { ...first, excluded: { reason: 'bad pair', by: 'a@example.com', at: NOW.toISOString() } });
+    const again = await runCreativeCalibration({}, { ...d, now: new Date('2026-09-25T09:00:00Z') });
+    expect(again).toMatchObject({ status: 'already_complete', existing: 20 });
   });
 
   it('an instance that loses the race for the first case finishes the batch but does not post', async () => {

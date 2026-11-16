@@ -32,6 +32,11 @@ export interface TimeoutContinuationMessage {
     // hasUnresolvedMediaDeferral for the "soft" deferral shape (see
     // hasDeferredMediaBudgetToolCall).
     toolCalls?: DeferredToolCallLike[];
+    // ENG-2854: the turn stopped at the step limit; its report is terminal, so a
+    // passive session read must never auto-resume a deferral it still lists.
+    iterationLimitReached?: boolean;
+    // ENG-2816: stamped on a user message typed by a share-link visitor (see generateSessionResponse).
+    ishareSender?: unknown;
   } | null;
   timestamp?: string;
   role?: string;
@@ -251,6 +256,7 @@ export function hasUnresolvedMediaDeferral(
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const last = messages[messages.length - 1];
   if (!last) return false;
+  if (last.metadata?.iterationLimitReached === true) return false;
   const isUnresolvedShape = last.role === 'user'
     ? last.metadata?.kind === 'auto-continuation'
     : last.role === 'tool'
@@ -262,6 +268,24 @@ export function hasUnresolvedMediaDeferral(
   const rawTs = last.timestamp || last.metadata?.timestamp;
   const ts = rawTs ? Date.parse(rawTs) : NaN;
   return Number.isFinite(ts) && ts >= sinceMs;
+}
+
+/**
+ * ENG-2816: whether the request a media continuation would carry on was typed by a share-link visitor. A continuation re-runs
+ * the last real request, so it must run under the same restrictions that request had, whoever happens to be looking at the
+ * chat when it fires (the owner reopening the session, for example). The newest user message decides: a stamped one is a
+ * visitor's; an unstamped real one is the owner's; a synthetic auto-continuation message is skipped unless it is itself stamped
+ * (a continuation of a visitor turn is flagged, so the chain keeps it round after round).
+ */
+export function lastUserTurnWasShareVisitor(messages: TimeoutContinuationMessage[] | undefined | null): boolean {
+  if (!Array.isArray(messages)) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== 'user') continue;
+    if (m.metadata?.ishareSender) return true;
+    if (m.metadata?.kind !== 'auto-continuation') return false;
+  }
+  return false;
 }
 
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */

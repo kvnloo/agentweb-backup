@@ -27,6 +27,9 @@ import { runLandingPagePageSpeedCheck } from "./landingPagePageSpeedCheck";
 import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+import { buildCallConsentNotice, CALL_CONSENT_NOTICE_VERSION } from "./voice/callConsent";
+import { registeredBusinessNameOf, type ConsentNameSources } from "./voice/callConsentName";
+export { registeredBusinessNameOf, type ConsentNameSources };
 // ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
 // Already a runtime dependency, not a devDependency.
 import * as ts from "typescript";
@@ -430,6 +433,50 @@ export function setVercelPollConfig(intervalMs: number, maxAttempts: number) {
   vercelPollMaxAttempts = maxAttempts;
 }
 
+export const V0_RATE_LIMITED_CODE = "V0_RATE_LIMITED";
+/** Minimum wait before retrying a 429 that carries no Retry-After (ENG-949). */
+let rateLimitFloorMs = 20_000;
+/** Ceiling on any single 429 wait, so a hostile/huge Retry-After cannot hang a build. */
+let rateLimitCapMs = 120_000;
+
+/** Test hook for the ENG-949 rate-limit backoff bounds. */
+export function setRateLimitBackoffConfig(floorMs: number, capMs: number): void {
+  rateLimitFloorMs = floorMs;
+  rateLimitCapMs = capMs;
+}
+
+function isRateLimitDetail(detail: string): boolean {
+  return /\bHTTP 429\b/.test(detail);
+}
+
+/**
+ * Parse a Retry-After value (delta-seconds or HTTP-date) into ms, from the error's response
+ * headers if present, else from a `retry-after`/`retryAfter` field in the SDK's error body.
+ */
+export function parseRetryAfterMs(err: any, detail: string, now = Date.now()): number | undefined {
+  const headers = err?.response?.headers;
+  let raw: unknown =
+    (typeof headers?.get === "function" ? headers.get("retry-after") : undefined) ??
+    headers?.["retry-after"] ??
+    headers?.["Retry-After"];
+  if (raw === undefined || raw === null) {
+    const m = /retry[-_ ]?after"?\s*[:=]\s*"?([^",}\s][^",}]*)/i.exec(detail);
+    raw = m?.[1];
+  }
+  if (raw === undefined || raw === null) return undefined;
+  const str = String(raw).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) return Math.round(parseFloat(str) * 1000);
+  const date = Date.parse(str);
+  if (!Number.isNaN(date)) return Math.max(0, date - now);
+  return undefined;
+}
+
+function rateLimitDelayMs(err: any, detail: string, attempt: number, baseDelayMs: number): number {
+  const retryAfter = parseRetryAfterMs(err, detail);
+  const fallback = Math.max(rateLimitFloorMs, baseDelayMs * Math.pow(2, attempt - 1));
+  return Math.min(rateLimitCapMs, retryAfter !== undefined ? retryAfter : fallback);
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
@@ -481,11 +528,25 @@ export async function withRetry<T>(
         if (err && typeof err === "object" && detail && detail !== err.message) {
           try { err.message = detail; } catch { /* frozen error — leave as-is */ }
         }
+        // ENG-949: a rate limit that outlived the retry budget is a distinct, recoverable
+        // terminal state — tag it so callers/users see "rate limited, retry later", not a
+        // generic generation failure.
+        if (isRateLimitDetail(detail) && err && typeof err === "object") {
+          try {
+            err.code = V0_RATE_LIMITED_CODE;
+            err.message = `v0 rate limit reached (HTTP 429) after ${attempt} attempt(s); retry the generation in a few minutes. ${detail}`;
+          } catch { /* frozen error — leave as-is */ }
+        }
         throw err;
       }
 
       const jitter = Math.random() * 500;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      // ENG-949: 429s used the generic 2s/4s backoff, so a minute-scale provider window
+      // exhausted all retries in ~6s. Honour Retry-After when the provider sends it, and
+      // otherwise wait at least the rate-limit floor; both are capped.
+      const delay = isRateLimitDetail(detail)
+        ? rateLimitDelayMs(err, detail, attempt, baseDelayMs) + jitter
+        : baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
         `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${detail}), retrying in ${delay}ms...`
       );
@@ -895,6 +956,9 @@ export async function resolveLandingPageLiveUrl(
 
 export interface BrandContext {
   brandName?: string;
+  /** ENG-2783: the name of the business that places the calls, for the call-consent notice (see registeredBusinessNameOf).
+   *  Absent = the prompt carries NO consent notice at all, so the page records no consent and triggers no calls. */
+  registeredBusinessName?: string;
   primaryColor?: string;
   primaryColorEnd?: string;
   isGradient?: boolean;
@@ -928,9 +992,13 @@ export interface BrandContext {
 export function buildBrandContextFromUser(
   user: any,
   brandGuidelinesOverride?: any,
+  /** ENG-2783: the caller's org, already loaded by the generation routes, for the consent notice's business name. */
+  org?: ConsentNameSources | null,
 ): BrandContext {
   const brandContext: BrandContext = {};
   if (!user) return brandContext;
+  const registeredBusinessName = registeredBusinessNameOf(org, user);
+  if (registeredBusinessName) brandContext.registeredBusinessName = registeredBusinessName;
 
   const bg: any = brandGuidelinesOverride ?? user.brandGuidelines;
   if (bg) {
@@ -1002,6 +1070,29 @@ export function extractTemplateOutline(fullHtml: string): string {
   }
 
   return sections.join('\n\n');
+}
+
+/**
+ * ENG-2783: the form's call-consent notice, for a lead capture form (the prompt always asks for a phone number). Included for EVERY
+ * such form whose business name is known: the prompt builder has no cheap, reliable signal that the org has hot-lead calling set up.
+ * With NO name the block is omitted entirely (returns ''): no placeholder ever reaches a page, the page records no consent and so
+ * triggers no calls until the notice is added.
+ */
+export function buildCallConsentInstructions(registeredBusinessName?: string): string {
+  const name = registeredBusinessName?.trim();
+  if (!name) return "";
+  const label = buildCallConsentNotice(name);
+  return (
+    `\n\nCALL CONSENT — REQUIRED WHENEVER THE FORM COLLECTS A PHONE NUMBER:\n` +
+    `1. Directly ABOVE the submit button add a checkbox that is UNCHECKED by default (never pre-checked, never hidden). ` +
+    `It is required before submit WHEN a phone number was entered, and optional otherwise.\n` +
+    `2. Its label is EXACTLY this text, word for word, in a single <label> next to the checkbox:\n` +
+    `   ${JSON.stringify(label)}\n` +
+    `   Keep it in ONE constant in the form file (const CALL_CONSENT_TEXT = ...) and render that same constant as the label and send it in the request.\n` +
+    `3. In the JSON body of the fetch('/api/capture', ...) call add ` +
+    `callConsent: { granted: <the checkbox state, a boolean>, text: CALL_CONSENT_TEXT, version: ${JSON.stringify(CALL_CONSENT_NOTICE_VERSION)} }. ` +
+    `Send it only with the checkbox state as the real boolean; never send granted: true when the box is not checked.`
+  );
 }
 
 /**
@@ -1098,6 +1189,8 @@ export function buildBrandEnrichedPrompt(
       `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
       `3. NEVER put absolute backend URLs in any client-side .tsx file.`
     );
+    const consentBlock = buildCallConsentInstructions(brand.registeredBusinessName);
+    if (consentBlock) parts.push(consentBlock);
   }
 
   // Both halves or neither: a conversion id without its label fires an event that
@@ -1467,7 +1560,7 @@ export async function generateLandingPage(
     // ── Add new page route to existing repo (no v0 call) ──
     // Legacy (DURABLE_LANDING_GENERATION off) also adds sub-pages, so the override has to
     // reach here too — otherwise the picker is silently ignored wherever the flag isn't on.
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride);
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1485,7 +1578,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds);
 }
 
 /**
@@ -1813,13 +1906,25 @@ export function isRetryableGithubPushError(err: any): { retryable: boolean; reas
  * Returns the pushed commit SHA and the post-push timestamp (used to scope the
  * Vercel deployment poll).
  */
+/**
+ * ENG-2896: thrown when a caller-supplied expected base SHA no longer matches
+ * the branch head. Never retried — nothing has been written when it is thrown.
+ */
+export class BaseShaConflictError extends Error {
+  constructor(public readonly expectedSha: string, public readonly actualSha: string) {
+    super(`Branch head is ${actualSha}, expected ${expectedSha}. Re-read the branch and retry.`);
+    this.name = "BaseShaConflictError";
+  }
+}
+
 export async function commitFilesToRepoMain(
   repoFullName: string,
   ghHeaders: Record<string, string>,
   filesToCommit: RepoFileToCommit[],
   commitMessage: string,
   maxAttempts = 4,
-  branch = "main"
+  branch = "main",
+  expectedBaseSha?: string
 ): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
   const getMainSha = async (): Promise<string> => {
     const refRes = await axios.get<any>(
@@ -1842,6 +1947,13 @@ export async function commitFilesToRepoMain(
       // Idempotency: a prior attempt's patch already landed (lost-response case).
       if (pendingCommitSha && latestCommitSha === pendingCommitSha) {
         return { pushedCommitSha: pendingCommitSha, pushTimestampMs: Date.now() };
+      }
+
+      // ENG-2896: optimistic concurrency. Checked on every attempt, so a
+      // concurrent push that turns our ref update into a non-fast-forward
+      // surfaces as a conflict on the retry instead of a silent rebase.
+      if (expectedBaseSha && latestCommitSha !== expectedBaseSha) {
+        throw new BaseShaConflictError(expectedBaseSha, latestCommitSha);
       }
 
       const treeItems = await Promise.all(
@@ -1886,6 +1998,7 @@ export async function commitFilesToRepoMain(
 
       return { pushedCommitSha, pushTimestampMs: Date.now() };
     } catch (err: any) {
+      if (err instanceof BaseShaConflictError) throw err;
       lastErr = err;
 
       // Did the patch actually land despite this error? (lost response after a
@@ -5019,7 +5132,38 @@ export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; con
  *
  * It imports `./domainMap`, so every writer must also emit a `domainMap.ts`.
  */
-export function buildLandingPageMiddleware(): string {
+export type AttributionCookiesMode = 'on' | 'off' | 'consent';
+
+/** ENG-2666: first-party consent cookie the 'consent' mode reads (written by the LP consent banner, ENG-2667). */
+export const CONSENT_COOKIE_NAME = 'aw_consent';
+
+export interface LandingPageMiddlewareOptions {
+  /**
+   * ENG-2666. 'on' (default) = attribution cookies set as today, output byte-identical.
+   * 'off' = aw_first_touch / aw_last_touch are never set; aw_page is kept.
+   * 'consent' = they are set only when the `aw_consent` cookie equals "granted".
+   */
+  attributionCookies?: AttributionCookiesMode;
+}
+
+const ATTRIBUTION_ANCHOR = '  const sp = req.nextUrl.searchParams;\n';
+
+export function buildLandingPageMiddleware(options: LandingPageMiddlewareOptions = {}): string {
+  const mode: AttributionCookiesMode = options.attributionCookies ?? 'on';
+  const base = buildLandingPageMiddlewareOn();
+  if (mode === 'on') return base;
+  const gate =
+    mode === 'off'
+      ? '  // ENG-2666: attributionCookies "off" — this site never sets aw_first_touch/aw_last_touch.\n' +
+        '  const ATTRIBUTION_ENABLED = false as boolean;\n' +
+        '  if (!ATTRIBUTION_ENABLED) return res;\n'
+      : '  // ENG-2666: attributionCookies "consent" — attribution cookies only after the visitor accepts.\n' +
+        `  if (req.cookies.get("${CONSENT_COOKIE_NAME}")?.value !== "granted") return res;\n`;
+  if (!base.includes(ATTRIBUTION_ANCHOR)) throw new Error('buildLandingPageMiddleware: attribution anchor missing');
+  return base.replace(ATTRIBUTION_ANCHOR, gate + ATTRIBUTION_ANCHOR);
+}
+
+function buildLandingPageMiddlewareOn(): string {
   return `import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { DOMAIN_MAP } from "./domainMap";
@@ -5260,6 +5404,9 @@ export async function POST(req: Request) {
     // bonus; the lead is the product. Never let the bonus cost the product.
     let visitorIp = "";
     let visitorUserAgent = "";
+    // ENG-2783: the page the form was on (the browser's Referer to THIS route), forwarded so the backend can record
+    // where call consent was given. The backend keeps host + path only and drops any query string.
+    let visitorPageUrl = "";
     try {
       const h = await headers();
       // x-vercel-forwarded-for FIRST. Vercel's docs: x-forwarded-for is overwritten by
@@ -5271,6 +5418,7 @@ export async function POST(req: Request) {
         .split(",")[0]
         .trim();
       visitorUserAgent = (h.get("user-agent") || "").trim();
+      visitorPageUrl = (h.get("referer") || "").trim();
     } catch {}
 
     const res = await fetch(FORWARD_URL, {
@@ -5288,6 +5436,7 @@ export async function POST(req: Request) {
         ...(fbc ? { fbc } : {}),
         ...(visitorIp ? { visitorIp } : {}),
         ...(visitorUserAgent ? { visitorUserAgent } : {}),
+        ...(visitorPageUrl ? { visitorPageUrl } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });

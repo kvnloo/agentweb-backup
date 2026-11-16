@@ -83,7 +83,7 @@ describe('AgentModeService - generate_video function', () => {
         'test.mp4',
         'user123',
         'session123',
-        'veo-3.1-generate-preview',
+        'gemini-omni-1.1-flash',
         undefined,
         undefined
       );
@@ -92,7 +92,7 @@ describe('AgentModeService - generate_video function', () => {
         prompt: 'Test video prompt',
         filename: 'test.mp4',
         userId: 'user123',
-        videoModel: 'veo-3.1-generate-preview',
+        videoModel: 'gemini-omni-1.1-flash',
         startFrame: undefined,
         endFrame: undefined
       });
@@ -230,91 +230,75 @@ describe('AgentModeService - generate_video function', () => {
   });
 
   describe('Cost Tracking', () => {
-    it('should charge $3.20 for an 8s veo-3.1-generate-preview video (single clip)', async () => {
+    // gemini-omni-1.1-flash estimate: $0.1014 per actual requested second,
+    // used only when the service reports no actual cost.
+    const generated = (extra: Record<string, any> = {}) => ({
+      success: true, videoUrl: 'https://example.com/video.mp4', filename: 'test.mp4', ...extra,
+    });
+
+    it('charges the actual provider cost the service reports (Omni usage), not the estimate', async () => {
       const { chatbotDb } = require('../services/chatbotService');
-      mockVideoService.generateVideo.mockResolvedValue({
-        success: true,
-        videoUrl: 'https://example.com/video.mp4',
-        filename: 'test.mp4'
-      });
+      mockVideoService.generateVideo.mockResolvedValue(generated({ model: 'gemini-omni-1.1-flash', costUsd: 0.8123 }));
 
       await (agentModeService as any).generateVideo(
         'Test prompt', 'test.mp4', 'user123', 'session123',
-        'veo-3.1-generate-preview', undefined, undefined,
-        false, undefined, 8
+        'gemini-omni-1.1-flash', undefined, undefined, false, undefined, 8
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 3.20, 'generateVideo');
+      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 0.8123, 'generateVideo');
     });
 
-    it('should charge $6.40 for a 16s video (2 clips × $3.20)', async () => {
+    it('estimates $0.1014 per requested second for Omni when no actual cost is reported', async () => {
       const { chatbotDb } = require('../services/chatbotService');
-      mockVideoService.generateVideo.mockResolvedValue({
-        success: true,
-        videoUrl: 'https://example.com/video.mp4',
-        filename: 'test_16s.mp4'
-      });
-
-      await (agentModeService as any).generateVideo(
-        'Test prompt', 'test_16s.mp4', 'user123', 'session123',
-        'veo-3.1-generate-preview', undefined, undefined,
-        false, undefined, 16
-      );
-
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 6.40, 'generateVideo');
-    });
-
-    it('should charge $9.60 for a 24s video (3 clips × $3.20)', async () => {
-      const { chatbotDb } = require('../services/chatbotService');
-      mockVideoService.generateVideo.mockResolvedValue({
-        success: true,
-        videoUrl: 'https://example.com/video.mp4',
-        filename: 'test_24s.mp4'
-      });
-
-      await (agentModeService as any).generateVideo(
-        'Test prompt', 'test_24s.mp4', 'user123', 'session123',
-        'veo-3.1-generate-preview', undefined, undefined,
-        false, undefined, 24
-      );
-
-      const call = chatbotDb.addToolCostToSession.mock.calls[0];
-      expect(call[0]).toBe('session123');
-      expect(call[1]).toBeCloseTo(9.60, 5);
-      expect(call[2]).toBe('generateVideo');
-    });
-
-    it('should charge $3.20 when durationSeconds is undefined (defaults to single clip)', async () => {
-      const { chatbotDb } = require('../services/chatbotService');
-      mockVideoService.generateVideo.mockResolvedValue({
-        success: true,
-        videoUrl: 'https://example.com/video.mp4',
-        filename: 'test.mp4'
-      });
+      mockVideoService.generateVideo.mockResolvedValue(generated({ model: 'gemini-omni-1.1-flash' }));
 
       await (agentModeService as any).generateVideo(
         'Test prompt', 'test.mp4', 'user123', 'session123',
-        'veo-3.1-generate-preview'
+        'gemini-omni-1.1-flash', undefined, undefined, false, undefined, 8
+      );
+      await (agentModeService as any).generateVideo(
+        'Test prompt', 'test.mp4', 'user123', 'session123',
+        'gemini-omni-1.1-flash', undefined, undefined, false, undefined, 24
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 3.20, 'generateVideo');
+      const calls = chatbotDb.addToolCostToSession.mock.calls;
+      expect(calls[0][1]).toBeCloseTo(8 * 0.1014, 5);  // 8s
+      expect(calls[1][1]).toBeCloseTo(24 * 0.1014, 5); // 24s → clips 10/10/4, billed on 24s
     });
 
-    it('should charge $2.80 for a 16s fast video (2 clips × $1.40)', async () => {
+    it('prices a legacy Veo id as gemini-omni-1.1-flash (alias, not the retired $3.20 rate)', async () => {
       const { chatbotDb } = require('../services/chatbotService');
-      mockVideoService.generateVideo.mockResolvedValue({
-        success: true,
-        videoUrl: 'https://example.com/video.mp4',
-        filename: 'test_fast.mp4'
-      });
+      mockVideoService.generateVideo.mockResolvedValue(generated());
 
-      await (agentModeService as any).generateVideo(
-        'Test prompt', 'test_fast.mp4', 'user123', 'session123',
-        'veo-3.1-fast-generate-preview', undefined, undefined,
-        false, undefined, 16
+      const result = await (agentModeService as any).generateVideo(
+        'Test prompt', 'test.mp4', 'user123', 'session123',
+        'veo-3.1-fast-generate-preview', undefined, undefined, false, undefined, 8
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 2.80, 'generateVideo');
+      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(8 * 0.1014, 5);
+      expect(result.model).toBe('gemini-omni-1.1-flash');
+    });
+
+    it('attributes cost to the model that actually produced the clip (Seedance→Omni fallback)', async () => {
+      const { chatbotDb } = require('../services/chatbotService');
+      mockVideoService.generateVideo.mockResolvedValue(generated({ model: 'gemini-omni-1.1-flash' }));
+
+      const result = await (agentModeService as any).generateVideo(
+        'Test prompt', 'test.mp4', 'user123', 'session123',
+        'seedance-2.0', undefined, undefined, false, undefined, 8
+      );
+
+      expect(chatbotDb.addToolCostToSession.mock.calls[0][1]).toBeCloseTo(8 * 0.1014, 5);
+      expect(result.model).toBe('gemini-omni-1.1-flash');
+    });
+
+    it('defaults the session cost to Seedance ($1.55) when no model is given or reported', async () => {
+      const { chatbotDb } = require('../services/chatbotService');
+      mockVideoService.generateVideo.mockResolvedValue(generated());
+
+      await (agentModeService as any).generateVideo('Test prompt', 'test.mp4', 'user123', 'session123');
+
+      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 1.55, 'generateVideo');
     });
 
     it('should not track cost when video generation fails', async () => {
@@ -326,7 +310,7 @@ describe('AgentModeService - generate_video function', () => {
 
       await (agentModeService as any).generateVideo(
         'Test prompt', 'test.mp4', 'user123', 'session123',
-        'veo-3.1-generate-preview', undefined, undefined,
+        'gemini-omni-1.1-flash', undefined, undefined,
         false, undefined, 16
       );
 

@@ -18,6 +18,8 @@ import {
   activeSessionGenerations,
   autoContinuationSessions,
   preemptAutoContinuationAndWait,
+  sessionGenerationOwners,
+  releaseSessionGeneration,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
@@ -66,6 +68,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn().mockResolvedValue({
     allowed: true, warning: false, used: 0, allowance: null,
     bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-08',
@@ -101,10 +104,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 jest.mock('../utils/agentModeErrors', () => ({
+  // Spread the real module so new exports (e.g. isProviderUnavailableError) never leave the controller error handler calling undefined.
+  ...jest.requireActual('../utils/agentModeErrors'),
   isContextLimitError: jest.fn().mockReturnValue(false),
   isSessionLimitError: jest.fn().mockReturnValue(false),
   isTransientLLMError: jest.fn().mockReturnValue(false),
   isWorkerShutdownError: jest.fn().mockReturnValue(false),
+  isProviderNoEndpointsError: jest.fn().mockReturnValue(false),
 }));
 
 const mockIoEmit = jest.fn();
@@ -196,6 +202,7 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     jest.clearAllMocks();
     activeSessionGenerations.clear();
     autoContinuationSessions.clear();
+    sessionGenerationOwners.clear();
     delete process.env.AGENT_RUN_STORE;
     mockSendOncallAlert.mockResolvedValue(undefined);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
@@ -353,6 +360,41 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  it('ENG-110: a REAL continuation holds the lock without a cap slot yet is listed by /generating for its owner only, then released with no owner leak', async () => {
+    const seen: any = {};
+    const listFor = async (userId: string) => {
+      const r = makeRes();
+      await agentModeController.getGeneratingSessions({ user: { userId } } as any, r);
+      return (r.json as jest.Mock).mock.calls[0][0].sessionIds;
+    };
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse('paused', [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()]),
+      )
+      .mockImplementationOnce(async () => {
+        seen.continuation = autoContinuationSessions.has(mockSessionId);
+        seen.owner = sessionGenerationOwners.get(mockSessionId);
+        seen.ownerList = await listFor(mockUserId);
+        seen.otherList = await listFor('someone-else');
+        const gr = makeRes();
+        await agentModeController.getSession({ params: { sessionId: mockSessionId }, user: { userId: mockUserId } } as any, gr);
+        seen.isGenerating = (gr.json as jest.Mock).mock.calls[0]?.[0]?.isGenerating;
+        return workerResponse('All 4 creatives are ready.', [imageToolCall(4)]);
+      });
+
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+
+    expect(seen.continuation).toBe(true);
+    expect(seen.owner).toBe(mockUserId);
+    expect(seen.ownerList).toEqual([mockSessionId]);
+    expect(seen.otherList).toEqual([]);
+    expect(seen.isGenerating).toBe(true);
+    expect(sessionGenerationOwners.size).toBe(0);
+    expect(activeSessionGenerations.size).toBe(0);
+    expect(await listFor(mockUserId)).toEqual([]);
   });
 
   it('releases the lock and does not recurse when a continuation call rejects outright', async () => {
@@ -527,7 +569,8 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
 
       // The usage check ran before any continuation work, and no second worker turn
       // (the auto-continuation itself) was ever attempted — no image generated, no charge.
-      expect(mockCheckTokenUsage).toHaveBeenCalledWith(mockUserId);
+      // A turn gate (ENG-668): it may record a pay-as-you-go admission.
+      expect(mockCheckTokenUsage).toHaveBeenCalledWith(mockUserId, { recordAdmission: true });
       expect(mockCheckTokenUsage).toHaveBeenCalledTimes(2);
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -834,6 +877,83 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
       expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
       expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+      // ENG-2816: the follow-up of a VISITOR's turn is a visitor turn too, not one with the owner's full tool set.
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(true);
+      expect(secondCallArgs.isInteractiveShare).toBe(true);
+    });
+
+    it('ENG-2816: a visitor\'s follow-up keeps the flag through EVERY round of a persistently slow provider', async () => {
+      const shareId = 'ishare-media-batch-chain';
+      const conversableToken = 'tok-media-batch-chain';
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const shareSession = {
+        ...mockSession,
+        sessionId: shareId,
+        interactiveShareMetadata: { isActive: true, token: conversableToken, sharedAt: new Date().toISOString(), expiresAt: '2099-01-01T00:00:00Z' },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...shareSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (shareSession as any),
+      );
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValue(workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ));
+
+      await agentModeController.generateSharedResponse({
+        params: { shareId },
+        query: { conversable: conversableToken },
+        body: { userMessage: 'Generate four 4:5 ad creatives', attachments: [] },
+        ip: '127.0.0.1',
+        headers: {},
+      } as unknown as Request, makeRes());
+      await flush(200);
+
+      // The visitor's own turn plus every continuation round (the cap is 4): none of them may run unflagged.
+      const calls = mockWorkerService.runInWorker.mock.calls as any[];
+      expect(calls.length).toBeGreaterThanOrEqual(3);
+      for (const c of calls) expect(c[0].isInteractiveShare).toBe(true);
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('ENG-2816: the follow-up of the share link OWNER\'s own turn stays an owner turn', async () => {
+      const shareId = 'ishare-media-batch-owner';
+      const conversableToken = 'tok-media-batch-owner';
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const shareSession = {
+        ...mockSession,
+        sessionId: shareId,
+        interactiveShareMetadata: { isActive: true, token: conversableToken, sharedAt: new Date().toISOString(), expiresAt: '2099-01-01T00:00:00Z' },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...shareSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (shareSession as any),
+      );
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+      const ownerCheck = jest.spyOn(require('../services/shareViewerIdentity'), 'isSessionOwnerRequest').mockResolvedValue(true);
+      try {
+        const shareReq = {
+          params: { shareId },
+          query: { conversable: conversableToken },
+          body: { userMessage: 'Generate four 4:5 ad creatives', attachments: [] },
+          ip: '127.0.0.1',
+          headers: { authorization: 'Bearer owner.jwt' },
+        } as unknown as Request;
+        await agentModeController.generateSharedResponse(shareReq, makeRes());
+        await flush();
+        expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+        expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(false);
+        expect((mockWorkerService.runInWorker.mock.calls[1][0] as any).isInteractiveShare).toBe(false);
+      } finally {
+        ownerCheck.mockRestore();
+      }
     });
   });
 
@@ -856,6 +976,32 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       expect(preempted).toBe(false);
       expect(mockRequestCancel).not.toHaveBeenCalled();
       expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+    });
+
+    it('ENG-110: the preempting request\'s re-claim records its owner (polling loop path)', async () => {
+      activeSessionGenerations.add(mockSessionId);
+      autoContinuationSessions.add(mockSessionId);
+      const p = preemptAutoContinuationAndWait(mockSessionId, 'owner-1');
+      setTimeout(() => activeSessionGenerations.delete(mockSessionId), 10);
+      expect(await p).toBe(true);
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-1');
+      releaseSessionGeneration(mockSessionId);
+      expect(sessionGenerationOwners.size).toBe(0);
+    });
+
+    it('ENG-110: the preempting request\'s FINAL re-claim (after the window) records its owner', async () => {
+      autoContinuationSessions.add(mockSessionId); // continuation flagged, lock already free
+      const realNow = Date.now();
+      const nowSpy = jest.spyOn(Date, 'now')
+        .mockReturnValueOnce(realNow) // deadline computation
+        .mockReturnValue(realNow + 10 * 60 * 1000); // window already over: loop skipped
+      try {
+        expect(await preemptAutoContinuationAndWait(mockSessionId, 'owner-2')).toBe(true);
+      } finally {
+        nowSpy.mockRestore();
+      }
+      expect(sessionGenerationOwners.get(mockSessionId)).toBe('owner-2');
+      releaseSessionGeneration(mockSessionId);
     });
 
     it('cancels the auto-continuation and re-claims the lock once it releases within the window', async () => {
@@ -1013,6 +1159,42 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       const callArgs = mockWorkerService.runInWorker.mock.calls[0][0] as any;
       expect(callArgs.messageContent).toMatch(/automatic continuation/i);
+    });
+
+    it('ENG-2816: the owner reopening a chat whose deferred request was a VISITOR\'s resumes it as a visitor turn', async () => {
+      const iso = recentIso();
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [
+          { role: 'user', content: 'make four creatives', metadata: { timestamp: iso, ishareSender: { isAnonymous: true } } },
+          { role: 'assistant', content: '3 done', timestamp: iso, metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: iso } },
+        ],
+      } as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      await agentModeController.getSession(makeGetSessionReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(true);
+    });
+
+    it('ENG-2816: the owner reopening a chat whose deferred request was their own resumes as an owner turn, as before', async () => {
+      const iso = recentIso();
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [
+          { role: 'user', content: 'make four creatives', metadata: { timestamp: iso } },
+          { role: 'assistant', content: '3 done', timestamp: iso, metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: iso } },
+        ],
+      } as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      await agentModeController.getSession(makeGetSessionReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect((mockWorkerService.runInWorker.mock.calls[0][0] as any).isInteractiveShare).toBe(false);
     });
 
     it('does NOT re-fire while a generation is already active for the session (avoids racing an in-flight resume)', async () => {

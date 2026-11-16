@@ -175,39 +175,32 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
   });
 
-  it('ENG-244: issues a continuation when the run is truncated by the step budget, even with non-report partial text', async () => {
-    let call = 0;
-    mockWorker.runInWorker.mockImplementation(() => {
-      call++;
-      // Turn 1: step budget exhausted mid-gather. The model complied with the
-      // "wrap up" nudge and wrote its own partial text (NO admission phrasing,
-      // NO canned apology), but the run set truncatedByStepBudget. Turn 2
-      // (continuation): produces the final report.
-      return Promise.resolve(
-        call === 1
-          ? { ...workerResult('Here is a partial summary gathered so far; page 4 of the S3 export is still pending.'), truncatedByStepBudget: true }
-          : workerResult('Daily User Activity Report complete. Final consolidated report below.')
-      );
+  it('ENG-2854: step-budget exhaustion stops after one attempt, even with partial text', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...workerResult('Iteration limit reached. LP lp-flatfee on draft/flatfee needs review by Yugo / engineering.'),
+      truncatedByStepBudget: true,
     });
-
     const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
-
-    // Gate fired off the flag → at least 2 LLM turns (no single-turn short-circuit).
-    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
-    // Continuation message is tailored to the truncation cause: it tells the model it
-    // was cut off at its step budget and must NOT falsely claim it "indicated"
-    // unfinished work (Greptile ENG-244 follow-up).
-    const secondMsg = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
-    expect(secondMsg).toMatch(/exhausted its processing-step budget|cut short/i);
-    expect(secondMsg).not.toMatch(/indicated some entities\/steps were not finished/i);
-    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    expect(result.status).not.toBe('success');
   });
 
+  it('ENG-2854: a completion-gate continuation that exhausts its steps is not retried', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(async () => ++call === 1
+      ? workerResult('Event 1 done. I did not complete Step 3 for Events 2 and 3.')
+      : { ...workerResult('Iteration limit reached. Review draft/flatfee with Yugo / engineering.'), truncatedByStepBudget: true });
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(2);
+    expect(result.status).not.toBe('success');
+  });
+
+  // Wall-clock continuation remains supported; iteration exhaustion now requires review.
   it('ENG-1640: resumes unfinished workflow steps before asking for the final report', async () => {
     let call = 0;
     mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
       ++call === 1
-        ? { ...workerResult('Inbox triage complete; sourcing did not run.'), truncatedByStepBudget: true }
+        ? { ...workerResult('Inbox triage complete; sourcing did not run.'), truncatedByTimeBudget: true }
         : workerResult('Sourcing complete. Final report below.')
     ));
 
@@ -222,7 +215,7 @@ describe('runScheduledChat — deterministic completion gate', () => {
     let call = 0;
     mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
       ++call === 1
-        ? { ...workerResult('Housekeeping complete; the sourcing step was starved.'), truncatedByStepBudget: true }
+        ? { ...workerResult('Housekeeping complete; the sourcing step was starved.'), truncatedByTimeBudget: true }
         : workerResult('Sourcing complete with tool evidence.')
     ));
 
@@ -237,7 +230,7 @@ describe('runScheduledChat — deterministic completion gate', () => {
     let call = 0;
     mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
       ++call === 1
-        ? { ...workerResult('Three DMs sent; sourcing did not run.'), truncatedByStepBudget: true }
+        ? { ...workerResult('Three DMs sent; sourcing did not run.'), truncatedByTimeBudget: true }
         : workerResult('Sourcing complete without duplicate sends.')
     ));
 
@@ -521,6 +514,52 @@ describe('runScheduledChat — deterministic completion gate', () => {
         expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
         expect(message).toContain('no longer authorized to publish with any tool');
       }
+    });
+  });
+  // ENG-1978: the subscription pre-check can come back unresolved (null). That is often a brief
+  // settings-read failure, so the run retries a couple of times before giving up its slot, and only
+  // then defers (never running with every required function treated as permitted).
+  describe('unresolved entitlement on a scheduled run (ENG-1978)', () => {
+    const needsTool = {
+      ...leadEngSchedule,
+      scheduleId: 'sched-entitlement',
+      requiredFunctionCalls: ['post_on_connected_account'],
+    };
+    const DEFERRED = 'entitlements are temporarily unavailable';
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    it('retries a transient null and then runs the schedule', async () => {
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      (getAllowedFunctionCalls as jest.Mock).mockReset();
+      (getAllowedFunctionCalls as jest.Mock).mockResolvedValueOnce(null).mockResolvedValue(['*']);
+      mockWorker.runInWorker.mockResolvedValue(workerResult('Posted everything as requested.'));
+
+      const pending = runScheduledChat(needsTool as any, 'test-user-123', true);
+      await jest.advanceTimersByTimeAsync(10_000);
+      const result = await pending;
+
+      expect(getAllowedFunctionCalls).toHaveBeenCalledTimes(2);
+      expect(mockWorker.runInWorker).toHaveBeenCalled();
+      expect(result.actualResponse ?? '').not.toContain(DEFERRED);
+    });
+
+    it('defers after the retries when the entitlement stays unresolved, keeping the run id', async () => {
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      (getAllowedFunctionCalls as jest.Mock).mockReset();
+      (getAllowedFunctionCalls as jest.Mock).mockResolvedValue(null);
+
+      const pending = runScheduledChat(needsTool as any, 'test-user-123', true, 'pre-generated-run-id');
+      await jest.advanceTimersByTimeAsync(10_000);
+      const result = await pending;
+
+      expect(getAllowedFunctionCalls).toHaveBeenCalledTimes(3);
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', runId: 'pre-generated-run-id' }));
+      expect(result.actualResponse).toContain(DEFERRED);
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledTimes(1);
     });
   });
 });

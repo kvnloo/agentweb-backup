@@ -133,7 +133,7 @@ describe('reconcileSentInvitationsToCrm', () => {
     await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, refreshFromLive: false });
     expect(createLead).toHaveBeenCalledWith(
       LIST,
-      expect.objectContaining({ firstName: 'Bala', lastName: 'S.', status: 'contacted' }),
+      expect.objectContaining({ firstName: 'Bala', lastName: 'S.', status: 'contacted' }), 'linkedin',
     );
   });
 
@@ -300,7 +300,7 @@ describe('reconcileSentInvitationsToCrm', () => {
     });
 
     expect(getLeadListsByUserId).not.toHaveBeenCalled();
-    expect(createLead).toHaveBeenCalledWith(LIST, expect.anything());
+    expect(createLead).toHaveBeenCalledWith(LIST, expect.anything(), 'linkedin');
   });
 
   it('still reconciles when the owner list lookup fails', async () => {

@@ -1,0 +1,227 @@
+name: Login host deploy
+
+# ENG-2110: ships the login host to the prod worker, automatically, with no human approval per deploy and nobody else involved.
+#
+# The gate is the REVIEWED MERGE, not a click: this only runs for code that is already on main. What stops a bad or hostile build from reaching the
+# machine that holds customers' Claude logins is checked by machines, in this order:
+#   1. the tests must pass in their own job, the tree must be clean and the lockfile must match before anything is packaged;
+#   2. the build is signed with a KMS key ONLY this workflow's role can use (the role's trust is pinned to the `login-host-prod` environment, which only
+#      accepts runs from `main`); the worker's SSM document verifies that signature before it unpacks a byte, and refuses a build older than the one running;
+#   3. the worker waits for an idle moment (running turns and sign-ins finish; nothing is ever cut off), restarts, checks health, and rolls back by itself.
+# TWO JOBS ON PURPOSE: the build job runs npm (every dependency's code, including install scripts and the test run) and has NO cloud credentials and no
+# OIDC token. The deploy job holds the credentials and runs no repository or npm code, only the AWS CLI and two scripts that were checked out from main.
+# Set up ONCE by someone with IAM rights: backend/src/loginHost/deploy/aws/README.md. Nothing here needs that person again.
+# SWITCHED OFF until that setup is done: both jobs only run when the repository variable LOGIN_HOST_DEPLOY_ENABLED is exactly 'true' (Settings -> Secrets and
+# variables -> Actions -> Variables). Until then a matching merge runs nothing at all, so there is no red run and no unrestricted environment gets created.
+#
+# Backend-only merges do not trigger this (path filter; a test keeps it in step with what the worker bundle actually imports). A change that needs the
+# worker to be new BEFORE the backend (a new request field or route, see PROTOCOL_VERSION in loginHost/protocol.ts) must be merged in two steps: worker
+# side first, backend side after this run is green.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/src/loginHost/**'
+      - '!backend/src/loginHost/__tests__/**'
+      - '!backend/src/loginHost/**/*.md'
+      - 'backend/src/services/funding/claudeLoginParse.ts'
+      - 'backend/src/services/funding/claudeBinary.ts'
+      - 'backend/src/services/funding/claudeCliRunner.ts'
+      - 'backend/scripts/build-login-host.sh'
+      - 'backend/scripts/sign-login-host.sh'
+      - 'backend/package-lock.json'
+      - '.github/workflows/login-host-deploy.yml'
+      - '.github/scripts/login-host-run-deploy.sh'
+      - '.github/scripts/login-host-verify-build.sh'
+  workflow_dispatch:
+    inputs:
+      max_wait_seconds:
+        description: 'How long the worker may wait for an idle moment before giving up (it never forces a restart). Digits only, at most 3000.'
+        required: false
+        default: '1800'
+        type: string
+
+# One at a time, newest wins; a running deploy is never cancelled half-way.
+concurrency:
+  group: login-host-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  ROLE_ARN: arn:aws:iam::992382574572:role/aw-login-host-ci
+  BUCKET: agentweb-login-host-992382574572
+  KMS_KEY: alias/aw-login-host-signing
+  INSTANCE_ID: i-033394e5467b48e94
+
+jobs:
+  test:
+    name: Gate tests (runs dev-dependency code; produces nothing; no credentials)
+    # Only ever from main, whatever started it, and only once the one-time setup is done and someone has switched it on.
+    if: github.ref == 'refs/heads/main' && vars.LOGIN_HOST_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read # and nothing else: no id-token
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies (no install scripts)
+        working-directory: backend
+        run: npm ci --ignore-scripts
+
+      - name: Gate tests (host, deploy scripts, tool relay, adapter, shim, wrapper, connection manager, server, mutual TLS)
+        working-directory: backend
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: bash scripts/build-login-host.sh --tests-only
+
+  build:
+    name: Build (no test code, no cloud credentials)
+    if: github.ref == 'refs/heads/main' && vars.LOGIN_HOST_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # and nothing else: no id-token
+    outputs:
+      artifact_id: ${{ steps.keep.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies (no install scripts)
+        working-directory: backend
+        run: npm ci --ignore-scripts
+
+      - name: Package (esbuild + lockfile check; the tests ran in the other job)
+        working-directory: backend
+        run: bash scripts/build-login-host.sh --out "$RUNNER_TEMP/out" --tests-run-elsewhere
+
+      - name: Keep the build
+        id: keep
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: login-host-build
+          path: ${{ runner.temp }}/out/login-host-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Verify the build against this commit (parses untrusted input; no credentials)
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && vars.LOGIN_HOST_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # and nothing else: no id-token
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      # Only the scripts this job runs and the files it compares the build against.
+      - name: Checkout the scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            backend/src/loginHost/deploy
+            .github/scripts/login-host-verify-build.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Fetch the build (by id, not by name)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: build
+
+      - name: Verify the build against this commit
+        run: |
+          mapfile -t found < <(find build -type f -name 'login-host-*.tar.gz')
+          [ "${#found[@]}" = 1 ] || { echo "::error::expected exactly one tarball, found ${#found[@]}"; exit 1; }
+          bash .github/scripts/login-host-verify-build.sh "${found[0]}"
+          echo "TAR=${found[0]}" >>"$GITHUB_ENV"
+
+      - name: Record the verified tarball's sha256
+        id: hash
+        run: echo "sha256=$(sha256sum "$TAR" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    name: Sign and deploy (credentials; parses nothing, runs no repository code)
+    needs: [test, build, verify]
+    if: github.ref == 'refs/heads/main' && vars.LOGIN_HOST_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: login-host-prod
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout the scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            backend/scripts/sign-login-host.sh
+            .github/scripts/login-host-run-deploy.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Fetch the build (by id, not by name)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: build
+
+      # The file that gets signed must be byte-for-byte the one the verify job examined.
+      - name: Check it is the verified build
+        env:
+          VERIFIED_SHA256: ${{ needs.verify.outputs.sha256 }}
+        run: |
+          mapfile -t found < <(find build -type f -name 'login-host-*.tar.gz')
+          [ "${#found[@]}" = 1 ] || { echo "::error::expected exactly one tarball, found ${#found[@]}"; exit 1; }
+          [ "$(sha256sum "${found[0]}" | cut -d' ' -f1)" = "$VERIFIED_SHA256" ] || { echo "::error::the build is not the one the verify job examined"; exit 1; }
+          echo "TAR=${found[0]}" >>"$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 14400 # the deploy loop below stops starting attempts before this runs out; the role allows up to 4 h
+
+      - name: Sign the build with KMS
+        run: bash backend/scripts/sign-login-host.sh "$TAR" "$KMS_KEY"
+
+      - name: Upload the build and its signature
+        run: |
+          name=$(basename "$TAR")
+          # The build first, then the signature: the worker needs both, and is only asked after both are there.
+          aws s3 cp --only-show-errors "$TAR" "s3://$BUCKET/prod/builds/$name"
+          aws s3 cp --only-show-errors "$TAR.sig" "s3://$BUCKET/prod/builds/$name.sig"
+          echo "BUILD_KEY=prod/builds/$name" >>"$GITHUB_ENV"
+
+      - name: Deploy on the worker (waits for an idle moment, health-checks, rolls back by itself)
+        env:
+          # Passed through the environment, never interpolated into the script text; the script and the worker's document also constrain it to digits.
+          MAX_WAIT: ${{ inputs.max_wait_seconds || '1800' }}
+        run: bash .github/scripts/login-host-run-deploy.sh "$BUILD_KEY" "$MAX_WAIT"

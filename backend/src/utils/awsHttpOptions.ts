@@ -10,6 +10,10 @@
  * A keep-alive agent is AWS's documented fix for v2 ("Reusing connections with
  * keep-alive in Node.js"). maxSockets matches the SDK's own default of 50, so this
  * changes reuse only, not concurrency.
+ *
+ * ENG-2598: an https.Agent cannot send an http:// request, and DynamoDB Local speaks plain
+ * http. When DYNAMODB_LOCAL_ENDPOINT is an http:// URL no agent is attached, so the opt-in
+ * real-DynamoDB suites run unmocked. Real DynamoDB is always https and keeps the agent.
  */
 import https from "https";
 
@@ -25,6 +29,11 @@ export function getAwsKeepAliveAgent(): https.Agent {
   return sharedAgent;
 }
 
-export function buildAwsHttpOptions(): { agent: https.Agent } {
-  return { agent: getAwsKeepAliveAgent() };
+/** True when the DynamoDB endpoint override is a plain http:// URL (DynamoDB Local). */
+export function isPlainHttpDynamoEndpoint(endpoint: string | undefined): boolean {
+  return typeof endpoint === "string" && /^http:\/\//i.test(endpoint.trim());
+}
+
+export function buildAwsHttpOptions(): { agent?: https.Agent } {
+  return isPlainHttpDynamoEndpoint(process.env.DYNAMODB_LOCAL_ENDPOINT) ? {} : { agent: getAwsKeepAliveAgent() };
 }

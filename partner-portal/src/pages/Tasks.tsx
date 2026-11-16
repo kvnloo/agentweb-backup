@@ -16,6 +16,7 @@ import { Add as AddIcon } from '@mui/icons-material';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { API_URL } from '../config';
+import { EmptyState, ErrorState } from '../components/StatusState';
 
 interface Task {
   taskId: string;
@@ -37,6 +38,8 @@ interface Task {
 
 export default function Tasks() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [fetchError, setFetchError] = useState(false);
   const { token } = useAuth();
   const navigate = useNavigate();
 
@@ -46,8 +49,12 @@ export default function Tasks() {
         headers: { Authorization: `Bearer ${token}` },
       });
       setTasks(response.data);
+      setFetchError(false);
     } catch (error: any) {
       console.error('Error fetching tasks:', error);
+      setFetchError(true);
+    } finally {
+      setLoaded(true);
     }
   }, [token]);
 
@@ -236,44 +243,24 @@ export default function Tasks() {
             </Card>
           </Grid>
         ))}
-        {activeTasks.length === 0 && (
+        {fetchError && activeTasks.length === 0 && (
           <Grid item xs={12}>
-            <Paper
-              sx={{
-                textAlign: 'center',
-                py: 6,
-                px: 3,
-                bgcolor: 'background.paper',
-                borderRadius: '16px',
-                border: '1px dashed',
-                borderColor: 'grey.300'
+            <ErrorState title="We couldn't load your tasks" onRetry={fetchTasks} />
+          </Grid>
+        )}
+        {loaded && !fetchError && activeTasks.length === 0 && (
+          <Grid item xs={12}>
+            <EmptyState
+              title="No active tasks found"
+              description={tasks.length > 0
+                ? `You have ${tasks.length} archived task${tasks.length > 1 ? 's' : ''}. Active tasks are shown here.`
+                : 'Create your first task to get started with web automation. Archived tasks are not shown here.'}
+              action={{
+                label: tasks.length > 0 ? 'Create New Task' : 'Create Your First Task',
+                onClick: () => navigate('/tasks/create'),
+                icon: <AddIcon />,
               }}
-            >
-              <Typography 
-                variant="h6" 
-                color="text.secondary"
-                sx={{ mb: 2 }}
-              >
-                No active tasks found
-              </Typography>
-              <Typography 
-                variant="body2" 
-                color="text.secondary"
-                sx={{ mb: 3 }}
-              >
-                {tasks.length > 0 ? 
-                  `You have ${tasks.length} archived task${tasks.length > 1 ? 's' : ''}. Active tasks are shown here.` : 
-                  'Create your first task to get started with web automation. Archived tasks are not shown here.'}
-              </Typography>
-              <Button
-                variant="contained"
-                size="large"
-                onClick={() => navigate('/tasks/create')}
-                startIcon={<AddIcon />}
-              >
-                {tasks.length > 0 ? 'Create New Task' : 'Create Your First Task'}
-              </Button>
-            </Paper>
+            />
           </Grid>
         )}
       </Grid>

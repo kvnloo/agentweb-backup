@@ -17,7 +17,7 @@ process.env.AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https:
 process.env.AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
 process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview';
 
-// agentModeService.ts/growthGeniusService.ts each fall back to their own hardcoded default
+// agentModeService.ts falls back to its own hardcoded default
 // model id (e.g. 'anthropic.claude-opus-5') only when these are unset — but a local .env
 // that still has the literal unfilled '.env.example' placeholder text (a truthy string, e.g.
 // "your_azure_openai_deployment_agent_mode") silently defeats that `||` fallback and never
@@ -32,7 +32,6 @@ process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '
 // file on disk the moment one of those modules loads — an empty string keeps the key present
 // (dotenv leaves it alone) while still being falsy for the app's own `|| 'default'` fallback.
 process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
-process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 
 // Same placeholder-leak class as above: routes/slack.ts's verifySlackRequest
 // deliberately treats an ABSENT SLACK_SIGNING_SECRET as "tests intentionally

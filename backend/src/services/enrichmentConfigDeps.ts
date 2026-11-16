@@ -46,7 +46,7 @@ async function llmInferAliases(
   // Lazy import — avoids circular deps + keeps the LLM service out of the
   // hot path for callers that never hit alias inference.
   const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
-  const { createLLMService } = await import('../utils/llmService');
+  const { buildAliasInferenceSystemPrompt } = await import('./enrichmentPrompts');
 
   // Build the canonical-field cheat sheet for the system prompt. Grouping
   // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
@@ -57,19 +57,7 @@ async function llmInferAliases(
     .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
     .join('\n');
 
-  const systemPrompt =
-    `You map user-named CRM enrichment fields to canonical field names ` +
-    `based on semantic intent (not just name similarity). ` +
-    `Return strict JSON keyed by user field name.\n\n` +
-    `Available canonical fields, grouped:\n${canonicalCheatsheet}\n\n` +
-    `Rules:\n` +
-    `- Match by MEANING, not string similarity. "stag" with instruction ` +
-    `"funding stage" → "funding_stage".\n` +
-    `- Return null when the user's field is a unique custom concept (no ` +
-    `confident canonical match).\n` +
-    `- Use the field's instruction text to disambiguate. If instruction is ` +
-    `empty, fall back to name alone.\n` +
-    `- Pick at most ONE canonical name per user field.`;
+  const systemPrompt = buildAliasInferenceSystemPrompt(canonicalCheatsheet);
 
   const userPrompt =
     `Map each user field to a canonical name (or null):\n` +
@@ -77,10 +65,8 @@ async function llmInferAliases(
     `\n\nReturn JSON: {"<userFieldName>": "<canonical_name>" | null} for each input.`;
 
   try {
-    const llm = createLLMService(
-      process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
-      0.0,
-    );
+    const { createEnrichmentHelperLLM } = await import('./enrichmentMappingLlm');
+    const llm = await createEnrichmentHelperLLM(userId, process.env.CRM_ENRICH_V3_ALIAS_MODEL);
     const result = await llm.generateJSONContent<Record<string, string | null>>(
       systemPrompt,
       userPrompt,
@@ -95,13 +81,37 @@ async function llmInferAliases(
   }
 }
 
+const normalizedSet = (values: unknown): string[] =>
+  Array.isArray(values) ? values.filter((v): v is string => typeof v === 'string').map(v => v.trim().toLowerCase()).sort() : [];
+
+/**
+ * Keeps, per field, only a classification both samples agree on: the same smart flag, the same type and,
+ * for an enum, the same set of options. A smart field keeps the dependencies named by either sample (a
+ * missing input is worse than an extra one); none is fine, the evaluator also gets the lead's own columns.
+ * Fields missing from either sample are dropped.
+ */
+export function agreeingClassifications(
+  a: Record<string, SmartFieldClassification>,
+  b: Record<string, SmartFieldClassification>,
+): Record<string, SmartFieldClassification> {
+  const out: Record<string, SmartFieldClassification> = {};
+  for (const [name, x] of Object.entries(a)) {
+    const y = b[name];
+    if (!x || !y || typeof x !== 'object' || typeof y !== 'object') continue;
+    if (!!x.isSmartField !== !!y.isSmartField || (x.fieldType ?? null) !== (y.fieldType ?? null)) continue;
+    if (x.fieldType === 'enum' && normalizedSet(x.enumOptions).join('\u0000') !== normalizedSet(y.enumOptions).join('\u0000')) continue;
+    if (!x.isSmartField) { out[name] = x; continue; }
+    out[name] = { ...x, dependencies: [...new Set([...normalizedSet(x.dependencies), ...normalizedSet(y.dependencies)])] };
+  }
+  return out;
+}
+
 async function llmClassifySmartFields(
   fields: Array<{ name: string; instruction: string }>,
   userId?: string,
 ): Promise<Record<string, SmartFieldClassification>> {
   if (fields.length === 0) return {};
   const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
-  const { createLLMService: mkLLM } = await import('../utils/llmService');
   const {
     buildSmartFieldClassificationSystemPrompt,
     buildSmartFieldClassificationUserPrompt,
@@ -114,17 +124,28 @@ async function llmClassifySmartFields(
     .join('\n');
 
   try {
-    const llm = mkLLM(process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2', 0.0);
-    const result = await llm.generateJSONContent<
-      Record<string, SmartFieldClassification>
-    >(
+    const { createEnrichmentHelperLLM } = await import('./enrichmentMappingLlm');
+    const llm = await createEnrichmentHelperLLM(userId, process.env.CRM_ENRICH_V3_CLASSIFY_MODEL || process.env.CRM_ENRICH_V3_ALIAS_MODEL);
+    const classifyOnce = () => llm.generateJSONContent<Record<string, SmartFieldClassification>>(
       buildSmartFieldClassificationSystemPrompt(canonicalFieldList),
       buildSmartFieldClassificationUserPrompt(fields),
       'json',
       undefined,
       enrichmentConfigUsageContext(userId),
     );
-    return result ?? {};
+    // ENG-2720: the answer is saved on the list and decides how every later run treats the field, and
+    // the model is not deterministic. Ask twice in parallel and keep only what both samples agree on;
+    // a field they disagree on stays unclassified and is asked again at the next save.
+    const [first, second] = await Promise.allSettled([classifyOnce(), classifyOnce()]);
+    if (first.status !== 'fulfilled' || second.status !== 'fulfilled') {
+      const failed = first.status === 'rejected' ? first.reason : (second as PromiseRejectedResult).reason;
+      throw failed instanceof Error ? failed : new Error(String(failed));
+    }
+    const agreed = agreeingClassifications(first.value ?? {}, second.value ?? {});
+    const answered = first.value && typeof first.value === 'object' ? Object.keys(first.value) : [];
+    const dropped = answered.filter(name => !(name in agreed)).length;
+    if (dropped > 0) console.warn(`[enrichmentConfigDeps] smart-field classification: ${dropped} field(s) not saved, the two samples disagreed`);
+    return agreed;
   } catch (err) {
     console.warn('[enrichmentConfigDeps] llmClassifySmartFields failed:', (err as Error).message);
     return {};

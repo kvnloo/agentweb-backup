@@ -84,6 +84,11 @@ export const CONTINUE_PROMPT =
 const CONTENT_FILTER_MESSAGE =
   "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
 
+// Returned (and persisted) when a turn ends with no answer text at all, so the user
+// never gets — and a reload never shows — a blank assistant message (Opslane 2026-10-13).
+export const EMPTY_FINAL_RESPONSE_FALLBACK =
+  "I wasn't able to produce a response this time. Please try again, or rephrase your request.";
+
 export const SYNTHESIS_NUDGE =
   '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.';
 
@@ -158,3 +163,9 @@ export function decideTermination(input: TerminationInput): TerminationDecision 
     counterDelta: noDelta,
   };
 }
+
+/** ENG-2778: injected on the final step-budget iteration (forced synthesis). */
+export const STEP_BUDGET_FINAL_SYNTHESIS_MESSAGE =
+  '[SYSTEM WARNING] Step budget exhausted: this is your final step. Do NOT call any tools — ' +
+  'any tool call now will be discarded. Write your final response from the work already ' +
+  'gathered: deliver what was completed, then list clearly what is still missing.';

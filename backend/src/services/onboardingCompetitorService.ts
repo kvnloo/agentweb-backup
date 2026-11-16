@@ -20,6 +20,7 @@
  * "If no competitive data is available, state assumptions clearly".
  */
 
+import { withClearedError } from "../utils/clearErrorOnClaim";
 import { LLMService } from "../utils/llmService";
 import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
@@ -30,6 +31,8 @@ import {
   competitorStartPatch,
   CompetitorPerICP,
   CompetitorResult,
+  CompetitorStatusFields,
+  COMPETITOR_TIMEOUT_MS,
   MAX_COMPETITOR_ICPS,
   sanitizeCompetitorResult,
 } from "./competitorStatusService";
@@ -38,6 +41,7 @@ import {
   IcpBrandContext,
 } from "./onboardingIcpService";
 import type { ICPPersona } from "./icpStatusService";
+import { trackBackgroundRun } from "../utils/trackedBackgroundRun";
 
 /** Bedrock model alias. Same family as Step 2 for tone consistency. */
 const COMPETITOR_MODEL = "anthropic.claude-sonnet-4-6";
@@ -472,21 +476,58 @@ export async function generateCompetitorStrategyForUser(
  * `running`) and produced a 100% onboarding ad-gen failure rate. See
  * Notion `34d09247-c951-81e4-af97-df1e869bc8aa` for the full diagnosis.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here). The stale-claim escape hatch lets a
+ * second claim reclaim the axis while the first claimant is merely slow,
+ * not crashed; `competitorReadyPatch` only checks `competitorStatus ===
+ * "running"`, not WHICH run's `running` it is, so a reclaimed run's zombie
+ * completion can otherwise overwrite — or be overwritten by, silently
+ * dropping the real result — the reclaiming run's own completion.
+ */
+function competitorOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#competitorStartedAt = :competitorOwnerStartedAt",
+    names: { "#competitorStartedAt": "competitorStartedAt" },
+    values: { ":competitorOwnerStartedAt": expectedStartedAt },
+  };
+}
+
 export async function triggerCompetitorStrategyForUser(
   userId: string,
   deps: {
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
+    expectedStartedAt?: string;
   } = {},
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
-  const u = user as any;
-  const icpStatus = typeof u.icpStatus === "string" ? u.icpStatus : "idle";
-  const personas: ICPPersona[] = Array.isArray(u.icpResult)
-    ? (u.icpResult as ICPPersona[])
-    : [];
+  let u = user as any;
+  const readiness = (rec: any) => {
+    const status = typeof rec.icpStatus === "string" ? rec.icpStatus : "idle";
+    const list: ICPPersona[] = Array.isArray(rec.icpResult) ? (rec.icpResult as ICPPersona[]) : [];
+    return { icpStatus: status, personas: list };
+  };
+  let { icpStatus, personas } = readiness(u);
+  if (icpStatus !== "ready" || personas.length === 0) {
+    // The read above is the eventually-consistent index: the legacy cascade
+    // calls us moments after icp turned `ready`, so a lagging read would gate a
+    // run that is actually good to go. Confirm with a consistent read before
+    // giving up. If that read is unavailable the original decision stands.
+    try {
+      const fresh = await (userDb as any).getUserByIdConsistent(userId);
+      if (fresh) {
+        u = fresh;
+        ({ icpStatus, personas } = readiness(u));
+      }
+    } catch {
+      /* keep the gate decision */
+    }
+  }
   if (icpStatus !== "ready" || personas.length === 0) {
     // Don't mark failed. Don't run. The polling tick and the next
     // cascade kickoff will re-call us once ICP is actually ready.
@@ -495,6 +536,25 @@ export async function triggerCompetitorStrategyForUser(
       userId,
       reason: `icp not ready (status=${icpStatus}, personas=${personas.length})`,
     });
+    // This run holds the axis claim but is not going to do any work. Left
+    // `running`, the claim would turn every retry into a no-op until the axis
+    // times out (3 minutes), where before the claims a retry simply re-fired.
+    // Hand the axis back (conditioned on OUR claim, so a newer run's state is
+    // never touched) so the next start or cascade kickoff can claim it.
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, { competitorStatus: "idle" } as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (releaseErr: any) {
+        if (releaseErr?.code !== "ConditionalCheckFailedException") {
+          console.warn("[onboardingCompetitorService] could not release gated claim", {
+            userId,
+            err: releaseErr?.message ?? String(releaseErr),
+          });
+        }
+      }
+    }
     return;
   }
 
@@ -506,7 +566,24 @@ export async function triggerCompetitorStrategyForUser(
     const current = await userDb.getUserById(userId);
     const patch = competitorReadyPatch((current as any) || {}, result);
     if (!patch) return;
-    await userDb.updateUser(userId, patch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, patch as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCompetitorService] dropping stale completion — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, patch as any);
+    }
 
     // Mirror to marketStrategy.competitors[] so the main account sees the
     // competitors onboarding generated. See companion mirror in
@@ -515,10 +592,25 @@ export async function triggerCompetitorStrategyForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
-      userId,
-      competitorFailedPatch((current as any) || {}, msg) as any,
-    );
+    const failedPatch = competitorFailedPatch((current as any) || {}, msg);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, failedPatch as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCompetitorService] dropping stale failure — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, failedPatch as any);
+    }
     console.error("[onboardingCompetitorService] generation failed", {
       userId,
       err: msg,
@@ -537,8 +629,83 @@ export async function triggerCompetitorStrategyForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as `onboardingIcpService`'s
+ * icp claim: a plain read-then-write here lets two concurrent callers both
+ * observe a non-running status and both win, launching two fully parallel
+ * per-ICP LLM loops. This function has two callers that can race each
+ * other — the `/competitor/start` route AND the `icpResult`-ready cascade
+ * kickoff in `onboardingIcpService.ts` — so even without a frontend
+ * double-fire, a manual retry landing while the cascade is already
+ * mid-flight hits the same bug (confirmed live during ENG-2276 production
+ * testing).
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `COMPETITOR_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again.
+ */
+function competitorStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - COMPETITOR_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning OR #competitorStartedAt <= :competitorStaleBefore",
+    names: {
+      "#competitorStatus": "competitorStatus",
+      "#competitorStartedAt": "competitorStartedAt",
+    },
+    values: {
+      ":competitorRunning": "running",
+      ":competitorStaleBefore": staleBefore,
+    },
+  };
+}
+
+/**
+ * Claim the competitor axis for a new run: atomically flip
+ * `competitorStatus` to `running` (or no-op, returning `null`, if someone
+ * else already holds the claim). Every entry point that wants to run
+ * competitor research must go through here — both `/competitor/start`
+ * (via `startCompetitorStrategyForUser`) and the eager-pipeline
+ * orchestrator's `runCompetitor` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runCompetitor` needed this split out (ENG-2308 follow-up, caught
+ * live): it used to call `triggerCompetitorStrategyForUser` directly, with
+ * nothing ever flipping `competitorStatus` to `running` first on a pure
+ * orchestrator-driven cascade. `competitorReadyPatch` requires
+ * `current.competitorStatus === 'running'` to persist a result — without
+ * it, the trigger ran for real then silently dropped its result, and the
+ * orchestrator recorded the step `ready` with a `null` output anyway,
+ * since nothing threw.
+ */
+export async function claimCompetitorRun(
+  userId: string,
+): Promise<CompetitorStatusFields | null> {
+  const patch = competitorStartPatch();
+  try {
+    await userDb.updateUser(userId, withClearedError(patch, "competitorError") as any, {
+      condition: competitorStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
+}
+
+/**
  * Synchronous entry point for routes. Flips status to `running` and
- * launches background work.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runCompetitor` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
  */
 export async function startCompetitorStrategyForUser(
   userId: string,
@@ -546,10 +713,7 @@ export async function startCompetitorStrategyForUser(
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
-): Promise<void> {
-  await userDb.updateUser(userId, competitorStartPatch() as any);
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+): Promise<CompetitorStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -560,7 +724,19 @@ export async function startCompetitorStrategyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return null;
   }
-  void triggerCompetitorStrategyForUser(userId, deps);
+  const patch = await claimCompetitorRun(userId);
+  if (!patch) return null;
+  // Tracked so a deploy's graceful shutdown waits for this run (cronJobRegistry
+  // is drained before the listener closes) instead of killing it mid-flight and
+  // leaving a dead `running` claim that nothing completes until it times out.
+  trackBackgroundRun(
+    "onboardingCompetitor",
+    triggerCompetitorStrategyForUser(userId, {
+      ...deps,
+      expectedStartedAt: patch.competitorStartedAt,
+    }),
+  );
+  return patch;
 }

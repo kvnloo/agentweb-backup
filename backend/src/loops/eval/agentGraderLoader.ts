@@ -9,6 +9,7 @@
  */
 
 import { isRunFailurePlaceholder, type ResumeMessage } from '../../services/agentMode/core/resumePlan';
+import { branchOwnMessages } from '../../services/agentMode/chatBranching';
 import type { AgentLoopEvent, GraderTurn, GraderWorkPlan, LedgerCall, SessionForGrading, SessionSpend } from './agentGraders';
 
 export type DocItem = Record<string, unknown>;
@@ -57,6 +58,11 @@ export interface LoadedSession {
   spend?: SessionSpend;
   /** Set only when spend was read. */
   spendStatus?: SpendStatus;
+  /**
+   * ENG-2648: a branch nobody continued (or the hidden leftover of a failed branch copy): every row is a copy
+   * of turns that ran in its source, so it has nothing of its own to grade. Samplers skip it.
+   */
+  branchCopyOnly?: true;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,14 +320,20 @@ export function buildLoadedSession(
   events: readonly AgentLoopEvent[],
   spend: SpendRollup | undefined,
 ): LoadedSession {
-  const messages = orderedMessages(messageRows);
+  const allMessages = orderedMessages(messageRows);
+  // ENG-2648: a branch's TURNS are its own only (its copied turns ran, and are graded, in its source): turn
+  // count, per-turn adherence, the final reply and the crash check read `messages`. The tool ledger stays the
+  // whole history's — groundedness checks a reply against every call it may report, copied ones included.
+  const messages = branchOwnMessages(allMessages);
+  const branchCopyOnly = messages.length === 0 && allMessages.length > 0;
   const workPlan = toGraderWorkPlan(sessionItem.workPlan);
   const finalReply = finalReplyOf(messages);
   return {
+    ...(branchCopyOnly ? { branchCopyOnly: true as const } : {}),
     session: {
       sessionId: String(sessionItem.sessionId),
       ...(workPlan ? { workPlan } : {}),
-      ledger: toLedger(messages),
+      ledger: toLedger(allMessages),
       events: [...events],
       endsWithRunFailurePlaceholder: endsWithRunFailurePlaceholder(messages),
       ...(finalReply ? { finalReply } : {}),

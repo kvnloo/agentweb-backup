@@ -931,28 +931,24 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
 
     if (activity.status === 'token_error') {
       summary.tokenErrors++;
-      await raise(
-        alertSink,
-        `${TOKEN_ALERT_CLASS}:${adAccountId}`,
-        now,
-        `Meta ad account ${adAccountId} cannot be read — token invalid`,
-        [
-          `Meta rejected our stored credentials for ad account ${adAccountId}.`,
-          '',
-          'While this holds, the account is invisible to tracking monitoring: no spend,',
-          'no conversions, and no way to tell a healthy account from a broken one. The',
-          'owner has to re-authorise the Meta connection.',
-          '',
-          `Meta said: ${activity.error}`,
-        ].join('\n'),
-        {
-          'Alert Class': TOKEN_ALERT_CLASS,
-          'Alert Priority': 'high',
-          'Ad Account': adAccountId,
-          'Owner User Id': user?.userId,
-          'Owner Email': user?.email,
-        },
-      );
+      // Harsha 2026-11-07: a dead token on a connection that existed is the one Meta alert we
+      // keep — facts only, to the Meta connection list (not oncall/founders), deduped weekly.
+      if (alertSink.dryRun || deps?.alertTransport) {
+        // Dry run / injected sink (diagnostics, tests): route through the sink as before.
+        await raise(alertSink, `${TOKEN_ALERT_CLASS}:${adAccountId}`, now,
+          `Meta connection expired: ad account ${adAccountId}`,
+          `Meta error: ${activity.error}`,
+          { 'Alert Class': TOKEN_ALERT_CLASS, 'Ad Account': adAccountId, 'Owner Email': user?.email });
+      } else {
+        const { sendMetaConnectionExpiredAlert } = await import('./metaConnectionExpiredAlert');
+        await sendMetaConnectionExpiredAlert({
+          accountId: String(adAccountId),
+          customerEmail: user?.email,
+          userId: user?.userId,
+          error: activity.error,
+          now,
+        });
+      }
       continue;
     }
 
@@ -1068,6 +1064,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       ].join('\n'),
       {
         'Alert Class': BLACKOUT_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Consecutive Days': verdict.consecutiveBlackoutDays,
         'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
@@ -1286,6 +1284,8 @@ async function checkOptimisationCoverage(
       ].join('\n'),
       {
         'Alert Class': OPTIMISATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1414,6 +1414,8 @@ async function checkDestinationCoverage(
       ].join('\n'),
       {
         'Alert Class': DESTINATION_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,
@@ -1694,6 +1696,8 @@ async function checkEventMixCoverage(
       ].join('\n'),
       {
         'Alert Class': EVENT_MIX_ALERT_CLASS,
+        // ENG-2267: one canonical per ad account, not one per class fleet-wide.
+        'Alert Scope': `meta-ad-account:${adAccountId}`,
         'Alert Priority': 'high',
         'Ad Account': adAccountId,
         'Owner User Id': user?.userId,

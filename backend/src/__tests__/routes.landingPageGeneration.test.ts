@@ -37,7 +37,7 @@ jest.mock("aws-sdk", () => {
 // Mock auth middleware
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: "test-user-id", email: "test@example.com", isAdmin: false };
+    req.user = { userId: "test-user-id", email: "test@example.com", isAdmin: req.headers["x-admin"] === "1" };
     next();
   },
   AuthenticatedRequest: {},
@@ -54,9 +54,14 @@ const mockCanOrgMemberAccessList = jest.fn();
 // ENG-827: the publish route's last-moment consent re-check reads these two for real.
 const mockGetScheduleById = jest.fn();
 const mockGetChatSession = jest.fn();
+// ENG-2651: /generate reads the originating session's record to decide whether to attach it.
+const mockGetChatSessionRecord = jest.fn();
 
 jest.mock("../services/chatbotService", () => ({
-  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+  chatbotDb: {
+    getChatSession: (...args: any[]) => mockGetChatSession(...args),
+    getChatSessionRecord: (...args: any[]) => mockGetChatSessionRecord(...args),
+  },
 }));
 
 jest.mock("../services/db", () => ({
@@ -271,6 +276,85 @@ beforeEach(() => {
 // =============================================================================
 // POST /generate
 // =============================================================================
+// ENG-2651: the page's originatingSessionId is the chat its completion/failure message is written
+// into and the session its auto human-eval candidate mints an iShare link for. A session the caller
+// may not open (owner or admin) must never be attached; generation itself still proceeds, because
+// external MCP clients send their transport session id here.
+describe("POST /api/landing-pages/v0/generate — originating_session_id ownership (ENG-2651)", () => {
+  const generateOpts = () => mockGenerateLandingPage.mock.calls[0][6];
+
+  beforeEach(() => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-new", status: "deployed" });
+  });
+
+  it("drops another account's session and still generates", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "victim-session", userId: "victim-user" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "victim-session" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetChatSessionRecord).toHaveBeenCalledWith("victim-session", true);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops an id that is not a chat session (an MCP transport session id)", async () => {
+    mockGetChatSessionRecord.mockResolvedValue(null);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "mcp-transport-id" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops an oversized id without reading it (DynamoDB would reject the key with a 500)", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "x".repeat(4000) });
+
+    expect(res.status).toBe(201);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("drops the id instead of failing the generation when the session read fails", async () => {
+    mockGetChatSessionRecord.mockRejectedValue(new Error("ProvisionedThroughputExceededException"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "own-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBeUndefined();
+  });
+
+  it("keeps the caller's own session", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "own-session", userId: "test-user-id" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "own-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBe("own-session");
+  });
+
+  it("keeps any account's session for an admin", async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: "customer-session", userId: "customer-user" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .set("x-admin", "1")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", originating_session_id: "customer-session" });
+
+    expect(res.status).toBe(201);
+    expect(generateOpts().originatingSessionId).toBe("customer-session");
+  });
+});
+
 describe("POST /api/landing-pages/v0/generate", () => {
   it("FAIL: no body → 400", async () => {
     const res = await request(app)
@@ -367,7 +451,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     // Solo user: the shared projection (unit-tested in services.v0Service
     // .test.ts) gets the caller record and NO org override…
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, undefined);
+    // ENG-2783: the third argument is the caller's org (null for a solo user), used only for the consent notice's business name.
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, undefined, null);
     // …and its result reaches generation untouched.
     expect(mockGenerateLandingPage.mock.calls[0][3]).toBe(projected);
   });
@@ -415,7 +500,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
     };
     const userRecord = { userId: "test-user-id", orgId: "org-1", orgRole: "owner" };
     mockGetUserById.mockResolvedValue(userRecord);
-    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand });
+    const orgRecord = { orgId: "org-1", brandGuidelines: orgBrand };
+    mockGetOrgById.mockResolvedValue(orgRecord);
     mockBuildBrandContextFromUser.mockReturnValue({
       brandName: "OrgBrand",
       logoUrl: "https://s3/org/logo.png",
@@ -427,7 +513,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
       .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
+    // ENG-2783: plus the org record itself (third argument), for the consent notice's business name.
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand, orgRecord);
   });
 
   it("SUCCESS: template_id provided → loads and extracts template from settings", async () => {
@@ -2040,7 +2127,8 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     };
     const userRecord = { userId: "test-user-id", orgId: "org-1", orgRole: "owner" };
     mockGetUserById.mockResolvedValue(userRecord);
-    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand });
+    const orgRecord = { orgId: "org-1", brandGuidelines: orgBrand };
+    mockGetOrgById.mockResolvedValue(orgRecord);
     const projected = { brandName: "OrgBrand", logoUrl: "https://s3/org/logo.png" };
     mockBuildBrandContextFromUser.mockReturnValue(projected);
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
@@ -2050,7 +2138,7 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
       .send({ name: "Copy" });
 
     expect(res.status).toBe(201);
-    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
+    expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand, orgRecord); // ENG-2783: org passed as 3rd arg
     expect(mockGenerateLandingPage.mock.calls[0][3]).toBe(projected);
   });
 
@@ -3309,8 +3397,40 @@ describe("PUT /generated/:id/update-files (ENG-497)", () => {
       expect.anything(),
       "Preview a 2-file change",
       4,
-      "draft/agentweb-preview"
+      "draft/agentweb-preview",
+      undefined
     );
+  });
+
+  it("ENG-2896: forwards expected_base_sha to the commit", async () => {
+    const sha = "a".repeat(40);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "draft/agentweb-preview", expected_base_sha: sha, files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(200);
+    expect(mockCommitFilesToRepoMain.mock.calls[0][6]).toBe(sha);
+  });
+
+  it("ENG-2896: malformed expected_base_sha -> 400, commit never attempted", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", expected_base_sha: "nope", files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("ENG-2896: base SHA conflict -> 409 with expected/actual", async () => {
+    const err: any = new Error("Branch head is b, expected a.");
+    err.name = "BaseShaConflictError";
+    err.expectedSha = "a".repeat(40);
+    err.actualSha = "b".repeat(40);
+    mockCommitFilesToRepoMain.mockRejectedValueOnce(err);
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "draft/agentweb-preview", expected_base_sha: "a".repeat(40), files: [{ file_path: "ok.txt", content: "x" }] });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Base SHA conflict.*Nothing was written/);
+    expect(res.body.actual_base_sha).toBe("b".repeat(40));
   });
 
   it("FAIL: no commit_message -> 400", async () => {
@@ -3351,5 +3471,49 @@ describe("PUT /generated/:id/update-files (ENG-497)", () => {
 
     expect(res.status).toBe(400);
     expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+});
+
+
+// ENG-2783: where the consent notice's business name comes from, through the REAL projection, for BOTH generation routes.
+// announcedName > account companyName > org name > none (no registeredBusinessName, so the prompt carries no notice).
+describe("call-consent business name reaches generation (ENG-2783)", () => {
+  const orgBrand = { brandData: { brandName: "OrgBrand" }, attachments: [{ type: "logo", url: "https://s3/org/logo.png" }] };
+  const cases: Array<[string, { org: Record<string, unknown>; user: Record<string, unknown> }, string | undefined]> = [
+    ["the hot-lead-call announcedName wins", { org: { name: "Org Name", hotLeadCall: { announcedName: "Announced Plumbing" } }, user: { companyName: "Account Co" } }, "Announced Plumbing"],
+    ["else the account companyName", { org: { name: "Org Name" }, user: { companyName: "Account Co" } }, "Account Co"],
+    ["else the org name", { org: { name: "Org Name" }, user: {} }, "Org Name"],
+    ["else none (argument absent)", { org: {}, user: {} }, undefined],
+  ];
+  const setup = (c: { org: Record<string, unknown>; user: Record<string, unknown> }) => {
+    // The real v0Service cannot load in this suite (aws-sdk is mocked away), so the projection is a stand-in that adds the
+    // business name through the REAL light helper; what is proven here is that each route passes the right user and org to it.
+    const { registeredBusinessNameOf } = jest.requireActual("../services/voice/callConsentName");
+    mockBuildBrandContextFromUser.mockImplementation((user: any, _brand: unknown, org: any) => {
+      const name = registeredBusinessNameOf(org, user);
+      return { brandName: "OrgBrand", logoUrl: "https://s3/org/logo.png", ...(name ? { registeredBusinessName: name } : {}) };
+    });
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id", orgId: "org-1", orgRole: "owner", ...c.user });
+    mockGetOrgById.mockResolvedValue({ orgId: "org-1", brandGuidelines: orgBrand, ...c.org });
+  };
+
+  it.each(cases)("generate: %s", async (_n, c, expected) => {
+    setup(c);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+    const res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Create a page", lead_list_id: "list-1" });
+    expect(res.status).toBe(201);
+    const brand = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brand.registeredBusinessName).toBe(expected);
+    expect("registeredBusinessName" in brand).toBe(expected !== undefined);
+  });
+
+  it.each(cases)("duplicate: %s", async (_n, c, expected) => {
+    setup(c);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+    const res = await request(app).post("/api/landing-pages/v0/generated/page-1/duplicate").send({ name: "Copy" });
+    expect(res.status).toBe(201);
+    const brand = mockGenerateLandingPage.mock.calls[0][3];
+    expect(brand.registeredBusinessName).toBe(expected);
+    expect("registeredBusinessName" in brand).toBe(expected !== undefined);
   });
 });

@@ -101,7 +101,7 @@ describe('ActivationAnalysisCron', () => {
                     lastActiveDate: OLD_DATE_DAY,
                 })
             })
-        ]));
+        ]), { origin: 'integration' });
 
         // Ensure all users are included in the CRM payload
         const batchCreateArgs = mockCrmDb.batchCreateLeads.mock.calls[0][1];

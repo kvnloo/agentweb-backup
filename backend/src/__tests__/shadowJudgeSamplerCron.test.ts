@@ -111,7 +111,8 @@ describe("ENG-2189/2138/2146 shadow judge sampler", () => {
     mockGetSetting.mockResolvedValue(judgesRow([{ id: "outcome-judge-b-shadow", shadow: true }]));
     mockListSessions.mockResolvedValue([{ sessionId: "s1" }, { sessionId: "s2" }]);
     mockGetChatSession.mockResolvedValue({ sessionId: "s1", messages: [], messageCount: 2 });
-    mockScoreWithJudge.mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce({ score: 5 });
+    // Fails on the first pass and again on the ENG-2138 retry, so it still ends as one error.
+    mockScoreWithJudge.mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce({ score: 5 }).mockRejectedValueOnce(new Error("boom again"));
 
     const result = await runShadowJudgeSample({ enabled: true, dryRun: false, sampleSize: 10, sampleDate: SAMPLE_DATE });
 
@@ -174,6 +175,80 @@ describe("ENG-2189/2138/2146 shadow judge sampler", () => {
     expect(isShadowJudgeSamplerEnabled({ [SHADOW_JUDGE_SAMPLER_FLAG]: "True" } as any)).toBe(false);
     expect(isShadowJudgeSamplerEnabled({ [SHADOW_JUDGE_SAMPLER_FLAG]: "1" } as any)).toBe(false);
     expect(isShadowJudgeSamplerEnabled({ [SHADOW_JUDGE_SAMPLER_FLAG]: "true" } as any)).toBe(true);
+  });
+
+  describe("ENG-2138 one in-run retry of failed sessions", () => {
+    const setup = (sessionIds: string[]) => {
+      mockGetSetting.mockResolvedValue(judgesRow([{ id: "outcome-judge-b-shadow", shadow: true }]));
+      mockListSessions.mockResolvedValue(sessionIds.map((sessionId) => ({ sessionId })));
+      mockGetChatSession.mockImplementation(async (id: string) => ({ sessionId: id, messages: [], messageCount: 2 }));
+    };
+    const run = () => runShadowJudgeSample({ enabled: true, dryRun: false, sampleSize: 10, sampleDate: SAMPLE_DATE });
+
+    it("a first-attempt failure that succeeds on retry counts as scored and recovered, not as an error", async () => {
+      setup(["s1"]);
+      mockScoreWithJudge.mockRejectedValueOnce(new Error("timeout")).mockResolvedValueOnce({ score: 4 });
+
+      const result = await run();
+
+      expect(mockScoreWithJudge).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({ scored: 1, errors: 0, retried: 1, recovered: 1 });
+    });
+
+    it("fails twice: counted once as an error, attempted exactly twice (retry bounded to one pass)", async () => {
+      setup(["s1"]);
+      mockScoreWithJudge.mockRejectedValue(new Error("bad json"));
+
+      const result = await run();
+
+      expect(mockScoreWithJudge).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({ scored: 0, errors: 1, retried: 1, recovered: 0 });
+    });
+
+    it("retries only after the main loop, and only the failed sessions", async () => {
+      setup(["s1", "s2"]);
+      const order: string[] = [];
+      mockScoreWithJudge.mockImplementation(async (session: any) => {
+        order.push(session.sessionId);
+        if (session.sessionId === order[0] && order.length === 1) throw new Error("boom");
+        return { score: 3 };
+      });
+
+      const result = await run();
+
+      expect(order).toHaveLength(3);
+      expect(order[2]).toBe(order[0]);
+      expect(result).toMatchObject({ scored: 2, errors: 0, retried: 1, recovered: 1 });
+    });
+
+    it("does not retry a session that was skipped or already scored (null result)", async () => {
+      setup(["s1"]);
+      mockScoreWithJudge.mockResolvedValue(null);
+
+      const result = await run();
+
+      expect(mockScoreWithJudge).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ scored: 0, errors: 0, retried: 0, recovered: 0 });
+    });
+
+    it("a null result on the retry is not a recovery and the failure stays an error", async () => {
+      setup(["s1"]);
+      mockScoreWithJudge.mockRejectedValueOnce(new Error("timeout")).mockResolvedValueOnce(null);
+
+      const result = await run();
+
+      expect(result).toMatchObject({ scored: 0, errors: 1, retried: 1, recovered: 0 });
+    });
+
+    it("does not retry a session-load failure (existing classification is unchanged)", async () => {
+      setup(["s1"]);
+      mockGetChatSession.mockRejectedValueOnce(new Error("dynamo down"));
+
+      const result = await run();
+
+      expect(mockScoreWithJudge).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ errors: 1, retried: 0, recovered: 0 });
+    });
   });
 
   it("a broken scoring-judges setting is treated as zero shadow judges, not a crash", async () => {

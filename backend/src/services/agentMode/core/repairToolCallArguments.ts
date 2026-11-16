@@ -365,6 +365,8 @@ export function parseToolCallArguments(raw: string): any {
   try {
     return JSON.parse(raw);
   } catch (primaryError) {
+    const deduped = parseDuplicatedJsonObjects(raw);
+    if (deduped !== undefined) return deduped;
     const repaired = repairUnescapedQuotes(raw);
     if (repaired !== raw && !hasDuplicateObjectKeys(repaired)) {
       try {
@@ -377,5 +379,75 @@ export function parseToolCallArguments(raw: string): any {
       throw new TruncatedToolCallArgumentsError(raw);
     }
     throw primaryError;
+  }
+}
+
+/**
+ * ENG-2597: the provider stream sometimes delivers a tool call's arguments
+ * twice, back to back (`{}{}`, `{"a":1}{"a":1}`), which JSON.parse rejects
+ * with "Unexpected non-whitespace character after JSON at position N".
+ * When `raw` splits into two or more top-level objects that are all
+ * identical, return that single object. Differing objects return undefined
+ * (the caller throws) so we never guess which call the model meant.
+ */
+export function parseDuplicatedJsonObjects(raw: string): unknown {
+  const parts: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (depth === 0) {
+      if (/\s/.test(ch)) continue;
+      if (ch !== '{') return undefined;
+      start = i;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth < 0) return undefined;
+      if (depth === 0) parts.push(raw.slice(start, i + 1));
+    }
+  }
+  if (depth !== 0 || inString || parts.length < 2) return undefined;
+  // Compare the RAW text, not parsed values: JSON.parse rounds integers past
+  // 2^53, so two calls differing only in a long numeric id would otherwise
+  // look identical and collapse into one call with a rounded id (Opslane P2).
+  // The observed stream bug duplicates bytes exactly, so exact text equality
+  // is all we need.
+  if (!parts.every((p) => p === parts[0])) return undefined;
+  try {
+    return JSON.parse(parts[0]);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * ENG-2597: if `toolCall.function.arguments` is not itself valid JSON but was
+ * successfully parsed (via repair) into `parsedArgs`, overwrite it with the
+ * re-serialized repaired object. The same toolCall object lives on the
+ * assistant message saved to chat history, so the next turn replays one valid
+ * object instead of the malformed provider text. Valid JSON is left untouched.
+ */
+export function normalizeRepairedToolCallArguments(
+  toolCall: { function?: { arguments?: unknown } } | undefined,
+  parsedArgs: unknown,
+): void {
+  const fn = toolCall?.function;
+  if (!fn || typeof fn.arguments !== 'string') return;
+  try {
+    JSON.parse(fn.arguments);
+    return;
+  } catch {
+    fn.arguments = JSON.stringify(parsedArgs);
   }
 }

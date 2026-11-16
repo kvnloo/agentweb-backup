@@ -146,6 +146,27 @@ async function fetchSelfCallWithRetry(url: string, fetchOptions: RequestInit, me
 }
 
 /**
+ * ENG-2963: a self-call's path is built from tool arguments, which an outside MCP caller controls. A value such as
+ * `../agent-mode/sessions?` used to turn `/api/tasks/${task_id}/execute` into a call to a different route. Tools escape their
+ * arguments (encodeURIComponent); this is the shared backstop, so a tool that forgets cannot be steered: the path part (before
+ * any `?`) must start with `/api/` and may not contain a dot segment, an empty segment or a percent-encoded dot (`%2e`, which URL
+ * normalisation turns into a dot segment); and no raw backslash, `#` or control character may appear anywhere, query included.
+ * An escaped slash (`%2F`) is allowed: Express keeps it inside one path parameter, and ids with slashes (file keys) need it.
+ */
+export function assertSafeSelfCallPath(path: string): void {
+  const pathname = String(path).split('?')[0];
+  const segments = pathname.split('/').slice(1);
+  const unsafe =
+    !pathname.startsWith('/api/') ||
+    /[\\#\u0000-\u001f\u007f]/.test(String(path)) ||
+    /%2e/i.test(pathname) ||
+    segments.some((segment, i) => segment === '.' || segment === '..' || (segment === '' && i < segments.length - 1));
+  if (unsafe) {
+    throw new Error('Invalid request: an id in this call contains characters that are not allowed. Nothing was sent.');
+  }
+}
+
+/**
  * Make an authenticated self-call to the backend REST API on behalf of an MCP
  * tool. Mints a short-lived self-call JWT for `context.userId`/`agentUserId`
  * unless `context.overrideToken` is already set (ENG-1596: a client-scoped
@@ -154,6 +175,7 @@ async function fetchSelfCallWithRetry(url: string, fetchOptions: RequestInit, me
  */
 export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const { method, path, context, body, queryParams } = options;
+  assertSafeSelfCallPath(path);
 
   let token: string;
   if (context.overrideToken) {
@@ -240,6 +262,10 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     // prose that was never meant to be a classification target (ENG-1844).
     if (typeof data === 'object' && typeof data.error === 'string' && data.error !== message) {
       (err as { code?: string }).code = data.error;
+    }
+    // A route's structured `details` (e.g. which Smartlead connections the caller may choose between) would otherwise be lost.
+    if (data && typeof data === 'object' && data.details !== undefined) {
+      (err as { details?: unknown }).details = data.details;
     }
     throw err;
   }

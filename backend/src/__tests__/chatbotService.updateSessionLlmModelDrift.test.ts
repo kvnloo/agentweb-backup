@@ -77,8 +77,36 @@ describe('chatbotDb.updateSessionLlmModel — llmModel/llmUsagePolicyDecision mu
 
     const params = updatePromiseMock.mock.calls[0][0];
     expect(params.UpdateExpression).toContain('SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision');
-    expect(params.UpdateExpression).not.toContain('REMOVE');
+    expect(params.UpdateExpression).not.toContain('REMOVE llmUsagePolicyDecision');
+    // ENG-669: a write that does not say who chose the model drops any stale source (same rule as the decision).
+    expect(params.UpdateExpression).toContain('REMOVE llmModelSource');
     expect(params.ExpressionAttributeValues[':policyDecision']).toEqual(decision);
     expect(params.ExpressionAttributeValues[':llmModel']).toBe('openrouter/deepseek/deepseek-v4-flash');
+  });
+});
+
+/**
+ * ENG-669: the expression for every combination of (decision, source). A source, like the decision, describes the model
+ * it is written with, so a write without one REMOVES it; every placeholder used has a value and no value is unused
+ * (DynamoDB rejects either).
+ */
+describe('updateSessionLlmModel: decision x model source, all four branches (ENG-669)', () => {
+  beforeEach(() => { jest.clearAllMocks(); updatePromiseMock.mockResolvedValue({ Attributes: {} }); });
+  const decision: any = {
+    requestedModel: 'm', effectiveModel: 'm', backupModel: null, backupSource: null, modelSelection: 'honored',
+    modelSelectionReason: 'x', usageMode: 'full_choice', usagePolicyVersion: null, recordedAt: 't',
+  };
+  it.each([
+    ['decision + source', decision, 'system', 'SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, llmModelSource = :llmModelSource, adminListPartition = :adminListPartition'],
+    ['decision only', decision, undefined, 'SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition REMOVE llmModelSource'],
+    ['source only', undefined, 'user', 'SET llmModel = :llmModel, llmModelSource = :llmModelSource, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision'],
+    ['neither', undefined, undefined, 'SET llmModel = :llmModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision, llmModelSource'],
+  ])('%s', async (_name, dec, src, expression) => {
+    await chatbotDb.updateSessionLlmModel('s1', 'm', dec, src as any);
+    const params = updatePromiseMock.mock.calls[0][0];
+    expect(params.UpdateExpression).toBe(expression);
+    expect(params.ConditionExpression).toBeUndefined();
+    const used = new Set(expression.match(/:[A-Za-z]+/g) || []);
+    expect(new Set(Object.keys(params.ExpressionAttributeValues))).toEqual(used);
   });
 });

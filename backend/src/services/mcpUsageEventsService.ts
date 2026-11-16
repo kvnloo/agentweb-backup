@@ -3,6 +3,8 @@ import AWS from 'aws-sdk';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import type { DynamoAttributeMap, DynamoAttributeValue } from '../loops/core/ports';
 import { userDb } from './db';
+import { normalizeProduct, validateRef, type JourneyProduct } from './journeyAttribution';
+import { isDatabricksRedirectUri } from '../mcp/zomaDatabricksReadOnly';
 
 export const EMMA_MCP_LOOP_ID = 'emma-mcp';
 export const EVT_MCP_OAUTH_STARTED = 'mcp_oauth_started';
@@ -11,8 +13,10 @@ export const EVT_MCP_OAUTH_TOKEN_ISSUED = 'mcp_oauth_token_issued';
 export const EVT_MCP_CONNECTION_ATTEMPTED = 'mcp_connection_attempted';
 export const EVT_MCP_TOOL_USED = 'mcp_tool_used';
 export const EVT_MCP_FIRST_TOOL_USED = 'mcp_first_tool_used';
+/** ENG-2303 P4: a Meta Toolkit write that was dispatched to Meta (the billable unit). */
+export const EVT_MCP_WRITE_EXECUTED = 'mcp_write_executed';
 
-export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'unknown';
+export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'zoma_token' | 'unknown';
 export type McpClientType =
   | 'claude_ai'
   | 'claude_code'
@@ -20,15 +24,20 @@ export type McpClientType =
   | 'chatgpt'
   | 'hermes'
   | 'openclaw'
+  | 'databricks'
   | 'api_key'
   | 'unknown';
 
 export interface McpUsageEventStore {
   put(item: DynamoAttributeMap, options?: { condition?: 'attribute_not_exists' }): Promise<void>;
   queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]>;
+  /** Range read on the existing (loopId, tsSession) key; ts-prefixed sort keys only. */
+  queryByLoopIdTsRange?(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]>;
 }
 
 export interface McpConnectionAttemptInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   authMethod?: McpAuthMethod;
   apiKeyId?: string;
@@ -38,10 +47,14 @@ export interface McpConnectionAttemptInput {
   sessionId?: string;
   userAgent?: string;
   requestId?: string;
+  /** ENG-2906: validated `ref` from the MCP URL (?ref=); dropped when invalid. */
+  ref?: string;
   now?: Date;
 }
 
 export interface McpOAuthStartedInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   clientId: string;
   clientName?: string;
   clientType?: McpClientType;
@@ -52,6 +65,8 @@ export interface McpOAuthStartedInput {
 }
 
 export interface McpOAuthUserEventInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   clientId?: string;
   clientName?: string;
@@ -63,6 +78,8 @@ export interface McpOAuthUserEventInput {
 }
 
 export interface McpToolUseInput {
+  /** ENG-2906: zoma | emma_mcp | emma_web | unknown (attribution only). Defaults to unknown. */
+  product?: JourneyProduct;
   userId?: string;
   toolName: string;
   authMethod?: McpAuthMethod;
@@ -73,7 +90,29 @@ export interface McpToolUseInput {
   sessionId?: string;
   llmModel?: string;
   userAgent?: string;
+  /** ENG-2823: ad platform a Zoma toolkit call ran against ('meta' | 'google_ads'). */
+  platform?: string;
+  /** ENG-2906: validated `ref` from the MCP URL (?ref=); dropped when invalid. */
+  ref?: string;
   now?: Date;
+}
+
+export interface McpWriteExecutedInput extends McpToolUseInput {
+  entityType: string;
+  action: string;
+  /** Read-back verdict: CONFIRMED | MISMATCH | UNCONFIRMED. */
+  verification: string;
+  objectId?: string;
+  /** ENG-2902: create | edit | pause | approve (status→ACTIVE go-live); scoreboard input. */
+  writeKind?: string;
+}
+
+export interface McpUserUsage {
+  start: string;
+  end: string;
+  toolCalls: number;
+  writes: { total: number; confirmed: number; mismatch: number; unconfirmed: number };
+  recentWrites: Array<{ ts: string; platform?: string; entityType?: string; action?: string; verification?: string; objectId?: string }>;
 }
 
 export interface McpUsageReport {
@@ -138,6 +177,25 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
     } });
   }
 
+  async queryByLoopIdTsRange(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]> {
+    const items: DynamoAttributeMap[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.doc
+        .query({
+          TableName: LOOP_EVENTS_TABLE,
+          KeyConditionExpression: 'loopId = :loopId AND tsSession BETWEEN :start AND :end',
+          FilterExpression: 'subjectId = :subjectId',
+          ExpressionAttributeValues: { ':loopId': loopId, ':start': startIso, ':end': endIso, ':subjectId': subjectId },
+          ExclusiveStartKey: lastKey,
+        })
+        .promise();
+      items.push(...((result.Items ?? []) as DynamoAttributeMap[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return items;
+  }
+
   async queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]> {
     const items: DynamoAttributeMap[] = [];
     let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -175,6 +233,7 @@ export async function recordMcpOAuthStarted(
     ts,
     tsSession: `${ts}#${clientId}#${EVT_MCP_OAUTH_STARTED}#${Math.random().toString(36).slice(2, 10)}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       clientId,
       clientName: cleanString(input.clientName),
       clientType: input.clientType ?? classifyMcpClient(input),
@@ -216,6 +275,7 @@ export async function recordMcpConnectionAttempt(
     ts,
     tsSession: `${ts}#${input.userId}#${EVT_MCP_CONNECTION_ATTEMPTED}#${requestId}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -224,6 +284,7 @@ export async function recordMcpConnectionAttempt(
       sessionId: cleanString(input.sessionId),
       userAgent: cleanString(input.userAgent),
       requestId,
+      ref: validateRef(input.ref),
     },
   });
 
@@ -244,6 +305,7 @@ export async function recordMcpToolUse(
     ts,
     tsSession: `${ts}#${input.userId}#${EVT_MCP_TOOL_USED}#${Math.random().toString(36).slice(2, 10)}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -253,11 +315,82 @@ export async function recordMcpToolUse(
       llmModel: cleanString(input.llmModel),
       toolName: input.toolName,
       userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
+      ref: validateRef(input.ref),
     },
   });
 
   await store.put(item);
   return true;
+}
+
+/**
+ * ENG-2303 P4: one event per Meta Toolkit write dispatched to Meta, distinct from
+ * `mcp_tool_used` (which still counts every call, previews included). Recorded only —
+ * no Stripe charge is made (price undecided). Same table and key shape as tool use.
+ */
+export async function recordMcpWriteExecuted(
+  input: McpWriteExecutedInput,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!input.userId) return false;
+  const ts = (input.now ?? new Date()).toISOString();
+  const item = eventItem({
+    eventType: EVT_MCP_WRITE_EXECUTED,
+    subjectId: input.userId,
+    ts,
+    tsSession: `${ts}#${input.userId}#${EVT_MCP_WRITE_EXECUTED}#${Math.random().toString(36).slice(2, 10)}`,
+    dimensions: {
+      product: normalizeProduct(input.product),
+      authMethod: input.authMethod ?? 'unknown',
+      apiKeyId: cleanString(input.apiKeyId),
+      clientId: cleanString(input.clientId),
+      clientType: input.clientType ?? classifyMcpClient(input),
+      sessionId: cleanString(input.sessionId),
+      toolName: input.toolName,
+      userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
+      entityType: input.entityType,
+      action: input.action,
+      verification: input.verification,
+      objectId: cleanString(input.objectId),
+      writeKind: cleanString(input.writeKind),
+    },
+  });
+  await store.put(item);
+  return true;
+}
+
+/** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
+export async function getMcpUserUsage(
+  userId: string,
+  params: { start: string; end: string },
+  store: McpUsageEventStore = defaultStore,
+): Promise<McpUserUsage> {
+  const rows = store.queryByLoopIdTsRange
+    ? await store.queryByLoopIdTsRange(EMMA_MCP_LOOP_ID, params.start, params.end, userId)
+    : await store.queryByLoopId(EMMA_MCP_LOOP_ID);
+  const startMs = Date.parse(params.start);
+  const endMs = Date.parse(params.end);
+  const events = rows
+    .map(parseEventRow)
+    .filter((e): e is ParsedMcpEvent => !!e && e.subjectId === userId && e.ts.getTime() >= startMs && e.ts.getTime() < endMs);
+  const writes = events.filter((e) => e.eventType === EVT_MCP_WRITE_EXECUTED).sort((a, b) => a.ts.getTime() - b.ts.getTime());
+  const count = (v: string) => writes.filter((w) => w.dimensions.verification === v).length;
+  return {
+    start: params.start,
+    end: params.end,
+    toolCalls: events.filter((e) => e.eventType === EVT_MCP_TOOL_USED).length,
+    writes: { total: writes.length, confirmed: count('CONFIRMED'), mismatch: count('MISMATCH'), unconfirmed: count('UNCONFIRMED') },
+    recentWrites: writes.slice(-5).map((w) => ({
+      ts: w.tsIso,
+      ...(w.dimensions.platform ? { platform: w.dimensions.platform } : {}),
+      entityType: w.dimensions.entityType,
+      action: w.dimensions.action,
+      verification: w.dimensions.verification,
+      objectId: w.dimensions.objectId,
+    })),
+  };
 }
 
 export async function recordMcpFirstToolUse(
@@ -273,6 +406,7 @@ export async function recordMcpFirstToolUse(
     ts,
     tsSession: `first_use#${input.userId}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: input.authMethod ?? 'unknown',
       apiKeyId: cleanString(input.apiKeyId),
       clientId: cleanString(input.clientId),
@@ -453,6 +587,7 @@ async function recordMcpUserEvent(
     ts,
     tsSession: `${eventType}#${input.userId}#${cleanString(input.clientId) ?? 'unknown'}`,
     dimensions: {
+      product: normalizeProduct(input.product),
       authMethod: 'oauth',
       clientId: cleanString(input.clientId),
       clientName: cleanString(input.clientName),
@@ -614,6 +749,7 @@ const MCP_CLIENT_TYPES = new Set<McpClientType>([
   'chatgpt',
   'hermes',
   'openclaw',
+  'databricks',
   'api_key',
   'unknown',
 ]);
@@ -633,6 +769,17 @@ export function classifyMcpClient(input: {
   const userAgent = cleanString(input.userAgent)?.toLowerCase() ?? '';
   const redirectUri = cleanString(input.redirectUri)?.toLowerCase() ?? '';
   const haystack = `${clientName} ${userAgent} ${redirectUri}`;
+
+  // ENG-2747: Databricks registers its OAuth client through DCR as "Databricks" with a redirect on a
+  // Databricks host. Checked first (a Databricks agent may run any model, so a model name elsewhere
+  // must not win), but never for aw_ key callers, which stay in the api_key bucket. The redirect
+  // uses the same host test as the Zoma read-only gate, so analytics and access agree.
+  if (
+    input.authMethod !== 'api_key' &&
+    (clientName === 'databricks' || (redirectUri !== '' && isDatabricksRedirectUri(redirectUri)))
+  ) {
+    return 'databricks';
+  }
 
   if (haystack.includes('claude-code') || haystack.includes('claude code') || haystack.includes('claudecode')) {
     return 'claude_code';

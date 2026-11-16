@@ -129,5 +129,17 @@ export function unipileNameMatches(
   if (itemFirst === null && itemLast === null) return false;
 
   // Bidirectional-prefix token comparison shared with the Apollo identity gate.
-  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
+  if (nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast)) return true;
+
+  // ENG-2870: compound names are split differently across providers
+  // (LinkedIn "Diego" + "Javier Llorente" vs CRM "Diego Javier" + "Llorente").
+  // The same full name in the same order is the same name, so accept when the
+  // normalized concatenations are identical. Both sides must be fully
+  // populated so this never loosens the partial-name cases above.
+  if (itemFirst && itemLast && leadFirst && leadLast) {
+    const itemFull = normalizeNameToken(`${itemFirst}${itemLast}`);
+    const leadFull = normalizeNameToken(`${leadFirst}${leadLast}`);
+    if (itemFull && itemFull === leadFull) return true;
+  }
+  return false;
 }

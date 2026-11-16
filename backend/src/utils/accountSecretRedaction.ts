@@ -28,6 +28,8 @@ const SECRET_CONFIG_KEYS = ['access_token', 'refresh_token', 'api_key', 'webhook
 // future platform adds e.g. `bearer_token` or `signing_secret` and
 // forgets to add it to `SECRET_CONFIG_KEYS`, this line fails to compile.
 import type { PlatformConfig } from '../services/connectedAccountsDb';
+// Pure module (no db / connectedAccountsDb dependency), so the note above still holds.
+import { toCustomerPaygOverage } from '../services/paygOverage';
 type KeysOf<U> = U extends infer T ? keyof T : never;
 type CredentialShapedKey = Extract<
   KeysOf<PlatformConfig>,
@@ -79,10 +81,18 @@ export const sanitizeUserForResponse = (
     stripeConnectAccessToken,
     stripeConnectRefreshToken,
     connected_accounts,
+    paygOverage,
     ...safe
   } = user;
+  // ENG-668 PR-2: settlement records carry provider cost and markup; the closed-month ledger is
+  // settlement input. No customer surface reads either.
+  delete safe.paygSettlements;
+  delete safe.llmUsageCreditsClosed;
   return {
     ...safe,
     connected_accounts: redactAccountsSecrets(connected_accounts),
+    // ENG-668: the stored opt-in carries micro-USD (pool high-water mark, opt-in baseline) that no
+    // customer surface may see; only the on/off state and the percentage cap pass.
+    ...(paygOverage ? { paygOverage: toCustomerPaygOverage(paygOverage) } : {}),
   };
 };

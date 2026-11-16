@@ -11,12 +11,16 @@ import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
   LLM_PRICE_BOOK_VERSION,
+  LIVE_MODALITY_PRICES,
   LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
   getModelPrice,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
+  videoClipCount,
+  omniVideoUsageCostUsd,
+  isPerGenerationPriced,
   costScoreFromPrice,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
@@ -45,7 +49,7 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
   const fingerprint = () =>
     require('crypto')
       .createHash('sha256')
-      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP, LIVE_MODALITY_PRICES }))
       .digest('hex')
       .slice(0, 16);
 
@@ -56,8 +60,23 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-09-26',
-      fingerprint: '1a418422ee41b613', // Adds the OpenRouter embedding model alias at the existing rate.
+      version: '2026-11-15',
+      // Sonnet 5.5 cache reads corrected from $0.20/M to the provider's $0.10/M.
+      fingerprint: '669a45de042e3931',
+    });
+  });
+});
+
+// Model-upgrade audit 2026-11-15: OpenRouter's anthropic/claude-sonnet-5.5 record lists
+// input_cache_read 0.0000001/token = $0.10/1M (5% of input, the same generation cut as
+// Opus 5.5's $0.20 on a $4 input). The book had $0.20 — 2x the provider rate.
+describe('Claude Sonnet 5.5 price (model-upgrade audit 2026-11-15)', () => {
+  it('matches the provider-published rates, including the 5%-of-input cache read', () => {
+    expect(MODEL_PRICING['openrouter/anthropic/claude-sonnet-5.5']).toEqual({
+      inPerM: 2,
+      outPerM: 10,
+      cacheReadPerM: 0.1,
+      cacheWritePerM: 2.5,
     });
   });
 });
@@ -76,6 +95,15 @@ describe('llmPricing', () => {
 
       const missing = registryKeys.filter((model) => !MODEL_PRICING[model]);
       expect(missing).toEqual([]);
+    });
+
+    it('tolerates documented deprecated alias price keys that are not registry models', () => {
+      // Pre-rename ids kept priced so late usage rows still meter (see LEGACY_MODEL_ALIASES).
+      const DEPRECATED_ALIAS_PRICE_KEYS = ['openrouter/qwen/qwen3.8-max'];
+      for (const key of DEPRECATED_ALIAS_PRICE_KEYS) {
+        expect(parseLlmModelsRegistryKeys()).not.toContain(key);
+        expect(MODEL_PRICING[key]).toEqual(MODEL_PRICING['openrouter/qwen/qwen3.8-max-0902']);
+      }
     });
 
     it('covers the chatbot + embedding models from the provider report', () => {
@@ -245,7 +273,7 @@ describe('llmPricing', () => {
       // at add time (ENG-2293) — not inferred from the registry's human-editable
       // `description` field, which the draft-PR review step explicitly tells
       // reviewers to rewrite before marking a model ready.
-      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7', 'openrouter/anthropic/claude-sonnet-5.5', 'openrouter/deepseek/deepseek-v4-pro-0813', 'openrouter/deepseek/deepseek-v4.1-flash', 'openrouter/google/gemini-3.5-flash-lite', 'openrouter/openai/gpt-6.1-sol', 'openrouter/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash', 'openrouter/anthropic/claude-haiku-5.5']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;
@@ -385,6 +413,53 @@ describe('llmPricing', () => {
 
     it('falls back to $3.20/clip for an unknown video model', () => {
       expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
+    });
+
+    it('estimates gemini-omni-1.1-flash at $0.1014 per actual requested second', () => {
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['gemini-omni-1.1-flash']).toBeCloseTo(10 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 5)).toBeCloseTo(5 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 8)).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 10)).toBeCloseTo(10 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 24)).toBeCloseTo(24 * 0.1014, 10);
+      // Default 8s; rounded; floored at Omni's 3s minimum.
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash')).toBeCloseTo(8 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 6.6)).toBeCloseTo(7 * 0.1014, 10);
+      expect(videoGenerationCostUsd('gemini-omni-1.1-flash', 1)).toBeCloseTo(3 * 0.1014, 10);
+      expect(isPerGenerationPriced('gemini-omni-1.1-flash')).toBe(true);
+      expect(getModelPrice('gemini-omni-1.1-flash')).toBeNull();
+    });
+
+    it('counts Omni clips per 10s while other models keep the 8s clip', () => {
+      expect(videoClipCount(16, 'gemini-omni-1.1-flash')).toBe(2);
+      expect(videoClipCount(10, 'gemini-omni-1.1-flash')).toBe(1);
+      expect(videoClipCount(16, 'seedance-2.0')).toBe(2);
+      expect(videoClipCount(9)).toBe(2);
+    });
+  });
+
+  describe('omniVideoUsageCostUsd (bill gemini-omni-1.1-flash on actual usage)', () => {
+    it('bills video output at $17.50/M, other output at $9/M and input at $1.50/M', () => {
+      const cost = omniVideoUsageCostUsd({
+        total_input_tokens: 2_000,
+        total_output_tokens: 58_920,
+        output_tokens_by_modality: [{ modality: 'video', tokens: 57_920 }, { modality: 'text', tokens: 1_000 }],
+      });
+      expect(cost).toBeCloseTo((2_000 * 1.5 + 1_000 * 9 + 57_920 * 17.5) / 1e6, 12);
+    });
+
+    it('bills every output token at the video rate when there is no modality breakdown', () => {
+      expect(omniVideoUsageCostUsd({ total_output_tokens: 1_000_000 })).toBeCloseTo(17.5, 10);
+    });
+
+    it('an 8s 720p clip (5,792 tokens/s) costs ~$0.81', () => {
+      expect(omniVideoUsageCostUsd({ total_output_tokens: 8 * 5_792 })).toBeCloseTo(0.81, 2);
+    });
+
+    it('returns undefined when usage is missing or unusable (caller estimates instead)', () => {
+      expect(omniVideoUsageCostUsd(undefined)).toBeUndefined();
+      expect(omniVideoUsageCostUsd({})).toBeUndefined();
+      expect(omniVideoUsageCostUsd({ total_output_tokens: -5 })).toBeUndefined();
+      expect(omniVideoUsageCostUsd('nope')).toBeUndefined();
     });
   });
 

@@ -12,7 +12,7 @@ const dynamodbConfig = {
 };
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamodbConfig);
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+import { TABLE_PREFIX } from '../config/constants';
 const APPROVAL_DECISIONS_TABLE = `${TABLE_PREFIX}AW-ApprovalDecisions`;
 
 export class ApprovalInboxError extends Error {
@@ -676,9 +676,14 @@ export class ApprovalInboxService {
     indexName: string,
     keyName: string,
     keyValue: string,
-    pendingStatus: ApprovalDecisionStatus,
+    pendingStatus: ApprovalDecisionStatus | ApprovalDecisionStatus[],
     limit: number,
+    // Applied server-side BEFORE the page limit counts a match, so rows the caller would only drop
+    // afterwards (e.g. other gate types) can't fill the page and hide the rows it wants.
+    extra?: { expression: string; names: Record<string, string>; values: Record<string, unknown> },
   ): Promise<ApprovalDecision[]> {
+    const statuses = Array.isArray(pendingStatus) ? pendingStatus : [pendingStatus];
+    const statusValues = Object.fromEntries(statuses.map((st, i) => [`:s${i}`, st]));
     const matches: ApprovalDecision[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     let pages = 0;
@@ -688,9 +693,9 @@ export class ApprovalInboxService {
           TableName: APPROVAL_DECISIONS_TABLE,
           IndexName: indexName,
           KeyConditionExpression: `${keyName} = :keyValue`,
-          FilterExpression: '#status = :pending',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':keyValue': keyValue, ':pending': pendingStatus },
+          FilterExpression: `#status IN (${Object.keys(statusValues).join(', ')})${extra ? ` AND ${extra.expression}` : ''}`,
+          ExpressionAttributeNames: { '#status': 'status', ...(extra?.names ?? {}) },
+          ExpressionAttributeValues: { ':keyValue': keyValue, ...statusValues, ...(extra?.values ?? {}) },
           ScanIndexForward: true,
           Limit: limit,
           ExclusiveStartKey: lastEvaluatedKey,
@@ -713,6 +718,19 @@ export class ApprovalInboxService {
 
   async listPendingForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
     return this.listPendingByIndex('ApproverIndex', 'approver', approver, 'pending_team_review', limit);
+  }
+
+  /**
+   * ENG-1853: approved meta_write items that are waiting for Approve All. They are no longer
+   * 'pending_team_review', so without this a reviewer who answered every card and left could not
+   * find the packet again from the queue even though nothing had been dispatched yet.
+   */
+  async listAwaitingDispatchForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
+    return this.listPendingByIndex('ApproverIndex', 'approver', approver, ['approved', 'dispatching'], limit, {
+      expression: '#gateType = :metaWrite AND #verdict = :approve',
+      names: { '#gateType': 'gateType', '#verdict': 'verdict' },
+      values: { ':metaWrite': 'meta_write', ':approve': 'approve' },
+    });
   }
 
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {

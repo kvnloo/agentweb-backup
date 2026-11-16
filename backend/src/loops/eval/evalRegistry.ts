@@ -26,6 +26,11 @@ export interface GraderValidation {
   date: string;
   /** Link to the run output (Linear comment, PR, report). */
   evidence: string;
+  /**
+   * Who wrote the labels the run was scored against. Only `human` qualifies: an AI labelling the set that validates
+   * an AI judge is circular, and a model of the same family as the judge shares its blind spots (ENG-2135).
+   */
+  labelSource?: 'human';
 }
 
 export interface GraderEntry {
@@ -104,12 +109,12 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     graderType: 'llm_judge',
     measures: 'Session outcome 1-5 (was the requested task delivered, with evidence) with goalCompletion/dataAccuracy/outputQuality and binary arguedWithInstruction/escalatedWhenNotRequired/failedToEscalate (ENG-2189); rationale before score; ENG-1714 rubric B (reconstructed text)',
     source: 'services/outcomeJudge.ts (rubric, sampling, model guard) via services/sessionScoringService.ts custom-judge path; AW-Settings scoring-judges row outcome-judge-b-shadow (OPS-1, ENG-2146); offline scripts/evalOutcomeJudge.ts',
-    version: '2026-09-28.reconstructed-2',
+    version: '2026-10-09.reconstructed-3',
     model: 'anthropic.claude-sonnet-4-6 via OpenRouter (row llmModel; Google models refused)',
     modelFamily: 'claude',
     consumers: ['AW-ChatSessions.judgeScores[outcome-judge-b-shadow] (shadow: true, sampled)', 'scripts/evalOutcomeJudge.ts (offline, read-only)'],
-    knownIssues: ['ENG-1710', 'ENG-1714', 'ENG-2138', 'ENG-2189'],
-    notes: 'Shadow (D1): never writes satisfactionScore, runs only on its sampleRate share of sessions, metered as system spend (outcome_judge_shadow). Off until OPS-1 appends the row. ENG-1710 measured the original rubric B at AUC 0.79 vs relaxed completion with 2.6% at 5; this reconstructed text is not yet re-measured.',
+    knownIssues: ['ENG-1710', 'ENG-1714', 'ENG-2138', 'ENG-2189', 'ENG-2356'],
+    notes: 'Shadow (D1): never writes satisfactionScore, runs only on its sampleRate share of sessions, metered as system spend (outcome_judge_shadow). Off until OPS-1 appends the row. ENG-1710 measured the original rubric B at AUC 0.79 vs relaxed completion with 2.6% at 5. ENG-2356 (2026-10-08) measured reconstructed-2 at AUC 0.58, 28.6% at 5, and 0 of 77 scored sessions at 1-2 despite 22 labelled failures — a leniency problem traced to holistic scoring. reconstructed-3 (2026-10-09) makes the score a mechanical function of an itemised deliverable checklist; not yet re-measured. ENG-2138 (2026-10-12): the ENG-1710 0.79 / 2.6% came from the original rubric B, which asks for a one-decimal score (a 5 counted at >= 4.95); reconstructed-3 asks for whole numbers. Prod rounded every judge score until the shadow judge began keeping one decimal, so integer-scale replays (ENG-2356, ENG-2380) are not comparable to it. On the ENG-1710 corpus (ENG-2410, rebuilt labels) the cached scores read AUC 0.76 / 3.4% at 5 raw and 0.72 / 46% rounded.',
   },
   {
     id: 'finalize-guard',
@@ -149,6 +154,19 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     consumers: ['scripts/evalAgentGraders.ts (offline, read-only)', 'online eval sampler cron/evalV2SamplerCron.ts (Dev-AW-LoopEvents eval_v2_scored, off until EVAL_V2_SAMPLER_ENABLED)', 'partner-portal Eval v2 tab (labelled unvalidated)'],
     knownIssues: ['ENG-1710', 'ENG-2137'],
     notes: 'Deterministic; offline only. Completion is still the plan\'s own step status, cross-checked against successful required tool calls; not yet compared with human labels (ENG-2135/2136).',
+  },
+  {
+    id: 'agent-task-success-judge',
+    surface: 'agent',
+    graderType: 'llm_judge',
+    measures: 'task_success pass | fail | na per session with the human labelling rubric: every requested deliverable delivered with tool or content evidence, explicit constraints respected; checklist before verdict',
+    source: 'services/taskSuccessJudge.ts (prompt, trace rendering, model guard) over services/agentRunTrace.ts; golden-case adapter loops/eval/runValidation.ts (taskSuccessJudgeGrader); trial scripts/runTaskSuccessJudgeTrial.ts',
+    version: 'prompt-sha256:17fef09dc816',
+    model: 'anthropic.claude-sonnet-5 via OpenRouter (Google and OpenAI models refused: the agent runs on Gemini)',
+    modelFamily: 'claude',
+    consumers: ['scripts/runTaskSuccessJudgeTrial.ts (offline, read-only)', 'scripts/runGraderValidation.ts agent-task-success-judge'],
+    knownIssues: ['ENG-2591'],
+    notes: 'ENG-2591: replaces reading the plan\'s own step checkmarks (agent-task-success measured kappa 0.20 vs blind labels on the 40 test work-plan cases, 2026-10-20). Trial 2026-10-21 on the test split: kappa 0.88 vs blind GPT-5.4 labels (n=39), 0.93 where GPT and Claude labels agree (n=34), 0.77 vs Claude labels (n=38); evidence https://linear.app/emmabyaw/issue/ENG-2591/agent-task-success-grader-stop-trusting-step-checkmarks-kappa-020-in#comment-ea8be576. AI labels, not human, so no validation is recorded and it cannot gate: advisory only. Offline only.',
   },
   {
     id: 'agent-tool-correctness',
@@ -332,7 +350,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
       'scripts/scoreCreativeRubric.ts (offline, read-only)',
     ],
     knownIssues: ['ENG-421'],
-    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
+    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0. Prod: on at sample rate 0.25 (Agentweb-backend-env-prod-3, checked 2026-10-19); verdicts are stored and reported in the eval-v2 creative snapshot (report-only); nothing gates or alerts on them. Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
   },
   {
     id: 'creative-performance-correlation',
@@ -426,9 +444,9 @@ export function mayGate(id: string): boolean {
   return isQualifyingValidation(getGrader(id)?.validation);
 }
 
-/** kappa >= MIN_KAPPA on n >= MIN_VALIDATION_N cases, with an http(s) link to the run. */
+/** kappa >= MIN_KAPPA on n >= MIN_VALIDATION_N cases scored against HUMAN labels, with an http(s) link to the run. */
 export function isQualifyingValidation(v: GraderValidation | undefined): boolean {
-  return !!v && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N && hasEvidenceLink(v.evidence);
+  return !!v && v.labelSource === 'human' && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N && hasEvidenceLink(v.evidence);
 }
 
 function hasEvidenceLink(evidence: string): boolean {

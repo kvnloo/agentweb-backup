@@ -95,7 +95,12 @@ jest.mock('../middleware/auth', () => ({
   AuthenticatedRequest: {},
 }));
 
+jest.mock('../services/leadImportFollowups', () => ({
+  applyLeadImportFollowups: jest.fn().mockResolvedValue({ inheritedDoNotContact: [], doNotContactCheckFailed: 0 }),
+}));
+
 import { crmDb } from '../services/db';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
 import router from '../routes/crm';
 
 // Helper to find route handler
@@ -207,7 +212,7 @@ describe('POST /lists/:listId/leads/bulk-import', () => {
 
     await handler!(mockReq, mockRes);
 
-    expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('list-123', validLeads);
+    expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('list-123', validLeads, { origin: 'enrichment_import' });
     expect(mockRes.status).toHaveBeenCalledWith(201);
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({ imported: 2, skipped: 0, errors: [] })
@@ -266,5 +271,18 @@ describe('POST /lists/:listId/leads/bulk-import', () => {
     const callArg = (crmDb.batchCreateLeads as jest.Mock).mock.calls[0][1];
     expect(callArg[0]).toHaveProperty('linkedin', 'https://www.linkedin.com/in/carolwhite');
     expect(callArg[0]).not.toHaveProperty('linkedin_url');
+  });
+
+  // ENG-2996 AC1/AC3: created leads go through validation + do-not-contact inheritance.
+  it('runs import follow-ups (validation + DNC inheritance) for created leads and reports inheritance', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-123', userId: 'test-user-id' });
+    const created = [{ leadId: 'n1', email: 'alice@example.com', sourceIndex: 0 }, { leadId: 'n2', email: 'bob@example.com', sourceIndex: 1 }];
+    (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({ successCount: 2, newCount: 2, mergedCount: 0, errorCount: 0, errors: [], created });
+    (applyLeadImportFollowups as jest.Mock).mockResolvedValueOnce({ inheritedDoNotContact: ['n2'], doNotContactCheckFailed: 0 });
+
+    await handler!(mockReq, mockRes);
+
+    expect(applyLeadImportFollowups).toHaveBeenCalledWith('list-123', 'test-user-id', created, { actingUserId: 'test-user-id', validate: true });
+    expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({ inheritedDoNotContact: 1, doNotContactCheckFailed: 0 }));
   });
 });

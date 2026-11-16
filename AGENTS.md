@@ -31,6 +31,13 @@ instructions narrow and operational.
   cannot schedule a run at all — and on a stale draft-time run in which every job
   skipped. Exit 3 is `NO_EVIDENCE`, meaning nothing has ever executed against
   this head; it is not a pass and never satisfies the gate (ENG-757).
+- ENG-2116: PRs owned by Argusoft engineers (author `anurag-seth` /
+  `mananv-argusoft`, or branches `anurag/`, `manan/`, ...) return exit 5
+  `FOREIGN_OWNER`; agents must not merge, push to, or close them. Exception
+  (Harsha, 2026-10-13): an agent directed by the PR's own author may merge it on
+  the normal green gate. Run the gate with
+  `MERGE_EVIDENCE_DIRECTING_LOGIN=<your GitHub login>`; it must equal the PR
+  author exactly. Never set it to anyone but the human directing you.
 - Prefer the repository's configured GitHub auto-merge mechanism. If merge is
   blocked by a stale branch, merge queue state, flaky gate, or sync issue, fix
   that condition, rerun the affected gates, and merge once the latest head is
@@ -72,6 +79,23 @@ instructions narrow and operational.
   Phase 2. (Harsha's personal Claude Code / Codex configs carry a longer
   version of this doctrine for cross-repo consistency; this paragraph is the
   authoritative in-repo copy — if they ever disagree, this one wins here.)
+
+## Customer-visible changes (Harsha, 2026-10-26)
+
+Applies to every engineer and agent, including Argusoft.
+
+- Default is pull: the team asks an agent (Yugo) for product state, sourced
+  from `main`, Linear and prod config. Nobody is briefed by hand.
+- The only push is Slack `#feature-launches`, and only for changes to what a
+  customer sees, pays, or is told. Yugo writes those posts from merged PRs;
+  engineers write nothing extra.
+- If a customer-visible change merges dark (behind a switch or flag), say
+  "dark" in the PR title or body, plus what turns it on.
+- When you switch a customer-visible change on in production, comment
+  "switched on <date>" on its Linear issue. That triggers the post.
+- A customer-visible billing or pricing change does not switch on before its
+  `#feature-launches` post exists.
+- Yugo maintains the posting job (doctrine rule `feature-launch-sync`).
 
 ## dev.md notes
 

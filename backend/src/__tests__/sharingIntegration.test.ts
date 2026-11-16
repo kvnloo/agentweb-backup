@@ -166,11 +166,12 @@ describe('Sharing Integration Tests', () => {
         .get(`/api/agent-mode/share/${sessionId}`)
         .expect(200);
 
-      expect(viewOnlyAccessResponse.body.session).toHaveProperty('shareMetadata');
-      expect(viewOnlyAccessResponse.body.session).toHaveProperty('interactiveShareMetadata');
-      expect(viewOnlyAccessResponse.body.session.shareMetadata.isShared).toBe(true);
-      expect(viewOnlyAccessResponse.body.session.interactiveShareMetadata.isActive).toBe(true);
-      expect(viewOnlyAccessResponse.body.session.isConversable).toBe(false);
+      expect(viewOnlyAccessResponse.body.session.sessionId).toBe(sessionId);
+      // ENG-2645: the read-only view never carries share metadata — interactiveShareMetadata.token is the
+      // conversable credential, so a read-only viewer must not be able to read it.
+      expect(viewOnlyAccessResponse.body.session).not.toHaveProperty('shareMetadata');
+      expect(viewOnlyAccessResponse.body.session).not.toHaveProperty('interactiveShareMetadata');
+      expect(JSON.stringify(viewOnlyAccessResponse.body)).not.toContain('test-token');
       // workPlan is included in response (may be undefined/missing if session has no work plan - JSON removes undefined)
 
       // Step 4: Test interactive access
@@ -178,11 +179,10 @@ describe('Sharing Integration Tests', () => {
         .get(`/api/agent-mode/share/${sessionId}?conversable=test-token`)
         .expect(200);
 
-      expect(interactiveAccessResponse.body.session).toHaveProperty('shareMetadata');
-      expect(interactiveAccessResponse.body.session).toHaveProperty('interactiveShareMetadata');
-      expect(interactiveAccessResponse.body.session.shareMetadata.isShared).toBe(true);
-      expect(interactiveAccessResponse.body.session.interactiveShareMetadata.isActive).toBe(true);
-      expect(interactiveAccessResponse.body.session.isConversable).toBe(true);
+      expect(interactiveAccessResponse.body.session.sessionId).toBe(sessionId);
+      // ENG-2645: the conversable chat page never reads share metadata (only the owner's Share dialog does).
+      expect(interactiveAccessResponse.body.session).not.toHaveProperty('shareMetadata');
+      expect(interactiveAccessResponse.body.session).not.toHaveProperty('interactiveShareMetadata');
       // workPlan is included in response (may be undefined/missing if session has no work plan - JSON removes undefined)
 
       // Step 5: Revoke view-only share (should preserve interactive share)
@@ -214,8 +214,7 @@ describe('Sharing Integration Tests', () => {
         .get(`/api/agent-mode/share/${sessionId}?conversable=test-token`)
         .expect(200);
 
-      expect(interactiveStillWorksResponse.body.session.shareMetadata.isShared).toBe(false);
-      expect(interactiveStillWorksResponse.body.session.interactiveShareMetadata.isActive).toBe(true);
+      expect(interactiveStillWorksResponse.body.session.sessionId).toBe(sessionId);
 
       // Step 7: Revoke interactive share
       const sessionWithNoShares = {
@@ -388,50 +387,6 @@ describe('Sharing Integration Tests', () => {
         .post('/api/agent-mode/share/test-session-id/generate')
         .send({})
         .expect(400);
-    });
-  });
-
-  describe('Metadata Separation', () => {
-    it('should maintain separate metadata objects', async () => {
-      const sessionId = 'test-session-id';
-      const mockSession = {
-        sessionId,
-        userId: 'test-user-id',
-        title: 'Test Session',
-        messages: [],
-        createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T00:00:00Z',
-        portalType: 'agent',
-        pageIdentifier: 'agent-mode',
-        shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: {
-          isActive: true,
-          token: 'test-token',
-          sharedAt: '2024-01-01T00:00:00Z',
-          expiresAt: '2099-01-01T00:00:00Z'
-        }
-      };
-
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
-
-      const response = await request(app)
-        .get(`/api/agent-mode/share/${sessionId}`)
-        .expect(200);
-
-      // Verify both metadata objects are present and separate
-      expect(response.body.session).toHaveProperty('shareMetadata');
-      expect(response.body.session).toHaveProperty('interactiveShareMetadata');
-      
-      // Verify they are separate objects
-      expect(response.body.session.shareMetadata).not.toBe(response.body.session.interactiveShareMetadata);
-      
-      // Verify their structures are correct
-      expect(response.body.session.shareMetadata).toHaveProperty('isShared');
-      expect(response.body.session.shareMetadata).toHaveProperty('sharedAt');
-      
-      expect(response.body.session.interactiveShareMetadata).toHaveProperty('isActive');
-      expect(response.body.session.interactiveShareMetadata).toHaveProperty('token');
-      expect(response.body.session.interactiveShareMetadata).toHaveProperty('sharedAt');
     });
   });
 

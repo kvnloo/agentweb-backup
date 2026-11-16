@@ -131,6 +131,7 @@
  * billingUserId and found zero matches, confirming Manan's own pre-check
  * before this round started.
  */
+import { truncateToolContent } from '../../utils/surrogateSafeCut';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -524,19 +525,66 @@ export async function updateKnowledgeBaseFile(
   }
 }
 
+const ATTACH_FILE_SHAPE = '{"name": "design.md", "content": "..."}';
+
+type AttachFile = { name: string; content: string };
+
+/**
+ * Validates the model-supplied `files` argument. Only top-level `required` is enforced by the tool
+ * schema, so per-file shape must be checked here. `error` (not `message`) is what the model sees on a
+ * failed result, so it must name the fix.
+ */
+function normalizeAttachFiles(
+  raw: unknown
+): { files: AttachFile[] } | { message: string; error: string } {
+  let files = raw;
+  // Models sometimes serialize the array as a JSON string.
+  if (typeof files === 'string') {
+    try { files = JSON.parse(files); } catch { /* reported by the array check below */ }
+  }
+  if (files != null && !Array.isArray(files)) {
+    return {
+      message: 'files must be an array',
+      error: `Invalid input: files must be an array of ${ATTACH_FILE_SHAPE} objects`
+    };
+  }
+  if (!files || files.length === 0) {
+    return { message: 'At least one file is required', error: 'Invalid input: empty files array' };
+  }
+
+  const result: AttachFile[] = [];
+  for (const [i, entry] of files.entries()) {
+    const f = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>;
+    // Models often reuse update_knowledge_base_file's `fileName` key; accept the aliases.
+    const name = f.name || f.fileName || f.file_name || f.filename;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return {
+        message: `File #${i + 1} has no name`,
+        error: `Invalid input: file #${i + 1} is missing "name" - each file must be ${ATTACH_FILE_SHAPE}`
+      };
+    }
+    if (typeof f.content !== 'string' || f.content.trim().length === 0) {
+      return {
+        message: `File "${name}" has empty content`,
+        error: `Invalid input: empty file content for "${name}" - put the text in a non-empty string "content" field`
+      };
+    }
+    result.push({ name, content: f.content });
+  }
+  return { files: result };
+}
+
 /**
  * Attach multiple files to a task's knowledge base
  * Used by attach_knowledge_base_files tool
  */
 export async function attachKnowledgeBaseFiles(
   taskId: string,
-  files: Array<{ name: string; content: string }>,
+  files: unknown,
   userId: string,
   sessionId: string
 ): Promise<any> {
   try {
-    console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${files?.length}, userId=${userId}`);
-
     // 1. Input validation
     if (!taskId || taskId.trim().length === 0) {
       return {
@@ -546,24 +594,12 @@ export async function attachKnowledgeBaseFiles(
       };
     }
 
-    if (!files || files.length === 0) {
-      return {
-        success: false,
-        message: 'At least one file is required',
-        error: 'Invalid input: empty files array'
-      };
+    const normalized = normalizeAttachFiles(files);
+    if ('error' in normalized) {
+      return { success: false, message: normalized.message, error: normalized.error };
     }
-
-    // Validate each file has content
-    for (const f of files) {
-      if (!f.content || f.content.trim().length === 0) {
-        return {
-          success: false,
-          message: `File "${f.name}" has empty content`,
-          error: 'Invalid input: empty file content'
-        };
-      }
-    }
+    const attachFiles = normalized.files;
+    console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${attachFiles.length}, userId=${userId}`);
 
     // 2. Get task and check authorization
     const { taskDb } = await import('../../services/db');
@@ -605,7 +641,7 @@ export async function attachKnowledgeBaseFiles(
     const uploadedFiles: Array<{ name: string; size: number; url: string }> = [];
 
     // 4. Upload each file
-    for (const f of files) {
+    for (const f of attachFiles) {
       const sanitizedName = f.name.replace(/[^a-zA-Z0-9._-]/g, '_');
       const filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
       const file = bucket.file(filePath);
@@ -1156,7 +1192,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
       // never capped, so a single oversized entry could exceed Node's max
       // string length once merged/serialized downstream and crash the process.
       content: result.content && result.content.length > 5000
-        ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+        ? truncateToolContent(result.content)
         : result.content,
       source: result.metadata?.source || 'unknown',
       ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
@@ -1203,7 +1239,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (content) {
                   const parentFolder = folders.find(f => file.parents?.includes(f.folderId));
                   results.push({
-                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                    content: truncateToolContent(content),
                     source: `google-drive/${parentFolder?.name || 'shared'}/${file.name}`
                   });
                 }
@@ -1251,7 +1287,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                   const contentMatch = content.toLowerCase().includes(queryLower);
                   if (nameMatch || contentMatch) {
                     results.push({
-                      content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                      content: truncateToolContent(content),
                       source: `clickup/${workspace.name}/${doc.name}`
                     });
                     clickUpResultCount++;
@@ -1289,7 +1325,7 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5,
                 if (nameMatch || descMatch) {
                   const summary = `# ${task.name}\n\n**Status:** ${task.status}${task.priority ? `\n**Priority:** ${task.priority}` : ''}${task.assignees.length > 0 ? `\n**Assignees:** ${task.assignees.join(', ')}` : ''}${task.description ? `\n\n${task.description}` : ''}`;
                   results.push({
-                    content: summary.length > 5000 ? summary.substring(0, 5000) + '\n\n[Content truncated]' : summary,
+                    content: truncateToolContent(summary),
                     source: `clickup-tasks/${workspace.name}/${task.name}`
                   });
                   clickUpTaskResultCount++;
@@ -1413,7 +1449,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
         if (nameMatch || descMatch || headlineMatch || brandMatch) {
           const content = formatForeplayAdAsMarkdown(ad);
           results.push({
-            content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+            content: truncateToolContent(content),
             source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
           });
           foreplayResultCount++;
@@ -1440,7 +1476,7 @@ export async function searchForeplayAds(query: string, maxResults: number = 5, u
             if (nameMatch || descMatch || headlineMatch || brandMatch) {
               const content = formatForeplayAdAsMarkdown(ad);
               results.push({
-                content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                content: truncateToolContent(content),
                 source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
               });
               foreplayResultCount++;
@@ -1553,7 +1589,7 @@ export async function searchForeplayDiscovery(
     const results = ads.map(ad => ({
       content: (() => {
         const c = formatForeplayAdAsMarkdown(ad);
-        return c.length > 5000 ? c.substring(0, 5000) + '\n\n[Content truncated]' : c;
+        return truncateToolContent(c);
       })(),
       source: `foreplay-discovery/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
     }));
@@ -2985,18 +3021,32 @@ export async function writeClickUpDoc(
   content: string,
   userId: string,
   parentDocId?: string
-): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
+): Promise<{ success: boolean; message: string; docId?: string; code?: number; errorType?: ClickUpDocErrorType }> {
+  // ENG-1892: reject malformed arguments locally and name the bad parameter,
+  // instead of letting ClickUp answer with an unreadable 400.
+  const badParam = !isNonEmptyString(workspaceId) ? 'workspace_id'
+    : !isNonEmptyString(name) ? 'name'
+    : typeof content !== 'string' ? 'content'
+    : parentDocId !== undefined && parentDocId !== null && !isNonEmptyString(parentDocId) ? 'parent_doc_id'
+    : null;
+  if (badParam) {
+    return {
+      success: false,
+      errorType: 'invalid_parameter',
+      message: `Invalid parameter "${badParam}" for write_clickup_doc: ${badParam === 'content' ? 'must be a string' : 'must be a non-empty string'}.`,
+    };
+  }
   try {
     const clickUpToken = await getClickUpAccessToken(userId);
     if (!clickUpToken) {
-      return { success: false, message: 'ClickUp not connected' };
+      return { success: false, errorType: 'configuration', message: 'ClickUp not connected' };
     }
 
     // Verify user has access to this workspace
     const workspaces = await getClickUpWorkspaces(clickUpToken);
     const workspace = workspaces.find(w => w.id === workspaceId);
     if (!workspace) {
-      return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      return { success: false, errorType: 'configuration', message: 'Not authorized to access this ClickUp workspace' };
     }
 
     if (parentDocId) {
@@ -3050,13 +3100,49 @@ export async function writeClickUpDoc(
     // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
     // business code (e.g. "OAUTH_019"), not an HTTP status.
     const code = error?.response?.status;
+    const errorType = classifyClickUpDocError(code);
+    const bodySnippet = !clickUpError?.err && clickUpError !== undefined
+      ? ` ClickUp response: ${truncateForError(clickUpError)}`
+      : '';
+    const statusText = typeof code === 'number' ? ` (HTTP ${code})` : '';
+    const guidance = errorType === 'configuration'
+      ? ' Reconnect ClickUp in Settings > Integrations and make sure the AgentWeb app is allowed to create Docs in this workspace.'
+      : errorType === 'invalid_parameter'
+        ? ' Check workspace_id, name, content and parent_doc_id (parent_doc_id must be a docId from list_knowledge_base_files).'
+        : '';
 
     return {
       success: false,
-      message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+      errorType,
+      message: `Failed to create ClickUp document "${name}"${statusText}: ${errorMessage}.${bodySnippet}${guidance}`,
       code,
     };
   }
+}
+
+export type ClickUpDocErrorType = 'configuration' | 'invalid_parameter' | 'not_found' | 'runtime';
+
+// ENG-1892: one class per failure family so the agent (and reliability runs)
+// can tell auth/config from schema from runtime failures.
+export function classifyClickUpDocError(status: unknown): ClickUpDocErrorType {
+  if (status === 401 || status === 403) return 'configuration';
+  if (status === 400 || status === 422) return 'invalid_parameter';
+  if (status === 404) return 'not_found';
+  return 'runtime';
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function truncateForError(body: unknown): string {
+  let text: string;
+  try {
+    text = typeof body === 'string' ? body : JSON.stringify(body);
+  } catch {
+    text = String(body);
+  }
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
 }
 
 // Helper: read a Foreplay ad from swipefile or a board

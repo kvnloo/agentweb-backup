@@ -158,42 +158,6 @@ export async function getWorkflowExecutions(req: AuthenticatedRequest, res: Resp
   }
 }
 
-export async function runWorkflow(req: AuthenticatedRequest, res: Response) {
-  try {
-    const { id } = req.params;
-
-    // Check workflow exists and user has access
-    const workflow = await workflowService.getWorkflow(id);
-    if (!workflow) {
-      return res.status(404).json({ error: 'Workflow not found' });
-    }
-    if (workflow.userId !== req.user.userId) {
-      return res.status(403).json({ error: 'Not authorized to run this workflow' });
-    }
-
-    // Create execution record
-    const execution = await workflowService.createWorkflowExecution({
-      workflowId: id,
-      userId: req.user.userId,
-      status: 'pending',
-      startTime: new Date().toISOString(),
-      tasks: []
-    });
-
-    // TODO: Implement actual workflow execution logic
-    // This should be handled by a separate service that:
-    // 1. Parses the YAML to determine execution steps
-    // 2. Executes tasks in sequence/parallel as defined
-    // 3. Updates execution status and task statuses
-    // 4. Handles errors and retries
-
-    res.json(execution);
-  } catch (error) {
-    console.error('Error running workflow:', error);
-    res.status(500).json({ error: 'Failed to run workflow' });
-  }
-}
-
 export async function generateWorkflow(req: AuthenticatedRequest, res: Response) {
   try {
     const { message, currentYaml } = req.body;

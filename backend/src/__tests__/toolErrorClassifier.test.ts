@@ -40,6 +40,12 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Unauthorized: missing credentials'))).toBe('auth');
   });
 
+  it('ENG-2786: client_id-scoped missing account_id is invalid_args, not auth; real token failure stays auth', () => {
+    expect(classifyToolErrorClass(new Error('client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="x@y.com" first; its ad_account_id field is this client\'s Meta ad account.'))).toBe('invalid_args');
+    expect(classifyToolErrorClass(Object.assign(new Error('client_id-scoped calls require an explicit account_id'), { toolErrorClass: 'invalid_args' }))).toBe('invalid_args');
+    expect(classifyToolErrorClass(Object.assign(new Error('Request failed'), { status: 401 }))).toBe('auth');
+  });
+
   it('classifies rate limits', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 429'))).toBe('rate_limit');
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
@@ -510,5 +516,42 @@ describe('publisher_refused — publisher/site blocks on a plain external fetch 
     expect(classifyToolErrorClass(err('HTTP 403: Forbidden'))).toBe('auth');
     expect(classifyToolErrorClass(err('403 Forbidden'))).toBe('auth');
     expect(classifyToolErrorClass(err('Request failed with status code 401'))).toBe('auth');
+  });
+});
+
+describe('create_html_file Error-class cluster (ENG-1627)', () => {
+  // Verbatim shapes from prod Dev-AW-LoopEvents agent_tool_failed rows for
+  // create_html_file that were still bucketed as generic `Error`.
+  it('classifies private-image size limits as invalid_args, not generic Error', () => {
+    expect(classifyToolErrorClass(err(
+      'Could not inline private image https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/u/brand/logo/1.png: decoded image exceeds the 5 MB limit. Reduce the image size or image count, confirm the asset is still accessible, and retry.',
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      'Private images exceed the 20 MB aggregate decoded limit after 4 images were inlined; offending asset: https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/u/files/1/a.png. Reduce image sizes or image count and retry; no partial document was created.',
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      'Private image exceeds the 5 MB decoded limit: https://x/a.png. Reduce the image size and retry; the document was not created with a broken image.',
+    ))).toBe('invalid_args');
+  });
+
+  it('keeps a private-image access failure out of invalid_args', () => {
+    expect(classifyToolErrorClass(err(
+      'Could not inline private image https://x/a.png: The specified key does not exist.. Reduce the image size or image count, confirm the asset is still accessible, and retry.',
+    ))).toBe('not_found');
+  });
+
+  it('classifies malformed tool-call JSON as invalid_args even when the position looks like a status code', () => {
+    expect(classifyToolErrorClass(err(
+      "Failed to parse arguments: Expected ',' or '}' after property value in JSON at position 87 (line 1 column 88)",
+    ))).toBe('invalid_args');
+    expect(classifyToolErrorClass(err(
+      "Failed to parse arguments: Expected ',' or '}' after property value in JSON at position 503 (line 1 column 504)",
+    ))).toBe('invalid_args');
+  });
+
+  it('classifies cut-off tool-call JSON as truncated_response (retryable)', () => {
+    expect(classifyToolErrorClass(err(
+      'Failed to parse arguments: The arguments for this tool call were cut off before the JSON object was complete (received 1441 character(s), ending mid-object).',
+    ))).toBe('truncated_response');
   });
 });

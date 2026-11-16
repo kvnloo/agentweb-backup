@@ -414,21 +414,28 @@ export class InstagramService {
         try {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
             const url = `${instagramApiBaseUrl}/${mediaId}/insights`;
-            
-            let metric = 'impressions,reach,saved,likes,comments,shares,total_interactions';
-            
+
+            // ENG-2636: Meta retired `impressions` and `plays` in favour of `views`, and rejects `impressions`
+            // outright on newer media product types.
+            let metrics = ['views', 'reach', 'saved', 'likes', 'comments', 'shares', 'total_interactions'];
+
             if (mediaProductType === 'REELS') {
-                metric = 'comments,likes,plays,reach,saved,shares,total_interactions,navigation,profile_visits';
-            } else if (mediaType === 'CAROUSEL_ALBUM') {
-                metric = 'reach,saved,likes,comments,shares,total_interactions';
+                metrics = ['comments', 'likes', 'views', 'reach', 'saved', 'shares', 'total_interactions', 'navigation', 'profile_visits'];
             }
 
-            const params = {
-                metric,
-                access_token: userToken
-            };
-            const response = await axios.get<any>(url, { params });
-            return response.data?.data || [];
+            // Which metrics each media product type accepts keeps changing (STORY, newer FEED types...), so
+            // when Meta names one it does not support, drop just that one and ask again.
+            for (;;) {
+                try {
+                    const response = await axios.get<any>(url, { params: { metric: metrics.join(','), access_token: userToken } });
+                    return response.data?.data || [];
+                } catch (error: any) {
+                    const unsupported = /does not support the (\w+) metric/i.exec(error?.response?.data?.error?.message || '')?.[1];
+                    if (!unsupported || !metrics.includes(unsupported) || metrics.length === 1) throw error;
+                    console.warn(`[Instagram] Media ${mediaId} (${mediaType}/${mediaProductType}) does not support the ${unsupported} metric; retrying without it.`);
+                    metrics = metrics.filter(m => m !== unsupported);
+                }
+            }
         } catch (error) {
             this.handleError(error, 'getInstagramMediaInsights');
         }

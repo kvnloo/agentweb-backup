@@ -5,7 +5,7 @@ import { decryptPassword, encryptPassword } from '../utils/crypto';
 import { CrmAuth, CrmAdapter } from './adapters/crmAdapterTypes';
 import { AttioAdapter } from './adapters/attioAdapter';
 import { HubspotAdapter, HUBSPOT_LIST_IDENTITY_MAPPING } from './adapters/hubspotAdapter';
-import { HubSpotService, HubSpotPipelineStage } from './hubspotService';
+import { HubSpotService, HubSpotPipelineStage, findOrgSharedHubSpotAccountById } from './hubspotService';
 import { AttioService } from './attioService';
 
 // ─── CRM Adapter Registry ─────────────────────────────────────────────────────
@@ -526,7 +526,11 @@ export class ExternalCrmSyncService {
   async isAccountConnected(config: ExternalCrmSyncConfig): Promise<boolean> {
     if (config.apiKeyEncrypted) return true;
     if (!config.accountId) return false;
-    const account = await getAccountById(config.accountId, config.userId).catch(() => null);
+    let account: { config?: unknown } | null = await getAccountById(config.accountId, config.userId).catch(() => null);
+    // Push resolves a HubSpot account an org admin shared (HubSpotService.create), so this must too.
+    if (!account && config.provider === 'hubspot') {
+      account = await findOrgSharedHubSpotAccountById(config.userId, config.accountId);
+    }
     if (!account) return false;
     // Attio's per-workspace webhook registration can 403 on a missing OAuth
     // scope (an account connected before webhook:read-write was requested) —

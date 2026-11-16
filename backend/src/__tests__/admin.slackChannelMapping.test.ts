@@ -8,6 +8,7 @@ jest.mock('../services/db', () => ({
     updateUser: jest.fn(),
     getAllUsers: jest.fn(),
   },
+  orgDb: { getOrgById: jest.fn() },
 }));
 jest.mock('../services/waitlistDb', () => ({}));
 jest.mock('../services/emailService', () => ({}));
@@ -52,7 +53,7 @@ jest.mock('aws-sdk', () => ({
   })),
 }));
 
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { getSlackChannelInfo } from '../services/slackService';
 
@@ -189,3 +190,74 @@ describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', ()
     expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-abc', { slackChannels: ['C_CLEAN'] });
   });
 });
+
+describe('PUT /users/:userId/slack-channel — the platform it reports (ENG-273)', () => {
+  const verifiedWhatsApp = {
+    channel: 'whatsapp',
+    destination: '+918005326946',
+    enabled: true,
+    optIn: { at: 'x', source: 'inbound_verification', verifiedAt: 'y' },
+  };
+
+  beforeEach(() => {
+    (orgDb.getOrgById as jest.Mock).mockReset();
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
+  });
+
+  it('reports the account as on Slack after a channel is assigned', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ ...existingUser } as any);
+    mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: ['C_NEW'] } as any);
+
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: ['C_NEW'] });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ messagingPlatform: 'slack', messagingPlatformSource: 'account' });
+  });
+
+  it('reports not connected after the only channel is cleared', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ ...existingUser } as any);
+    mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: null } as any);
+
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: [] });
+    expect(res.body.messagingPlatform).toBeNull();
+  });
+
+  it('reports an organisation member as on Slack via the organisation after clearing their own', async () => {
+    // Without this the dashboard would show "Not connected" for someone who still receives
+    // the organisation's Slack notifications.
+    const member = { ...existingUser, orgId: 'org-1' };
+    mockUserDb.getUserById.mockResolvedValue({ ...member, slackChannels: ['C_OWN'] } as any);
+    mockUserDb.updateUser.mockResolvedValue({ ...member, slackChannels: null } as any);
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org-1', slackChannel: 'C_ORG' });
+
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: [] });
+    expect(res.body).toMatchObject({ messagingPlatform: 'slack', messagingPlatformSource: 'organisation' });
+  });
+
+  it('still succeeds when the platform cannot be recalculated', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ ...existingUser } as any);
+    mockUserDb.updateUser.mockResolvedValue({ ...existingUser, orgId: 'org-1', slackChannels: null } as any);
+    (orgDb.getOrgById as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: [] });
+    expect(res.status).toBe(200);
+  });
+
+  it('refuses to assign a Slack channel to an account that is on WhatsApp', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ ...existingUser, messagingChannels: [verifiedWhatsApp] } as any);
+
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: ['C_NEW'] });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('platform_conflict');
+    expect(mockUserDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('still lets an admin CLEAR channels on a WhatsApp account', async () => {
+    // Clearing is how Slack is removed, so it must never be blocked by the rule.
+    mockUserDb.getUserById.mockResolvedValue({ ...existingUser, messagingChannels: [verifiedWhatsApp] } as any);
+    mockUserDb.updateUser.mockResolvedValue({ ...existingUser, slackChannels: null } as any);
+    const res = await request(app).put('/api/admin/users/user-abc/slack-channel').send({ slackChannels: [] });
+    expect(res.status).toBe(200);
+  });
+});
+

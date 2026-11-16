@@ -1,6 +1,17 @@
 import express from 'express';
 import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
+import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+
+/**
+ * ENG-669 PR-C: a setting whose value is a model id is a configured model (a default that stands in when nothing was
+ * chosen, a role's model, ...): it must be one concrete model, never the AgentWeb Model, which is routed per chat turn
+ * and would otherwise be silently replaced wherever such a setting is read. Refused on create (POST) and update (PUT).
+ */
+const AGENTWEB_MODEL_NOT_CONFIGURABLE = {
+  error: 'AgentWeb Model picks a model per chat turn and can\'t be a configured model. Choose a specific model.',
+  code: 'agentweb_model_not_configurable',
+};
 import { userDb, orgDb } from '../services/db';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { agentModeService } from '../services/agentModeService';
@@ -469,6 +480,7 @@ router.post('/', authenticateToken, requireAdmin, async (req, res) => {
     if (!settingName || !settingValue) {
       return res.status(400).json({ error: 'settingName and settingValue are required' });
     }
+    if (isAgentWebModelId(settingValue)) return res.status(400).json(AGENTWEB_MODEL_NOT_CONFIGURABLE);
     
     const setting = await settingsService.setSetting(settingName, settingValue, description, updatedBy);
     res.json(setting);
@@ -488,6 +500,7 @@ router.put('/:settingName', authenticateToken, requireAdmin, async (req, res) =>
     if (settingValue === undefined) {
       return res.status(400).json({ error: 'settingValue is required' });
     }
+    if (isAgentWebModelId(settingValue)) return res.status(400).json(AGENTWEB_MODEL_NOT_CONFIGURABLE);
     
     const setting = await settingsService.setSetting(settingName, settingValue, description, updatedBy);
     res.json(setting);

@@ -67,6 +67,10 @@ function isPrivateIPv4(ip: string): boolean {
   if (((raw & 0xff000000) >>> 0) === 0x00000000) return true;
   // 224.0.0.0/4 (multicast)
   if (((raw & 0xf0000000) >>> 0) === 0xe0000000) return true;
+  // 192.0.0.0/24 (IETF protocol assignments)
+  if (((raw & 0xffffff00) >>> 0) === 0xc0000000) return true;
+  // 198.18.0.0/15 (benchmarking; reachable inside some networks)
+  if (((raw & 0xfffe0000) >>> 0) === 0xc6120000) return true;
   // 240.0.0.0/4 (class E reserved — includes 255.255.255.255 broadcast)
   if (((raw & 0xf0000000) >>> 0) === 0xf0000000) return true;
   return false;
@@ -96,6 +100,19 @@ function isPrivateIPv6(ip: string): boolean {
     return isPrivateIPv4(dotted);
   }
 
+  // ENG-2915: addresses that embed an IPv4 address the network may translate and route to:
+  // 64:ff9b::/96 (NAT64), 2002::/16 (6to4) and ::/96 (deprecated IPv4-compatible). Check the
+  // embedded address; ::/96 itself is never a legitimate destination.
+  const hextets = expandIPv6(lower);
+  if (hextets) {
+    const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+    if (hextets[0] === 0x64 && hextets[1] === 0xff9b && hextets.slice(2, 6).every((h) => h === 0)) {
+      return isPrivateIPv4(v4(hextets[6], hextets[7]));
+    }
+    if (hextets[0] === 0x2002) return isPrivateIPv4(v4(hextets[1], hextets[2]));
+    if (hextets.slice(0, 6).every((h) => h === 0)) return true;
+  }
+
   // fc00::/7 (Unique Local Address): first byte 0xfc or 0xfd
   if (/^f[cd][0-9a-f]{2}:/.test(lower)) return true;
 
@@ -111,6 +128,26 @@ function isPrivateIPv6(ip: string): boolean {
   if (/^ff[0-9a-f]{2}:/.test(lower)) return true;
 
   return false;
+}
+
+/** Eight 16-bit groups of an IPv6 address (handles `::` and a trailing dotted IPv4), or null. */
+function expandIPv6(ip: string): number[] | null {
+  let text = ip.split('%')[0];
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const n = ipv4ToInt(dotted[2]);
+    if (n === null) return null;
+    text = `${dotted[1]}${(n >>> 16).toString(16)}:${(n & 0xffff).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const parts = [...head, ...Array(fill).fill('0'), ...tail];
+  if (parts.length !== 8 || parts.some((h) => !/^[0-9a-f]{1,4}$/.test(h))) return null;
+  return parts.map((h) => parseInt(h, 16));
 }
 
 function isPrivateIP(ip: string): boolean {
@@ -329,6 +366,9 @@ async function defaultPinnedRequest(
   return axios.get(url, {
     responseType: 'arraybuffer',
     timeout: timeoutMs,
+    // axios `timeout` is a socket-idle timer on Node; the signal bounds total time, so a server
+    // that trickles bytes cannot hold the call open.
+    signal: AbortSignal.timeout(timeoutMs),
     // Abort mid-stream once the body exceeds the cap, so an unbounded response
     // is never fully buffered into memory (Greptile P1).
     maxContentLength: maxBytes,
@@ -342,4 +382,99 @@ async function defaultPinnedRequest(
       callback(null, pinned.address, pinned.family);
     },
   } as any);
+}
+
+/** Body cap for user-supplied HTML imports (load-from-url). Routes truncate the
+ * extracted body to 200k chars anyway; 5MB bounds memory without false-blocking
+ * real newsletter pages (ENG-2425). */
+export const DEFAULT_MAX_HTML_BYTES = 5 * 1024 * 1024;
+
+/**
+ * SSRF-safe HTML fetch for endpoints that return a user-supplied URL's body to
+ * the caller (ENG-2425). DNS-pinned, every redirect hop re-validated, size and
+ * total-time bounded. Throws SsrfBlockedError for private/loopback/link-local/
+ * metadata targets before any outbound request is made.
+ */
+export async function fetchPublicHtml(
+  url: string,
+  deps: RedirectFetchDeps = {},
+  timeoutMs: number = 15000,
+  maxBytes: number = DEFAULT_MAX_HTML_BYTES
+): Promise<string> {
+  const { buffer } = await fetchBufferFollowingRedirects(url, deps, DEFAULT_MAX_REDIRECTS, timeoutMs, maxBytes);
+  return buffer.toString('utf8');
+}
+
+export interface MediaProbeDeps {
+  resolvePinned?: (url: string) => Promise<{ hostname: string; address: string; family: number }>;
+  /** Response status + headers only; the body must not be read. */
+  requestHeaders?: (
+    url: string,
+    pinned: { address: string; family: number },
+    timeoutMs: number,
+  ) => Promise<{ status: number; headers: Record<string, any> }>;
+}
+
+/**
+ * ENG-2915: SSRF-safe header probe of a remote media URL before it is handed to a fetcher we do
+ * not control (Meta pulls video file_urls itself; the image upload re-fetches the URL). Same
+ * hop-by-hop rule as fetchBufferFollowingRedirects: every redirect hop is re-resolved and
+ * pinned, so a public URL that redirects to a private address is refused. Only https hops are
+ * followed. Uses GET (not HEAD: presigned and many CDN URLs are signed for GET only) and never
+ * reads the body. Returns the final URL so the fetcher starts at the validated hop.
+ */
+export async function probePublicMediaUrl(
+  startUrl: string,
+  deps: MediaProbeDeps = {},
+  maxRedirects: number = DEFAULT_MAX_REDIRECTS,
+  timeoutMs: number = 15000,
+): Promise<{ finalUrl: string; status: number; contentType: string; contentLength?: number }> {
+  const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
+  const requestHeaders = deps.requestHeaders ?? defaultPinnedHeaderRequest;
+  const deadline = Date.now() + timeoutMs;
+  let url = startUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (new URL(url).protocol !== 'https:') throw new SsrfBlockedError('Only https URLs are followed');
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error(`Timed out following redirects after ${timeoutMs}ms`);
+    const pinned = await resolvePinned(url);
+    const res = await requestHeaders(url, pinned, remainingMs);
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.location ?? res.headers?.Location;
+      if (!location) throw new Error(`Redirect ${res.status} with no Location header`);
+      url = new URL(String(location), url).toString();
+      continue;
+    }
+    const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';
+    const declared = Number(res.headers?.['content-length'] ?? res.headers?.['Content-Length']);
+    return {
+      finalUrl: url,
+      status: res.status,
+      contentType: String(rawType).split(';')[0].trim().toLowerCase(),
+      ...(Number.isFinite(declared) && declared >= 0 ? { contentLength: declared } : {}),
+    };
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
+/* istanbul ignore next — network boundary; unit tests inject `requestHeaders` instead. */
+async function defaultPinnedHeaderRequest(
+  url: string,
+  pinned: { address: string; family: number },
+  timeoutMs: number,
+): Promise<{ status: number; headers: Record<string, any> }> {
+  const axios = (await import('axios')).default;
+  const res = await axios.get(url, {
+    responseType: 'stream',
+    timeout: timeoutMs,
+    signal: AbortSignal.timeout(timeoutMs),
+    maxRedirects: 0,
+    validateStatus: () => true,
+    lookup: (_hostname: string, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      callback(null, pinned.address, pinned.family);
+    },
+  } as any);
+  (res.data as any)?.destroy?.();
+  return { status: res.status, headers: res.headers as any };
 }

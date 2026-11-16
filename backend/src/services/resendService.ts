@@ -9,6 +9,21 @@ import {
 } from '../utils/nonProdEmailGuard';
 
 /**
+ * ENG-2652: one SPF/DKIM/DMARC verdict on a received email, as Resend's
+ * GET /emails/receiving/{id} returns it. Computed by Resend's receiving mail server,
+ * not read from the message headers, so a sender cannot forge it. `gray` means: SPF
+ * none/softfail/neutral; DKIM unsigned or signed by a domain other than the From
+ * domain; DMARC no policy or p=none.
+ */
+export type ReceivedEmailAuthVerdict = 'pass' | 'fail' | 'gray' | 'processing_failed' | 'unknown';
+
+export interface ReceivedEmailAuthentication {
+  spf?: ReceivedEmailAuthVerdict;
+  dkim?: ReceivedEmailAuthVerdict;
+  dmarc?: ReceivedEmailAuthVerdict;
+}
+
+/**
  * Parameters for a Resend send.
  *
  * Deliberately NOT the same shape as emailProviderService's SendEmailParams, and no longer
@@ -33,6 +48,8 @@ interface ResendSendParams {
   cc?: string | string[];
   inReplyTo?: string;
   replyTo?: string;
+  /** ENG-2367: extra headers (e.g. List-Unsubscribe). */
+  headers?: Record<string, string>;
 }
 
 interface QueuedEmailSend {
@@ -237,7 +254,8 @@ class ResendService {
     text,
     cc,
     inReplyTo,
-    replyTo
+    replyTo,
+    headers
   }: ResendSendParams) {
     await this.initializeResend();
 
@@ -272,8 +290,12 @@ class ResendService {
     }
 
     // Add reply headers if replying to an email
+    if (headers && Object.keys(headers).length > 0) {
+      emailOptions.headers = { ...headers };
+    }
     if (inReplyTo) {
       emailOptions.headers = {
+        ...(emailOptions.headers || {}),
         'In-Reply-To': inReplyTo
       };
     }
@@ -391,6 +413,8 @@ class ResendService {
     html?: string;
     text?: string;
     headers?: Record<string, string>;
+    /** ENG-2652: Resend's SPF/DKIM/DMARC verdicts for this message (null when Resend has none). */
+    authentication?: ReceivedEmailAuthentication | null;
     attachments?: Array<{
       id: string;
       filename: string;
@@ -416,6 +440,7 @@ class ResendService {
       html?: string;
       text?: string;
       headers?: Record<string, string>;
+      authentication?: ReceivedEmailAuthentication | null;
       attachments?: Array<{
         id: string;
         filename: string;
@@ -480,6 +505,7 @@ class ResendService {
         html: result.html || undefined,
         text: result.text || undefined,
         headers: result.headers || undefined,
+        authentication: result.authentication ?? null,
         attachments: attachments && attachments.length > 0 ? attachments : undefined,
       };
     }
