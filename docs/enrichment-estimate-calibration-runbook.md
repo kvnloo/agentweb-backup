@@ -43,7 +43,13 @@ It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs f
 `dynamodb get-item`. It prints one line per account and day (6-character user id prefix, contacts, fields, booked dollars,
 dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. The mode and the user id come from
 log text, so only the modes `enrich` and `preview` and plain ids are accepted; other lines are ignored and counted. It prints no email, lead or field
-value. AWS error text is reduced to the error code and the operation (the full text can carry account names); run the same
+value. A genuine run line starts with the syslog prefix (`Nov 13 11:42:30 ip-... web[4828]: [Worker] [v3] runEnrichment ...`);
+any other line that mentions a run, a mode other than `enrich` or `preview`, an id that is not 1 to 64 plain characters or a
+number that is not 1 to 9 digits is ignored and counted (`ignored N log lines that were not genuine run lines`), so a
+changed log format shows up as ignored lines and a run count of zero, not as silently wrong numbers. A customer list that
+no longer exists is counted with the reference field count, reported, and its row is marked `?` in the table (the field
+count there is an assumption, not a measurement); a list that exists but has no saved config also uses the reference count,
+as the customer quote does, and is not marked. AWS error text is reduced to the error code and the operation (the full text can carry account names); run the same
 `aws` command by hand to read it.
 
 Left out as non-customers: the test account `test@account.com` (`--exclude-emails`, case-insensitive), every platform admin
@@ -81,7 +87,9 @@ written is the IAM role: run it with a read-only one. The script reads the three
 
 ## Known limits
 
-- The ledger is per user and day, so a day with an enrich run and a preview, or two lists, is compared as a whole.
+- The ledger is per user and day, so a day with an enrich run and a preview, or two lists, is compared as a whole. The
+  ledger feature `enrichment` is also written by other code (for example the ICP-filter LLM extractor, `icpFilterLlmExtractor.ts`),
+  so that spend on a run day counts as booked even though it is not part of the run.
 - The field count is read from each list's *current* enrichment config, which may differ from the run's.
 - Customer quotes use a model-aware per-field cost; this check uses the same per-field constant the recalibration used.
 - A run that straddles midnight UTC is split across days. A run that started before `--since` is not counted (the script
@@ -135,8 +143,10 @@ accounts):
 - There is no measured need. Since 2026-11-04 the only customer evidence on the paid email search is one search in the
   recalibration sample (before that, the 2026-11-03 list fired it for 60 of its 146 eligible leads, $26.70), and 0 of 8 real
   name-and-company-only people fired it, so the case for adding quote-time cache lookups rests on little.
-- The Apollo cache key for a match lookup is `apollo:name:<first>|<last>|<domain or normalised company>` and for a find
-  lookup `apollo:find:<first>|<last>|<domain or company>` (`apolloCacheKeys.ts`). A quote-time lookup would have to rebuild the same key the run will use, and the domain a run
+- The Apollo cache key for a match lookup is the strongest identifier the lead has, in this order: `apollo:linkedin:<url>`,
+  `apollo:email:<email>`, and only then `apollo:name:<first>|<last>|<domain or normalised company>`; a find lookup uses
+  `apollo:find:<first>|<last>|<domain or company>` (`apolloCacheKeys.ts`). Most customer leads carry a LinkedIn URL, so the
+  usual key is the LinkedIn one. A quote-time lookup would have to rebuild the same key the run will use, and the domain a run
   uses can come from an earlier step, so a quote could miss entries the run would hit. We have not measured how often.
 - Which way it would move the number is unclear: cached lists would quote lower, lists with nothing cached higher, and the
   customer sample (58 contacts at 1.50 of quote) suggests it is the uncached side that is low. That is a calibration
@@ -150,5 +160,5 @@ accounts):
 |---|---|---|---|---|
 | 2026-11-13 | 118 contacts, 4 accounts as recorded then, since 2026-11-04 (one of them fired the paid email search), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
 | 2026-11-16 | 2026-11-03: one 148-contact customer list (the list the recalibration was fitted to); its 60 paid email searches ($26.70, booked under the old name `apollo:full_enrichment`) excluded | $10.49 | $10.38 (ratio 1.01) | confirms the fit, not the quote; a window that includes it is INSUFFICIENT because this list is 72% of the contacts |
-| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) looks like a list with nothing cached (29 of its 30 contacts needed a paid person lookup; inferred, not measured), its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
+| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) looks like a list with nothing cached (29 of its 30 contacts needed a paid person lookup; inferred, not measured), its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups, but its list no longer exists, so its field count is the assumed reference count of 10 (marked `?` by the script) and its ratio is less certain than the other two. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
 | 2026-11-16 | 2026-11-13 to 2026-11-16: 12 runs in the logs, all from excluded accounts (an internal `agentweb.pro` user booked $0.48 for 7 contacts against a $0.49 quote, ratio 0.97; the rest is the test account) | | | no customer data in the window; nothing to retune |
