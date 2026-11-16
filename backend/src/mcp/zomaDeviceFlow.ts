@@ -61,6 +61,7 @@ const USER_CODE_LENGTH = 8;
 
 /** ENG-3125: Meta is connected but no Facebook Page is usable for ads — guided fix, no stored link. */
 export type ZomaBlockerStep = 'fix_meta_page';
+const META_LINK_UNAVAILABLE = 'Could not create the Meta connect link right now; poll again for a fresh one.';
 export type ZomaNextStep = 'sign_in' | ZomaLinkStep | ZomaBlockerStep | 'complete';
 
 export interface ZomaDeviceFlowDeps {
@@ -363,6 +364,24 @@ async function paymentLink(deps: ZomaDeviceFlowDeps, device: ZomaDeviceRecord & 
 }
 
 /**
+ * ENG-3125: the fresh Meta connect link that is the whole point of the Page-blocker reply. One
+ * retry absorbs a transient Secrets Manager/JWT blip; a persistent failure is traced and returns
+ * undefined so the caller states the gap explicitly instead of silently omitting the link.
+ */
+async function blockerMetaLink(deps: ZomaDeviceFlowDeps, deviceId: string, userId: string): Promise<string | undefined> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await deps.mintMetaLink(userId, deviceId);
+    } catch (error) {
+      if (attempt >= 2) {
+        await track(deps, deviceId, userId, 'meta_link', 'error', error);
+        return undefined;
+      }
+    }
+  }
+}
+
+/**
  * ENG-3125: the browser's guided fix for a Meta connection that cannot create ads. Never the
  * "you're set" page while the blocker exists; the button is a fresh Meta connect link for this
  * setup, so reconnecting returns here and readiness is re-derived.
@@ -372,12 +391,7 @@ async function metaPageBlockedPage(
   device: ZomaDeviceRecord & { userId: string },
   blocker: ZomaMetaPageBlocker,
 ): Promise<PageStep> {
-  let link: string | undefined;
-  try {
-    link = await deps.mintMetaLink(device.userId, device.deviceId);
-  } catch (error) {
-    await track(deps, device.deviceId, device.userId, 'meta_link', 'error', error);
-  }
+  const link = await blockerMetaLink(deps, device.deviceId, device.userId);
   await track(deps, device.deviceId, device.userId, 'meta_page_blocked', blocker.reason);
   return {
     kind: 'page',
@@ -594,6 +608,8 @@ export type PollResult =
         message: string;
         instructions: string[];
         link?: string;
+        /** Set exactly when `link` is absent: the Meta link could not be minted on this poll. */
+        link_error?: string;
         create_page_url?: string;
         page_id?: string;
         interval: number;
@@ -655,20 +671,21 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
 
   if (step === 'fix_meta_page') {
     const blocker = state.blocker as ZomaMetaPageBlocker;
-    let link: string | undefined;
-    try {
-      link = await deps.mintMetaLink(userId, device.deviceId);
-    } catch (error) {
-      await track(deps, device.deviceId, userId, 'meta_link', 'error', error);
-    }
+    const link = await blockerMetaLink(deps, device.deviceId, userId);
     return {
       status: 200,
       body: {
         next_step: 'fix_meta_page',
         reason: blocker.reason,
         message: blocker.message,
-        instructions: metaPageFixSteps(blocker.reason, { link, pageId: blocker.page_id }),
-        ...(link ? { link } : {}),
+        // Without a link, the step points the agent back at this poll (which mints a fresh one),
+        // never at "ask me" — the polling agent is the one who would have to ask.
+        instructions: metaPageFixSteps(blocker.reason, {
+          link,
+          pageId: blocker.page_id,
+          connectText: link ? undefined : 'poll setup again for a fresh Meta connect link, then open it and log in with the same Facebook account.',
+        }),
+        ...(link ? { link } : { link_error: META_LINK_UNAVAILABLE }),
         ...(blocker.create_page_url ? { create_page_url: blocker.create_page_url } : {}),
         ...(blocker.page_id ? { page_id: blocker.page_id } : {}),
         interval: device.intervalSec,
