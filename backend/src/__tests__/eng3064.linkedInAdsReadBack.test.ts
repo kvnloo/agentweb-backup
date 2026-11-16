@@ -97,6 +97,9 @@ describe('updateCampaignGroup read-back', () => {
     const result = await svc.updateCampaignGroup(TOKEN, ACCT, '77', params);
     expect(result).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['status', 'totalBudget.amount'] });
     expect(result.error).toContain('status, totalBudget.amount');
+    // Only the fields that did not land are called unapplied; name and schedule did land here.
+    expect(result.error).toContain('Those field(s) were NOT applied');
+    expect(result.error).not.toContain('The change was NOT applied');
   });
 
   it('read-back request fails: not reported as success', async () => {

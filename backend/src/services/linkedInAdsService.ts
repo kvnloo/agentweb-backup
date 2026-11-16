@@ -208,7 +208,7 @@ async function verifyUpdate(
     success: false,
     errorType: 'unsupported_field',
     fields,
-    error: `unsupported_field: LinkedIn accepted the update for ${readPath} but read-back shows these field(s) did not change: ${fields.join(', ')}. The change was NOT applied; do not report it as done.`,
+    error: `unsupported_field: LinkedIn accepted the update for ${readPath} but read-back shows these field(s) did not change: ${fields.join(', ')}. Those field(s) were NOT applied; do not report them as done.`,
   };
 }
 
