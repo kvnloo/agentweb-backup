@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { PublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
+import { assertImageDownload } from './linkedInMedia';
 import {
   LinkedInProfile,
   LinkedInPost,
@@ -946,6 +947,7 @@ export class LinkedInService {
       });
 
       const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+      assertImageDownload(imageResponse.headers['content-type'], imageBuffer);
       const contentType = imageResponse.headers['content-type'] || 'image/png';
 
       // Step 1: Initialize upload

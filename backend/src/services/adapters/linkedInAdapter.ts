@@ -1,4 +1,5 @@
 import { linkedInService } from '../linkedInService';
+import { isVideoUrl, LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE } from '../linkedInMedia';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { isPublishConsentWithdrawn, PublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
@@ -90,20 +91,6 @@ function recheckConsentBeforeRetry(assertStillAuthorized: AssertStillAuthorized 
   };
 }
 
-// ENG-3003: media_urls are uploaded through LinkedIn's image pipeline only. A video sent that way
-// is accepted and returns a share URN, then LinkedIn drops the post asynchronously.
-const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'];
-export function isVideoUrl(url: string): boolean {
-  let path: string;
-  try {
-    path = new URL(url).pathname;
-  } catch {
-    path = url.split(/[?#]/)[0];
-  }
-  path = path.toLowerCase();
-  return VIDEO_EXTENSIONS.some(ext => path.endsWith(ext));
-}
-
 export class LinkedInAdapter implements SocialPlatformAdapter {
 
   /**
@@ -184,13 +171,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
-    const videoUrls = (mediaUrls || []).filter(isVideoUrl);
-    if (videoUrls.length > 0) {
-      return {
-        success: false,
-        message: 'LinkedIn video posts are not supported yet: media_urls on LinkedIn accept images only, and a video would be dropped by LinkedIn after being accepted. '
-          + 'Video upload is currently supported for YouTube only. Nothing was posted - post the text with an image, or upload the video to LinkedIn manually.',
-      };
+    if ((mediaUrls || []).some(isVideoUrl)) {
+      return { success: false, message: LINKEDIN_VIDEO_UNSUPPORTED_MESSAGE };
     }
 
     try {
@@ -209,6 +191,8 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           } catch (uploadError: any) {
             // The same token will be refused for the post itself; do not publish it without the image.
             if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
+            // Publishing the text without the media the caller asked for would be a silent downgrade.
+            if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
             const errorMsg = uploadError?.message || 'Unknown upload error';
             console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
             failedImageUploads.push({ url, error: errorMsg });
