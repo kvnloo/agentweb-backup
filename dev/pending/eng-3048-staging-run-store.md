@@ -13,6 +13,6 @@ Staging now matches. `AGENT_RUN_STORE=true` was set as an environment property o
 Things to know when testing on staging:
 
 - Table is `Dev-AW-AgentRuns` (us-west-2), hash key `pk`.
-- TTL is disabled on `Dev-AW-AgentRuns` (enabled on `ttl` in production). Locks still expire, because `claimIdempotency` treats an expired row as free. Rows are never deleted on dev, so the table only grows.
+- TTL is disabled on `Dev-AW-AgentRuns` (enabled on `ttl` in production). Locks still expire, because `claimIdempotency` treats an expired row as free. Rows are never deleted on dev, so the table only grows. Enabling TTL is a retention decision tracked on ENG-3050.
 - The backend reaches DynamoDB with the `aw_backend_user` access key from the environment, not the instance role.
-- Session create with a repeated `idempotencyKey` now returns the first session with `idempotentReplay: true` (200) instead of a second session (201).
+- Session create with a repeated `idempotencyKey` now returns the first session with `idempotentReplay: true` (200) instead of a second session (201). Checked on staging 2026-11-16 00:26Z: before the change two calls with one key gave two sessions; after it they gave one session and one `idem#` row.
