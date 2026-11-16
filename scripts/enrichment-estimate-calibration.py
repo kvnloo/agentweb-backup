@@ -57,6 +57,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ESTIMATE_SRC = os.path.join(REPO, "backend", "src", "services", "enrichmentCostEstimate.ts")
 DEFAULT_LOG_GROUP = "/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log"
 LEDGER_FEATURES = ("crm_enrichment", "enrichment")
+ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # list, user and run ids copied from log text must look like this
+MODES = ("enrich", "preview")
+MAX_MARKER_OFFSET = 100  # real log lines carry the "[v3] runEnrichment" marker within the first ~60 characters
+START_RE = re.compile(r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)")
+DONE_RE = re.compile(r"\[v3\] runEnrichment DONE runId=(\S+) processed=([0-9]{1,9})(?!\S)")
 EMAIL_SEARCH_MODELS = ("apollo:waterfall_email", "apollo:full_enrichment")  # same $0.445 request; the second is its older ledger name (last seen 2026-11-03)
 ENIGMA_PREFIX = "enigma:"
 
@@ -69,7 +74,7 @@ def short(text, limit=60):
 
 def aws_error_summary(stderr):
     """AWS CLI error text can carry account names, ARNs or emails, so only the error code and the operation are shown."""
-    m = re.search(r"An error occurred \(([A-Za-z0-9._]{1,60})\) when calling the ([A-Za-z0-9]{1,60}) operation", stderr[:5000])
+    m = re.search(r"An error occurred \(([A-Za-z0-9]{1,60})\) when calling the ([A-Za-z0-9]{1,60}) operation", stderr[:5000])
     if m:
         return "%s on %s" % (m.group(1), m.group(2))
     return "unrecognised error (its text is hidden because it can carry account names; run the same aws command by hand to read it)"
@@ -124,7 +129,12 @@ def _arith(expr, name):
 
 class Aws:
     def __init__(self, cli, region):
-        self.base = shlex.split(cli) + ["--region", region]
+        try:
+            self.base = shlex.split(cli) + ["--region", region]
+        except ValueError:
+            sys.exit("--aws is not a valid command line (unbalanced quotes?)")
+        if len(self.base) < 3:
+            sys.exit("--aws must not be empty")
 
     def __call__(self, *args):
         label = " ".join(args[:2])
@@ -232,23 +242,31 @@ def main():
         print("WARNING: the log group keeps only %d days: runs before %s are already gone and %s itself is only partly covered, while the "
               "ledger counts whole days (that inflates the ratio). Start --since at %s for a clean result."
               % (keep, oldest_day.strftime("%Y-%m-%d"), oldest_day.strftime("%Y-%m-%d"), (oldest_day + dt.timedelta(days=1)).strftime("%Y-%m-%d")))
-    ev = lambda pat: aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
-                         "--filter-pattern", pat).get("events", [])
-    starts = {}
+    events = aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
+                 "--filter-pattern", '?"runEnrichment START" ?"runEnrichment DONE"').get("events", [])
+    starts, finished, ignored_ids = {}, {}, set()
     odd_lines = 0
-    for x in ev('"runEnrichment START"'):
-        m = re.search(r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)", x["message"])
-        if not m:
+    for x in events:
+        msg = x.get("message") or ""
+        ts = x.get("timestamp")
+        m = START_RE.search(msg)
+        if m:
+            lid, uid, mode, rid = m.groups()
+            if m.start() > MAX_MARKER_OFFSET or mode not in MODES or not all(ID_RE.fullmatch(v) for v in (lid, uid, rid)):
+                odd_lines += 1  # only the fixed mode names and plain ids are ever copied into the table
+                if ID_RE.fullmatch(rid):
+                    ignored_ids.add(rid)
+                continue
+            starts[rid] = (uid, mode, lid)
             continue
-        if m.group(3) not in ("enrich", "preview") or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", m.group(2)):
-            odd_lines += 1  # only the fixed mode names and a plain id are ever copied into the table
-            continue
-        starts[m.group(4)] = (m.group(2), m.group(3), m.group(1))
-    finished = {}
-    for x in ev('"runEnrichment DONE"'):
-        m = re.search(r"\[v3\] runEnrichment DONE runId=(\S+) processed=(\d+)", x["message"])
-        if m and m.group(1) not in finished:  # a repeated DONE line must not count a run twice
-            finished[m.group(1)] = (int(m.group(2)), x["timestamp"])
+        m = DONE_RE.search(msg)
+        if m:
+            rid = m.group(1)
+            if m.start() > MAX_MARKER_OFFSET or not ID_RE.fullmatch(rid) or not isinstance(ts, int):
+                odd_lines += 1
+                continue
+            if rid not in finished:  # a repeated DONE line must not count a run twice
+                finished[rid] = (int(m.group(2)), ts)
     runs = []
     for rid, (processed, ts) in finished.items():
         if rid not in starts:
@@ -261,7 +279,7 @@ def main():
     if odd_lines:
         print("ignored %s with an unexpected mode or user id" % plural(odd_lines, "log line"))
     unfinished = sum(1 for rid, st in starts.items() if rid not in finished and st[0] not in test_ids)
-    orphans = sum(1 for rid in finished if rid not in starts)
+    orphans = sum(1 for rid in finished if rid not in starts and rid not in ignored_ids)
     print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
           "with no contacts), %s finished whose start is before --since (account unknown)" % (plural(unfinished, "run"), plural(orphans, "run")))
 
