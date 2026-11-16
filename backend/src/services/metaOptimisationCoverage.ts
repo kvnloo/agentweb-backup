@@ -459,7 +459,21 @@ export type AccountOptimisationVerdict = {
   unrecognisedOptimisations: string[];
   /** Pixels that reported no events, so nothing can be concluded about them either way. */
   inconclusivePixels: string[];
+  /** ENG-3079: ad sets whose pixel reported the optimisation event in its own window. Not a
+   *  finding; recorded so a reader can tell "arriving" apart from "nothing to judge". */
+  arriving: OptimisationMismatch[];
 };
+
+/**
+ * ENG-3079: one word for client health, from the verdict above and nothing else.
+ * `missing` is the monitor's confirmed case (what it would alert on). `recent` means a pixel
+ * reported an optimisation event and nothing is confirmed missing. Every other outcome
+ * (paused, unconfirmed, unconfirmable, silent pixel, no conversion ad set) is `unknown`.
+ */
+export function selectedEventState(verdict: AccountOptimisationVerdict): 'recent' | 'missing' | 'unknown' {
+  if (verdict.alerting.length > 0) return 'missing';
+  return verdict.arriving.length > 0 ? 'recent' : 'unknown';
+}
 
 /**
  * Account-level §G Tier 1: does anything we are PAYING to optimise for look like it stopped
@@ -510,7 +524,7 @@ export function evaluateAccountOptimisationCoverage(
 ): AccountOptimisationVerdict {
   const verdict: AccountOptimisationVerdict = {
     alerting: [], unconfirmed: [], unconfirmable: [], dormant: [], staleDelivery: [],
-    unrecognisedOptimisations: [], inconclusivePixels: [],
+    unrecognisedOptimisations: [], inconclusivePixels: [], arriving: [],
   };
 
   const rows = (Array.isArray(adSets) ? adSets : []).filter(Boolean);
@@ -575,7 +589,10 @@ export function evaluateAccountOptimisationCoverage(
     // decoded and percent-encoded names, and a raw Set lookup sees only one of them. This
     // evaluator was left on the raw check when the helper was introduced for its sibling —
     // the same fix-one-of-a-pair defect §48 records, in the commit that cited §48.
-    if (pixelReceivedEvent(received, expected)) continue; // arriving — no claim to make
+    if (pixelReceivedEvent(received, expected)) {
+      verdict.arriving.push(hit); // arriving — no claim to make
+      continue;
+    }
 
     // Paused: real, but costs nothing until someone resumes it. Never alerted, by decision.
     if (!delivering) {
