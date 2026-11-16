@@ -244,9 +244,6 @@ def main():
             if uid.startswith(entry):
                 why["--exclude-user-ids"].add(uid); matched_entries.add(entry)
     test_ids = set().union(*why.values())
-    for i, entry in enumerate(id_entries, 1):
-        if entry not in matched_entries:
-            print("WARNING: no account matches --exclude-user-ids entry number %d (%d characters)" % (i, len(entry)))
     print("excluded accounts: %d of %d (%s; one account can match several rules)"
           % (len(test_ids), len(users), ", ".join("%s %d" % (k, len(v)) for k, v in why.items())))
 
@@ -299,11 +296,21 @@ def main():
         uid, mode, lid = starts[rid]
         day = dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
         runs.append(dict(uid=uid, day=day, mode=mode, p=processed, lid=lid))
-    cust = [r for r in runs if r["uid"] not in test_ids]
+    def excluded(uid):  # an account deleted from the user table is still matched by its id in the run logs
+        return uid in test_ids or any(uid.startswith(e) for e in id_entries)
+
+    for r in runs:
+        for entry in id_entries:
+            if r["uid"].startswith(entry):
+                matched_entries.add(entry)
+    for i, entry in enumerate(id_entries, 1):
+        if entry not in matched_entries:
+            print("WARNING: no account matches --exclude-user-ids entry number %d (%d characters)" % (i, len(entry)))
+    cust = [r for r in runs if not excluded(r["uid"])]
     print("runs since %s: %d in the logs, %d from excluded accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
     if odd_lines:
         print("ignored %s that were not genuine run lines (wrong line prefix, mode, id or digits)" % plural(odd_lines, "log line"))
-    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and rid not in ignored_ids and st[0] not in test_ids)
+    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and rid not in ignored_ids and not excluded(st[0]))
     orphans = sum(1 for rid in finished if rid not in starts and rid not in ignored_ids)
     print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
           "with no contacts), %s finished whose start is before --since (account unknown)" % (plural(unfinished, "run"), plural(orphans, "run")))
