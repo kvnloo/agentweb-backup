@@ -25,6 +25,10 @@ import {
 } from './zomaProviders';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
+import {
+  adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+} from './zomaAdsExperience';
 
 export class ZomaNotReadyError extends Error {
   constructor(message: string) {
@@ -99,6 +103,11 @@ export interface ZomaReadiness {
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
   /**
+   * ENG-3128: answer to "How familiar are you with ads?" (null until answered). It is asked
+   * before any other step; `not_interested` ends setup with a thank-you and no further steps.
+   */
+  ads_experience: ZomaAdsExperience | null;
+  /**
    * ENG-3125: Meta is connected but ads will fail for lack of a usable Facebook Page. While
    * set, setup is not complete: zoma_status never says "All set" and the device flow never
    * issues its token or shows "You're set".
@@ -122,6 +131,8 @@ export interface ZomaOnboardingDeps {
   frontendUrl: () => string;
   now: () => number;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
+  /** ENG-3128: persist the ads-experience answer on the user row. */
+  saveAdsExperience?: (userId: string, answer: ZomaAdsExperience) => Promise<void>;
 }
 
 const defaultDeps: ZomaOnboardingDeps = {
@@ -135,6 +146,7 @@ const defaultDeps: ZomaOnboardingDeps = {
   frontendUrl: () => process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro',
   now: () => Date.now(),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
+  saveAdsExperience: (userId, answer) => defaultAdsExperienceStore.save(userId, answer, new Date().toISOString()),
 };
 
 /** Same usability rule the toolkit gateway applies to account resolution (now in zomaProviders). */
@@ -319,9 +331,11 @@ export async function getZomaReadiness(
   deps: ZomaOnboardingDeps = defaultDeps,
   opts: { mintLinks?: boolean } = {},
 ): Promise<ZomaReadiness> {
-  const mintLinks = opts.mintLinks !== false;
   const user = await deps.getUser(userId);
   if (!user) throw new ZomaNotReadyError('No AgentWeb account was found for this login.');
+  const adsExperience = parseZomaAdsExperience(user.zomaAdsExperience);
+  // ENG-3128: no setup links until the question is answered, and none for "just a friend".
+  const mintLinks = opts.mintLinks !== false && adsExperience !== null && adsExperience !== 'not_interested';
 
   const payment: ZomaReadiness['payment'] = { ready: false };
   try {
@@ -349,7 +363,7 @@ export async function getZomaReadiness(
     }
   }
   const readiness: ZomaReadiness = {
-    email: user.email, payment, meta, writes_enabled, blocker, next_step: null,
+    email: user.email, payment, meta, writes_enabled, ads_experience: adsExperience, blocker, next_step: null,
     google_ads: { available: false, ready: false, accounts: [], writes_enabled: false, reason: 'google_ads_provider_disabled' },
   };
 
@@ -372,25 +386,34 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
-  readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
+  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   return readiness;
 }
 
-function nextStep(payment: ZomaReadiness['payment'], meta: ZomaReadiness['meta'], googleAds: ZomaReadiness['google_ads']): string | null {
+/** ENG-3128 order: the ads question, then ad accounts (with setup guidance for new advertisers), then the card. */
+function nextStep(
+  adsExperience: ZomaAdsExperience | null,
+  payment: ZomaReadiness['payment'],
+  meta: ZomaReadiness['meta'],
+  googleAds: ZomaReadiness['google_ads'],
+): string | null {
+  if (adsExperience === null) return adsExperienceQuestionText('zoma_status { "ads_experience": "<value>" }');
+  if (adsExperience === 'not_interested') return ZOMA_NOT_INTERESTED_MESSAGE;
   const google = googleAds.available ? googleAds : undefined;
+  if (!meta.ready && !google?.ready) {
+    return [
+      ...(adsExperience === 'new_to_ads' ? [newToAdsGuideText(), ''] : []),
+      `Connect Meta (Facebook Business login) and pick your ad account → ${meta.link}`,
+      ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
+      'Tell me when it is connected and I will re-check.',
+    ].join('\n');
+  }
   if (!payment.ready) {
     if (payment.error) return payment.error;
     return [
       `Add a payment method → ${payment.link}`,
       'Reads work without one; Zoma needs a payment method on file before it changes anything in an ad account. Nothing is charged by adding it.',
       'Tell me when it is done and I will re-check.',
-    ].join('\n');
-  }
-  if (!meta.ready && !google?.ready) {
-    return [
-      `Connect Meta (Facebook Business login) and pick your ad account → ${meta.link}`,
-      ...(google ? [`Or connect Google Ads → ${google.link ?? 'Settings → Connected accounts'}`] : []),
-      'Tell me when it is connected and I will re-check.',
     ].join('\n');
   }
   return null;
@@ -401,6 +424,7 @@ export function formatZomaStatus(r: ZomaReadiness): string {
   const lines = [
     'Zoma setup:',
     `  [x] AgentWeb login${r.email ? ` (${r.email})` : ''}`,
+    `  ${box(r.ads_experience !== null)} How familiar you are with ads${r.ads_experience ? ` (${r.ads_experience})` : ''}`,
     `  ${box(r.payment.ready)} Payment method on file`,
     `  ${box(r.meta.ready)} Meta ad account connected${
       r.meta.accounts.length ? ` (${r.meta.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})` : ''
@@ -440,8 +464,15 @@ export function formatZomaUsage(u: McpUserUsage): string {
 }
 
 /** Tool entry point for the toolkit gateway. Returns the text plus the structured state. */
-export async function runZomaTool(name: ZomaToolName, _args: unknown, context: { userId: string }, deps: ZomaOnboardingDeps = defaultDeps) {
+export async function runZomaTool(name: ZomaToolName, args: unknown, context: { userId: string }, deps: ZomaOnboardingDeps = defaultDeps) {
   if (name === 'zoma_status') {
+    // ENG-3128: an agent that asked "How familiar are you with ads?" in chat records the answer here.
+    const raw = (args as { ads_experience?: unknown } | null | undefined)?.ads_experience;
+    if (raw !== undefined) {
+      const answer = parseZomaAdsExperience(raw);
+      if (!answer) throw new ZomaNotReadyError(`ads_experience must be one of: ${ZOMA_ADS_EXPERIENCE_VALUES.join(', ')}.`);
+      await (deps.saveAdsExperience ?? defaultDeps.saveAdsExperience!)(context.userId, answer);
+    }
     const readiness = await getZomaReadiness(context.userId, deps);
     return { summary: formatZomaStatus(readiness), ...readiness };
   }
