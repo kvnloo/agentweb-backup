@@ -224,7 +224,7 @@ router.post('/:taskId/unsubscribe', optOutIpLimiter, async (req, res) => {
     // ENG-2991: the undo token is what lets someone switch mail back on, so it goes only to the caller whose request really changes the row
     // from subscribed to unsubscribed (one atomic update). Repeating the call for an address that has already opted out, or racing a
     // person's own unsubscribe, gets no token.
-    const unsubscribeIfActive = () => subscriberDb.softUnsubscribe(taskId, email, typeof feedback === 'string' ? feedback.slice(0, 2000) : undefined, { onlyIfActive: true });
+    const unsubscribeIfActive = () => subscriberDb.softUnsubscribe(taskId, email, typeof feedback === 'string' ? Array.from(feedback).slice(0, 2000).join('') : undefined, { onlyIfActive: true });
     let updated: any = null;
     for (let attempt = 0; attempt < 3 && !updated; attempt++) {
       updated = await unsubscribeIfActive();
@@ -324,9 +324,20 @@ const sendConfirmPage = (res: Response, status: number, page: string) =>
 const expiredLinkPage = () =>
   renderConfirmPage({ title: 'This link has expired', message: 'This confirmation link is invalid or has expired. Please subscribe again from the form.' });
 
+// The confirm routes are public and each call reads the database. A link is reusable for 48 hours, so bound what one connection may do. The
+// limit is generous because mail scanners and link previews open every link in a message, often from one shared gateway address.
+const confirmIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) =>
+    sendConfirmPage(res, 429, renderConfirmPage({ title: 'Too many requests', message: 'There have been a lot of requests from your connection. Please try again in a little while.' })),
+});
+
 // Confirm a subscription, step 1 (public: the signed link from the confirmation email). It only shows a page with a button. Mail scanners and
 // link previews open every link in a message (and a HEAD request lands here too), so opening the link must not change anything.
-router.get('/:taskId/subscribers/confirm', async (req, res) => {
+router.get('/:taskId/subscribers/confirm', confirmIpLimiter, async (req, res) => {
   try {
     const { taskId } = req.params;
     const claim = readConfirmToken(req.query.token);
@@ -346,7 +357,7 @@ router.get('/:taskId/subscribers/confirm', async (req, res) => {
 });
 
 // Confirm a subscription, step 2: the button on that page.
-router.post('/:taskId/subscribers/confirm', async (req, res) => {
+router.post('/:taskId/subscribers/confirm', confirmIpLimiter, async (req, res) => {
   try {
     const { taskId } = req.params;
     const claim = readConfirmToken(req.body?.token);
