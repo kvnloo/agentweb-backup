@@ -406,19 +406,28 @@ describe('StorageAccessLookups: how many missing records one request may look up
     expect((await decideStorageAccess(ME, 'users/me/files/1/abc/mine.png', 'read', lookups)).allow).toBe(true); // no lookup needed for one's own key
   });
 
-  it('once the limit is reached an execution file is refused, not decided by falling back to its task (that would skip the check that the execution belongs to the task)', async () => {
+  it('once the limit is reached an execution file is refused, not decided by falling back to its task (that would skip the check that the execution belongs to the task), even when the task was read earlier in the same request', async () => {
     getTask.mockResolvedValue({ taskId: 't-me', userId: 'me' });
     getExecution.mockResolvedValue({ userId: 'mate', taskId: 'someone-elses-task' }); // a victim's execution, named under my own task
     // without the limit the check is real: the execution does not belong to the task in the key
     expect((await decideStorageAccess(ME, 'tasks/t-me/executions/e-victim/1-a.png', 'read', new StorageAccessLookups())).allow).toBe(false);
-    // with the limit reached first, the execution is not even looked up, and the answer is still a refusal
+    // a batch: my own task's attachment first (so the task is already known), then a run of made-up owners, then the execution file
     const lookups = new StorageAccessLookups();
+    expect((await decideStorageAccess(ME, 'tasks/t-me/attachments/a.png', 'read', lookups)).allow).toBe(true);
     for (let i = 0; i < 12; i++) await decideStorageAccess(ME, `users/ghost${i}/files/1/abc/a.png`, 'read', lookups);
     getExecution.mockClear();
     const decision = await decideStorageAccess(ME, 'tasks/t-me/executions/e-victim/1-a.png', 'read', lookups);
-    expect(decision.allow).toBe(false);
-    expect(decision.reason).toBe('lookup_failed');
+    expect(decision).toMatchObject({ allow: false, reason: 'lookup_failed' });
     expect(getExecution).not.toHaveBeenCalled();
+  });
+
+  it('lookups that throw count toward the limit too (a database slowdown must not queue one slow read per URL)', async () => {
+    getUser.mockImplementation(async () => { throw new Error('throttled'); });
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const lookups = new StorageAccessLookups();
+    for (let i = 0; i < 30; i++) await lookups.user(`u-${i}`);
+    expect(getUser).toHaveBeenCalledTimes(StorageAccessLookups.MAX_MISSES);
+    expect(lookups.failed).toBe(true);
   });
 });
 
