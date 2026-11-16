@@ -23,6 +23,7 @@ const ALL_SET = 'All set. Ask me about your Meta ads, e.g. "how are my campaigns
 const TODAY_SUMMARY = [
   'Zoma setup:',
   '  [x] AgentWeb login (a@b.co)',
+  '  [x] How familiar you are with ads (runs_ads)',
   '  [x] Payment method on file',
   '  [x] Meta ad account connected (111, TWD)',
   '',
@@ -44,7 +45,7 @@ const googleAccount = () => ({
 
 function deps(accounts: any[], over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Record<string, jest.Mock> {
   return {
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue(accounts),
     findLiveCustomerId: jest.fn(),
     createCustomerForUser: jest.fn(),

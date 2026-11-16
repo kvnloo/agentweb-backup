@@ -51,7 +51,7 @@ const PROBES = {
 
 function onboardingDeps(accounts: any[]): ZomaOnboardingDeps & Record<string, jest.Mock> {
   return {
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue(accounts),
     findLiveCustomerId: jest.fn(),
     createCustomerForUser: jest.fn(),
