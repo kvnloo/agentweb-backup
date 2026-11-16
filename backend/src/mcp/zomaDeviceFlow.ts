@@ -10,7 +10,7 @@
  *      (completeMetaConnect — never the browser's portal session), then straight to Stripe
  *      setup-mode Checkout, whose success_url is Zoma's "you're set" page. Done steps are skipped.
  *   3. pollSetup          POST /api/zoma/setup/poll     -> RFC errors until bound, then
- *      next_step from getZomaReadiness (connect_meta | add_payment | complete). On complete
+ *      next_step from getZomaReadiness (connect_meta | add_payment | fix_meta_page | complete). On complete
  *      a per-user Zoma token is issued exactly once; only its hash is stored.
  *   4. validateZomaToken  used by the Meta Toolkit gateway for `zoma_` bearers.
  *   5. revokeZomaToken    POST /api/zoma/token/revoke
@@ -23,7 +23,14 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { mcpOAuthService } from './oauth/oauthService';
 import { getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from './oauth/authChallenge';
-import { createZomaPaymentSetupLink, getZomaReadiness, type ZomaReadiness } from './zomaOnboarding';
+import {
+  createZomaPaymentSetupLink,
+  getZomaReadiness,
+  metaPageFixSteps,
+  type ZomaMetaPageBlocker,
+  type ZomaMetaPageBlockerReason,
+  type ZomaReadiness,
+} from './zomaOnboarding';
 import { DynamoZomaDeviceStore, type ZomaDeviceRecord, type ZomaDeviceStore, type ZomaLinkStep } from './zomaDeviceStore';
 import { logZomaSetup } from './zomaSetupLog';
 import {
@@ -52,7 +59,9 @@ export const ZOMA_POLL_INTERVAL_SEC = 5;
 const USER_CODE_ALPHABET = 'BCDFGHJKLMNPQRSTVWXZ'; // RFC 8628 §6.1: no vowels, no look-alikes
 const USER_CODE_LENGTH = 8;
 
-export type ZomaNextStep = 'sign_in' | ZomaLinkStep | 'complete';
+/** ENG-3125: Meta is connected but no Facebook Page is usable for ads — guided fix, no stored link. */
+export type ZomaBlockerStep = 'fix_meta_page';
+export type ZomaNextStep = 'sign_in' | ZomaLinkStep | ZomaBlockerStep | 'complete';
 
 export interface ZomaDeviceFlowDeps {
   store: ZomaDeviceStore;
@@ -307,7 +316,7 @@ export interface ZomaPickerAccount {
 
 export type BrowserStep =
   | { kind: 'redirect'; url: string }
-  | { kind: 'page'; status: number; title: string; message: string; retryUrl?: string; done?: boolean }
+  | { kind: 'page'; status: number; title: string; message: string; retryUrl?: string; retryLabel?: string; steps?: string[]; done?: boolean }
   | { kind: 'pick_account'; action: string; token: string; accounts: ZomaPickerAccount[]; message?: string };
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
@@ -353,6 +362,34 @@ async function paymentLink(deps: ZomaDeviceFlowDeps, device: ZomaDeviceRecord & 
   return link;
 }
 
+/**
+ * ENG-3125: the browser's guided fix for a Meta connection that cannot create ads. Never the
+ * "you're set" page while the blocker exists; the button is a fresh Meta connect link for this
+ * setup, so reconnecting returns here and readiness is re-derived.
+ */
+async function metaPageBlockedPage(
+  deps: ZomaDeviceFlowDeps,
+  device: ZomaDeviceRecord & { userId: string },
+  blocker: ZomaMetaPageBlocker,
+): Promise<PageStep> {
+  let link: string | undefined;
+  try {
+    link = await deps.mintMetaLink(device.userId, device.deviceId);
+  } catch (error) {
+    await track(deps, device.deviceId, device.userId, 'meta_link', 'error', error);
+  }
+  await track(deps, device.deviceId, device.userId, 'meta_page_blocked', blocker.reason);
+  return {
+    kind: 'page',
+    status: 200,
+    title: 'One more step: your Facebook Page',
+    message: blocker.message,
+    steps: metaPageFixSteps(blocker.reason, { pageId: blocker.page_id, connectText: link ? 'use the Reconnect Meta button below and log in with the same Facebook account.' : undefined }),
+    retryUrl: link ?? continueLink(deps, device.deviceId),
+    retryLabel: link ? 'Reconnect Meta' : 'Try again',
+  };
+}
+
 /** Send the browser to the first unfinished step for this setup; "you're set" when none is left. */
 export async function continueInBrowser(deviceId: string, deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps): Promise<BrowserStep> {
   const raw = await deps.store.getDevice(deviceId);
@@ -372,6 +409,7 @@ export async function continueInBrowser(deviceId: string, deps: ZomaDeviceFlowDe
     }
     return { kind: 'redirect', url: await paymentLink(deps, device) };
   }
+  if (state.blocker) return metaPageBlockedPage(deps, device, state.blocker);
   return DONE_PAGE;
 }
 
@@ -530,8 +568,13 @@ export async function finishPayment(
     await track(deps, raw.deviceId, raw.userId, 'checkout_completed', verified ? 'ok' : 'unverified');
     // ENG-2906: a Stripe-verified setup session for this user is the card_saved moment.
     if (verified) void zomaMilestone(raw.userId, 'card_saved', { emit: 'always', requireZoma: true, props: { product: 'zoma', source: 'checkout' } });
-    // Stripe can lag in listing the new payment method; a verified session for this user is enough.
-    if (verified) return DONE_PAGE;
+    // Stripe can lag in listing the new payment method; a verified session for this user is enough
+    // for payment — but not for a Meta Page blocker (ENG-3125), which still withholds "you're set".
+    if (verified) {
+      const device = journeyDevice(raw, deps.now());
+      const blocker = device ? (await deps.readiness(device.userId)).blocker : null;
+      return device && blocker ? metaPageBlockedPage(deps, device, blocker) : DONE_PAGE;
+    }
   }
   return continueInBrowser(raw.deviceId, deps);
 }
@@ -543,6 +586,19 @@ export type PollResult =
   | { status: 400; body: { error: 'slow_down'; error_description: string; interval: number } }
   | { status: 400; body: { error: 'expired_token' | 'access_denied' | 'invalid_grant' | 'invalid_request'; error_description: string } }
   | { status: 200; body: { next_step: ZomaLinkStep; link?: string; message?: string; interval: number } }
+  | {
+      status: 200;
+      body: {
+        next_step: ZomaBlockerStep;
+        reason: ZomaMetaPageBlockerReason;
+        message: string;
+        instructions: string[];
+        link?: string;
+        create_page_url?: string;
+        page_id?: string;
+        interval: number;
+      };
+    }
   | { status: 200; body: { next_step: 'complete'; access_token: string; token_type: 'Bearer'; mcp_url: string; message: string } };
 
 const rfcError = (error: 'expired_token' | 'access_denied' | 'invalid_grant' | 'invalid_request', error_description: string): PollResult => ({
@@ -594,7 +650,31 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps): P
   // same ones the browser journey uses, so an agent can re-send one if the user drops off.
   const userId = device.userId;
   const state = await deps.readiness(userId);
-  const step: ZomaNextStep = !state.meta.ready ? 'connect_meta' : !state.payment.ready ? 'add_payment' : 'complete';
+  // Same order as zoma_status: connect Meta, payment, then the Page blocker (ENG-3125).
+  const step: ZomaNextStep = !state.meta.ready ? 'connect_meta' : !state.payment.ready ? 'add_payment' : state.blocker ? 'fix_meta_page' : 'complete';
+
+  if (step === 'fix_meta_page') {
+    const blocker = state.blocker as ZomaMetaPageBlocker;
+    let link: string | undefined;
+    try {
+      link = await deps.mintMetaLink(userId, device.deviceId);
+    } catch (error) {
+      await track(deps, device.deviceId, userId, 'meta_link', 'error', error);
+    }
+    return {
+      status: 200,
+      body: {
+        next_step: 'fix_meta_page',
+        reason: blocker.reason,
+        message: blocker.message,
+        instructions: metaPageFixSteps(blocker.reason, { link, pageId: blocker.page_id }),
+        ...(link ? { link } : {}),
+        ...(blocker.create_page_url ? { create_page_url: blocker.create_page_url } : {}),
+        ...(blocker.page_id ? { page_id: blocker.page_id } : {}),
+        interval: device.intervalSec,
+      },
+    };
+  }
 
   if (step !== 'complete') {
     if (state.payment.error && step === 'add_payment') {

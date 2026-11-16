@@ -103,8 +103,9 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       PICKER_FORM_ACTION,
     );
   }
-  const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">Try again</a></p>` : '';
-  return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${retry}`);
+  const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">${escapeHtml(step.retryLabel ?? 'Try again')}</a></p>` : '';
+  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>` : '';
+  return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${steps}${retry}`);
 }
 
 function failPage(res: Response, step: string, error: unknown) {
