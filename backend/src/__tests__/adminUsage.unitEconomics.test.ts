@@ -5,17 +5,18 @@
 
 import request from "supertest";
 import express from "express";
+import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import adminUsageRoutes from "../routes/adminUsage";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 jest.mock("../middleware/auth", () => ({
-  authenticateToken: (req: any, res: any, next: any) => {
+  authenticateToken: (req: Request, res: Response, next: NextFunction) => {
     const header = req.headers.authorization || "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : "";
     try {
-      req.user = jwt.verify(token, JWT_SECRET);
+      (req as { user?: unknown }).user = jwt.verify(token, JWT_SECRET);
       next();
     } catch {
       res.status(401).json({ message: "Unauthorized" });
@@ -26,7 +27,7 @@ jest.mock("../middleware/auth", () => ({
 const mockBuild = jest.fn();
 jest.mock("../services/llmUnitEconomicsService", () => ({
   ...jest.requireActual("../services/llmUnitEconomicsService"),
-  buildUnitEconomicsReport: (...a: any[]) => mockBuild(...a),
+  buildUnitEconomicsReport: (...a: unknown[]) => mockBuild(...a),
 }));
 
 const adminToken = jwt.sign({ userId: "a", email: "a@x.com", isAdmin: true }, JWT_SECRET);

@@ -234,7 +234,7 @@ describe('AC3 — target comparison (live hard threshold + overhead envelope)', 
     llmUsagePolicy: { enforcementState: 'hard_only', hardCostThresholdMicroUsd: usd * 1_000_000 },
   });
   // Live caps as of 2026-11-16, served per tier name like getSubscriptionTypeConfig.
-  let LIVE: Record<string, any> = {};
+  let LIVE: Record<string, ReturnType<typeof policyFor> | null> = {};
   beforeEach(() => {
     LIVE = { Free: policyFor(5), Starter: policyFor(80), Pro: policyFor(200) };
     mockGetSubscriptionTypeConfig.mockImplementation(async (t: string) => LIVE[t] ?? null);
