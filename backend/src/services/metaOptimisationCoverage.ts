@@ -459,7 +459,7 @@ export type AccountOptimisationVerdict = {
   unrecognisedOptimisations: string[];
   /** Pixels that reported no events, so nothing can be concluded about them either way. */
   inconclusivePixels: string[];
-  /** ENG-3079: ad sets whose pixel reported the optimisation event in its own window. Not a
+  /** ENG-3079: delivering ad sets whose pixel reported the optimisation event in its own window. Not a
    *  finding; recorded so a reader can tell "arriving" apart from "nothing to judge". */
   arriving: OptimisationMismatch[];
 };
@@ -590,8 +590,9 @@ export function evaluateAccountOptimisationCoverage(
     // evaluator was left on the raw check when the helper was introduced for its sibling —
     // the same fix-one-of-a-pair defect §48 records, in the commit that cited §48.
     if (pixelReceivedEvent(received, expected)) {
-      verdict.arriving.push(hit); // arriving — no claim to make
-      continue;
+      // Recorded only for a delivering ad set: a paused one says nothing about what is live.
+      if (delivering) verdict.arriving.push(hit);
+      continue; // arriving — no claim to make
     }
 
     // Paused: real, but costs nothing until someone resumes it. Never alerted, by decision.

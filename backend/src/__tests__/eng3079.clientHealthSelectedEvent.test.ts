@@ -111,6 +111,20 @@ describe('ENG-3079 selectedEventState (the monitor verdict, reduced to one word)
     expect(stateOf(ok({ adSets: [purchaseAdSet()], receivedEventsByPixel: { px1: ['PageView'] } }))).toBe('unknown');
   });
 
+  it('unknown: a paused ad set whose pixel reports the event (the event may come from elsewhere; nothing is delivering)', () => {
+    expect(stateOf(ok({
+      adSets: [purchaseAdSet({ effective_status: 'PAUSED' })],
+      receivedEventsByPixel: { px1: ['PageView', 'Purchase'] },
+    }))).toBe('unknown');
+  });
+
+  it('recent: a delivering ad set is arriving beside a paused one on the same pixel', () => {
+    expect(stateOf(ok({
+      adSets: [purchaseAdSet({ id: 'as0', effective_status: 'PAUSED' }), purchaseAdSet()],
+      receivedEventsByPixel: { px1: ['PageView', 'Purchase'] },
+    }))).toBe('recent');
+  });
+
   it('unknown: a paused ad set with a silent event (the monitor never alerts on these)', () => {
     const paused = ok({
       adSets: [purchaseAdSet({ effective_status: 'PAUSED' })],
