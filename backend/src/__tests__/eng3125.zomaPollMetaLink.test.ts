@@ -41,7 +41,7 @@ function harness() {
     issueToken: jest.fn().mockResolvedValue(true),
   };
   const onboarding: any = {
-    getUser: jest.fn().mockResolvedValue({ userId: 'user-1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'user-1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue([noPageAccount]),
     resolvePaymentMethod: jest.fn().mockResolvedValue({ hasPaymentMethod: true }),
     buildMetaConnectUrl: jest.fn(),
