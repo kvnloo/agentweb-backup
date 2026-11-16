@@ -97,7 +97,10 @@ export const CONFIRMING_READS_REQUIRED = 2;
  *     group stops polling long before it matters;
  *   - the cost on such a machine is 60 local requests, each capped at
  *     IMDS_TIMEOUT_MS, and two log lines in total (first failure, then give-up).
- * Any successful read resets the count.
+ * Any read that is not "unavailable" resets the count. That includes a non-404
+ * error status and a thrown request on the state path (both come back as
+ * `unavailable: false`), not only a 200. So a machine that alternates 404 with 5xx
+ * never disables; it just keeps polling, which is the safe direction.
  */
 export const UNAVAILABLE_READS_BEFORE_DISABLE = 60;
 
