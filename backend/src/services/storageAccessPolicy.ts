@@ -126,6 +126,7 @@ export class StorageAccessLookups {
         return found ?? null;
       }).catch((error: any) => {
         this.failed = true;
+        this.misses++; // a lookup that throws counts too: during a database slowdown a batch must not queue up one slow read per URL
         console.error(JSON.stringify({ event: 'storage_access_lookup_failed', kind, error: String(error?.message || error).slice(0, 200) }));
         return null;
       });
