@@ -28,16 +28,21 @@
  * platform overhead from per-account attribution without a reviewed allocation
  * policy, so allocating it here would be an invention, not a measurement.
  *
- * What AC3 still needs from a human: the COGS targets ($7 / $73 / $180 in the
- * ticket) to compare actual all-in against. Those numbers are stale (the hard
- * caps moved to $80/$200 on 2026-09-01 and Super Premium never had a row), and
- * setting the authoritative targets is a business decision (ENG-1688). This
- * report computes and separates actual all-in cost; the target comparison is
- * layered on once those numbers exist.
+ * ## All-in cost targets (AC3 comparison)
  *
- * The tier targets are likewise NOT hardcoded here. They moved on 2026-09-01
- * (Starter $60 -> $80, Pro $150 -> $200) and Super Premium has never had a row,
- * so thresholds are read live from the same `subscription_types` policy the
+ * Decided 2026-11-16 (the ticket's $7/$73/$180 table is stale; ENG-1688):
+ * target = the tier's LIVE hard LLM threshold + a fixed overhead envelope for
+ * everything that is not LLM spend (non-LLM vendors, infrastructure, support).
+ * The threshold half is read from the policy at report time, never hardcoded;
+ * only the envelope lives in this file (TIER_OVERHEAD_ENVELOPE_USD). Each row
+ * and each tier aggregate carries `targetAllInUsd`, `varianceUsd`
+ * (actual - target) and `overTarget`; the admin CSV export includes them too.
+ * Credits are deliberately NOT added to the target: it is the tier's included
+ * economics, so a purchased top-up shows as variance rather than moving the goal.
+ *
+ * Thresholds are read live; envelopes are fixed constants. The caps moved on
+ * 2026-09-01 (Starter $60 -> $80, Pro $150 -> $200) and Super Premium has never
+ * had a row, so thresholds come from the same `subscription_types` policy the
  * enforcement path reads. A report that disagrees with the enforcer about where
  * the cap is would be worse than no report.
  */
@@ -48,6 +53,70 @@ import { getSubscriptionTypeConfig } from './subscriptionService';
 import { getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 
 const MICRO = 1_000_000;
+
+/**
+ * Fixed non-LLM overhead allowance added to a tier's live hard LLM threshold to
+ * form its all-in cost target (2026-11-16 decision, project owner's delegate).
+ * Rationale: the threshold already caps LLM spend, so the envelope budgets what
+ * the threshold cannot see: metered vendors, shared infrastructure and support.
+ * It scales with plan size. Change an envelope here only with a new owner
+ * decision. Resolved targets follow the live caps, e.g. Free $5 -> $7.
+ */
+export const TIER_OVERHEAD_ENVELOPE_USD: Readonly<Record<string, number>> = {
+  Free: 2,
+  Starter: 13,
+  Pro: 30,
+  'Super Premium': 30,
+};
+
+/**
+ * Tiers with no `subscription_types` policy row of their own borrow another
+ * tier's live policy for the TARGET only. Super Premium is internal-only and has
+ * never had a row; enforcement does not alias it (it reports uncapped), so this
+ * does not change thresholds, usage state or the uncapped alert. An own policy
+ * row, if one is ever added, wins over the alias.
+ */
+const TARGET_POLICY_FALLBACK_TIER: Readonly<Record<string, string>> = {
+  'Super Premium': 'Pro',
+};
+
+/** Human-readable list of the envelopes, built from the constant so the note cannot drift. */
+const envelopeSummary = (): string =>
+  Object.entries(TIER_OVERHEAD_ENVELOPE_USD)
+    .map(([tier, usd]) => `${tier} $${usd}`)
+    .join(', ');
+
+/** Built from TARGET_POLICY_FALLBACK_TIER so the note cannot drift from the alias map. */
+const targetPolicyNote = (): string =>
+  Object.entries(TARGET_POLICY_FALLBACK_TIER)
+    .map(([tier, from]) => `${tier} borrows ${from}'s policy`)
+    .join('; ');
+
+interface TargetFields {
+  targetAllInUsd: number | null;
+  varianceUsd: number | null;
+  overTarget: boolean;
+}
+
+/**
+ * Pure target arithmetic. `hardCostThresholdMicroUsd` is the tier's resolved live
+ * policy threshold (own row, else the fallback tier's); null/undefined means no
+ * policy. A tier with no envelope or no policy has no target, and `overTarget`
+ * is then false: callers must surface "no target" separately (tier_no_target).
+ */
+export function computeTargetFields(
+  tier: string,
+  hardCostThresholdMicroUsd: number | null | undefined,
+  allInCostUsd: number,
+): TargetFields {
+  const envelope = TIER_OVERHEAD_ENVELOPE_USD[tier];
+  if (envelope === undefined || hardCostThresholdMicroUsd == null) {
+    return { targetAllInUsd: null, varianceUsd: null, overTarget: false };
+  }
+  const target = round(hardCostThresholdMicroUsd / MICRO + envelope);
+  const variance = round(allInCostUsd - target);
+  return { targetAllInUsd: target, varianceUsd: variance, overTarget: variance > 0 };
+}
 
 /** `YYYY-MM` -> the inclusive day range covering it. */
 export function monthBounds(month: string): { start: string; end: string } {
@@ -94,6 +163,12 @@ export interface UnitEconomicsRow {
   /** LLM spend minus the migration offset — what the cap counts. */
   policyCostUsd: number;
   percentUsed: number | null;
+
+  /** Live hard LLM threshold + the tier's overhead envelope. Null when the tier has no policy or no envelope. */
+  targetAllInUsd: number | null;
+  /** allInCostUsd - targetAllInUsd; positive means over target. Null when there is no target. */
+  varianceUsd: number | null;
+  overTarget: boolean;
 }
 
 export interface UnitEconomicsFilters {
@@ -121,6 +196,12 @@ export interface UnitEconomicsReport {
     purchasedCreditsUsd: number;
     includedThresholdUsd: number | null;
     overThreshold: number;
+    /** Sum of the accounts' targets, comparable with this tier's aggregate allInCostUsd. Null if no account has one. */
+    targetAllInUsd: number | null;
+    varianceUsd: number | null;
+    overTarget: boolean;
+    /** Accounts whose own actual exceeds their own target. */
+    overTargetAccounts: number;
   }>;
   /** AC5 — aggregate and threshold-based; never one issue per heavy account. */
   alerts: Array<{ kind: string; count: number; detail: string }>;
@@ -171,6 +252,9 @@ export async function buildUnitEconomicsReport(
     const tier = user?.subscriptionType || 'Unknown';
     const config = await tierConfig(tier);
     const policy = config?.llmUsagePolicy ?? null;
+    const fallbackTier = TARGET_POLICY_FALLBACK_TIER[tier];
+    const targetPolicy =
+      policy ?? (fallbackTier ? (await tierConfig(fallbackTier))?.llmUsagePolicy : null);
 
     const adj = getLlmUsageCreditAdjustment(user?.llmUsageCredits, month);
     const migrationOffsetUsd = adj.migrationOffsetMicroUsd / MICRO;
@@ -178,6 +262,7 @@ export async function buildUnitEconomicsReport(
     const adminGrantedUsd = adj.adminGrantedMicroUsd / MICRO;
 
     const llmCostUsd = agg.llmMicro / MICRO;
+    const allInCostUsd = round(llmCostUsd + agg.vendorMicro / MICRO);
     const policyCostUsd = Math.max(0, llmCostUsd - migrationOffsetUsd);
 
     const includedThresholdUsd = policy ? policy.hardCostThresholdMicroUsd / MICRO : null;
@@ -198,7 +283,7 @@ export async function buildUnitEconomicsReport(
       llmCostUsd: round(llmCostUsd),
       vendorCostUsd: round(agg.vendorMicro / MICRO),
       vendorCoverage: 'complete',
-      allInCostUsd: round(llmCostUsd + agg.vendorMicro / MICRO),
+      allInCostUsd,
       // Overrun is measured against the EFFECTIVE cap (threshold + credits +
       // grants); an uncapped tier cannot overrun, so a null threshold => $0.
       admittedWorkOverrunUsd:
@@ -212,6 +297,7 @@ export async function buildUnitEconomicsReport(
       effectiveThresholdUsd: effectiveThresholdUsd === null ? null : round(effectiveThresholdUsd),
       policyCostUsd: round(policyCostUsd),
       percentUsed,
+      ...computeTargetFields(tier, targetPolicy?.hardCostThresholdMicroUsd, allInCostUsd),
       _models: agg.models,
     } as UnitEconomicsRow & { _models: Set<string> });
   }
@@ -239,16 +325,27 @@ export async function buildUnitEconomicsReport(
     tierMap.set(r.tier, list);
   }
   const byTier = [...tierMap.entries()]
-    .map(([tier, list]) => ({
-      tier,
-      accounts: list.length,
-      llmCostUsd: round(list.reduce((s, r) => s + r.llmCostUsd, 0)),
-      vendorCostUsd: round(list.reduce((s, r) => s + r.vendorCostUsd, 0)),
-      allInCostUsd: round(list.reduce((s, r) => s + r.allInCostUsd, 0)),
-      purchasedCreditsUsd: round(list.reduce((s, r) => s + r.purchasedCreditsUsd, 0)),
-      includedThresholdUsd: list[0]?.includedThresholdUsd ?? null,
-      overThreshold: list.filter((r) => r.percentUsed !== null && r.percentUsed >= 100).length,
-    }))
+    .map(([tier, list]) => {
+      const targets = list.flatMap((r) => (r.targetAllInUsd === null ? [] : [r.targetAllInUsd]));
+      const target = targets.length ? round(targets.reduce((sum, t) => sum + t, 0)) : null;
+      // Compare like with like: only accounts that have a target contribute actual.
+      const targetedActual = list.reduce((sum, r) => sum + (r.targetAllInUsd === null ? 0 : r.allInCostUsd), 0);
+      const variance = target === null ? null : round(targetedActual - target);
+      return {
+        tier,
+        accounts: list.length,
+        llmCostUsd: round(list.reduce((s, r) => s + r.llmCostUsd, 0)),
+        vendorCostUsd: round(list.reduce((s, r) => s + r.vendorCostUsd, 0)),
+        allInCostUsd: round(list.reduce((s, r) => s + r.allInCostUsd, 0)),
+        purchasedCreditsUsd: round(list.reduce((s, r) => s + r.purchasedCreditsUsd, 0)),
+        includedThresholdUsd: list[0]?.includedThresholdUsd ?? null,
+        overThreshold: list.filter((r) => r.percentUsed !== null && r.percentUsed >= 100).length,
+        targetAllInUsd: target,
+        varianceUsd: variance,
+        overTarget: variance !== null && variance > 0,
+        overTargetAccounts: list.filter((r) => r.overTarget).length,
+      };
+    })
     .sort((a, b) => b.llmCostUsd - a.llmCostUsd);
 
   const uncapped = filtered.filter((r) => r.includedThresholdUsd === null);
@@ -263,6 +360,30 @@ export async function buildUnitEconomicsReport(
       detail: `${uncapped.length} spending account(s) on a tier with no cost policy: ${[...new Set(uncapped.map((r) => r.tier))].join(', ')}`,
     });
   }
+  // AC5: aggregate counts only. Tiers over target, and a count of accounts over
+  // theirs; never one alert (or Linear issue) per heavy user.
+  const tiersOver = byTier.filter((t) => t.overTarget);
+  if (tiersOver.length > 0) {
+    alerts.push({
+      kind: 'tier_over_target',
+      count: tiersOver.length,
+      detail: `${tiersOver.length} tier(s) with aggregate all-in cost over target: ${tiersOver.map((t) => t.tier).join(', ')}`,
+    });
+  }
+  const accountsOver = filtered.filter((r) => r.overTarget).length;
+  if (accountsOver > 0) {
+    alerts.push({ kind: 'account_over_target', count: accountsOver, detail: `${accountsOver} account(s) with all-in cost over their tier target` });
+  }
+  // A null target is "unknown", never "on target": surface it, still aggregate-only.
+  const noTarget = filtered.filter((r) => r.targetAllInUsd === null);
+  if (noTarget.length > 0) {
+    const tiers = [...new Set(noTarget.map((r) => r.tier))];
+    alerts.push({
+      kind: 'tier_no_target',
+      count: tiers.length,
+      detail: `${tiers.length} tier(s) with ${noTarget.length} spending account(s) have no all-in target (no policy or no envelope), so they are not compared: ${tiers.join(', ')}`,
+    });
+  }
   return {
     month,
     start,
@@ -271,6 +392,34 @@ export async function buildUnitEconomicsReport(
     byTier,
     alerts,
     vendorCoverageNote:
-      'vendorCostUsd is complete: every paid vendor (v0, X, You.com, Google CSE, Apollo, enrich.so, Remotion, ElevenLabs, 2captcha, Placid) writes to AW-UsageRecords. allInCostUsd = LLM + vendor is therefore actual all-in cost. Per-account infrastructure is $0 (shared overhead is not per-account attributable). The remaining AC3 item is the COGS target comparison, which needs the authoritative $7/$73/$180 numbers (ENG-1688).',
+      "vendorCostUsd is complete: every paid vendor (v0, X, You.com, Google CSE, Apollo, enrich.so, Remotion, ElevenLabs, 2captcha, Placid) writes to AW-UsageRecords. allInCostUsd = LLM + vendor is therefore actual all-in cost. Per-account infrastructure is $0 (shared overhead is not per-account attributable). " +
+      `targetAllInUsd = the tier's live hard LLM threshold + a fixed overhead envelope (${envelopeSummary()}; ${targetPolicyNote()}); varianceUsd = allInCostUsd - targetAllInUsd. A tier with no target is flagged by the tier_no_target alert, not treated as on target. Internal only.`,
   };
+}
+
+const CSV_COLUMNS: Array<[string, (r: UnitEconomicsRow) => unknown]> = [
+  ['billingUserId', (r) => r.billingUserId],
+  ['email', (r) => r.email],
+  ['tier', (r) => r.tier],
+  ['llmCostUsd', (r) => r.llmCostUsd],
+  ['nonLlmVendorCostUsd', (r) => r.vendorCostUsd],
+  ['admittedWorkOverrunUsd', (r) => r.admittedWorkOverrunUsd],
+  ['infrastructureUsd', (r) => r.infrastructureUsd],
+  ['actualAllInUsd', (r) => r.allInCostUsd],
+  ['targetAllInUsd', (r) => r.targetAllInUsd],
+  ['varianceUsd', (r) => r.varianceUsd],
+  ['overTarget', (r) => r.overTarget],
+];
+
+/** AC3 monthly export: one row per account, parts separated, actual vs target. Admin-only. */
+export function buildUnitEconomicsCsv(report: UnitEconomicsReport): string {
+  const esc = (v: unknown) => {
+    let text = v === null || v === undefined ? '' : String(v);
+    // Neutralise spreadsheet formula injection from user-controlled emails.
+    if (typeof v === 'string' && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  const lines = [CSV_COLUMNS.map(([h]) => h).join(',')];
+  for (const r of report.rows) lines.push(CSV_COLUMNS.map(([, f]) => esc(f(r))).join(','));
+  return lines.join('\n') + '\n';
 }

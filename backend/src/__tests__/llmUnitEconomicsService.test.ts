@@ -14,6 +14,9 @@
  *    envelope being comfortably met when it is simply unmeasured.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 const mockScanByDateRange = jest.fn();
 const mockGetAllUsers = jest.fn();
 const mockGetSubscriptionTypeConfig = jest.fn();
@@ -29,7 +32,13 @@ jest.mock('../services/subscriptionService', () => ({
   getSubscriptionTypeConfig: (...a: any[]) => mockGetSubscriptionTypeConfig(...a),
 }));
 
-import { buildUnitEconomicsReport, monthBounds } from '../services/llmUnitEconomicsService';
+import {
+  buildUnitEconomicsReport,
+  buildUnitEconomicsCsv,
+  computeTargetFields,
+  monthBounds,
+  TIER_OVERHEAD_ENVELOPE_USD,
+} from '../services/llmUnitEconomicsService';
 
 const llmRow = (billingUserId: string, costMicroUsd: number, model = 'gpt-5.4') => ({
   userId: billingUserId, billingUserId, sk: `2026-09-05#${model}#agent_task`,
@@ -217,5 +226,208 @@ describe('AC5 — alerting is aggregate, not per-account', () => {
     const over = r.alerts.filter((a) => a.kind === 'over_threshold');
     expect(over).toHaveLength(1);
     expect(over[0].count).toBe(2);
+  });
+});
+
+describe('AC3 — target comparison (live hard threshold + overhead envelope)', () => {
+  const policyFor = (usd: number) => ({
+    llmUsagePolicy: { enforcementState: 'hard_only', hardCostThresholdMicroUsd: usd * 1_000_000 },
+  });
+  // Live caps as of 2026-11-16, served per tier name like getSubscriptionTypeConfig.
+  let LIVE: Record<string, any> = {};
+  beforeEach(() => {
+    LIVE = { Free: policyFor(5), Starter: policyFor(80), Pro: policyFor(200) };
+    mockGetSubscriptionTypeConfig.mockImplementation(async (t: string) => LIVE[t] ?? null);
+  });
+  const run = async (tier: string, costUsd: number, vendorUsd = 0) => {
+    mockScanByDateRange.mockResolvedValue([
+      llmRow('u1', costUsd * 1_000_000),
+      ...(vendorUsd ? [vendorRow('u1', vendorUsd * 1_000_000)] : []),
+    ]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: tier }]);
+    return buildUnitEconomicsReport('2026-09');
+  };
+
+  it('resolves Free $7, Starter $93, Pro $230, Super Premium $230 from the live caps', async () => {
+    const got: Record<string, number | null> = {};
+    for (const tier of ['Free', 'Starter', 'Pro', 'Super Premium']) {
+      got[tier] = (await run(tier, 1)).rows[0].targetAllInUsd;
+    }
+    expect(got).toEqual({ Free: 7, Starter: 93, Pro: 230, 'Super Premium': 230 });
+  });
+
+  it('follows the policy when the cap moves (never a hardcoded threshold)', async () => {
+    LIVE.Starter = policyFor(100);
+    expect((await run('Starter', 1)).rows[0].targetAllInUsd).toBe(113);
+  });
+
+  it('computes variance = actual - target and flags overTarget only above it', async () => {
+    const under = (await run('Pro', 100, 5)).rows[0];
+    expect(under).toMatchObject({ allInCostUsd: 105, targetAllInUsd: 230, varianceUsd: -125, overTarget: false });
+    const at = (await run('Pro', 200, 30)).rows[0];
+    expect(at).toMatchObject({ varianceUsd: 0, overTarget: false });
+    const over = (await run('Pro', 220, 15)).rows[0];
+    expect(over).toMatchObject({ allInCostUsd: 235, varianceUsd: 5, overTarget: true });
+  });
+
+  it('counts vendor spend toward the comparison, not only LLM', async () => {
+    const r = (await run('Free', 5, 3)).rows[0];
+    expect(r).toMatchObject({ allInCostUsd: 8, targetAllInUsd: 7, varianceUsd: 1, overTarget: true });
+  });
+
+  it('gives an unknown or unpriced tier no target and never flags it', async () => {
+    const r = (await run('Managed', 900)).rows[0];
+    expect(r).toMatchObject({ targetAllInUsd: null, varianceUsd: null, overTarget: false });
+  });
+
+  it('prefers a Super Premium policy row of its own over the Pro fallback', async () => {
+    LIVE['Super Premium'] = policyFor(300);
+    expect((await run('Super Premium', 1)).rows[0].targetAllInUsd).toBe(330);
+  });
+
+  it('aggregates per tier: summed target, variance, and an over-target account count', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 250_000_000), llmRow('u2', 10_000_000)]);
+    mockGetAllUsers.mockResolvedValue([
+      { userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' },
+      { userId: 'u2', email: 'b@x.com', subscriptionType: 'Pro' },
+    ]);
+    const t = (await buildUnitEconomicsReport('2026-09')).byTier[0];
+    expect(t).toMatchObject({ targetAllInUsd: 460, varianceUsd: -200, overTarget: false, overTargetAccounts: 1 });
+  });
+
+  it('alerts once per kind (aggregate), flagging tiers and a count of accounts', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 250_000_000), llmRow('u2', 260_000_000)]);
+    mockGetAllUsers.mockResolvedValue([
+      { userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' },
+      { userId: 'u2', email: 'b@x.com', subscriptionType: 'Pro' },
+    ]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    const tiers = r.alerts.filter((a) => a.kind === 'tier_over_target');
+    expect(tiers).toHaveLength(1);
+    expect(tiers[0].detail).toContain('Pro');
+    const acct = r.alerts.filter((a) => a.kind === 'account_over_target');
+    expect(acct).toHaveLength(1);
+    expect(acct[0].count).toBe(2);
+    expect(acct[0].detail).not.toMatch(/u1|u2|@x\.com/);
+  });
+
+  it('returns empty tiers, no alerts and a header-only CSV for a month with no rows', async () => {
+    mockScanByDateRange.mockResolvedValue([]);
+    mockGetAllUsers.mockResolvedValue([]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.byTier).toEqual([]);
+    expect(r.alerts).toEqual([]);
+    expect(buildUnitEconomicsCsv(r).trim().split('\n')).toHaveLength(1);
+  });
+
+  it('has no target (and says so) when the policy is missing but the envelope is known', async () => {
+    LIVE.Pro = null;
+    const r = await run('Pro', 900);
+    expect(r.rows[0]).toMatchObject({ targetAllInUsd: null, varianceUsd: null, overTarget: false });
+    expect(r.byTier[0]).toMatchObject({ targetAllInUsd: null, varianceUsd: null, overTarget: false });
+    const a = r.alerts.find((x) => x.kind === 'tier_no_target');
+    expect(a).toMatchObject({ count: 1 });
+    expect(a?.detail).toContain('Pro');
+    expect(a?.detail).not.toMatch(/u1|a@x\.com/);
+  });
+
+  it('gives Super Premium no target when neither its own row nor Pro has a policy', async () => {
+    LIVE.Pro = null;
+    const r = await run('Super Premium', 5);
+    expect(r.rows[0].targetAllInUsd).toBeNull();
+    expect(r.alerts.some((x) => x.kind === 'tier_no_target')).toBe(true);
+  });
+
+  it('raises tier_no_target for a tier missing from the envelope map', async () => {
+    const r = await run('Managed', 5);
+    expect(r.alerts.find((x) => x.kind === 'tier_no_target')?.detail).toContain('Managed');
+  });
+
+  it('renders a null target as empty CSV cells', async () => {
+    const csv = buildUnitEconomicsCsv(await run('Managed', 5));
+    expect(csv.trim().split('\n')[1]).toBe('u1,a@x.com,Managed,5,0,0,0,5,,,false');
+  });
+
+  it('quotes emails with a quote or newline and leaves negative variance unprefixed', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a"b\nc@x.com', subscriptionType: 'Pro' }]);
+    const csv = buildUnitEconomicsCsv(await buildUnitEconomicsReport('2026-09'));
+    expect(csv).toContain('u1,"a""b\nc@x.com",Pro,10,0,0,0,10,230,-220,false');
+  });
+
+  it('keeps tier and account alerts independent across mixed tiers', async () => {
+    mockScanByDateRange.mockResolvedValue([
+      llmRow('u1', 250_000_000), // Pro, over its own $230
+      llmRow('u2', 1_000_000), // Pro, under
+      llmRow('u3', 1_000_000), // Starter, under
+      llmRow('u4', 6_000_000), // Free, under its $7
+    ]);
+    mockGetAllUsers.mockResolvedValue([
+      { userId: 'u1', subscriptionType: 'Pro' },
+      { userId: 'u2', subscriptionType: 'Pro' },
+      { userId: 'u3', subscriptionType: 'Starter' },
+      { userId: 'u4', subscriptionType: 'Free' },
+    ]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    // Pro aggregate: 251 actual vs 460 target => tier under, but one account over.
+    expect(r.alerts.find((a) => a.kind === 'tier_over_target')).toBeUndefined();
+    expect(r.alerts.find((a) => a.kind === 'account_over_target')?.count).toBe(1);
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 500_000_000), llmRow('u3', 1_000_000)]);
+    const r2 = await buildUnitEconomicsReport('2026-09');
+    const t = r2.alerts.find((a) => a.kind === 'tier_over_target');
+    expect(t?.count).toBe(1);
+    expect(t?.detail).toContain('Pro');
+    expect(t?.detail).not.toContain('Starter');
+  });
+
+  it('computeTargetFields is pure arithmetic over a resolved threshold', () => {
+    expect(computeTargetFields('Starter', 80_000_000, 100)).toEqual({ targetAllInUsd: 93, varianceUsd: 7, overTarget: true });
+    expect(computeTargetFields('Starter', null, 100)).toEqual({ targetAllInUsd: null, varianceUsd: null, overTarget: false });
+    expect(computeTargetFields('Nope', 80_000_000, 100).targetAllInUsd).toBeNull();
+  });
+
+  it('builds the note from the envelope constant, with no withheld wording', async () => {
+    const note = (await run('Pro', 1)).vendorCoverageNote;
+    for (const [tier, usd] of Object.entries(TIER_OVERHEAD_ENVELOPE_USD)) {
+      expect(note).toContain(`${tier} $${usd}`);
+    }
+  });
+
+  it('exports separated parts and actual vs target as CSV, escaping hostile emails', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 220_000_000), vendorRow('u1', 15_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: '=HYPERLINK("x"),y@x.com', subscriptionType: 'Pro' }]);
+    const csv = buildUnitEconomicsCsv(await buildUnitEconomicsReport('2026-09'));
+    const [header, line] = csv.trim().split('\n');
+    expect(header).toBe(
+      'billingUserId,email,tier,llmCostUsd,nonLlmVendorCostUsd,admittedWorkOverrunUsd,infrastructureUsd,actualAllInUsd,targetAllInUsd,varianceUsd,overTarget',
+    );
+    expect(line).toBe('u1,"\'=HYPERLINK(""x""),y@x.com",Pro,220,15,20,0,235,230,5,true');
+  });
+});
+
+describe('AC6 — customer-facing code never reaches the target or cost economics', () => {
+  // The ONLY non-test source files allowed to mention the unit-economics service
+  // or its target fields. Adding a file here means exposing COGS targets from it:
+  // it must be admin-gated. Customer APIs must never carry these (AC6).
+  const ADMIN_ONLY_ALLOW_LIST = ['routes/adminUsage.ts', 'services/llmUnitEconomicsService.ts'];
+
+  it('no other source file imports the service or mentions target fields', () => {
+    const src = path.join(__dirname, '..');
+    const hits: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          if (e.name !== '__tests__' && e.name !== 'node_modules') walk(p);
+        } else if (/\.tsx?$/.test(e.name)) {
+          const text = fs.readFileSync(p, 'utf8');
+          if (/llmUnitEconomicsService|targetAllInUsd|TIER_OVERHEAD_ENVELOPE_USD/.test(text)) {
+            hits.push(path.relative(src, p));
+          }
+        }
+      }
+    };
+    walk(src);
+    expect(hits.sort()).toEqual(ADMIN_ONLY_ALLOW_LIST);
   });
 });
