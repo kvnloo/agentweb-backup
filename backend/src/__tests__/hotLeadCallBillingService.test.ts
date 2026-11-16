@@ -57,6 +57,29 @@ describe('addHotLeadCallBilling', () => {
     await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_hlc', alreadyPresent: false });
   });
 
+  it('does not report success when the mirror cannot be stored: calling stays off and a retry finishes it without a second charge', async () => {
+    mockStripe.subscriptions.retrieve.mockResolvedValueOnce(sub([baseItem])).mockResolvedValueOnce(sub([baseItem, item()]));
+    mockOrgDb.updateOrg.mockRejectedValueOnce(new Error('dynamo down'));
+    await expect(addHotLeadCallBilling('org-a')).rejects.toThrow(/payment .* went through/);
+    // The retry: Stripe already has the item, so nothing is created and the mirror is written.
+    mockStripe.subscriptions.retrieve.mockReset().mockResolvedValue(sub([baseItem, item()]));
+    await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_hlc', alreadyPresent: true });
+    expect(mockStripe.subscriptionItems.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a duplicate cleanup that failed earlier when the add-on is already there', async () => {
+    mockStripe.subscriptions.retrieve.mockResolvedValue(sub([item('si_late', 9), item('si_first', 3)]));
+    await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_first', alreadyPresent: true });
+    expect(mockStripe.subscriptionItems.del).toHaveBeenCalledWith('si_late', { proration_behavior: 'always_invoice' });
+    expect(mockOrgDb.updateOrg).toHaveBeenCalledWith('org-a', { hotLeadCallBilling: expect.objectContaining({ itemId: 'si_first' }) });
+  });
+
+  it('a duplicate cleanup that fails again does not fail an add-on that is paid', async () => {
+    mockStripe.subscriptions.retrieve.mockResolvedValue(sub([item('si_late', 9), item('si_first', 3)]));
+    mockStripe.subscriptionItems.del.mockRejectedValueOnce(new Error('stripe down'));
+    await expect(addHotLeadCallBilling('org-a')).resolves.toMatchObject({ alreadyPresent: true });
+  });
+
   it('is idempotent: when the live subscription already has the item nothing is created', async () => {
     mockStripe.subscriptions.retrieve.mockResolvedValue(sub([item('si_existing')]));
     await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_existing', alreadyPresent: true });
@@ -113,10 +136,11 @@ describe('mirrorHotLeadCallBilling (subscription webhook)', () => {
     expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
   });
 
-  it('falls back to the event payload when Stripe cannot be read', async () => {
+  it('leaves the mirror unchanged when Stripe cannot be read: an event payload may be stale', async () => {
+    mockOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-a', ownerUserId: 'owner', hotLeadCallBilling: { itemId: 'si_hlc', status: 'canceled', updatedAt: 'x' } });
     mockStripe.subscriptions.retrieve.mockRejectedValue(new Error('network'));
-    await mirrorHotLeadCallBilling(OWNER, sub([item()], 'past_due') as never);
-    expect(written()).toMatchObject({ itemId: 'si_hlc', status: 'past_due' });
+    await mirrorHotLeadCallBilling(OWNER, sub([item()]) as never); // an older "active" event arriving late
+    expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
   });
 
   it('skips a duplicate delivery, a non-owner and an unconfigured product', async () => {
