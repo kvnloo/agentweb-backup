@@ -195,7 +195,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
             // Publishing the text without the media the caller asked for would be a silent downgrade.
             if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
             const errorMsg = uploadError?.message || 'Unknown upload error';
-            if (isVideoUrl(url)) {
+            if (uploadError?.isVideoUpload || isVideoUrl(url)) {
               return { success: false, message: `The video failed to upload to LinkedIn (${errorMsg}). Nothing was posted.` };
             }
             console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);

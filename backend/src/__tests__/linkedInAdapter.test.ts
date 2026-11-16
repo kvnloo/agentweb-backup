@@ -148,6 +148,14 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
     });
 
+    it('ENG-3116: does not publish text-only when an EXTENSIONLESS video fails inside the video upload', async () => {
+      mockLinkedInService.uploadMediaFromUrl.mockRejectedValue(Object.assign(new Error('LinkedIn Permission Denied: no org access'), { isVideoUpload: true }));
+      const result = await adapter.createPost(mockCompanyAccount, 'Event recap', ['https://cdn.example.com/asset/9f3a'], 'user-1');
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/video failed to upload/i);
+      expect(mockLinkedInService.createPost).not.toHaveBeenCalled();
+    });
+
     it('ENG-3003: still uploads image media_urls', async () => {
       mockLinkedInService.uploadMediaFromUrl.mockResolvedValue('urn:li:image:1');
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:1');

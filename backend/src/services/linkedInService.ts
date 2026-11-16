@@ -12,7 +12,7 @@ import {
   LinkedInUnsupportedMediaError,
   LINKEDIN_MAX_VIDEO_BYTES,
   LINKEDIN_VIDEO_FORMAT_MESSAGE,
-  withVideoUploadSlot,
+  withMediaUploadSlot,
 } from './linkedInMedia';
 import {
   LinkedInProfile,
@@ -980,6 +980,16 @@ export class LinkedInService {
   videoProcessingTimeoutMs = 120_000;
   private static readonly MEDIA_DOWNLOAD_DEADLINE_MS = 5 * 60_000;
 
+  // /tmp is tmpfs (RAM) on Amazon Linux 2023; /var/tmp is disk-backed.
+  private static spoolDir(): string {
+    try {
+      fs.accessSync('/var/tmp', fs.constants.W_OK);
+      return '/var/tmp';
+    } catch {
+      return os.tmpdir();
+    }
+  }
+
   /** Streams a media_url to a temp file, aborting as soon as it exceeds the size cap. */
   private async downloadToTempFile(url: string): Promise<{ file: string; bytes: number; contentType: string | undefined }> {
     const tooLarge = () => new LinkedInUnsupportedMediaError(
@@ -989,13 +999,18 @@ export class LinkedInService {
       responseType: 'stream',
       timeout: 30000,
       signal: AbortSignal.timeout(LinkedInService.MEDIA_DOWNLOAD_DEADLINE_MS),
+      validateStatus: () => true,
     } as any);
+    if (response.status < 200 || response.status >= 300) {
+      response.data.destroy();
+      throw new Error(`Could not download the media_url (HTTP ${response.status}).`);
+    }
     const declared = Number(response.headers?.['content-length']);
     if (declared > LINKEDIN_MAX_VIDEO_BYTES) {
       response.data.destroy();
       throw tooLarge();
     }
-    const file = path.join(os.tmpdir(), `li-media-${randomUUID()}`);
+    const file = path.join(LinkedInService.spoolDir(), `li-media-${randomUUID()}`);
     let bytes = 0;
     const counter = new Transform({
       transform(chunk, _enc, cb) {
@@ -1005,7 +1020,7 @@ export class LinkedInService {
       },
     });
     try {
-      await pipeline(response.data, counter, fs.createWriteStream(file));
+      await pipeline(response.data, counter, fs.createWriteStream(file, { mode: 0o600 }));
     } catch (err) {
       await fs.promises.rm(file, { force: true });
       throw err;
@@ -1019,27 +1034,40 @@ export class LinkedInService {
    * image or video URN; the caller tells them apart by prefix.
    */
   async uploadMediaFromUrl(accessToken: string, ownerUrn: string, mediaUrl: string): Promise<string> {
-    return this.safeRequest(async () => {
-      const download = await this.downloadToTempFile(mediaUrl);
+    return withMediaUploadSlot(async () => {
+      // Set once the bytes say this is a video, so a failure after that point can be told apart from
+      // an image failure even when the URL gave no hint. The error object is tagged, not rewrapped,
+      // because callers match on its message (fresh-token 401 retry).
+      let isVideo = false;
       try {
-        const head = Buffer.alloc(16);
-        const handle = await fs.promises.open(download.file, 'r');
-        try { await handle.read(head, 0, 16, 0); } finally { await handle.close(); }
+        return await this.safeRequest(async () => {
+          const download = await this.downloadToTempFile(mediaUrl);
+          try {
+            const head = Buffer.alloc(16);
+            const handle = await fs.promises.open(download.file, 'r');
+            let headBytes: number;
+            try { headBytes = (await handle.read(head, 0, 16, 0)).bytesRead; } finally { await handle.close(); }
 
-        const cls = classifyMedia(download.contentType, head);
-        if (cls.kind === 'unsupported') throw new LinkedInUnsupportedMediaError(cls.message);
+            const cls = classifyMedia(download.contentType, head.subarray(0, headBytes));
+            if (cls.kind === 'unsupported') throw new LinkedInUnsupportedMediaError(cls.message);
 
-        if (cls.kind === 'image') {
-          const imageBuffer = await fs.promises.readFile(download.file);
-          const { uploadUrl, imageUrn } = await this.initializeImageUpload(accessToken, ownerUrn);
-          await this.uploadImageBinary(uploadUrl, imageBuffer, download.contentType || 'image/png');
-          console.log(`[LinkedIn] Image uploaded successfully: ${imageUrn}`);
-          return imageUrn;
-        }
+            if (cls.kind === 'image') {
+              const imageBuffer = await fs.promises.readFile(download.file);
+              const { uploadUrl, imageUrn } = await this.initializeImageUpload(accessToken, ownerUrn);
+              await this.uploadImageBinary(uploadUrl, imageBuffer, download.contentType || 'image/png');
+              console.log(`[LinkedIn] Image uploaded successfully: ${imageUrn}`);
+              return imageUrn;
+            }
 
-        return await withVideoUploadSlot(() => this.uploadVideoFile(accessToken, ownerUrn, download.file, download.bytes));
-      } finally {
-        await fs.promises.rm(download.file, { force: true });
+            isVideo = true;
+            return await this.uploadVideoFile(accessToken, ownerUrn, download.file, download.bytes);
+          } finally {
+            await fs.promises.rm(download.file, { force: true });
+          }
+        });
+      } catch (error: any) {
+        if (isVideo && error && typeof error === 'object') error.isVideoUpload = true;
+        throw error;
       }
     });
   }

@@ -1,6 +1,6 @@
 import {
   assertImageDownload, classifyMedia, isVideoUrl, isVideoUrn, LinkedInUnsupportedMediaError,
-  LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS, withVideoUploadSlot,
+  LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS, withMediaUploadSlot,
 } from '../services/linkedInMedia';
 
 const isoBmff = (brand: string) => Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftyp'), Buffer.from(brand), Buffer.alloc(12)]);
@@ -32,6 +32,14 @@ describe('ENG-3003 / ENG-3116 linkedInMedia', () => {
       expect(classifyMedia('application/octet-stream', isoBmff('avif')).kind).toBe('image');
       expect(classifyMedia('application/octet-stream', Buffer.from([0x89, 0x50, 0x4e, 0x47])).kind).toBe('image');
     });
+
+    it('lets the bytes override the content-type: video bytes served as image/* are a video, empty is refused', () => {
+      expect(classifyMedia('image/jpeg', isoBmff('isom')).kind).toBe('video');
+      const free = isoBmff('isom'); free.write('free', 4, 'latin1');
+      expect(classifyMedia('application/octet-stream', free).kind).toBe('video');
+      expect(classifyMedia('image/png', isoBmff('heic')).kind).toBe('image');
+      expect(classifyMedia('image/png', Buffer.alloc(0)).kind).toBe('unsupported');
+    });
   });
 
   describe('assertImageDownload (image-only path)', () => {
@@ -42,12 +50,12 @@ describe('ENG-3003 / ENG-3116 linkedInMedia', () => {
     });
   });
 
-  describe('withVideoUploadSlot', () => {
+  describe('withMediaUploadSlot', () => {
     it('runs at most the allowed number at once and releases slots when a run throws', async () => {
       let running = 0;
       let peak = 0;
       const gates: Array<() => void> = [];
-      const job = (fail = false) => withVideoUploadSlot(async () => {
+      const job = (fail = false) => withMediaUploadSlot(async () => {
         running++;
         peak = Math.max(peak, running);
         await new Promise<void>(resolve => gates.push(resolve));
@@ -56,15 +64,15 @@ describe('ENG-3003 / ENG-3116 linkedInMedia', () => {
       });
       const settledPromise = Promise.allSettled([job(), job(true), job(), job()]);
       await new Promise(r => setImmediate(r));
-      expect(running).toBe(LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS);
+      expect(running).toBe(LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS);
       while (gates.length || running) {
         gates.shift()?.();
         await new Promise(r => setImmediate(r));
       }
       const settled = await settledPromise;
       expect(settled.map(r => r.status)).toEqual(['fulfilled', 'rejected', 'fulfilled', 'fulfilled']);
-      expect(peak).toBe(LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS);
-      await expect(withVideoUploadSlot(async () => 'ok')).resolves.toBe('ok');
+      expect(peak).toBe(LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS);
+      await expect(withMediaUploadSlot(async () => 'ok')).resolves.toBe('ok');
     });
   });
 });
