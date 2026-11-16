@@ -14,11 +14,29 @@ import { Request, Response } from 'express';
 
 jest.mock('../utils/s3Utils', () => ({
   extractS3KeyFromUrl: jest.fn(),
-  presignS3Url: jest.fn(),
+  generatePresignedUrl: jest.fn(),
+}));
+// ENG-2988: the handler now asks the storage access policy who may read the key. These tests are about the download disposition, so the
+// caller owns the key (no lookups); the policy itself is covered by storageAccessPolicy.test.ts and filesController.access.test.ts.
+jest.mock('../middleware/auth', () => ({
+  isRealAdmin: jest.requireActual('../middleware/auth').isRealAdmin,
+}));
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  taskDb: { getTaskById: jest.fn(), getTaskExecutionOwnerById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
+}));
+jest.mock('../services/chatbotService', () => ({
+  ChatbotDB: jest.fn(),
+  chatbotDb: { getChatSessionRecord: jest.fn() },
 }));
 
-import { presignS3Url, extractS3KeyFromUrl } from '../utils/s3Utils';
+import { generatePresignedUrl, extractS3KeyFromUrl } from '../utils/s3Utils';
 import { getPresignedFileUrl } from '../controllers/filesController';
+
+const OWN_KEY = 'users/u1/files/1/abc/banner.html';
+const OWN_URL = `https://agentweb-user-files.s3.amazonaws.com/${OWN_KEY}`;
+const asUser = (query: Record<string, string>) => ({ query, user: { userId: 'u1', isAdmin: false } }) as unknown as Request;
 
 function mockRes(): Response {
   const res: any = {};
@@ -28,36 +46,32 @@ function mockRes(): Response {
 }
 
 function lastDisposition(): string | undefined {
-  const call = (presignS3Url as jest.Mock).mock.calls[0];
+  const call = (generatePresignedUrl as jest.Mock).mock.calls[0];
   return call?.[3];
 }
 
 describe('getPresignedFileUrl — download disposition', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (extractS3KeyFromUrl as jest.Mock).mockReturnValue('users/u1/banner.html');
+    (extractS3KeyFromUrl as jest.Mock).mockReturnValue(OWN_KEY);
   });
 
   it('does NOT request a disposition when download is not requested (existing "view" behavior unchanged)', async () => {
-    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
-    const req = { query: { url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html' } } as unknown as Request;
+    (generatePresignedUrl as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = asUser({ url: OWN_URL });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
 
     expect(lastDisposition()).toBeUndefined();
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    // the key that was checked is the key that is signed
+    expect((generatePresignedUrl as jest.Mock).mock.calls[0][0]).toBe(OWN_KEY);
   });
 
   it('requests an attachment disposition with the sanitized filename when download=true', async () => {
-    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
-    const req = {
-      query: {
-        url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html',
-        download: 'true',
-        filename: 'xCures Master Banners V2.html',
-      },
-    } as unknown as Request;
+    (generatePresignedUrl as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = asUser({ url: OWN_URL, download: 'true', filename: 'xCures Master Banners V2.html' });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
@@ -68,13 +82,8 @@ describe('getPresignedFileUrl — download disposition', () => {
   });
 
   it('falls back to a generic filename when none is supplied for a download', async () => {
-    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
-    const req = {
-      query: {
-        url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html',
-        download: 'true',
-      },
-    } as unknown as Request;
+    (generatePresignedUrl as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = asUser({ url: OWN_URL, download: 'true' });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
@@ -83,14 +92,8 @@ describe('getPresignedFileUrl — download disposition', () => {
   });
 
   it('strips path separators, quotes, and other header-breaking characters from the filename', async () => {
-    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
-    const req = {
-      query: {
-        url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html',
-        download: 'true',
-        filename: '../../etc/passwd" ; evil="1',
-      },
-    } as unknown as Request;
+    (generatePresignedUrl as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = asUser({ url: OWN_URL, download: 'true', filename: '../../etc/passwd" ; evil="1' });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
@@ -104,14 +107,8 @@ describe('getPresignedFileUrl — download disposition', () => {
     // CodeRabbit (PR #2430): RFC 9110 forbids CR/LF/NUL/other C0 controls and DEL
     // in a header field value. Left unstripped, S3 can reject the presigned
     // request (InvalidRequest) or a client can see a malformed/injected header.
-    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
-    const req = {
-      query: {
-        url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html',
-        download: 'true',
-        filename: 'report\r\nX-Injected: yes\x00.txt\x7f',
-      },
-    } as unknown as Request;
+    (generatePresignedUrl as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = asUser({ url: OWN_URL, download: 'true', filename: 'report\r\nX-Injected: yes\x00.txt\x7f' });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
@@ -125,12 +122,12 @@ describe('getPresignedFileUrl — download disposition', () => {
 
   it('returns 400 when the URL does not reference the configured bucket, without ever presigning', async () => {
     (extractS3KeyFromUrl as jest.Mock).mockReturnValue(null);
-    const req = { query: { url: 'https://evil.example.com/steal.html', download: 'true' } } as unknown as Request;
+    const req = asUser({ url: 'https://evil.example.com/steal.html', download: 'true' });
     const res = mockRes();
 
     await getPresignedFileUrl(req, res);
 
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(presignS3Url).not.toHaveBeenCalled();
+    expect(generatePresignedUrl).not.toHaveBeenCalled();
   });
 });
