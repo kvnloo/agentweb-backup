@@ -40,7 +40,7 @@ Reads work without a payment method. Changes to ads need a payment method on fil
 ## Reads
 - `list_meta_ads_campaigns`, `get_meta_ads_metrics`, `call_meta_ads_insights_api` for campaigns and performance.
 - `call_meta_marketing_api` with LIST / GET / PREVIEW / SEARCH / GET_MATCH_QUALITY.
-- Datasets (pixels) and conversions: `ads_get_datasets`, `ads_get_dataset_details`, `ads_get_dataset_stats`, `ads_pixel_event_read` (event rules), `ads_get_customconversions`. Pixel reads take `pixel_id` and only work for pixels in the selected ad account. If Meta refuses a read, the result has `success: false` with Meta's reason and an `errorClass`.
+- Datasets (pixels) and conversions: `ads_get_datasets`, `ads_get_dataset_details`, `ads_get_dataset_stats`, `ads_pixel_event_read` (event rules), `ads_pixel_parameter_read` (parameter extractors), `ads_get_customconversions`. Pixel reads take `pixel_id` and only work for pixels in the selected ad account. If Meta refuses a read, the result has `success: false` with Meta's reason and an `errorClass`.
 - With more than one connected ad account, pass `account_id`.
 
 ## Creatives: upload your own images and videos

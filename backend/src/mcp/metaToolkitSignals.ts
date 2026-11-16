@@ -8,7 +8,7 @@ export const SIGNAL_FIELDS = {
   conversions: 'id,name,pixel,rule,custom_event_type,is_archived',
 };
 
-const names = ['ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions'] as const;
+const names = ['ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_pixel_parameter_read', 'ads_get_customconversions'] as const;
 export function isSignalsRead(name: string): boolean { return (names as readonly string[]).includes(name); }
 export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
   name,
@@ -17,6 +17,7 @@ export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
     ads_get_dataset_details: 'Read a dataset/pixel belonging to the selected ad account.',
     ads_get_dataset_stats: 'Read dataset/pixel event stats for the selected ad account.',
     ads_pixel_event_read: 'Read existing pixel event rules through the documented event_rules edge. Availability depends on Meta permissions and API version.',
+    ads_pixel_parameter_read: 'Read the parameter extractors on a pixel in the selected ad account: the rules that pull values such as price or currency from a page for events set up without code. Read-only; returns one page and paging cursors. Availability depends on Meta permissions and API version.',
     ads_get_customconversions: 'List custom conversions in the selected Meta ad account. Read-only; returns one page and paging cursors.',
   })[name],
   inputSchema: {
@@ -24,7 +25,7 @@ export const SIGNAL_READ_DEFINITIONS = names.map((name) => ({
     properties: {
       account_id: { type: 'string', description: 'Connected Meta ad account; optional when exactly one is connected.' },
       ...(!['ads_get_datasets', 'ads_get_customconversions'].includes(name) ? { pixel_id: { type: 'string', pattern: '^[0-9]+$' } } : {}),
-      ...(['ads_get_datasets', 'ads_get_customconversions', 'ads_pixel_event_read'].includes(name) ? {
+      ...(['ads_get_datasets', 'ads_get_customconversions', 'ads_pixel_event_read', 'ads_pixel_parameter_read'].includes(name) ? {
         limit: { type: 'integer', minimum: 1, maximum: 100 }, after: { type: 'string' },
       } : {}),
       ...(name === 'ads_get_dataset_stats' ? {
@@ -167,5 +168,6 @@ async function runSignalsRead(
   }
   if (name === 'ads_get_dataset_details') return get(args.pixel_id, { fields: SIGNAL_FIELDS.details });
   if (name === 'ads_pixel_event_read') return get(`${args.pixel_id}/event_rules`, page);
+  if (name === 'ads_pixel_parameter_read') return get(`${args.pixel_id}/extractors`, page);
   return get(`${args.pixel_id}/stats`, Object.fromEntries(['aggregation', 'start_time', 'end_time'].filter((k) => args[k] !== undefined).map((k) => [k, args[k]])));
 }

@@ -49,6 +49,7 @@ describe('ENG-2917 HTTP signals recorder and local-error boundary', () => {
     ['ads_get_dataset_details', { pixel_id: '456' }, ['/act_123/adspixels', '/456']],
     ['ads_get_dataset_stats', { pixel_id: '456', aggregation: 'event' }, ['/act_123/adspixels', '/456/stats']],
     ['ads_pixel_event_read', { pixel_id: '456' }, ['/act_123/adspixels', '/456/event_rules']],
+    ['ads_pixel_parameter_read', { pixel_id: '456' }, ['/act_123/adspixels', '/456/extractors']],
     ['ads_get_customconversions', {}, ['/act_123/customconversions']],
   ])('%s reaches the request recorder through the HTTP route', async (name, args, expected) => {
     const response = await request(app).post(`/tools/${name}/call`).set('Authorization', 'Bearer aw_fixture').send({ args: { account_id: '123', ...args } });

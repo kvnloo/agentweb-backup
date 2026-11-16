@@ -118,7 +118,7 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_create', NO_PUBLIC_PIXEL_RULE_WRITE),
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_update', NO_PUBLIC_PIXEL_RULE_WRITE),
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_read'),
+  same(SIG, 'ENG-3055', 'ads_pixel_parameter_read'),
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_create', NO_PUBLIC_PIXEL_RULE_WRITE),
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_update', NO_PUBLIC_PIXEL_RULE_WRITE),
   notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_delete', NO_PUBLIC_PIXEL_RULE_WRITE),

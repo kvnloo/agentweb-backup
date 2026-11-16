@@ -64,6 +64,7 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_get_dataset_details',
   'ads_get_dataset_stats',
   'ads_pixel_event_read',
+  'ads_pixel_parameter_read',
   'ads_get_customconversions',
   // Meta: experiments, activity, diagnostics
   'ads_experiment_list_tests',
