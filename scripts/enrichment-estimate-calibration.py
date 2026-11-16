@@ -3,11 +3,14 @@
 
 READ-ONLY. It only calls `aws logs describe-log-groups|filter-log-events` and `aws dynamodb scan|get-item`; it writes
 nothing to AWS and prints aggregates only (a 6-character user id prefix, counts and dollars; never an email, a lead or a
-field value). Test accounts (by email), platform admins (`isAdmin`) and any `--exclude-user-ids` are left out; real
-customer accounts are kept whatever their email domain.
+field value; AWS error text is reduced to its error code and operation because it can carry account names). The only guarantee that nothing can be written is the IAM role you run it with: use a read-only one. Left out
+as non-customers (matched in Python, case-insensitively, so no email ever reaches a DynamoDB expression or the output): test
+accounts (--exclude-emails), platform admins (`isAdmin`), every account whose email domain is, or is a subdomain of, one of
+--exclude-domains (default agentweb.pro and argusoft.com) and any --exclude-user-ids. A look-alike such as
+agentweb.pro.example.com stays in. Real customer accounts are kept whatever their email domain.
 
 What it does: joins the enrichment runs found in the prod logs ("runEnrichment START" / "runEnrichment DONE") to the
-usage ledger (AW-UsageRecords, features crm_enrichment and enrichment) per customer and day, then prints the booked
+usage ledger (AW-UsageRecords, features crm_enrichment and enrichment) per account and day, then prints the booked
 dollars per processed contact next to what the estimate formula quotes for leads that already have an email:
 
     quote per contact = fields * llmPerFieldPerLead + lookupPerLead + webSearchPerLead
@@ -17,17 +20,24 @@ dependencies, at least 1) to the list's SAVED enrichment config, or `referenceFi
 quote counts the saved config merged with the list's current columns, so a column added to the list after the config was
 saved counts there but not here (about 3% of the ratio per column).
 
-The quote's Apollo email-search term is not part of that formula, so booked dollars here EXCLUDE `apollo:waterfall_email`
-(the paid email search); that spend is shown in its own column.
+The per-contact quote has no term for the paid add-ons, so booked dollars here EXCLUDE them: the Apollo email search
+(`apollo:waterfall_email`, booked as `apollo:full_enrichment` until the ENG-2720 change reached prod, last seen in the
+ledger on 2026-11-03; the same $0.445 request) and Enigma
+(`enigma:*`, which the customer quote adds separately for card-revenue fields). They are shown in their own columns.
 
-The constants are read from backend/src/services/enrichmentCostEstimate.ts, so this check cannot drift from the code.
-The ledger is per user and day, so a day that mixes an enrich run with a preview or another run is compared as a whole
-(booked and contacts both include every run of that user-day). The prod log group keeps only 14 days: run this at least
-every 14 days or the oldest runs are gone (the script warns when --since reaches past the retention).
+Only the three rate constants (and referenceFieldCount) are read from backend/src/services/enrichmentCostEstimate.ts;
+the formula above is duplicated here, so if `estimateEnrichmentCost` or `effectiveFieldCount` changes shape, update this
+script. The ledger is per user and day, so a day that mixes an enrich run with a preview or another run is compared as a
+whole (booked and contacts both include every run of that account-day). The prod log group keeps only 14 days: run this
+at least every 14 days or the oldest runs are gone (the script warns when --since reaches into the lost part).
 
-It ends with a verdict: below --min-contacts or --min-customers it says INSUFFICIENT DATA and you must not retune.
+It ends with a verdict: below --min-contacts, or with fewer than --min-customers accounts that each supplied at least
+--min-customer-contacts, or when one account supplies more than --max-account-share of the contacts, it says INSUFFICIENT
+DATA and you must not retune (one list can be the very sample the constants were fitted to).
 
-Usage (needs read access to the prod CloudWatch log group and the AW-* DynamoDB tables):
+Usage (needs read access to the prod CloudWatch log group and the AW-* DynamoDB tables). --since is required: choose
+the day AFTER the last change to pricing or the enrichment pipeline, and keep it until the data is enough, because a
+window that includes runs from before a change shows a false DRIFT:
     python3 scripts/enrichment-estimate-calibration.py --since 2026-11-13
 See docs/enrichment-estimate-calibration-runbook.md for when to run it and how to read the result.
 """
@@ -47,17 +57,65 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ESTIMATE_SRC = os.path.join(REPO, "backend", "src", "services", "enrichmentCostEstimate.ts")
 DEFAULT_LOG_GROUP = "/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log"
 LEDGER_FEATURES = ("crm_enrichment", "enrichment")
+ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # list, user and run ids copied from log text must look like this
+MODES = ("enrich", "preview")
+# A real prod log line is: syslog prefix, optional "[Worker] ", then the marker (e.g. "Nov 13 11:42:30 ip-172-31-19-250 web[4828]:
+# [Worker] [v3] runEnrichment START ..."). Matching the whole prefix means text a user typed later in some other line cannot pass.
+LINE_PREFIX = r"[A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} \S{1,100} web\[[0-9]{1,7}\]: (?:\[Worker\] )?"
+START_RE = re.compile(LINE_PREFIX + r"\[v3\] runEnrichment START listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)")
+DONE_RE = re.compile(LINE_PREFIX + r"\[v3\] runEnrichment DONE runId=(\S+) processed=([0-9]{1,9})(?!\S)")
+RUN_ID_RE = re.compile(r"runId=([A-Za-z0-9_-]{1,64})(?!\S)")
+EMAIL_SEARCH_MODELS = ("apollo:waterfall_email", "apollo:full_enrichment")  # same $0.445 request; the second is its older ledger name (last seen 2026-11-03)
+ENIGMA_PREFIX = "enigma:"
+
+
+def short(text, limit=60):
+    """Keep error messages short: a hostile source line can be tens of kilobytes."""
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + "... (%d characters)" % len(text)
+
+
+def aws_error_summary(stderr):
+    """AWS CLI error text can carry account names, ARNs or emails, so only the error code and the operation are shown."""
+    m = re.search(r"An error occurred \(([A-Za-z0-9]{1,60})\) when calling the ([A-Za-z0-9]{1,60}) operation", stderr[:5000])
+    if m:
+        return "%s on %s" % (m.group(1), m.group(2))
+    return "unrecognised error (its text is hidden because it can carry account names; run the same aws command by hand to read it)"
+
+
+def plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
 def read_rate(name):
     """Read one numeric constant (a literal or simple arithmetic such as `(2.673 + 2.128) / 118`) from the source."""
-    src = open(ESTIMATE_SRC, encoding="utf-8").read()
-    m = re.search(r"^\s*%s:\s*([0-9.+\-*/() ]+?),\s*(?://.*)?$" % re.escape(name), src, re.M)
+    where = os.path.relpath(ESTIMATE_SRC, REPO)
+    with open(ESTIMATE_SRC, encoding="utf-8", errors="replace") as fh:
+        src = fh.read(5_000_001)
+    if len(src) > 5_000_000:
+        sys.exit("%s is unexpectedly large" % where)
+    pattern = re.compile(r"[ \t]*%s:[ \t]*([0-9.+\-*/() ]+?),[ \t]*(?://.*)?" % re.escape(name))
+    m = None
+    in_block = False
+    for line in src.splitlines():
+        stripped = line.lstrip()
+        if in_block:  # a decoy inside a block comment must not be read
+            in_block = "*/" not in stripped
+            continue
+        cut = stripped.find("/*")
+        if cut != -1 and "*/" not in stripped[cut + 2:]:
+            in_block = True  # a block comment opens here (anywhere in the line) and stays open
+            continue
+        if stripped.startswith("/*") or stripped.startswith("//") or len(line) > 300:
+            continue  # a constant line is short; skipping long lines keeps this linear on hostile input
+        m = pattern.fullmatch(line)
+        if m:
+            break
     if not m:
-        sys.exit("cannot find %s in %s: did the estimate change shape? Update this script." % (name, ESTIMATE_SRC))
+        sys.exit("cannot find %s in %s: did the estimate change shape? Update this script." % (name, where))
     val = _arith(m.group(1).strip(), name)
     if not (math.isfinite(val) and val > 0):
-        sys.exit("%s must be a finite number above zero, got %r" % (name, val))
+        sys.exit("%s must be a finite number above zero, got %s" % (name, short(val)))
     return val
 
 
@@ -78,82 +136,201 @@ def _arith(expr, name):
 
     try:
         return walk(ast.parse(expr, mode="eval"))
-    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, RecursionError):
-        sys.exit("unexpected expression for %s: %r" % (name, expr))
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, RecursionError, MemoryError):
+        sys.exit("unexpected expression for %s: %s" % (name, short(expr)))
 
 
 class Aws:
     def __init__(self, cli, region):
-        self.base = shlex.split(cli) + ["--region", region]
+        try:
+            self.base = shlex.split(cli) + ["--region", region]
+        except ValueError:
+            sys.exit("--aws is not a valid command line (unbalanced quotes?)")
+        if len(self.base) < 3:
+            sys.exit("--aws must not be empty")
 
     def __call__(self, *args):
-        r = subprocess.run(self.base + list(args) + ["--output", "json"], capture_output=True, text=True)
+        label = " ".join(args[:2])
+        try:
+            r = subprocess.run(self.base + list(args) + ["--output", "json"], capture_output=True, text=True, errors="replace",
+                               stdin=subprocess.DEVNULL, timeout=1800)
+        except FileNotFoundError:
+            sys.exit("cannot run the --aws command (is the AWS CLI installed?)")
+        except subprocess.TimeoutExpired:
+            sys.exit("aws %s did not finish within 30 minutes (a credentials prompt, or a very wide --since)" % label)
         if r.returncode != 0:
-            sys.exit("aws %s failed: %s" % (" ".join(args[:2]), r.stderr.strip()[:400]))
-        return json.loads(r.stdout) if r.stdout.strip() else {}
+            sys.exit("aws %s failed: %s" % (label, aws_error_summary(r.stderr)))
+        try:
+            out = json.loads(r.stdout) if r.stdout.strip() else {}
+        except ValueError:
+            sys.exit("aws %s returned output that is not JSON" % label)
+        if not isinstance(out, dict):
+            sys.exit("aws %s returned an unexpected kind of output" % label)
+        return out
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    default_since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=14)).strftime("%Y-%m-%d")
-    ap.add_argument("--since", default=default_since, help="first UTC day to include, YYYY-MM-DD (default: 14 days ago)")
+    ap.add_argument("--since", required=True,
+                    help="first UTC day to include, YYYY-MM-DD, zero-padded. Pick the day AFTER the last change to pricing or the "
+                         "enrichment pipeline and keep it until the data is enough: runs from before a change give a false DRIFT")
     ap.add_argument("--exclude-emails", default="test@account.com",
-                    help="comma-separated internal/test account emails to leave out (default: test@account.com)")
-    ap.add_argument("--exclude-user-ids", default="", help="comma-separated user ids to leave out as well")
+                    help="comma-separated internal/test account emails to leave out, case-insensitive (default: the shared test account)")
+    ap.add_argument("--exclude-domains", default="agentweb.pro,argusoft.com",
+                    help="comma-separated email domains of internal staff; every account on them or on a subdomain is left out (default: agentweb.pro,argusoft.com)")
+    ap.add_argument("--exclude-user-ids", default="", help="comma-separated user ids to leave out as well; a prefix of at least 6 characters (as printed in the table) is enough")
     ap.add_argument("--aws", default=os.environ.get("AWS_CLI", "aws"), help="aws command (default: $AWS_CLI or 'aws')")
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--log-group", default=DEFAULT_LOG_GROUP)
     ap.add_argument("--min-contacts", type=int, default=100, help="below this many customer contacts: no retune (default 100)")
-    ap.add_argument("--min-customers", type=int, default=3, help="below this many customers: no retune (default 3)")
+    ap.add_argument("--min-customers", type=int, default=3, help="below this many qualifying accounts: no retune (default 3)")
+    ap.add_argument("--min-customer-contacts", type=int, default=10,
+                    help="an account counts toward --min-customers only with at least this many contacts (default 10)")
+    ap.add_argument("--max-account-share", type=float, default=0.5,
+                    help="INSUFFICIENT DATA when one account supplies more than this share of the contacts (default 0.5)")
     ap.add_argument("--tolerance", type=float, default=0.25, help="retune if booked/quote differs from 1 by more (default 0.25)")
     a = ap.parse_args()
+    if not (math.isfinite(a.tolerance) and a.tolerance > 0):
+        ap.error("--tolerance must be a finite number above zero")
+    if not (math.isfinite(a.max_account_share) and 0 < a.max_account_share <= 1):
+        ap.error("--max-account-share must be above 0 and at most 1")
+    for flag in ("min_contacts", "min_customers", "min_customer_contacts"):
+        if getattr(a, flag) < 1:
+            ap.error("--%s must be at least 1" % flag.replace("_", "-"))
+    now = dt.datetime.now(dt.timezone.utc)
+    if not re.fullmatch(r"[A-Za-z0-9/][A-Za-z0-9_./#-]*", a.log_group):  # the AWS CLI reads a file for values like file:///path and takes a leading dash as a flag
+        sys.exit("--log-group must start with a letter, digit or / and contain only letters, digits and _ . / # -")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", a.region):
+        sys.exit("--region must look like us-west-2")
     try:
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.since):  # ASCII only; strptime accepts 2026-11-5 and the ledger date filter is a string compare
+            raise ValueError
         since_dt = dt.datetime.strptime(a.since, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
     except ValueError:
-        sys.exit("--since must be a real date, YYYY-MM-DD")
+        sys.exit("--since must be a real, zero-padded date, YYYY-MM-DD (for example 2026-11-05)")
+    if since_dt.date() > now.date():
+        sys.exit("--since %s is in the future" % a.since)
+    if since_dt.year < 2020:
+        sys.exit("--since %s is implausibly old (the logs do not go back that far)" % a.since)
 
     llm_field = read_rate("llmPerFieldPerLead")
     lookup = read_rate("lookupPerLead")
     web = read_rate("webSearchPerLead")
-    reference_fields = int(read_rate("referenceFieldCount"))
+    reference_value = read_rate("referenceFieldCount")
+    if reference_value != int(reference_value):
+        sys.exit("referenceFieldCount must be a whole number, got %s" % short(reference_value))
+    reference_fields = int(reference_value)
     aws = Aws(a.aws, a.region)
 
-    excl = sorted({v for raw in a.exclude_emails.split(",") if raw.strip() for v in (raw.strip(), raw.strip().lower())})
-    vals = {":e%d" % i: {"S": e} for i, e in enumerate(excl)}
-    vals[":t"] = {"BOOL": True}
-    cond = "isAdmin = :t" + (" OR email IN (%s)" % ", ".join(k for k in vals if k != ":t") if excl else "")
-    d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId",
-            "--filter-expression", cond, "--expression-attribute-values", json.dumps(vals))
-    test_ids = {u["userId"]["S"] for u in d.get("Items", [])} | {x.strip() for x in a.exclude_user_ids.split(",") if x.strip()}
+    # Accounts to leave out. The user table is read whole and matched here, so emails (kept in memory only, never printed) are
+    # never put into a DynamoDB expression and the match is case-insensitive.
+    excl_emails = {raw.strip().lower() for raw in a.exclude_emails.split(",") if raw.strip()}
+    domains = sorted({x.strip().lower().lstrip("@.") for x in a.exclude_domains.split(",") if x.strip().lstrip("@.")})
+    id_entries = [x.strip() for x in a.exclude_user_ids.split(",") if x.strip()]
+    for entry in id_entries:
+        if len(entry) < 6:
+            sys.exit("--exclude-user-ids entries must be at least 6 characters (the prefix printed in the table)")
+    d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId, email, isAdmin")
+    users = [u for u in d.get("Items") or [] if u.get("userId", {}).get("S")]
+    if not users:
+        sys.exit("the user table scan returned no accounts, so staff cannot be told from customers: refusing to continue")
+    why = {"platform admins": set(), "test emails": set(), "internal domains": set(), "--exclude-user-ids": set()}
+    matched_entries = set()
+    for u in users:
+        uid = u["userId"]["S"]
+        em = (u.get("email", {}).get("S") or "").strip().lower()
+        if u.get("isAdmin", {}).get("BOOL"):
+            why["platform admins"].add(uid)
+        if em in excl_emails:
+            why["test emails"].add(uid)
+        if any(em.endswith("@" + dom) or em.endswith("." + dom) for dom in domains):
+            why["internal domains"].add(uid)
+        for entry in id_entries:
+            if uid.startswith(entry):
+                why["--exclude-user-ids"].add(uid); matched_entries.add(entry)
+    test_ids = set().union(*why.values())
+    print("excluded accounts: %d of %d (%s; one account can match several rules)"
+          % (len(test_ids), len(users), ", ".join("%s %d" % (k, len(v)) for k, v in why.items())))
 
     start_ms = int(since_dt.timestamp() * 1000)
-    groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups", [])
-    keep = next((g.get("retentionInDays") for g in groups if g.get("logGroupName") == a.log_group), None)
-    if keep and since_dt < dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep):
-        print("WARNING: the log group keeps only %d days, so runs before %s are already gone; the result below starts later than --since."
-              % (keep, (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep)).strftime("%Y-%m-%d")))
-    ev = lambda pat: aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
-                         "--filter-pattern", pat).get("events", [])
-    starts = {}
-    for x in ev('"runEnrichment START"'):
-        m = re.search(r"listId=(\S+) userId=(\S+) mode=(\S+) runId=(\S+)", x["message"])
-        if m:
-            starts[m.group(4)] = (m.group(2), m.group(3), m.group(1))
-    runs = []
-    for x in ev('"runEnrichment DONE"'):
-        m = re.search(r"runId=(\S+) processed=(\d+)", x["message"])
-        if not m or m.group(1) not in starts:
+    groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups") or []
+    keep = next((g.get("retentionInDays") for g in groups if isinstance(g, dict) and g.get("logGroupName") == a.log_group), None)
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+        keep = None
+    oldest_day = (now - dt.timedelta(days=keep)).date() if keep else None
+    if oldest_day and since_dt.date() <= oldest_day:
+        print("WARNING: the log group keeps only %d days: runs before %s are already gone and %s itself is only partly covered, while the "
+              "ledger counts whole days (that inflates the ratio). Start --since at %s for a clean result."
+              % (keep, oldest_day.strftime("%Y-%m-%d"), oldest_day.strftime("%Y-%m-%d"), (oldest_day + dt.timedelta(days=1)).strftime("%Y-%m-%d")))
+    events = aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
+                 "--filter-pattern", '?"runEnrichment START" ?"runEnrichment DONE"').get("events") or []
+    starts, finished, ignored_ids = {}, {}, set()
+    odd_lines = 0
+    for x in events:
+        msg = x.get("message") if isinstance(x, dict) else None
+        ts = x.get("timestamp") if isinstance(x, dict) else None
+        if not isinstance(msg, str):
+            odd_lines += 1
             continue
-        uid, mode, lid = starts[m.group(1)]
-        day = dt.datetime.fromtimestamp(x["timestamp"] / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
-        runs.append(dict(uid=uid, day=day, mode=mode, p=int(m.group(2)), lid=lid))
-    cust = [r for r in runs if r["uid"] not in test_ids]
-    print("runs since %s: %d in the logs, %d from excluded test accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
+        m = START_RE.match(msg)
+        if m:
+            lid, uid, mode, rid = m.groups()
+            if mode not in MODES or not all(ID_RE.fullmatch(v) for v in (lid, uid, rid)):
+                odd_lines += 1  # only the fixed mode names and plain ids are ever copied into the table
+                if ID_RE.fullmatch(rid):
+                    ignored_ids.add(rid)
+                continue
+            starts[rid] = (uid, mode, lid)
+            continue
+        m = DONE_RE.match(msg)
+        if m:
+            rid = m.group(1)
+            if not ID_RE.fullmatch(rid) or not isinstance(ts, int) or not 0 < ts < 10**14:
+                odd_lines += 1
+                if ID_RE.fullmatch(rid):
+                    ignored_ids.add(rid)
+                continue
+            if rid not in finished:  # a repeated DONE line must not count a run twice
+                finished[rid] = (int(m.group(2)), ts)
+            continue
+        if "runEnrichment START" in msg or "runEnrichment DONE" in msg:
+            odd_lines += 1  # mentions a run but is not a genuine line (wrong prefix, bad digits, unexpected format)
+            r = RUN_ID_RE.search(msg)
+            if r:
+                ignored_ids.add(r.group(1))  # so its other half is not reported as unfinished or as an orphan
+    runs = []
+    for rid, (processed, ts) in finished.items():
+        if rid not in starts:
+            continue
+        uid, mode, lid = starts[rid]
+        day = dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc).strftime("%Y-%m-%d")
+        runs.append(dict(uid=uid, day=day, mode=mode, p=processed, lid=lid))
+    def excluded(uid):  # an account deleted from the user table is still matched by its id in the run logs
+        return uid in test_ids or any(uid.startswith(e) for e in id_entries)
+
+    for r in runs:
+        for entry in id_entries:
+            if r["uid"].startswith(entry):
+                matched_entries.add(entry)
+    for i, entry in enumerate(id_entries, 1):
+        if entry not in matched_entries:
+            print("WARNING: no account matches --exclude-user-ids entry number %d (%d characters)" % (i, len(entry)))
+    cust = [r for r in runs if not excluded(r["uid"])]
+    print("runs since %s: %d in the logs, %d from excluded accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
+    if odd_lines:
+        print("ignored %s that were not genuine run lines (wrong line prefix, mode, id or digits)" % plural(odd_lines, "log line"))
+    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and rid not in ignored_ids and not excluded(st[0]))
+    orphans = sum(1 for rid in finished if rid not in starts and rid not in ignored_ids)
+    print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
+          "with no contacts), %s finished whose start is before --since (account unknown)" % (plural(unfinished, "run"), plural(orphans, "run")))
 
     fields = {}
+    gone = set()  # lists that no longer exist: DynamoDB returns no Item key at all (an existing list without a saved config returns Item: {})
     for lid in {r["lid"] for r in cust}:
         d = aws("dynamodb", "get-item", "--table-name", "AW-LeadLists", "--key", json.dumps({"listId": {"S": lid}}),
                 "--projection-expression", "enrichmentConfig")
+        if "Item" not in d:
+            gone.add(lid)
         cfg = d.get("Item", {}).get("enrichmentConfig", {}).get("M")
         if not cfg:
             fields[lid] = reference_fields  # the customer quote falls back to referenceFieldCount without a saved config
@@ -161,39 +338,55 @@ def main():
         inc = [x for x in cfg.get("fields", {}).get("L", []) if x.get("M", {}).get("include", {}).get("BOOL")]
         deps = sum(len(x["M"].get("smartDependencies", {}).get("L", [])) for x in inc)
         fields[lid] = max(1, len(inc) + deps)
+    if gone:
+        print("%s used by customer runs could not be found (counted with the reference field count, marked ? in the table)" % plural(len(gone), "list"))
 
     led = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))
     d = aws("dynamodb", "scan", "--table-name", "AW-UsageRecords", "--page-size", "1000",
             "--projection-expression", "userId, #d, model, feature, callCount, costMicroUsd",
             "--filter-expression", "#d >= :s AND (feature = :a OR feature = :b)", "--expression-attribute-names", '{"#d":"date"}',
             "--expression-attribute-values", json.dumps({":s": {"S": a.since}, ":a": {"S": LEDGER_FEATURES[0]}, ":b": {"S": LEDGER_FEATURES[1]}}))
-    for r in d.get("Items", []):
-        k = (r["userId"]["S"], r["date"]["S"])
-        led[k][r["model"]["S"]][0] += int(r["callCount"]["N"])
-        led[k][r["model"]["S"]][1] += int(r["costMicroUsd"]["N"])
+    skipped_rows = 0
+    for r in d.get("Items") or []:
+        try:
+            k = (r["userId"]["S"], r["date"]["S"])
+            calls, micro = int(r["callCount"]["N"]), int(r["costMicroUsd"]["N"])
+            model = r["model"]["S"]
+        except (KeyError, ValueError, TypeError):
+            skipped_rows += 1
+            continue
+        led[k][model][0] += calls
+        led[k][model][1] += micro
+    if skipped_rows:
+        print("skipped %s that did not have the expected fields" % plural(skipped_rows, "ledger row"))
 
-    agg = collections.defaultdict(lambda: dict(p=0, fp=0, modes=collections.Counter()))
+    agg = collections.defaultdict(lambda: dict(p=0, fp=0, unknown=0, modes=collections.Counter()))
     for r in cust:
         g = agg[(r["uid"], r["day"])]
         g["p"] += r["p"]; g["fp"] += r["p"] * fields[r["lid"]]; g["modes"][r["mode"]] += r["p"]
+        if r["lid"] in gone:
+            g["unknown"] += r["p"]
 
-    print("\n%-13s %-14s %8s %6s %8s %7s %10s %12s  %s" % ("user/day", "modes", "contacts", "fields", "booked$*", "$/ctc*", "quote$/ctc", "booked/quote", "email-search $ (calls)"))
+    print("\n%-13s %-14s %8s %6s %8s %7s %10s %12s  %-22s %s" % ("user/day", "modes", "contacts", "fields", "booked$*", "$/ctc*", "quote$/ctc", "booked/quote", "email-search $ (calls)", "enigma $"))
     tot_b = tot_q = tot_n = 0
-    customers = set()
+    by_account = collections.Counter()
     for (uid, day), g in sorted(agg.items(), key=lambda kv: kv[0][1]):
         n = g["p"]
         if n == 0:
             continue
         L = led.get((uid, day), {})
-        wf = L.get("apollo:waterfall_email", [0, 0])
-        total = (sum(v[1] for v in L.values()) - wf[1]) / 1e6  # excludes the paid email search (own column)
+        wf = [sum(L.get(m, [0, 0])[0] for m in EMAIL_SEARCH_MODELS), sum(L.get(m, [0, 0])[1] for m in EMAIL_SEARCH_MODELS)]
+        eg = sum(v[1] for k, v in L.items() if k.startswith(ENIGMA_PREFIX))
+        total = (sum(v[1] for v in L.values()) - wf[1] - eg) / 1e6  # excludes the paid add-ons (own columns)
         flds = g["fp"] / n  # weighted by contacts
         q = flds * llm_field + lookup + web
-        print("%-13s %-14s %8d %6.1f %8.2f %7.3f %10.3f %12.2f  %.2f (%d)" % ("%s/%s" % (uid[:6], day[5:]), ",".join(g["modes"]), n, flds, total, total / n, q, total / n / q, wf[1] / 1e6, wf[0]))
+        print("%-13s %-14s %8d %6s %8.2f %7.3f %10.3f %12.2f  %-22s %.2f" % ("%s/%s" % (uid[:6], day[5:]), ",".join(g["modes"]), n, "%.1f%s" % (flds, "?" if g["unknown"] else ""), total, total / n, q, total / n / q, "%.2f (%d)" % (wf[1] / 1e6, wf[0]), eg / 1e6))
         if g["modes"].get("enrich", 0) > 0:
-            tot_b += total; tot_q += q * n; tot_n += n; customers.add(uid)
+            tot_b += total; tot_q += q * n; tot_n += n; by_account[uid] += n
 
-    print("\n* excluding the paid email search (apollo:waterfall_email), which is not part of the per-contact quote")
+    print("\n* excluding the paid add-ons (the Apollo email search and Enigma), which are not part of the per-contact quote")
+    if gone:
+        print("? a list of that day no longer exists, so its field count is the reference count and not measured")
     print("\nVERDICT")
     if tot_n == 0:
         print("  No customer enrich-mode runs in the window: nothing to compare.")
@@ -202,13 +395,25 @@ def main():
         print("  No booked cost found in the ledger for these runs (not written yet, or the wrong window): cannot compare.")
         return
     ratio = tot_b / tot_q
-    print("  %d contacts from %d customers: booked $%.2f vs quote $%.2f (booked/quote = %.2f), email search excluded" % (tot_n, len(customers), tot_b, tot_q, ratio))
-    if tot_n < a.min_contacts or len(customers) < a.min_customers:
-        print("  INSUFFICIENT DATA (need >= %d contacts from >= %d customers): do NOT retune; run again later." % (a.min_contacts, a.min_customers))
+    qualifying = [u for u, c in by_account.items() if c >= a.min_customer_contacts]
+    share = max(by_account.values()) / tot_n
+    print("  %d contacts from %s: booked $%.2f vs quote $%.2f (booked/quote = %.2f), paid add-ons excluded"
+          % (tot_n, plural(len(by_account), "account"), tot_b, tot_q, ratio))
+    print("  the largest account supplies %.1f%% of the contacts; %d of them supplied at least %d contacts each"
+          % (100 * share, len(qualifying), a.min_customer_contacts))
+    short_of = []
+    if tot_n < a.min_contacts:
+        short_of.append("only %d contacts (need %d)" % (tot_n, a.min_contacts))
+    if len(qualifying) < a.min_customers:
+        short_of.append("only %s with at least %d contacts each (need %d)" % (plural(len(qualifying), "account"), a.min_customer_contacts, a.min_customers))
+    if share > a.max_account_share:
+        short_of.append("one account supplies %.1f%% of the contacts (at most %g%% allowed)" % (100 * share, 100 * a.max_account_share))
+    if short_of:
+        print("  INSUFFICIENT DATA (%s): do NOT retune; run again later with the same --since." % "; ".join(short_of))
     elif abs(ratio - 1) > a.tolerance:
-        print("  DRIFT beyond +/-%d%%: retune ENRICHMENT_COST_RATES_USD in enrichmentCostEstimate.ts (see the runbook)." % round(a.tolerance * 100))
+        print("  DRIFT beyond +/-%g%%: retune ENRICHMENT_COST_RATES_USD in enrichmentCostEstimate.ts (see the runbook)." % (100 * a.tolerance))
     else:
-        print("  Within +/-%d%%: leave the constants alone." % round(a.tolerance * 100))
+        print("  Within +/-%g%%: leave the constants alone." % (100 * a.tolerance))
 
 
 if __name__ == "__main__":
