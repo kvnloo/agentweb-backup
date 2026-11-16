@@ -3,6 +3,7 @@ import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import { register, login, googleCallback } from '../controllers/auth';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb, subscriberDb, orgDb } from '../services/db';
+import { forgetSubscriberLookup } from '../services/subscriberLookup';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { AuthRequest } from '../types/express';
@@ -444,6 +445,7 @@ router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) =>
     }
 
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    forgetSubscriberLookup(taskId);
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
