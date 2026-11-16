@@ -10,11 +10,11 @@ const GENERIC_CONTENT_TYPES = ['', 'application/octet-stream', 'binary/octet-str
 const IMAGE_FTYP_BRANDS = ['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1', 'avif', 'avis'];
 const MP4_CONTENT_TYPES = ['video/mp4', 'video/x-m4v'];
 
-// The backend shares one 8 GB host with everything else, so the file is spooled to disk and read
-// back one part at a time; this cap bounds disk and time, not memory. LinkedIn itself allows 500 MB.
+// The backend shares one 8 GB host with everything else, so a video is spooled to disk (not /tmp, which is
+// tmpfs on Amazon Linux 2023) and read back one part at a time. LinkedIn itself allows 500 MB.
 export const LINKEDIN_MAX_VIDEO_BYTES = 150 * 1024 * 1024;
 export const LINKEDIN_VIDEO_PART_BYTES = 4 * 1024 * 1024;
-export const LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS = 2;
+export const LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS = 2;
 export const LINKEDIN_VIDEO_URN_PREFIX = 'urn:li:video:';
 
 export class LinkedInUnsupportedMediaError extends Error {
@@ -55,26 +55,35 @@ const NOT_MEDIA = (contentType: string): MediaClass => ({
   message: `A LinkedIn media_url did not return an image or MP4 video (content-type ${contentType}). Nothing was posted.`,
 });
 
-function sniff(bytes: Buffer): MediaClass {
+type Sniffed = MediaClass | { kind: 'unknown' };
+
+// An MP4 usually opens with `ftyp`, but some writers put free/wide/skip/mdat/moov first.
+const MP4_LEADING_BOXES = ['free', 'wide', 'skip', 'mdat', 'moov'];
+
+function sniff(bytes: Buffer): Sniffed {
   if (bytes.length >= 12 && bytes.toString('latin1', 4, 8) === 'ftyp') {
     const brand = bytes.toString('latin1', 8, 12).toLowerCase();
     if (IMAGE_FTYP_BRANDS.includes(brand)) return { kind: 'image' };
     if (brand === 'qt  ') return { kind: 'unsupported', message: LINKEDIN_VIDEO_FORMAT_MESSAGE };
     return { kind: 'video' };
   }
+  if (bytes.length >= 8 && MP4_LEADING_BOXES.includes(bytes.toString('latin1', 4, 8))) return { kind: 'video' };
   const webmOrMatroska = bytes.length >= 4 && bytes.readUInt32BE(0) === 0x1a45dfa3;
   const avi = bytes.length >= 12 && bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'AVI ';
   if (webmOrMatroska || avi) return { kind: 'unsupported', message: LINKEDIN_VIDEO_FORMAT_MESSAGE };
-  return { kind: 'image' }; // unknown bytes are left to the image pipeline, as before
+  return { kind: 'unknown' };
 }
 
-/** The downloaded bytes are the authority on what a media_url is, not its extension. */
+/** The downloaded bytes are the authority on what a media_url is, not its extension or its content-type. */
 export function classifyMedia(contentTypeHeader: unknown, head: Buffer): MediaClass {
+  if (head.length === 0) return { kind: 'unsupported', message: 'A LinkedIn media_url returned an empty file. Nothing was posted.' };
+  const sniffed = sniff(head);
+  if (sniffed.kind !== 'unknown') return sniffed;
   const contentType = String(contentTypeHeader ?? '').split(';')[0].trim().toLowerCase();
   if (contentType.startsWith('image/')) return { kind: 'image' };
   if (MP4_CONTENT_TYPES.includes(contentType)) return { kind: 'video' };
   if (contentType.startsWith('video/')) return { kind: 'unsupported', message: LINKEDIN_VIDEO_FORMAT_MESSAGE };
-  if (GENERIC_CONTENT_TYPES.includes(contentType)) return sniff(head);
+  if (GENERIC_CONTENT_TYPES.includes(contentType)) return { kind: 'image' }; // unrecognised bytes stay with the image pipeline, as before
   return NOT_MEDIA(contentType);
 }
 
@@ -88,21 +97,21 @@ export function assertImageDownload(contentTypeHeader: unknown, bytes: Buffer): 
   );
 }
 
-let activeVideoUploads = 0;
-const waitingVideoUploads: Array<() => void> = [];
+let activeMediaUploads = 0;
+const waitingMediaUploads: Array<() => void> = [];
 
-/** At most LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS run at once; the rest queue. */
-export async function withVideoUploadSlot<T>(run: () => Promise<T>): Promise<T> {
-  if (activeVideoUploads >= LINKEDIN_MAX_CONCURRENT_VIDEO_UPLOADS) {
-    await new Promise<void>(resolve => waitingVideoUploads.push(resolve));
+/** At most LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS download-and-upload runs at once, so spooled files stay bounded; the rest queue. */
+export async function withMediaUploadSlot<T>(run: () => Promise<T>): Promise<T> {
+  if (activeMediaUploads >= LINKEDIN_MAX_CONCURRENT_MEDIA_UPLOADS) {
+    await new Promise<void>(resolve => waitingMediaUploads.push(resolve));
   } else {
-    activeVideoUploads++;
+    activeMediaUploads++;
   }
   try {
     return await run();
   } finally {
-    const next = waitingVideoUploads.shift();
+    const next = waitingMediaUploads.shift();
     if (next) next(); // hand the slot straight over
-    else activeVideoUploads--;
+    else activeMediaUploads--;
   }
 }
