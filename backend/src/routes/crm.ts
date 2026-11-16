@@ -5769,6 +5769,16 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
 });
 
 /**
+ * ENG-3052: the db layer signals a missing lead or engagement by message and a
+ * lost race by `preconditionFailed`. Those are 404 and 409, not 500.
+ */
+function engagementWriteErrorStatus(error: any): 404 | 409 | 500 {
+  if (error?.preconditionFailed === true) return 409;
+  if (error?.message === 'Lead not found' || error?.message === 'Engagement not found') return 404;
+  return 500;
+}
+
+/**
  * @route PUT /api/crm/lists/:listId/leads/:leadId/engagements/:eventId
  * @desc Update a custom engagement event for a lead
  * @access Private
@@ -5813,7 +5823,11 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
     res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error updating lead engagement:', error);
-    res.status(500).json({ message: error.message || 'Failed to update lead engagement' });
+    const status = engagementWriteErrorStatus(error);
+    if (status === 409) {
+      return res.status(409).json({ message: 'This lead changed while the engagement was being saved. Reload and try again.' });
+    }
+    res.status(status).json({ message: error.message || 'Failed to update lead engagement' });
   }
 });
 
@@ -5846,7 +5860,11 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
     res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error deleting lead engagement:', error);
-    res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
+    const status = engagementWriteErrorStatus(error);
+    if (status === 409) {
+      return res.status(409).json({ message: 'This lead changed while the engagement was being saved. Reload and try again.' });
+    }
+    res.status(status).json({ message: error.message || 'Failed to delete lead engagement' });
   }
 });
 

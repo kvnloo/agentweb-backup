@@ -81,6 +81,8 @@ const s3 = new S3();
 // Helper function to handle DynamoDB errors
 /** True when a resubscribe call asked for any condition (so a refused condition is an answer, not an error). */
 const hasResubscribeConditions = (options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) => Boolean(options?.onlyIfOptOutNonce || options?.onlyIfUnsubscribedAt);
+/** ENG-3052: lost-race re-reads before an engagement edit/delete gives up. */
+const ENGAGEMENT_REWRITE_MAX_ATTEMPTS = 3;
 
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
@@ -10087,37 +10089,69 @@ export const crmDb = {
     }
   },
 
-  async updateLeadEngagement(listId: string, leadId: string, eventId: string, engagement: {
-    eventType: string;
-    eventData: any;
-    createdAt: string;
-  }) {
-    try {
+  /**
+   * ENG-3052: read-modify-write of a lead's `engagements` array for edit and
+   * delete. The write only lands if the lead still looks the way it did when it
+   * was read: same `updatedAt` (or still no `updatedAt`) and the same number of
+   * engagements. `addLeadEngagement` appends server-side and can land between
+   * the read and the write; an unconditioned `SET engagements = :whole` would
+   * then overwrite that append with the stale array.
+   *
+   * The count is checked as well as `updatedAt` because an unconditional append
+   * stamps `updatedAt` from the clock and could, within one millisecond, rewrite
+   * the same value. An append always changes the count.
+   *
+   * On a lost race the lead is re-read and `rebuild` runs again on the fresh
+   * array. After ENGAGEMENT_REWRITE_MAX_ATTEMPTS lost races the thrown error
+   * carries `preconditionFailed`, the same signal `addLeadEngagement` uses.
+   */
+  async rewriteLeadEngagements(
+    listId: string,
+    leadId: string,
+    rebuild: (existing: Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) => Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>,
+  ) {
+    for (let attempt = 1; ; attempt++) {
       // Get the lead first to ensure it exists
       const lead = await this.getLeadById(listId, leadId);
       if (!lead) {
         throw new Error('Lead not found');
       }
 
-      // Get existing engagements or initialize empty array
-      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
-
-      // Find the engagement by eventId
-      const engagementIndex = existingEngagements.findIndex((eng) => eng.eventId === eventId);
-
-      if (engagementIndex === -1) {
-        throw new Error('Engagement not found');
-      }
-
-      // Update the engagement while preserving the eventId
-      const updatedEngagements = [...existingEngagements];
-      updatedEngagements[engagementIndex] = {
-        ...engagement,
-        eventId, // Preserve the original eventId
-      };
+      const hasEngagementsAttribute = Array.isArray(lead.engagements);
+      const existingEngagements = (hasEngagementsAttribute ? lead.engagements : []) as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>;
+      // Throws 'Engagement not found' when the target is absent.
+      const updatedEngagements = rebuild(existingEngagements);
       const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
 
-      // Update the lead with the updated engagements array
+      // Compare against whatever is stored, including a null or a non-string
+      // value: a condition the row can never satisfy would refuse every edit.
+      const expectedUpdatedAt = (lead as any).updatedAt;
+      // Move the token strictly past the one read, so this write always changes it.
+      let stampedUpdatedAt = new Date().toISOString();
+      if (typeof expectedUpdatedAt === 'string' && stampedUpdatedAt <= expectedUpdatedAt) {
+        const bumped = new Date(new Date(expectedUpdatedAt).getTime() + 1);
+        if (!Number.isNaN(bumped.getTime())) stampedUpdatedAt = bumped.toISOString();
+      }
+
+      const expressionAttributeValues: Record<string, any> = {
+        ':engagements': updatedEngagements,
+        ':isEngaged': isEngaged,
+        ':updatedAt': stampedUpdatedAt,
+      };
+      const conditions = ['attribute_exists(leadId)'];
+      if (expectedUpdatedAt !== undefined) {
+        conditions.push('updatedAt = :expectedUpdatedAt');
+        expressionAttributeValues[':expectedUpdatedAt'] = expectedUpdatedAt;
+      } else {
+        conditions.push('attribute_not_exists(updatedAt)');
+      }
+      // Only when a list was read. A row whose `engagements` is absent or not a
+      // list is guarded by `updatedAt` alone.
+      if (hasEngagementsAttribute) {
+        conditions.push('size(engagements) = :expectedCount');
+        expressionAttributeValues[':expectedCount'] = existingEngagements.length;
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
@@ -10125,16 +10159,46 @@ export const crmDb = {
           leadId,
         },
         UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
-        ExpressionAttributeValues: {
-          ':engagements': updatedEngagements,
-          ':isEngaged': isEngaged,
-          ':updatedAt': new Date().toISOString(),
-        },
+        ConditionExpression: conditions.join(' AND '),
+        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      try {
+        const result = await dynamodb.update(params).promise();
+        return result.Attributes;
+      } catch (updateError: any) {
+        if (updateError?.code !== 'ConditionalCheckFailedException') throw updateError;
+        if (attempt >= ENGAGEMENT_REWRITE_MAX_ATTEMPTS) {
+          const raceError: any = new Error('Lead engagement precondition failed');
+          raceError.preconditionFailed = true;
+          throw raceError;
+        }
+        // The lead changed (or was deleted) under us: re-read and re-decide.
+      }
+    }
+  },
+
+  async updateLeadEngagement(listId: string, leadId: string, eventId: string, engagement: {
+    eventType: string;
+    eventData: any;
+    createdAt: string;
+  }) {
+    try {
+      return await this.rewriteLeadEngagements(listId, leadId, (existingEngagements) => {
+        // Find the engagement by eventId
+        const engagementIndex = existingEngagements.findIndex((eng) => eng.eventId === eventId);
+        if (engagementIndex === -1) {
+          throw new Error('Engagement not found');
+        }
+        // Update the engagement while preserving the eventId
+        const updatedEngagements = [...existingEngagements];
+        updatedEngagements[engagementIndex] = {
+          ...engagement,
+          eventId, // Preserve the original eventId
+        };
+        return updatedEngagements;
+      });
     } catch (error) {
       handleDynamoDbError(error, "updateLeadEngagement");
       throw error;
@@ -10143,42 +10207,15 @@ export const crmDb = {
 
   async deleteLeadEngagement(listId: string, leadId: string, eventId: string) {
     try {
-      // Get the lead first to ensure it exists
-      const lead = await this.getLeadById(listId, leadId);
-      if (!lead) {
-        throw new Error('Lead not found');
-      }
-
-      // Get existing engagements or initialize empty array
-      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
-
-      // Find and remove the matching engagement by eventId
-      const updatedEngagements = existingEngagements.filter((eng) => eng.eventId !== eventId);
-      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
-
-      // Check if we actually removed something
-      if (updatedEngagements.length === existingEngagements.length) {
-        throw new Error('Engagement not found');
-      }
-
-      // Update the lead with the updated engagements array
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        Key: {
-          listId,
-          leadId,
-        },
-        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
-        ExpressionAttributeValues: {
-          ':engagements': updatedEngagements,
-          ':isEngaged': isEngaged,
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
-
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return await this.rewriteLeadEngagements(listId, leadId, (existingEngagements) => {
+        // Find and remove the matching engagement by eventId
+        const updatedEngagements = existingEngagements.filter((eng) => eng.eventId !== eventId);
+        // Check if we actually removed something
+        if (updatedEngagements.length === existingEngagements.length) {
+          throw new Error('Engagement not found');
+        }
+        return updatedEngagements;
+      });
     } catch (error) {
       handleDynamoDbError(error, "deleteLeadEngagement");
       throw error;
