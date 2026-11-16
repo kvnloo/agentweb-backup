@@ -200,6 +200,7 @@ describe('renderConfirmPage', () => {
     expect(page).toContain('<form method="post" action="/x"');
     expect(page).toContain('name="token"');
     expect(page).toContain('<meta name="robots" content="noindex">');
+    expect(page).toContain('<html lang="en">');
     expect(renderConfirmPage({ title: 't', message: 'm' })).not.toContain('<form');
   });
 });
