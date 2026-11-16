@@ -263,11 +263,40 @@ describe('POST /api/tasks/:taskId/unsubscribe (public)', () => {
     expect((subscriberDb.softUnsubscribe as jest.Mock).mock.calls.at(-1)![2]).toHaveLength(2000);
   });
 
+  it('cuts a long feedback note on whole characters (an emoji is not split in half)', async () => {
+    (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(subscribed);
+    await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL, feedback: '😀'.repeat(2500) }).expect(200);
+    const stored = (subscriberDb.softUnsubscribe as jest.Mock).mock.calls.at(-1)![2] as string;
+    expect(Array.from(stored)).toHaveLength(2000);
+    expect(stored.length).toBe(4000);
+    expect(stored).toBe('😀'.repeat(2000)); // no lone surrogate at the cut
+  });
+
   it('does not repeat a database error message to the visitor', async () => {
     (subscriberDb.getTaskSubscriberByEmail as jest.Mock).mockResolvedValue(subscribed);
     (subscriberDb.softUnsubscribe as jest.Mock).mockRejectedValue(new Error('ProvisionedThroughputExceededException: table AW-Subscribers'));
     const res = await post(`/api/tasks/${TASK}/unsubscribe`).send({ email: EMAIL }).expect(500);
     expect(JSON.stringify(res.body)).not.toContain('AW-Subscribers');
+  });
+});
+
+describe('the per-connection limit on the confirm page and its button', () => {
+  it('allows 300 an hour from one connection (a mail gateway opens every link it scans), then answers a plain page with 429 and reads nothing more', async () => {
+    const getFromOneConnection = () => request(app).get(`/api/tasks/${TASK}/subscribers/confirm`).query({ token: 'nope' }).set('X-Forwarded-For', '203.0.113.201');
+    for (let i = 0; i < 300; i++) expect((await getFromOneConnection()).status).toBe(400);
+    (taskDb.getTaskById as jest.Mock).mockClear();
+    const limited = await getFromOneConnection();
+    expect(limited.status).toBe(429);
+    expect(limited.type).toBe('text/html');
+    expect(limited.text).toContain('Too many requests');
+    expect(limited.headers['cache-control']).toBe('no-store');
+    expect(limited.headers['referrer-policy']).toBe('same-origin');
+    // the button's POST shares the same counter, and nothing was read for either
+    const press = await request(app).post(`/api/tasks/${TASK}/subscribers/confirm`).type('form').send({ token: 'nope' }).set('X-Forwarded-For', '203.0.113.201');
+    expect(press.status).toBe(429);
+    expect(taskDb.getTaskById).not.toHaveBeenCalled();
+    // another connection is unaffected
+    expect((await request(app).get(`/api/tasks/${TASK}/subscribers/confirm`).query({ token: 'nope' }).set('X-Forwarded-For', '203.0.113.202')).status).toBe(400);
   });
 });
 

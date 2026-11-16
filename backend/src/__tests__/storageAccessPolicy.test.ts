@@ -360,6 +360,39 @@ describe('decideStorageAccess: when a lookup fails', () => {
   });
 });
 
+describe('StorageAccessLookups: how many records one request may look up', () => {
+  beforeEach(() => {
+    getUser.mockReset();
+    getUser.mockImplementation(async (id: string) => users[id]);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('looks up at most 20 distinct records; the rest count as not found, with one log line for the request', async () => {
+    const lookups = new StorageAccessLookups();
+    const found = await Promise.all(Array.from({ length: 30 }, (_, i) => lookups.user(`ghost-${i}`)));
+    expect(getUser).toHaveBeenCalledTimes(StorageAccessLookups.MAX_DISTINCT_LOOKUPS);
+    expect(found.every((u) => u === null)).toBe(true);
+    expect((console.warn as jest.Mock).mock.calls.filter((c) => String(c[0]).includes('storage_access_lookup_limit'))).toHaveLength(1);
+  });
+
+  it('asking again for a record already looked up costs nothing and does not count', async () => {
+    const lookups = new StorageAccessLookups();
+    for (let round = 0; round < 5; round++) for (let i = 0; i < 20; i++) await lookups.user(i === 0 ? 'me' : `ghost-${i}`);
+    expect(getUser).toHaveBeenCalledTimes(20);
+    expect(await lookups.user('me')).toMatchObject({ userId: 'me' }); // the first twenty keep working however often they are asked
+  });
+
+  it('a batch naming 50 made-up owners refuses them all without 50 reads, and still allows the caller\'s own files and records inside the limit', async () => {
+    const lookups = new StorageAccessLookups();
+    const keys = Array.from({ length: 50 }, (_, i) => `users/ghost${i}/files/1/abc/a.png`);
+    const decisions = await Promise.all(keys.map((key) => decideStorageAccess(ME, key, 'read', lookups)));
+    expect(decisions.every((d) => !d.allow)).toBe(true);
+    expect(getUser.mock.calls.length).toBeLessThanOrEqual(StorageAccessLookups.MAX_DISTINCT_LOOKUPS);
+    expect((await decideStorageAccess(ME, 'users/me/files/1/abc/mine.png', 'read', lookups)).allow).toBe(true); // no lookup needed for one's own key
+  });
+});
+
 describe('decideStorageAccess: ids that cannot name a record are never looked up', () => {
   it('refuses them without asking the database (a long or odd id cannot exist, and a 600-character one would even make the lookup throw)', async () => {
     const long = 'x'.repeat(600);
