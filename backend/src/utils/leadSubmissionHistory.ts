@@ -78,3 +78,43 @@ export function collectOverwrittenValues(
   }
   return prior;
 }
+
+/**
+ * Attempts for one guarded notes merge. The writer that loses every round needs one attempt
+ * per competitor, so five attempts could not absorb a six-way burst: measured on Dev-AW-Leads,
+ * one of six concurrent appends ran out of attempts in 4 of 6 runs.
+ */
+export const NOTES_GUARD_MAX_ATTEMPTS = 8;
+const NOTES_GUARD_BASE_DELAY_MS = 25;
+const NOTES_GUARD_MAX_DELAY_MS = 400;
+
+const isLostNotesGuard = (err: any): boolean =>
+  err?.code === 'ConditionalCheckFailedException' || err?.name === 'ConditionalCheckFailedException';
+
+/**
+ * Run `mergeOnce` against `initial`; when its notes compare-and-set loses to a concurrent
+ * writer, wait a jittered moment, re-read the row and merge again. Any other error, and a
+ * lost guard on the last attempt, is rethrown. The wait is full jitter over a doubling
+ * ceiling so the losers of one round do not all retry at the same instant.
+ */
+export async function mergeWithNotesRetry<T>(
+  initial: T,
+  mergeOnce: (current: T) => Promise<void>,
+  reread: (current: T) => Promise<T | null | undefined>,
+  opts: { sleep?: (ms: number) => Promise<void>; random?: () => number } = {},
+): Promise<void> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const random = opts.random ?? Math.random;
+  let current = initial;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await mergeOnce(current);
+      return;
+    } catch (err) {
+      if (!isLostNotesGuard(err) || attempt >= NOTES_GUARD_MAX_ATTEMPTS) throw err;
+      const ceiling = Math.min(NOTES_GUARD_MAX_DELAY_MS, NOTES_GUARD_BASE_DELAY_MS * 2 ** (attempt - 1));
+      await sleep(Math.floor(random() * ceiling));
+      current = (await reread(current)) || current;
+    }
+  }
+}

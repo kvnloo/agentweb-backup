@@ -28,7 +28,7 @@ import { pruneClickIds } from '../utils/leadSchema';
 import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
-import { appendNotes, collectOverwrittenValues } from '../utils/leadSubmissionHistory';
+import { appendNotes, collectOverwrittenValues, mergeWithNotesRetry } from '../utils/leadSubmissionHistory';
 import { onPublicFormSubmitted } from '../services/contactCaptureHooks';
 import { buildCallConsentRecord, consentPhoneDigits, pageUrlOf, parseCallConsent, type CallConsentRecord } from '../services/voice/callConsent';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
@@ -1043,19 +1043,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     };
 
     // Share the retry across email hits, phone matches, and create-race adoption.
-    const mergeIntoExistingLead = async (initial: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> => {
-      let current = initial;
-      for (let attempt = 0; ; attempt++) {
-        try {
-          await mergeIntoExistingLeadOnce(current, opts);
-          return;
-        } catch (err: any) {
-          const lost = err?.code === 'ConditionalCheckFailedException' || err?.name === 'ConditionalCheckFailedException';
-          if (!lost || attempt >= 4) throw err;
-          current = (await crmDb.getLeadById(leadList.listId, current.leadId, { consistentRead: true })) || current;
-        }
-      }
-    };
+    const mergeIntoExistingLead = (initial: any, opts: { fillBlanksOnly?: boolean } = {}): Promise<void> =>
+      mergeWithNotesRetry<any>(
+        initial,
+        (current) => mergeIntoExistingLeadOnce(current, opts),
+        (current) => crmDb.getLeadById(leadList.listId, current.leadId, { consistentRead: true }),
+      );
 
     // ENG-2837: everything above is a read; from here on a lead write may happen (and may
     // succeed even if its call then throws), so a claimed key can no longer be given back.
