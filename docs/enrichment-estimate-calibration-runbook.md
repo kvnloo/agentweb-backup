@@ -55,8 +55,9 @@ as the customer quote does, and is not marked. AWS error text is reduced to the 
 Left out as non-customers: the test account `test@account.com` (`--exclude-emails`, case-insensitive), every platform admin
 (`isAdmin`), every account whose email domain is, or is a subdomain of, `agentweb.pro` or `argusoft.com`
 (`--exclude-domains`; a look-alike such as `agentweb.pro.example.com` stays in) and any `--exclude-user-ids` (a prefix of
-6 or more characters, as printed in the table, is enough). It prints how many accounts each rule excluded and warns when an
-`--exclude-user-ids` entry matches nothing. The user table is read whole and matched inside the script, so no email is put
+6 or more characters, as printed in the table, is enough; it is matched against the user table and against the user ids in
+the run logs, so an account that has been deleted from the user table can still be excluded). It prints how many accounts
+each rule excluded and warns when an `--exclude-user-ids` entry matches nothing. The user table is read whole and matched inside the script, so no email is put
 into a DynamoDB expression or printed. Real customer
 accounts are kept whatever their email domain. The script only issues read calls, but the guarantee that nothing can be
 written is the IAM role: run it with a read-only one. The script reads the three rate constants and `referenceFieldCount` from
@@ -70,7 +71,8 @@ written is the IAM role: run it with a read-only one. The script reads the three
   customer quote's formula (included fields plus smart-field dependencies, at least 1; 10 when the list has no saved
   config) to the list's *saved* config. The quote also counts columns added to the list since the config was saved; this
   check does not (about 3% of the ratio per column: a reviewer estimated that the Nuerraa list, 12 saved fields and about 3
-  columns not in its saved config, would read about 1.56 instead of 1.68 on the quote's count).
+  columns not in its saved config, would read about 1.56 instead of 1.68 on the quote's count; the quote also drops saved
+  fields that are excluded or reserved, a smaller effect in the other direction).
 - Within +/-25% on enough data (all three conditions above): leave the constants alone.
 - Beyond that on enough data: retune `ENRICHMENT_COST_RATES_USD`, update the calibration paragraph in that file's header
   and the tests in `enrichmentCostEstimate.test.ts`, and ship it through the normal PR rules. Record the sample below.
@@ -88,8 +90,9 @@ written is the IAM role: run it with a read-only one. The script reads the three
 ## Known limits
 
 - The ledger is per user and day, so a day with an enrich run and a preview, or two lists, is compared as a whole. The
-  ledger feature `enrichment` is also written by other code (for example the ICP-filter LLM extractor, `icpFilterLlmExtractor.ts`),
-  so that spend on a run day counts as booked even though it is not part of the run.
+  ledger features `crm_enrichment` and `enrichment` are also written by other code (for example the ICP-filter LLM
+  extractor, `icpFilterLlmExtractor.ts`, and Apollo person lookups made outside a v3 run), so that spend counts as booked
+  on any day the same account also runs v3, even though it is not part of the run.
 - The field count is read from each list's *current* enrichment config, which may differ from the run's.
 - Customer quotes use a model-aware per-field cost; this check uses the same per-field constant the recalibration used.
 - A run that straddles midnight UTC is split across days. A run that started before `--since` is not counted (the script
