@@ -12,8 +12,10 @@ dollars per processed contact next to what the estimate formula quotes for leads
 
     quote per contact = fields * llmPerFieldPerLead + lookupPerLead + webSearchPerLead
 
-where `fields` mirrors the customer quote's `effectiveFieldCount`: included fields plus their smart-field dependencies
-(at least 1), and `referenceFieldCount` when the list has no saved enrichment config.
+where `fields` applies the customer quote's `effectiveFieldCount` formula (included fields plus their smart-field
+dependencies, at least 1) to the list's SAVED enrichment config, or `referenceFieldCount` when there is none. The customer
+quote counts the saved config merged with the list's current columns, so a column added to the list after the config was
+saved counts there but not here (about 3% of the ratio per column).
 
 The quote's Apollo email-search term is not part of that formula, so booked dollars here EXCLUDE `apollo:waterfall_email`
 (the paid email search); that spend is shown in its own column.
