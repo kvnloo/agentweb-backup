@@ -7,9 +7,10 @@
  * is cut short at its in-flight lease (setRunInFlight -> 'already_in_flight') so no
  * model work happens; setRunInFlight is asserted alongside as a second count.
  *
- * scheduleDb.updateScheduleAfterRun is a fake with the real single-winner rule of
- * the conditional write: the first advance for a (schedule, expected due time) pair
- * lands, a later one with the same expected due time throws `preconditionFailed`.
+ * scheduleDb.updateScheduleAfterRun is a fake that keeps one stored row per schedule
+ * and applies the rule of the conditional write: an advance lands only if the
+ * expected due time and last run time both match the stored row, and it then moves
+ * both. Otherwise it throws `preconditionFailed`.
  * The real condition is pinned in db.scheduleConditionalAdvance.test.ts. The mock
  * preamble is lifted from agentModeController.capacityGate.test.ts.
  */
@@ -164,22 +165,23 @@ async function poll() {
 }
 
 describe('ENG-3047 one run per scheduled fire in the due-schedule loop', () => {
-  let advanced: Set<string>;
+  let stored: Map<string, { nextRunTime: string; lastRunTime: string | undefined }>;
   let errorSpy: jest.SpyInstance;
   const savedRunStoreFlag = process.env.AGENT_RUN_STORE;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    advanced = new Set();
-    mockAdvance.mockImplementation(async (scheduleId: string, _last: string, _next: string, _decrement?: boolean, expectedNextRunTime?: string) => {
-      if (expectedNextRunTime === undefined) return undefined;
-      const key = `${scheduleId}|${expectedNextRunTime}`;
-      if (advanced.has(key)) {
+    stored = new Map();
+    mockAdvance.mockImplementation(async (scheduleId: string, last: string, next: string, _decrement?: boolean, expected?: { nextRunTime: string; lastRunTime: string | undefined }) => {
+      if (expected === undefined) return undefined;
+      // A schedule the test has not seeded is taken to be stored as the caller read it.
+      const row = stored.get(scheduleId) ?? { ...expected };
+      if (row.nextRunTime !== expected.nextRunTime || row.lastRunTime !== expected.lastRunTime) {
         const lost: any = new Error('Schedule advance precondition failed');
         lost.preconditionFailed = true;
         throw lost;
       }
-      advanced.add(key);
+      stored.set(scheduleId, { nextRunTime: next, lastRunTime: last });
       return undefined;
     });
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([dueSchedule()] as any);
@@ -218,8 +220,8 @@ describe('ENG-3047 one run per scheduled fire in the due-schedule loop', () => {
     }
 
     expect(mockAdvance).toHaveBeenCalledTimes(2);
-    expect(mockAdvance.mock.calls[0][4]).toBe(DUE);
-    expect(mockAdvance.mock.calls[1][4]).toBe(DUE);
+    expect(mockAdvance.mock.calls[0][4]).toEqual({ nextRunTime: DUE, lastRunTime: LAST });
+    expect(mockAdvance.mock.calls[1][4]).toEqual({ nextRunTime: DUE, lastRunTime: LAST });
     // The loser decrements nothing: its only write is the one the condition refused.
     expect(mockAdvance.mock.calls[0][3]).toBe(true);
     expect(mockTrack).toHaveBeenCalledTimes(1);
@@ -227,13 +229,45 @@ describe('ENG-3047 one run per scheduled fire in the due-schedule loop', () => {
 
   it('never suppresses a later fire of the same schedule', async () => {
     await poll();
-    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([
-      dueSchedule({ nextRunTime: '2026-11-16T09:00:00.000Z', lastRunTime: '2026-11-15T09:00:05.000Z' }),
-    ] as any);
+    // The next fire: the row as the first fire left it.
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([dueSchedule({ ...stored.get('sched-1')! })] as any);
     await poll();
 
     expect(mockTrack).toHaveBeenCalledTimes(2);
     expect(mockScheduleDb.setRunInFlight).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a stale caller after the owner sets the schedule back to the same due time, and lets a fresh read fire', async () => {
+    await poll();
+    expect(mockTrack).toHaveBeenCalledTimes(1);
+
+    // Owner edit: the due time is restored. The last run time written by the first fire stays.
+    const afterFirstFire = stored.get('sched-1')!;
+    stored.set('sched-1', { nextRunTime: DUE, lastRunTime: afterFirstFire.lastRunTime });
+
+    // A caller still holding the row as it was before the first fire.
+    const stale = await poll();
+    expect(mockTrack).toHaveBeenCalledTimes(1);
+    expect(stale.json).toHaveBeenCalledWith(expect.objectContaining({
+      results: [expect.objectContaining({ status: 'already_started' })],
+    }));
+
+    // A caller that reads the row as it is now.
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([
+      dueSchedule({ lastRunTime: afterFirstFire.lastRunTime }),
+    ] as any);
+    await poll();
+    expect(mockTrack).toHaveBeenCalledTimes(2);
+  });
+
+  it('expects no last run time on a schedule that has never run', async () => {
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([dueSchedule({ lastRunTime: undefined })] as any);
+
+    await poll();
+    await poll();
+
+    expect(mockAdvance.mock.calls[0][4]).toEqual({ nextRunTime: DUE, lastRunTime: undefined });
+    expect(mockTrack).toHaveBeenCalledTimes(1);
   });
 
   it('guards the fire the same way with AGENT_RUN_STORE off and on', async () => {

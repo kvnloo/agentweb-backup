@@ -4539,12 +4539,16 @@ export const scheduleDb = {
   },
 
   /**
-   * ENG-3047: pass `expectedNextRunTime` (the due time the caller read) to make the
-   * advance land only if the row still carries it. Of two callers that read the same
-   * due row, one advances and decrements `runCount`; the other gets an error marked
-   * `preconditionFailed` and has changed nothing. Without it the write is unconditional.
+   * ENG-3047: pass `expected` (the due time and last run time the caller read) to make
+   * the advance land only if the row still carries both. Of two callers that read the
+   * same due row, one advances and decrements `runCount`; the other gets an error
+   * marked `preconditionFailed` and has changed nothing. `lastRunTime` is checked as
+   * well because it moves on every fire: an edit that puts the old due time back
+   * cannot let a caller holding the older row through. A `lastRunTime` that was read
+   * as anything but a non-empty string or absent is not checked. Without `expected`
+   * the write is unconditional.
    */
-  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true, expectedNextRunTime?: string) {
+  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true, expected?: { nextRunTime: string; lastRunTime?: unknown }) {
     try {
       // First, get the current schedule to check runCount
       const getParams = {
@@ -4598,14 +4602,21 @@ export const scheduleDb = {
         ReturnValues: 'ALL_NEW',
       };
 
-      if (expectedNextRunTime === undefined) {
+      if (expected === undefined) {
         const result = await dynamodb.update(params).promise();
         return result.Attributes;
       }
 
-      attributeValues[':expectedNextRunTime'] = expectedNextRunTime;
+      const conditions = ['#nextRunTime = :expectedNextRunTime'];
+      attributeValues[':expectedNextRunTime'] = expected.nextRunTime;
+      if (typeof expected.lastRunTime === 'string' && expected.lastRunTime.length > 0) {
+        conditions.push('#lastRunTime = :expectedLastRunTime');
+        attributeValues[':expectedLastRunTime'] = expected.lastRunTime;
+      } else if (expected.lastRunTime === undefined) {
+        conditions.push('attribute_not_exists(#lastRunTime)');
+      }
       try {
-        const result = await dynamodb.update({ ...params, ConditionExpression: '#nextRunTime = :expectedNextRunTime' }).promise();
+        const result = await dynamodb.update({ ...params, ConditionExpression: conditions.join(' AND ') }).promise();
         return result.Attributes;
       } catch (updateError: any) {
         if (updateError?.code !== 'ConditionalCheckFailedException') throw updateError;

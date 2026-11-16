@@ -1,10 +1,11 @@
 /**
  * ENG-3047 — scheduleDb.updateScheduleAfterRun with an expected due time.
  *
- * The due-schedule loop passes the `nextRunTime` it read. The write then lands only
- * if the row still carries that value, so of two callers that read the same due row
- * exactly one advances it (and decrements runCount). Callers that pass no expected
- * value keep the unconditional write.
+ * The due-schedule loop passes the `nextRunTime` and `lastRunTime` it read. The write
+ * then lands only if the row still carries both, so of two callers that read the same
+ * due row exactly one advances it (and decrements runCount). `lastRunTime` moves on
+ * every fire, so an edit that puts the old due time back does not let a stale caller
+ * through. Callers that pass no expected value keep the unconditional write.
  */
 import AWS from 'aws-sdk';
 
@@ -27,6 +28,7 @@ import { scheduleDb } from '../services/db';
 
 const SCHEDULE_ID = 'sched-1';
 const DUE = '2026-11-15T09:00:00.000Z';
+const LAST = '2026-11-14T09:00:04.000Z';
 const NOW = '2026-11-15T09:00:05.000Z';
 const NEXT = '2026-11-16T09:00:00.000Z';
 
@@ -56,16 +58,27 @@ describe('ENG-3047 updateScheduleAfterRun conditional advance', () => {
     expect(params.ExpressionAttributeValues[':expectedNextRunTime']).toBeUndefined();
   });
 
-  it('conditions the write on the expected due time and still sets the new one', async () => {
-    const result = await scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, DUE);
+  it('conditions the write on the expected due time and last run time, and still sets the new ones', async () => {
+    const result = await scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, { nextRunTime: DUE, lastRunTime: LAST });
 
     const params = mockDynamoDB.update.mock.calls[0][0];
-    expect(params.ConditionExpression).toBe('#nextRunTime = :expectedNextRunTime');
+    expect(params.ConditionExpression).toBe('#nextRunTime = :expectedNextRunTime AND #lastRunTime = :expectedLastRunTime');
     expect(params.ExpressionAttributeNames['#nextRunTime']).toBe('nextRunTime');
+    expect(params.ExpressionAttributeNames['#lastRunTime']).toBe('lastRunTime');
     expect(params.ExpressionAttributeValues[':expectedNextRunTime']).toBe(DUE);
+    expect(params.ExpressionAttributeValues[':expectedLastRunTime']).toBe(LAST);
     expect(params.ExpressionAttributeValues[':nextRunTime']).toBe(NEXT);
+    expect(params.ExpressionAttributeValues[':lastRunTime']).toBe(NOW);
     expect(params.UpdateExpression).toContain('#runCount = #runCount - :one');
     expect(result).toEqual({ scheduleId: SCHEDULE_ID, runCount: 2 });
+  });
+
+  it('requires the last run time to still be absent for a schedule that has never run', async () => {
+    await scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, { nextRunTime: DUE, lastRunTime: undefined });
+
+    const params = mockDynamoDB.update.mock.calls[0][0];
+    expect(params.ConditionExpression).toBe('#nextRunTime = :expectedNextRunTime AND attribute_not_exists(#lastRunTime)');
+    expect(params.ExpressionAttributeValues[':expectedLastRunTime']).toBeUndefined();
   });
 
   it('throws preconditionFailed when the row no longer carries the expected due time', async () => {
@@ -73,7 +86,7 @@ describe('ENG-3047 updateScheduleAfterRun conditional advance', () => {
     conditional.code = 'ConditionalCheckFailedException';
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(conditional) });
 
-    await expect(scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, DUE))
+    await expect(scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, { nextRunTime: DUE, lastRunTime: LAST }))
       .rejects.toMatchObject({ preconditionFailed: true });
   });
 
@@ -82,7 +95,7 @@ describe('ENG-3047 updateScheduleAfterRun conditional advance', () => {
     throttled.code = 'ProvisionedThroughputExceededException';
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(throttled) });
 
-    const caught: any = await scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, DUE).catch((e) => e);
+    const caught: any = await scheduleDb.updateScheduleAfterRun(SCHEDULE_ID, NOW, NEXT, true, { nextRunTime: DUE, lastRunTime: LAST }).catch((e) => e);
     expect(caught).toBeInstanceOf(Error);
     expect(caught.preconditionFailed).toBeUndefined();
   });
