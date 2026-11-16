@@ -57,6 +57,12 @@ describe('addHotLeadCallBilling', () => {
     await expect(addHotLeadCallBilling('org-a')).resolves.toEqual({ itemId: 'si_hlc', alreadyPresent: false });
   });
 
+  it('never mirrors an item that is not on the subscription (a replayed idempotent response for a removed item)', async () => {
+    mockStripe.subscriptions.retrieve.mockResolvedValueOnce(sub([baseItem])).mockResolvedValueOnce(sub([baseItem])); // created item is absent
+    await expect(addHotLeadCallBilling('org-a')).rejects.toThrow(/could not be confirmed/);
+    expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
   it('does not report success when the mirror cannot be stored: calling stays off and a retry finishes it without a second charge', async () => {
     mockStripe.subscriptions.retrieve.mockResolvedValueOnce(sub([baseItem])).mockResolvedValueOnce(sub([baseItem, item()]));
     mockOrgDb.updateOrg.mockRejectedValueOnce(new Error('dynamo down'));
