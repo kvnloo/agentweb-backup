@@ -1,3 +1,25 @@
+## ENG-3038: consolidate PRs had no CI because GITHUB_TOKEN events start no workflows (2026-11-15)
+
+- Cause: `dev-md-fragments.yml` opens and force-updates the `automation/dev-md-consolidate` PR with the workflow's own `GITHUB_TOKEN`. GitHub starts no workflow for an event made by that token, so every `pull_request` run on that PR (actor `github-actions[bot]`) has zero jobs: `failure` on the opened pair (43755763117 / 43755763155), `action_required` on later updates (43761230507 / 43761230577).
+- The 11 checks on #4075 came from a manual close and reopen by a user token (runs 43756441782 / 43756441791), not from the workflow.
+- Fix: `workflow_dispatch` is an event `GITHUB_TOKEN` may start. After the consolidate job creates or updates the PR it dispatches `dev-md-fragments.yml` (guard) and `tests.yml` (Build) on the automation branch. Check runs are keyed on the commit, so `merge-evidence.sh` reads them at the PR head.
+- The dispatched guard looks the PR up by branch and fails unless the PR head equals the run's commit. Build honours a dispatch only on `automation/dev-md-consolidate`; on any other ref `Detect changed projects` fails.
+- Manual `workflow_dispatch` of `dev-md-fragments.yml` on `main` still consolidates; on the automation branch it now runs the guard instead.
+- Not provable before merge: the first consolidate PR opened after this lands is the proof.
+
+## ENG-3029: frontier monitor uploads the first Artificial Analysis response page as an artifact (2026-11-15)
+
+- Step 1 of 2. The `Frontier monitor and model catalog` workflow sets `AA_FIRST_PAGE_CAPTURE_PATH`; `fetchArtificialAnalysisModels` then writes the parsed body of page 1 to that path, and the workflow uploads it as artifact `artificial-analysis-first-page` (14 days).
+- The file is the response body only: no request, no headers, no key. A body that contains the key is not written. A capture failure goes to stderr and never fails the read. Without the env var nothing is written, so no other caller changes.
+- Not done yet: replacing the jest fixture (`artificialAnalysisLanguageModelsFree.json` is still the documented example). That needs the artifact from a real run after this merges; ENG-3029 stays open for it.
+
+## ENG-3021: No-inference readback routes for get_leads and get_lead_details (2026-11-15)
+
+- `POST /api/emma/leads` `{ list_id, limit?, cursor?, status?, search?, include_all_fields? }` and `POST /api/emma/lead-details` `{ list_id, lead_id }` call the same handlers as Emma's `get_leads` and `get_lead_details` tools (`backend/src/emma/impl/leads.ts`). No model run.
+- Read-only. The caller is always the authenticated user; identity fields in the body are ignored and the handlers enforce list access.
+- Both are `metered` in `EMMA_ROUTE_BUDGET`, like `POST /search-leads`.
+- Purpose: a post-merge verifier can read stored `contactStatus` and unsubscribe evidence through all three lead projections with a fixture token.
+
 ## ENG-3037: failure-cluster loop treats the "<X> not connected" wording as never-connected (2026-11-15)
 
 - `isNeverConnectedMessage` in `backend/src/loops/instances/agent-mode/failureRuleSet.ts` matched only "No <X> account connected" (ENG-2943). The other wording of the same precondition was counted as a dispatchable `config` failure and could file an Auto oncall row with nothing to act on (the google_drive cluster on ENG-2788).
