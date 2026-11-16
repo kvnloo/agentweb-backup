@@ -3586,6 +3586,38 @@
     }
   },
   {
+    "name": "read_client_meta_budgets",
+    "listed": false,
+    "description": "Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.\n\nResolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window.\n\nRefuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address, or a display name that matches exactly one client."
+        },
+        "since": {
+          "type": "string",
+          "description": "First day of the window, YYYY-MM-DD (inclusive)."
+        },
+        "until": {
+          "type": "string",
+          "description": "Last day of the window, YYYY-MM-DD (inclusive)."
+        }
+      },
+      "required": [
+        "client_name_or_email",
+        "since",
+        "until"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "read_email",
     "listed": false,
     "description": "Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. Available when signed in to Emma (OAuth) or with an API key holding 'email:read'. Cannot send or reply, and cannot read mailboxes shared by teammates.",
