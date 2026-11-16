@@ -1214,6 +1214,14 @@ describe('hot lead calls add-on (ENG-2783)', () => {
     await call();
     expect(addHotLeadCallBilling).not.toHaveBeenCalled();
   });
+  it('an approval given while the add-on was active does not authorize buying it if it lapses before the answer', async () => {
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: '2026-11-13T00:00:00.000Z' };
+    answerCard(recordHalt(await call()), 'approve'); // card said: already covered
+    org.hotLeadCallBilling = { itemId: 'si_1', status: 'canceled', updatedAt: '2026-11-13T01:00:00.000Z' };
+    const halt = await call();                        // now a purchase is needed: a new card, nothing bought
+    expect(card(halt).question).toContain('This costs');
+    expect(addHotLeadCallBilling).not.toHaveBeenCalled();
+  });
   it('the number card says the rent is part of the $70 price', async () => {
     org.hotLeadCall = configured({ verified: true });
     const halt = (await run('provision_hot_lead_call_number', {}, attended())) as Halt;

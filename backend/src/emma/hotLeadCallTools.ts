@@ -167,7 +167,8 @@ emmaToolRegistry.register({
         org,
         context,
         priceText: billingRequired ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
-        target: canonicalJson(patch),
+        // Whether this approval buys the add-on is part of what was approved: the digest changes if that flips before the answer.
+        target: canonicalJson(needsAddon ? { ...patch, _buysAddon: true } : patch),
         card: {
           action: 'enable',
           number: next.twilioNumber && maskPhone(next.twilioNumber),
