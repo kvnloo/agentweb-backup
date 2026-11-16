@@ -3,9 +3,11 @@
 
 READ-ONLY. It only calls `aws logs describe-log-groups|filter-log-events` and `aws dynamodb scan|get-item`; it writes
 nothing to AWS and prints aggregates only (a 6-character user id prefix, counts and dollars; never an email, a lead or a
-field value). Left out as non-customers: test accounts (by email), platform admins (`isAdmin`), every account on the
-internal domains (--exclude-domains, default agentweb.pro and argusoft.com) and any --exclude-user-ids. Real customer
-accounts are kept whatever their email domain.
+field value). The only guarantee that nothing can be written is the IAM role you run it with: use a read-only one. Left out
+as non-customers (matched in Python, case-insensitively, so no email ever reaches a DynamoDB expression or the output): test
+accounts (--exclude-emails), platform admins (`isAdmin`), every account whose email domain is, or is a subdomain of, one of
+--exclude-domains (default agentweb.pro and argusoft.com) and any --exclude-user-ids. A look-alike such as
+agentweb.pro.example.com stays in. Real customer accounts are kept whatever their email domain.
 
 What it does: joins the enrichment runs found in the prod logs ("runEnrichment START" / "runEnrichment DONE") to the
 usage ledger (AW-UsageRecords, features crm_enrichment and enrichment) per account and day, then prints the booked
@@ -65,8 +67,8 @@ def short(text, limit=60):
 
 def scrub(text, limit=300):
     """AWS CLI error text without ARNs or email addresses (an SSO session name can be an email)."""
-    text = re.sub(r"arn:aws[a-z-]*:[^\s'\",]+", "<arn>", text)
-    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<email>", text)
+    text = re.sub(r"arn:aws[a-z-]*:\S+", "<arn>", text)
+    text = re.sub(r"\S+@[^\s'\",)]+", "<email>", text)
     return text.strip()[:limit]
 
 
@@ -124,9 +126,9 @@ def main():
                     help="first UTC day to include, YYYY-MM-DD, zero-padded. Pick the day AFTER the last change to pricing or the "
                          "enrichment pipeline and keep it until the data is enough: runs from before a change give a false DRIFT")
     ap.add_argument("--exclude-emails", default="test@account.com",
-                    help="comma-separated internal/test account emails to leave out (default: test@account.com)")
+                    help="comma-separated internal/test account emails to leave out, case-insensitive (default: test@account.com)")
     ap.add_argument("--exclude-domains", default="agentweb.pro,argusoft.com",
-                    help="comma-separated email domains of internal staff; every account on them is left out (default: agentweb.pro,argusoft.com)")
+                    help="comma-separated email domains of internal staff; every account on them or on a subdomain is left out (default: agentweb.pro,argusoft.com)")
     ap.add_argument("--exclude-user-ids", default="", help="comma-separated user ids to leave out as well")
     ap.add_argument("--aws", default=os.environ.get("AWS_CLI", "aws"), help="aws command (default: $AWS_CLI or 'aws')")
     ap.add_argument("--region", default="us-west-2")
@@ -138,6 +140,10 @@ def main():
     ap.add_argument("--tolerance", type=float, default=0.25, help="retune if booked/quote differs from 1 by more (default 0.25)")
     a = ap.parse_args()
     now = dt.datetime.now(dt.timezone.utc)
+    if not re.fullmatch(r"[A-Za-z0-9_./#-]+", a.log_group):  # the AWS CLI reads a file for values like file:///path
+        sys.exit("--log-group may only contain letters, digits and _ . / # -")
+    if not re.fullmatch(r"[a-z0-9-]+", a.region):
+        sys.exit("--region must look like us-west-2")
     try:
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.since):  # ASCII only; strptime accepts 2026-11-5 and the ledger date filter is a string compare
             raise ValueError
@@ -156,37 +162,25 @@ def main():
     reference_fields = int(reference_value)
     aws = Aws(a.aws, a.region)
 
-    # Accounts to leave out: test emails (both cases), platform admins, internal domains (exact suffix, checked below), explicit ids.
-    excl_emails = sorted({v for raw in a.exclude_emails.split(",") if raw.strip() for v in (raw.strip(), raw.strip().lower())})
-    domains = sorted({x.strip().lower().lstrip("@") for x in a.exclude_domains.split(",") if x.strip()})
-    vals = {":t": {"BOOL": True}}
-    clauses = ["isAdmin = :t"]
-    for i, e in enumerate(excl_emails):
-        vals[":e%d" % i] = {"S": e}
-    if excl_emails:
-        clauses.append("email IN (%s)" % ", ".join(":e%d" % i for i in range(len(excl_emails))))
-    for i, dom in enumerate(domains):
-        vals[":d%d" % i] = {"S": "@" + dom}
-        clauses.append("contains(email, :d%d)" % i)
-    d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId, email, isAdmin",
-            "--filter-expression", " OR ".join(clauses), "--expression-attribute-values", json.dumps(vals))
-    lower_emails = {e.lower() for e in excl_emails}
+    # Accounts to leave out. The user table is read whole and matched here, so emails (kept in memory only, never printed) are
+    # never put into a DynamoDB expression and the match is case-insensitive.
+    excl_emails = {raw.strip().lower() for raw in a.exclude_emails.split(",") if raw.strip()}
+    domains = sorted({x.strip().lower().lstrip("@") for x in a.exclude_domains.split(",") if x.strip().lstrip("@")})
+    d = aws("dynamodb", "scan", "--table-name", "AW-Users", "--projection-expression", "userId, email, isAdmin")
     test_ids = {x.strip() for x in a.exclude_user_ids.split(",") if x.strip()}
     for u in d.get("Items", []):
-        em = (u.get("email", {}).get("S") or "").lower()  # kept in memory only, never printed
-        if u.get("isAdmin", {}).get("BOOL") or em in lower_emails or any(em.endswith("@" + dom) for dom in domains):
+        em = (u.get("email", {}).get("S") or "").strip().lower()
+        if u.get("isAdmin", {}).get("BOOL") or em in excl_emails or any(em.endswith("@" + dom) or em.endswith("." + dom) for dom in domains):
             test_ids.add(u["userId"]["S"])
 
     start_ms = int(since_dt.timestamp() * 1000)
     groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups", [])
     keep = next((g.get("retentionInDays") for g in groups if g.get("logGroupName") == a.log_group), None)
     oldest_day = (now - dt.timedelta(days=keep)).date() if keep else None
-    if oldest_day and since_dt.date() < oldest_day:
-        print("WARNING: the log group keeps only %d days, so runs before %s are already gone; the result below starts later than --since."
-              % (keep, oldest_day.strftime("%Y-%m-%d")))
-    elif oldest_day and since_dt.date() == oldest_day:
-        print("WARNING: the log group keeps only %d days, so the early hours of %s are already gone but the ledger counts the whole day; "
-              "start one day later for a clean result." % (keep, a.since))
+    if oldest_day and since_dt.date() <= oldest_day:
+        print("WARNING: the log group keeps only %d days: runs before %s are already gone and %s itself is only partly covered, while the "
+              "ledger counts whole days (that inflates the ratio). Start --since at %s for a clean result."
+              % (keep, oldest_day.strftime("%Y-%m-%d"), oldest_day.strftime("%Y-%m-%d"), (oldest_day + dt.timedelta(days=1)).strftime("%Y-%m-%d")))
     ev = lambda pat: aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
                          "--filter-pattern", pat).get("events", [])
     starts = {}
@@ -208,10 +202,10 @@ def main():
         runs.append(dict(uid=uid, day=day, mode=mode, p=processed, lid=lid))
     cust = [r for r in runs if r["uid"] not in test_ids]
     print("runs since %s: %d in the logs, %d from excluded accounts, %d customer runs" % (a.since, len(runs), len(runs) - len(cust), len(cust)))
-    unfinished = sum(1 for rid in starts if rid not in finished)
+    unfinished = sum(1 for rid, st in starts.items() if rid not in finished and st[0] not in test_ids)
     orphans = sum(1 for rid in finished if rid not in starts)
-    print("not counted: %s started but not finished (still running or crashed; their cost sits in the booked dollars with no contacts), "
-          "%s finished whose start is before --since" % (plural(unfinished, "run"), plural(orphans, "run")))
+    print("not counted: %s of customer accounts started but not finished (still running or crashed; their cost sits in the booked dollars "
+          "with no contacts), %s finished whose start is before --since (account unknown)" % (plural(unfinished, "run"), plural(orphans, "run")))
 
     fields = {}
     for lid in {r["lid"] for r in cust}:
