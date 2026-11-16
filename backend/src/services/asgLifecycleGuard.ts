@@ -28,8 +28,10 @@
  *
  * Fail-safe by construction — every failure mode degrades to today's behavior or
  * better, never worse:
- *   - Not in an ASG / IMDS disabled (local dev, ECS, the test box): the metadata
- *     path 404s, the guard disables itself permanently and never fires.
+ *   - Not in an ASG / IMDS disabled (local dev, ECS, the test box): the token fetch
+ *     fails or the metadata path 404s on every poll; after
+ *     UNAVAILABLE_READS_BEFORE_DISABLE consecutive such reads the guard disables
+ *     itself and never fires. One failed read does NOT disable it (ENG-3094).
  *   - CompleteLifecycleAction denied or erroring: the hook still expires on its own
  *     HeartbeatTimeout with DefaultResult=CONTINUE, so an instance is never stranded.
  *   - The hook itself missing: `Terminated` is still reported for any termination, so
@@ -74,6 +76,38 @@ export const LIFECYCLE_POLL_INTERVAL_MS = 5000;
  * healthy instance — two polls costs 5 extra seconds against a 10-minute drain.
  */
 export const CONFIRMING_READS_REQUIRED = 2;
+
+/**
+ * ENG-3094: consecutive "unavailable" reads (IMDS token fetch failed, or the
+ * lifecycle-state path returned 404) before the guard concludes this machine is not
+ * in an Auto Scaling group and stops polling.
+ *
+ * It used to be 1. On 2026-11-16 a prod instance that WAS in the group logged
+ * "not an ASG instance" at boot, the guard stopped, nothing answered the termination
+ * hook, and the instance sat out the full 900 s heartbeat (26m44s to terminate
+ * against 14-16.5 min for its five siblings).
+ *
+ * 60 reads at LIFECYCLE_POLL_INTERVAL_MS is five minutes. Why five minutes:
+ *   - it comfortably outlasts a boot-time IMDS hiccup, and the window in which AWS
+ *     documents the path as absent: the item exists only once the instance has
+ *     transitioned to a target lifecycle state, "otherwise ... you receive an HTTP
+ *     404 error", and AWS tells callers to poll and retry
+ *     (docs.aws.amazon.com/autoscaling/ec2/userguide/retrieving-target-lifecycle-state-through-imds.html);
+ *   - it is far shorter than any deploy cycle, so a machine that really is outside a
+ *     group stops polling long before it matters;
+ *   - the cost on such a machine is 60 local requests, each capped at
+ *     IMDS_TIMEOUT_MS, and two log lines in total (first failure, then give-up).
+ * Any successful read resets the count.
+ */
+export const UNAVAILABLE_READS_BEFORE_DISABLE = 60;
+
+/** Why a lifecycle-state read could not tell whether this is an ASG instance. */
+export type LifecycleStateUnavailableReason = 'token_fetch_failed' | 'state_path_404';
+
+const UNAVAILABLE_REASON_TEXT: Record<LifecycleStateUnavailableReason, string> = {
+  token_fetch_failed: 'IMDS token fetch failed',
+  state_path_404: 'autoscaling/target-lifecycle-state returned 404',
+};
 
 /**
  * AWS may expose `Terminating` through IMDS just before its lifecycle action becomes
@@ -132,20 +166,29 @@ async function fetchImdsToken(fetchImpl: typeof fetch): Promise<string | null> {
 /**
  * Read this instance's ASG target lifecycle state.
  *
- * Returns the state string, or null when the instance is not part of an ASG — the
- * metadata category 404s in that case (empirically confirmed on a standalone EC2
- * box), which is the signal to disable the guard rather than to retry forever.
+ * Returns the state string. `unavailable: true` means the read could not tell: the
+ * IMDS token fetch failed, or the metadata category 404ed. A machine outside an ASG
+ * answers that way on every read (404 empirically confirmed on a standalone EC2
+ * box), but an instance inside one can answer that way briefly too, so the caller
+ * counts consecutive occurrences instead of trusting one (ENG-3094).
+ * `unavailableReason` names which of the two happened.
  */
 export async function readTargetLifecycleState(
   fetchImpl: typeof fetch = fetch
-): Promise<{ state: string | null; unavailable: boolean }> {
+): Promise<{
+  state: string | null;
+  unavailable: boolean;
+  unavailableReason?: LifecycleStateUnavailableReason;
+}> {
   const token = await fetchImdsToken(fetchImpl);
-  if (!token) return { state: null, unavailable: true };
+  if (!token) return { state: null, unavailable: true, unavailableReason: 'token_fetch_failed' };
   try {
     const res = await imdsRequest(fetchImpl, '/latest/meta-data/autoscaling/target-lifecycle-state', {
       headers: { 'X-aws-ec2-metadata-token': token },
     });
-    if (res.status === 404) return { state: null, unavailable: true };
+    if (res.status === 404) {
+      return { state: null, unavailable: true, unavailableReason: 'state_path_404' };
+    }
     if (!res.ok) return { state: null, unavailable: false };
     return { state: res.body.trim(), unavailable: false };
   } catch {
@@ -226,12 +269,13 @@ export function startAsgTerminationGuard(
   const log = deps.logger ?? console;
 
   let confirmingReads = 0;
+  let unavailableReads = 0;
   let fired = false;
   let stopped = false;
 
   const timer = setIntervalFn(async () => {
     if (stopped || fired) return;
-    let reading: { state: string | null; unavailable: boolean };
+    let reading: Awaited<ReturnType<typeof readTargetLifecycleState>>;
     try {
       reading = await readTargetLifecycleState(fetchImpl);
     } catch {
@@ -239,11 +283,27 @@ export function startAsgTerminationGuard(
     }
 
     if (reading.unavailable) {
-      // Not in an ASG (or IMDS is off) — this guard can never apply here.
-      stop();
-      log.log('[asgLifecycleGuard] not an ASG instance — termination guard disabled');
+      // Either this machine is not in an ASG, or IMDS hiccuped. One read cannot tell
+      // them apart, so keep polling and give up only on a long unbroken streak.
+      const reason = reading.unavailableReason
+        ? UNAVAILABLE_REASON_TEXT[reading.unavailableReason]
+        : 'lifecycle state unavailable';
+      unavailableReads += 1;
+      confirmingReads = 0;
+      if (unavailableReads >= UNAVAILABLE_READS_BEFORE_DISABLE) {
+        stop();
+        log.log(
+          `[asgLifecycleGuard] not an ASG instance — termination guard disabled (${reason}; ${unavailableReads} consecutive unavailable reads)`
+        );
+      } else if (unavailableReads === 1) {
+        // Once per streak, never once per poll.
+        log.warn(
+          `[asgLifecycleGuard] lifecycle state unavailable (${reason}); still polling, will disable after ${UNAVAILABLE_READS_BEFORE_DISABLE} consecutive unavailable reads`
+        );
+      }
       return;
     }
+    unavailableReads = 0;
 
     if (reading.state !== 'Terminated') {
       confirmingReads = 0;

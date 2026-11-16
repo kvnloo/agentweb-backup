@@ -12,6 +12,7 @@ import {
   readTargetLifecycleState,
   TERMINATION_LIFECYCLE_HOOK_NAME,
   CONFIRMING_READS_REQUIRED,
+  UNAVAILABLE_READS_BEFORE_DISABLE,
 } from '../services/asgLifecycleGuard';
 
 const STATE_PATH = '/latest/meta-data/autoscaling/target-lifecycle-state';
@@ -26,15 +27,24 @@ type StateReply = { status: number; body: string } | 'throw';
  */
 function makeFetch(opts: {
   token?: string | null;
+  /**
+   * ENG-3094: per-read token outcomes (false = token fetch fails), consumed one per
+   * token request; the last entry repeats. Overrides `token` when present.
+   */
+  tokenReplies?: boolean[];
   stateReplies: StateReply[];
   instanceId?: string;
 }) {
   const stateReplies = [...opts.stateReplies];
+  const tokenReplies = opts.tokenReplies ? [...opts.tokenReplies] : null;
   const fetchImpl = jest.fn(async (url: string) => {
     const path = String(url).replace('http://169.254.169.254', '');
 
     if (path === TOKEN_PATH) {
-      if (opts.token === null) return { ok: false, status: 500, text: async () => '' } as any;
+      const tokenRefused = tokenReplies
+        ? !(tokenReplies.length > 1 ? tokenReplies.shift()! : tokenReplies[0])
+        : opts.token === null;
+      if (tokenRefused) return { ok: false, status: 500, text: async () => '' } as any;
       return { ok: true, status: 200, text: async () => opts.token ?? 'tok-1' } as any;
     }
     if (path === STATE_PATH) {
@@ -85,6 +95,7 @@ describe('readTargetLifecycleState', () => {
     await expect(readTargetLifecycleState(fetchImpl)).resolves.toEqual({
       state: null,
       unavailable: true,
+      unavailableReason: 'state_path_404',
     });
   });
 
@@ -94,6 +105,7 @@ describe('readTargetLifecycleState', () => {
     await expect(readTargetLifecycleState(fetchImpl)).resolves.toEqual({
       state: null,
       unavailable: true,
+      unavailableReason: 'token_fetch_failed',
     });
   });
 
@@ -136,11 +148,181 @@ describe('startAsgTerminationGuard', () => {
       logger: silentLogger,
       ...clock,
     });
-    await clock.advance(3);
+    // ENG-3094: it takes a full unbroken streak, not one read.
+    await clock.advance(UNAVAILABLE_READS_BEFORE_DISABLE - 1);
+    expect(clock.isCleared()).toBe(false);
+    await clock.advance(1);
 
     expect(onTerminating).not.toHaveBeenCalled();
     expect(completeAction).not.toHaveBeenCalled();
     expect(clock.isCleared()).toBe(true);
+  });
+
+  describe('ENG-3094: one failed metadata read must not switch the guard off', () => {
+    const disabledLines = () =>
+      silentLogger.log.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('guard disabled'));
+    const allLines = () =>
+      [...silentLogger.log.mock.calls, ...silentLogger.warn.mock.calls].map((c) => String(c[0]));
+
+    it('keeps polling after a single failed token fetch', async () => {
+      const clock = makeClock();
+      startAsgTerminationGuard(jest.fn(async () => {}), {
+        fetchImpl: makeFetch({ tokenReplies: [false, true], stateReplies: [{ status: 200, body: 'InService' }] }),
+        completeAction: jest.fn(async () => {}),
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(1);
+
+      expect(clock.isCleared()).toBe(false);
+      expect(disabledLines()).toEqual([]);
+    });
+
+    it('keeps polling after a single 404 on the lifecycle-state path', async () => {
+      const clock = makeClock();
+      startAsgTerminationGuard(jest.fn(async () => {}), {
+        fetchImpl: makeFetch({ stateReplies: [{ status: 404, body: '' }, { status: 200, body: 'InService' }] }),
+        completeAction: jest.fn(async () => {}),
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(1);
+
+      expect(clock.isCleared()).toBe(false);
+      expect(disabledLines()).toEqual([]);
+    });
+
+    it('a failed token fetch followed by normal reads still drains and answers the hook on Terminated', async () => {
+      const clock = makeClock();
+      const onTerminating = jest.fn(async () => {});
+      const completeAction = jest.fn(async () => {});
+      startAsgTerminationGuard(onTerminating, {
+        fetchImpl: makeFetch({
+          tokenReplies: [false, true],
+          stateReplies: [
+            { status: 200, body: 'InService' },
+            { status: 200, body: 'Terminated' },
+          ],
+          instanceId: 'i-083786db744a33a52',
+        }),
+        completeAction,
+        logger: silentLogger,
+        ...clock,
+      });
+      // read 1: token fails. read 2: InService. reads 3..: Terminated.
+      await clock.advance(2 + CONFIRMING_READS_REQUIRED);
+
+      expect(onTerminating).toHaveBeenCalledTimes(1);
+      expect(completeAction).toHaveBeenCalledWith('i-083786db744a33a52');
+    });
+
+    it('a 404 followed by normal reads still drains and answers the hook on Terminated', async () => {
+      const clock = makeClock();
+      const onTerminating = jest.fn(async () => {});
+      const completeAction = jest.fn(async () => {});
+      startAsgTerminationGuard(onTerminating, {
+        fetchImpl: makeFetch({
+          stateReplies: [
+            { status: 404, body: '' },
+            { status: 200, body: 'InService' },
+            { status: 200, body: 'Terminated' },
+          ],
+        }),
+        completeAction,
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(2 + CONFIRMING_READS_REQUIRED);
+
+      expect(onTerminating).toHaveBeenCalledTimes(1);
+      expect(completeAction).toHaveBeenCalledWith('i-abc');
+    });
+
+    it('names a failed token fetch in the log, distinctly from a 404', async () => {
+      const tokenClock = makeClock();
+      startAsgTerminationGuard(jest.fn(async () => {}), {
+        fetchImpl: makeFetch({ token: null, stateReplies: [{ status: 200, body: 'InService' }] }),
+        logger: silentLogger,
+        ...tokenClock,
+      });
+      await tokenClock.advance(UNAVAILABLE_READS_BEFORE_DISABLE);
+      const tokenLines = allLines();
+      expect(tokenLines.length).toBeGreaterThan(0);
+      for (const line of tokenLines) {
+        expect(line).toContain('IMDS token fetch failed');
+        expect(line).not.toContain('404');
+      }
+      expect(disabledLines()).toHaveLength(1);
+
+      jest.clearAllMocks();
+      const notFoundClock = makeClock();
+      startAsgTerminationGuard(jest.fn(async () => {}), {
+        fetchImpl: makeFetch({ stateReplies: [{ status: 404, body: '' }] }),
+        logger: silentLogger,
+        ...notFoundClock,
+      });
+      await notFoundClock.advance(UNAVAILABLE_READS_BEFORE_DISABLE);
+      const notFoundLines = allLines();
+      expect(notFoundLines.length).toBeGreaterThan(0);
+      for (const line of notFoundLines) {
+        expect(line).toContain('returned 404');
+        expect(line).not.toContain('token fetch failed');
+      }
+      expect(disabledLines()).toHaveLength(1);
+    });
+
+    it('off-ASG: ends up off after the stated streak and logs twice in total, not once per poll', async () => {
+      const clock = makeClock();
+      const onTerminating = jest.fn(async () => {});
+      startAsgTerminationGuard(onTerminating, {
+        fetchImpl: makeFetch({ token: null, stateReplies: [{ status: 200, body: 'InService' }] }),
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(UNAVAILABLE_READS_BEFORE_DISABLE + 5);
+
+      expect(clock.isCleared()).toBe(true);
+      expect(onTerminating).not.toHaveBeenCalled();
+      expect(allLines()).toHaveLength(2);
+      expect(silentLogger.error).not.toHaveBeenCalled();
+    });
+
+    it('a good read resets the streak: failures that never run consecutively do not disable', async () => {
+      const clock = makeClock();
+      // Alternating fail/ok forever-ish: far more failures in total than the limit.
+      const tokenReplies: boolean[] = [];
+      for (let i = 0; i < UNAVAILABLE_READS_BEFORE_DISABLE * 2; i++) tokenReplies.push(false, true);
+      startAsgTerminationGuard(jest.fn(async () => {}), {
+        fetchImpl: makeFetch({ tokenReplies, stateReplies: [{ status: 200, body: 'InService' }] }),
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(UNAVAILABLE_READS_BEFORE_DISABLE * 4 - 2);
+
+      expect(clock.isCleared()).toBe(false);
+      expect(disabledLines()).toEqual([]);
+    });
+
+    it('an unavailable read between two Terminated reads breaks the confirmation streak', async () => {
+      const clock = makeClock();
+      const onTerminating = jest.fn(async () => {});
+      startAsgTerminationGuard(onTerminating, {
+        fetchImpl: makeFetch({
+          stateReplies: [
+            { status: 200, body: 'Terminated' },
+            { status: 404, body: '' },
+            { status: 200, body: 'Terminated' },
+            { status: 200, body: 'InService' },
+          ],
+        }),
+        completeAction: jest.fn(async () => {}),
+        logger: silentLogger,
+        ...clock,
+      });
+      await clock.advance(4);
+
+      expect(onTerminating).not.toHaveBeenCalled();
+    });
   });
 
   it('does not drain a healthy in-service instance', async () => {
