@@ -16,6 +16,10 @@ const mockRunMetaTrackingMonitor = runMetaTrackingMonitor as jest.Mock;
 
 const CLIENT = { userId: 'client-1', email: 'haven@example.com', displayName: 'Haven' };
 const ACCOUNT_ID = 'act123';
+const CLEAN_TRACKING = {
+  healthy: 1, accountsChecked: 1, blackouts: 0, tokenErrors: 0, fetchErrors: 0,
+  unclassifiable: 0, idle: 0, optimisationAlerts: 0, capturedAlerts: [],
+};
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -98,8 +102,68 @@ describe('diagnoseLeadsAtZero — demand drop vs normal variance mapping', () =>
 });
 
 describe('diagnoseLeadsAtZero — pixel/CAPI and destination evidence mapping', () => {
+  it.each([
+    { healthy: 0, blackouts: 0, tokenErrors: 1 },
+    { healthy: 0, blackouts: 0, accountsChecked: 0 },
+    { healthy: 1, blackouts: 0, tokenErrors: 1 },
+    { healthy: 1, blackouts: 0, fetchErrors: 1 },
+    { healthy: 1, blackouts: 0, unclassifiable: 1 },
+    { healthy: 1, blackouts: 1 },
+    { healthy: 1, blackouts: 0, accountsChecked: 0 },
+    { healthy: NaN, blackouts: 0 },
+    { optimisationAlerts: 1 },
+    { idle: 1 },
+    { fetchErrors: undefined },
+    { accountsChecked: 2 },
+  ])('leaves incomplete tracking evidence unchecked: %j', async summary => {
+    mockRunMetaTrackingMonitor.mockResolvedValue({ ...CLEAN_TRACKING, ...summary });
+    const result = await diagnoseLeadsAtZero('caller-1', CLIENT.email, true);
+    const pixel = result.diagnoses?.[0].causes.find(c => c.cause === 'pixel_capi_broken');
+    expect(pixel?.verdict).toBe('unchecked');
+    expect(pixel?.evidence).toMatch(/did not return a usable summary/);
+  });
+
+  it.each(['meta-attribution-blackout', 'meta-optimisation-event-missing'])('keeps matching positive %s evidence despite sweep errors', async alertClass => {
+    mockRunMetaTrackingMonitor.mockResolvedValue({ healthy: 0, tokenErrors: 1, capturedAlerts: [
+      { message: 'confirmed failure', context: { 'Alert Class': alertClass, 'Ad Account': ACCOUNT_ID } },
+    ] });
+    const result = await diagnoseLeadsAtZero('caller-1', CLIENT.email, true);
+    expect(result.diagnoses?.[0].causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('supported');
+  });
+
+  it('does not borrow healthy evidence or a foreign alert for a failed sibling account', async () => {
+    mockGetAccounts.mockResolvedValue([ACCOUNT_ID, 'act-other'].map(account_id => ({
+      platform: 'meta', account_id, config: { account_type: 'ad_account' },
+    })));
+    mockRunMetaTrackingMonitor.mockImplementation(async ({ adAccountId }: { adAccountId: string }) =>
+      adAccountId === ACCOUNT_ID ? CLEAN_TRACKING : {
+        healthy: 0, blackouts: 0, tokenErrors: 1, capturedAlerts: [
+          { message: 'foreign failure', context: { 'Alert Class': 'meta-attribution-blackout', 'Ad Account': ACCOUNT_ID } },
+        ],
+      });
+    const result = await diagnoseLeadsAtZero('caller-1', CLIENT.email, true);
+    expect(result.diagnoses?.[0].causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('ruled_out');
+    expect(result.diagnoses?.[1].causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('unchecked');
+  });
+
+  it('does not use a normal campaign to dismiss missing sibling campaign history', async () => {
+    mockMonitorLeadVolume.mockResolvedValue({ success: true, reports: [{ accountId: ACCOUNT_ID, campaigns: [
+      { status: 'normal', reason: 'within floor' },
+      { status: 'insufficient_history', reason: 'missing history' },
+    ] }] });
+    const result = await diagnoseLeadsAtZero('caller-1', CLIENT.email, true);
+    const causes = result.diagnoses?.[0].causes ?? [];
+    expect(causes.find(c => c.cause === 'genuine_demand_drop')?.verdict).toBe('unchecked');
+    expect(causes.find(c => c.cause === 'normal_variance')?.verdict).toBe('unchecked');
+  });
+
+  it('does not treat missing destination completeness as confirmed reachability', async () => {
+    mockRunMetaTrackingMonitor.mockResolvedValue({ healthy: 1, blackouts: 0, destinationOk: 1, capturedAlerts: [] });
+    const result = await diagnoseLeadsAtZero('caller-1', CLIENT.email, true);
+    expect(result.diagnoses?.[0].causes.find(c => c.cause === 'landing_page_unreachable')?.verdict).toBe('unchecked');
+  });
   it('rules out pixel_capi_broken when the tracking sweep is clean', async () => {
-    mockRunMetaTrackingMonitor.mockResolvedValue({ healthy: 1, blackouts: 0, capturedAlerts: [] });
+    mockRunMetaTrackingMonitor.mockResolvedValue(CLEAN_TRACKING);
     const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
     const causes = result.diagnoses?.[0].causes ?? [];
     expect(causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('ruled_out');

@@ -450,7 +450,7 @@ call, Slack only"). Validation applies to every read, including the webhooks.
 | `maxAgeMinutes` | integer 1-60, default 10. A lead older than this when the first job runs (`submittedAt`, else lead `createdAt`; a missing or unparseable time fails closed) is skipped as `too_old`. Further attempts must start within this long of the call record's `startedAt`. |
 | `maxCallsPerHour` | integer 1-30, default 6. Counts LEADS that get a call, one per lead at its first attempt: a lead can ring up to `maxAttemptsPerLead` members and then the lead's own leg and still uses one slot. |
 | `maxCallsPerDay` | integer 1-100, default 20. Counts leads the same way. |
-| `maxCallsPerMonth` | integer 1-2000, default 200 (ENG-2783; a config stored without it reads as 200, no data migration). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
+| `maxCallsPerMonth` | integer 1-2000, default 150 (the allowance included in the plan price; ENG-2783, default lowered from 200; a config stored without it reads as 150, no data migration; stored values are unchanged). Counts leads the same way, per org-local calendar month. The owner routes (Emma `update_hot_lead_call_settings`, REST `PUT`) may set only 1-200 and refuse anything higher with "Higher monthly limits are set by AgentWeb support"; 201-2000 is written only by an operator (see [Raise a customer's monthly limit](#raise-a-customers-monthly-limit)). A stored value above 200 is shown in the read-out and kept when the owner edits other fields (sending the same value back is accepted). |
 | `memberCooldownMinutes` | integer 1-60, default 2. Per team member: a member who was just rung is passed over for the next available one. |
 | `maxAttemptsPerLead` | integer 1-5, default 3. How many member calls may be made for one lead; a member who was already tried is never rung again. |
 | `announcedName` | required, trimmed, 1-60 chars of letters, digits, space and `. , & ' -`. Spoken in `<Say>`; XML-escaped by the TwiML builder. It must be the business's registered (legal) name: it is the name the lead hears as the caller and the name in the consent notice (47 CFR 64.1200(b)(1)). The setup tool description and the owner-facing validation messages say so; validation itself is unchanged (it cannot check that a name is the registered one). |
@@ -691,7 +691,7 @@ GET /api/orgs/me/hot-lead-call
 200 { "_revision": "9f2c...e1", "entitled": true, "enabled": false, "canEnable": false,
       "blockers": ["Verify the phone of at least one person"],
       "callingHours": { "start": "09:00", "end": "18:00", "timezone": "America/Chicago" },
-      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 200, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
+      "maxAttemptsPerLead": 3, "maxCallsPerMonth": 150, "warnings": [], "announcedName": "Acme Plumbing", "twilioNumberMasked": "***0111",
       "team": [ { "id": "mk3f9a2b", "name": "Dana Lee", "phoneMasked": "***0100", "verified": false,
                   "windows": [ { "days": [1,2,3,4,5], "start": "09:00", "end": "17:00" } ] } ],
       "limits": { "maxTeamSize": 10, "maxWindowsPerMember": 7, "minAttempts": 1, "maxAttempts": 5, "nameMaxLength": 40 } }
@@ -760,6 +760,80 @@ members and admins follow the owner's plan) lists `hot_lead_call` or `*`.
   an org that loses its plan stops dialing. A call already in flight finishes.
 - `release_hot_lead_call_number` and `confirm_hot_lead_call_verification` stay
   available so an org that lost its plan can still stop paying for a number.
+- With `HOT_LEAD_CALL_BILLING_REQUIRED=true` the plan feature is necessary but not
+  enough: the org also needs the paid add-on (see "Billing add-on" below). The
+  plan check alone (`isHotLeadCallPlanEntitled`) gates the setup steps and the
+  start of the "turn calling on" flow (the add-on is bought at its approval; the
+  portal's REST save, which cannot buy it, is refused while the add-on is missing); the plan AND the add-on (`isHotLeadCallEntitled`)
+  gate dispatch, retries, inbound callbacks and the settings read-out.
+
+## Billing add-on (ENG-2783)
+
+- **Price**: a flat $70 per month per organization, charged to the organization
+  owner as ONE extra item on the owner's existing Stripe subscription. It includes
+  one calling number and 150 lead calls per month. The number's rent is folded in
+  (the number-purchase card still states the real Twilio rent and says it is
+  part of the $70 price). Calls beyond the configured monthly limit are not priced:
+  the limit just stops them. No trial, monthly only. Hot lead Twilio spend is still
+  recorded in the spend ledger and plan-pool enforcement is unchanged.
+- **Environment variables**
+  - `STRIPE_HOT_LEAD_CALL_PRODUCT_ID`: the Stripe product id. The item is created
+    with `price_data` (usd, 7000, monthly) against that product, and found again by
+    product id on the live subscription (never from the DB). Missing = the add-on
+    refuses to be added with a plain message and nothing is turned on.
+  - `HOT_LEAD_CALL_BILLING_REQUIRED`: the kill switch. Only the exact value `true`
+    makes billing required. Unset or anything else = billing is NOT checked, so
+    deploying this code changes nothing for any org (including the Super Premium
+    test org) until an operator sets it. Read on every call, so a
+    changed value applies as soon as the process has the new environment.
+- **Buying**: with billing required and the add-on not active, the approval card for
+  `update_hot_lead_call_settings` with `enabled:true` states "$70 per month,
+  includes one calling number and 150 lead calls per month, billed to your
+  subscription". That price text is part of the approved digest, so a price change
+  needs a new card. Only after the user approved, and just before the settings
+  write, `addHotLeadCallBilling` adds the item (prorated charge now,
+  `error_if_incomplete`, idempotency key per org+subscription+minute; an existing
+  item is found and left alone). It refuses a subscription in a trial (the
+  proration charges nothing then) and one that is not monthly. After the charge the
+  mirror is written at once (entitlement never waits for the webhook), and a second
+  look removes any duplicate item that a racing request created (credited). If the
+  settings write fails after the charge (for example a concurrent edit) the add-on
+  stays active and is not charged again; the user approves a fresh card and the
+  card then states no price. If Stripe refuses (no active subscription, card
+  declined, missing product id) the tool fails with a plain message and calling
+  stays off; the approval is already used, so the user approves a fresh card to
+  retry. The portal's REST save has no purchase hook: with billing required and the
+  add-on inactive it refuses `enabled:true` with a message saying to subscribe.
+- **Mirror**: `customer.subscription.created/updated/deleted` write
+  `Organization.hotLeadCallBilling = { itemId, status: 'active'|'past_due'|'canceled', updatedAt }`
+  from Stripe's CURRENT state of the subscription (the event only names it; a late or
+  out-of-order event cannot flip a paid add-on to canceled; the payload is used only
+  when Stripe cannot be read), only when the Stripe customer's user is the org owner
+  (`stripeService.handleSubscriptionUpdated` -> `mirrorHotLeadCallBilling`). Item
+  present: active/trialing -> active, past_due/unpaid/incomplete -> past_due,
+  otherwise canceled. Item gone: canceled, only for an org that has a mirror. When the
+  owner's subscription is deleted but another one remains (a downgrade), the mirror is
+  judged from the remaining subscription.
+  Duplicate deliveries write nothing. When not active, dispatch skips with
+  `not_entitled` and a call in flight finishes.
+- **Cancel**: turning calling off does not cancel billing, and there is no
+  cancel tool yet. Until there is, remove the item in the Stripe dashboard; the
+  webhook then marks the mirror `canceled`.
+- **Rollout**: (1) create the "Hot lead calls" product in Stripe TEST mode and set
+  `STRIPE_HOT_LEAD_CALL_PRODUCT_ID` in a non-production environment; (2) set
+  `HOT_LEAD_CALL_BILLING_REQUIRED=true` there and run: approve the card, check the
+  item and the mirror, fail a payment (past_due), remove the item (canceled);
+  (3) Harsha approves the new `hotLeadCallBilling` field and the live-mode product;
+  (4) set the product id in production; (5) mark existing paying orgs by hand-adding
+  the item (or leave the switch off until they are billed), then set
+  `HOT_LEAD_CALL_BILLING_REQUIRED=true`. Setting it first would stop dispatch for
+  every org without the item.
+- **Turn it off**: unset `HOT_LEAD_CALL_BILLING_REQUIRED` (or set it to anything
+  but `true`). Entitlement goes back to the plan check alone. Existing Stripe items
+  are not touched.
+- **Known gap**: number rent and phone verification happen before the add-on is
+  bought (it is bought when calling is turned on), so an org that never subscribes
+  has cost a number's rent and a few verification calls.
 
 ## Settings keys (AW-Settings)
 
@@ -980,7 +1054,7 @@ back if the record is not created:
 3. Limits, taken once per lead at its first attempt, in this order: `duplicate_phone`
    (same org and number within 24h), `org_hourly_cap` (UTC clock hour),
    `org_daily_cap` (org's local calendar day), `org_monthly_cap` (org's local calendar month, key
-   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 200, see `maxCallsPerMonth`). The three caps count LEADS, not member
+   `hlc#cap#m#<orgId>#<YYYY-MM>`, TTL 40 days, default 150, see `maxCallsPerMonth`). The three caps count LEADS, not member
    calls (a lead rings up to `maxAttemptsPerLead` members and the lead's leg for one
    slot). Each is one conditional write. Then, for every attempt, first and next, the
    chosen member's cooldown: a member in cooldown is a per-attempt skip, the next
@@ -1017,7 +1091,7 @@ Known limits, accepted:
   the cap.
 - The 80% notice can fire for a count that is then given back when the call record is not created (rare); the email said
   "used N" for a moment when N was reached.
-- Rollout: every org starts at 200 leads per month on deploy, because stored configs without the field read as the default.
+- Rollout: every org without a stored value starts at 150 leads per month (it was 200 before the default was lowered; orgs with a stored value keep it), because stored configs without the field read as the default.
 - Phone-rotating bots can consume the org's hourly and daily caps; the Slack
   alert still fires.
 - Whoever submits a number first suppresses calls for that number for 24h.
@@ -1180,7 +1254,7 @@ carry the Twilio retry override `#rc=3&rp=5xx,ct` so Twilio redelivers a 5xx.
 
 ### Raise a customer's monthly limit
 
-The default is 200 automatic calls per org-local calendar month and the customer can only lower it. To raise it for a
+The default is 150 automatic calls per org-local calendar month (the allowance in the plan price); the customer can set it from 1 to 200. To raise it for a
 customer, an operator writes `hotLeadCall.maxCallsPerMonth` (integer 201-2000) on the org item in AW-Organizations
 (a data write, no route; keep the rest of `hotLeadCall` unchanged, and write conditionally on the previous value like the
 settings service). The next call is checked against the new value. The customer keeps seeing and keeping it when they edit

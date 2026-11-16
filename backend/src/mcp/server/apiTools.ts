@@ -17,6 +17,8 @@ import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import './readEmailTool';
+// Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
+import './smartleadTools';
 import './conversionSummaryTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
@@ -1075,6 +1077,8 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'list_lead_lists',
+  // A GET only: listing lists changes nothing. Read-only so a key scoped to tools:read (e.g. a Smartlead agent key) can find a listId.
+  readOnly: true,
   definition: {
     name: 'list_lead_lists',
     description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
@@ -1086,6 +1090,11 @@ mcpToolRegistry.register({
   },
   /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
+    // The tool is read-only so a tools:read key can find its own listIds, but reading ANOTHER account's lists (client_id, admin-only)
+    // stays a tools:execute capability, as it was before the tool was marked read-only.
+    if (args?.client_id && context?.externalMcp === true && context?.authMethod === 'api_key' && !(context.apiKeyScopes ?? []).includes('tools:execute')) {
+      throw new Error("client_id needs an API key that holds the 'tools:execute' scope.");
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',

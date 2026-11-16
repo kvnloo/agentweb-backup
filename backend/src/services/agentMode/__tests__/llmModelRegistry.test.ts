@@ -45,6 +45,29 @@ describe('LLM model registry module (ENG-1831)', () => {
   });
 });
 
+// Model-upgrade audit 2026-11-15 (docs/model-upgrade-audit-2026-11-15.md): Claude Sonnet 5.5 metadata completed from
+// the OpenRouter record (reasoning.supported_efforts) while it stays admin-only — customer exposure is an ENG-1606
+// roster decision, and vision needs a live describe_image smoke this change did not run.
+describe('Claude Sonnet 5.5 registry entry (model-upgrade audit 2026-11-15)', () => {
+  const id = 'openrouter/anthropic/claude-sonnet-5.5';
+  const sonnet = LLM_MODEL_REGISTRY[id];
+
+  it('keeps its pinned id and stays admin-only', () => {
+    expect(sonnet).toBeDefined();
+    expect(sonnet.adminOnly).toBe(true);
+  });
+
+  it('records the provider-published reasoning efforts without setting an effort default', () => {
+    expect(sonnet.supportedReasoningEfforts).toEqual(['max', 'xhigh', 'high', 'medium', 'low']);
+    expect(sonnet.reasoningEffort).toBeUndefined();
+  });
+
+  it('does not claim vision or carry the unreviewed auto-added placeholder description', () => {
+    expect(sonnet.supportsVision).toBeUndefined();
+    expect(sonnet.description).not.toMatch(/Auto-added from OpenRouter/);
+  });
+});
+
 // ENG-2646: `name` is the model's one display name in every client (the portal resolves every model label from it).
 // Seven OpenRouter auto-additions predated cleanModelName and kept OpenRouter's "<Vendor>: <Model>" form, so the
 // picker listed "Z.ai: GLM 5.3 Flash" beside "GLM 5.2" and "Anthropic: Claude Sonnet 5.5" beside "Claude Sonnet 5".

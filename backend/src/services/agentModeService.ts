@@ -1257,6 +1257,22 @@ export function titleFromUserMessage(message: string): string {
   return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
 }
 
+/**
+ * The closing sentence of an ad-set read-back mismatch, worded from the status
+ * Meta actually reported. A PAUSED ad set is not delivering, so telling the user
+ * it "is live" was false; an ACTIVE or unknown status still says to pause it.
+ */
+export function describeMismatchedAdSetState(status: unknown): string {
+  const s = typeof status === 'string' ? status.toUpperCase() : '';
+  if (s === 'PAUSED' || s === 'ARCHIVED' || s === 'DELETED') {
+    return `It exists with status ${s} and is not delivering — review these settings in Ads Manager before activating it.`;
+  }
+  if (s === 'ACTIVE') {
+    return 'It is ACTIVE with settings that differ from the request — review or pause it in Ads Manager.';
+  }
+  return 'Its delivery status could not be confirmed — review it in Ads Manager and pause it if it is delivering.';
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-2103 (F2): dataAnalysisConsistencyCache (and its two bound constants)
@@ -2601,25 +2617,7 @@ export class AgentModeService {
     params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
-      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
-      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
-      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
-      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
-      // Studio" slot, and default routing lands on the degraded one. Skip it
-      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
-      // uptime recovers — remove this then, since it forfeits the BYOK cost
-      // discount in exchange for reliability.
-      //
-      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
-      // are the slugs OpenRouter's separate BYOK-credential-creation API
-      // uses, not what `provider.ignore` matches on here. This param matches
-      // against the `provider_name` string from GET /v1/models/{id}/endpoints
-      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
-      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
-      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
-      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
-      // proposed the slug form once already and was reverted for this reason
-      // — verify empirically against live traffic before changing this line.
+      // No default exclusions today; see openRouterIgnoredProviders.
       params.provider.ignore = ignoredProviders;
     }
     if (providerIgnore?.length) {
@@ -12873,6 +12871,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Meta returns monetary fields as strings; compare stringified so
       // 1000 and "1000" are the same value and not a fake mismatch.
       const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      // Schedule fields are instants, not strings: Meta echoes them back in the
+      // ad account's timezone at whole-second precision (requested
+      // 16:44:56.157+00:00 is stored as 08:44:56-0800). Compare the instant at
+      // second resolution so an equivalent time is never reported as overridden.
+      const sameInstant = (requested: string | null, applied: string | null) => {
+        if (requested === null || applied === null) return false;
+        const r = Date.parse(requested);
+        const a = Date.parse(applied);
+        return Number.isFinite(r) && Number.isFinite(a) && Math.floor(r / 1000) === Math.floor(a / 1000);
+      };
+      const isScheduleField = (parameter: string) => parameter === 'start_time' || parameter === 'end_time';
       const readBackMismatches = expected
         .filter(([, requested]) => requested !== undefined)
         .map(([parameter, requested]) => ({
@@ -12880,7 +12889,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           requested: asComparable(requested),
           applied: asComparable(readBack?.[parameter])
         }))
-        .filter(m => m.requested !== m.applied);
+        .filter(m => m.requested !== m.applied &&
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -12896,7 +12906,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} ${describeMismatchedAdSetState(readBack?.status ?? adSet?.status)}`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
@@ -16022,7 +16032,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
-      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // ENG-1636: an AD (or AD_SET) status flip usually arrives with only its own id, but the gate needs
       // the parent campaign to scope its tracking checks — and blocked such calls with
       // "no campaign was identified" even though Meta carries campaign_id on the ad
       // object. Resolve the parent instead of refusing a call whose campaign is one
@@ -16033,6 +16043,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         entityType: entity_type,
         campaignId: campaign_id,
         adId: ad_id,
+        adSetId: ad_set_id,
         accessToken: gateCreds.accessToken,
         accountId: gateCreds.accountId,
         resolver: metaService,

@@ -2,6 +2,9 @@ import { emmaToolRegistry } from './registry';
 import type { ToolContext } from './orgCaller';
 import { getSmartleadPushService } from '../services/smartleadPushRuntime';
 import * as gate from '../services/smartleadPushApprovalGate';
+import {
+  ID, STATS_LAG_NOTE, campaignArg, campaignStatsSummary, idArg, onlyKeys, previewSummary, pushArgs, pushBody, runIdArg, unwrap,
+} from '../services/smartleadPushToolShared';
 
 /**
  * Emma's Smartlead push tools (ENG-673). Whatever the CRM dialog can do, Emma can do, over the SAME service and with the same safeguards:
@@ -18,111 +21,12 @@ import * as gate from '../services/smartleadPushApprovalGate';
  * push, as in the dialog, and needs an attended chat.
  */
 
-const BAD_ARGS = 'Invalid Smartlead push arguments';
-
-function onlyKeys(args: unknown, allowed: readonly string[]): Record<string, unknown> {
-  if (args === undefined || args === null) return {};
-  if (typeof args !== 'object' || Array.isArray(args)) throw new Error(BAD_ARGS);
-  // Models often send null for omitted optionals; treat null as "not provided".
-  const entries = Object.entries(args).filter(([, v]) => v !== null);
-  if (entries.some(([k]) => !allowed.includes(k))) throw new Error(BAD_ARGS);
-  return Object.fromEntries(entries);
-}
-
 function userIdOf(context: ToolContext): string {
   const id = context?.userId || context?.agentUserId;
   if (typeof id !== 'string' || !id.trim()) throw new Error('Authentication required');
   return id;
 }
 
-const ID = /^[A-Za-z0-9_.:-]{1,200}$/;
-const RUN_ID = /^[A-Za-z0-9]{10,40}$/;
-
-function idArg(value: unknown, what: string): string {
-  if (typeof value !== 'string' || !ID.test(value)) throw new Error(`${what} is required`);
-  return value;
-}
-
-function campaignArg(value: unknown): number {
-  const n = typeof value === 'string' && /^\d{1,15}$/.test(value) ? Number(value) : value;
-  if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new Error('campaignId must be a positive whole number (from list_smartlead_campaigns)');
-  return n;
-}
-
-function runIdArg(value: unknown): string {
-  if (typeof value !== 'string' || !RUN_ID.test(value)) throw new Error('runId is required (from get_smartlead_push_status)');
-  return value;
-}
-
-/** The service's refusals carry a status and a message written for the user: surface them as the tool's error. */
-function unwrap<T extends { ok: boolean }>(result: T): Extract<T, { ok: true }> {
-  if (result.ok) return result as Extract<T, { ok: true }>;
-  const fail = result as unknown as { message?: string; code?: string };
-  throw new Error(fail.message || fail.code || 'The Smartlead push request failed');
-}
-
-interface PushArgs {
-  listId: string;
-  campaignId: number;
-  accountId?: string;
-  includeUnverified: boolean;
-  mapping: Record<string, string>;
-  acknowledgedTags: string[];
-  cohort?: number;
-}
-
-const PUSH_KEYS = ['listId', 'campaignId', 'accountId', 'includeUnverified', 'mapping', 'acknowledgedTags', 'cohort', 'confirm'] as const;
-
-function pushArgs(args: unknown): PushArgs {
-  const a = onlyKeys(args, PUSH_KEYS);
-  const mappingRaw = a.mapping ?? {};
-  if (typeof mappingRaw !== 'object' || Array.isArray(mappingRaw) || Object.keys(mappingRaw).length > 50) throw new Error(BAD_ARGS);
-  const mapping: Record<string, string> = {};
-  for (const [tag, path] of Object.entries(mappingRaw as Record<string, unknown>)) {
-    if (typeof path !== 'string' || !tag || tag.length > 100 || !path || path.length > 100) throw new Error(BAD_ARGS);
-    mapping[tag] = path;
-  }
-  const tagsRaw = a.acknowledgedTags ?? [];
-  if (!Array.isArray(tagsRaw) || tagsRaw.length > 50 || tagsRaw.some(t => typeof t !== 'string' || !t || t.length > 100)) throw new Error(BAD_ARGS);
-  if (a.includeUnverified !== undefined && typeof a.includeUnverified !== 'boolean') throw new Error(BAD_ARGS);
-  if (a.cohort !== undefined && (typeof a.cohort !== 'number' || !Number.isSafeInteger(a.cohort) || a.cohort < 1)) throw new Error('cohort must be a positive whole number');
-  return {
-    listId: idArg(a.listId, 'listId'),
-    campaignId: campaignArg(a.campaignId),
-    ...(a.accountId !== undefined ? { accountId: idArg(a.accountId, 'accountId') } : {}),
-    includeUnverified: a.includeUnverified === true,
-    mapping,
-    acknowledgedTags: tagsRaw as string[],
-    ...(a.cohort !== undefined ? { cohort: a.cohort as number } : {}),
-  };
-}
-
-const pushBody = (p: PushArgs) => ({
-  listId: p.listId,
-  campaignId: p.campaignId,
-  ...(p.accountId ? { accountId: p.accountId } : {}),
-  includeUnverified: p.includeUnverified,
-  mapping: p.mapping,
-  acknowledgedTags: p.acknowledgedTags,
-  ...(p.cohort !== undefined ? { cohort: p.cohort } : {}),
-});
-
-/** What the model is told about a preview: numbers and findings, never the signed token. */
-function previewSummary(p: any) {
-  return {
-    campaign: p.campaign,
-    smartleadAccount: p.connection,
-    emailStepsInCampaignSequence: p.sequence.stepCount,
-    list: p.list,
-    cohort: p.cohort,
-    blocks: p.preflight.blocks,
-    warnings: p.preflight.warnings,
-    fieldsToDecide: p.preflight.tagsToMap,
-    campaignAlreadySending: p.requiresActiveConfirmation === true,
-    sendingWithNoUnsubscribeLink: p.requiresUnsubscribeAcknowledgement === true,
-    canStart: p.canStart === true,
-  };
-}
 
 const PUSH_PROPERTIES = {
   listId: { type: 'string', description: 'The CRM list to push (its id from get_lead_lists).' },
@@ -197,8 +101,6 @@ emmaToolRegistry.register({
   },
 });
 
-/** Smartlead updates its counters on its own schedule, so a recent send or push may not show yet. */
-const STATS_LAG_NOTE = "Smartlead's counts can lag a few minutes behind a recent push or send.";
 
 emmaToolRegistry.register({
   name: 'get_smartlead_campaign_stats',
@@ -213,16 +115,7 @@ emmaToolRegistry.register({
     return {
       success: true,
       smartleadAccount: connection,
-      campaign: { id: stats.campaignId, name: stats.name, status: stats.status },
-      stats: {
-        ...(stats.leadsInCampaign !== undefined ? { leadsInCampaign: stats.leadsInCampaign } : {}),
-        contactsEmailed: stats.contactsEmailed,
-        emailsSent: stats.emailsSent,
-        replies: stats.replies,
-        bounces: stats.bounces,
-        unsubscribes: stats.unsubscribes,
-      },
-      note: STATS_LAG_NOTE,
+      ...campaignStatsSummary(stats),
     };
   },
 });

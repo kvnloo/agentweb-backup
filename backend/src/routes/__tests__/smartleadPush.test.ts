@@ -4,12 +4,13 @@ import request from 'supertest';
 jest.mock('../../middleware/auth', () => ({
   authenticateToken: jest.fn((req: any, _res: any, next: any) => {
     req.user = { userId: req.headers['x-test-user'] || 'user-123' };
+    req.isSelfCall = req.headers['x-test-self-call'] === '1';
     next();
   }),
 }));
 
 const svc = {
-  campaigns: jest.fn(), preview: jest.fn(), start: jest.fn(), history: jest.fn(), status: jest.fn(), pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(),
+  campaigns: jest.fn(), campaignStats: jest.fn(), preview: jest.fn(), start: jest.fn(), history: jest.fn(), status: jest.fn(), pause: jest.fn(), resume: jest.fn(), cancel: jest.fn(), release: jest.fn(),
 };
 jest.mock('../../services/smartleadPushRuntime', () => ({ getSmartleadPushService: () => svc }));
 
@@ -37,6 +38,30 @@ describe('Smartlead push routes (ENG-673)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ preview: { token: 't' } });
     expect(svc.preview).toHaveBeenCalledWith('u-9', expect.objectContaining({ listId: 'L', campaignId: 5 }));
+  });
+
+  it('campaign stats: the authenticated user, a numeric campaign id, the optional connection', async () => {
+    svc.campaignStats.mockResolvedValue({ ok: true, connection: { accountId: 'a' }, stats: { campaignId: 7 } });
+    const res = await request(app()).get(`${base}/campaigns/7/stats?accountId=acc-1`).set('x-test-user', 'u-7');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ connection: { accountId: 'a' }, stats: { campaignId: 7 } });
+    expect(svc.campaignStats).toHaveBeenCalledWith('u-7', 7, 'acc-1');
+  });
+
+  it.each(['0', 'abc', '1.5', '-3', '1234567890123456'])('campaign stats refuses campaign id %s without calling Smartlead', async (id) => {
+    const res = await request(app()).get(`${base}/campaigns/${id}/stats`).set('x-test-user', user());
+    expect(res.status).toBe(400);
+    expect(svc.campaignStats).not.toHaveBeenCalled();
+  });
+
+  it('an agent (self-call) and the person have separate rate-limit buckets: a looping agent cannot lock the person out', async () => {
+    svc.campaigns.mockResolvedValue({ ok: true, connection: {}, campaigns: [] });
+    const u = user();
+    let last = 0;
+    for (let i = 0; i < 31; i++) last = (await request(app()).get(`${base}/campaigns`).set('x-test-user', u).set('x-test-self-call', '1')).status;
+    expect(last).toBe(429); // the agent's bucket (30 per 15 minutes) is spent
+    const person = await request(app()).get(`${base}/campaigns`).set('x-test-user', u);
+    expect(person.status).toBe(200); // the person's bucket is untouched
   });
 
   it('ignores a user id in the body on start too', async () => {

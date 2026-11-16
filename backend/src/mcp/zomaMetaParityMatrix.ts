@@ -6,11 +6,9 @@
  * `eng2950.zomaMetaParityMatrix.test.ts` checks every mapping against the advertised
  * Zoma manifest, so a row cannot point at a tool or action that does not exist.
  *
- * Source of Meta tool names: the "Meta parity:" lists in ENG-2912's category children
- * (ENG-2913..2921). ENG-2918 abbreviates its 31 catalog tools; those rows use the labels
- * exactly as written there, expanded only where the issue writes "create/update/list/delete".
- * The epic cites 88 Meta tools; the research file it references was not on disk, so rows
- * beyond the child lists must be added when that list is recovered (see ENG-2950).
+ * Official names are pinned in the seven-category documentation snapshot
+ * `__tests__/__fixtures__/officialMetaAdsMcpTools.json`. The exact-set test
+ * rejects missing names and abbreviated catalog aliases.
  *
  * Pure data. No provider calls, no persistence, no change to tool behavior or scopes.
  */
@@ -45,6 +43,16 @@ const covered = (category: string, source: string, metaTool: string, zoma: ZomaO
 const gap = (category: string, source: string, metaTool: string, owner = source): ParityRow =>
   ({ metaTool, category, source, status: 'gap', owner });
 const same = (category: string, source: string, name: string): ParityRow => covered(category, source, name, { tool: name });
+const notApplicable = (category: string, source: string, metaTool: string, reason: string): ParityRow =>
+  ({ metaTool, category, source, status: 'not_applicable', reason });
+
+/** ENG-3031: what was checked before a Reporting row was marked not_applicable. */
+const NO_PUBLIC_INSIGHTS_ENDPOINT =
+  'No public Graph endpoint or field: not in the Ad Account reference (fields and edges) or the Ad Account / Campaign / Ad Set Insights references, checked 2026-11-15.';
+
+/** ENG-3056: what was checked before the six pixel rule write rows were marked not_applicable. */
+const NO_PUBLIC_PIXEL_RULE_WRITE =
+  'No public Graph write: the Ads Pixel event_rules and extractors edge references each state that creating, updating and deleting cannot be performed on the endpoint, the Ad Pixel reference lists no other rule edge, and the rule nodes (CalibratorExistingRule, SignalsIWLExtractor) have no reference page, checked 2026-11-16.';
 
 const EDITS = 'Campaign management';
 const AUDS = 'Audiences';
@@ -57,9 +65,18 @@ const PG = 'Pages, Instagram & Ad Library';
 const DIA = 'Diagnostics & help';
 
 export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
-  // ENG-2913
+  // ENG-2913 — base discovery/lifecycle names are part of the official inventory.
+  // ENG-3034: create and activate are the guarded call_meta_marketing_api writes
+  // (always created PAUSED; status=ACTIVE is its own preview and approval), proven
+  // per entity in eng3034.campaignManagementParity.test.ts. The two read rows are
+  // still gaps, owned by ENG-3040.
+  gap(EDITS, 'ENG-2913', 'ads_get_ad_accounts', 'ENG-3040'),
+  covered(EDITS, 'ENG-2913', 'ads_create_campaign', { tool: MMA, action: 'CREATE', entityType: 'CAMPAIGN' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad_set', { tool: MMA, action: 'CREATE', entityType: 'AD_SET' }),
+  covered(EDITS, 'ENG-2913', 'ads_create_ad', { tool: MMA, action: 'CREATE', entityType: 'AD' }),
+  covered(EDITS, 'ENG-2913', 'ads_activate_entity', { tool: MMA, action: 'UPDATE' }),
   covered(EDITS, 'ENG-2913', 'ads_update_entity', { tool: MMA, action: 'UPDATE' }),
-  gap(EDITS, 'ENG-2913', 'ads_get_field_context'),
+  gap(EDITS, 'ENG-2913', 'ads_get_field_context', 'ENG-3040'),
   covered(EDITS, 'ENG-2913', 'ads_get_ad_preview', { tool: MMA, action: 'PREVIEW', entityType: 'AD' }),
 
   // ENG-2914
@@ -80,10 +97,15 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
 
   // ENG-2916
   gap(REP, 'ENG-2916', 'ads_get_opportunity_score'),
-  gap(REP, 'ENG-2916', 'ads_insights_advertiser_context'),
-  gap(REP, 'ENG-2916', 'ads_insights_anomaly_signal'),
-  gap(REP, 'ENG-2916', 'ads_insights_auction_ranking_benchmarks'),
-  gap(REP, 'ENG-2916', 'ads_insights_industry_benchmark'),
+  // ENG-3031: these three are computed inside Meta's own MCP server. No public Marketing API
+  // endpoint or field was found for them, and a substitute score of our own is out of scope.
+  notApplicable(REP, 'ENG-3031', 'ads_insights_advertiser_context', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_anomaly_signal', NO_PUBLIC_INSIGHTS_ENDPOINT),
+  // ENG-3031: Meta's public auction comparison is the three ad relevance diagnostics, which
+  // call_meta_ads_insights_api already accepts as fields (quality_ranking,
+  // engagement_rate_ranking, conversion_rate_ranking). eng3031 test pins that.
+  covered(REP, 'ENG-3031', 'ads_insights_auction_ranking_benchmarks', { tool: 'call_meta_ads_insights_api' }),
+  notApplicable(REP, 'ENG-3031', 'ads_insights_industry_benchmark', NO_PUBLIC_INSIGHTS_ENDPOINT),
   covered(REP, 'ENG-2916', 'ads_insights_performance_trend', { tool: 'call_meta_ads_insights_api' }),
   gap(REP, 'ENG-2916', 'ads_get_ad_entities'),
 
@@ -93,47 +115,47 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   same(SIG, 'ENG-2917', 'ads_get_dataset_stats'),
   covered(SIG, 'ENG-2917', 'ads_get_dataset_quality', { tool: MMA, action: 'GET_MATCH_QUALITY', entityType: 'DATASET' }),
   same(SIG, 'ENG-2917', 'ads_pixel_event_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   gap(SIG, 'ENG-2917', 'ads_pixel_parameter_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   same(SIG, 'ENG-2917', 'ads_get_customconversions'),
 
-  // ENG-2918 (labels as written in the issue)
+  // ENG-2918 (canonical official Meta tool names)
   covered(CAT, 'ENG-2918', 'ads_catalog_create', { tool: 'meta_catalog_create' }),
-  covered(CAT, 'ENG-2918', 'update_catalog', { tool: 'meta_catalog_update' }),
-  covered(CAT, 'ENG-2918', 'list_catalogs', { tool: 'meta_list_catalogs' }),
-  covered(CAT, 'ENG-2918', 'list_dpa_eligible_catalogs', { tool: 'meta_list_dpa_eligible_catalogs' }),
-  covered(CAT, 'ENG-2918', 'get_diagnostics', { tool: 'meta_get_catalog_diagnostics' }),
-  covered(CAT, 'ENG-2918', 'get_dynamic_ads_health', { tool: 'meta_get_dynamic_ads_health' }),
-  covered(CAT, 'ENG-2918', 'get_data_sources', { tool: 'meta_get_catalog_data_sources' }),
-  covered(CAT, 'ENG-2918', 'list_products', { tool: 'meta_list_products' }),
-  covered(CAT, 'ENG-2918', 'product_create', { tool: 'meta_product_create' }),
-  covered(CAT, 'ENG-2918', 'update_product', { tool: 'meta_update_product' }),
-  covered(CAT, 'ENG-2918', 'delete_product', { tool: 'meta_delete_product' }),
-  covered(CAT, 'ENG-2918', 'get_suggested_filter', { tool: 'meta_get_suggested_filter' }),
-  covered(CAT, 'ENG-2918', 'product_set_create', { tool: 'meta_product_set_create' }),
-  covered(CAT, 'ENG-2918', 'product_set_update', { tool: 'meta_product_set_update' }),
-  covered(CAT, 'ENG-2918', 'product_set_list', { tool: 'meta_list_product_sets' }),
-  covered(CAT, 'ENG-2918', 'product_set_delete', { tool: 'meta_product_set_delete' }),
-  covered(CAT, 'ENG-2918', 'product_feed_create', { tool: 'meta_product_feed_create' }),
-  covered(CAT, 'ENG-2918', 'product_feed_update', { tool: 'meta_product_feed_update' }),
-  covered(CAT, 'ENG-2918', 'product_feed_list', { tool: 'meta_list_product_feeds' }),
-  covered(CAT, 'ENG-2918', 'product_feed_delete', { tool: 'meta_product_feed_delete' }),
-  covered(CAT, 'ENG-2918', 'feed_upload_session_create', { tool: 'meta_feed_upload_create' }),
-  covered(CAT, 'ENG-2918', 'feed_upload_session_get', { tool: 'meta_feed_upload_get' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_create', { tool: 'meta_feed_rule_create' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_get', { tool: 'meta_feed_rule_get' }),
-  covered(CAT, 'ENG-2918', 'feed_rule_delete', { tool: 'meta_feed_rule_delete' }),
-  covered(CAT, 'ENG-2918', 'event_source_get', { tool: 'meta_event_source_get' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_catalogs', { tool: 'meta_event_source_get_catalogs' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_health', { tool: 'meta_event_source_get_health' }),
-  covered(CAT, 'ENG-2918', 'event_source_get_recommendations', { tool: 'meta_event_source_get_recommendations' }),
-  covered(CAT, 'ENG-2918', 'event_source_connect', { tool: 'meta_event_source_connect' }),
-  covered(CAT, 'ENG-2918', 'event_source_disconnect', { tool: 'meta_event_source_disconnect' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_catalog', { tool: 'meta_catalog_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_catalogs', { tool: 'meta_list_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_dpa_eligible_catalogs', { tool: 'meta_list_dpa_eligible_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_diagnostics', { tool: 'meta_get_catalog_diagnostics' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_dynamic_ads_health', { tool: 'meta_get_dynamic_ads_health' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_data_sources', { tool: 'meta_get_catalog_data_sources' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_products', { tool: 'meta_list_products' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_create', { tool: 'meta_product_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product', { tool: 'meta_update_product' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_delete_product', { tool: 'meta_delete_product' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_suggested_filter', { tool: 'meta_get_suggested_filter' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_set', { tool: 'meta_product_set_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product_set', { tool: 'meta_product_set_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_product_sets', { tool: 'meta_list_product_sets' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_set_delete', { tool: 'meta_product_set_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_feed', { tool: 'meta_product_feed_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_update_product_feed', { tool: 'meta_product_feed_update' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_list_product_feeds', { tool: 'meta_list_product_feeds' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_feed_delete', { tool: 'meta_product_feed_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_product_feed_upload_session', { tool: 'meta_feed_upload_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_product_feed_upload_sessions', { tool: 'meta_feed_upload_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_create_feed_rule', { tool: 'meta_feed_rule_create' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_get_feed_rules', { tool: 'meta_feed_rule_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_product_feed_delete_rule', { tool: 'meta_feed_rule_delete' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get', { tool: 'meta_event_source_get' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_catalogs', { tool: 'meta_event_source_get_catalogs' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_health', { tool: 'meta_event_source_get_health' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_get_recommendations', { tool: 'meta_event_source_get_recommendations' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_connect', { tool: 'meta_event_source_connect' }),
+  covered(CAT, 'ENG-2918', 'ads_catalog_event_source_disconnect', { tool: 'meta_event_source_disconnect' }),
 
   // ENG-2919
   same(EXP, 'ENG-2919', 'ads_experiment_list_tests'),

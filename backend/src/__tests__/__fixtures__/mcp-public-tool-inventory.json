@@ -22,6 +22,29 @@
     }
   },
   {
+    "name": "cancel_smartlead_push",
+    "listed": false,
+    "description": "Cancel a Smartlead push for good; contacts already added stay in Smartlead (they can be removed there).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "The push (from get_smartlead_push_status with a listId)."
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "check_account_tracking_health",
     "listed": false,
     "description": "Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.\n\nResolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.\n\nReturns:\n- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.\n- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.\n\nUse this to check \"is the pixel broken\" / \"is CAPI deployed\" / \"does this ad's destination actually carry a pixel this account owns\" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.\n\nIf the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.",
@@ -1773,6 +1796,57 @@
     }
   },
   {
+    "name": "get_smartlead_campaign_stats",
+    "listed": false,
+    "description": "How one of the user's Smartlead campaigns is doing, as Smartlead counts it: contacts emailed, emails sent (follow-ups included), replies, bounces and unsubscribes. Read only. Opens and clicks are not reported, and the counts can lag a few minutes behind a recent push or send.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "campaignId": {
+          "type": "number",
+          "description": "The id of one of the user's Smartlead campaigns (from list_smartlead_campaigns)."
+        },
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        }
+      },
+      "required": [
+        "campaignId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "get_smartlead_push_status",
+    "listed": false,
+    "description": "Progress of a Smartlead push (how many contacts were added, whether it is running, paused or finished, and why it paused), or a CRM list's recent pushes. Give runId for one push, or listId for the list. Read only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "One push."
+        },
+        "listId": {
+          "type": "string",
+          "description": "A CRM list (from list_lead_lists): its recent pushes."
+        }
+      },
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "get_user_by_id",
     "listed": false,
     "description": "Resolve a raw userId (e.g. from get_chat_history) to that account's profile: email, displayName, roles, subscription, timestamps. Admin-only, read-only; secret values are never returned. Returns found=false for an unknown userId.",
@@ -2077,7 +2151,7 @@
       },
       "required": []
     },
-    "sideEffect": "write",
+    "sideEffect": "read",
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
@@ -2200,6 +2274,26 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_smartlead_campaigns",
+    "listed": false,
+    "description": "List the campaigns in the user's own connected Smartlead account, with their status and whether leads can be added to them. Read only. Smartlead does the sending; AgentWeb never sends these emails.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        }
+      },
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {
@@ -3345,6 +3439,83 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "pause_smartlead_push",
+    "listed": false,
+    "description": "Pause a running Smartlead push; contacts already added stay in Smartlead. Resuming it is done by a person in AgentWeb, not by an agent.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "description": "The push (from get_smartlead_push_status with a listId)."
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "preview_smartlead_push",
+    "listed": false,
+    "description": "Check what pushing a CRM list into one of the user's Smartlead campaigns would do, without changing anything: how many contacts can be added, why others are skipped, what blocks the push and what needs a decision. Read only. An agent cannot start the push: the result has a link where the person who owns the account reviews and approves it in AgentWeb.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "listId": {
+          "type": "string",
+          "description": "The CRM list to push (its id from list_lead_lists)."
+        },
+        "campaignId": {
+          "type": "number",
+          "description": "The id of one of the user's Smartlead campaigns (from list_smartlead_campaigns)."
+        },
+        "accountId": {
+          "type": "string",
+          "description": "Which Smartlead connection to use, only when more than one is available (the error lists them); by default the user's own, else the one a teammate shared."
+        },
+        "includeUnverified": {
+          "type": "boolean",
+          "description": "Also count contacts whose email is not verified. Default false; only when the user asks."
+        },
+        "mapping": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "For a merge field the campaign uses that is not a standard one: its name mapped to the CRM field that fills it, only as the user said."
+        },
+        "acknowledgedTags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Merge fields the user said Smartlead fills in itself. Only what the user said."
+        },
+        "cohort": {
+          "type": "number",
+          "description": "How many contacts to add (default: the preview's suggestion, 50 for a first push)."
+        }
+      },
+      "required": [
+        "listId",
+        "campaignId"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {

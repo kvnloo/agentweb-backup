@@ -16,22 +16,31 @@ import { computeLoopHealth, type LoopHealth } from '../core/health';
 import { productionLoopPorts } from '../adapters/awsAdapters';
 import type { ClockPort } from '../core/ports';
 
+/** Failed reads carry unknown observations, never fabricated zero counts. */
+export interface UnavailableLoopHealth extends Omit<LoopHealth, 'state' | 'counts' | 'lastActivityAt' | 'lastOutcome'> {
+  state: 'unavailable';
+  counts: null;
+  lastActivityAt: null;
+  lastOutcome: null;
+  error: 'learning_history_unavailable';
+}
+
 export interface LoopHealthReport {
   generatedAt: string;
-  loops: LoopHealth[];
+  loops: (LoopHealth | UnavailableLoopHealth)[];
 }
 
 /**
  * Build the health report for every registered loop. A loop whose learning
  * store can't be read (misregistered impl, transient Dynamo error) is reported
- * with an `error` state rather than failing the whole report — one bad loop
+ * with an `unavailable` state rather than failing the whole report — one bad loop
  * must not blind the operator to the others.
  */
 export async function getLoopHealthReport(
   clock: ClockPort = productionLoopPorts().clock,
 ): Promise<LoopHealthReport> {
   const now = clock.now();
-  const loops: LoopHealth[] = [];
+  const loops: LoopHealthReport['loops'] = [];
 
   for (const manifest of getRegisteredLoopManifests()) {
     try {
@@ -39,25 +48,23 @@ export async function getLoopHealthReport(
       const history = await learning.queryHistory({ loopId: manifest.loopId });
       loops.push(computeLoopHealth(manifest, history, now));
     } catch (err) {
+      // Only known SDK codes are safe diagnostics; messages/stacks may carry secrets.
+      const cause = err instanceof Error && [
+        'ResourceNotFoundException', 'AccessDeniedException', 'ThrottlingException',
+      ].includes(err.name) ? err.name : 'unknown';
+      console.error('[loopHealth] learning history unavailable', { loopId: manifest.loopId, cause });
       loops.push({
         loopId: manifest.loopId,
         displayName: manifest.displayName,
-        state: 'empty',
+        state: 'unavailable',
         paused: manifest.paused,
+        ...(manifest.pauseReason ? { pauseReason: manifest.pauseReason } : {}),
         targetMetric: manifest.targetMetric.name,
-        counts: {
-          total: 0,
-          pendingApproval: 0,
-          inFlight: 0,
-          improved: 0,
-          regressed: 0,
-          noChange: 0,
-          inconclusive: 0,
-        },
+        counts: null,
         lastActivityAt: null,
         lastOutcome: null,
-        error: err instanceof Error ? err.message : String(err),
-      } as LoopHealth & { error: string });
+        error: 'learning_history_unavailable',
+      });
     }
   }
 

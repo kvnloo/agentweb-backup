@@ -7,6 +7,7 @@ import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
 import { waitlistDb, WaitlistEntry } from './waitlistDb';
 import { findSeatLineItem } from './orgSeatBillingService';
+import { mirrorHotLeadCallBilling } from './hotLeadCallBillingService';
 import { invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
 
 dotenv.config();
@@ -1333,6 +1334,9 @@ export async function handleSubscriptionUpdated(
     }
   }
 
+  // Hot lead calls add-on (ENG-2783): same idea for its flat-fee item; see mirrorHotLeadCallBilling.
+  await mirrorHotLeadCallBilling(user, subscription);
+
   console.log(
     `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}, offer=${updateData.activeOffer?.couponId ?? 'none'}`
   );
@@ -1560,6 +1564,8 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             subscriptionType: updateData.subscriptionType,
             subscription_status: updateData.subscription_status,
           });
+          // The deleted subscription may have carried the hot lead calls add-on: judge it from the surviving one.
+          await mirrorHotLeadCallBilling(user, activeSub);
           console.log(
             `Subscription downgrade: user ${user.userId} → synced to ${activeSub.id} (status=${activeSub.status})`
           );
@@ -1593,6 +1599,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     status: 'canceled',
     stripeSubscriptionId: subscription.id,
   });
+
+  // A deleted subscription takes its add-on item with it (the payload still lists the item, with status 'canceled').
+  await mirrorHotLeadCallBilling(user, subscription);
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
 }

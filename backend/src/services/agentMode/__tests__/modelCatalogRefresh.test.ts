@@ -141,6 +141,35 @@ describe('catalog critical invariants', () => {
     // The registry entry itself stays admin-only and carries the cleaned name.
     expect(plan.registryChanges['openrouter/x-ai/grok-4.9']).toMatchObject({ adminOnly: true, name: 'Grok 4.9' });
   });
+  // OpenRouter publishes each reasoning model's accepted efforts as `reasoning.supported_efforts`
+  // (e.g. anthropic/claude-sonnet-5.5: [max, xhigh, high, medium, low]). The gateway drops any
+  // effort it cannot validate against this list, so an addition without it can never be tuned.
+  it('captures a valid reasoning.supported_efforts list but never sets an effort default', () => {
+    const reasoning = { ...row, id: 'x-ai/grok-4.9', supported_parameters: ['tools', 'temperature', 'reasoning_effort'],
+      reasoning: { mandatory: true, supported_efforts: ['max', 'xhigh', 'high', 'medium', 'low'], default_effort: 'high' } };
+    const [added] = discoverNewModels({ data: [reasoning] }, LLM_MODEL_REGISTRY, ['openrouter/x-ai/grok-4.9']);
+    expect(added.config.supportedReasoningEfforts).toEqual(['max', 'xhigh', 'high', 'medium', 'low']);
+    expect(added.config.reasoningEffort).toBeUndefined();
+    expect(added.config.adminOnly).toBe(true);
+  });
+  it.each([
+    ['an unknown effort', { supported_efforts: ['high', 'turbo'] }],
+    ['a non-array', { supported_efforts: 'high' }],
+    ['an empty list', { supported_efforts: [] }],
+    ['no reasoning record', undefined],
+  ])('omits supportedReasoningEfforts for %s (fail closed, never a partial list)', (_label, reasoning) => {
+    const [added] = discoverNewModels({ data: [{ ...row, id: 'x-ai/grok-4.9', reasoning }] }, LLM_MODEL_REGISTRY, ['openrouter/x-ai/grok-4.9']);
+    expect(added.config).not.toHaveProperty('supportedReasoningEfforts');
+  });
+  it('does not tell the reviewer to set efforts the refresh already captured', async () => {
+    const reasoning = { ...row, id: 'x-ai/grok-4.9', supported_parameters: ['tools', 'temperature', 'reasoning_effort'],
+      reasoning: { supported_efforts: ['high', 'medium', 'low'] } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [reasoning] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    const exposure = plan.reports.find(r => r.startsWith('ℹ️ BEFORE CUSTOMER EXPOSURE'))!;
+    expect(exposure).not.toContain('supportedReasoningEfforts not set');
+    expect(plan.registryChanges['openrouter/x-ai/grok-4.9']).toMatchObject({ supportedReasoningEfforts: ['high', 'medium', 'low'] });
+  });
   it('notes time-of-day price windows on an existing model instead of reporting plain drift', async () => {
     const windowed = { ...row, id: 'x-ai/grok-4.7', pricing: { prompt: '0.000001', completion: '0.000003',
       overrides: [{ utc_days: ['monday'], prompt: '0.000002', completion: '0.000006' }] } };
