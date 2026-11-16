@@ -108,6 +108,8 @@ export function reserveJoinConfirmation(taskId: string, email: string, ownerId: 
 export function resetJoinConfirmationLimits(): void {
   sendLog.clear();
   lastSweep = 0;
+  joinSendsInFlight = 0;
+  joinSendsEpoch++; // places handed out before this reset must not be given back into the new count
 }
 
 /** For tests: how many counters are being kept. */
@@ -131,4 +133,34 @@ export function renderConfirmPage({ title, message, form }: ConfirmPageOptions):
     ? `<form method="post" action="${escapeHtmlText(form.action)}" style="margin: 24px 0 0;"><input type="hidden" name="token" value="${escapeHtmlText(form.token)}"><button type="submit" style="background: #3b82f6; color: #fff; border: 0; padding: 12px 22px; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer;">${escapeHtmlText(form.button)}</button></form>`
     : '';
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtmlText(title)}</title></head><body style="font-family: Arial, sans-serif; background: #f8f9fa; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0;"><div style="background: #fff; padding: 32px; border-radius: 8px; max-width: 480px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,.1);"><h2 style="color: #1B2549; margin-top: 0;">${escapeHtmlText(title)}</h2><p style="color: #333; line-height: 1.6;">${escapeHtmlText(message)}</p>${button}</div></body></html>`;
+}
+
+/**
+ * ENG-2991: confirmation emails share one outgoing queue with every other email the app sends (about two a second). The hourly caps above
+ * bound the total, but not a burst, so this also bounds how many of these are waiting to go out at once: a flood of sign-ups can delay
+ * everyone else's email by about half a minute at most, not by the length of the whole hourly allowance.
+ */
+export const MAX_JOIN_SENDS_IN_FLIGHT = 50;
+let joinSendsInFlight = 0;
+let joinSendsEpoch = 0;
+
+/** Take a place in the outgoing queue for one confirmation email. Returns the function that gives it back, or null when the queue is full. */
+export function tryBeginJoinSend(): (() => void) | null {
+  if (joinSendsInFlight >= MAX_JOIN_SENDS_IN_FLIGHT) {
+    console.warn(JSON.stringify({ event: 'subscriber_join_throttled', cap: 'queue' }));
+    return null;
+  }
+  joinSendsInFlight++;
+  const epoch = joinSendsEpoch;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (epoch === joinSendsEpoch) joinSendsInFlight--;
+  };
+}
+
+/** For tests. */
+export function joinSendsInFlightCount(): number {
+  return joinSendsInFlight;
 }

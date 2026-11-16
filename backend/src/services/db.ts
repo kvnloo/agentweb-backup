@@ -14,6 +14,7 @@ import type { TrackingConfig } from "../utils/trackingConfig";
 import { ingestListCache } from "../utils/ingestListCache";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
+import { randomUUID } from "crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
@@ -78,6 +79,9 @@ const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 const s3 = new S3();
 
 // Helper function to handle DynamoDB errors
+/** True when a resubscribe call asked for any condition (so a refused condition is an answer, not an error). */
+const hasResubscribeConditions = (options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) => Boolean(options?.onlyIfOptOutNonce || options?.onlyIfUnsubscribedAt);
+
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
   if (error.code === "CredentialsError") {
@@ -4771,13 +4775,16 @@ export const subscriberDb = {
    */
   async softUnsubscribe(taskId: string, email: string, feedback?: string, options?: { onlyIfActive?: boolean }) {
     try {
+      // optOutNonce names this particular opt-out (ENG-2991): the undo token is bound to it, and a repeat unsubscribe of an address that is already
+      // opted out rotates it (refreshOptOut), without touching unsubscribedAt, which stays the record of when the person opted out.
       const updateExpression = feedback
-        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
-        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
+        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce, feedback = :feedback"
+        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce";
 
       const expressionAttributeValues: any = {
         ":unsubscribed": true,
         ":unsubscribedAt": new Date().toISOString(),
+        ":optOutNonce": randomUUID(),
       };
 
       if (feedback) {
@@ -4808,10 +4815,11 @@ export const subscriberDb = {
   },
 
   /**
-   * Put an unsubscribed address back. With `onlyIfUnsubscribedAt` the update applies only while the row is still unsubscribed by exactly that
-   * opt-out, in one atomic step, and returns null when it did not (ENG-2991: an undo token must not undo a newer opt-out).
+   * Put an unsubscribed address back. With `onlyIfOptOutNonce` and/or `onlyIfUnsubscribedAt` the update applies only while the row is still
+   * unsubscribed by exactly that opt-out, in one atomic step, and returns null when it did not (ENG-2991: an undo token or a confirmation link
+   * must not undo a newer opt-out).
    */
-  async resubscribe(taskId: string, email: string, options?: { onlyIfUnsubscribedAt?: string }) {
+  async resubscribe(taskId: string, email: string, options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) {
     try {
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -4827,25 +4835,34 @@ export const subscriberDb = {
         },
         ReturnValues: "ALL_NEW",
       };
+      const conditions: string[] = [];
+      if (options?.onlyIfOptOutNonce) {
+        conditions.push("optOutNonce = :claimedNonce");
+        params.ExpressionAttributeValues[":claimedNonce"] = options.onlyIfOptOutNonce;
+      }
       if (options?.onlyIfUnsubscribedAt) {
-        params.ConditionExpression = "unsubscribed = :wasOptedOut AND unsubscribedAt = :claimedOptOut";
-        params.ExpressionAttributeValues[":wasOptedOut"] = true;
+        conditions.push("unsubscribedAt = :claimedOptOut");
         params.ExpressionAttributeValues[":claimedOptOut"] = options.onlyIfUnsubscribedAt;
+      }
+      if (conditions.length) {
+        params.ConditionExpression = ["unsubscribed = :wasOptedOut", ...conditions].join(" AND ");
+        params.ExpressionAttributeValues[":wasOptedOut"] = true;
       }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error: any) {
-      if (options?.onlyIfUnsubscribedAt && error?.code === "ConditionalCheckFailedException") return null;
+      if (hasResubscribeConditions(options) && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "resubscribe");
     }
   },
 
   /**
-   * Give an already unsubscribed address a new opt-out time, which voids every undo token issued for the earlier one (ENG-2991). Does
-   * nothing (returns null) if the address is not unsubscribed.
+   * Give an already unsubscribed address a new opt-out nonce, which voids every undo token issued for the earlier one (ENG-2991). It does not
+   * touch `unsubscribedAt`: that stays the record of when the person opted out, and the rule that refuses a confirmation link sent before the
+   * opt-out depends on it. Returns true when it applied; false if the address is not unsubscribed or does not exist (no row is created).
    */
-  async refreshOptOut(taskId: string, email: string) {
+  async refreshOptOut(taskId: string, email: string): Promise<boolean> {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -4853,20 +4870,20 @@ export const subscriberDb = {
           taskId,
           email,
         },
-        UpdateExpression: "SET unsubscribedAt = :now",
+        UpdateExpression: "SET optOutNonce = :nonce",
         ConditionExpression: "unsubscribed = :isOptedOut",
         ExpressionAttributeValues: {
-          ":now": new Date().toISOString(),
+          ":nonce": randomUUID(),
           ":isOptedOut": true,
         },
-        ReturnValues: "ALL_NEW" as const,
       };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      await dynamodb.update(params).promise();
+      return true;
     } catch (error: any) {
-      if (error?.code === "ConditionalCheckFailedException") return null;
+      if (error?.code === "ConditionalCheckFailedException") return false;
       handleDynamoDbError(error, "refreshOptOut");
+      return false;
     }
   },
 
