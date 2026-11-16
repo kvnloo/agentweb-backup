@@ -544,7 +544,8 @@ export function runInsights(dataset: SandboxDataset, overlay: SandboxOverlay, pa
     const unbroken = new Map<string, Agg[]>();
     for (const agg of groups.values()) {
       const key = `${agg.bucket.since}|${JSON.stringify(agg.entity)}`;
-      unbroken.set(key, [...(unbroken.get(key) ?? []), agg]);
+      const group = unbroken.get(key);
+      if (group) group.push(agg); else unbroken.set(key, [agg]);
     }
     for (const dimensions of unbroken.values()) {
       const byAd = new Map<string, Map<string, number>>();
