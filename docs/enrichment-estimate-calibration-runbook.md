@@ -9,8 +9,9 @@ were measured from what prod booked. This runbook is how to check, from real run
 - **At least every 14 days.** The run logs the script reads live in a CloudWatch log group that keeps 14 days, so older
   runs disappear. The script warns whenever `--since` is at or before the oldest retained day: that day is only partly
   covered by the logs while the ledger counts the whole day, which inflates the ratio, so start at the day after.
-- Retune only on enough data: at least **100 contacts, from at least 3 accounts that each supplied at least 10 contacts**.
-  Below that the script says INSUFFICIENT DATA, and you must not retune; run it again later.
+- Retune only on enough data: at least **100 contacts, from at least 3 accounts that each supplied at least 10 contacts,
+  with no account supplying more than half of them**. Otherwise the script says INSUFFICIENT DATA and names what is short,
+  and you must not retune; run it again later.
 - **Do not move `--since` forward after an INSUFFICIENT result.** Keep the same `--since` (the day after the last change
   to pricing or the enrichment pipeline) until the data is enough, so the runs keep adding up. Because the logs only last
   14 days, before the oldest runs of that window fall off, write the partial numbers into the History table below.
@@ -27,19 +28,27 @@ python3 scripts/enrichment-estimate-calibration.py --since <the day after the la
 `--since` is required and must be a real, zero-padded date (`2026-11-05`, not `2026-11-5`: the ledger filter is a string
 comparison, so the script rejects the unpadded form instead of silently dropping rows). It must be the day **after the last
 change** to pricing or the enrichment pipeline, because the script cannot know that date and a window that reaches back
-before a change gives a false DRIFT: on 2026-11-16 a 14-day window started on 2026-11-02 and included the 2026-11-03 run
-from before the 2026-11-04 fixes (148 contacts at 3.6 times the quote), which turned a 245-contact sample into "DRIFT".
+before a change can mislead: on 2026-11-16 a 14-day window started on 2026-11-02 and printed DRIFT because it included the
+2026-11-03 run, whose 148 contacts looked 3.6 times the quote. Most of that was the day's 60 paid email searches ($26.70), booked under the
+old model name `apollo:full_enrichment`, which the first version of the script did not exclude; the script now treats both
+names as the email search, and that run reads 1.01. It is also the 148-contact list the 2026-11-13 recalibration was fitted
+to, so it confirms the fit, not the quote. A window that includes it is dominated by it (72% of the contacts from
+2026-11-03), so the script refuses to give a verdict when one account supplies more than half of the contacts
+(`--max-account-share`). Other things changed on 2026-11-04 (the ENG-2720 fixes), so still start after the last change.
 Always read the per-line table before acting on the verdict.
 
 It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs filter-log-events`, `dynamodb scan` and
 `dynamodb get-item`. It prints one line per account and day (6-character user id prefix, contacts, fields, booked dollars,
 dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. It prints no email, lead or field
-value, and AWS error text is scrubbed of ARNs and email addresses and capped at 300 characters.
+value. AWS error text is reduced to the error code and the operation (the full text can carry account names); run the same
+`aws` command by hand to read it.
 
 Left out as non-customers: the test account `test@account.com` (`--exclude-emails`, case-insensitive), every platform admin
 (`isAdmin`), every account whose email domain is, or is a subdomain of, `agentweb.pro` or `argusoft.com`
-(`--exclude-domains`; a look-alike such as `agentweb.pro.example.com` stays in) and any `--exclude-user-ids`. The user table
-is read whole and matched inside the script, so no email is put into a DynamoDB expression or printed. Real customer
+(`--exclude-domains`; a look-alike such as `agentweb.pro.example.com` stays in) and any `--exclude-user-ids` (a prefix of
+6 or more characters, as printed in the table, is enough). It prints how many accounts each rule excluded and warns when an
+`--exclude-user-ids` entry matches nothing. The user table is read whole and matched inside the script, so no email is put
+into a DynamoDB expression or printed. Real customer
 accounts are kept whatever their email domain. The script only issues read calls, but the guarantee that nothing can be
 written is the IAM role: run it with a read-only one. The script reads the three rate constants and `referenceFieldCount` from
 `enrichmentCostEstimate.ts`, so those cannot drift; the **formula itself is duplicated** in the script, so if
@@ -52,15 +61,17 @@ written is the IAM role: run it with a read-only one. The script reads the three
   customer quote's formula (included fields plus smart-field dependencies, at least 1; 10 when the list has no saved
   config) to the list's *saved* config. The quote also counts columns added to the list since the config was saved; this
   check does not (about 3% of the ratio per column).
-- Within +/-25% on enough data: leave the constants alone.
+- Within +/-25% on enough data (all three conditions above): leave the constants alone.
 - Beyond that on enough data: retune `ENRICHMENT_COST_RATES_USD`, update the calibration paragraph in that file's header
   and the tests in `enrichmentCostEstimate.test.ts`, and ship it through the normal PR rules. Record the sample below.
-- **Fresh lists cost more than the quote.** The quote is an average over lists whose lookups are partly cached. A list of
-  people Apollo has not been asked about recently pays full price: the 2026-11-05 Nuerraa run's person and company lookups
-  cost about $0.094 a contact against the quote's $0.041 lookup term. Expect single runs above the quote.
+- **Lists with nothing cached cost more than the quote.** The quote is an average over lists whose lookups are partly
+  cached. The 2026-11-05 Nuerraa run looks like a list with nothing cached (29 of its 30 contacts needed a paid person
+  lookup): its person and company lookups cost about $0.094 a contact against the quote's $0.041 lookup term. Expect single
+  runs above the quote.
 - The paid add-ons have no term in the per-contact quote, so they are excluded from the ratio and shown in their own
-  columns: the Apollo email search (`apollo:waterfall_email`, $0.445 a request, hit or miss; the quote models it as a share
-  of the emailless leads it can reach, `apolloEligibleRate` and `apolloOtherRate`) and Enigma (`enigma:*`, which the customer
+  columns: the Apollo email search (`apollo:waterfall_email`, called `apollo:full_enrichment` until 2026-11-02, $0.445 a
+  request, hit or miss; the quote models it as a share of the emailless leads it can reach, `apolloEligibleRate` and
+  `apolloOtherRate`) and Enigma (`enigma:*`, which the customer
   quote adds separately for card-revenue fields).
 
 ## Known limits
@@ -71,8 +82,9 @@ written is the IAM role: run it with a read-only one. The script reads the three
 - A run that straddles midnight UTC is split across days. A run that started before `--since` is not counted (the script
   reports how many, account unknown), and a customer run that started but never finished (still running or crashed) leaves
   its cost in the booked dollars with no contacts (also reported).
-- The gate counts accounts that each supplied at least `--min-customer-contacts` (default 10) contacts, and the verdict
-  prints the share of the largest account; read the per-line table anyway.
+- The gate counts accounts that each supplied at least `--min-customer-contacts` (default 10) contacts, and refuses a
+  verdict when one account supplies more than `--max-account-share` (default 0.5) of the contacts; the verdict prints that
+  share. Read the per-line table anyway.
 - The share of leads that fire the paid email search cannot be read from this join; see the next section.
 
 ## The paid email search (measured 2026-11-16)
@@ -104,18 +116,28 @@ written is the IAM role: run it with a read-only one. The script reads the three
   statuses (`completed` vs `no_email`). Five or more requests and none `completed` means the callback layout may have
   changed: look at the webhook, do not retune.
 
-### Decision: no cache-aware quote (2026-11-16)
+### Decision: no cache-aware quote for now (2026-11-16)
 
-Not worth building now. Name-based cache keys depend on a domain that is only known at run time, so the quote cannot look
-them up. Asking Apollo whether it knows a lead is a paid person lookup ($0.0495), about a quarter of the expected search
-cost, and the quote should not spend money to estimate spend. Customer exposure on emailless leads without a LinkedIn URL
-is still unmeasured (the one customer search above sat in a sample that was almost all emailed leads). Revisit if this
-check shows the quote is persistently off by more than the tolerance.
+Not building it yet, for these reasons, and to be revisited once this check has enough customer data (100 contacts from 3
+accounts):
+
+- There is no measured need. The only customer evidence on the paid email search is one search in the recalibration
+  sample, and 0 of 8 real name-and-company-only people fired it, so the case for adding quote-time cache lookups rests on
+  nothing yet.
+- The Apollo cache key for a name lookup is `apollo:name:<first>|<last>|<domain or normalised company>`
+  (`apolloCacheKeys.ts`). A quote-time lookup would have to rebuild the same key the run will use, and the domain a run
+  uses can come from an earlier step, so a quote could miss entries the run would hit. We have not measured how often.
+- Which way it would move the number is unclear: cached lists would quote lower, lists with nothing cached higher, and the
+  customer sample (58 contacts at 1.50 of quote) suggests it is the uncached side that is low. That is a calibration
+  question for this check to answer with more data, not something quote-time lookups settle first.
+- Customer exposure on emailless leads without a LinkedIn URL is still unmeasured (the one customer search above sat in a
+  sample that was almost all emailed leads).
 
 ## History
 
 | Date | Sample | Booked | Quote | Result |
 |---|---|---|---|---|
 | 2026-11-13 | 118 contacts, 4 accounts as recorded then, since 2026-11-04 (one of them fired the paid email search), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
+| 2026-11-16 | 2026-11-03: one 148-contact customer list (the list the recalibration was fitted to); its 60 paid email searches ($26.70, booked under the old name `apollo:full_enrichment`) excluded | $10.49 | $10.38 (ratio 1.01) | confirms the fit, not the quote; a window that includes it is INSUFFICIENT because this list is 72% of the contacts |
 | 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) was on a fresh list, its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
 | 2026-11-16 | 7 contacts, 1 internal `agentweb.pro` account (excluded as non-customer by the current defaults), 2026-11-13 to 2026-11-16 | $0.48 | $0.49 (ratio 0.97) | no customer data in the window; nothing to retune |
