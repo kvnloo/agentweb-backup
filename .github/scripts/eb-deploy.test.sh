@@ -167,6 +167,24 @@ case "$operation" in
     ;;
 
   describe-instances-health)
+    # ENG-3082: the per-instance DEPLOYMENT read (which version each instance
+    # reports as deployed) has its own fixture, `instances_deployment`, holding
+    # "<instance-id><TAB><HealthStatus><TAB><VersionLabel><TAB><DeployStatus>"
+    # lines or "ERROR|<message>", so the ENG-878 health fixture below keeps
+    # serving exactly what it always served.
+    if grep -qF 'Deployment.VersionLabel' <<<"$query"; then
+      if [ -f "${MOCK_DIR}/instances_deployment" ]; then
+        first=$(head -n 1 "${MOCK_DIR}/instances_deployment")
+        if [ "${first%%|*}" = "ERROR" ]; then
+          printf '%s\n' "${first#*|}" >&2
+          exit 255
+        fi
+        cat "${MOCK_DIR}/instances_deployment"
+      else
+        printf 'None\n'
+      fi
+      exit 0
+    fi
     # ENG-878: the non-lagging per-instance signal. Fixture `instances_health`
     # holds "<instance-id><TAB><HealthStatus>" lines, the literal token NONE for
     # an empty environment, or "ERROR|<message>" to simulate an API/IAM failure.
@@ -1505,6 +1523,177 @@ set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
 check 'ENG-3039: a normal deploy still succeeds through the Ready path' 0 \
   "is Ready, running version 'backend-20260729-pr2216'"
+
+# ---------------------------------------------------------------------------
+# ENG-3082 -- a release that is serving must not be reported failed because
+# the environment's version label has not moved yet.
+#
+# Production, 2026-11-16, run 43832897163 (merge of #4118). The run waited
+# from 08:41Z to 08:59Z behind a configuration update it did not start, so its
+# own update was accepted at 08:59:57Z with about 26 minutes of budget left.
+# Elastic Beanstalk logged "Deployment succeeded. Terminating old instances and
+# temporary Auto Scaling group." at 09:06:20Z and then spent until 09:23:08Z
+# removing the old instance. The environment's VersionLabel only moves when the
+# whole update completes (09:28:10Z), so every poll read
+# `Status=Updating Health=Green Version=backend-20261116-pr4116` and the run
+# failed on its budget at 09:26:30Z, 100 seconds before EB finished and about
+# 20 minutes after the release was serving.
+#
+# The fixtures are that sequence with the harness's labels ('old-version' is
+# pr4116, the expected label is pr4118): the status line every poll logged, the
+# INFO events for the window newest first, and the per-instance view read from
+# production during the same phase of the next deploy (new instance on the new
+# version, old instance still listed on the old one and draining).
+# ---------------------------------------------------------------------------
+
+printf '\nENG-3082: a serving release whose version label lags is not a failure\n'
+
+EB_IMMUTABLE_SUCCEEDED='Deployment succeeded. Terminating old instances and temporary Auto Scaling group.'
+
+# Newest first, as describe-events returns them.
+set_immutable_succeeded_events() {
+  local dir="$1"
+  {
+    printf '%s\n' "${EB_IMMUTABLE_SUCCEEDED}"
+    printf '%s\n' 'Waiting for post-deployment configuration to complete.'
+    printf '%s\n' 'Instance deployment completed successfully.'
+    printf '%s\n' 'Starting post-deployment configuration on new instances.'
+    printf '%s\n' 'Attached new instance(s) to the permanent auto scaling group awseb-e-x-stack-AWSEBAutoScalingGroup-SoB9a6hVCRje.'
+    printf '%s\n' 'Created temporary auto scaling group awseb-e-x-immutable-stack-AWSEBAutoScalingGroup-uQBsl6uZEzRD.'
+    printf '%s\n' 'Immutable deployment policy enabled. Launching one instance with the new settings to verify health.'
+    printf '%s\n' 'Environment update is starting.'
+  } >"${dir}/info_events"
+}
+
+# New instance serving the expected version, old instance still draining.
+set_new_instance_serving() {
+  local dir="$1"
+  {
+    printf 'i-0504eb4eaa2e817fc\tOk\tbackend-20260729-pr2216\tDeployed\n'
+    printf 'i-088cef37b3ad334e5\tOk\told-version\tDeployed\n'
+  } >"${dir}/instances_deployment"
+  printf 'arn:aws:elasticloadbalancing:us-west-2:1:loadbalancer/app/awseb-AWSEB-X/abc\n' >"${dir}/lb_arns"
+  printf 'arn:aws:elasticloadbalancing:us-west-2:1:targetgroup/awseb-AWSEB-UUBAGFYEVPQ1/def\n' >"${dir}/tg_arns"
+  {
+    printf 'i-0504eb4eaa2e817fc\thealthy\n'
+    printf 'i-088cef37b3ad334e5\tdraining\n'
+  } >"${dir}/target_health"
+}
+
+new_lagging_label_case() {
+  M=$(new_mock_dir)
+  set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|old-version'
+  set_immutable_succeeded_events "$M"
+  set_new_instance_serving "$M"
+}
+
+# The 11-16 replay.
+new_lagging_label_case
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: the 2026-11-16 sequence is a success, not a budget timeout' 0 \
+  'SUCCESS: environment'
+check 'ENG-3082: the success names the instance and the version it reports' 0 \
+  "i-0504eb4eaa2e817fc reports 'backend-20260729-pr2216' as Deployed"
+check 'ENG-3082: the success says the old instance is still being removed' 0 \
+  'still removing the old instance'
+
+# The run still uses its whole budget first: the proof is only consulted at the
+# point where the deploy would otherwise be failed, so a later deploy is never
+# released into an environment this one could still have waited for.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(cat "$M/clock")" -ge 20 ]; then
+  pass 'ENG-3082: the proof is consulted only once the budget is spent'
+else
+  printf '  FAIL ENG-3082: succeeded before the budget was spent (clock=%s)\n' "$(cat "$M/clock")"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# The old instance already gone (the state at 09:26:30Z on 11-16): still a success.
+new_lagging_label_case
+printf 'i-0504eb4eaa2e817fc\tOk\tbackend-20260729-pr2216\tDeployed\n' >"$M/instances_deployment"
+printf 'i-0504eb4eaa2e817fc\thealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: one remaining instance on the expected version is a success' 0 \
+  'SUCCESS: environment'
+
+# A deploy that did not apply must still fail. Each case removes one leg.
+
+# No instance reports the expected version.
+new_lagging_label_case
+printf 'i-088cef37b3ad334e5\tOk\told-version\tDeployed\n' >"$M/instances_deployment"
+printf 'i-088cef37b3ad334e5\thealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: instances on a different version still fail on the budget' 1 \
+  'did not come up Ready'
+
+# EB never logged the deployment as succeeded for this update.
+new_lagging_label_case
+{
+  printf '%s\n' 'Instance deployment completed successfully.'
+  printf '%s\n' 'Immutable deployment policy enabled. Launching one instance with the new settings to verify health.'
+  printf '%s\n' 'Environment update is starting.'
+} >"$M/info_events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: no "Deployment succeeded" event for this update still fails' 1 \
+  'did not come up Ready'
+
+# The success line belongs to the update BEFORE ours (the 08:32Z line of the
+# configuration update on 11-16): our own start comes after it.
+new_lagging_label_case
+{
+  printf '%s\n' 'Immutable deployment policy enabled. Launching one instance with the new settings to verify health.'
+  printf '%s\n' 'Environment update is starting.'
+  printf '%s\n' 'Environment update completed successfully.'
+  printf '%s\n' "${EB_IMMUTABLE_SUCCEEDED}"
+  printf '%s\n' 'Environment update is starting.'
+} >"$M/info_events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: a success event from the previous update is not accepted' 1 \
+  'did not come up Ready'
+
+# The expected version is on the instance but its deployment has not finished.
+new_lagging_label_case
+printf 'i-0504eb4eaa2e817fc\tOk\tbackend-20260729-pr2216\tInProgress\n' >"$M/instances_deployment"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: expected version not yet Deployed on the instance still fails' 1 \
+  'did not come up Ready'
+
+# The instance on the expected version is not healthy.
+new_lagging_label_case
+printf 'i-0504eb4eaa2e817fc\tSevere\tbackend-20260729-pr2216\tDeployed\n' >"$M/instances_deployment"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: expected-version instance that is not Ok still fails' 1 \
+  'did not come up Ready'
+
+# The instance is not taking traffic from the load balancer.
+new_lagging_label_case
+printf 'i-0504eb4eaa2e817fc\tunhealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: expected-version instance not healthy in the target group still fails' 1 \
+  'did not come up Ready'
+
+# The per-instance read fails: no proof, so the failure stands.
+new_lagging_label_case
+printf 'ERROR|AccessDenied: not authorized to perform elasticbeanstalk:DescribeInstancesHealth\n' >"$M/instances_deployment"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: an unreadable instance view is not proof' 1 \
+  'did not come up Ready'
+
+# This path is only for a label that has NOT moved. Updating on our own label
+# is the ENG-3039 state, which needs EB's rollout-complete line and is judged
+# there; the evidence above must not open a second way through it.
+new_lagging_label_case
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: Updating on our own label is still judged by the ENG-3039 rule' 1 \
+  'did not come up Ready'
+
+# The event log cannot be read: no proof either.
+new_lagging_label_case
+printf '255' >"$M/info_events_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: an unreadable event log is not proof' 1 \
+  'did not come up Ready'
 
 # ---------------------------------------------------------------------------
 

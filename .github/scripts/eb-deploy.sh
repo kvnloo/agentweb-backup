@@ -618,6 +618,140 @@ rollout_logged_complete() {
   ' <<<"${out}"
 }
 
+# True when the release is provably serving although the environment's version
+# label has not moved to it yet (ENG-3082).
+#
+# An Immutable update finishes in two parts. First the new instance passes its
+# health checks, joins the permanent group and takes traffic; EB then logs
+# "Deployment succeeded. Terminating old instances and temporary Auto Scaling
+# group." Only after the old instance has drained and gone does EB mark the
+# update complete and move the environment's VersionLabel. On 2026-11-16 the
+# second part took 17 minutes and, one update earlier, 27. A run that started
+# late (it had waited 18 minutes behind an update it did not start) ran out of
+# budget 100 seconds before EB finished, and reported a release that had been
+# serving for 20 minutes as failed.
+#
+# verify_deployment consults this only when the budget is spent, in place of
+# the failure. It never ends a deploy early, so the next deploy is not released
+# into an environment this one could still have waited for.
+#
+# Three things must all hold. Sets EB_SERVING_DETAIL for the success line.
+#
+#   1. EB's event log, since our update was accepted: the LAST "Environment
+#      update is starting." is followed by the "Deployment succeeded" line. EB
+#      runs one update at a time and the label is not ours yet, so the last
+#      start is our own. A success line from the update before ours sits
+#      before that start and is ignored. EB writes this line only after it has
+#      accepted the new instances; a failed Immutable update terminates the NEW
+#      instances and never logs it.
+#   2. At least one instance reports EB_VERSION_LABEL as its deployed version
+#      with deployment status Deployed and health Ok, and no instance on our
+#      version reports anything else. This is the leg that names the version:
+#      it is read from the instance, not from the environment. An instance on
+#      another version is the old one being removed and is not counted.
+#   3. Every one of those instances is `healthy` in a load-balancer target
+#      group, so it is taking traffic.
+#
+# Any read that fails, or any leg that does not hold, returns false and the
+# caller fails the deploy exactly as before.
+EB_SERVING_DETAIL=''
+release_serving_while_old_instances_terminate() {
+  EB_SERVING_DETAIL=''
+  [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 1
+
+  local since out from
+  from=$(( EB_UPDATE_ACCEPTED_AT - EB_ROLLOUT_EVENT_LOOKBACK_SECONDS ))
+  since="$(date -u -r "${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -z "${since}" ] && return 1
+
+  if ! out=$(aws elasticbeanstalk describe-events \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --severity INFO \
+    --start-time "${since}" \
+    --max-items 200 \
+    --query 'Events[].[Message]' \
+    --output text 2>&1); then
+    log "[events] could not read EB events to check whether the release is serving. AWS reported: ${out}"
+    return 1
+  fi
+
+  # EB returns newest first; walk oldest first. Each start resets the answer,
+  # so only a success line after the LAST start counts.
+  if ! awk '
+    { lines[NR] = $0 }
+    END {
+      started = 0; succeeded = 0
+      for (i = NR; i >= 1; i--) {
+        if (index(lines[i], "Environment update is starting.")) { started = 1; succeeded = 0 }
+        else if (started && index(lines[i], "Deployment succeeded. Terminating old instances and temporary Auto Scaling group.")) succeeded = 1
+      }
+      exit succeeded ? 0 : 1
+    }
+  ' <<<"${out}"; then
+    return 1
+  fi
+
+  local instances serving='' iid ihealth iversion istatus
+  if ! instances=$(aws elasticbeanstalk describe-instances-health \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --attribute-names HealthStatus Deployment \
+    --query 'InstanceHealthList[*].[InstanceId,HealthStatus,Deployment.VersionLabel,Deployment.Status]' \
+    --output text 2>&1); then
+    log "[verify] could not read per-instance deployment state. AWS reported: ${instances}"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r iid ihealth iversion istatus; do
+    [ -z "${iid}" ] && continue
+    [ "${iversion}" != "${EB_VERSION_LABEL}" ] && continue
+    if [ "${ihealth}" != "Ok" ] || [ "${istatus}" != "Deployed" ]; then
+      log "[verify] instance ${iid} is on '${EB_VERSION_LABEL}' but reports health=${ihealth} deployment=${istatus}; the release is not proven serving."
+      return 1
+    fi
+    serving="${serving}${iid} "
+  done <<<"${instances}"
+  [ -z "${serving}" ] && return 1
+
+  local lb_arns lb tg_arns arn targets all_targets=''
+  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --query 'EnvironmentResources.LoadBalancers[*].Name' \
+    --output text 2>&1); then
+    return 1
+  fi
+  lb_arns=$(printf '%s' "${lb_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+  [ -z "${lb_arns}" ] && return 1
+
+  while IFS= read -r lb; do
+    [ -z "${lb}" ] && continue
+    if ! tg_arns=$(aws elbv2 describe-target-groups \
+      --load-balancer-arn "${lb}" \
+      --query 'TargetGroups[*].TargetGroupArn' \
+      --output text 2>&1); then
+      return 1
+    fi
+    for arn in $(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true); do
+      if ! targets=$(aws elbv2 describe-target-health \
+        --target-group-arn "${arn}" \
+        --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+        --output text 2>&1); then
+        return 1
+      fi
+      all_targets="${all_targets}${targets}"$'\n'
+    done
+  done <<<"${lb_arns}"
+
+  for iid in ${serving}; do
+    if ! grep -qx "${iid}"$'\t''healthy' <<<"${all_targets}"; then
+      log "[verify] instance ${iid} is on '${EB_VERSION_LABEL}' but is not healthy in a load-balancer target group; the release is not proven serving."
+      return 1
+    fi
+  done
+
+  EB_SERVING_DETAIL="${serving% }"
+}
+
 # Creates the application version. A genuine failure fails the job; the single
 # tolerated case is the version already existing (a re-run of the same commit),
 # which is logged with the reason AWS gave.
@@ -849,6 +983,14 @@ verify_deployment() {
     fi
 
     if run_budget_exhausted; then
+      # ENG-3082: the budget is spent with the label still on the previous
+      # version. That is a failure unless the release is provably serving and
+      # EB is only still removing the old instance.
+      if [ "${EB_STATUS}" = "Updating" ] && [ "${EB_CURRENT_VERSION}" != "${EB_VERSION_LABEL}" ] \
+        && release_serving_while_old_instances_terminate; then
+        log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' is serving version '${EB_VERSION_LABEL}': Elastic Beanstalk logged this deployment as succeeded, and instance ${EB_SERVING_DETAIL} reports '${EB_VERSION_LABEL}' as Deployed with health Ok and is healthy in the load balancer. The environment still reads Updating on '${EB_CURRENT_VERSION}' because Elastic Beanstalk is still removing the old instance; the deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s ran out before it finished."
+        return 0
+      fi
       fail "environment '${EB_ENVIRONMENT_NAME}' did not come up Ready on version '${EB_VERSION_LABEL}' within the overall deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s. Last observed Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION}."
     fi
 
