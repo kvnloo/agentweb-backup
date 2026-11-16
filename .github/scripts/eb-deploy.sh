@@ -659,13 +659,19 @@ release_serving_while_old_instances_terminate() {
   EB_SERVING_DETAIL=''
   [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 1
 
+  # This runs after the budget is spent, inside the margin the workflow step
+  # leaves above it (300s at the tightest caller). Each read is capped so a
+  # stalled AWS call cannot hold the step open until it is cancelled: five
+  # reads for one load balancer and one target group, 25s each at worst.
+  local read_bound=(--cli-connect-timeout 10 --cli-read-timeout 15)
+
   local since out from
   from=$(( EB_UPDATE_ACCEPTED_AT - EB_ROLLOUT_EVENT_LOOKBACK_SECONDS ))
   since="$(date -u -r "${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || date -u -d "@${from}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
   [ -z "${since}" ] && return 1
 
-  if ! out=$(aws elasticbeanstalk describe-events \
+  if ! out=$(aws elasticbeanstalk describe-events "${read_bound[@]}" \
     --environment-name "${EB_ENVIRONMENT_NAME}" \
     --severity INFO \
     --start-time "${since}" \
@@ -693,7 +699,7 @@ release_serving_while_old_instances_terminate() {
   fi
 
   local instances serving='' iid ihealth iversion istatus
-  if ! instances=$(aws elasticbeanstalk describe-instances-health \
+  if ! instances=$(aws elasticbeanstalk describe-instances-health "${read_bound[@]}" \
     --environment-name "${EB_ENVIRONMENT_NAME}" \
     --attribute-names HealthStatus Deployment \
     --query 'InstanceHealthList[*].[InstanceId,HealthStatus,Deployment.VersionLabel,Deployment.Status]' \
@@ -714,7 +720,7 @@ release_serving_while_old_instances_terminate() {
   [ -z "${serving}" ] && return 1
 
   local lb_arns lb tg_arns arn targets all_targets=''
-  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources \
+  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources "${read_bound[@]}" \
     --environment-name "${EB_ENVIRONMENT_NAME}" \
     --query 'EnvironmentResources.LoadBalancers[*].Name' \
     --output text 2>&1); then
@@ -725,14 +731,14 @@ release_serving_while_old_instances_terminate() {
 
   while IFS= read -r lb; do
     [ -z "${lb}" ] && continue
-    if ! tg_arns=$(aws elbv2 describe-target-groups \
+    if ! tg_arns=$(aws elbv2 describe-target-groups "${read_bound[@]}" \
       --load-balancer-arn "${lb}" \
       --query 'TargetGroups[*].TargetGroupArn' \
       --output text 2>&1); then
       return 1
     fi
     for arn in $(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true); do
-      if ! targets=$(aws elbv2 describe-target-health \
+      if ! targets=$(aws elbv2 describe-target-health "${read_bound[@]}" \
         --target-group-arn "${arn}" \
         --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
         --output text 2>&1); then
@@ -742,9 +748,22 @@ release_serving_while_old_instances_terminate() {
     done
   done <<<"${lb_arns}"
 
+  # Healthy in EVERY target group that lists the instance, and listed in at
+  # least one. An environment with several processes has a target group per
+  # process; healthy in one and failing in another is not a serving release.
+  local tid tstate listed
   for iid in ${serving}; do
-    if ! grep -qx "${iid}"$'\t''healthy' <<<"${all_targets}"; then
-      log "[verify] instance ${iid} is on '${EB_VERSION_LABEL}' but is not healthy in a load-balancer target group; the release is not proven serving."
+    listed=0
+    while IFS=$'\t' read -r tid tstate; do
+      [ "${tid}" != "${iid}" ] && continue
+      listed=1
+      if [ "${tstate}" != "healthy" ]; then
+        log "[verify] instance ${iid} is on '${EB_VERSION_LABEL}' but is ${tstate} in a load-balancer target group; the release is not proven serving."
+        return 1
+      fi
+    done <<<"${all_targets}"
+    if [ "${listed}" -eq 0 ]; then
+      log "[verify] instance ${iid} is on '${EB_VERSION_LABEL}' but is not registered in any load-balancer target group; the release is not proven serving."
       return 1
     fi
   done

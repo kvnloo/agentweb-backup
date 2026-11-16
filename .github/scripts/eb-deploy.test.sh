@@ -1672,6 +1672,36 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
 check 'ENG-3082: expected-version instance not healthy in the target group still fails' 1 \
   'did not come up Ready'
 
+# Healthy in one target group but failing in another (an environment with more
+# than one process): not serving on every path.
+new_lagging_label_case
+{
+  printf 'i-0504eb4eaa2e817fc\thealthy\n'
+  printf 'i-0504eb4eaa2e817fc\tunhealthy\n'
+  printf 'i-088cef37b3ad334e5\tdraining\n'
+} >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: healthy in one target group and unhealthy in another still fails' 1 \
+  'did not come up Ready'
+
+# On the expected version but not registered with the load balancer at all.
+new_lagging_label_case
+printf 'i-088cef37b3ad334e5\tdraining\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+check 'ENG-3082: expected-version instance not registered in a target group still fails' 1 \
+  'did not come up Ready'
+
+# Every read the proof makes is time-bounded, because it runs after the budget.
+new_lagging_label_case
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='20'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if grep -qF -- '--cli-read-timeout 15' "$M/info_events_args" 2>/dev/null; then
+  pass 'ENG-3082: the proof reads carry a read timeout'
+else
+  printf '  FAIL ENG-3082: the event read has no read timeout: %s\n' "$(cat "$M/info_events_args" 2>/dev/null)"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
 # The per-instance read fails: no proof, so the failure stands.
 new_lagging_label_case
 printf 'ERROR|AccessDenied: not authorized to perform elasticbeanstalk:DescribeInstancesHealth\n' >"$M/instances_deployment"
