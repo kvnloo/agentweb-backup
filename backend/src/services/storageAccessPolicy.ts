@@ -96,6 +96,10 @@ function shapeOf(key: string): string {
 export class StorageAccessLookups {
   /** True once any lookup in this request threw. */
   failed = false;
+  /** Distinct records one request may look up. A batch of 50 URLs naming 50 made-up owners would otherwise cost 50 reads; past the limit a record counts as not found. */
+  static readonly MAX_DISTINCT_LOOKUPS = 20;
+  private loads = 0;
+  private limitLogged = false;
   private users = new Map<string, Promise<any>>();
   private tasks = new Map<string, Promise<any>>();
   private executions = new Map<string, Promise<any>>();
@@ -104,6 +108,14 @@ export class StorageAccessLookups {
   private memo<T>(m: Map<string, Promise<any>>, kind: string, id: string, load: () => Promise<T>): Promise<T | null> {
     let p = m.get(id);
     if (!p) {
+      if (this.loads >= StorageAccessLookups.MAX_DISTINCT_LOOKUPS) {
+        if (!this.limitLogged) {
+          this.limitLogged = true;
+          console.warn(JSON.stringify({ event: 'storage_access_lookup_limit', limit: StorageAccessLookups.MAX_DISTINCT_LOOKUPS }));
+        }
+        return Promise.resolve(null);
+      }
+      this.loads++;
       p = load().catch((error: any) => {
         this.failed = true;
         console.error(JSON.stringify({ event: 'storage_access_lookup_failed', kind, error: String(error?.message || error).slice(0, 200) }));
