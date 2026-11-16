@@ -361,6 +361,55 @@ export async function recordMcpWriteExecuted(
   return true;
 }
 
+/** ENG-3131: Zoma plan funnel (paywall → checkout → paid → trial converted/canceled). */
+export const EVT_ZOMA_BILLING_FUNNEL = 'zoma_billing_funnel';
+export type ZomaBillingFunnelStep =
+  | 'paywall_shown'
+  | 'checkout_started'
+  | 'paid'
+  | 'checkout_canceled'
+  | 'trial_reminder_sent'
+  | 'trial_converted'
+  | 'trial_canceled'
+  | 'subscription_canceled';
+
+export interface ZomaBillingFunnelInput {
+  userId: string;
+  step: ZomaBillingFunnelStep;
+  /** Stable id (Stripe event / session id). With it the row is written once, so webhook retries never double count. */
+  dedupeKey?: string;
+  dimensions?: Record<string, unknown>;
+  now?: Date;
+}
+
+/** Same table and key shape as tool use; no new persistence. Returns false for a deduped repeat. */
+export async function recordZomaBillingFunnel(
+  input: ZomaBillingFunnelInput,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!input.userId) return false;
+  const ts = (input.now ?? new Date()).toISOString();
+  const suffix = input.dedupeKey ? `${input.step}#${input.dedupeKey}` : `${input.step}#${Math.random().toString(36).slice(2, 10)}`;
+  const item = eventItem({
+    eventType: EVT_ZOMA_BILLING_FUNNEL,
+    subjectId: input.userId,
+    ts,
+    tsSession: `${ts}#${input.userId}#${EVT_ZOMA_BILLING_FUNNEL}#${suffix}`,
+    dimensions: { product: 'zoma', step: input.step, ...(input.dimensions ?? {}) },
+  });
+  if (!input.dedupeKey) {
+    await store.put(item);
+    return true;
+  }
+  try {
+    await store.put(item, { condition: 'attribute_not_exists' });
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return false;
+    throw error;
+  }
+}
+
 /** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
 export async function getMcpUserUsage(
   userId: string,
