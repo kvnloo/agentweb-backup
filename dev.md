@@ -1,3 +1,7 @@
+## ENG-3076: group-email send builds each recipient message in one place (2026-11-16)
+
+- `buildGroupEmailRecipientMessage` in `backend/src/routes/crm.ts` now builds subject, html, text and List-Unsubscribe headers for both the background mailbox run and the in-request loop. Behavior unchanged; a characterization test asserts both paths produce the identical message.
+
 ## ENG-3070: admin read of a named client's Meta change history (2026-11-16)
 
 New admin-only tool `read_client_meta_activity` (`backend/src/mcp/server/apiTools.ts`) calls `GET /api/client-health/:client/meta-activity`, served by `readClientMetaActivity` in `backend/src/services/clientHealthService.ts`. It reads one page of the Meta `activities` edge for the named client's ad account through the existing `executeActivityLogRead` (`backend/src/mcp/metaToolkitDiagnostics.ts`). Nothing is written to Meta. The tool is not listed on the public MCP surface.
