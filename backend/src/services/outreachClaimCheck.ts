@@ -51,11 +51,19 @@ function flatten(value: unknown, depth = 0): string {
   return '';
 }
 
+/**
+ * This runs synchronously on the draft path and lead records are customer
+ * supplied, so every pattern in this file has to stay near-linear on hostile
+ * text. Three things keep it that way: the tag pattern stops at the next `<`,
+ * whitespace runs are collapsed here before any other pattern sees them, and
+ * the number pattern below uses bounded repeats.
+ */
 function plainText(value: unknown): string {
   return flatten(value)
-    .replace(/<[^>]*>/g, ' ')
+    .replace(/<[^<>]*>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&');
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ');
 }
 
 const MULTIPLIERS: Record<string, number> = {
@@ -70,7 +78,8 @@ function toNumber(digits: string, multiplier?: string): number | null {
   return Math.round(n * mult * 1e6) / 1e6;
 }
 
-const NUM = String.raw`\d[\d,]*(?:\.\d+)?`;
+// Bounded: a longer digit run is junk, not a claim, and unbounded repeats backtrack quadratically.
+const NUM = String.raw`\d[\d,]{0,30}(?:\.\d{1,10})?`;
 const MULT = String.raw`(?:thousand|million|billion|bn|mm|k|m|b)`;
 
 const MONEY_PREFIX = new RegExp(String.raw`(?:US)?\$\s*(${NUM})\s*(${MULT})?\b`, 'gi');

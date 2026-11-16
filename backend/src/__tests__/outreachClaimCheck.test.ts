@@ -89,6 +89,29 @@ describe('findUnsupportedSenderClaims', () => {
   });
 });
 
+describe('findUnsupportedSenderClaims runtime on hostile input', () => {
+  // The check runs synchronously on the draft path. Lead records are customer
+  // supplied, so each shape below must stay near-linear rather than quadratic.
+  const N = 60_000;
+  const cases: Array<[string, string]> = [
+    ['one long digit run', '7'.repeat(N)],
+    ['comma-separated digits', '1,'.repeat(N / 2)],
+    ['a number followed by a long whitespace run', `5${' '.repeat(N)}!`],
+    ['unclosed angle brackets', '<'.repeat(N)],
+    ['a long capitalised run after a trigger', `we work with ${'A'.repeat(N)}`],
+  ];
+  it.each(cases)('finishes quickly on %s in the lead record, the facts and the draft', (_label, hostile) => {
+    const started = Date.now();
+    const result = findUnsupportedSenderClaims({
+      draft: { body: hostile },
+      facts: facts({ brandName: 'Acme', notes: hostile }),
+      recipient: { notes: hostile },
+    });
+    expect(result.status).toBe('checked');
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+});
+
 describe('logOutreachClaimCheckShadow', () => {
   let logSpy: jest.SpyInstance;
   beforeEach(() => { logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined); });
