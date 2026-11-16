@@ -107,8 +107,22 @@ export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_unins
  */
 const NEVER_CONNECTED_RE = /\bno\s+[\w .\-/]{1,40}?\s+accounts?\s+(?:is\s+|are\s+)?connected\b/i;
 
+/**
+ * ENG-3037: the same precondition in its other wording, "<X> not connected.
+ * Connect ..." / "<X> account not connected. Please connect ...". This is an
+ * allow-list of the integrations whose throw site was read and fires only when
+ * no connected-account row exists (googleDriveAccess, hubspotService,
+ * gmailService, outlookService, attioService) — not a general "not connected"
+ * pattern. Deliberately left as `config`, because a connected account can
+ * produce them: LinkedIn Ads (adsApis also throws it for a row with no
+ * access_token), bare "ClickUp/Foreplay not connected" (returned when a stored
+ * token fails to decrypt), and any message naming one specific account.
+ */
+const NOT_CONNECTED_PRECONDITION_RE =
+  /\bGoogle Drive not connected\. Connect Google Drive in Settings\b|\b(?:Gmail|Outlook|HubSpot|Attio) account not connected\. Please connect\b/i;
+
 export function isNeverConnectedMessage(message: string): boolean {
-  return NEVER_CONNECTED_RE.test(message);
+  return NEVER_CONNECTED_RE.test(message) || NOT_CONNECTED_PRECONDITION_RE.test(message);
 }
 
 /**

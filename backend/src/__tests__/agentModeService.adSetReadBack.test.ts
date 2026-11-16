@@ -217,24 +217,32 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
   });
 
   it('still reports a schedule Meta moved to a different instant', async () => {
-    (metaService.getAdSet as jest.Mock).mockResolvedValue({
-      id: 'adset_new',
-      name: 'Ad Set',
-      status: 'PAUSED',
-      bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
-      daily_budget: '1000',
-      end_time: '2026-11-15T09:44:56-0800' // one hour later than requested
-    });
+    // This case sends no start_time, so createMetaAdsAdSet starts the schedule at now() and rejects
+    // an end_time that is not after it. The fixture end_time is 2026-11-15T16:44:56Z, so the case
+    // began failing at that wall-clock moment. Pin now() to before the fixture window.
+    jest.useFakeTimers({ now: new Date('2026-11-13T16:44:56Z'), doNotFake: ['nextTick', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask', 'performance', 'hrtime'] });
+    try {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({
+        id: 'adset_new',
+        name: 'Ad Set',
+        status: 'PAUSED',
+        bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        daily_budget: '1000',
+        end_time: '2026-11-15T09:44:56-0800' // one hour later than requested
+      });
 
-    const result = await service.createMetaAdsAdSet('user123', {
-      ...baseAdSetParams,
-      end_time: '2026-11-15T16:44:56.157085+00:00'
-    });
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        end_time: '2026-11-15T16:44:56.157085+00:00'
+      });
 
-    expect(result.readBackMismatch).toBe(true);
-    expect(result.readBackMismatches).toEqual([
-      { parameter: 'end_time', requested: '2026-11-15T16:44:56.157085+00:00', applied: '2026-11-15T09:44:56-0800' }
-    ]);
+      expect(result.readBackMismatch).toBe(true);
+      expect(result.readBackMismatches).toEqual([
+        { parameter: 'end_time', requested: '2026-11-15T16:44:56.157085+00:00', applied: '2026-11-15T09:44:56-0800' }
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('never calls a PAUSED mismatched ad set live; an ACTIVE one is told to be reviewed or paused', async () => {
