@@ -7,8 +7,8 @@ were measured from what prod booked. This runbook is how to check, from real run
 ## When to run it
 
 - **At least every 14 days.** The run logs the script reads live in a CloudWatch log group that keeps 14 days, so older
-  runs disappear. The script warns when `--since` reaches into the lost part, and also when `--since` is exactly 14 days
-  ago (the early hours of that day are gone but the ledger counts the whole day).
+  runs disappear. The script warns whenever `--since` is at or before the oldest retained day: that day is only partly
+  covered by the logs while the ledger counts the whole day, which inflates the ratio, so start at the day after.
 - Retune only on enough data: at least **100 contacts, from at least 3 accounts that each supplied at least 10 contacts**.
   Below that the script says INSUFFICIENT DATA, and you must not retune; run it again later.
 - **Do not move `--since` forward after an INSUFFICIENT result.** Keep the same `--since` (the day after the last change
@@ -36,10 +36,12 @@ It makes four kinds of AWS calls, all reads: `logs describe-log-groups`, `logs f
 dollars per contact, the quote per contact, the ratio, the paid add-ons) and a verdict. It prints no email, lead or field
 value, and AWS error text is scrubbed of ARNs and email addresses and capped at 300 characters.
 
-Left out as non-customers: the test account `test@account.com` (`--exclude-emails`), every platform admin (`isAdmin`),
-every account on the internal domains `agentweb.pro` and `argusoft.com` (`--exclude-domains`, exact suffix match, so a
-look-alike such as `agentweb.pro.example.com` stays in) and any `--exclude-user-ids`. Real customer accounts are kept
-whatever their email domain. The script reads the three rate constants and `referenceFieldCount` from
+Left out as non-customers: the test account `test@account.com` (`--exclude-emails`, case-insensitive), every platform admin
+(`isAdmin`), every account whose email domain is, or is a subdomain of, `agentweb.pro` or `argusoft.com`
+(`--exclude-domains`; a look-alike such as `agentweb.pro.example.com` stays in) and any `--exclude-user-ids`. The user table
+is read whole and matched inside the script, so no email is put into a DynamoDB expression or printed. Real customer
+accounts are kept whatever their email domain. The script only issues read calls, but the guarantee that nothing can be
+written is the IAM role: run it with a read-only one. The script reads the three rate constants and `referenceFieldCount` from
 `enrichmentCostEstimate.ts`, so those cannot drift; the **formula itself is duplicated** in the script, so if
 `estimateEnrichmentCost` or `effectiveFieldCount` changes shape, update the script.
 
@@ -67,8 +69,8 @@ whatever their email domain. The script reads the three rate constants and `refe
 - The field count is read from each list's *current* enrichment config, which may differ from the run's.
 - Customer quotes use a model-aware per-field cost; this check uses the same per-field constant the recalibration used.
 - A run that straddles midnight UTC is split across days. A run that started before `--since` is not counted (the script
-  reports how many), and a run that started but never finished (still running or crashed) leaves its cost in the booked
-  dollars with no contacts (also reported).
+  reports how many, account unknown), and a customer run that started but never finished (still running or crashed) leaves
+  its cost in the booked dollars with no contacts (also reported).
 - The gate counts accounts that each supplied at least `--min-customer-contacts` (default 10) contacts, and the verdict
   prints the share of the largest account; read the per-line table anyway.
 - The share of leads that fire the paid email search cannot be read from this join; see the next section.
@@ -87,11 +89,15 @@ whatever their email domain. The script reads the three rate constants and `refe
   callback secret could). We have not seen the payload itself (Apollo publishes no callback example) and did not trace
   which code path wrote the lead's email.
 - **The seven placeholder rows that existed on 2026-11-16:** that one customer row; five in the Argusoft admin test account
-  on 2026-11-04 (four from the live test, each of which got a real empty callback 23 to 42 seconds after its request, and
-  two of those were later overwritten by our own simulated callbacks at 16:20, one `completed` and one empty; plus one fresh
-  real empty callback at 17:32 after the secret was rotated); one real empty callback in the test account on 2026-11-12.
+  on 2026-11-04: four created by the live test at 16:14, of which two still show their callback stamps (23 and 28 seconds
+  after creation, both empty) and two were overwritten at 16:20 by our own simulated callbacks (one `completed`, one
+  empty), and a fifth created at 17:32 after the secret was rotated and stamped empty 35 seconds later (our ENG-2801 notes
+  record all of these live-test callbacks as real); and one empty callback in the test account on 2026-11-12, stamped 52
+  seconds after creation.
 - **Real people, name and company only, no LinkedIn:** 0 of 8 fired the search (3 founders on 2026-11-05, 5 people on
-  2026-11-16). Apollo's immediate match supplied every email. The 5-person run booked $0.42 in total, about $0.08 a lead.
+  2026-11-16): the ledger shows no email search for either test, and the tests' own results show Apollo's immediate match
+  supplying the emails (the lead contents were not re-read for this runbook). The 5-person run booked $0.42 in total, about
+  $0.08 a lead.
 - **Worst case is unchanged:** a lead Apollo cannot match immediately costs $0.445 for the search. The admission reserve
   still bounds real spend; this only affects the number shown to customers.
 - **Tripwire:** compare the email-search requests booked in the ledger (`apollo:waterfall_email`) with the placeholder
@@ -111,5 +117,5 @@ check shows the quote is persistently off by more than the tolerance.
 | Date | Sample | Booked | Quote | Result |
 |---|---|---|---|---|
 | 2026-11-13 | 118 contacts, 4 accounts as recorded then, since 2026-11-04 (one of them fired the paid email search), plus one 146-lead list | $8.09 | old constants $14.4 to $14.8; new $7.80 | recalibrated in #4038 |
-| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: both runs were on fresh lists, and the Nuerraa run's person and company lookups cost $0.094 a contact against the quote's $0.041. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
+| 2026-11-16 | Replay of 2026-11-04 to 2026-11-13 with the final script (internal accounts excluded): 58 contacts, 2 customer accounts (one Nuerraa, one ThinkingAI) | $6.28 | $4.19 (ratio 1.50) | insufficient data (needs 3 accounts with 10 or more contacts each), so no retune. The ratio is above the quote: the Nuerraa run (1.68) was on a fresh list, its person and company lookups costing $0.094 a contact against the quote's $0.041; the ThinkingAI run (1.29) paid $0.055 a contact for lookups. An earlier replay that included an internal `agentweb.pro` account (97 contacts, ratio 1.13) looked inside the band only because that account's runs were cheap; the "4 customers" recorded at the 2026-11-13 recalibration probably included internal accounts too. Re-run with the same `--since` as customer runs accumulate. |
 | 2026-11-16 | 7 contacts, 1 internal `agentweb.pro` account (excluded as non-customer by the current defaults), 2026-11-13 to 2026-11-16 | $0.48 | $0.49 (ratio 0.97) | no customer data in the window; nothing to retune |
