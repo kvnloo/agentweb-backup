@@ -6,6 +6,7 @@ import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareP
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
+import { checkMetaDelete, checkMetaUpdate } from './agentMode/metaWriteReadBack';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): resolveModelForUser's
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
@@ -13264,6 +13265,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const money = await this.normalizeMetaMoneyParams(accountId, accessToken, params);
       const normalizedParams = money.params;
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
+      // ENG-3065: name/status are read back; budget and spend_cap keep their own checks below.
+      const unlanded = await checkMetaUpdate('campaign', campaignId, normalizedParams,
+        () => metaService.getCampaign(accountId, accessToken, campaignId), this.readBackOptions());
+      if (unlanded) return unlanded;
 
       // ENG-2278: budget fields are verified independently of the spend cap.
       const budgetFields = hasBudgetField(normalizedParams)
@@ -13342,6 +13347,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       await metaService.deleteCampaign(accessToken, campaignId, accountId);
+      const notDeleted = await checkMetaDelete('campaign', campaignId,
+        () => metaService.getCampaign(accountId, accessToken, campaignId), this.readBackOptions());
+      if (notDeleted) return notDeleted;
       return {
         success: true,
         message: `Campaign deleted successfully`
@@ -13365,6 +13373,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const money = await this.normalizeMetaMoneyParams(accountId, accessToken, params);
       const normalizedParams = money.params;
       await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
+      // ENG-3065: name/status/bid fields are read back; budget keeps its own check below.
+      const unlanded = await checkMetaUpdate('adSet', adSetId, normalizedParams,
+        () => metaService.getAdSet(accessToken, adSetId, accountId), this.readBackOptions());
+      if (unlanded) return unlanded;
       if (!hasBudgetField(normalizedParams)) {
         return {
           success: true,
@@ -13400,6 +13412,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       await metaService.deleteAdSet(accessToken, adSetId, accountId);
+      const notDeleted = await checkMetaDelete('adSet', adSetId,
+        () => metaService.getAdSet(accessToken, adSetId, accountId), this.readBackOptions());
+      if (notDeleted) return notDeleted;
       return {
         success: true,
         message: `Ad set deleted successfully`
@@ -13449,6 +13464,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /** ENG-3065: read an ad back after an ad-level update (name, status). */
+  private checkMetaAdUpdate(accessToken: string, adId: string, requested: Record<string, any>, accountId: string) {
+    return checkMetaUpdate('ad', adId, requested, () => metaService.getAd(accessToken, adId, accountId), this.readBackOptions());
+  }
+
+  /** ENG-3065: same retry policy as the spend-cap and budget read-backs, on this service's sleep. */
+  private readBackOptions() {
+    return { ...this.budgetVerifyOptions(), sleep: (ms: number) => this.sleep(ms) };
+  }
+
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -13467,6 +13492,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
         if (Object.keys(adLevelParams).length > 0) {
           await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
+          const unlanded = await this.checkMetaAdUpdate(accessToken, adId, adLevelParams, accountId);
+          if (unlanded) return unlanded;
         }
 
         // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
@@ -13510,6 +13537,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
       // Standard ad-level update (status, name, etc.)
       await metaService.updateAd(accessToken, adId, params, accountId);
+      const unlanded = await this.checkMetaAdUpdate(accessToken, adId, params, accountId);
+      if (unlanded) return unlanded;
       return {
         success: true,
         message: `Ad updated successfully`
@@ -13733,6 +13762,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (Object.keys(adLevelParams).length > 0) {
       await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
+      // ENG-3065: an ad-level field that did not land stops here, before the creative is attached.
+      const unlanded = await this.checkMetaAdUpdate(accessToken, adId, adLevelParams, accountId);
+      if (unlanded) return unlanded;
     }
 
     // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
@@ -13946,6 +13978,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       await metaService.deleteAd(accessToken, adId, accountId);
+      const notDeleted = await checkMetaDelete('ad', adId,
+        () => metaService.getAd(accessToken, adId, accountId), this.readBackOptions());
+      if (notDeleted) return notDeleted;
       return {
         success: true,
         message: `Ad deleted successfully`

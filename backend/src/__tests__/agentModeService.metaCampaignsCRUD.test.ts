@@ -11,6 +11,7 @@ jest.mock('../services/metaService', () => ({
     createCampaign: jest.fn(),
     updateCampaign: jest.fn(),
     deleteCampaign: jest.fn(),
+    getCampaign: jest.fn(), // ENG-3065: updates and deletes are read back
     listCampaigns: jest.fn()
   }
 }));
@@ -253,6 +254,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: campaignId, ...params }); // ENG-3065 read-back
 
       const result = await agentModeService.updateMetaAdsCampaign('user123', campaignId, params);
 
@@ -290,6 +292,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(multiAccountUser);
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', name: 'Updated' }); // ENG-3065 read-back
 
       const result = await agentModeService.updateMetaAdsCampaign(
         'user123',
@@ -319,6 +322,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
       (metaService.deleteCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: campaignId, status: 'DELETED' }); // ENG-3065 read-back
 
       const result = await agentModeService.deleteMetaAdsCampaign('user123', campaignId);
 
@@ -356,6 +360,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
 
       (userDb.getUserById as jest.Mock).mockResolvedValue(multiAccountUser);
       (metaService.deleteCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', status: 'DELETED' }); // ENG-3065 read-back
 
       const result = await agentModeService.deleteMetaAdsCampaign('user123', 'camp_123', '987654321');
 

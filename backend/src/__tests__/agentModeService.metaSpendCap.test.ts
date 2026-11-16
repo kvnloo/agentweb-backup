@@ -293,12 +293,15 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.message).toMatch(/could NOT be confirmed/i);
     });
 
-    it('leaves non-spend_cap updates untouched (no extra read-back)', async () => {
+    // ENG-3065: a status-only update is now read back once (status), with no spend-cap fields added.
+    it('leaves non-spend_cap updates untouched (one status read-back, no spend-cap verdict)', async () => {
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', status: 'PAUSED' });
 
       const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { status: 'PAUSED' });
 
-      expect(metaService.getCampaign).not.toHaveBeenCalled();
+      expect(metaService.getCampaign).toHaveBeenCalledTimes(1);
+      expect(result.spend_cap_verified).toBeUndefined();
       expect(result.success).toBe(true);
       expect(result.message).toBe('Campaign updated successfully');
     });

@@ -27,6 +27,8 @@ describe('ENG-2277 currency-aware Meta money writes', () => {
 
   it.each(['create', 'update'])('TWD NT$300/day stays 300 on campaign %s and echoes both units', async action => {
     const params = { name: 'Daily', objective: 'OUTCOME_TRAFFIC', advantage_campaign_budget: true, budget_amount: 300 };
+    // ENG-3065: the update reads name back before success is reported.
+    meta.getCampaign.mockResolvedValue({ id: 'campaign', name: 'Daily', objective: 'OUTCOME_TRAFFIC', spend_cap: '300000' });
     const result = action === 'create'
       ? await service.createMetaAdsCampaign('user', params)
       : await service.updateMetaAdsCampaign('user', 'campaign', params);
@@ -39,6 +41,8 @@ describe('ENG-2277 currency-aware Meta money writes', () => {
   it.each(['create', 'update'])('USD $3,000 cap becomes 300000 on %s, never a $30 cap', async action => {
     meta.getAdAccountCurrency.mockResolvedValue('USD');
     const params = { name: 'Capped', objective: 'OUTCOME_TRAFFIC', spend_cap: 3000 };
+    // ENG-3065: the update reads name back before success is reported.
+    meta.getCampaign.mockResolvedValue({ id: 'campaign', name: 'Capped', objective: 'OUTCOME_TRAFFIC', spend_cap: '300000' });
     const result = action === 'create'
       ? await service.createMetaAdsCampaign('user', params)
       : await service.updateMetaAdsCampaign('user', 'campaign', params);
@@ -84,6 +88,7 @@ describe('ENG-2277 currency-aware Meta money writes', () => {
   });
 
   it('leaves status-only writes independent of currency lookup', async () => {
+    meta.getCampaign.mockResolvedValue({ id: 'campaign', status: 'PAUSED' }); // ENG-3065 read-back
     const result = await service.updateMetaAdsCampaign('user', 'campaign', { status: 'PAUSED' });
     expect(result.success).toBe(true);
     expect(meta.getAdAccountCurrency).not.toHaveBeenCalled();

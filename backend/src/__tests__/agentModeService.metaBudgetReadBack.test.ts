@@ -113,10 +113,12 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
       expect(result.budget_verification).toBe('CONFIRMED');
     });
 
-    it('does not read back non-budget updates', async () => {
+    // ENG-3065: a status-only update is read back once for status; no budget verdict is added.
+    it('adds no budget verdict to non-budget updates', async () => {
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'as_1', status: 'PAUSED' });
       const result = await service.updateMetaAdsAdSet('user123', 'as_1', { status: 'PAUSED' });
       expect(result).toEqual({ success: true, message: 'Ad set updated successfully' });
-      expect(metaService.getAdSet).not.toHaveBeenCalled();
+      expect(metaService.getAdSet).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -150,10 +152,12 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
       expect(result.error).toBe('BUDGET_MISMATCH');
     });
 
-    it('does not read back a status-only update', async () => {
+    // ENG-3065: a status-only update is read back once for status; no budget verdict is added.
+    it('adds no budget verdict to a status-only update', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'c_1', status: 'PAUSED' });
       const result = await service.updateMetaAdsCampaign('user123', 'c_1', { status: 'PAUSED' });
       expect(result).toEqual({ success: true, message: 'Campaign updated successfully' });
-      expect(metaService.getCampaign).not.toHaveBeenCalled();
+      expect(metaService.getCampaign).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -15,6 +15,7 @@ jest.mock('../services/metaService', () => ({
     createAdSet: jest.fn(),
     updateAdSet: jest.fn(),
     deleteAdSet: jest.fn(),
+    getAdSet: jest.fn(), // ENG-3065: ad set updates and deletes are read back
     getCampaign: jest.fn(),
     updateCampaign: jest.fn(),
     deleteCampaign: jest.fn(),
@@ -142,6 +143,10 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_AWARENESS' });
         (metaService.createAdSet as jest.Mock).mockResolvedValue(mockAdSetData);
+        // ENG-3065 added getAdSet to this file's mock, so the ENG-838 create read-back now runs here.
+        (metaService.getAdSet as jest.Mock).mockResolvedValue({
+          id: 'adset_123', name: 'New Ad Set', bid_strategy: 'LOWEST_COST_WITH_BID_CAP', bid_amount: '200', daily_budget: '100000',
+        });
 
         const result = await agentModeService.createMetaAdsAdSet('user123', params);
 
@@ -215,6 +220,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_123', status: 'PAUSED' }); // ENG-3065 read-back
 
         const result = await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
 
@@ -259,6 +265,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_123', bid_amount: '250' }); // ENG-3065 read-back
 
         await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
 
@@ -275,6 +282,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_123', ...params }); // ENG-3065 read-back
 
         await agentModeService.updateMetaAdsAdSet('user123', 'adset_123', params);
 
@@ -291,6 +299,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
       it('should successfully delete an ad set', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.deleteAdSet as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_123', status: 'DELETED' }); // ENG-3065 read-back
 
         const result = await agentModeService.deleteMetaAdsAdSet('user123', 'adset_123');
 
@@ -728,14 +737,15 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', status: 'ACTIVE' });
 
         const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Ad updated successfully');
         expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params, '123456789');
-        // Should NOT call getAd or getAdCreative for ad-level updates
-        expect(metaService.getAd).not.toHaveBeenCalled();
+        // ENG-3065: one getAd read-back for the ad-level fields; still no creative read.
+        expect(metaService.getAd).toHaveBeenCalledTimes(1);
         expect(metaService.getAdCreative).not.toHaveBeenCalled();
       });
 
@@ -783,6 +793,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         // Post-swap verification read-back shows the new creative attached.
         (metaService.getAd as jest.Mock).mockResolvedValue({
           id: 'ad_123',
+          status: 'ACTIVE', // ENG-3065: the ad-level status is read back too
           creative: { creative_id: 'new_creative_B' }
         });
 
@@ -843,6 +854,29 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.error).toBe('SWAP_NOT_REFLECTED');
         expect(result.new_creative_id).toBe('new_creative_B');
         expect(result.live_creative_id).toBe('old_creative_A');
+      });
+
+      // ENG-3065: an ad-level field sent alongside creative content is read back before the swap.
+      it('stops before attaching the new creative when the ad-level status did not land', async () => {
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', status: 'ACTIVE', creative: { creative_id: 'old_creative_123' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hi', link: 'https://old-page.com', name: 'T', image_hash: 'abc123' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { link_url: 'https://new-landing-page.com', status: 'PAUSED' });
+
+        expect(result).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['status'] });
+        expect(metaService.updateAd).toHaveBeenCalledTimes(1);
+        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', { status: 'PAUSED' }, '123456789');
       });
 
       it('should use creative swap when link_url is in params', async () => {
@@ -1851,6 +1885,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
       it('should successfully delete an ad', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.deleteAd as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', status: 'DELETED' }); // ENG-3065 read-back
 
         const result = await agentModeService.deleteMetaAdsAd('user123', 'ad_123');
 
@@ -2006,6 +2041,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
       it('should not modify params without budget_amount', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', name: 'New Name', status: 'PAUSED' }); // ENG-3065 read-back
 
         await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { name: 'New Name', status: 'PAUSED' });
 
@@ -2020,6 +2056,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
       it('should return success after updating campaign', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+        (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', status: 'PAUSED' }); // ENG-3065 read-back
 
         const result = await agentModeService.updateMetaAdsCampaign('user123', 'camp_123', { status: 'PAUSED' });
 

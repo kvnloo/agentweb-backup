@@ -17,6 +17,13 @@ Removes: pass when the resource reads back `REMOVED` or is not found; anything e
 
 Creates: the returned resource name is the evidence; exempt with reason.
 
+Meta (ENG-3065): the read-back runs one layer up, in the `AgentModeService` handlers, through
+`backend/src/services/agentMode/metaWriteReadBack.ts`. Updates compare `name` and `status`
+(ad sets also `bid_strategy` and `bid_amount`); budgets, `spend_cap` and creative swaps keep
+their older checks; every other update field (targeting, schedule, ...) is not verified.
+Deletes pass on `DELETED`/`ARCHIVED` or not found. The guard and the verified/exempt map are in
+`backend/src/__tests__/eng3065.metaWriteReadBack.test.ts`.
+
 Tool boundary: the tool handler maps the read-back error to `success: false` with
 `errorType: 'unsupported_field'` and the field list. Never convert it to success.
 
