@@ -4538,7 +4538,13 @@ export const scheduleDb = {
     }
   },
 
-  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
+  /**
+   * ENG-3047: pass `expectedNextRunTime` (the due time the caller read) to make the
+   * advance land only if the row still carries it. Of two callers that read the same
+   * due row, one advances and decrements `runCount`; the other gets an error marked
+   * `preconditionFailed` and has changed nothing. Without it the write is unconditional.
+   */
+  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true, expectedNextRunTime?: string) {
     try {
       // First, get the current schedule to check runCount
       const getParams = {
@@ -4592,9 +4598,23 @@ export const scheduleDb = {
         ReturnValues: 'ALL_NEW',
       };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes;
-    } catch (error) {
+      if (expectedNextRunTime === undefined) {
+        const result = await dynamodb.update(params).promise();
+        return result.Attributes;
+      }
+
+      attributeValues[':expectedNextRunTime'] = expectedNextRunTime;
+      try {
+        const result = await dynamodb.update({ ...params, ConditionExpression: '#nextRunTime = :expectedNextRunTime' }).promise();
+        return result.Attributes;
+      } catch (updateError: any) {
+        if (updateError?.code !== 'ConditionalCheckFailedException') throw updateError;
+        const lost: any = new Error('Schedule advance precondition failed');
+        lost.preconditionFailed = true;
+        throw lost;
+      }
+    } catch (error: any) {
+      if (error?.preconditionFailed === true) throw error;
       handleDynamoDbError(error, "updateScheduleAfterRun");
       throw error;
     }

@@ -1,13 +1,14 @@
-## ENG-3047: one run per scheduled fire in the due-schedule loop (2026-11-15)
+## ENG-3047: one run per scheduled fire in the due-schedule loop (2026-11-16)
 
-- `runScheduledChats` (`backend/src/controllers/agentModeController.ts`) now claims
-  `scheduledIdempotencyKey(scheduleId, "<stored nextRunTime>|<stored lastRunTime>")` through
-  `claimIdempotency` with `IDEM_TTL_SCHEDULED_S` (24h) after it advances the schedule and before it
-  starts the run. A caller that loses the claim starts nothing and reports `already_started`.
-- Only active when `AGENT_RUN_STORE=true` (true in production, unset on staging as of 2026-11-15).
-  Reuses the existing `idem#` rows in `AW-AgentRuns`; no table, key, index or attribute change.
-- If the claim call throws, the run starts anyway and the error is logged with `[ENG-3047]`.
-- The key includes the stored last run time so a schedule set back to a due time it already ran at
-  still fires. Manual test runs and the two variable-submission paths take no claim.
-- Not fixed here: both racing callers still call `updateScheduleAfterRun`, so a run-limited
-  schedule can have `runCount` decremented twice for one fire.
+- `runScheduledChats` (`backend/src/controllers/agentModeController.ts`) now passes the due time it
+  read (`schedule.nextRunTime`) to `scheduleDb.updateScheduleAfterRun` when it advances a schedule
+  to start a run. The write carries `ConditionExpression: #nextRunTime = :expectedNextRunTime`, so
+  it lands only if the row still has that due time.
+- A caller whose advance is refused starts nothing, decrements nothing, and reports
+  `already_started` for that schedule. Any other write error is handled as before.
+- `updateScheduleAfterRun` takes the expected value as an optional fifth argument. Every other
+  caller (delayed, waiting-for-variables, retries, the social engagement executor) passes none and
+  keeps the unconditional write.
+- Not behind `AGENT_RUN_STORE`; it applies wherever the due-schedule loop runs. No table, key,
+  index or attribute change. `scheduledIdempotencyKey` still has no production caller.
+- Also corrects a stale comment in `chatBranching.ts` that said the run store is off in production.

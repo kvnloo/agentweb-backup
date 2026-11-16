@@ -7,9 +7,11 @@
  * is cut short at its in-flight lease (setRunInFlight -> 'already_in_flight') so no
  * model work happens; setRunInFlight is asserted alongside as a second count.
  *
- * The run store is a fake with real single-winner semantics (first claim of a key
- * wins, later claims of the same key lose). The mock preamble is lifted from
- * agentModeController.capacityGate.test.ts.
+ * scheduleDb.updateScheduleAfterRun is a fake with the real single-winner rule of
+ * the conditional write: the first advance for a (schedule, expected due time) pair
+ * lands, a later one with the same expected due time throws `preconditionFailed`.
+ * The real condition is pinned in db.scheduleConditionalAdvance.test.ts. The mock
+ * preamble is lifted from agentModeController.capacityGate.test.ts.
  */
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -126,26 +128,13 @@ jest.mock('../utils/scheduledRunTracker', () => ({
   trackScheduledRun: jest.fn((run: Promise<unknown>) => run),
 }));
 
-jest.mock('../services/agentMode/runStore', () => ({
-  ...jest.requireActual('../services/agentMode/runStore'),
-  isRunStoreEnabled: jest.fn(),
-  claimIdempotency: jest.fn(),
-  releaseIdempotency: jest.fn().mockResolvedValue(undefined),
-  recordIdempotencySessionId: jest.fn().mockResolvedValue(undefined),
-  createRunRecord: jest.fn().mockResolvedValue(undefined),
-  markRunTerminal: jest.fn().mockResolvedValue(undefined),
-}));
-
 import { scheduleDb, userDb } from '../services/db';
-import * as runStore from '../services/agentMode/runStore';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTrack = trackScheduledRun as jest.Mock;
-const mockClaim = runStore.claimIdempotency as jest.Mock;
-const mockEnabled = runStore.isRunStoreEnabled as jest.Mock;
-const realKey = jest.requireActual('../services/agentMode/runStore').scheduledIdempotencyKey as (id: string, fire: string) => string;
+const mockAdvance = mockScheduleDb.updateScheduleAfterRun as unknown as jest.Mock;
 
 const DUE = '2026-11-15T09:00:00.000Z';
 const LAST = '2026-11-14T09:00:04.000Z';
@@ -174,21 +163,26 @@ async function poll() {
   return res;
 }
 
-describe('ENG-3047 scheduled fire idempotency in the due-schedule loop', () => {
-  let claimed: Set<string>;
+describe('ENG-3047 one run per scheduled fire in the due-schedule loop', () => {
+  let advanced: Set<string>;
   let errorSpy: jest.SpyInstance;
+  const savedRunStoreFlag = process.env.AGENT_RUN_STORE;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    claimed = new Set();
-    mockEnabled.mockReturnValue(true);
-    mockClaim.mockImplementation(async (key: string) => {
-      if (claimed.has(key)) return { claimed: false, inFlightRunId: 'winner' };
-      claimed.add(key);
-      return { claimed: true };
+    advanced = new Set();
+    mockAdvance.mockImplementation(async (scheduleId: string, _last: string, _next: string, _decrement?: boolean, expectedNextRunTime?: string) => {
+      if (expectedNextRunTime === undefined) return undefined;
+      const key = `${scheduleId}|${expectedNextRunTime}`;
+      if (advanced.has(key)) {
+        const lost: any = new Error('Schedule advance precondition failed');
+        lost.preconditionFailed = true;
+        throw lost;
+      }
+      advanced.add(key);
+      return undefined;
     });
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([dueSchedule()] as any);
-    mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined as any);
     mockScheduleDb.updateSchedule.mockResolvedValue(undefined as any);
     mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
     (mockScheduleDb.setRunInFlight as jest.Mock).mockResolvedValue('already_in_flight');
@@ -198,9 +192,11 @@ describe('ENG-3047 scheduled fire idempotency in the due-schedule loop', () => {
 
   afterEach(() => {
     errorSpy.mockRestore();
+    if (savedRunStoreFlag === undefined) delete process.env.AGENT_RUN_STORE;
+    else process.env.AGENT_RUN_STORE = savedRunStoreFlag;
   });
 
-  it('starts one run when the same due schedule is polled twice (AC1)', async () => {
+  it('starts one run when the same due row is read by two polls', async () => {
     await poll();
     const second = await poll();
 
@@ -211,7 +207,7 @@ describe('ENG-3047 scheduled fire idempotency in the due-schedule loop', () => {
     }));
   });
 
-  it('claims with the scheduled TTL and a key built from the stored row, not the clock (AC1, AC2)', async () => {
+  it('conditions the advance on the due time stored on the row, not the clock', async () => {
     jest.useFakeTimers({ now: new Date('2026-11-15T09:00:05.000Z'), doNotFake: ['nextTick', 'setImmediate'] });
     try {
       await poll();
@@ -221,15 +217,15 @@ describe('ENG-3047 scheduled fire idempotency in the due-schedule loop', () => {
       jest.useRealTimers();
     }
 
-    expect(mockClaim).toHaveBeenCalledTimes(2);
-    const [firstKey, , firstTtl] = mockClaim.mock.calls[0];
-    expect(mockClaim.mock.calls[1][0]).toBe(firstKey);
-    expect(firstKey).toBe(realKey('sched-1', `${DUE}|${LAST}`));
-    expect(firstTtl).toBe(24 * 3600);
+    expect(mockAdvance).toHaveBeenCalledTimes(2);
+    expect(mockAdvance.mock.calls[0][4]).toBe(DUE);
+    expect(mockAdvance.mock.calls[1][4]).toBe(DUE);
+    // The loser decrements nothing: its only write is the one the condition refused.
+    expect(mockAdvance.mock.calls[0][3]).toBe(true);
     expect(mockTrack).toHaveBeenCalledTimes(1);
   });
 
-  it('never suppresses a later fire of the same schedule (AC3)', async () => {
+  it('never suppresses a later fire of the same schedule', async () => {
     await poll();
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([
       dueSchedule({ nextRunTime: '2026-11-16T09:00:00.000Z', lastRunTime: '2026-11-15T09:00:05.000Z' }),
@@ -240,47 +236,38 @@ describe('ENG-3047 scheduled fire idempotency in the due-schedule loop', () => {
     expect(mockScheduleDb.setRunInFlight).toHaveBeenCalledTimes(2);
   });
 
-  it('does not suppress the same due time when the schedule has run since (reset to an earlier time)', async () => {
+  it('guards the fire the same way with AGENT_RUN_STORE off and on', async () => {
+    delete process.env.AGENT_RUN_STORE;
     await poll();
-    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([
-      dueSchedule({ lastRunTime: '2026-11-15T09:00:05.000Z' }),
-    ] as any);
     await poll();
+    expect(mockTrack).toHaveBeenCalledTimes(1);
 
+    process.env.AGENT_RUN_STORE = 'true';
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([dueSchedule({ scheduleId: 'sched-2' })] as any);
+    await poll();
+    await poll();
     expect(mockTrack).toHaveBeenCalledTimes(2);
   });
 
-  it('still starts the run and logs when the claim throws (AC5)', async () => {
-    mockClaim.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+  it('does not start a run and does not report already_started when the advance fails for another reason', async () => {
+    mockAdvance.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
 
     const res = await poll();
 
-    expect(mockTrack).toHaveBeenCalledTimes(1);
-    expect(errorSpy.mock.calls.some((c) => String(c[0]).includes('ENG-3047'))).toBe(true);
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
-      results: [expect.objectContaining({ scheduleId: 'sched-1', status: 'started' })],
-    }));
+    expect(mockTrack).not.toHaveBeenCalled();
+    const payload = res.json.mock.calls[0][0];
+    expect(JSON.stringify(payload)).not.toContain('already_started');
   });
 
-  it('makes no claim and starts every poll when AGENT_RUN_STORE is off (AC6)', async () => {
-    mockEnabled.mockReturnValue(false);
-
-    await poll();
-    await poll();
-
-    expect(mockClaim).not.toHaveBeenCalled();
-    expect(mockTrack).toHaveBeenCalledTimes(2);
-  });
-
-  it('makes no claim for a schedule that is waiting on variables (AC4)', async () => {
+  it('puts no condition on the advance for a schedule that is waiting on variables', async () => {
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([
       dueSchedule({ variables: [{ name: 'topic' }], variableValues: {} }),
     ] as any);
 
     const res = await poll();
 
-    expect(mockClaim).not.toHaveBeenCalled();
     expect(mockTrack).not.toHaveBeenCalled();
+    for (const call of mockAdvance.mock.calls) expect(call[4]).toBeUndefined();
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       results: [expect.objectContaining({ status: 'waiting_for_variables' })],
     }));

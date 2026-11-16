@@ -92,7 +92,6 @@ import { evaluateLinkedInSendRequirement, linkedInOutreachArgs, normalizeLinkedI
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
-  scheduledIdempotencyKey,
   createSessionIdempotencyKey,
   planSessionIdempotencyKey,
   claimIdempotency,
@@ -101,7 +100,6 @@ import {
   createRunRecord,
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
-  IDEM_TTL_SCHEDULED_S,
 } from '../services/agentMode/runStore';
 import { assertSequentialStepCounts } from '../services/workPlanSteps';
 import { validateModelPin, normalizeRequestedLlmModel, resolvePlanLaunchModel, canonicalPinId } from '../services/agentMode/modelPin';
@@ -16719,44 +16717,32 @@ export const agentModeController = {
 
           // Decrement runCount and auto-pause if it reaches 0
           // Note: Both successful and failed runs count toward the run limit
-          await scheduleDb.updateScheduleAfterRun(
-            schedule.scheduleId,
-            now.toISOString(),
-            nextRunTime.toISOString(),
-            true // Decrement runCount (default behavior)
-          );
-
-          // ENG-3047: one run per fire. Two callers that both read this due row before
-          // either write above landed would both start a run. The key is built from the
-          // row as it was read (due time + last run time), never the clock, so those
-          // callers compute the same key and exactly one wins. It sits AFTER the advance
-          // on purpose: a winner that dies here must not leave the schedule due and
-          // locked for the 24h TTL. The last run time is in the key so a schedule that
-          // has run since, then is set back to the same due time, still fires.
-          if (isRunStoreEnabled() && typeof schedule.nextRunTime === 'string' && schedule.nextRunTime.length > 0) {
-            let fireAlreadyStarted = false;
-            try {
-              const fireWindow = `${schedule.nextRunTime}|${typeof schedule.lastRunTime === 'string' ? schedule.lastRunTime : ''}`;
-              const fireClaim = await claimIdempotency(
-                scheduledIdempotencyKey(schedule.scheduleId, fireWindow),
-                uuidv4(),
-                IDEM_TTL_SCHEDULED_S
-              );
-              fireAlreadyStarted = !fireClaim.claimed;
-            } catch (claimError) {
-              // A duplicate run is the smaller harm than a missed customer schedule.
-              console.error(`[ENG-3047] scheduled fire claim failed for schedule ${schedule.scheduleId}; starting the run anyway:`, claimError);
-            }
-            if (fireAlreadyStarted) {
-              console.log(`[ENG-3047] schedule ${schedule.scheduleId} already started for fire ${schedule.nextRunTime}; not starting a second run`);
-              results.push({
-                scheduleId: schedule.scheduleId,
-                scheduleName: schedule.scheduleName,
-                status: 'already_started',
-                nextRunTime: nextRunTime.toISOString()
-              });
-              continue;
-            }
+          // ENG-3047: one run per fire. The advance lands only if the row still carries
+          // the due time this caller read (never the clock). Two callers that read the
+          // same due row, or one that read a stale index entry, cannot both get past
+          // here: the loser's write is refused, so it decrements nothing and starts
+          // nothing. Any other failure keeps its existing handling below.
+          const expectedDueTime = typeof schedule.nextRunTime === 'string' && schedule.nextRunTime.length > 0
+            ? schedule.nextRunTime
+            : undefined;
+          try {
+            await scheduleDb.updateScheduleAfterRun(
+              schedule.scheduleId,
+              now.toISOString(),
+              nextRunTime.toISOString(),
+              true, // Decrement runCount (default behavior)
+              expectedDueTime
+            );
+          } catch (advanceError: any) {
+            if (advanceError?.preconditionFailed !== true) throw advanceError;
+            console.log(`[ENG-3047] schedule ${schedule.scheduleId} was already advanced past fire ${schedule.nextRunTime}; not starting a second run`);
+            results.push({
+              scheduleId: schedule.scheduleId,
+              scheduleName: schedule.scheduleName,
+              status: 'already_started',
+              nextRunTime: nextRunTime.toISOString()
+            });
+            continue;
           }
 
           // Increment concurrent run counter
