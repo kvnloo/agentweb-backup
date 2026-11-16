@@ -134,7 +134,10 @@ function metaPageProblem(accounts: ConnectedAccount[]): string | null {
   const messages = accounts
     .filter((a) => getMetaPagesAccessState(a.config as any) === 'missing')
     .map((a) => getMetaAdsNoPagesMessage(a.config as any));
-  return messages.length ? [...new Set(messages)].join('\n') : null;
+  // ENG-3127: say plainly that reading/reporting still works; only ad creation is blocked.
+  return messages.length
+    ? `Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:\n${[...new Set(messages)].join('\n')}`
+    : null;
 }
 
 function usableAccounts(accounts: ConnectedAccount[], provider: ZomaProvider, now: number): ConnectedAccount[] {

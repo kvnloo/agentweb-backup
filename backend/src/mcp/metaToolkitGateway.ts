@@ -127,6 +127,8 @@ export interface MetaToolkitGatewayDeps {
   executeAudience?: (userId: string, args: any) => Promise<any>;
   /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
   getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
+  /** ENG-3127: last-30-day spend of a connected Meta ad account; defaults to a Graph insights read. */
+  accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -246,10 +248,76 @@ export async function resolveMetaToolkitAdAccount(
   requestedAccountId: unknown,
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ): Promise<string> {
-  const resolved = resolveProviderAccount(META_PROVIDER, await deps.listAccounts(userId), requestedAccountId, deps.now());
+  const accounts = await deps.listAccounts(userId);
+  const now = deps.now();
+  const resolved = resolveProviderAccount(META_PROVIDER, accounts, requestedAccountId, now);
   if (resolved.ok) return resolved.accountId;
-  if (resolved.kind === 'ambiguous') throw new MetaToolkitRefusal(resolved.message);
+  if (resolved.kind === 'ambiguous') {
+    const usable = accounts.filter((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now));
+    const picked = await pickActiveMetaAccount(userId, usable, deps);
+    if (picked) return picked;
+    throw new MetaToolkitRefusal(ambiguousAccountMessage(usable));
+  }
   throw new MetaToolkitAuthError(resolved.message, 403);
+}
+
+/**
+ * ENG-3127: with several usable Meta ad accounts and no account_id, run against the one account
+ * that is actually advertising (strictly highest last-30-day spend, > 0). A tie or no spend
+ * anywhere still refuses, but the refusal names every account so the agent can pick one.
+ * Cached per user for 10 minutes so the spend probe is not repeated on every call.
+ */
+const ACTIVE_ACCOUNT_TTL_MS = 10 * 60 * 1000;
+const activeAccountCache = new Map<string, { key: string; accountId: string | null; at: number }>();
+
+export function __resetActiveMetaAccountCache() {
+  activeAccountCache.clear();
+}
+
+async function defaultAccountSpend(account: ConnectedAccount, accountId: string): Promise<number> {
+  const token = (account.config as any)?.access_token;
+  if (!token) return 0;
+  const url = `https://graph.facebook.com/v21.0/act_${accountId}/insights?fields=spend&date_preset=last_30d&access_token=${encodeURIComponent(token)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) return 0;
+  const body: any = await res.json();
+  return Number(body?.data?.[0]?.spend ?? 0) || 0;
+}
+
+async function pickActiveMetaAccount(
+  userId: string,
+  usable: ConnectedAccount[],
+  deps: MetaToolkitGatewayDeps,
+): Promise<string | null> {
+  const ids = usable.map((a) => META_PROVIDER.accountIds(a)[0]).filter(Boolean);
+  const key = [...ids].sort().join(',');
+  const now = deps.now();
+  const cached = activeAccountCache.get(userId);
+  if (cached && cached.key === key && now - cached.at < ACTIVE_ACCOUNT_TTL_MS) return cached.accountId;
+
+  const spendOf = deps.accountSpend ?? defaultAccountSpend;
+  const spends = await Promise.all(
+    usable.map(async (a) => {
+      const id = META_PROVIDER.accountIds(a)[0];
+      try {
+        return { id, spend: await spendOf(a, id) };
+      } catch {
+        return { id, spend: 0 };
+      }
+    }),
+  );
+  spends.sort((x, y) => y.spend - x.spend);
+  const top = spends[0];
+  const accountId = top && top.spend > 0 && (spends.length < 2 || top.spend > spends[1].spend) ? top.id : null;
+  activeAccountCache.set(userId, { key, accountId, at: now });
+  return accountId;
+}
+
+function ambiguousAccountMessage(usable: ConnectedAccount[]): string {
+  const list = usable
+    .map((a) => `${(a as any).account_name || 'Meta ad account'} (${META_PROVIDER.accountIds(a)[0]})`)
+    .join(', ');
+  return `Multiple Meta ad accounts are connected and none is clearly the active one; pass account_id. Connected: ${list}.`;
 }
 
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
