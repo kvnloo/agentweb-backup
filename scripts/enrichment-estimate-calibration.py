@@ -27,7 +27,9 @@ every 14 days or the oldest runs are gone (the script warns when --since reaches
 
 It ends with a verdict: below --min-contacts or --min-customers it says INSUFFICIENT DATA and you must not retune.
 
-Usage (needs read access to the prod CloudWatch log group and the AW-* DynamoDB tables):
+Usage (needs read access to the prod CloudWatch log group and the AW-* DynamoDB tables). --since is required: choose
+the day AFTER the last change to pricing or the enrichment pipeline (or the last check), because a window that includes
+runs from before a change shows a false DRIFT:
     python3 scripts/enrichment-estimate-calibration.py --since 2026-11-13
 See docs/enrichment-estimate-calibration-runbook.md for when to run it and how to read the result.
 """
@@ -78,7 +80,7 @@ def _arith(expr, name):
 
     try:
         return walk(ast.parse(expr, mode="eval"))
-    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, RecursionError):
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError, RecursionError, MemoryError):
         sys.exit("unexpected expression for %s: %r" % (name, expr))
 
 
@@ -95,8 +97,9 @@ class Aws:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    default_since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=14)).strftime("%Y-%m-%d")
-    ap.add_argument("--since", default=default_since, help="first UTC day to include, YYYY-MM-DD (default: 14 days ago)")
+    ap.add_argument("--since", required=True,
+                    help="first UTC day to include, YYYY-MM-DD, zero-padded. Pick the day AFTER the last change to pricing or the "
+                         "enrichment pipeline (or the last check): runs from before a change give a false DRIFT")
     ap.add_argument("--exclude-emails", default="test@account.com",
                     help="comma-separated internal/test account emails to leave out (default: test@account.com)")
     ap.add_argument("--exclude-user-ids", default="", help="comma-separated user ids to leave out as well")
@@ -108,9 +111,11 @@ def main():
     ap.add_argument("--tolerance", type=float, default=0.25, help="retune if booked/quote differs from 1 by more (default 0.25)")
     a = ap.parse_args()
     try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", a.since):  # strptime accepts 2026-11-5; the ledger date filter is a string compare
+            raise ValueError
         since_dt = dt.datetime.strptime(a.since, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
     except ValueError:
-        sys.exit("--since must be a real date, YYYY-MM-DD")
+        sys.exit("--since must be a real, zero-padded date, YYYY-MM-DD (for example 2026-11-05)")
 
     llm_field = read_rate("llmPerFieldPerLead")
     lookup = read_rate("lookupPerLead")
@@ -129,9 +134,10 @@ def main():
     start_ms = int(since_dt.timestamp() * 1000)
     groups = aws("logs", "describe-log-groups", "--log-group-name-prefix", a.log_group).get("logGroups", [])
     keep = next((g.get("retentionInDays") for g in groups if g.get("logGroupName") == a.log_group), None)
-    if keep and since_dt < dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep):
+    oldest_day = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep)).date() if keep else None
+    if oldest_day and since_dt.date() < oldest_day:
         print("WARNING: the log group keeps only %d days, so runs before %s are already gone; the result below starts later than --since."
-              % (keep, (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep)).strftime("%Y-%m-%d")))
+              % (keep, oldest_day.strftime("%Y-%m-%d")))
     ev = lambda pat: aws("logs", "filter-log-events", "--log-group-name", a.log_group, "--start-time", str(start_ms),
                          "--filter-pattern", pat).get("events", [])
     starts = {}
