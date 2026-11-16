@@ -1,6 +1,0 @@
-## ENG-3029: Artificial Analysis jest fixture is now a live capture; Grok creator alias rolled back (2026-11-16)
-
-- Step 2 of 2. `backend/src/services/agentMode/__tests__/fixtures/artificialAnalysisLanguageModelsFree.json` is no longer the documented example. It is 7 rows, verbatim, from the first response page uploaded by workflow run 43771490745 (2026-11-15). The rows cover: scored and unscored, `performance_v3` null and present, cost block null and present, all-null pricing, an integer score.
-- The live rows showed that the current endpoint names Grok's lab `SpaceXAI`, which does not normalize to registry provider `xai`. Every `x-ai/*` entry reports "AA unmatched" and keeps its old score.
-- An alias for that name was merged in #4095 and removed the same day. With it, the monitor workflow (run 43787084872) matched `grok-4.7` and proposed 46.4 -> 35.5 while `grok-4.6` stayed unmatched at 44.3, and the "Grok 4.7 supersedes 4.6" invariant failed the run. The feed is Intelligence Index v5; the registry's older scores are on an earlier scale. Do not re-add the alias before that mix is decided (ENG-3054).
-- The fixture is one trimmed page of four. Rows on pages 2 to 4 were never captured.
