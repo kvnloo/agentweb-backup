@@ -226,6 +226,36 @@ describe('Subscriber Join Endpoint', () => {
       await join('flaky@example.com').expect(202);
     });
 
+    it('holds at most 50 confirmation emails in the shared outgoing queue at once: the next sign-up is told to try later and nothing is reserved for it', async () => {
+      const waiting: Array<(sent: boolean) => void> = [];
+      sendConfirmation.mockImplementation(() => new Promise<boolean>((resolve) => waiting.push(resolve)));
+      for (let i = 0; i < 50; i++) await join(`queued${i}@example.com`).expect(202);
+      expect(sendConfirmation).toHaveBeenCalledTimes(50);
+
+      const refused = await join('one-too-many@example.com').expect(429);
+      expect(refused.body.message).toMatch(/try again/i);
+      expect(sendConfirmation).toHaveBeenCalledTimes(50);
+
+      // as the mail goes out, places free up and sign-ups work again; the refused address was never reserved, so it is not held back either
+      waiting.splice(0, 5).forEach((resolve) => resolve(true));
+      await new Promise((resolve) => setImmediate(resolve));
+      await join('one-too-many@example.com').expect(202);
+      expect(sendConfirmation).toHaveBeenCalledTimes(51);
+      waiting.splice(0).forEach((resolve) => resolve(true));
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+
+    it('logs (without the address) when the person was told to check their email but nothing could be sent', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      sendConfirmation.mockResolvedValueOnce(false);
+      await join('lost@example.com').expect(202);
+      await new Promise((resolve) => setImmediate(resolve));
+      const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('subscriber_join_confirmation_not_sent');
+      expect(logged).not.toContain('lost@example.com');
+      warn.mockRestore();
+    });
+
     it('limits one connection to 10 sign-up attempts an hour', async () => {
       const ip = newIp();
       const statuses: number[] = [];

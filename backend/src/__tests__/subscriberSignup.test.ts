@@ -9,6 +9,9 @@ import {
   resetJoinConfirmationLimits,
   trackedJoinKeyCount,
   renderConfirmPage,
+  tryBeginJoinSend,
+  joinSendsInFlightCount,
+  MAX_JOIN_SENDS_IN_FLIGHT,
 } from '../services/subscriberSignup';
 
 describe('parseSignupEmail', () => {
@@ -198,5 +201,45 @@ describe('renderConfirmPage', () => {
     expect(page).toContain('name="token"');
     expect(page).toContain('<meta name="robots" content="noindex">');
     expect(renderConfirmPage({ title: 't', message: 'm' })).not.toContain('<form');
+  });
+});
+
+describe('tryBeginJoinSend (a burst cannot fill the shared outgoing mail queue)', () => {
+  beforeEach(() => jest.spyOn(console, 'warn').mockImplementation(() => undefined));
+  afterEach(() => jest.restoreAllMocks());
+
+  it('gives out as many places as the queue may hold at once, then none, and takes them back when they are released', () => {
+    const places = Array.from({ length: MAX_JOIN_SENDS_IN_FLIGHT }, () => tryBeginJoinSend());
+    expect(places.every((release) => typeof release === 'function')).toBe(true);
+    expect(joinSendsInFlightCount()).toBe(MAX_JOIN_SENDS_IN_FLIGHT);
+    expect(tryBeginJoinSend()).toBeNull();
+    expect((console.warn as jest.Mock).mock.calls.map((c) => String(c[0])).join('\n')).toContain('"cap":"queue"');
+    places[0]!();
+    const again = tryBeginJoinSend();
+    expect(again).not.toBeNull();
+    places.slice(1).forEach((release) => release!());
+    again!();
+    expect(joinSendsInFlightCount()).toBe(0);
+  });
+
+  it('places handed out before a reset are not given back into the new count', () => {
+    const before = tryBeginJoinSend()!;
+    resetJoinConfirmationLimits();
+    expect(joinSendsInFlightCount()).toBe(0);
+    before(); // the old place's release arrives after the reset
+    expect(joinSendsInFlightCount()).toBe(0);
+    const taken = Array.from({ length: MAX_JOIN_SENDS_IN_FLIGHT }, () => tryBeginJoinSend());
+    expect(tryBeginJoinSend()).toBeNull(); // the cap is still exactly the cap
+    taken.forEach((r) => r!());
+  });
+
+  it('a place can only be given back once (a second release must not hand out an extra place)', () => {
+    const release = tryBeginJoinSend()!;
+    release();
+    release();
+    expect(joinSendsInFlightCount()).toBe(0);
+    const taken = Array.from({ length: MAX_JOIN_SENDS_IN_FLIGHT }, () => tryBeginJoinSend());
+    expect(tryBeginJoinSend()).toBeNull();
+    taken.forEach((r) => r!());
   });
 });

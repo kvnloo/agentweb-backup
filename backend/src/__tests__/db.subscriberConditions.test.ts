@@ -47,7 +47,18 @@ describe('subscriberDb: conditional writes (ENG-2991)', () => {
       const p = lastParams(ddb.update);
       expect(p.ConditionExpression).toBeUndefined();
       expect(p.Key).toEqual({ taskId: 't1', email: 'a@x.com' });
-      expect(p.UpdateExpression).toBe('SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback');
+      expect(p.UpdateExpression).toBe('SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce, feedback = :feedback');
+    });
+
+    it('writes a fresh random nonce with every opt-out (the undo token is bound to it), different each time', async () => {
+      ddb.update.mockReturnValue(ok({ Attributes: { unsubscribed: true } }));
+      await subscriberDb.softUnsubscribe('t1', 'a@x.com');
+      const first = lastParams(ddb.update);
+      await subscriberDb.softUnsubscribe('t1', 'a@x.com');
+      const second = lastParams(ddb.update);
+      expect(first.UpdateExpression).toBe('SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce');
+      expect(first.ExpressionAttributeValues[':optOutNonce']).toMatch(/^[0-9a-f-]{36}$/);
+      expect(second.ExpressionAttributeValues[':optOutNonce']).not.toBe(first.ExpressionAttributeValues[':optOutNonce']);
     });
 
     it('with onlyIfActive: applies only to an existing row that is not already unsubscribed, and returns the new row', async () => {
@@ -96,6 +107,26 @@ describe('subscriberDb: conditional writes (ENG-2991)', () => {
       expect(p.UpdateExpression).toContain('unsubscribed = :unsubscribed');
     });
 
+    it('with onlyIfOptOutNonce: applies only while the row still carries exactly that nonce', async () => {
+      ddb.update.mockReturnValue(ok({ Attributes: { unsubscribed: false } }));
+      await subscriberDb.resubscribe('t1', 'a@x.com', { onlyIfOptOutNonce: 'nonce-1' });
+      const p = lastParams(ddb.update);
+      expect(p.ConditionExpression).toBe('unsubscribed = :wasOptedOut AND optOutNonce = :claimedNonce');
+      expect(p.ExpressionAttributeValues[':claimedNonce']).toBe('nonce-1');
+      expect(p.ExpressionAttributeValues[':wasOptedOut']).toBe(true);
+    });
+
+    it('with onlyIfOptOutNonce: returns null when a repeat opt-out has changed the nonce (or the person was put back)', async () => {
+      ddb.update.mockReturnValue(fails(conditionFailed()));
+      await expect(subscriberDb.resubscribe('t1', 'a@x.com', { onlyIfOptOutNonce: 'old' })).resolves.toBeNull();
+    });
+
+    it('with both conditions, both must hold', async () => {
+      ddb.update.mockReturnValue(ok({ Attributes: {} }));
+      await subscriberDb.resubscribe('t1', 'a@x.com', { onlyIfOptOutNonce: 'n', onlyIfUnsubscribedAt: 't' });
+      expect(lastParams(ddb.update).ConditionExpression).toBe('unsubscribed = :wasOptedOut AND optOutNonce = :claimedNonce AND unsubscribedAt = :claimedOptOut');
+    });
+
     it('with onlyIfUnsubscribedAt: returns null when the person has opted out again (or been put back) since', async () => {
       ddb.update.mockReturnValue(fails(conditionFailed()));
       await expect(subscriberDb.resubscribe('t1', 'a@x.com', { onlyIfUnsubscribedAt: 'old' })).resolves.toBeNull();
@@ -108,20 +139,20 @@ describe('subscriberDb: conditional writes (ENG-2991)', () => {
   });
 
   describe('refreshOptOut', () => {
-    it('gives an unsubscribed row a new opt-out time, and only an unsubscribed one', async () => {
-      ddb.update.mockReturnValue(ok({ Attributes: { unsubscribed: true, unsubscribedAt: 'new' } }));
-      const row = await subscriberDb.refreshOptOut('t1', 'a@x.com');
+    it('gives an unsubscribed row a new nonce (voiding undo tokens for the earlier one), only an unsubscribed one, and leaves the opt-out time alone', async () => {
+      ddb.update.mockReturnValue(ok({}));
+      await expect(subscriberDb.refreshOptOut('t1', 'a@x.com')).resolves.toBe(true);
       const p = lastParams(ddb.update);
-      expect(p.UpdateExpression).toBe('SET unsubscribedAt = :now');
+      expect(p.UpdateExpression).toBe('SET optOutNonce = :nonce');
+      expect(p.UpdateExpression).not.toContain('unsubscribedAt'); // it is the record of when the person opted out, and a confirmation-link rule depends on it
       expect(p.ConditionExpression).toBe('unsubscribed = :isOptedOut');
       expect(p.ExpressionAttributeValues[':isOptedOut']).toBe(true);
-      expect(Date.parse(p.ExpressionAttributeValues[':now'])).not.toBeNaN();
-      expect(row).toMatchObject({ unsubscribed: true });
+      expect(p.ExpressionAttributeValues[':nonce']).toMatch(/^[0-9a-f-]{36}$/);
     });
 
-    it('does nothing (null) for an address that is not unsubscribed or does not exist, and creates no row', async () => {
+    it('does nothing (false) for an address that is not unsubscribed or does not exist, and creates no row', async () => {
       ddb.update.mockReturnValue(fails(conditionFailed()));
-      await expect(subscriberDb.refreshOptOut('t1', 'ghost@x.com')).resolves.toBeNull();
+      await expect(subscriberDb.refreshOptOut('t1', 'ghost@x.com')).resolves.toBe(false);
     });
   });
 
