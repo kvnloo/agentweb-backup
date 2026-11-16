@@ -1,5 +1,9 @@
 import express, { Request, RequestHandler, Response } from 'express';
 import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
+import rateLimit from 'express-rate-limit';
+import { signConfirmToken, signResubscribeToken, readConfirmToken, readResubscribeToken } from '../services/subscriberTokens';
+import { parseSignupEmail, isStoredEmail, reserveJoinConfirmation, renderConfirmPage } from '../services/subscriberSignup';
+import { findSubscriberAnyCase, forgetSubscriberLookup } from '../services/subscriberLookup';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -154,17 +158,14 @@ router.get('/:taskId/subscribers/:email/status', async (req, res) => {
       return res.status(404).json({ message: 'Subscriber not found for this task' });
     }
     
+    // ENG-2991: public, so only what the unsubscribe page needs. The feedback text someone wrote when unsubscribing, and the dates, stay private.
     res.json({
       email: subscriber.email,
-      subscribedAt: subscriber.subscribedAt,
-      unsubscribed: subscriber.unsubscribed || false,
-      unsubscribedAt: subscriber.unsubscribedAt,
-      resubscribedAt: subscriber.resubscribedAt,
-      feedback: subscriber.feedback
+      unsubscribed: subscriber.unsubscribed || false
     });
   } catch (error: any) {
     console.error('Error checking subscriber status:', error);
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -179,99 +180,245 @@ router.get('/:id/name', async (req, res) => {
     res.json({ name: task.name });
   } catch (error: any) {
     console.error('Error getting task name:', error);
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
+// Public unsubscribe/undo calls write to a table anyone can name an address in: bound what one connection can do.
+const optOutIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests from this connection. Please try again later.' },
+});
+
 // Soft unsubscribe from task (public)
-router.post('/:taskId/unsubscribe', async (req, res) => {
+router.post('/:taskId/unsubscribe', optOutIpLimiter, async (req, res) => {
   try {
     const { taskId } = req.params;
     const { email, feedback } = req.body;
 
-    if (!email) {
+    if (!isStoredEmail(email)) {
       return res.status(400).json({ message: 'Email is required' });
     }
 
     // Check if subscriber exists
-    const subscriber = await subscriberDb.getTaskSubscriberByEmail(taskId, email);
+    const subscriber = await subscriberDb.getTaskSubscriberByEmail(taskId, email, true);
     
     if (!subscriber) {
       return res.status(404).json({ message: 'Subscriber not found for this task' });
     }
 
-    await subscriberDb.softUnsubscribe(taskId, email, feedback);
-    res.json({ message: 'Successfully unsubscribed' });
+    // ENG-2991: the undo token is what lets someone switch mail back on, so it goes only to the caller whose request really changes the row
+    // from subscribed to unsubscribed (one atomic update). Repeating the call for an address that has already opted out, or racing a
+    // person's own unsubscribe, gets no token.
+    const updated = await subscriberDb.softUnsubscribe(taskId, email, typeof feedback === 'string' ? feedback.slice(0, 2000) : undefined, { onlyIfActive: true });
+    if (!updated?.unsubscribedAt) {
+      // Already opted out. Give the opt-out a new time, which voids any undo token that was handed out for the earlier one: someone who
+      // unsubscribed this address just before the person did must not keep a token that undoes the person's own opt-out.
+      await subscriberDb.refreshOptOut(taskId, email);
+      return res.json({ message: 'Already unsubscribed' });
+    }
+    // The unsubscribe page's "undo" needs this token. It is tied to this opt-out and this exact address, so it stops working once the person
+    // opts out again or has been put back.
+    res.json({ message: 'Successfully unsubscribed', resubscribeToken: signResubscribeToken(taskId, email, updated.unsubscribedAt) });
   } catch (error: any) {
     console.error('Error unsubscribing:', error);
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
-// Resubscribe to task (public)
-router.post('/:taskId/resubscribe', async (req, res) => {
+// Resubscribe to task (public): undoes an opt-out, with the token the unsubscribe call returned for that opt-out
+router.post('/:taskId/resubscribe', optOutIpLimiter, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { email } = req.body;
+    const { email, token } = req.body;
 
-    if (!email) {
+    if (!isStoredEmail(email)) {
       return res.status(400).json({ message: 'Email is required' });
     }
 
-    // Check if subscriber exists
-    const subscriber = await subscriberDb.getTaskSubscriberByEmail(taskId, email);
-    
+    // ENG-2991: this used to reverse an unsubscribe from just a task id and an email, so anyone could re-enable mail to an address that had
+    // opted out. It needs the undo token for this address and this opt-out (the owner-only route below needs no token).
+    const expired = () => res.status(403).json({ message: 'This resubscribe option has expired. To receive updates again, subscribe from the form.' });
+    const claim = readResubscribeToken(token);
+    if (!claim || claim.taskId !== taskId || claim.email !== email) {
+      return expired();
+    }
+
+    // The row must still be opted out by the very opt-out the token was issued for (an address that has been put back, or opted out again
+    // since, no longer matches).
+    const subscriber = await subscriberDb.getTaskSubscriberByEmail(taskId, email, true);
     if (!subscriber) {
       return res.status(404).json({ message: 'Subscriber not found for this task' });
     }
+    if (subscriber.unsubscribed !== true || subscriber.unsubscribedAt !== claim.unsubscribedAt) {
+      return expired();
+    }
 
-    await subscriberDb.resubscribe(taskId, email);
+    // One atomic step: it applies only while the row is still opted out by exactly the opt-out this token undoes.
+    const done = await subscriberDb.resubscribe(taskId, email, { onlyIfUnsubscribedAt: claim.unsubscribedAt });
+    if (!done) {
+      return expired();
+    }
     res.json({ message: 'Successfully resubscribed' });
   } catch (error: any) {
     console.error('Error resubscribing:', error);
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
-// Public endpoint for embed code/widget subscriptions (sends welcome email)
+// ENG-2991: public double opt-in. The join form only asks for a confirmation email; the subscriber is created when the person confirms from it.
+const joinIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many sign-up attempts from this connection. Please try again later.' },
+});
+
+const sendConfirmPage = (res: Response, status: number, page: string) =>
+  res.status(status).set({
+    'Cache-Control': 'no-store',
+    'X-Robots-Tag': 'noindex',
+    // Not the API's usual no-referrer: under that policy browsers label a form POST (even one to the same site) `Origin: null`, and the global
+    // CORS check rejects that with 403, so the Confirm button would never work (the same trap routes/zoma.ts documents). same-origin still
+    // never sends a referrer anywhere else. The page has no script, image or external link, so nothing else is allowed.
+    'Referrer-Policy': 'same-origin',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  }).type('html').send(page);
+const expiredLinkPage = () =>
+  renderConfirmPage({ title: 'This link has expired', message: 'This confirmation link is invalid or has expired. Please subscribe again from the form.' });
+
+// Confirm a subscription, step 1 (public: the signed link from the confirmation email). It only shows a page with a button. Mail scanners and
+// link previews open every link in a message (and a HEAD request lands here too), so opening the link must not change anything.
+router.get('/:taskId/subscribers/confirm', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const claim = readConfirmToken(req.query.token);
+    const task = claim && claim.taskId === taskId ? await taskDb.getTaskById(taskId) : null;
+    if (!claim || !task) {
+      return sendConfirmPage(res, 400, expiredLinkPage());
+    }
+    return sendConfirmPage(res, 200, renderConfirmPage({
+      title: 'Confirm your subscription',
+      message: `Confirm that you want to receive email updates for ${task.name || 'this task'}.`,
+      form: { action: `/api/tasks/${encodeURIComponent(taskId)}/subscribers/confirm`, token: String(req.query.token), button: 'Confirm subscription' },
+    }));
+  } catch (error: any) {
+    console.error('Error showing subscription confirmation:', error);
+    return sendConfirmPage(res, 500, renderConfirmPage({ title: 'Something went wrong', message: 'We could not open this link. Please try again in a moment.' }));
+  }
+});
+
+// Confirm a subscription, step 2: the button on that page.
+router.post('/:taskId/subscribers/confirm', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const claim = readConfirmToken(req.body?.token);
+    const task = claim && claim.taskId === taskId ? await taskDb.getTaskById(taskId) : null;
+    if (!claim || !task) {
+      return sendConfirmPage(res, 400, expiredLinkPage());
+    }
+    // Rows are stored exactly as typed. The link carries the lower-cased address, so look for that row first and otherwise for the same
+    // address in any letter case (an older sign-up, or an import), so the person is not added a second time under another spelling.
+    let existing = await subscriberDb.getTaskSubscriberByEmail(taskId, claim.email, true);
+    if (!existing) {
+      // The address list is read once for everyone who asks within 30 seconds, with only the fields needed (see services/subscriberLookup.ts),
+      // and the matching row is then read again so what is decided below is not based on the cached copy.
+      const sameAddress = await findSubscriberAnyCase(taskId, claim.email);
+      if (sameAddress) existing = await subscriberDb.getTaskSubscriberByEmail(taskId, sameAddress.email, true);
+    }
+    // A link sent before the person unsubscribed must not switch the mail back on (a forwarded email or a rescan would otherwise do it).
+    if (existing?.unsubscribed && !(Date.parse(existing.unsubscribedAt) <= claim.issuedAtMs)) {
+      return sendConfirmPage(res, 400, renderConfirmPage({
+        title: 'This link is no longer valid',
+        message: 'You unsubscribed after this link was sent. To receive updates again, use the sign-up form.',
+      }));
+    }
+    let changed = false;
+    if (!existing) {
+      try {
+        await subscriberDb.addSubscriber(taskId, claim.email);
+        changed = true;
+      } catch (e: any) {
+        if (!/already subscribed|already in the subscriber list/i.test(String(e?.message))) throw e;
+      }
+    } else if (existing.unsubscribed) {
+      await subscriberDb.resubscribe(taskId, existing.email);
+      changed = true;
+    }
+    if (changed) {
+      forgetSubscriberLookup(taskId);
+      emailService.sendSubscriberWelcomeEmail(existing?.email || claim.email, taskId).catch((emailError) => {
+        console.error('Failed to send welcome email (subscription still succeeded):', emailError);
+      });
+    }
+    return sendConfirmPage(res, 200, renderConfirmPage({
+      title: "You're subscribed",
+      message: `You will now receive updates for ${task.name || 'this task'}. You can unsubscribe at any time from any email we send.`,
+    }));
+  } catch (error: any) {
+    console.error('Error confirming subscription:', error);
+    return sendConfirmPage(res, 500, renderConfirmPage({ title: 'Something went wrong', message: 'We could not confirm your subscription. Please try again in a moment.' }));
+  }
+});
+
+// Public endpoint for embed code/widget subscriptions (sends a confirmation email; the welcome email follows the confirmation)
 // Use CORS middleware to allow requests from any origin (for embed code)
 router.post('/:taskId/subscribers/join', cors({
   origin: '*',
   methods: ['POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
   credentials: false
-}), async (req, res) => {
+}), joinIpLimiter, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { email } = req.body;
+    const parsed = parseSignupEmail(req.body?.email);
+    if (!parsed.ok) {
+      return res.status(400).json({ message: parsed.reason === 'missing' ? 'Email is required' : 'Invalid email format' });
+    }
+    const email = parsed.email;
 
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
+    // ENG-2991: only a real task can be joined (this used to write a row for any task id).
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: 'Invalid email format' });
+    // Nobody is subscribed yet: ask the address to confirm. An address that is already subscribed gets nothing and the same answer, so the
+    // join form cannot be used to find out who subscribes. (Rows are stored exactly as typed, so look for the address as typed and lower-cased.)
+    const lower = email.toLowerCase();
+    const existing = (await subscriberDb.getTaskSubscriberByEmail(taskId, email))
+      || (lower !== email ? await subscriberDb.getTaskSubscriberByEmail(taskId, lower) : null);
+    const alreadyActive = Boolean(existing && !existing.unsubscribed);
+    if (!alreadyActive) {
+      const base = (process.env.BACKEND_URL || 'https://api.agentweb.pro').replace(/\/+$/, '');
+      const confirmUrl = `${base}/api/tasks/${encodeURIComponent(taskId)}/subscribers/confirm?token=${encodeURIComponent(signConfirmToken(taskId, email))}`;
+      const reservation = reserveJoinConfirmation(taskId, email, task.userId ? String(task.userId) : `no-owner:${taskId}`);
+      if (!reservation.ok) {
+        // A limit on this one address answers like any sign-up, so the limit itself does not reveal who is subscribed; a limit on the whole
+        // form says to try later, so nobody waits for mail that was never sent. (/status and /unsubscribe already tell anyone who knows a task id
+        // and an address whether it is subscribed, so this is no new exposure.)
+        if (reservation.visible) {
+          return res.status(429).json({ message: 'This form is getting a lot of sign-ups right now. Please try again in a little while.' });
+        }
+      } else {
+        // If the email could not be sent, give the person's slot back so they can try again straight away.
+        emailService.sendSubscriberConfirmationEmail(email, taskId, confirmUrl)
+          .then((sent) => { if (!sent) reservation.release(); })
+          .catch((emailError) => {
+            reservation.release();
+            console.error('Failed to send subscription confirmation email:', emailError);
+          });
+      }
     }
 
-    // Add subscriber
-    const subscriber = await subscriberDb.addSubscriber(taskId, email);
-    
-    // Send welcome email asynchronously (don't wait for it to complete)
-    // Pass taskId instead of task name so the function can get task and user config
-    emailService.sendSubscriberWelcomeEmail(email, taskId).catch((emailError) => {
-      console.error('Failed to send welcome email (subscription still succeeded):', emailError);
-    });
-
-    res.status(201).json(subscriber);
+    res.status(202).json({ message: 'Check your email to confirm your subscription.' });
   } catch (error: any) {
-    console.error('Error adding subscriber:', error);
-    if (error.message.includes('already subscribed') || error.message.includes('already in the subscriber list')) {
-      res.status(409).json({ message: error.message });
-    } else {
-      res.status(500).json({ message: error.message });
-    }
+    console.error('Error handling subscriber join:', error);
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -459,10 +606,16 @@ router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (re
   }
 });
 
-// Get task subscribers (active only - public)
+// Get a task's subscribers (login required; the task's owner or an admin only, see ENG-2990)
 router.get('/:taskId/subscribers', async (req, res) => {
   try {
     const { taskId } = req.params;
+    // ENG-2990: needs a login (router level) but also used to hand any signed-in user the full subscriber records (emails, imported fields,
+    // email history) of any task. The task's owner or an admin only, like the other subscriber routes.
+    const access = await checkTaskSubscriberAccess((req as unknown as AuthenticatedRequest).user?.userId, taskId);
+    if (!access.ok) {
+      return res.status(access.status).json({ message: access.message });
+    }
     const subscribers = await subscriberDb.getTaskSubscribers(taskId);
     res.json(subscribers);
   } catch (error: any) {

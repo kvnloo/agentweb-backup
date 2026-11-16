@@ -4731,9 +4731,18 @@ export const subscriberDb = {
           subscribedAt,
           unsubscribed: false,
         },
+        // Two requests can both pass the check above (a person's click and a mail scanner's, for example): only one may create the row.
+        ConditionExpression: "attribute_not_exists(email)",
       };
 
-      await dynamodb.put(params).promise();
+      try {
+        await dynamodb.put(params).promise();
+      } catch (putError: any) {
+        if (putError?.code === "ConditionalCheckFailedException") {
+          throw new Error(`Email ${email} is already in the subscriber list for this task`);
+        }
+        throw putError;
+      }
       return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
       handleDynamoDbError(error, "addSubscriber");
@@ -4756,7 +4765,11 @@ export const subscriberDb = {
     }
   },
 
-  async softUnsubscribe(taskId: string, email: string, feedback?: string) {
+  /**
+   * Mark an address unsubscribed. With `onlyIfActive` the update happens only if the row exists and is not already unsubscribed, in one
+   * atomic step, and returns null when it did not (ENG-2991: only the caller that really flips the row is handed an undo token).
+   */
+  async softUnsubscribe(taskId: string, email: string, feedback?: string, options?: { onlyIfActive?: boolean }) {
     try {
       const updateExpression = feedback
         ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
@@ -4780,18 +4793,27 @@ export const subscriberDb = {
         UpdateExpression: updateExpression,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
+        ...(options?.onlyIfActive
+          ? { ConditionExpression: "attribute_exists(email) AND (attribute_not_exists(unsubscribed) OR unsubscribed = :stillActive)" }
+          : {}),
       };
+      if (options?.onlyIfActive) (params.ExpressionAttributeValues as any)[":stillActive"] = false;
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (options?.onlyIfActive && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "softUnsubscribe");
     }
   },
 
-  async resubscribe(taskId: string, email: string) {
+  /**
+   * Put an unsubscribed address back. With `onlyIfUnsubscribedAt` the update applies only while the row is still unsubscribed by exactly that
+   * opt-out, in one atomic step, and returns null when it did not (ENG-2991: an undo token must not undo a newer opt-out).
+   */
+  async resubscribe(taskId: string, email: string, options?: { onlyIfUnsubscribedAt?: string }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
@@ -4805,11 +4827,64 @@ export const subscriberDb = {
         },
         ReturnValues: "ALL_NEW",
       };
+      if (options?.onlyIfUnsubscribedAt) {
+        params.ConditionExpression = "unsubscribed = :wasOptedOut AND unsubscribedAt = :claimedOptOut";
+        params.ExpressionAttributeValues[":wasOptedOut"] = true;
+        params.ExpressionAttributeValues[":claimedOptOut"] = options.onlyIfUnsubscribedAt;
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (options?.onlyIfUnsubscribedAt && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "resubscribe");
+    }
+  },
+
+  /**
+   * Give an already unsubscribed address a new opt-out time, which voids every undo token issued for the earlier one (ENG-2991). Does
+   * nothing (returns null) if the address is not unsubscribed.
+   */
+  async refreshOptOut(taskId: string, email: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET unsubscribedAt = :now",
+        ConditionExpression: "unsubscribed = :isOptedOut",
+        ExpressionAttributeValues: {
+          ":now": new Date().toISOString(),
+          ":isOptedOut": true,
+        },
+        ReturnValues: "ALL_NEW" as const,
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") return null;
+      handleDynamoDbError(error, "refreshOptOut");
+    }
+  },
+
+  /** Every address of a task with only the three fields needed to match and judge it (not the history and imported fields). */
+  async getTaskSubscriberStates(taskId: string): Promise<Array<{ email: string; unsubscribed?: boolean; unsubscribedAt?: string }> | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        KeyConditionExpression: "taskId = :taskId",
+        ProjectionExpression: "email, unsubscribed, unsubscribedAt",
+        ExpressionAttributeValues: {
+          ":taskId": taskId,
+        },
+      };
+
+      return (await paginatedQuery(dynamodb, params)) as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscriberStates");
     }
   },
 
@@ -4847,7 +4922,7 @@ export const subscriberDb = {
     }
   },
 
-  async getTaskSubscriberByEmail(taskId: string, email: string) {
+  async getTaskSubscriberByEmail(taskId: string, email: string, consistentRead = false) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -4855,6 +4930,7 @@ export const subscriberDb = {
           taskId: taskId,
           email: email,
         },
+        ...(consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
