@@ -59,12 +59,15 @@ function deps(accounts: any[], over: Partial<ZomaOnboardingDeps> = {}): ZomaOnbo
 }
 const status = (d: ZomaOnboardingDeps): Promise<any> => runZomaTool('zoma_status', {}, { userId: 'u1' }, d);
 
+// ENG-3127: the Page step leads with the fact that reads still work.
+const READS_OK = 'Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:\n';
+
 describe('ENG-3078 zoma_status and Facebook Page access', () => {
   it('missing: the Page problem is the next step instead of "All set"', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false })]));
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
-    expect(r.summary.endsWith(`\n\n${META_ADS_NO_PAGES_MESSAGE}`)).toBe(true);
+    expect(r.next_step).toBe(READS_OK + META_ADS_NO_PAGES_MESSAGE);
+    expect(r.summary.endsWith(`\n\n${READS_OK}${META_ADS_NO_PAGES_MESSAGE}`)).toBe(true);
     expect(r.meta.accounts).toEqual([
       { account_id: '111', name: 'Phoenix', currency: 'TWD', ads_management: 'granted', page_access: 'missing' },
     ]);
@@ -82,33 +85,33 @@ describe('ENG-3078 zoma_status and Facebook Page access', () => {
 
   it('missing because existing ads run under an inaccessible Page: names that Page', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false, existing_ads_page_id: '9001' })]));
-    expect(r.next_step).toBe(buildMetaAdsWrongPageMessage('9001'));
+    expect(r.next_step).toBe(READS_OK + buildMetaAdsWrongPageMessage('9001'));
     expect(r.summary).not.toContain('All set');
   });
 
   it('one account granted, one missing: only the missing one is flagged and the step is shown', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: true }), metaAccount({ has_meta_pages: false }, '222')]));
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(r.next_step).toBe(READS_OK + META_ADS_NO_PAGES_MESSAGE);
     expect(r.meta.accounts.map((a: any) => [a.account_id, a.page_access])).toEqual([['111', undefined], ['222', 'missing']]);
   });
 
   it('two accounts with the same Page problem: the message is shown once', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false }), metaAccount({ has_meta_pages: false }, '222')]));
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(r.next_step).toBe(READS_OK + META_ADS_NO_PAGES_MESSAGE);
   });
 
   it('Google Ads ready but Meta Page missing: still not "All set"', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false }), googleAccount()], { googleEnabled: () => true }));
     expect(r.google_ads.ready).toBe(true);
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(r.next_step).toBe(READS_OK + META_ADS_NO_PAGES_MESSAGE);
   });
 
   it('missing with mintLinks off (device-flow poll): step shown, no link minted', async () => {
     const d = deps([metaAccount({ has_meta_pages: false })]);
     const r = await getZomaReadiness('u1', d, { mintLinks: false });
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(r.next_step).toBe(READS_OK + META_ADS_NO_PAGES_MESSAGE);
     expect(d.buildMetaConnectUrl).not.toHaveBeenCalled();
   });
 
