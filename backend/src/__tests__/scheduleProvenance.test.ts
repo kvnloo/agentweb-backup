@@ -14,6 +14,7 @@ import {
   minCallsWithoutRefused,
   planProvenanceChange,
   readScheduleProvenance,
+  scheduleContentVersion,
   trackedFieldsInBody,
   withoutRefusedNames,
 } from '../utils/scheduleProvenance';
@@ -73,12 +74,13 @@ describe('isScheduleMarked', () => {
 });
 
 describe('tracked fields', () => {
-  it('are exactly the seven content fields; session_id, self_improve, timing, model, name and description are not tracked', () => {
+  it('are exactly the eight content fields (selfImprove included); session_id, timing, model, name and description are not tracked', () => {
     expect([...SCHEDULE_PROVENANCE_FIELDS].sort()).toEqual([
       'emailNotifications',
       'functionCallMinCalls',
       'keywords',
       'requiredFunctionCalls',
+      'selfImprove',
       'startingMessage',
       'variableValues',
       'variables',
@@ -93,13 +95,13 @@ describe('tracked fields', () => {
         requiredFunctionCalls: undefined,
         variableValues: {},
         sessionId: 's',
-        selfImprove: true,
+        selfImprove: false,
         nextRunTime: 'soon',
         llmModel: 'm',
         scheduleName: 'n',
         description: 'd',
       })
-    ).toEqual(['startingMessage', 'keywords', 'variableValues']);
+    ).toEqual(['startingMessage', 'keywords', 'variableValues', 'selfImprove']);
     expect(trackedFieldsInBody(undefined)).toEqual([]);
     expect(trackedFieldsInBody('nope')).toEqual([]);
   });
@@ -155,5 +157,64 @@ describe('planProvenanceChange: marks are only ever ADDED, and only by a visitor
     expect(applyProvenancePlan(['keywords'], { provenanceAdd: ['startingMessage', 'keywords'] })).toEqual(['keywords', 'startingMessage']);
     expect(applyProvenancePlan(['keywords'], {})).toEqual(['keywords']);
     expect(applyProvenancePlan([], {})).toEqual([]);
+  });
+});
+
+describe('scheduleContentVersion: the digest the adopt route binds to (computed on read, never stored)', () => {
+  const base = () => ({
+    scheduleId: 's1', scheduleName: 'S', startingMessage: 'Hi', keywords: ['a', 'b'], requiredFunctionCalls: ['t1'],
+    functionCallMinCalls: { t1: 1, t2: 2 }, variables: [{ name: 'who', description: 'd' }], variableValues: { who: 'Alice', where: 'here' },
+    emailNotifications: ['o@example.com'], selfImprove: false, provenance: ['keywords', 'startingMessage'],
+  });
+
+  it('is 32 hex characters and the same for the same content', () => {
+    expect(scheduleContentVersion(base())).toMatch(/^[0-9a-f]{32}$/);
+    expect(scheduleContentVersion(base())).toBe(scheduleContentVersion(base()));
+  });
+
+  it('is stable across object KEY order (at any depth) and across provenance ORDER and shape (array, real Set)', () => {
+    const reordered = {
+      provenance: realSet(['startingMessage', 'keywords']),
+      selfImprove: false, emailNotifications: ['o@example.com'],
+      variableValues: { where: 'here', who: 'Alice' }, variables: [{ description: 'd', name: 'who' }],
+      functionCallMinCalls: { t2: 2, t1: 1 }, requiredFunctionCalls: ['t1'], keywords: ['a', 'b'], startingMessage: 'Hi', scheduleName: 'S', scheduleId: 's1',
+    };
+    expect(scheduleContentVersion(reordered)).toBe(scheduleContentVersion(base()));
+  });
+
+  it('changes when ANY tracked field, or the marks, change', () => {
+    const before = scheduleContentVersion(base());
+    for (const change of [
+      { startingMessage: 'Hi!' }, { keywords: ['b', 'a'] }, { requiredFunctionCalls: ['t1', 't2'] }, { functionCallMinCalls: { t1: 9, t2: 2 } },
+      { variables: [{ name: 'who' }] }, { variableValues: { who: 'Mallory', where: 'here' } }, { emailNotifications: ['o@example.com', 'x@example.com'] },
+      { selfImprove: true }, { provenance: ['keywords'] }, { provenance: ['keywords', 'startingMessage', 'variables'] }, { provenance: [] },
+    ]) {
+      expect(scheduleContentVersion({ ...base(), ...change })).not.toBe(before);
+    }
+  });
+
+  it('does NOT change for anything that is not tracked content: updatedAt, run bookkeeping, name, model, timing, run results', () => {
+    const before = scheduleContentVersion(base());
+    expect(scheduleContentVersion({
+      ...base(), updatedAt: '2026-11-18T00:00:00Z', lastRunTime: 'x', nextRunTime: 'y', status: 'paused', runCount: 3, runResults: [{ runId: 'r' }],
+      runInFlight: { runId: 'r' }, claimedAt: 'x', claimedBy: 'i', scheduleName: 'Renamed', llmModel: 'm', timezone: 'UTC', description: 'd',
+      deliveryLog: [{ at: 'x' }], promptRevisions: [{ startingMessage: 'old' }],
+    })).toBe(before);
+  });
+
+  it('an absent field reads as its empty value, so a handler storing "[]" where nothing was stored changes nothing', () => {
+    const bare = { startingMessage: 'Hi', provenance: ['keywords'] };
+    expect(scheduleContentVersion({ ...bare, keywords: [], requiredFunctionCalls: [], functionCallMinCalls: {}, variables: [], variableValues: {}, emailNotifications: [], selfImprove: false }))
+      .toBe(scheduleContentVersion(bare));
+    expect(scheduleContentVersion({ ...bare, keywords: null, selfImprove: undefined })).toBe(scheduleContentVersion(bare));
+  });
+
+  it('reads an unreadable provenance as marked (and so as different from none)', () => {
+    expect(scheduleContentVersion({ ...base(), provenance: 17 })).not.toBe(scheduleContentVersion({ ...base(), provenance: [] }));
+  });
+
+  it('copes with a missing schedule', () => {
+    expect(scheduleContentVersion(null)).toMatch(/^[0-9a-f]{32}$/);
+    expect(scheduleContentVersion(undefined)).toBe(scheduleContentVersion({}));
   });
 });

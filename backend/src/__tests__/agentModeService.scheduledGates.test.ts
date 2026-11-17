@@ -101,6 +101,19 @@ describe('dispatch-time publish gate and Slack directive: marked schedules are w
       await expect(slackState()).resolves.toEqual({ authorized: false, reason: 'visitor_edited' });
     });
 
+    it('both per-turn directive reads are CONSISTENT (a mark a visitor just wrote is seen by the very next turn)', async () => {
+      await slackState();
+      expect(getSchedule).toHaveBeenLastCalledWith(SCHEDULE_ID, { consistent: true });
+      getSchedule.mockClear();
+      await (service as any).resolveScheduledPublishAuthorization(scheduledSession);
+      expect(getSchedule).toHaveBeenCalledWith(SCHEDULE_ID, { consistent: true });
+    });
+
+    it('the publish directive withholds a MARKED schedule, with the visitor reason', async () => {
+      getSchedule.mockResolvedValue({ ...publishing, provenance: ['startingMessage'] } as any);
+      await expect((service as any).resolveScheduledPublishAuthorization(scheduledSession)).resolves.toMatchObject({ authorized: false, reason: 'visitor_edited' });
+    });
+
     it('everything that cannot be read stays withheld (unchanged), and a non-scheduled session is untouched', async () => {
       getSchedule.mockRejectedValue(new Error('blip'));
       await expect(slackState()).resolves.toEqual({ authorized: false });

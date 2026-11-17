@@ -40,7 +40,8 @@ jest.mock('../services/db', () => ({
 import { scheduleDb, userDb, scheduleTemplateDb } from '../services/db';
 import { agentModeController } from '../controllers/agentModeController';
 import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
-import { SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
+import { SCHEDULE_PROVENANCE_FIELDS, scheduleContentVersion } from '../utils/scheduleProvenance';
+import { resolveSchedulePublishAuthorization, describePublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -136,9 +137,22 @@ describe('createScheduledChat', () => {
     expect(created().provenance).toEqual(['startingMessage']);
   });
 
-  it('does not track session_id, self_improve, timing, model, name or description', async () => {
-    await create(visitorByClaim, { startingMessage: 'Hi', selfImprove: true, nextRunTime: '2030-01-01T09:00:00Z', timezone: 'UTC', description: 'd', runCount: 3, scheduleName: 'Renamed' });
+  it('does not track session_id, timing, model, name or description', async () => {
+    await create(visitorByClaim, { startingMessage: 'Hi', nextRunTime: '2030-01-01T09:00:00Z', timezone: 'UTC', description: 'd', runCount: 3, scheduleName: 'Renamed' });
     expect(created().provenance).toEqual(['startingMessage']);
+  });
+
+  it('tracks selfImprove on a create that carries it (the next run\'s owner-powered reflection turn would rewrite the prompt)', async () => {
+    await create(visitorByClaim, { startingMessage: 'Hi', selfImprove: true });
+    expect(created().provenance).toEqual(['startingMessage', 'selfImprove']);
+    mockScheduleDb.createSchedule.mockClear();
+    await create(visitorByClaim, { startingMessage: 'Hi', selfImprove: false });
+    expect(created().provenance).toEqual(['startingMessage', 'selfImprove']);
+  });
+
+  it('an owner create that carries selfImprove marks nothing', async () => {
+    await create(portalOwner, { startingMessage: 'Hi', selfImprove: true });
+    expect(created()).not.toHaveProperty('provenance');
   });
 
   it.each([
@@ -184,9 +198,35 @@ describe('updateScheduledChat: marking', () => {
     ['requiredFunctionCalls', { requiredFunctionCalls: ['save_memory'] }],
     ['functionCallMinCalls', { functionCallMinCalls: { t1: 5 } }],
     ['emailNotifications', { emailNotifications: ['attacker@example.com'] }],
+    ['selfImprove', { selfImprove: true }],
   ])('tracks %s on its own', async (field, body) => {
     await update(visitorByClaim, body);
     expect(updatedWith().provenanceAdd).toEqual([field]);
+  });
+
+  it('selfImprove: a visitor CHANGING it marks it (either way); re-sending the stored value, or an absent one as false, marks nothing', async () => {
+    await update(visitorByClaim, { selfImprove: true });
+    expect(updatedWith().provenanceAdd).toEqual(['selfImprove']);
+
+    mockScheduleDb.updateSchedule.mockClear();
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ selfImprove: true }) as any);
+    await update(visitorByClaim, { selfImprove: false });
+    expect(updatedWith().provenanceAdd).toEqual(['selfImprove']);
+
+    for (const storedValue of [true, false, undefined]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      mockScheduleDb.getScheduleById.mockResolvedValue(stored(storedValue === undefined ? {} : { selfImprove: storedValue }) as any);
+      await update(visitorByClaim, { selfImprove: storedValue === true });
+      expect(updatedWith()).not.toHaveProperty('provenanceAdd');
+    }
+  });
+
+  it('selfImprove: an owner turning it on or off marks nothing', async () => {
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      await update(caller, { selfImprove: true });
+      expect(updatedWith()).not.toHaveProperty('provenanceAdd');
+    }
   });
 
   it('tracks variables and variableValues (values are substituted into the run\'s prompt)', async () => {
@@ -196,7 +236,7 @@ describe('updateScheduledChat: marking', () => {
   });
 
   it('a visitor edit of only the name, timing or model marks nothing and writes no provenance at all', async () => {
-    await update(visitorByClaim, { scheduleName: 'Renamed', nextRunTime: '2030-02-01T09:00:00Z', timezone: 'UTC', selfImprove: true });
+    await update(visitorByClaim, { scheduleName: 'Renamed', nextRunTime: '2030-02-01T09:00:00Z', timezone: 'UTC' });
     const payload = updatedWith();
     expect(payload).not.toHaveProperty('provenanceAdd');
     expect(payload).not.toHaveProperty('provenanceRemove');
@@ -475,62 +515,132 @@ describe('templates: a visitor cannot create, change, delete or submit one (a te
 });
 
 describe('POST /scheduled-chats/:id/adopt-visitor-edits (the ONLY way a mark comes off)', () => {
-  const VERSION = '2026-11-17T08:00:00.000Z';
-  const adopt = async (caller: Caller, body: Record<string, unknown> | undefined = { expectedUpdatedAt: VERSION }, scheduleId = 's1') => {
+  const markedSchedule = (extra: Record<string, unknown> = {}) => stored({ provenance: ['keywords', 'startingMessage'], ...extra });
+  /** The version the portal list showed: computed from the schedule exactly as the list computes it. */
+  const versionOf = (schedule: any) => scheduleContentVersion(schedule);
+  const adopt = async (caller: Caller, body: Record<string, unknown> | undefined, scheduleId = 's1') => {
     const res = makeRes();
     await agentModeController.adoptScheduledChatVisitorEdits(makeReq(caller, { params: { scheduleId }, body }), res);
     return res;
   };
-  const markedSchedule = (extra: Record<string, unknown> = {}) => stored({ provenance: ['keywords', 'startingMessage'], ...extra });
+  const adoptWhatWasShown = (schedule: any, caller: Caller = portalOwner) => adopt(caller, { expectedContentVersion: versionOf(schedule) });
+  const conditionalFailure = () => Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' });
 
-  it('removes the WHOLE attribute from a real portal login that names the version it looked at, in one write bound to that version', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule() as any);
-    const res = await adopt(portalOwner);
+  it('removes the WHOLE attribute from a real portal login that names the content it looked at, bound to the updatedAt it just read', async () => {
+    const schedule = markedSchedule();
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+    const res = await adoptWhatWasShown(schedule);
 
     expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('s1', { consistent: true });
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
     const [id, payload, expectation, shed, removals] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
     expect(id).toBe('s1');
     expect(Object.keys(payload)).toEqual(['updatedAt']);
-    expect(expectation).toEqual({ updatedAt: VERSION });
+    expect(expectation).toEqual({ updatedAt: schedule.updatedAt });
     expect(shed).toBeUndefined();
     expect(removals).toEqual(['provenance']);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ adopted: true, provenance: [] }));
   });
 
   it('adopts a provenance value that is not a well-formed set, because the whole attribute is removed', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule({ provenance: 17 }) as any);
-    const res = await adopt(portalOwner);
+    const schedule = markedSchedule({ provenance: 17 });
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+    const res = await adoptWhatWasShown(schedule);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ adopted: true }));
     expect((mockScheduleDb.updateSchedule.mock.calls[0] as any[])[4]).toEqual(['provenance']);
   });
 
-  it('answers 409 when the body names a STALE version (a visitor edited after the owner opened it), and writes nothing', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule({ updatedAt: '2026-11-17T09:30:00.000Z' }) as any);
-    const res = await adopt(portalOwner, { expectedUpdatedAt: VERSION });
-    expect(res.status).toHaveBeenCalledWith(409);
-    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('Reopen it') });
-    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
-  });
+  describe('the owner adopts the CONTENT they saw', () => {
+    it('answers 409 when the content changed since the list (a visitor edited it), and writes nothing', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule({ keywords: ['a', 'b', 'planted'] }) as any);
+      const res = await adopt(portalOwner, { expectedContentVersion: versionOf(shown) });
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('Reopen it') });
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
 
-  it('answers 409 when the schedule moves between the read and the write (the write is conditioned on that version too)', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule() as any);
-    mockScheduleDb.updateSchedule.mockRejectedValue(Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' }));
-    const res = await adopt(portalOwner);
-    expect(res.status).toHaveBeenCalledWith(409);
+    it('answers 409 when only the MARKS changed (a visitor marked another field since the list)', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule({ provenance: ['keywords', 'startingMessage', 'selfImprove'] }) as any);
+      expect((await adopt(portalOwner, { expectedContentVersion: versionOf(shown) })).status).toHaveBeenCalledWith(409);
+    });
+
+    it('still adopts when updatedAt (and other bookkeeping) moved since the list: a run, the cron, a toggle, identical variables', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...shown, updatedAt: '2026-11-17T23:59:59.000Z', lastRunTime: 'later', runCount: 9, runResults: [{ runId: 'r1' }], status: 'paused', claimedAt: 'x',
+        variableValuesUpdatedAt: 'later', scheduleName: 'Renamed',
+      } as any);
+      const res = await adoptWhatWasShown(shown);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ adopted: true }));
+      // ...and the write is bound to the updatedAt it JUST read, not the one the list showed.
+      expect((mockScheduleDb.updateSchedule.mock.calls[0] as any[])[2]).toEqual({ updatedAt: '2026-11-17T23:59:59.000Z' });
+    });
+
+    it('bookkeeping landing BETWEEN the read and the write retries with the fresh updatedAt, and adopts', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById
+        .mockResolvedValueOnce(shown as any)
+        .mockResolvedValueOnce({ ...shown, updatedAt: '2026-11-17T09:00:00.000Z', runCount: 4 } as any);
+      mockScheduleDb.updateSchedule.mockRejectedValueOnce(conditionalFailure()).mockResolvedValue(undefined as any);
+
+      const res = await adoptWhatWasShown(shown);
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+      expect((mockScheduleDb.updateSchedule.mock.calls[0] as any[])[2]).toEqual({ updatedAt: shown.updatedAt });
+      expect((mockScheduleDb.updateSchedule.mock.calls[1] as any[])[2]).toEqual({ updatedAt: '2026-11-17T09:00:00.000Z' });
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ adopted: true }));
+    });
+
+    it('a REAL visitor edit landing between the read and the write is NOT adopted: the retry sees the content changed and answers 409', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById
+        .mockResolvedValueOnce(shown as any)
+        .mockResolvedValueOnce(markedSchedule({ startingMessage: 'visitor rewrote it', updatedAt: '2026-11-17T09:00:00.000Z' }) as any);
+      mockScheduleDb.updateSchedule.mockRejectedValueOnce(conditionalFailure());
+
+      const res = await adoptWhatWasShown(shown);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1); // no second REMOVE
+    });
+
+    it('gives up after three attempts when the write keeps losing the race, answering 409', async () => {
+      const shown = markedSchedule();
+      mockScheduleDb.getScheduleById.mockImplementation((async () => ({ ...shown, updatedAt: String(Math.random()) })) as any);
+      mockScheduleDb.updateSchedule.mockRejectedValue(conditionalFailure());
+      const res = await adoptWhatWasShown(shown);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(3);
+    });
+
+    it('is not tied to the content version of a stale list that happens to match nothing: a made-up version is 409', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule() as any);
+      const res = await adopt(portalOwner, { expectedContentVersion: 'a'.repeat(32) });
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
+    it('ignores a client that still sends expectedUpdatedAt (it was never part of the API)', async () => {
+      const schedule = markedSchedule();
+      mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+      const res = await adopt(portalOwner, { expectedUpdatedAt: schedule.updatedAt });
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
   });
 
   it.each([
     ['absent', {}],
-    ['empty', { expectedUpdatedAt: '' }],
-    ['a number', { expectedUpdatedAt: 1731830400000 }],
-    ['null', { expectedUpdatedAt: null }],
-    ['an object', { expectedUpdatedAt: { v: VERSION } }],
-  ])('answers 400 when expectedUpdatedAt is %s, reading and writing nothing', async (_name, body) => {
+    ['empty', { expectedContentVersion: '' }],
+    ['a number', { expectedContentVersion: 12345 }],
+    ['null', { expectedContentVersion: null }],
+    ['an object', { expectedContentVersion: { v: 'x' } }],
+  ])('answers 400 when expectedContentVersion is %s, reading and writing nothing', async (_name, body) => {
     mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule() as any);
     const res = await adopt(portalOwner, body as any);
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('expectedUpdatedAt is required') });
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('expectedContentVersion is required') });
     expect(mockScheduleDb.getScheduleById).not.toHaveBeenCalled();
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
@@ -542,8 +652,9 @@ describe('POST /scheduled-chats/:id/adopt-visitor-edits (the ONLY way a mark com
     ['a visitor by session marker only', visitorByMarkerOnly],
     ['a delegated admin', delegate],
   ])('refuses %s with 403, reads nothing and writes nothing', async (_name, caller) => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule() as any);
-    const res = await adopt(caller);
+    const schedule = markedSchedule();
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+    const res = await adoptWhatWasShown(schedule, caller);
     expect(res.status).toHaveBeenCalledWith(403);
     expect(mockScheduleDb.getScheduleById).not.toHaveBeenCalled();
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
@@ -551,17 +662,127 @@ describe('POST /scheduled-chats/:id/adopt-visitor-edits (the ONLY way a mark com
 
   it('is 404 for a missing schedule and for someone else\'s', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(undefined as any);
-    expect((await adopt(portalOwner)).status).toHaveBeenCalledWith(404);
+    expect((await adopt(portalOwner, { expectedContentVersion: 'x' })).status).toHaveBeenCalledWith(404);
     mockScheduleDb.getScheduleById.mockResolvedValue(markedSchedule({ userId: 'someone-else' }) as any);
-    expect((await adopt(portalOwner)).status).toHaveBeenCalledWith(404);
+    expect((await adopt(portalOwner, { expectedContentVersion: 'x' })).status).toHaveBeenCalledWith(404);
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
 
   it('an unmarked schedule has nothing to adopt and is not written', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
-    const res = await adopt(portalOwner);
+    const schedule = stored();
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+    const res = await adoptWhatWasShown(schedule);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ adopted: false, provenance: [] }));
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+});
+
+describe('contentVersion: computed on the list, never stored', () => {
+  const list = async () => {
+    const res = makeRes();
+    await agentModeController.getScheduledChats(makeReq(portalOwner, { body: {} }) as any, res);
+    return res.json.mock.calls[0][0] as any[];
+  };
+  const row = () => ({ ...stored({ provenance: ['keywords'] }), type: 'scheduled_chat', createdAt: '2026-11-17T00:00:00.000Z', runResults: [{ runId: 'r' }] });
+
+  it('every row carries the digest of its own tracked content and marks (what the portal sends back to adopt)', async () => {
+    const a = row();
+    const b = { ...stored({ scheduleId: 's2', keywords: ['other'] }), type: 'scheduled_chat', createdAt: '2026-11-16T00:00:00.000Z' };
+    mockScheduleDb.getSchedulesByUserId.mockResolvedValue([a, b] as any);
+    const items = await list();
+    expect(items.find((i) => i.scheduleId === 's1')!.contentVersion).toBe(scheduleContentVersion(a));
+    expect(items.find((i) => i.scheduleId === 's2')!.contentVersion).toBe(scheduleContentVersion(b));
+    expect(items[0].contentVersion).not.toBe(items[1].contentVersion);
+  });
+
+  it('is never written back: the stored row is untouched, and no write handler ever puts it on an item (even if the portal posts it back)', async () => {
+    const a = row();
+    mockScheduleDb.getSchedulesByUserId.mockResolvedValue([a] as any);
+    await list();
+    expect(a).not.toHaveProperty('contentVersion');
+
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    await update(portalOwner, { ...wholeForm(), contentVersion: 'abc', expectedContentVersion: 'abc' });
+    await update(visitorByClaim, { keywords: ['z'], contentVersion: 'abc' });
+    await create(portalOwner, { startingMessage: 'Hi', contentVersion: 'abc' });
+    await create(visitorByClaim, { startingMessage: 'Hi', contentVersion: 'abc' });
+    for (const call of mockScheduleDb.updateSchedule.mock.calls) expect(JSON.stringify(call)).not.toContain('contentVersion');
+    for (const call of mockScheduleDb.createSchedule.mock.calls) expect(JSON.stringify(call)).not.toContain('contentVersion');
+  });
+
+  it('moves when a visitor changes content, and not when only bookkeeping moves', async () => {
+    const before = row();
+    expect(scheduleContentVersion({ ...before, updatedAt: 'later', runResults: [], runCount: 5, status: 'paused' })).toBe(scheduleContentVersion(before));
+    expect(scheduleContentVersion({ ...before, keywords: ['x'] })).not.toBe(scheduleContentVersion(before));
+  });
+});
+
+// ENG-2816 (step 3): a schedule a visitor CREATES holds at the publish step until the owner decides otherwise, so that ADOPTING it
+// does not also switch on unattended publishing the owner never decided. (The resolver's legacy branch reads a schedule that was
+// never asked as AUTHORIZED for the publish tools it requires; a visitor writes the tools it requires.)
+describe('a visitor-created schedule stays on "Require approval before publishing" (M1)', () => {
+  const publishing = { startingMessage: 'Post this', requiredFunctionCalls: ['post_on_connected_account'] };
+
+  it('createScheduledChat by a visitor stores requirePublishApproval: true; by anyone else, exactly what it always stored', async () => {
+    for (const caller of [visitorByClaim, markedRunByClaim, visitorByMarkerOnly]) {
+      mockScheduleDb.createSchedule.mockClear();
+      await create(caller, publishing);
+      expect(created().requirePublishApproval).toBe(true);
+    }
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.createSchedule.mockClear();
+      await create(caller, publishing);
+      expect(created().requirePublishApproval).toBe(false);
+    }
+  });
+
+  it('an owner create that explicitly asks for the hold still gets it (unchanged)', async () => {
+    await create(portalOwner, { ...publishing, requirePublishApproval: true });
+    expect(created().requirePublishApproval).toBe(true);
+  });
+
+  it('createScheduleFromTemplate by a visitor stores it; by anyone else the field is simply not there (unchanged)', async () => {
+    mockTemplateDb.getTemplateById.mockResolvedValue({
+      templateId: 't1', createdBy: USER, visibility: 'private', name: 'T', startingMessage: 'm', variables: [], keywords: [], requiredFunctionCalls: ['post_on_connected_account'],
+      functionCallMinCalls: {}, suggestedFrequency: 'daily', emailNotifications: [OWNER_EMAIL], llmModel: '',
+    } as any);
+    const use = (caller: Caller) => agentModeController.createScheduleFromTemplate(makeReq(caller, { body: {}, params: { templateId: 't1' } }) as any, makeRes());
+    await use(visitorByClaim);
+    expect(created().requirePublishApproval).toBe(true);
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.createSchedule.mockClear();
+      await use(caller);
+      expect(created()).not.toHaveProperty('requirePublishApproval');
+    }
+  });
+
+  it('a visitor EDIT of an existing schedule does not touch requirePublishApproval (owner schedules are unaffected)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ requirePublishApproval: false }) as any);
+    await update(visitorByClaim, { startingMessage: 'new', requiredFunctionCalls: ['post_on_connected_account'] });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+  });
+
+  it('ADOPT THEN RESOLVE: the adopted visitor-created schedule still drafts instead of publishing, until the owner grants consent', async () => {
+    await create(visitorByClaim, publishing);
+    const createdItem = { ...created(), userId: USER };
+    // As written: marked, so unauthorized.
+    expect(resolveSchedulePublishAuthorization(createdItem).authorized).toBe(false);
+    expect(describePublishAuthorizationWithholdReason(createdItem)).toBe('visitor_edited');
+
+    // The owner clicks Adopt: the whole provenance attribute comes off (what the route's REMOVE does).
+    const { provenance: _removed, ...adopted } = createdItem;
+    expect(resolveSchedulePublishAuthorization(adopted)).toEqual({ authorized: false, tools: [] });
+    expect(describePublishAuthorizationWithholdReason(adopted)).toBe('require_publish_approval');
+
+    // Only the owner's own decision turns publishing on: turning the hold OFF is what makes the legacy default apply, and
+    // an explicit grant is the other way. Adopt alone is neither.
+    expect(resolveSchedulePublishAuthorization({ ...adopted, requirePublishApproval: false }).authorized).toBe(true);
+  });
+
+  it('CONTROL: without the hold, an adopted visitor-written publish tool WOULD resolve as authorized (the thing this prevents)', async () => {
+    const { requirePublishApproval: _hold, ...withoutHold } = { ...(await (async () => { await create(visitorByClaim, publishing); return created(); })()), userId: USER };
+    const { provenance: _removed, ...adopted } = withoutHold;
+    expect(resolveSchedulePublishAuthorization(adopted)).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
   });
 });
 

@@ -207,6 +207,8 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   describe('what "could not be verified" means depends on who is calling (attendance)', () => {
     const unattended = { isUnattendedRun: true };
     const attended = { isUnattendedRun: false };
+    const refusedAsVisitorSchedule = (tool: string, ctx?: Record<string, unknown>) =>
+      expect(run(tool, ctx)).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('set up or edited through a share link') });
     const refused = (tool: string, ctx?: Record<string, unknown>) =>
       expect(run(tool, ctx)).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('could not be verified') });
     const keepsTools = async (ctx?: Record<string, unknown>) => {
@@ -272,12 +274,27 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     describe('the schedule READ fails while the session is known to be scheduled', () => {
       beforeEach(() => getSchedule.mockRejectedValue(new Error('DynamoDB blip')));
-      it('refuses EVERYONE (rare, and an unknown schedule must not run as the owner)', async () => {
+      it('refuses EVERYONE, after one retry (rare, and an unknown schedule must not run as the owner)', async () => {
         await refused('save_memory', unattended);
+        expect(getSchedule).toHaveBeenCalledTimes(2);
         await refused('save_memory', attended);
         await refused('save_memory', undefined);
         await refused('manage_scheduled_chat', unattended);
         expect(dispatch).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('only the FIRST schedule read fails (a single throttle)', () => {
+      it('is absorbed by the retry: an unmarked schedule keeps its tools, a marked one is still restricted', async () => {
+        getSchedule.mockReset();
+        getSchedule.mockRejectedValueOnce(new Error('throttled')).mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id' } as any);
+        await expect(run('save_memory', attended)).resolves.toEqual({ ran: true });
+        expect(getSchedule).toHaveBeenCalledTimes(2);
+        expect(getSchedule).toHaveBeenNthCalledWith(2, SCHEDULE_ID, { consistent: true });
+
+        getSchedule.mockReset();
+        getSchedule.mockRejectedValueOnce(new Error('throttled')).mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance: ['keywords'] } as any);
+        await refusedAsVisitorSchedule('save_memory', attended);
       });
     });
   });

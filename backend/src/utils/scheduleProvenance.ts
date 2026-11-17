@@ -12,15 +12,18 @@
  * everything here fails toward "marked". Marks are only ever ADDED, by a visitor's write, in the same write as the content; the
  * only thing that removes them is the owner adopting the schedule (the whole attribute, on purpose, from the portal).
  *
- * This module imports nothing, so the pure publish-authorization resolver and the database layer can both use it without an
- * import cycle.
+ * This module imports only Node's `crypto`, so the pure publish-authorization resolver and the database layer can both use it
+ * without an import cycle.
  */
+
+import { createHash } from 'crypto';
 
 /**
  * The content fields a visitor can change that steer a later run: the prompt, the words and tool names the retry message pastes
  * in, the variable definitions and values substituted into the prompt, and the recipients (a visitor-chosen recipient also
- * receives the emailed variables link). Not tracked, on purpose: `session_id` (create-only), `self_improve`, timing, `llmModel`,
- * name and description.
+ * receives the emailed variables link), and `selfImprove` (switching it on makes the NEXT run's owner-powered reflection turn rewrite
+ * the clean prompt from content the visitor planted in the run). Not tracked, on purpose: `session_id` (create-only), timing,
+ * `llmModel`, name and description.
  */
 export const SCHEDULE_PROVENANCE_FIELDS = [
   'startingMessage',
@@ -30,6 +33,7 @@ export const SCHEDULE_PROVENANCE_FIELDS = [
   'variables',
   'variableValues',
   'emailNotifications',
+  'selfImprove',
 ] as const;
 
 export type ScheduleProvenanceField = (typeof SCHEDULE_PROVENANCE_FIELDS)[number];
@@ -140,4 +144,50 @@ export function planProvenanceChange(input: { visitorWrite: boolean; fields: str
 /** The marks a schedule will carry once `plan` has been applied to `stored` (for a run that starts from the pre-write snapshot). */
 export function applyProvenancePlan(stored: string[], plan: ProvenancePlan): string[] {
   return [...new Set([...stored, ...(plan.provenanceAdd ?? [])])].sort();
+}
+
+const EMPTY_CONTENT: Record<ScheduleProvenanceField, unknown> = {
+  startingMessage: '',
+  keywords: [],
+  requiredFunctionCalls: [],
+  functionCallMinCalls: {},
+  variables: [],
+  variableValues: {},
+  emailNotifications: [],
+  selfImprove: false,
+};
+
+/** `value` with every object's keys in sorted order (arrays keep their order: the order of a list IS content), for hashing. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(source).sort().map((key) => [key, canonical(source[key])]));
+  }
+  // JSON has no `undefined`: an absent field and a null one are the same content.
+  return value === undefined ? null : value;
+}
+
+/**
+ * A stable digest of everything the owner would be adopting: the eight tracked content fields as stored, plus the sorted provenance.
+ * It is COMPUTED on read (the schedule list hands it to the portal as `contentVersion`) and never stored.
+ *
+ * It is what the adopt route compares, instead of `updatedAt`, because `updatedAt` moves for reasons that are not content: every
+ * run's bookkeeping, the cron's claim and pause writes, and a visitor re-submitting identical values or toggling an already-active
+ * schedule. A visitor could keep `updatedAt` moving to make adopting impossible; it cannot change this digest without really
+ * changing content, which is exactly the case where the owner must look again.
+ *
+ * Stable across object key order and provenance order (a set); sensitive to list order and to every tracked value. sha256, the
+ * first 32 hex characters.
+ */
+export function scheduleContentVersion(schedule: Record<string, unknown> | null | undefined): string {
+  const content: Record<string, unknown> = {};
+  // An ABSENT field reads as its empty value, so the write handlers' habit of storing "[]" where nothing was stored (a no-op write)
+  // does not change the digest.
+  for (const field of SCHEDULE_PROVENANCE_FIELDS) {
+    const value = schedule?.[field];
+    content[field] = value === undefined || value === null ? EMPTY_CONTENT[field] : field === 'selfImprove' ? value === true : value;
+  }
+  const canonicalJson = JSON.stringify(canonical({ content, provenance: readScheduleProvenance(schedule?.provenance) }));
+  return createHash('sha256').update(canonicalJson).digest('hex').slice(0, 32);
 }
