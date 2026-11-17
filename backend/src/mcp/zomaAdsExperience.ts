@@ -62,7 +62,7 @@ export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
   'Meta: create a Business portfolio at https://business.facebook.com/overview (use the Facebook login you want to manage ads with).',
   'Meta: create a Facebook Page for your business at https://www.facebook.com/pages/create — Meta ads run from a Page.',
   'Meta: in Business settings → Accounts → Ad accounts, create an ad account and set its currency and time zone (https://business.facebook.com/settings/ad-accounts).',
-  ...ZOMA_GOOGLE_NEW_ACCOUNT_STEPS.slice(0, 1).map((s) => `Google (optional): ${s}`),
+  ...ZOMA_GOOGLE_NEW_ACCOUNT_STEPS.map((s, i) => (i === 0 ? `Google (optional): ${s}` : s)),
   'Then connect those ad accounts to Zoma.',
 ];
 
