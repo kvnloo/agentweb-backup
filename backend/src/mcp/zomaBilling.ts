@@ -140,9 +140,12 @@ export interface ZomaPlanState {
   periodStart?: string;
   periodEnd?: string;
   cancelAtPeriodEnd?: boolean;
+  /** A trialing subscription can exist before its upfront invoice has settled. */
+  latestInvoicePaid?: boolean;
 }
 
-export const planAllowsPublish = (state: ZomaPlanState) => state.status === 'trialing' || state.status === 'active';
+export const planAllowsPublish = (state: ZomaPlanState) =>
+  (state.status === 'trialing' || state.status === 'active') && state.latestInvoicePaid === true;
 
 const isoFromEpoch = (s: unknown) => (typeof s === 'number' && s > 0 ? new Date(s * 1000).toISOString() : undefined);
 
@@ -161,6 +164,7 @@ export function planStateFromSubscriptions(customerId: string | null, subs: Stri
     periodStart: isoFromEpoch(item?.current_period_start ?? (sub as any).current_period_start),
     periodEnd: isoFromEpoch(item?.current_period_end ?? (sub as any).current_period_end),
     cancelAtPeriodEnd: sub.cancel_at_period_end === true,
+    latestInvoicePaid: typeof sub.latest_invoice === 'object' && sub.latest_invoice !== null && sub.latest_invoice.status === 'paid',
   };
 }
 
@@ -229,7 +233,7 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
     return customer.id;
   },
   async listSubscriptions(customerId) {
-    return (await stripe().subscriptions.list({ customer: customerId, status: 'all', limit: 20 })).data;
+    return (await stripe().subscriptions.list({ customer: customerId, status: 'all', limit: 20, expand: ['data.latest_invoice'] })).data;
   },
   async createCheckoutSession(params) {
     const session = await stripe().checkout.sessions.create(params);
@@ -368,6 +372,9 @@ export async function assertZomaPublishAllowed(
     throw new ZomaPaywallError('Could not check the Zoma plan right now, so nothing went live. Try again shortly.');
   }
   if (planAllowsPublish(state)) return;
+  if (state.status === 'trialing' || state.status === 'active') {
+    throw new ZomaPaywallError('Your Zoma payment is not confirmed yet, so nothing went live. Finish payment in your existing Stripe checkout or billing portal, then try again. Do not start a second plan.');
+  }
   let link: string | undefined;
   try {
     link = await createZomaTrialCheckoutLink(userId, deps);
@@ -411,7 +418,9 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
-    if (!summary.publish_enabled) {
+    if (!summary.publish_enabled && (state.status === 'trialing' || state.status === 'active')) {
+      summary.error = 'Payment is not confirmed yet. Finish payment in your existing Stripe checkout or billing portal, then try again; do not start a second plan.';
+    } else if (!summary.publish_enabled) {
       summary.link = await createZomaTrialCheckoutLink(userId, deps);
       void deps.recordFunnel({ userId, step: 'paywall_shown', dimensions: { surface: 'zoma_status', planStatus: state.status } })
         .catch((e) => console.error('[zoma-billing] funnel record failed:', e));

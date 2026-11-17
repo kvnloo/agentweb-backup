@@ -50,6 +50,7 @@ function sub(over: Partial<Stripe.Subscription> & Record<string, any> = {}): Str
   return {
     id: 'sub_1', status: 'trialing', created: sec('2026-11-10T00:00:00Z'),
     trial_start: sec('2026-11-10T00:00:00Z'), trial_end: sec('2026-11-17T00:00:00Z'),
+    latest_invoice: { id: 'in_fee', status: 'paid' },
     cancel_at_period_end: false, metadata: { product: 'zoma_plan', userId: 'u1' },
     items: { data: [{ current_period_start: sec('2026-11-10T00:00:00Z'), current_period_end: sec('2026-11-17T00:00:00Z') }] },
     ...over,
@@ -248,6 +249,21 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
   it('ignores subscriptions that are not the Zoma plan (e.g. the Emma plan)', async () => {
     const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: 'active', metadata: {} })]) });
     await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toBeInstanceOf(ZomaPaywallError);
+  });
+
+  it.each(['trialing', 'active'])('an unsettled %s invoice blocks publish without creating a second subscription checkout', async (status) => {
+    const d = billingDeps({
+      findCustomerId: jest.fn().mockResolvedValue('cus_1'),
+      listSubscriptions: jest.fn().mockResolvedValue([sub({ status: status as any, latest_invoice: { id: 'in_fee', status: 'open' } })]),
+    });
+    await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toThrow(/payment.*not.*confirmed/i);
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
+    const { getZomaPlanSummary, formatZomaPlanLine } = await import('../mcp/zomaBilling');
+    const summary = await getZomaPlanSummary('u1', d);
+    expect(summary).toMatchObject({ status, publish_enabled: false });
+    expect(summary?.link).toBeUndefined();
+    expect(formatZomaPlanLine(summary!, d.config())).not.toContain('[x]');
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
   });
 
   it('fails closed when Stripe cannot be read', async () => {
