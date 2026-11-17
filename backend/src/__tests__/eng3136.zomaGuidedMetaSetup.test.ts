@@ -136,6 +136,8 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     const page = await request(app).get('/api/zoma/meta/callback').query({ code: 'c', state }).expect(400);
     expect(page.text).toContain('No ad account found');
     expect(page.text).toContain('does not need to use the same email as your Zoma login');
+    expect(page.text).toContain('reconnect with a Facebook login that has access to it and select it');
+    expect(page.text).not.toContain('belongs to its Business portfolio');
     expect(page.text).toContain('any other Facebook login shows Zoma no ad accounts');
     // Provider routes are clickable, not plain text, and open safely in a new tab.
     expect(page.text).toContain('<a href="https://business.facebook.com/settings/ad-accounts" target="_blank" rel="noopener noreferrer">https://business.facebook.com/settings/ad-accounts</a>');

@@ -614,7 +614,7 @@ function noAdAccountPage(reason: 'no_ad_accounts' | 'ad_accounts_unavailable', r
     kind: 'page',
     status: 400,
     title: 'No ad account found',
-    message: `Meta did not share any ad accounts. If you already have one, reconnect with the Facebook login that owns it (or belongs to its Business portfolio) and select it. If you have never run ads, set one up first (a few minutes), then reconnect. ${ZOMA_META_LOGIN_NOTE}`,
+    message: `Meta did not share any ad accounts. If you already have one, reconnect with a Facebook login that has access to it and select it. If you have never run ads, set one up first (a few minutes), then reconnect. ${ZOMA_META_LOGIN_NOTE}`,
     steps: ZOMA_NEW_TO_ADS_STEPS.slice(0, -1),
     retryUrl,
     retryLabel: 'Reconnect Meta',
