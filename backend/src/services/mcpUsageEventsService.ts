@@ -201,7 +201,8 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
   }
 
   async get(loopId: string, tsSession: string): Promise<DynamoAttributeMap | undefined> {
-    const result = await this.doc.get({ TableName: LOOP_EVENTS_TABLE, Key: { loopId, tsSession } }).promise();
+    // Consistent: an opt-out or a week claim written a moment ago must be visible, or a user who just unsubscribed could still be mailed.
+    const result = await this.doc.get({ TableName: LOOP_EVENTS_TABLE, Key: { loopId, tsSession }, ConsistentRead: true }).promise();
     return result.Item as DynamoAttributeMap | undefined;
   }
 
