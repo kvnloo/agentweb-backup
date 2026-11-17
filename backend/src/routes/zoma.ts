@@ -10,9 +10,13 @@
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
  *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup or an MCP user's zoma_status link (forwarded by /api/oauth/meta/callback)
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
+ *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
+ *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
+ *   GET  /api/zoma/billing/checkout/:id  ENG-3131 pay link: records checkout_started, then -> Stripe Checkout
+ *   GET  /api/zoma/billing/done       Stripe Checkout return for the $1 trial -> plain result page
  *
  * None of these read the browser's AgentWeb session: the setup's user always comes from the
  * device item (bound at approval), named by a signed state/link.
@@ -35,7 +39,9 @@ import {
   type BrowserStep,
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
+import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
+import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
 export const ZOMA_POLL_MAX_PER_MINUTE = 60;
@@ -54,6 +60,18 @@ function throttle(bucket: string, maxPerMinute: number) {
 
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
+
+// Step text carries provider URLs the user must open; plain text is not clickable, so https URLs become links.
+export function linkifyHttps(text: string): string {
+  return text
+    .split(/(https:\/\/[^\s<>"']+)/)
+    .map((part, i) => {
+      if (i % 2 === 0) return escapeHtml(part);
+      const url = part.replace(/[.,;:!?)\]]+$/, '');
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${escapeHtml(part.slice(url.length))}`;
+    })
+    .join('');
+}
 
 // Browsers enforce form-action on the redirect chain a form submit starts, and the picker's
 // submit continues on to Stripe Checkout (or back to Meta), so that page allows those hops.
@@ -124,7 +142,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
     );
   }
   const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">${escapeHtml(step.retryLabel ?? 'Try again')}</a></p>` : '';
-  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>` : '';
+  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${linkifyHttps(s)}</li>`).join('')}</ol>` : '';
   return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${steps}${retry}`);
 }
 
@@ -133,7 +151,11 @@ function failPage(res: Response, step: string, error: unknown) {
   return page(res, 500, 'Zoma setup', '<p>Something went wrong. Try again in a moment, or ask your agent to start Zoma setup again.</p>');
 }
 
-export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps): Router {
+export function createZomaRouter(
+  deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
+  googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps,
+  billingDeps?: Parameters<typeof openZomaCheckout>[1],
+): Router {
   const router = Router();
 
   router.post('/setup', throttle('setup', ZOMA_SETUP_MAX_PER_MINUTE), async (req: Request, res: Response) => {
@@ -197,6 +219,23 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
     }
   });
 
+  router.get('/google/callback', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const q = req.query;
+      return renderStep(res, await completeGoogleConnect({ code: q.code, state: q.state, error: q.error }, googleDeps));
+    } catch (error) {
+      return failPage(res, 'google_callback', error);
+    }
+  });
+
+  router.post('/google/select', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await selectGoogleAccounts({ t: req.body?.t, account_id: req.body?.account_id }, googleDeps), req);
+    } catch (error) {
+      return failPage(res, 'google_connect', error);
+    }
+  });
+
   router.post('/ads-experience', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       return renderStep(res, await answerAdsExperience({ t: req.body?.t, answer: req.body?.answer }, deps), req);
@@ -220,6 +259,28 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
     } catch (error) {
       return failPage(res, 'checkout_completed', error);
     }
+  });
+
+  router.get('/billing/checkout/:id', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const opened = await openZomaCheckout(String(req.params.id ?? ''), billingDeps);
+      if (opened.kind === 'redirect') return res.redirect(302, opened.url);
+      if (opened.kind === 'gone') {
+        return page(res, 410, 'Zoma plan', '<p>This payment link has expired or was already used. Ask your agent for a new one.</p>');
+      }
+      return page(res, 404, 'Zoma plan', '<p>This payment link is not valid. Ask your agent for a new one.</p>');
+    } catch (error) {
+      return failPage(res, 'billing_checkout', error);
+    }
+  });
+
+  router.get('/billing/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    if (req.query.result === 'paid') {
+      return page(res, 200, "You're on the Zoma plan", '<p>Your trial has started: $1 was charged today. After 7 days your card is charged $50/month automatically unless you cancel before then. Go back to your agent and ask it to try the launch again.</p>');
+    }
+    // Funnel only (ENG-3131 R5): a failed write must never change what the user sees.
+    await recordZomaCheckoutCanceled(req.query, billingDeps).catch((e) => console.error('[zoma-billing] cancel record failed:', e));
+    return page(res, 200, 'Zoma plan', '<p>Checkout was canceled and nothing was charged. Reads and drafts still work. Ask your agent for the link again whenever you want to go live.</p>');
   });
 
   router.post('/token/revoke', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
