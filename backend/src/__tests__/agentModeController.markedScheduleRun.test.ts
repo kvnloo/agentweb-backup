@@ -171,6 +171,21 @@ describe('a MARKED schedule\'s run (ENG-2816 step 3)', () => {
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('records what it was NOT held to, so a "passed" run says what it skipped (informational only)', async () => {
+    mockWorker.runInWorker.mockResolvedValue(partial as any);
+    const result = await runScheduledChat(markedSchedule(), USER, true);
+    expect(result.passed).toBe(true);
+    expect(result.skippedRequiredCalls).toEqual(['save_memory', 'luma_get_guests']);
+  });
+
+  it('an unmarked run (and a marked one that drops nothing) carries no such field', async () => {
+    mockWorker.runInWorker.mockResolvedValue({ ...partial, toolCalls: [{ name: 'get_marketing_tips', arguments: {} }, { name: 'save_memory', arguments: {} }, { name: 'luma_get_guests', arguments: {} }] } as any);
+    const unmarked = await runScheduledChat(schedule({ functionCallMinCalls: {} }), USER, true);
+    expect(unmarked).not.toHaveProperty('skippedRequiredCalls');
+    const markedNothingDropped = await runScheduledChat(schedule({ provenance: ['keywords'], requiredFunctionCalls: ['get_marketing_tips'] }), USER, true);
+    expect(markedNothingDropped).not.toHaveProperty('skippedRequiredCalls');
+  });
+
   it('control: the SAME schedule without provenance is still held to every tool it stores', async () => {
     mockWorker.runInWorker.mockResolvedValue(partial as any);
 

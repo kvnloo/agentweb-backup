@@ -6771,13 +6771,15 @@ function provenancePlanForWrite(req: Request, fields: string[]) {
  * owner pays for up to twenty refused attempts. So for a marked schedule the refused names are dropped from `requiredFunctionCalls`
  * and `functionCallMinCalls`; an unmarked schedule (every schedule that predates this) gets back exactly what it stores.
  */
-function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number> } {
+function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
   const functionCalls: string[] = schedule?.requiredFunctionCalls || [];
   const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
-  if (!isScheduleMarked(schedule)) return { functionCalls, minCalls };
+  if (!isScheduleMarked(schedule)) return { functionCalls, minCalls, skipped: [] };
   // ADMIN_SKILL_TOOL_NAMES can be absent where a test replaces the whole service module; production always has it.
   const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? []) !== null;
-  return { functionCalls: withoutRefusedNames(functionCalls, isRefused), minCalls: minCallsWithoutRefused(minCalls, isRefused) };
+  const kept = withoutRefusedNames(functionCalls, isRefused);
+  // `skipped` is what the run was NOT held to, in the schedule's own order, so a "passed" run can say what it skipped.
+  return { functionCalls: kept, minCalls: minCallsWithoutRefused(minCalls, isRefused), skipped: functionCalls.filter((name) => !kept.includes(name)) };
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
@@ -6853,6 +6855,9 @@ export async function runScheduledChat(
   sendPressExhausted?: boolean;
   // ENG-1552: present only when the recipient preflight skipped generation.
   remediation?: RecipientRemediation;
+  // ENG-2816 (step 3): present only on a run of a MARKED schedule that dropped tool names from what it was required to call (they are
+  // refused to a schedule a share-link visitor wrote into). Informational: a run that "passed" says here what it was not held to.
+  skippedRequiredCalls?: string[];
 }> {
   if (isEvaluationUser(userId) || isEvaluationUser(schedule?.userId)) {
     await (await import('../services/evaluationStore')).evaluationStore.discardJob(isEvaluationUser(schedule?.userId) ? schedule.userId : userId, schedule?.scheduleId);
@@ -8447,6 +8452,8 @@ export async function runScheduledChat(
       // was left unwritten — marked so the waived minimum is still observable in
       // runResults rather than looking like every requirement was met.
       ...(result.readOnlyRequirementWaived ? { readOnlyRequirementWaived: true } : {}),
+      // ENG-2816 (step 3): see skippedRequiredCalls on this function's return type.
+      ...(runRequired.skipped.length > 0 ? { skippedRequiredCalls: runRequired.skipped } : {}),
       // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
       // people-search still delivers a report when that endpoint is down for the
       // account, so it lands here as a plain `success` and the owner's schedule
