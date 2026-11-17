@@ -40,17 +40,14 @@ jest.mock('../services/usageRecorderService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
-  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
 }));
 
 import { AgentModeService } from '../services/agentModeService';
 import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
-import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { chatbotDb } from '../services/chatbotService';
 
 const mockRecordUsage = recordUsage as jest.Mock;
 const mockMeterUser = meterUserUsage as jest.Mock;
-const mockIncrement = incrementUserTokenUsage as jest.Mock;
 
 // A fake OpenAI-compatible client whose chat.completions.create returns a
 // response carrying Anthropic-style cache token counters.
@@ -145,7 +142,6 @@ describe('makeToolUsageCallback no longer double-charges (ENG-200)', () => {
     const cb = (svc as any).makeToolUsageCallback('sess-1', 'createHTMLFile');
     cb({ model: MODEL, inputTokens: 100, outputTokens: 20, totalTokens: 120 });
 
-    expect(mockIncrement).not.toHaveBeenCalled();
     expect(chatbotDb.addToolCostToSession).toHaveBeenCalledTimes(1);
   });
 });

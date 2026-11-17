@@ -99,9 +99,19 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('no model is gated by name: adminOnly is only ever on unreviewed auto-added entries', () => {
       const entries = Object.entries((agentModeService as any).llmModels) as [string, any][];
+      // Reviewed entries that are deliberately admin-only. Each id names the issue that approved it.
+      // Adding an id here is a decision about who can use a model, not a way to quiet this test.
+      const REVIEWED_ADMIN_ONLY: Record<string, string> = {
+        'openrouter/anthropic/claude-sonnet-5.5': 'ENG-3016',
+      };
       const gated = entries.filter(([, m]) => m.adminOnly === true);
       for (const [id, m] of gated) {
+        if (Object.prototype.hasOwnProperty.call(REVIEWED_ADMIN_ONLY, id)) continue;
         expect({ id, description: String(m.description).startsWith('Auto-added') }).toEqual({ id, description: true });
+      }
+      // A listed id that is no longer admin-only is a stale exception: remove it from the list.
+      for (const id of Object.keys(REVIEWED_ADMIN_ONLY)) {
+        expect({ id, adminOnly: entries.find(([entryId]) => entryId === id)?.[1].adminOnly === true }).toEqual({ id, adminOnly: true });
       }
       expect(entries.find(([id]) => id === 'anthropic.claude-opus-4-6-v1')?.[1].adminOnly).not.toBe(true);
       for (const [id, m] of entries.filter(([id]) => id.includes('opus'))) {

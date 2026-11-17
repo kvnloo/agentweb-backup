@@ -30,6 +30,8 @@ jobs:
           ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
           SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
           PR_BODY_PATH: /tmp/model-catalog-pr-body.md
+          # ENG-3029: response body of the first Artificial Analysis page (no headers, no key).
+          AA_FIRST_PAGE_CAPTURE_PATH: /tmp/artificial-analysis-first-page.json
         run: npx ts-node --transpile-only src/scripts/frontierMonitor.ts --write --notify > /tmp/model-catalog-plan.json
       - name: Refresh capability evidence for added models
         working-directory: backend
@@ -67,6 +69,14 @@ jobs:
           path: |
             /tmp/model-catalog-plan.json
             docs/openrouter-byok-coverage.md
+      # ENG-3029: source for the jest fixture. Absent when the key is missing or the read failed.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: artificial-analysis-first-page
+          path: /tmp/artificial-analysis-first-page.json
+          if-no-files-found: ignore
+          retention-days: 14
       - uses: peter-evans/create-pull-request@v8
         id: open_pr
         with:

@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { assessClientHealth, listAllClients } from "../services/clientHealthService";
+import { assessClientHealth, listAllClients, readClientMetaActivity } from "../services/clientHealthService";
 import { userDb } from "../services/db";
 
 const router = express.Router();
@@ -45,11 +45,50 @@ router.get("/:clientEmail", async (req: Request, res: Response) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const clientEmail = decodeURIComponent(req.params.clientEmail);
+    // Express has already decoded route params; decoding again breaks a literal "%" (ENG-3084).
+    const clientEmail = req.params.clientEmail;
     const result = await assessClientHealth(userId, clientEmail, authReq.user.isAdmin);
     return res.json(result);
   } catch (error) {
     console.error("GET /api/client-health/:clientEmail error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * GET /api/client-health/:clientEmail/meta-activity
+ * ENG-3070: read-only Meta change history for one named client's resolved ad account.
+ * Admin-only (enforced by middleware + service layer).
+ */
+router.get("/:clientEmail/meta-activity", async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
+    const limit = text(req.query.limit);
+    const result = await readClientMetaActivity(
+      userId,
+      req.params.clientEmail,
+      {
+        since: text(req.query.since),
+        until: text(req.query.until),
+        after: text(req.query.after),
+        // A non-numeric limit reaches the validator as NaN and is refused there, not dropped.
+        limit: limit === undefined ? undefined : Number(limit),
+      },
+      authReq.user.isAdmin,
+    );
+    return res.json(result);
+  } catch (error) {
+    console.error("GET /api/client-health/:clientEmail/meta-activity error:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
