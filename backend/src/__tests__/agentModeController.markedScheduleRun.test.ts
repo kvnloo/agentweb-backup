@@ -297,6 +297,12 @@ describe('Slack sends of a MARKED schedule are withheld (ENG-2816 step 3)', () =
       expect(message).toContain('set up or edited through a share link and has not been adopted by its owner');
     });
 
+    it('re-reads the schedule CONSISTENTLY on each turn (a mark a visitor just wrote narrows the very next turn)', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ provenance: ['startingMessage'] }) as any);
+      await runScheduledChat(grantedPublisher(), USER, true);
+      expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('sched-1', { consistent: true });
+    });
+
     it('a run ADMITTED marked was admitted unauthorized, so there is nothing to withdraw and no notice (no bypass is injected)', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ provenance: ['keywords'] }) as any);
       await runScheduledChat(grantedPublisher({ provenance: ['keywords'] }), USER, true);

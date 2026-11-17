@@ -24,6 +24,7 @@ jest.mock('../services/agentModeService', () => ({
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
+    cancelSession: jest.fn(),
   },
 }));
 
@@ -53,9 +54,12 @@ jest.mock('../middleware/auth', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { progressStore } from '../utils/sseProgress';
+import { progressStore, requestCancel } from '../utils/sseProgress';
+import * as markerModule from '../services/shareVisitorTurnMarker';
 import { getUserFromToken } from '../middleware/auth';
-import { agentModeController, tryClaimSessionGeneration, releaseSessionGeneration } from '../controllers/agentModeController';
+import {
+  agentModeController, tryClaimSessionGeneration, releaseSessionGeneration, preemptAutoContinuationAndWait, autoContinuationSessions,
+} from '../controllers/agentModeController';
 import { isShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -175,5 +179,201 @@ describe('generateSharedResponse marks the turn a visitor\'s while it runs (ENG-
     (req as any).query = { conversable: 'wrong-token' };
     await agentModeController.generateSharedResponse(req, fakeRes());
     expect(isShareVisitorTurn(SESSION_ID)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The gap between claiming the lock and recognising the owner, and whose continuation a visitor may preempt (ENG-2816 step 3, round 2).
+
+const flush = async (ticks = 10) => { for (let i = 0; i < ticks; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const stopRequest = (headers: Record<string, string> = {}): Request => ({
+  params: { shareId: SESSION_ID }, query: { conversable: CONVERSABLE_TOKEN }, headers,
+}) as unknown as Request;
+const OWNER_AUTH = { user: { userId: OWNER_ID }, decoded: { userId: OWNER_ID } };
+
+describe('a visitor\'s stop cannot cancel an owner turn that is still STARTING (the stop window)', () => {
+  let markSpy: jest.SpyInstance;
+  const cancel = requestCancel as jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearShareVisitorTurn(SESSION_ID);
+    releaseSessionGeneration(SESSION_ID);
+    autoContinuationSessions.delete(SESSION_ID);
+    markSpy = jest.spyOn(markerModule, 'markShareVisitorTurn');
+    (mockChatbotDb.getChatSession as jest.Mock).mockReset().mockResolvedValue({ ...baseSession, messages: [{ role: 'user', content: 'hi', metadata: { timestamp: new Date().toISOString() } }] });
+    mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockWorkerService.runInWorker.mockResolvedValue(workerResponse as any);
+    (progressStore.delete as jest.Mock).mockReturnValue(true);
+    (progressStore as any).has.mockReturnValue(false);
+    (mockChatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
+    (mockChatbotDb.updateSessionTitle as jest.Mock).mockResolvedValue(undefined);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockGetUserFromToken.mockResolvedValue({ user: null });
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    markSpy.mockRestore();
+    clearShareVisitorTurn(SESSION_ID);
+    releaseSessionGeneration(SESSION_ID);
+    autoContinuationSessions.delete(SESSION_ID);
+  });
+
+  it('the owner\'s login on their share link: the turn is NEVER marked a visitor\'s, at any moment', async () => {
+    mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+    mockWorkerService.runInWorker.mockImplementation(async () => { markerDuringTurn = isShareVisitorTurn(SESSION_ID); return workerResponse as any; });
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), fakeRes());
+    expect(markSpy).not.toHaveBeenCalled();
+    expect(markerDuringTurn).toBe(false);
+  });
+
+  it('a visitor (no login, a colleague, a delegate) is marked, once, before generation starts', async () => {
+    mockWorkerService.runInWorker.mockImplementation(async () => { markerDuringTurn = isShareVisitorTurn(SESSION_ID); return workerResponse as any; });
+    await agentModeController.generateSharedResponse(shareRequest(), fakeRes());
+    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markSpy).toHaveBeenCalledWith(SESSION_ID);
+    expect(markerDuringTurn).toBe(true);
+
+    markSpy.mockClear();
+    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'colleague' }, decoded: { userId: 'colleague' } });
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer colleague.jwt' }), fakeRes());
+    expect(markSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a visitor\'s stop DURING the gap (lock claimed, owner login still being verified) is ignored; the owner\'s turn runs on uncancelled', async () => {
+    let finishLogin!: (value: unknown) => void;
+    // The FIRST verification (right after the lock claim) is held open; the later owner-turn decision then resolves at once.
+    mockGetUserFromToken.mockImplementationOnce(() => new Promise((resolve) => { finishLogin = resolve; }));
+    mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+    const turn = agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), fakeRes());
+    await flush();
+    // The gap: the lock is held, the owner is not yet recognised, and nothing has been marked.
+    expect(mockGetUserFromToken).toHaveBeenCalledTimes(1);
+    expect(markSpy).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+
+    const stopRes = fakeRes();
+    await agentModeController.stopGenerationPublic(stopRequest(), stopRes);
+    expect(stopRes.json).toHaveBeenCalledWith({ success: true });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+
+    finishLogin(OWNER_AUTH);
+    await turn;
+    expect(cancel).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('a visitor\'s own turn stays stoppable by that visitor once it is under way', async () => {
+    let releaseWorker!: () => void;
+    mockWorkerService.runInWorker.mockImplementation(() => new Promise((resolve) => { releaseWorker = () => resolve(workerResponse as any); }));
+    const turn = agentModeController.generateSharedResponse(shareRequest(), fakeRes());
+    await flush();
+    expect(isShareVisitorTurn(SESSION_ID)).toBe(true);
+
+    const stopRes = fakeRes();
+    await agentModeController.stopGenerationPublic(stopRequest(), stopRes);
+    expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+
+    releaseWorker();
+    await turn;
+  });
+});
+
+describe('a visitor\'s message preempts only a continuation of a VISITOR\'s turn (ENG-1239 preemption, ENG-2816 step 3)', () => {
+  const cancel = requestCancel as jest.Mock;
+  const workerCancel = () => (mockWorkerService as any).cancelSession as jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearShareVisitorTurn(SESSION_ID);
+    releaseSessionGeneration(SESSION_ID);
+    autoContinuationSessions.delete(SESSION_ID);
+    (mockChatbotDb.getChatSession as jest.Mock).mockReset().mockResolvedValue({ ...baseSession, messages: [{ role: 'user', content: 'hi', metadata: { timestamp: new Date().toISOString() } }] });
+    mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockWorkerService.runInWorker.mockResolvedValue(workerResponse as any);
+    (progressStore.delete as jest.Mock).mockReturnValue(true);
+    (progressStore as any).has.mockReturnValue(false);
+    (mockChatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
+    (mockChatbotDb.updateSessionTitle as jest.Mock).mockResolvedValue(undefined);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockGetUserFromToken.mockResolvedValue({ user: null });
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    clearShareVisitorTurn(SESSION_ID);
+    releaseSessionGeneration(SESSION_ID);
+    autoContinuationSessions.delete(SESSION_ID);
+  });
+
+  /** A background continuation holding the session lock; a visitor's one carries the visitor-turn marker, as scheduleAutoMediaContinuation sets it. */
+  const holdContinuation = (visitorOwned: boolean) => {
+    tryClaimSessionGeneration(SESSION_ID, OWNER_ID);
+    autoContinuationSessions.add(SESSION_ID);
+    if (visitorOwned) markerModule.markShareVisitorTurn(SESSION_ID);
+  };
+
+  it('an OWNER\'s continuation is not preempted by the share route: the visitor is answered like a held lock (409), and nothing is cancelled', async () => {
+    holdContinuation(false);
+    const res = fakeRes();
+    await agentModeController.generateSharedResponse(shareRequest(), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'Session is busy',
+      message: 'A response is already being generated for this session. Please wait.',
+      code: 'SESSION_BUSY',
+      userMessageSaved: false,
+    });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(workerCancel()).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    // The continuation still holds its lock.
+    expect(tryClaimSessionGeneration(SESSION_ID, OWNER_ID)).toBe(false);
+  });
+
+  it('a VISITOR\'s continuation is still preempted by a visitor\'s message (as before)', async () => {
+    holdContinuation(true);
+    setTimeout(() => releaseSessionGeneration(SESSION_ID), 30);
+    const res = fakeRes();
+    await agentModeController.generateSharedResponse(shareRequest(), res);
+
+    expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+    expect(workerCancel()).toHaveBeenCalledWith(SESSION_ID);
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  describe('preemptAutoContinuationAndWait itself', () => {
+    it('with onlyVisitorContinuations: an owner continuation is left alone (false, no cancel); a visitor one is preempted', async () => {
+      holdContinuation(false);
+      await expect(preemptAutoContinuationAndWait(SESSION_ID, OWNER_ID, true)).resolves.toBe(false);
+      expect(cancel).not.toHaveBeenCalled();
+      expect(workerCancel()).not.toHaveBeenCalled();
+
+      markerModule.markShareVisitorTurn(SESSION_ID);
+      setTimeout(() => releaseSessionGeneration(SESSION_ID), 30);
+      await expect(preemptAutoContinuationAndWait(SESSION_ID, OWNER_ID, true)).resolves.toBe(true);
+      expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+    });
+
+    it('WITHOUT the option (the authenticated /generate path) an owner continuation is preempted exactly as before', async () => {
+      holdContinuation(false);
+      setTimeout(() => releaseSessionGeneration(SESSION_ID), 30);
+      await expect(preemptAutoContinuationAndWait(SESSION_ID, OWNER_ID)).resolves.toBe(true);
+      expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+      expect(workerCancel()).toHaveBeenCalledWith(SESSION_ID);
+    });
+
+    it('nothing to preempt: not a continuation, so false either way (a plain held lock is not touched)', async () => {
+      tryClaimSessionGeneration(SESSION_ID, OWNER_ID);
+      await expect(preemptAutoContinuationAndWait(SESSION_ID, OWNER_ID, true)).resolves.toBe(false);
+      await expect(preemptAutoContinuationAndWait(SESSION_ID, OWNER_ID)).resolves.toBe(false);
+      expect(cancel).not.toHaveBeenCalled();
+    });
   });
 });

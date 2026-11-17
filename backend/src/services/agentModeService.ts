@@ -2994,7 +2994,8 @@ export class AgentModeService {
     try {
       // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
       // schedule too, so a vanished record withholds rather than publishes.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       const live = resolveSchedulePublishAuthorization(schedule);
       const resolved = narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
       // ENG-1245: attach WHY, read straight off the live schedule record, so the
@@ -3039,7 +3040,8 @@ export class AgentModeService {
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) return { authorized: false };
     try {
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       // ENG-2816 (step 3): also WITHHELD for a schedule a share-link visitor wrote into, and says so (see describeSlackSendState).
       return describeSlackSendState(schedule);
     } catch (error) {
@@ -10089,10 +10091,15 @@ export class AgentModeService {
     let schedule: any;
     try {
       schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
-    } catch (scheduleError) {
-      // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
-      console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
-      return unverifiable;
+    } catch (firstScheduleError) {
+      // One retry absorbs a single throttled read, as the session read above does, before a throw counts as unverifiable.
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (scheduleError) {
+        // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
+        console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
+        return unverifiable;
+      }
     }
     // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
     if (!schedule) return whenUnverifiable;

@@ -77,7 +77,7 @@ import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassific
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId, describeSlackSendState, filterSlackSendFromRequiredIfWithheld, type SlackSendState } from '../utils/schedulePublishApproval';
 import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/toolRestrictionProfiles';
-import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
+import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, scheduleContentVersion, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
 import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { isDeepStrictEqual } from 'util';
@@ -1784,8 +1784,18 @@ const AUTO_CONTINUATION_PREEMPT_POLL_MS = parseInt(process.env.AUTO_CONTINUATION
  * into the same session — worst case, it behaves exactly like before this fix existed.
  * Exported so tests can drive it directly instead of racing real generation timing.
  */
-export async function preemptAutoContinuationAndWait(sessionId: string, ownerUserId?: string): Promise<boolean> {
+export async function preemptAutoContinuationAndWait(
+  sessionId: string,
+  ownerUserId?: string,
+  // ENG-2816 (step 3): the SHARE route passes true. A share-link visitor's message may preempt a continuation of a VISITOR's turn,
+  // but not one of the OWNER's own turn (a visitor must not be able to cancel the owner's work by sending a message): for that the
+  // visitor is answered exactly as if the lock were held (409 SESSION_BUSY). Whose continuation it is comes from the visitor-turn
+  // marker, which scheduleAutoMediaContinuation sets for a continuation of a visitor's request and never for an owner's. The
+  // authenticated /generate path does not pass it and preempts as before.
+  onlyVisitorContinuations = false,
+): Promise<boolean> {
   if (!autoContinuationSessions.has(sessionId)) return false;
+  if (onlyVisitorContinuations && !isShareVisitorTurn(sessionId)) return false;
   requestCancel(sessionId);
   generateMarketingResponseWorkerService.cancelSession(sessionId);
   const deadline = Date.now() + AUTO_CONTINUATION_PREEMPT_WAIT_MS;
@@ -8119,7 +8129,8 @@ export async function runScheduledChat(
         // once again report requirements the run was never held to.
         let latest: SchedulePublishAuthorization | null = null;
         try {
-          const latestSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+          // ENG-2816 (step 3): consistent (a scheduled run only), so a mark a visitor just wrote narrows this run at its next turn.
+          const latestSchedule = await scheduleDb.getScheduleById(schedule.scheduleId, { consistent: true });
           latest = resolveSchedulePublishAuthorization(latestSchedule);
           // ENG-2816 (step 3): a visitor marking the schedule mid-run withholds Slack for the rest of it (narrowing only).
           if (isScheduleMarked(latestSchedule)) effectiveSlackSend = { authorized: false, reason: 'visitor_edited' };
@@ -13222,7 +13233,8 @@ export const agentModeController = {
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
       // ENG-1239: unless it's a background media auto-continuation holding the lock —
       // preempt that instead (see the regular /generate path above).
-      if (!tryClaimSessionGeneration(session.sessionId, session.userId) && !(await preemptAutoContinuationAndWait(session.sessionId, session.userId))) {
+      // ENG-2816 (step 3): ...but only a continuation of a VISITOR's turn; an owner's own continuation answers like a held lock.
+      if (!tryClaimSessionGeneration(session.sessionId, session.userId) && !(await preemptAutoContinuationAndWait(session.sessionId, session.userId, true))) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -13230,12 +13242,14 @@ export const agentModeController = {
           userMessageSaved: false,
         });
       }
-      // ENG-2816 (step 3): this turn is a visitor's until the owner is recognised (below). Marked where the lock is claimed, not
-      // where that is decided, so there is no moment in which a visitor's turn holds the session unmarked: the marker is what the
-      // schedule write handlers and the stop route read, and it is cleared with the lock.
-      markShareVisitorTurn(session.sessionId);
 
       try {
+
+      // ENG-2816 (step 3): is this REQUEST the owner's own (the check the stop route uses)? Asked right after the lock is claimed, and
+      // the turn is marked a visitor's only when it is not, so an owner's turn that is still starting is never marked and a
+      // visitor's stop cannot cancel it in that gap. Nothing runs between here and the generation, so no tool can run first. This
+      // only decides the MARKER; the owner-turn decision that changes what the turn may do is still made last, below.
+      if (!(await isSessionOwnerRequest(req, session.userId))) markShareVisitorTurn(session.sessionId);
 
       const defaultModel = await agentModeService.getDefaultModel();
 
@@ -15080,7 +15094,13 @@ export const agentModeController = {
         // (consent to decide unaided is a different question from consent to post)
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
-        requirePublishApproval: requirePublishApproval === true,
+        // ENG-2816 (step 3): a schedule a share-link visitor CREATES holds at the publish step until the owner decides otherwise. The
+        // marks keep it from publishing now, but the resolver's legacy branch reads a schedule that was never asked as AUTHORIZED for
+        // the publish tools it requires, so on the owner's Adopt click a visitor-written `requiredFunctionCalls` would become
+        // standing consent to publish unattended that the owner never gave. This existing owner opt-out (no new attribute) makes
+        // adopting only lift the limits: the schedule keeps drafting until the owner turns "Require approval before publishing"
+        // OFF or grants consent themselves. Owner-created schedules, and visitor EDITS of existing schedules, are untouched.
+        requirePublishApproval: requirePublishApproval === true || isVisitorScheduleWrite(req),
         // ENG-2204: owner opt-OUT for the unattended Slack-send override, same
         // polarity/rationale as requirePublishApproval above. Default false =
         // authorized (an unattended run calls slack_send_message directly when its
@@ -15239,6 +15259,9 @@ export const agentModeController = {
         // never has to guess what "missing" meant.
         autopublishAuthorized: rest.autopublishAuthorized === true,
         runHealth: computeScheduleRunHealth(runResults, rest),
+        // ENG-2816 (step 3): COMPUTED here, never stored. What the portal sends back as `expectedContentVersion` when the owner adopts
+        // a visitor-edited schedule, so adopting is bound to the content they were shown (see adoptScheduledChatVisitorEdits).
+        contentVersion: scheduleContentVersion(rest),
       }));
 
       // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
@@ -15638,6 +15661,8 @@ export const agentModeController = {
         present.has('variables') && !isDeepStrictEqual(normalizedVariables, existingSchedule.variables || []) && 'variables',
         present.has('variableValues') && !isDeepStrictEqual(normalizedVariableValues, storedVariableValues) && 'variableValues',
         present.has('emailNotifications') && !isDeepStrictEqual(effectiveEmailNotifications, normalizeEmailList(existingSchedule.emailNotifications || [])) && 'emailNotifications',
+        // Self-improve: switching it on makes the next run's owner-powered reflection turn rewrite the prompt from the run's content.
+        present.has('selfImprove') && updates.selfImprove !== (existingSchedule.selfImprove === true) && 'selfImprove',
       ].filter((field): field is string => typeof field === 'string');
       const provenancePlan = provenancePlanForWrite(req, changedTrackedFields);
       Object.assign(updates, provenancePlan);
@@ -16404,21 +16429,26 @@ export const agentModeController = {
 
   /**
    * POST /api/agent-mode/scheduled-chats/:scheduleId/adopt-visitor-edits
-   * Body: { expectedUpdatedAt: string }
+   * Body: { expectedContentVersion: string }   (the `contentVersion` the schedule list returned for this schedule)
    *
    * ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into. This is the ONLY way a visitor mark comes
    * off (editing the schedule never removes one). It removes the whole `provenance` attribute, after which the schedule runs with
-   * the owner's full tool set again and its publish authorization resolves from the owner's own settings.
+   * the owner's full tool set again. (A schedule a visitor CREATED also stays on "Require approval before publishing", so adopting
+   * does not switch on unattended publishing: the owner decides that separately.)
    *
    * The owner has to say so, so the guards are the publish-consent endpoint's and stricter:
    *   - a real portal login only: never a self-call (Emma in the owner's own chat, a marked run's reflection turn, an external MCP
    *     client: none of them can tell the owner from a visitor), never a delegated session (an admin acting as the owner is not the
    *     owner), never a write that is a visitor's;
    *   - the schedule must be the caller's own;
-   *   - the owner adopts WHAT THEY LOOKED AT: the body must carry the `updatedAt` of the schedule version the portal loaded
-   *     (`expectedUpdatedAt`, required: 400 without it), it must equal the stored one (409 if a visitor edit landed since), and the
-   *     write itself is conditioned on that same value, so an edit that lands between this read and the write also loses (409)
-   *     instead of being adopted unseen.
+   *   - the owner adopts WHAT THEY LOOKED AT: the body must carry the `contentVersion` the list showed (`expectedContentVersion`,
+   *     required: 400 without it), and it must equal the digest of the schedule as freshly read (409 if the tracked content or the
+   *     marks changed since: a visitor edited it). The token is a digest of the eight tracked content fields and the marks, not
+   *     `updatedAt`, which moves for reasons that are not content (every run's bookkeeping, the cron's claim and pause writes, a
+   *     visitor re-submitting identical values) and would otherwise let a visitor keep adopting from ever succeeding.
+   *   - the write itself is conditioned on the `updatedAt` just read, so an edit that lands between the read and the write cannot be
+   *     adopted unseen. If that condition fails the schedule is re-read and, ONLY if its digest still equals the expected one (only
+   *     bookkeeping moved), the write is retried; three attempts at most, then 409.
    * The mark is removed with REMOVE of the attribute, not a set operation, so a value that is not a well-formed set can still be
    * adopted. Nothing in the MCP tool bodies exposes this route or any provenance (tested).
    */
@@ -16439,50 +16469,54 @@ export const agentModeController = {
         });
       }
 
-      const expectedUpdatedAt = (req.body as { expectedUpdatedAt?: unknown } | undefined)?.expectedUpdatedAt;
-      if (typeof expectedUpdatedAt !== 'string' || expectedUpdatedAt === '') {
+      const expectedContentVersion = (req.body as { expectedContentVersion?: unknown } | undefined)?.expectedContentVersion;
+      if (typeof expectedContentVersion !== 'string' || expectedContentVersion === '') {
         return res.status(400).json({
-          error: 'expectedUpdatedAt is required: send the updatedAt of the schedule version you reviewed, so what you adopt is what you saw.',
+          error: 'expectedContentVersion is required: send the contentVersion of the schedule you reviewed, so what you adopt is what you saw.',
         });
-      }
-
-      // Consistent: the decision is about what is stored right now, not a replica that may not have seen a visitor's last edit.
-      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
-      if (!schedule || schedule.userId !== user.userId) {
-        return res.status(404).json({ error: 'Scheduled chat not found' });
-      }
-
-      const marks = readScheduleProvenance(schedule.provenance);
-      if (marks.length === 0) {
-        return res.json({ adopted: false, provenance: [], message: 'Nothing to adopt: no part of this schedule was written through a share link.' });
       }
 
       const changedSince = {
         error: 'This schedule changed since you opened it, so nothing was adopted. Reopen it to see its current content, then adopt it again.',
       };
-      if (schedule.updatedAt !== expectedUpdatedAt) return res.status(409).json(changedSince);
-
-      try {
-        await scheduleDb.updateSchedule(
-          scheduleId,
-          { updatedAt: new Date().toISOString() },
-          { updatedAt: schedule.updatedAt },
-          undefined,
-          ['provenance']
-        );
-      } catch (writeError: any) {
-        if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
-          return res.status(409).json(changedSince);
+      const MAX_ADOPT_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ADOPT_ATTEMPTS; attempt++) {
+        // Consistent: the decision is about what is stored right now, not a replica that may not have seen a visitor's last edit.
+        const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+        if (!schedule || schedule.userId !== user.userId) {
+          return res.status(404).json({ error: 'Scheduled chat not found' });
         }
-        throw writeError;
-      }
 
-      console.log(`[ENG-2816] schedule ${scheduleId} adopted by owner ${user.userId}; visitor marks removed [${marks.join(', ')}]`);
-      res.json({
-        adopted: true,
-        provenance: [],
-        message: 'You adopted this schedule. It now runs with your full tool set.',
-      });
+        const marks = readScheduleProvenance(schedule.provenance);
+        if (marks.length === 0) {
+          return res.json({ adopted: false, provenance: [], message: 'Nothing to adopt: no part of this schedule was written through a share link.' });
+        }
+        if (scheduleContentVersion(schedule) !== expectedContentVersion) return res.status(409).json(changedSince);
+
+        try {
+          await scheduleDb.updateSchedule(
+            scheduleId,
+            { updatedAt: new Date().toISOString() },
+            { updatedAt: schedule.updatedAt },
+            undefined,
+            ['provenance']
+          );
+        } catch (writeError: any) {
+          if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
+            // Something wrote to the schedule since the read. Whether it was only bookkeeping is decided by re-reading it.
+            continue;
+          }
+          throw writeError;
+        }
+
+        console.log(`[ENG-2816] schedule ${scheduleId} adopted by owner ${user.userId}; visitor marks removed [${marks.join(', ')}]`);
+        return res.json({
+          adopted: true,
+          provenance: [],
+          message: 'You adopted this schedule. It now runs with your full tool set.',
+        });
+      }
+      return res.status(409).json(changedSince);
     } catch (error) {
       console.error('AgentMode: Adopt scheduled chat visitor edits error:', error);
       res.status(500).json({ error: 'Failed to adopt scheduled chat' });
@@ -19144,6 +19178,9 @@ export const agentModeController = {
         // `updateScheduledChat` and both `submitScheduledChatVariables` paths all
         // stamp it; this path and the ENG-1723 auto-create were the two that did not.
         variableValuesUpdatedAt: now.toISOString(),
+        // ENG-2816 (step 3): same as createScheduledChat: a schedule a visitor creates from a template holds at the publish step
+        // until the owner decides, so adopting it does not also switch on unattended publishing.
+        ...(isVisitorScheduleWrite(req) ? { requirePublishApproval: true } : {}),
       };
 
       // ENG-1552: a template-created schedule is live the moment it exists, like
