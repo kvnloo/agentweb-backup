@@ -61,6 +61,7 @@ async function main() {
   if (!/^(sk|rk)_test_/.test(key)) throw new Error('Refusing to run: the Stripe key is not a TEST-mode key (must start with sk_test_ or rk_test_).');
   process.env.STRIPE_WEBHOOK_SECRET = `whsec_rehearsal_${RUN}`;
   process.env.BACKEND_URL = 'https://example.com'; // Checkout return pages are not served by this run
+  process.env.JWT_SECRET ||= `rehearsal-${RUN}-${crypto.randomBytes(16).toString('hex')}`; // signs the cancel redirect; this run only
 
   const { createStripeClient, STRIPE_API_VERSION } = await import('../services/stripeClientFactory');
   const stripe = createStripeClient(key);
@@ -154,6 +155,16 @@ async function main() {
     const found = await sleepUntilFound('findCustomerId', () => billing.defaultZomaBillingDeps.findCustomerId(userId));
     check('findCustomerId returns the clock customer', found === customer.id, { found, expected: customer.id });
     if (!found) throw new Error('Stripe Search did not return the clock customer; cannot continue');
+    // Search is eventually consistent and not monotonic: one hit does not mean the next call hits too. A miss here would
+    // make the code create a second (non-clock) customer, which only happens in this harness because the clock customer
+    // is made outside the code's idempotent createCustomer. Wait for several consecutive hits before going on.
+    let streak = 0;
+    for (let i = 0; i < 60 && streak < 4; i++) {
+      streak = (await billing.defaultZomaBillingDeps.findCustomerId(userId)) === customer.id ? streak + 1 : 0;
+      if (streak < 4) await sleep(5000);
+    }
+    check('Stripe Search returned the clock customer on 4 consecutive calls (harness precondition)', streak >= 4, { streak });
+    if (streak < 4) throw new Error('Stripe Search stayed inconsistent; stopping so the run does not split the customer');
 
     log('\n=== 2. Paywall before any plan');
     const refusal: any = await billing.assertZomaPublishAllowed(userId, { platform: 'meta', toolName: 'rehearsal' }, deps).catch((e: any) => e);
@@ -165,6 +176,7 @@ async function main() {
     check('zoma_status shows the same link and is not publish-enabled', summary?.link === refusal.link && summary?.publish_enabled === false);
     const sessionId = String(refusal.link).split('/').pop() as string;
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items'] });
+    check('the Checkout belongs to the test-clock customer (one customer for the user)', session.customer === customer.id, { sessionCustomer: session.customer, clockCustomer: customer.id });
     check('Checkout is subscription mode with plan + metered overage + $1 fee, 7-day trial',
       session.mode === 'subscription' && session.line_items?.data.length === 3, { mode: session.mode, items: session.line_items?.data.map((l) => `${l.price?.id === feePrice.id ? 'fee' : l.price?.id === planPrice.id ? 'plan' : 'overage'}:${l.amount_total}`) });
     const opened = await billing.openZomaCheckout(sessionId, deps);
