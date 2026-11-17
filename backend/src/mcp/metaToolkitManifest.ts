@@ -16,7 +16,7 @@
 import { SIGNAL_READ_DEFINITIONS } from './metaToolkitSignals';
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
-import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
+import { isZomaTool, zomaToolDefinitions } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
@@ -136,7 +136,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     // ENG-2926: catalog create/update, feeds, upload sessions, feed rules (deletes are preview → confirm).
     ...META_CATALOG_FEED_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
-    ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...zomaToolDefinitions().map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
     JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
   ];
