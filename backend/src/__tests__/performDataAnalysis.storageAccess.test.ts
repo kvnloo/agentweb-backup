@@ -246,31 +246,41 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(sent).toContain('a,b\n1,2');
     });
 
-    it('does not read another user\'s tool response named in the text', async () => {
+    it('refuses another user\'s tool response named in the text, with the same answer as the other read sites', async () => {
       const r = await performDataAnalysis([], `Use tool-responses/${OTHER_SESSION}/call1.txt and total the clicks.`, 'me');
+      refused(r);
       expect(readS3).not.toHaveBeenCalled();
-      expect(r.success).toBe(false); // the same "could not be read" outcome as for a key that is not there
     });
 
-    it('does not read a key named in the text when the lookup fails (never a pass)', async () => {
+    it('says "try again", and reads nothing, when the lookup fails for a key named in the text', async () => {
       process.env.TEST_LOOKUP_FAILS = '1';
       const r = await performDataAnalysis([], `Use tool-responses/${MY_SESSION}/call1.txt and total the clicks.`, 'me');
-      expect(readS3).not.toHaveBeenCalled();
       expect(r.success).toBe(false);
+      expect(r.message).toBe(TOOL_FILE_UNAVAILABLE_MESSAGE);
+      expect(r.errorClass).toBe('upstream_5xx');
+      expect(readS3).not.toHaveBeenCalled();
     });
 
-    it('does not follow a key that climbs out of the caller\'s own tool-response folder', async () => {
+    it('refuses a key that climbs out of the caller\'s own tool-response folder', async () => {
       const r = await performDataAnalysis([], `Use tool-responses/${MY_SESSION}/../../users/other/files/1/abc/secret.csv now.`, 'me');
+      refused(r);
       expect(readS3).not.toHaveBeenCalled();
-      expect(r.success).toBe(false);
     });
 
-    it('reads only the keys the caller owns when the text names both', async () => {
+    it('refuses the WHOLE call, and reads nothing, when the text names one key the caller owns and one it does not', async () => {
       const mine = `tool-responses/${MY_SESSION}/a.txt`;
       const theirs = `tool-responses/${OTHER_SESSION}/b.txt`;
-      await performDataAnalysis([], `Compare ${mine} with ${theirs}.`, 'me');
-      expect(readS3).toHaveBeenCalledTimes(1);
-      expect(readS3).toHaveBeenCalledWith(mine);
+      const r = await performDataAnalysis([], `Compare ${mine} with ${theirs}.`, 'me');
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it('still inlines several keys when the caller owns them all', async () => {
+      const a = `tool-responses/${MY_SESSION}/a.txt`;
+      const b = `tool-responses/${MY_SESSION}/b.txt`;
+      await performDataAnalysis([], `Compare ${a} with ${b}.`, 'me');
+      expect(readS3).toHaveBeenCalledTimes(2);
     });
   });
 

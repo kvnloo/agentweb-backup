@@ -400,12 +400,13 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       let resolved = analysisInstruction;
       const resolvedKeys: string[] = [];
       const failedKeys: string[] = [];
+      // Check EVERY key before reading any: a call that names a file the caller may not read is refused whole, with the same
+      // answers as the other two read sites (a refusal is `invalid_args`; a check that could not run says "try again").
+      const keyDecisions: string[] = [];
+      for (const key of uniqueKeys) keyDecisions.push(await fileAccess.check(key));
+      if (keyDecisions.includes('refuse')) return refuseFile();
+      if (keyDecisions.includes('unavailable')) return fileCheckUnavailable();
       for (const key of uniqueKeys) {
-        // A key the caller may not read ends up in the same "could not be read" outcome as a key that is not there.
-        if ((await fileAccess.check(key)) !== 'allow') {
-          failedKeys.push(key);
-          continue;
-        }
         try {
           const content = await getS3ObjectAsString(key);
           if (content) {
