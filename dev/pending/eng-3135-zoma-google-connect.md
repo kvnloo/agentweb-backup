@@ -1,0 +1,9 @@
+## ENG-3135: Zoma Google Ads connect finishes on Zoma, never creates or defaults anything (2026-11-17)
+
+Evidence (prod, 2026-11-16 19:54 UTC, Nikhil's onboarding call): the Google Ads callback hit `app.agentweb.pro` (Emma portal) and `/finalize` logged `accountCount: 0`. The probe for customer `6197536133` returned `403 PERMISSION_DENIED / authorizationError: CUSTOMER_NOT_ENABLED` — an account Google lists as accessible but whose signup was started and never finished — and `listAccountHierarchy` silently skipped it. Only one callback that day; no retry.
+
+- Our connect link sends only `response_type, client_id, redirect_uri, scope, state, access_type, prompt`: no locale, country or account-creation hint. "Italy" and the campaign prompt come from Google's own `ads.google.com` signup (the old `zoma_status` fallback pointed there), not from our redirect logic. Nothing in the backend creates Google Ads accounts, budgets or campaigns on connect.
+- Zoma-minted links carry a signed `zoma: 'mcp'` state; `/api/oauth/google-ads/callback` forwards them to `/api/zoma/google/callback` (server-rendered, finalizes for the state's user). Expiry is ignored only for routing, so an expired link shows Zoma's "ask your agent" page, not the portal. Portal states are untouched.
+- `listAccountHierarchy(token, diagnostics?)` reports `CUSTOMER_NOT_ENABLED` ids via an out-param. With no connectable account, Zoma shows "Google Ads account not finished" (finish THAT account; check country/currency/time zone, which Google will not let you change) instead of "create an account", which would have told Nikhil to start a second one.
+- The portal `/finalize` response is unchanged: it still shows 0 accounts for a not-enabled-only user (customer-portal follow-up).
+- Dev OAuth client's redirect URI is a stale ngrok host, so a real consent flow cannot be completed from the autofix box; verify consent in prod/staging.
