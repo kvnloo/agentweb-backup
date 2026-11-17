@@ -33,7 +33,7 @@ import {
 import { type ZomaToolName } from './zomaToolDefinitions';
 import {
   adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
-  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_META_LOGIN_NOTE, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
 } from './zomaAdsExperience';
 
 export class ZomaNotReadyError extends Error {
@@ -439,6 +439,7 @@ function nextStep(
         : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
       ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
       'Tell me when it is connected and I will re-check.',
+      ZOMA_META_LOGIN_NOTE,
       ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
     ].join('\n');
   }

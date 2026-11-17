@@ -45,13 +45,26 @@ export type ZomaLeadClassification = 'pal' | 'prospect';
 export const ZOMA_PAL: ZomaLeadClassification = 'pal';
 export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => (isNotInterested(raw) ? 'pal' : 'prospect');
 
+/**
+ * Which Facebook login Zoma wants (ENG-3136). Zoma binds the Meta connection to the Zoma account that
+ * started the link, never by comparing emails, so a different Facebook email is fine — but Meta only
+ * shares the ad accounts that Facebook login can see.
+ */
+export const ZOMA_META_LOGIN_NOTE =
+  'The Facebook login you connect does not need to use the same email as your Zoma login: Zoma links whichever Facebook account you sign in with to this Zoma account. It must be the Facebook login that created the ad account or belongs to the Business portfolio that owns it; a different Facebook login shows Zoma no ad accounts.';
+
+/** Meta hosts ad-account creation, so a failed Create button is Meta's; Zoma gives a current route and a way back. */
+export const ZOMA_AD_ACCOUNT_CREATE_FALLBACK =
+  'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as the portfolio admin, or open Ads Manager (https://adsmanager.facebook.com) with the same Facebook login, where Meta usually offers to create one; if it still fails, report it to Meta (https://www.facebook.com/business/help) and tell me the exact message. Then ask me to re-check or open the connect link again.';
+
 /** Ad-account setup for someone who has never run ads, in the order they need it. */
 export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
-  'Meta: create a Business portfolio at https://business.facebook.com/overview (use the Facebook login you want to manage ads with).',
+  'Meta: create a Business portfolio at https://business.facebook.com/overview (use the Facebook login you want to manage ads with, and keep using that same login below).',
   'Meta: create a Facebook Page for your business at https://www.facebook.com/pages/create — Meta ads run from a Page.',
   'Meta: in Business settings → Accounts → Ad accounts, create an ad account and set its currency and time zone (https://business.facebook.com/settings/ad-accounts).',
+  ZOMA_AD_ACCOUNT_CREATE_FALLBACK,
   'Google (optional): create a Google Ads account at https://ads.google.com — choose "Switch to Expert Mode" and "Create an account without a campaign" so nothing starts spending.',
-  'Then connect those ad accounts to Zoma.',
+  `Then connect those ad accounts to Zoma. ${ZOMA_META_LOGIN_NOTE}`,
 ];
 
 /** Agent-facing question block: greet, ask the one question, and how to record each answer. */
