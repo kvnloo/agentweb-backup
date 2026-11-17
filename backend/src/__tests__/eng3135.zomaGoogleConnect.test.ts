@@ -59,6 +59,12 @@ const zomaState = (userId = 'u1') => jwt.sign({ userId, zoma: ZOMA_MCP_SETUP, no
 const portalState = (userId = 'u1') => jwt.sign({ userId, nonce: 'n' }, getJwtSecret(), { expiresIn: '15m' });
 const stateOf = (url: string) => new URL(url).searchParams.get('state')!;
 
+const ORIGINAL_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL;
+afterEach(() => {
+  if (ORIGINAL_FRONTEND_URL === undefined) delete process.env.CUSTOMER_FRONTEND_URL;
+  else process.env.CUSTOMER_FRONTEND_URL = ORIGINAL_FRONTEND_URL;
+});
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockAxiosPost.mockResolvedValue({ data: { access_token: 'at', refresh_token: 'rt', expires_in: 3600, scope: GRANTED } });
@@ -71,6 +77,8 @@ describe('connect link state', () => {
     expect(jwt.verify(stateOf(zoma), getJwtSecret())).toMatchObject({ userId: 'u1', zoma: ZOMA_MCP_SETUP });
     expect(jwt.verify(stateOf(await buildGoogleAdsConnectUrl('u1')), getJwtSecret())).not.toHaveProperty('zoma');
     const params = new URL(zoma).searchParams;
+    const hijack = jwt.verify(stateOf(await buildGoogleAdsConnectUrl('u1', { userId: 'attacker' })), getJwtSecret());
+    expect(hijack).toMatchObject({ userId: 'u1' });
     expect([...params.keys()].sort()).toEqual(['access_type', 'client_id', 'prompt', 'redirect_uri', 'response_type', 'scope', 'state']);
   });
 });
@@ -226,7 +234,8 @@ describe('POST /api/zoma/google/select + GET /api/zoma/google/callback routes', 
     const res = await request(app).get('/api/zoma/google/callback').query({ code: 'c', state: zomaState() });
     expect(res.status).toBe(200);
     expect(res.text).toContain('Google Ads connected');
-    expect(res.text).not.toMatch(/location|app\.agentweb/i);
+    expect(res.headers.location).toBeUndefined();
+    expect(res.text).not.toMatch(/app\.agentweb/i);
   });
   it('an invalid picker link renders an expired page, not a 500', async () => {
     const res = await request(app).post('/api/zoma/google/select').type('form').send({ t: 'bad', account_id: '1' });
