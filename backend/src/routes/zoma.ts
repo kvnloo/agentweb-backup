@@ -8,10 +8,10 @@
  *   POST /api/zoma/ads-experience     ENG-3128 "How familiar are you with ads?" form submit
  *   GET  /api/zoma/activate           verification page; ?user_code= -> AgentWeb sign-in + consent
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
- *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup (forwarded by /api/oauth/meta/callback)
+ *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup or an MCP user's zoma_status link (forwarded by /api/oauth/meta/callback)
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
  *   GET  /api/zoma/continue           resume the journey from a signed link
- *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set"
+ *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
  *
  * None of these read the browser's AgentWeb session: the setup's user always comes from the
@@ -216,7 +216,7 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
   router.get('/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       const q = req.query;
-      return renderStep(res, await finishPayment({ t: q.t, session_id: q.session_id, canceled: q.canceled }, deps));
+      return renderStep(res, await finishPayment({ t: q.t, session_id: q.session_id, canceled: q.canceled, mcp: q.mcp }, deps));
     } catch (error) {
       return failPage(res, 'checkout_completed', error);
     }
