@@ -176,10 +176,19 @@ describe('completeGoogleConnect', () => {
     expect(step.message).toContain('6197536133');
     expect(step.message).toMatch(/did not create it/);
     const text = step.steps.join(' ');
-    expect(text).toMatch(/finish setting up the account Google already created/);
+    expect(text).toMatch(/If its setup is unfinished, finish it there; do not create another account yet/);
     expect(text).toContain('Create an account without a campaign');
-    expect(text).toMatch(/Do not start a second account yet/);
+    expect(text).toMatch(/Zoma cannot either/);
     expect(text).not.toMatch(/Create a Google Ads account yourself/);
+    expect(step.message).toMatch(/deactivated/);
+    expect(createAccount).not.toHaveBeenCalled();
+  });
+
+  it('manager-only login with no active client account: no "create an account" advice', async () => {
+    tree.mockResolvedValue([{ type: 'manager', customerId: '9', name: 'MCC', children: [] }]);
+    const step: any = await completeGoogleConnect({ code: 'c', state: zomaState() }, deps());
+    expect(step).toMatchObject({ kind: 'page', status: 400, title: 'No active Google Ads account to connect', retryLabel: 'Connect Google Ads again' });
+    expect(step.steps.join(' ')).not.toMatch(/Create a Google Ads account yourself/);
     expect(createAccount).not.toHaveBeenCalled();
   });
 

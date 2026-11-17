@@ -327,6 +327,22 @@ describe('listAccountHierarchy: accounts Google lists but has not enabled (ENG-3
     errSpy.mockRestore();
   });
 
+  it('a malformed error body never makes the listing throw', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/1', 'customers/2', 'customers/111'] } });
+    mockAxiosPost
+      .mockRejectedValueOnce(Object.assign(new Error('x'), { response: { data: { error: { details: { errors: 'nope' } } } } }))
+      .mockRejectedValueOnce(Object.assign(new Error('y'), { response: { data: { error: { details: [null, { errors: null }] } } } }))
+      .mockResolvedValueOnce({ data: { results: [{ customer: { id: '111', descriptiveName: 'Live', currencyCode: 'USD', manager: false } }] } });
+    const diagnostics: { notEnabledCustomerIds?: string[] } = {};
+    const tree = await service.listAccountHierarchy('test-access-token', diagnostics);
+    expect(tree.map((n: any) => n.customerId)).toEqual(['111']);
+    expect(diagnostics.notEnabledCustomerIds).toBeUndefined();
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
   it('does not report other probe failures as not-enabled', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/222'] } });
