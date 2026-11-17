@@ -1,8 +1,10 @@
 import express from 'express';
 import { checkTaskSubscriberAccess } from '../services/taskSubscriberAccess';
 import { register, login, googleCallback } from '../controllers/auth';
+import { encodeGoogleOAuthState, parseGoogleOAuthState } from '../services/zomaSignupIntent';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb, subscriberDb, orgDb } from '../services/db';
+import { forgetSubscriberLookup } from '../services/subscriberLookup';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { AuthRequest } from '../types/express';
@@ -335,29 +337,26 @@ router.get('/google', (req: Request, res: Response, next: NextFunction) => {
                  req.query.portal === 'genius' ? 'genius' : 'partner';
   passport.authenticate('google', { 
     scope: ['profile', 'email'], 
-    state: portal
+    // ENG-3124: a Zoma sign-in carries its signed signup intent through Google in the state.
+    state: encodeGoogleOAuthState(portal, req.query.signupIntent)
   })(req, res, next);
 });
 
+function portalFrontendUrl(state: unknown): string {
+  const { portal } = parseGoogleOAuthState(state);
+  if (portal === 'customer') return CUSTOMER_FRONTEND_URL;
+  if (portal === 'genius') return GROWTH_GENIUS_CHAT_URL;
+  return PARTNER_FRONTEND_URL;
+}
+
 const googleAuthFinalHandler = (req: Request, res: Response) => {
     if (!req.user) {
-        let failureRedirectPortal = PARTNER_FRONTEND_URL;
-        if (req.query.state === 'customer') {
-            failureRedirectPortal = CUSTOMER_FRONTEND_URL;
-        } else if (req.query.state === 'genius') {
-            failureRedirectPortal = GROWTH_GENIUS_CHAT_URL;
-        }
+        const failureRedirectPortal = portalFrontendUrl(req.query.state);
         return res.redirect(`${failureRedirectPortal}/oauth-callback?error=${encodeURIComponent('Google authentication session error. Please try again.')}&code=session_error`);
     }
 
     const userAuthInfo = req.user as any;
-    const portalState = req.query.state as string;
-    let targetFrontendUrl = PARTNER_FRONTEND_URL;
-    if (portalState === 'customer') {
-        targetFrontendUrl = CUSTOMER_FRONTEND_URL;
-    } else if (portalState === 'genius') {
-        targetFrontendUrl = GROWTH_GENIUS_CHAT_URL;
-    }
+    const targetFrontendUrl = portalFrontendUrl(req.query.state);
 
     if (!userAuthInfo || !userAuthInfo.token) {
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
@@ -374,12 +373,7 @@ router.get('/google/callback',
     const state = req.query.state as string;
     
     const customPassportAuthCallback = (err: any, user: any, info: any, status: any) => {
-      let frontendUrl = PARTNER_FRONTEND_URL;
-      if (state === 'customer') {
-        frontendUrl = CUSTOMER_FRONTEND_URL;
-      } else if (state === 'genius') {
-        frontendUrl = GROWTH_GENIUS_CHAT_URL;
-      }
+      const frontendUrl = portalFrontendUrl(state);
 
       if (err) {
         const errMsg = err.message || 'Authentication failed due to an error.';
@@ -444,6 +438,7 @@ router.post('/tasks/:taskId/subscribers', authenticateToken, async (req, res) =>
     }
 
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    forgetSubscriberLookup(taskId);
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error('Error adding subscriber:', error);
