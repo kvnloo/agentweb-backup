@@ -3546,6 +3546,46 @@
     }
   },
   {
+    "name": "read_client_meta_activity",
+    "listed": false,
+    "description": "Read the Meta ad account change history (who changed what, when) for one named client. Admin-only tool, read-only — nothing is written to Meta.\n\nResolves the client the same way assess_client_health does, with one difference: a name that matches more than one client is refused, so pass the exact email when a name is ambiguous.\n\nReturns:\n- 'ad_account_id' and 'client': the account that was actually read and whose it is. Check these before quoting the history.\n- 'events': one page of Meta activity events (event_time, event_type, object_id, object_name, object_type, actor_name, extra_data). When Meta supplies old and new values (for example a budget change), they are also given as 'before' and 'after'. Fields Meta did not return are absent.\n- 'paging': cursors; pass paging.cursors.after as 'after' to read the next page.\n\nA result with success:false means nothing was read ('reason' says why: ambiguous_client, client_not_found, no_meta_connection, credential_pair_mismatch, invalid_argument, meta_read_failed). Never report a failed read as \"no changes\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        },
+        "since": {
+          "type": "string",
+          "description": "ISO date or unix seconds; earliest event."
+        },
+        "until": {
+          "type": "string",
+          "description": "ISO date or unix seconds; latest event."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Events per page (default 50)."
+        },
+        "after": {
+          "type": "string",
+          "description": "Paging cursor from a previous result."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
     "name": "read_email",
     "listed": false,
     "description": "Read-only access to your own connected email accounts (Gmail, Outlook): search, list a folder, or get messages by ID. Available when signed in to Emma (OAuth) or with an API key holding 'email:read'. Cannot send or reply, and cannot read mailboxes shared by teammates.",

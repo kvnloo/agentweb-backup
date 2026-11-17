@@ -46,6 +46,7 @@ import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
+import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
 
 /**
  * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
@@ -127,6 +128,10 @@ export interface MetaToolkitGatewayDeps {
   executeAudience?: (userId: string, args: any) => Promise<any>;
   /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
   getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
+  /** ENG-3127: last-30-day spend of a connected Meta ad account; defaults to a Graph insights read. */
+  accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
+  /** ENG-3134 zoma_ads_report; defaults to runZomaAdsReport (Graph insights read). */
+  runAdsReport?: (account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -246,10 +251,76 @@ export async function resolveMetaToolkitAdAccount(
   requestedAccountId: unknown,
   deps: MetaToolkitGatewayDeps = defaultDeps,
 ): Promise<string> {
-  const resolved = resolveProviderAccount(META_PROVIDER, await deps.listAccounts(userId), requestedAccountId, deps.now());
+  const accounts = await deps.listAccounts(userId);
+  const now = deps.now();
+  const resolved = resolveProviderAccount(META_PROVIDER, accounts, requestedAccountId, now);
   if (resolved.ok) return resolved.accountId;
-  if (resolved.kind === 'ambiguous') throw new MetaToolkitRefusal(resolved.message);
+  if (resolved.kind === 'ambiguous') {
+    const usable = accounts.filter((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now));
+    const picked = await pickActiveMetaAccount(userId, usable, deps);
+    if (picked) return picked;
+    throw new MetaToolkitRefusal(ambiguousAccountMessage(usable));
+  }
   throw new MetaToolkitAuthError(resolved.message, 403);
+}
+
+/**
+ * ENG-3127: with several usable Meta ad accounts and no account_id, run against the one account
+ * that is actually advertising (strictly highest last-30-day spend, > 0). A tie or no spend
+ * anywhere still refuses, but the refusal names every account so the agent can pick one.
+ * Cached per user for 10 minutes so the spend probe is not repeated on every call.
+ */
+const ACTIVE_ACCOUNT_TTL_MS = 10 * 60 * 1000;
+const activeAccountCache = new Map<string, { key: string; accountId: string | null; at: number }>();
+
+export function __resetActiveMetaAccountCache() {
+  activeAccountCache.clear();
+}
+
+async function defaultAccountSpend(account: ConnectedAccount, accountId: string): Promise<number> {
+  const token = (account.config as any)?.access_token;
+  if (!token) return 0;
+  const url = `https://graph.facebook.com/v21.0/act_${accountId}/insights?fields=spend&date_preset=last_30d&access_token=${encodeURIComponent(token)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) return 0;
+  const body: any = await res.json();
+  return Number(body?.data?.[0]?.spend ?? 0) || 0;
+}
+
+async function pickActiveMetaAccount(
+  userId: string,
+  usable: ConnectedAccount[],
+  deps: MetaToolkitGatewayDeps,
+): Promise<string | null> {
+  const ids = usable.map((a) => META_PROVIDER.accountIds(a)[0]).filter(Boolean);
+  const key = [...ids].sort().join(',');
+  const now = deps.now();
+  const cached = activeAccountCache.get(userId);
+  if (cached && cached.key === key && now - cached.at < ACTIVE_ACCOUNT_TTL_MS) return cached.accountId;
+
+  const spendOf = deps.accountSpend ?? defaultAccountSpend;
+  const spends = await Promise.all(
+    usable.map(async (a) => {
+      const id = META_PROVIDER.accountIds(a)[0];
+      try {
+        return { id, spend: await spendOf(a, id) };
+      } catch {
+        return { id, spend: 0 };
+      }
+    }),
+  );
+  spends.sort((x, y) => y.spend - x.spend);
+  const top = spends[0];
+  const accountId = top && top.spend > 0 && (spends.length < 2 || top.spend > spends[1].spend) ? top.id : null;
+  activeAccountCache.set(userId, { key, accountId, at: now });
+  return accountId;
+}
+
+function ambiguousAccountMessage(usable: ConnectedAccount[]): string {
+  const list = usable
+    .map((a) => `${(a as any).account_name || 'Meta ad account'} (${META_PROVIDER.accountIds(a)[0]})`)
+    .join(', ');
+  return `Multiple Meta ad accounts are connected and none is clearly the active one; pass account_id. Connected: ${list}.`;
 }
 
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
@@ -282,17 +353,46 @@ export function stripCredentials<T>(value: T, depth = 0): T {
   return out as T;
 }
 
+type MetaToolkitCallRequest = { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string };
+
+/**
+ * A failure whose reason the caller must be able to read: a refusal, or a 403 about the caller's own
+ * connection ("No usable Meta ad account is connected"). 401, 429 and 503 stay protocol errors because
+ * the OAuth challenge and retry handling depend on them.
+ */
+function isReadableFailure(error: unknown): error is Error {
+  return error instanceof MetaToolkitRefusal || (error instanceof MetaToolkitAuthError && error.status === 403);
+}
+
 /**
  * Full external call: authenticate → resolve account → execute → meter once on success.
  * A refused or failed call is not metered.
  */
-export async function handleMetaToolkitCall(
-  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string; ref?: string },
-  deps: MetaToolkitGatewayDeps = defaultDeps,
-) {
+export async function handleMetaToolkitCall(request: MetaToolkitCallRequest, deps: MetaToolkitGatewayDeps = defaultDeps) {
   const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  try {
+    return await runAuthenticatedMetaToolkitCall(caller, request, deps);
+  } catch (error) {
+    // Databricks' gateway replaces the text of every MCP tool error with a generic "The external MCP tool
+    // failed" line, so the model and the user never see why a call was refused (read-only gate, Meta
+    // rejecting a read, no Meta account connected). Answer those to a Databricks-origin caller as a normal
+    // result carrying the reason. Nothing is loosened: the call was still refused or failed, and it is not
+    // metered (ENG-2747).
+    if (caller.databricksOrigin && isReadableFailure(error)) {
+      return { success: false, message: error.message };
+    }
+    throw error;
+  }
+}
+
+async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, request: MetaToolkitCallRequest, deps: MetaToolkitGatewayDeps) {
   // ENG-2747 (option B): refused before any upstream call or metering.
   if (caller.databricksOrigin && !isDatabricksAllowedCall(request.toolName, request.args)) {
+    // Tool name and action only: arguments can hold ad copy and ids. Shows a model retrying a write.
+    console.warn('[meta-toolkit] databricks read-only gate refused', {
+      tool: String(request.toolName).slice(0, 80),
+      action: typeof request.args?.action === 'string' ? request.args.action.slice(0, 40) : undefined,
+    });
     throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
   }
   const meter = (platform?: string) => {
@@ -417,6 +517,18 @@ export async function handleMetaToolkitCall(
   return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+
+  // ENG-3134: reporting on the resolved (owned, usable) account with that connection's own token.
+  if (isZomaAdsReportTool(request.toolName)) {
+    const account = (await deps.listAccounts(caller.userId)).find(
+      (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
+    );
+    if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
+    const report = await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
+    await meter('meta');
+    journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
+    return stripCredentials(report);
+  }
 
   if (isSignalsRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');

@@ -1,3 +1,115 @@
+## ENG-3076: group-email send builds each recipient message in one place (2026-11-16)
+
+- `buildGroupEmailRecipientMessage` in `backend/src/routes/crm.ts` now builds subject, html, text and List-Unsubscribe headers for both the background mailbox run and the in-request loop. Behavior unchanged; a characterization test asserts both paths produce the identical message.
+
+## ENG-3070: admin read of a named client's Meta change history (2026-11-16)
+
+New admin-only tool `read_client_meta_activity` (`backend/src/mcp/server/apiTools.ts`) calls `GET /api/client-health/:client/meta-activity`, served by `readClientMetaActivity` in `backend/src/services/clientHealthService.ts`. It reads one page of the Meta `activities` edge for the named client's ad account through the existing `executeActivityLogRead` (`backend/src/mcp/metaToolkitDiagnostics.ts`). Nothing is written to Meta. The tool is not listed on the public MCP surface.
+
+The client lookup and the account/token pairing were lifted out of `assessClientHealth` into `findClientMatches` and `resolveClientMetaAccount`; `assessClientHealth` calls both and still takes the first name match. The new read refuses instead when a name matches more than one client.
+
+Every failure returns `success: false` with a `reason`: `not_admin`, `client_not_found`, `ambiguous_client`, `no_meta_connection`, `credential_pair_mismatch`, `invalid_argument`, `meta_read_failed`. A failed Meta read is never returned as an empty history. A connected account that has an id but no token of its own is not read with the shared token.
+
+`before` and `after` are Meta's own `extra_data.old_value` / `new_value`, passed through unchanged; their inner shape per event type was not checked against a live account.
+
+## ENG-3067: shadow-only claim check on server-side outreach drafts (2026-11-16)
+
+`backend/src/services/outreachClaimCheck.ts` adds `findUnsupportedSenderClaims`, a pure function (no I/O, no LLM, no network) that returns percentages, money amounts, numbers with a unit and named customers/partners a draft states which the sender's `brandData` and market strategy text do not contain. Anything in the lead record counts as the recipient's and is not flagged. Missing facts return `{ status: 'no_facts' }`.
+
+`updateEmailDraftForLead` (`backend/src/emma/impl/leads.ts`) calls `logOutreachClaimCheckShadow` after the email draft and after the LinkedIn note. It logs one JSON line, `event: outreach_claim_check_shadow`, with channel, lead list ID and counts by kind. No draft text is logged. It never blocks, rewrites or surfaces anything, and an error inside it is swallowed.
+
+A zero count is not proof a draft is grounded. The check cannot see qualitative claims, spelled-out or paraphrased numbers, a supported number attached to the wrong thing, or customer names outside its trigger phrases.
+
+## ENG-2783: hot lead calls launch fixes (2026-11-16)
+
+Found by walking the customer path before launch; each checked against the code and prod data first.
+
+- The portal read-out told a customer on the right plan "Your plan may not include hot-lead calls" once the paid add-on was required and not yet bought. `entitled` is now the plan check, and a blocker explains the add-on and that Emma sells it (the portal cannot buy it). An org that is already on and has lost the add-on sees the same blocker in Emma's read-out.
+- Emma no longer sells the add-on while the global `hot_lead_call_mode` switch is off, and checks again right before charging: setup does not need the switch, so without this a customer could pay $70 for calls that cannot happen. An org that already has the add-on is not blocked.
+- The add now confirms the created item with a read before mirroring it, and refuses when the read fails (the retry finds the paid item, no second charge). Duplicate-item cleanup moved to a helper that works on the items just read.
+- Launch order, because of who is on which plan (27 of 33 Pro accounts have no Stripe subscription): billing required first, then tick `hot_lead_call` on the plans, then the kill switch. Ticking a plan while billing is off lets every owner on it call at AgentWeb's Twilio cost.
+
+## ENG-2783: hot lead calls add-on, findings from the Stripe sandbox run (2026-11-16)
+
+The real add-on code was run against a Stripe sandbox account (test mode); two problems turned up.
+
+- The idempotency key repeats within a minute, so cancelling the add-on and buying it again at once made Stripe replay the first response, an item that was already removed. The add reported success and mirrored an item that does not exist. It now writes the mirror only when the created item is really on the subscription, and otherwise asks the customer to try again in a couple of minutes.
+- The plan lookup (`findBasePlanItem`) skipped only the seat item. The add-on item comes from price_data, so if it ever listed first it would be read as the plan: wrong tier, and a plan change could overwrite the add-on's price. It now skips the add-on item too, and the three tier-derivation sites that read `items.data[0]` use it.
+
+## ENG-2783: hot lead calls add-on, review fixes (2026-11-16)
+
+Four review findings on the billing add-on (#4048), each checked against the code before the change.
+
+- A mirror write that fails after the customer paid no longer reports success. `addHotLeadCallBilling` throws a plain "payment went through, calling is still off, try again" message, so the settings are not written; the retry finds the paid item in Stripe and writes the mirror without a second charge.
+- A duplicate add-on item left by a failed cleanup is retried on the next add (the already-present path now removes duplicates too). A cleanup failure is logged, never thrown, because the add-on is paid.
+- The webhook mirror never decides from an event payload when Stripe cannot be read: the mirror is left unchanged. Cost: a cancellation event whose live read fails is not applied until the next event or the next enable. The webhook writer still never throws (a throw would make Stripe replay the whole subscription handler); that part of the finding was not taken.
+- The approval card wording follows the billing model (`addon`) and not whether a purchase is needed (`purchase`): an organization that already has the add-on is told it covers the calls, not asked to approve per-minute billing.
+- The enable approval digest also covers whether the approval buys the add-on, so an approval given while the add-on was active cannot authorize a charge if the mirror lapses before the answer (found by the pre-merge review).
+
+## ENG-3062: consolidation PR title no longer names an issue (2026-11-16)
+
+The dev.md consolidation workflow titled every PR `... (ENG-809)`. Linear links
+a PR to an issue id in its title, so each run moved ENG-809 to In Progress and
+then Merged, long after it was verified. The title and body now carry no issue
+id; the body still names the workflow file. Do not put an issue id in the title
+or body of any recurring bot PR.
+
+## ENG-3056: six pixel rule write rows in the Zoma parity matrix are not applicable (2026-11-16)
+
+`backend/src/mcp/zomaMetaParityMatrix.ts` no longer lists `ads_pixel_event_create/update/delete` and
+`ads_pixel_parameter_create/update/delete` as gaps. They are `not_applicable`: Meta's public Marketing API
+reference documents no write for pixel event rules or parameter extractors.
+
+Checked 2026-11-16 (v25.0 reference):
+
+- `ads-pixel/event_rules`: read only. Creating, updating and deleting each say "You can't perform this operation on this endpoint."
+- `ads-pixel/extractors`: read only, same three statements.
+- `ads-pixel` (Ad Pixel): no other rule or parameter edge. Its own update takes pixel settings only, and it has no delete.
+- No reference page exists for the rule nodes `CalibratorExistingRule` or `SignalsIWLExtractor`.
+
+Meta's own Ads MCP server lists these six tools. How it performs them is not in the public reference.
+No tool, handler or Meta call was added. `ads_pixel_parameter_read` stays a gap (ENG-3055); the public
+`extractors` read exists for it.
+
+## ENG-3029: Grok creator alias rolled back; the entry below this one is partly wrong (2026-11-16)
+
+- Correction to the ENG-3029 entry dated 2026-11-16 ("Grok rows match again"): the `SpaceXAI` -> `xai` alias in `refreshScores` (`AA_CREATOR_ALIASES`) was merged in #4095 and removed the same day in #4097. Grok rows do not match. The live fixture from that entry is unchanged.
+- Why: with the alias, monitor workflow run 43787084872 matched `grok-4.7` and proposed 46.4 -> 35.5 from the feed while `grok-4.6` stayed unmatched at 44.3, and the "Grok 4.7 supersedes 4.6" invariant failed the run. The feed is Intelligence Index v5; the registry's older scores are on an earlier scale.
+- Do not re-add the alias before the score-scale mix is decided (ENG-3054).
+
+## ENG-3029: Artificial Analysis jest fixture is now a live capture; Grok rows match again (2026-11-16)
+
+- Step 2 of 2. `backend/src/services/agentMode/__tests__/fixtures/artificialAnalysisLanguageModelsFree.json` is no longer the documented example. It is 7 rows, verbatim, from the first response page uploaded by workflow run 43771490745 (2026-11-15). The rows cover: scored and unscored, `performance_v3` null and present, cost block null and present, all-null pricing, an integer score.
+- The live rows showed one parser defect. The current endpoint names Grok's lab `SpaceXAI`; the retired one sent a slug that normalized to `xai`. Every `x-ai/*` registry entry therefore reported "AA unmatched" and kept its old score. `refreshScores` now maps that one creator name to `xai` (`AA_CREATOR_ALIASES` in `modelCatalogRefresh.ts`).
+- Not changed: `Alibaba` (registry provider `qwen`) and `Kimi` (`moonshot`) also do not match by name. Those entries carry hand-picked variant scores and did not match on the old endpoint either, so matching them is a separate decision.
+- The fixture is one trimmed page of four. Rows on pages 2 to 4 were never captured.
+
+## ENG-3048: the agent run store is ON in production and on staging (2026-11-15)
+
+Correction to three older entries. They say `AGENT_RUN_STORE` is unset in production. That is no longer true.
+
+- ENG-2773 (2026-11-01): "Dark: active only with `AGENT_RUN_STORE=true` (unset in production)".
+- ENG-112 (2026-10-08): "The run store is OFF in production today (`AGENT_RUN_STORE` unset), so only the in-process layer is live there."
+- ENG-110 (2026-10-13), accepted risk: "AW-AgentRuns / AGENT_RUN_STORE is not provisioned".
+
+Read from Elastic Beanstalk on 2026-11-15: `Agentweb-backend-env-prod-3` has `AGENT_RUN_STORE=true`. So in production the `idem#` submit locks (session create, plan session, chat branch, interactive submit) and the `run#` records are live. The ENG-112 note about a 409 `DUPLICATE_SUBMIT` on a retry that lands on another instance describes real production behaviour, not a dark path. The same stale sentence is in a comment at `backend/src/services/agentMode/chatBranching.ts:659`; it was not changed here.
+
+Staging now matches. `AGENT_RUN_STORE=true` was set as an environment property on `Agentweb-backend-env-1` (the environment `staging-backend.yml` deploys, `NODE_ENV=development`) on 2026-11-16 UTC. It is an EB property, not repo config: no file in the repo owns staging environment variables, and `.github/scripts/staging-env-override.sh` is for temporary overrides only. Rollback: remove the property from the environment (the app restarts).
+
+Things to know when testing on staging:
+
+- Table is `Dev-AW-AgentRuns` (us-west-2), hash key `pk`.
+- TTL is disabled on `Dev-AW-AgentRuns` (enabled on `ttl` in production). Locks still expire, because `claimIdempotency` treats an expired row as free. Rows are never deleted on dev, so the table only grows. Enabling TTL is a retention decision tracked on ENG-3050.
+- The backend reaches DynamoDB with the `aw_backend_user` access key from the environment, not the instance role.
+- Session create with a repeated `idempotencyKey` now returns the first session with `idempotentReplay: true` (200) instead of a second session (201). Checked on staging 2026-11-16 00:26Z: before the change two calls with one key gave two sessions; after it they gave one session and one `idem#` row.
+
+## ENG-3039: eb-deploy.sh no longer fails an applied release because a later update is running (2026-11-15)
+
+- Cause of the 2026-11-06 false failure (run 42150471207): EB finished rolling out `backend-20261106-pr3910` at 02:53:52Z; at 02:54:00Z an environment-variable change made outside the workflow (CloudTrail `UpdateEnvironment` with `optionSettings`, principal `harsha-swarm`) started a second Immutable update that ran to 03:21:06Z. The environment was Ready for less than one 15s poll, so the script only ever saw `Updating` on the expected version and failed on the 2700s budget, 22 minutes after the release was serving.
+- `verify_deployment` now treats `Status=Updating` on the expected version as success only when both hold: EB's INFO events since `update-environment` was accepted show "Environment update is starting." followed by "New application version was deployed to running EC2 instances.", and `underlying_health_verdict` reports every instance Ok and every target healthy. Anything less keeps polling against the same budget, so a rollout that is stuck still fails.
+- The 2026-11-13 failure (run 43424274684) was a correct verdict and is unchanged: the script arrived one minute into a manual configuration update that took 1474s, against a 1200s settle cap. Measured Immutable update durations in the two windows: 1381s, 1626s, 1405s, 1474s. The budgets in `deploy.yml` are not changed here.
+- Both foreign updates were environment-variable changes on prod made while a deploy was in flight. Each one costs a full Immutable replacement (23 to 27 minutes) and blocks the next deploy for that long.
+
 ## ENG-3038: consolidate PRs had no CI because GITHUB_TOKEN events start no workflows (2026-11-15)
 
 - Cause: `dev-md-fragments.yml` opens and force-updates the `automation/dev-md-consolidate` PR with the workflow's own `GITHUB_TOKEN`. GitHub starts no workflow for an event made by that token, so every `pull_request` run on that PR (actor `github-actions[bot]`) has zero jobs: `failure` on the opened pair (43755763117 / 43755763155), `action_required` on later updates (43761230507 / 43761230577).

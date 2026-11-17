@@ -42,7 +42,6 @@ jest.mock('../utils/sseProgress', () => ({
 
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, percentUsed: 0 }),
-  incrementUserTokenUsage: jest.fn(),
 }));
 
 // Only the login check is replaced; the rest of the auth module stays real for the controller.

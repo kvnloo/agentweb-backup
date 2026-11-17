@@ -107,10 +107,13 @@ jobs:
           base: main
           author: deploy <deploy@agentweb.pro>
           committer: deploy <deploy@agentweb.pro>
-          title: 'docs(dev.md): consolidate pending fragments (ENG-809)'
+          # ENG-3062: no issue id in the title or body. Linear links a PR to
+          # any issue id it finds there and moves that issue with the PR, so
+          # every consolidation run reopened the issue it named.
+          title: 'docs(dev.md): consolidate pending fragments'
           commit-message: 'docs(dev.md): consolidate pending fragments'
           body: |
-            Automated by `.github/workflows/dev-md-fragments.yml` (ENG-809).
+            Automated by `.github/workflows/dev-md-fragments.yml`.
 
             Folds every `dev/pending/*.md` fragment on `main` into `dev.md`
             (newest first) and deletes the fragments. The consolidation script

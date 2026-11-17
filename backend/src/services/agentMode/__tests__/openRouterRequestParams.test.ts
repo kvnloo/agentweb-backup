@@ -94,8 +94,8 @@ describe('assertOpenRouterToolsSupported (ENG-1831)', () => {
 });
 
 describe('openRouterIgnoredProviders', () => {
-  it('ignores only the degraded Google BYOK slot, only for Gemini (ENG-1702)', () => {
-    expect(openRouterIgnoredProviders('google/gemini-3.5-flash')).toEqual(['Google']);
+  it('excludes no provider, so Gemini can use the Vertex BYOK slot (ENG-2704)', () => {
+    expect(openRouterIgnoredProviders('google/gemini-3.5-flash')).toEqual([]);
     expect(openRouterIgnoredProviders('anthropic/claude-opus-5')).toEqual([]);
   });
 });

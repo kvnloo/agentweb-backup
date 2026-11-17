@@ -75,7 +75,6 @@ jest.mock('../services/agentMode/concurrentGenerationCap', () => {
 jest.mock('../services/llmUsagePolicyResolverService', () => ({ getEffectiveLlmUsagePolicy: jest.fn() }));
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(),
-  incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
 }));
 jest.mock('../utils/sseProgress', () => ({

@@ -97,6 +97,10 @@ export interface MetaPagesDeps {
   readGraph: (userId: string, accountId: string, path: string, params: Record<string, string>) => Promise<any>;
 }
 
+/** Unverified: third-party guides say the Ad Library API needs the Facebook user to have confirmed their identity (facebook.com/ID). */
+const AD_LIBRARY_ACCESS_HINT =
+  ' Meta may require the connected Facebook account to have confirmed its identity at https://www.facebook.com/ID before it allows Ad Library searches.';
+
 const defaultDeps: MetaPagesDeps = {
   readGraph: async (userId, accountId, path, params) => {
     const { agentModeService } = await import('../services/agentModeService');
@@ -126,7 +130,17 @@ export async function runMetaPagesTool(name: MetaPagesToolName, userId: string, 
     try {
       return await deps.readGraph(userId, accountId, path, params);
     } catch (error: any) {
-      throw new MetaToolkitRefusal(`Could not read from Meta: ${error?.metaError?.message || error?.message || 'Meta request failed'}.`);
+      const meta = error?.metaError;
+      const detail = String(meta?.message || error?.message || 'Meta request failed');
+      // A refusal is not logged anywhere else, so a Meta rejection of the Ad Library read left no trace (ENG-2747).
+      // Meta's error fields only: the raw axios error carries the access token and is never logged.
+      if (path === 'ads_archive') {
+        console.warn('[meta-toolkit] ads_library_search rejected by Meta', { code: meta?.code, subcode: meta?.error_subcode, message: detail.slice(0, 300) });
+      }
+      // Only Meta's "application does not have permission" (code 10) or an explicit identity message: a plain
+      // missing-scope error ("Requires ads_read permission") is a different problem and gets no hint.
+      const needsIdentity = path === 'ads_archive' && (meta?.code === 10 || /identity/i.test(detail));
+      throw new MetaToolkitRefusal(`Could not read from Meta: ${detail}.${needsIdentity ? AD_LIBRARY_ACCESS_HINT : ''}`);
     }
   };
   const acct = `act_${String(accountId).replace(/^act_/, '')}`;
