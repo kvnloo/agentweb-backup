@@ -173,6 +173,14 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       refused(r);
       expect(readS3).not.toHaveBeenCalled();
     });
+
+    // The policy lets ANY signed-in user read anonymous-visitor files, so this is the case where only the "no usable caller" guard
+    // stands between a caller-less run and a read (an ordinary key is refused by the policy anyway and would not prove the guard).
+    it.each([[undefined], [''], ['   ']])('does not let a caller-less run read a file the policy opens to any signed-in user (%j)', async (caller) => {
+      const r = await performDataAnalysis([`s3://${OUR_BUCKET}/users/anon_abc123/files/1/abc/plan.csv`], 'summarise', caller as any);
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+    });
   });
 
   describe('bare tool-response keys', () => {
