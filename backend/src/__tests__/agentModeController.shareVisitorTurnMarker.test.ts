@@ -229,17 +229,17 @@ describe('a visitor\'s stop cannot cancel an owner turn that is still STARTING (
     expect(markerDuringTurn).toBe(false);
   });
 
-  it('a visitor (no login, a colleague, a delegate) is marked, once, before generation starts', async () => {
+  it('a visitor (no login, a colleague, a delegate) is marked before generation starts (by the check after the claim, and again, idempotently, by the owner-turn decision)', async () => {
     mockWorkerService.runInWorker.mockImplementation(async () => { markerDuringTurn = isShareVisitorTurn(SESSION_ID); return workerResponse as any; });
     await agentModeController.generateSharedResponse(shareRequest(), fakeRes());
-    expect(markSpy).toHaveBeenCalledTimes(1);
-    expect(markSpy).toHaveBeenCalledWith(SESSION_ID);
+    expect(markSpy).toHaveBeenCalledTimes(2);
+    expect(markSpy.mock.calls.every((call) => call[0] === SESSION_ID)).toBe(true);
     expect(markerDuringTurn).toBe(true);
 
     markSpy.mockClear();
     mockGetUserFromToken.mockResolvedValue({ user: { userId: 'colleague' }, decoded: { userId: 'colleague' } });
     await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer colleague.jwt' }), fakeRes());
-    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markSpy).toHaveBeenCalledTimes(2);
   });
 
   it('a visitor\'s stop DURING the gap (lock claimed, owner login still being verified) is ignored; the owner\'s turn runs on uncancelled', async () => {
@@ -264,6 +264,27 @@ describe('a visitor\'s stop cannot cancel an owner turn that is still STARTING (
     await turn;
     expect(cancel).not.toHaveBeenCalled();
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('L2: the first check says OWNER, the later one says not-owner (the login stopped verifying): the turn is marked a visitor\'s, once, before it runs', async () => {
+    mockGetUserFromToken.mockResolvedValueOnce(OWNER_AUTH).mockResolvedValue({ user: null });
+    mockWorkerService.runInWorker.mockImplementation(async () => { markerDuringTurn = isShareVisitorTurn(SESSION_ID); return workerResponse as any; });
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer expiring.jwt' }), fakeRes());
+    expect(mockGetUserFromToken).toHaveBeenCalledTimes(2);
+    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markerDuringTurn).toBe(true);
+    expect(isShareVisitorTurn(SESSION_ID)).toBe(false); // and it went with the lock
+  });
+
+  it('L2 control: owner on both checks is never marked; a visitor on both is marked exactly once (the second mark is idempotent)', async () => {
+    mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), fakeRes());
+    expect(markSpy).not.toHaveBeenCalled();
+
+    mockGetUserFromToken.mockResolvedValue({ user: null });
+    await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer garbage.jwt' }), fakeRes());
+    expect(isShareVisitorTurn(SESSION_ID)).toBe(false);
+    expect(markSpy.mock.calls.every((call) => call[0] === SESSION_ID)).toBe(true);
   });
 
   it('a visitor\'s own turn stays stoppable by that visitor once it is under way', async () => {
@@ -346,6 +367,76 @@ describe('a visitor\'s message preempts only a continuation of a VISITOR\'s turn
     expect(workerCancel()).toHaveBeenCalledWith(SESSION_ID);
     expect(res.status).not.toHaveBeenCalledWith(409);
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  describe('M1: the OWNER logged in on their own share link keeps preempting their own continuation (as before this delta)', () => {
+    const releaseSoon = () => setTimeout(() => releaseSessionGeneration(SESSION_ID), 30);
+    const ownerRequest = () => shareRequest({ authorization: 'Bearer owner.jwt' });
+
+    it('owner login vs the owner\'s own (unmarked) continuation -> preempts, and the turn runs', async () => {
+      mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+      holdContinuation(false);
+      releaseSoon();
+      const res = fakeRes();
+      await agentModeController.generateSharedResponse(ownerRequest(), res);
+      expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+      expect(workerCancel()).toHaveBeenCalledWith(SESSION_ID);
+      expect(res.status).not.toHaveBeenCalledWith(409);
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('owner login vs a VISITOR\'s continuation -> preempts too', async () => {
+      mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+      holdContinuation(true);
+      releaseSoon();
+      const res = fakeRes();
+      await agentModeController.generateSharedResponse(ownerRequest(), res);
+      expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+      expect(res.status).not.toHaveBeenCalledWith(409);
+    });
+
+    it.each([
+      ['no login (a plain visitor)', undefined, { user: null }],
+      ['a garbage or expired login', 'Bearer garbage.jwt', { user: null }],
+      ['a colleague\'s login', 'Bearer colleague.jwt', { user: { userId: 'colleague' }, decoded: { userId: 'colleague' } }],
+      ['an admin delegate token for the owner', 'Bearer delegate.jwt', {
+        user: { userId: OWNER_ID },
+        decoded: { userId: 'admin', delegateAccess: { adminUserId: 'admin', adminEmail: 'a@x.com', targetUserId: OWNER_ID, targetEmail: 'o@x.com' } },
+      }],
+      ['a service self-call token', 'Bearer svc.jwt', { user: { userId: OWNER_ID }, decoded: { userId: OWNER_ID, _svc: true } }],
+    ])('%s vs the owner\'s continuation -> 409 with the held-lock body, nothing cancelled, the continuation keeps its lock', async (_name, authorization, auth) => {
+      mockGetUserFromToken.mockResolvedValue(auth);
+      holdContinuation(false);
+      const res = fakeRes();
+      await agentModeController.generateSharedResponse(shareRequest(authorization ? { authorization } : {}), res);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Session is busy',
+        message: 'A response is already being generated for this session. Please wait.',
+        code: 'SESSION_BUSY',
+        userMessageSaved: false,
+      });
+      expect(cancel).not.toHaveBeenCalled();
+      expect(workerCancel()).not.toHaveBeenCalled();
+      expect(tryClaimSessionGeneration(SESSION_ID, OWNER_ID)).toBe(false);
+    });
+
+    it('an owner login against a plain HELD lock (not a continuation) is still a 409: only continuations are ever preempted', async () => {
+      mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+      tryClaimSessionGeneration(SESSION_ID, OWNER_ID);
+      const res = fakeRes();
+      await agentModeController.generateSharedResponse(ownerRequest(), res);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it('the owner check is asked ONLY in the failed-claim branch (a free session pays nothing extra for it before the lock)', async () => {
+      mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+      mockWorkerService.runInWorker.mockImplementation(async () => { expect(mockGetUserFromToken).toHaveBeenCalledTimes(2); return workerResponse as any; });
+      await agentModeController.generateSharedResponse(ownerRequest(), fakeRes());
+      // (after the claim: the marker check and the owner-turn decision; none for preemption)
+      expect(mockGetUserFromToken).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('preemptAutoContinuationAndWait itself', () => {

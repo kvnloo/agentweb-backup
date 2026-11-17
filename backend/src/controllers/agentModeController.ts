@@ -242,6 +242,13 @@ class ScheduleConsentRaceError extends Error {}
 /** ENG-1048: raised when run history moved out from under an edit's history shed. */
 class ScheduleHistoryRaceError extends Error {}
 
+/**
+ * ENG-2816 (step 3): raised when a VISITOR's edit was built against a version of the schedule that someone else has since written to.
+ * A visitor's edit is diffed against a consistent read (which fields it changed, whether it added a publish tool) and must land on
+ * exactly that version, or nothing is written and the visitor is asked to read the schedule again.
+ */
+class ScheduleChangedUnderEditError extends Error {}
+
 const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 
 /**
@@ -287,35 +294,57 @@ async function applyScheduleEditWithConsentNarrowing(
   // removal, not a value, and it has to ride the same write as the edit that asked
   // for it -- a second call could leave the rename applied with the model still
   // pinned, or the reverse, with nothing to say which landed.
-  removeAttributes?: string[]
+  removeAttributes?: string[],
+  // ENG-2816 (step 3): set ONLY for a share-link visitor's edit: `{ updatedAt }` of the consistent read the edit was diffed against.
+  // Every write below is conditioned on it, so the edit lands on exactly that version or not at all (ScheduleChangedUnderEditError).
+  // An owner's edit passes nothing and is exactly what it was.
+  visitorBaseline?: Record<string, any>
 ): Promise<void> {
   const removals = removeAttributes && removeAttributes.length ? removeAttributes : undefined;
+  const isConditionFailure = (error: any) =>
+    error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException';
+  // Did the schedule move since the visitor's read? A read that fails cannot show it did not, so it counts as moved.
+  const baselineMoved = async (): Promise<boolean> => {
+    try {
+      const fresh = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      return !fresh || fresh.updatedAt !== visitorBaseline!.updatedAt;
+    } catch {
+      return true;
+    }
+  };
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
   const write = async (payload: any, expectation?: Record<string, any>) => {
-    if (shedRunResults && shedRunResults.count > 0) {
-      try {
-        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults, removals);
-      } catch (writeError: any) {
-        // The shed count belongs to the history it was measured against; it cannot be
-        // replayed against a different one. Hand back a conflict instead of retrying.
-        if (
-          writeError?.code === 'ConditionalCheckFailedException' ||
-          writeError?.name === 'ConditionalCheckFailedException'
-        ) {
-          throw new ScheduleHistoryRaceError(
-            `Run history for schedule ${scheduleId} moved while this edit was saving.`
-          );
+    const expected = visitorBaseline ? { ...visitorBaseline, ...(expectation || {}) } : expectation;
+    try {
+      if (shedRunResults && shedRunResults.count > 0) {
+        try {
+          await scheduleDb.updateSchedule(scheduleId, payload, expected, shedRunResults, removals);
+        } catch (writeError: any) {
+          // The shed count belongs to the history it was measured against; it cannot be
+          // replayed against a different one. Hand back a conflict instead of retrying.
+          if (isConditionFailure(writeError)) {
+            throw new ScheduleHistoryRaceError(
+              `Run history for schedule ${scheduleId} moved while this edit was saving.`
+            );
+          }
+          throw writeError;
         }
-        throw writeError;
+        return;
       }
-      return;
+      if (expected || removals) {
+        await scheduleDb.updateSchedule(scheduleId, payload, expected, undefined, removals);
+        return;
+      }
+      await scheduleDb.updateSchedule(scheduleId, payload);
+    } catch (writeError: any) {
+      // A visitor's edit whose baseline moved is a conflict whichever clause tripped (consent, history, or the version itself);
+      // one whose baseline did not move failed on something else, and keeps that handling.
+      if (visitorBaseline && (isConditionFailure(writeError) || writeError instanceof ScheduleHistoryRaceError) && (await baselineMoved())) {
+        throw new ScheduleChangedUnderEditError(`Schedule ${scheduleId} changed while this edit was being saved.`);
+      }
+      throw writeError;
     }
-    if (expectation || removals) {
-      await scheduleDb.updateSchedule(scheduleId, payload, expectation, undefined, removals);
-      return;
-    }
-    await scheduleDb.updateSchedule(scheduleId, payload);
   };
 
   // An edit that does not move the required tools cannot move the scope: plain write.
@@ -6770,8 +6799,8 @@ const VISITOR_TEMPLATE_WRITE_REFUSAL = {
  * ENG-2816 (step 3): what a schedule write does to its provenance. A visitor's write marks `fields` (the tracked fields it changes);
  * every other write, the owner's own portal save included, leaves provenance alone. Nothing but the adopt route takes a mark off.
  */
-function provenancePlanForWrite(req: Request, fields: string[]) {
-  return planProvenanceChange({ visitorWrite: isVisitorScheduleWrite(req), fields });
+function provenancePlanForWrite(visitorWrite: boolean, fields: string[]) {
+  return planProvenanceChange({ visitorWrite, fields });
 }
 
 /**
@@ -13233,14 +13262,19 @@ export const agentModeController = {
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
       // ENG-1239: unless it's a background media auto-continuation holding the lock —
       // preempt that instead (see the regular /generate path above).
-      // ENG-2816 (step 3): ...but only a continuation of a VISITOR's turn; an owner's own continuation answers like a held lock.
-      if (!tryClaimSessionGeneration(session.sessionId, session.userId) && !(await preemptAutoContinuationAndWait(session.sessionId, session.userId, true))) {
-        return res.status(409).json({
-          error: 'Session is busy',
-          message: 'A response is already being generated for this session. Please wait.',
-          code: 'SESSION_BUSY',
-          userMessageSaved: false,
-        });
+      // ENG-2816 (step 3): ...but a NON-owner request may preempt only a continuation of a VISITOR's turn; an owner's own continuation
+      // answers it like a held lock. The OWNER, logged in on their own share link, preempts as they always did: their own typed
+      // message takes priority over their own background continuation. (Asked only here, in the failed-claim branch.)
+      if (!tryClaimSessionGeneration(session.sessionId, session.userId)) {
+        const onlyVisitorContinuations = !(await isSessionOwnerRequest(req, session.userId));
+        if (!(await preemptAutoContinuationAndWait(session.sessionId, session.userId, onlyVisitorContinuations))) {
+          return res.status(409).json({
+            error: 'Session is busy',
+            message: 'A response is already being generated for this session. Please wait.',
+            code: 'SESSION_BUSY',
+            userMessageSaved: false,
+          });
+        }
       }
 
       try {
@@ -13467,6 +13501,11 @@ export const agentModeController = {
       // link, lock, usage and model check, so it can never stand in for any of them.
       const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
       sharedTurnIsVisitor = !viewerIsOwner;
+      if (!viewerIsOwner) {
+        // ENG-2816 (step 3): the first check (right after the lock claim) may have said "owner" for a login that no longer verifies
+        // here (expired in between, or revoked). Whatever the first said, the turn that actually runs as a visitor is marked (idempotent).
+        markShareVisitorTurn(session.sessionId);
+      }
       if (viewerIsOwner) {
         // ENG-2816 (step 3): the owner's own turn through their share link is not a visitor's: its schedule writes are the owner's,
         // and a visitor's stop must not cancel it.
@@ -14975,6 +15014,9 @@ export const agentModeController = {
   // Create scheduled chat
   async createScheduledChat(req: Request, res: Response) {
     try {
+      // ENG-2816 (step 3): asked ONCE, before anything is awaited. The visitor-turn marker goes with the generation lock, so a
+      // re-evaluation after an await can read false for a request that really was a visitor's.
+      const visitorWrite = isVisitorScheduleWrite(req);
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const {
@@ -15100,14 +15142,17 @@ export const agentModeController = {
         // standing consent to publish unattended that the owner never gave. This existing owner opt-out (no new attribute) makes
         // adopting only lift the limits: the schedule keeps drafting until the owner turns "Require approval before publishing"
         // OFF or grants consent themselves. Owner-created schedules, and visitor EDITS of existing schedules, are untouched.
-        requirePublishApproval: requirePublishApproval === true || isVisitorScheduleWrite(req),
+        requirePublishApproval: requirePublishApproval === true || visitorWrite,
         // ENG-2204: owner opt-OUT for the unattended Slack-send override, same
         // polarity/rationale as requirePublishApproval above. Default false =
         // authorized (an unattended run calls slack_send_message directly when its
         // task asks for it), matching this ticket's fix. Absent from the
         // manage_scheduled_chat MCP allowlist so only a human can set it — same
         // reasoning as requirePublishApproval's own comment above.
-        requireSlackApproval: requireSlackApproval === true,
+        // ENG-2816 (step 3): a Slack send a visitor requires gets the same hold as a publish tool (see requirePublishApproval above):
+        // this gate's default is "authorized", so adopting would otherwise let a visitor-written slack_send_message send unattended.
+        requireSlackApproval: requireSlackApproval === true
+          || (visitorWrite && Array.isArray(requiredFunctionCalls) && requiredFunctionCalls.includes('slack_send_message')),
         // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
         // blocked/recovered" transition email specifically — does not affect the
         // schedule-card badge, per-run emails, or run history, which stay on.
@@ -15193,7 +15238,7 @@ export const agentModeController = {
 
       // ENG-2816 (step 3): a schedule a share-link visitor creates is stored as the owner's own, so say who wrote it: every tracked
       // content field the request carries is marked, in the same write that creates the schedule.
-      if (isVisitorScheduleWrite(req)) {
+      if (visitorWrite) {
         const marks = trackedFieldsInBody(req.body);
         if (marks.length > 0) {
           scheduledChat.provenance = marks;
@@ -15261,7 +15306,8 @@ export const agentModeController = {
         runHealth: computeScheduleRunHealth(runResults, rest),
         // ENG-2816 (step 3): COMPUTED here, never stored. What the portal sends back as `expectedContentVersion` when the owner adopts
         // a visitor-edited schedule, so adopting is bound to the content they were shown (see adoptScheduledChatVisitorEdits).
-        contentVersion: scheduleContentVersion(rest),
+        // A digest that cannot be computed omits the field on that one row: the list itself must never fail for it.
+        ...(() => { try { return { contentVersion: scheduleContentVersion(rest) }; } catch { return {}; } })(),
       }));
 
       // ENG-1611: optional bounded pagination. With neither `limit` nor `cursor`
@@ -15290,6 +15336,8 @@ export const agentModeController = {
   // Update scheduled chat
   async updateScheduledChat(req: Request, res: Response) {
     try {
+      // ENG-2816 (step 3): asked ONCE, before anything is awaited (see createScheduledChat).
+      const visitorWrite = isVisitorScheduleWrite(req);
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
@@ -15323,7 +15371,7 @@ export const agentModeController = {
       // Verify schedule exists and belongs to user (before validation so we can merge)
       // ENG-2816 (step 3): a visitor's write is compared with what is stored NOW (it decides which fields it marks), so it reads
       // consistently; every other caller keeps its read exactly as it was.
-      const existingSchedule = isVisitorScheduleWrite(req)
+      const existingSchedule = visitorWrite
         ? await scheduleDb.getScheduleById(scheduleId, { consistent: true })
         : await scheduleDb.getScheduleById(scheduleId);
       if (!existingSchedule || existingSchedule.userId !== user.userId) {
@@ -15664,8 +15712,21 @@ export const agentModeController = {
         // Self-improve: switching it on makes the next run's owner-powered reflection turn rewrite the prompt from the run's content.
         present.has('selfImprove') && updates.selfImprove !== (existingSchedule.selfImprove === true) && 'selfImprove',
       ].filter((field): field is string => typeof field === 'string');
-      const provenancePlan = provenancePlanForWrite(req, changedTrackedFields);
+      const provenancePlan = provenancePlanForWrite(visitorWrite, changedTrackedFields);
       Object.assign(updates, provenancePlan);
+      // ENG-2816 (step 3): a publish tool or a Slack send that a VISITOR newly adds to a schedule gets the same hold a visitor create
+      // gets, in this same write. Without it, adopting the schedule would read a visitor-added tool as authorized by the legacy
+      // "never asked" default (publish) or the default-authorized Slack gate. Only a tool that was NOT already required, only when the
+      // owner has stored no consent, and only ever to TRUE (an existing hold is never lowered). A visitor write that adds no such tool,
+      // and every owner write, leaves a pre-existing publishing schedule's settings alone.
+      if (visitorWrite && present.has('requiredFunctionCalls')) {
+        const storedRequired: string[] = Array.isArray(existingSchedule.requiredFunctionCalls) ? existingSchedule.requiredFunctionCalls : [];
+        const writtenRequired: string[] = Array.isArray(updates.requiredFunctionCalls) ? updates.requiredFunctionCalls : [];
+        const storedPublishTools = getRequiredPublishTools(storedRequired);
+        const addsPublishTool = getRequiredPublishTools(writtenRequired).some((tool) => !storedPublishTools.includes(tool));
+        if (addsPublishTool && (existingSchedule as any).autopublishAuthorized !== true) updates.requirePublishApproval = true;
+        if (writtenRequired.includes('slack_send_message') && !storedRequired.includes('slack_send_message')) updates.requireSlackApproval = true;
+      }
       if (provenancePlan.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId} edited through a share link; marked [${provenancePlan.provenanceAdd.join(', ')}]`);
       }
@@ -15780,7 +15841,9 @@ export const agentModeController = {
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
             : []),
-        ]
+        ],
+        // ENG-2816 (step 3): a visitor's edit lands on the version it was diffed against, or not at all.
+        visitorWrite ? { updatedAt: existingSchedule.updatedAt } : undefined
       );
 
       res.json({
@@ -15806,6 +15869,16 @@ export const agentModeController = {
       // ENG-1048: the shed was bound to the run history it was measured against, and
       // that history moved, so nothing was written. Ask for a retry rather than
       // replaying a removal count that would now take a prefix too many.
+      // ENG-2816 (step 3): a visitor's edit raced another write to the schedule, so nothing was written. The message reaches the model
+      // through the MCP tool, so it says what to do.
+      if (error instanceof ScheduleChangedUnderEditError) {
+        console.warn(`AgentMode: ENG-2816 visitor schedule edit abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule changed while your edit was being saved, so nothing was saved. Read it again (list_scheduled_chats) ' +
+            'and retry your change.',
+        });
+      }
       if (error instanceof ScheduleHistoryRaceError) {
         console.warn(`AgentMode: ENG-1048 schedule update abandoned — ${error.message}`);
         return res.status(409).json({
@@ -15835,6 +15908,8 @@ export const agentModeController = {
   // Submit variable values for a scheduled chat
   async submitScheduledChatVariables(req: Request, res: Response) {
     try {
+      // ENG-2816 (step 3): asked ONCE, before anything is awaited (see createScheduledChat).
+      const visitorWrite = isVisitorScheduleWrite(req);
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
@@ -15845,7 +15920,7 @@ export const agentModeController = {
       }
 
       // ENG-2816 (step 3): a visitor's write is compared with what is stored NOW (consistent read); everyone else reads as before.
-      const schedule = isVisitorScheduleWrite(req)
+      const schedule = visitorWrite
         ? await scheduleDb.getScheduleById(scheduleId, { consistent: true })
         : await scheduleDb.getScheduleById(scheduleId);
       if (!schedule || schedule.userId !== user.userId) {
@@ -15877,7 +15952,7 @@ export const agentModeController = {
         const stored = (schedule.variableValues as Record<string, unknown> | undefined)?.[variable.name];
         if (typeof stored === 'string' && stored.trim().length > 0) storedForSubmission[variable.name] = stored.trim();
       });
-      const submissionProvenance = provenancePlanForWrite(req, isDeepStrictEqual(sanitizedValues, storedForSubmission) ? [] : ['variableValues']);
+      const submissionProvenance = provenancePlanForWrite(visitorWrite, isDeepStrictEqual(sanitizedValues, storedForSubmission) ? [] : ['variableValues']);
       if (submissionProvenance.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId}: variable values submitted through a share link; marked [${submissionProvenance.provenanceAdd.join(', ')}]`);
       }
@@ -19052,6 +19127,8 @@ export const agentModeController = {
   // POST /api/agent-mode/schedule-templates/:templateId/use
   createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
+      // ENG-2816 (step 3): asked ONCE, before anything is awaited (see createScheduledChat).
+      const visitorWrite = isVisitorScheduleWrite(req);
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { templateId } = req.params;
@@ -19180,8 +19257,10 @@ export const agentModeController = {
         variableValuesUpdatedAt: now.toISOString(),
         // ENG-2816 (step 3): same as createScheduledChat: a schedule a visitor creates from a template holds at the publish step
         // until the owner decides, so adopting it does not also switch on unattended publishing.
-        ...(isVisitorScheduleWrite(req) ? { requirePublishApproval: true } : {}),
+        ...(visitorWrite ? { requirePublishApproval: true } : {}),
       };
+      // ...and a Slack send it requires holds too (the Slack gate's default is "authorized").
+      if (visitorWrite && scheduledChat.requiredFunctionCalls.includes('slack_send_message')) scheduledChat.requireSlackApproval = true;
 
       // ENG-1552: a template-created schedule is live the moment it exists, like
       // createScheduledChat's — same authorized-recipient gate, same shadow mode.
@@ -19202,7 +19281,7 @@ export const agentModeController = {
       // ENG-2816 (step 3): a schedule a share-link visitor creates from a template is a visitor's schedule. The content comes from the
       // template, and a template carries no provenance of its own (a visitor may have written it), so every tracked field is
       // marked, not just the ones the request names. Over-marking is safe; the owner adopts it.
-      if (isVisitorScheduleWrite(req)) {
+      if (visitorWrite) {
         scheduledChat.provenance = [...SCHEDULE_PROVENANCE_FIELDS];
         console.log(`[ENG-2816] schedule ${scheduleId} created from template ${templateId} through a share link; marked every tracked field`);
       }
