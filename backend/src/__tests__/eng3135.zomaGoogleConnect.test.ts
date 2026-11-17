@@ -97,7 +97,7 @@ describe('GET /api/oauth/google-ads/callback', () => {
     const expired = jwt.sign({ userId: 'u1', zoma: ZOMA_MCP_SETUP, nonce: 'n' }, getJwtSecret(), { expiresIn: -60 });
     const res = await request(app).get('/callback').query({ code: 'c0de', state: expired });
     expect(res.headers.location).toMatch(/^\/api\/zoma\/google\/callback\?/);
-    expect(await completeGoogleConnect({ code: 'c0de', state: expired }, defaultZomaGoogleDeps)).toMatchObject({ kind: 'page', status: 400 });
+    expect(await completeGoogleConnect({ code: 'c0de', state: expired }, { ...defaultZomaGoogleDeps, enabled: () => true })).toMatchObject({ kind: 'page', status: 400 });
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
   it('a forged (wrongly signed) state is not treated as Zoma', async () => {
@@ -117,6 +117,7 @@ describe('completeGoogleConnect', () => {
   const deps = (over: Partial<ZomaGoogleDeps> = {}): ZomaGoogleDeps => ({
     ...defaultZomaGoogleDeps,
     mintLink: jest.fn().mockResolvedValue('https://accounts.google.com/o/oauth2/v2/auth?state=fresh'),
+    enabled: () => true,
     ...over,
   });
 
@@ -256,6 +257,9 @@ describe('completeGoogleConnect', () => {
 });
 
 describe('POST /api/zoma/google/select + GET /api/zoma/google/callback routes', () => {
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
+  beforeAll(() => { process.env.ZOMA_GOOGLE_ENABLED = 'true'; });
+  afterAll(() => { if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED; else process.env.ZOMA_GOOGLE_ENABLED = prev; });
   const app = express().use(express.urlencoded({ extended: false })).use('/api/zoma', createZomaRouter());
   it('renders the connected page on Zoma (not a redirect to the portal)', async () => {
     const res = await request(app).get('/api/zoma/google/callback').query({ code: 'c', state: zomaState() });

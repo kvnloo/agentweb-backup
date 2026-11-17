@@ -56,8 +56,8 @@ describe('ENG-2865 toolkit aw_ key scopes', () => {
   });
 
   it('read-only key: Google Ads write is denied before the Google stack runs', async () => {
-    const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    const prev = process.env.ZOMA_GOOGLE_ENABLED;
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     try {
       const { deps, raw, authorization } = makeDeps(['tools:read']);
       await expect(handleMetaToolkitCall({
@@ -68,7 +68,7 @@ describe('ENG-2865 toolkit aw_ key scopes', () => {
       expect(raw.listAccounts).not.toHaveBeenCalled();
       expect(raw.recordWrite).not.toHaveBeenCalled();
     } finally {
-      if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED; else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+      if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED; else process.env.ZOMA_GOOGLE_ENABLED = prev;
     }
   });
 
