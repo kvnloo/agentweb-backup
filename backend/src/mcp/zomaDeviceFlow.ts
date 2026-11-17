@@ -834,7 +834,7 @@ export type PollResult =
   | { status: 400; body: { error: 'authorization_pending'; error_description: string; next_step: 'sign_in'; link: string; interval: number } }
   | { status: 400; body: { error: 'slow_down'; error_description: string; interval: number } }
   | { status: 400; body: { error: 'expired_token' | 'access_denied' | 'invalid_grant' | 'invalid_request'; error_description: string } }
-  | { status: 200; body: { next_step: ZomaLinkStep; link?: string; message?: string; guide?: readonly string[]; interval: number } }
+  | { status: 200; body: { next_step: ZomaLinkStep; link?: string; message?: string; guide?: readonly string[]; note?: string; interval: number } }
   | {
       status: 200;
       body: {
@@ -968,7 +968,10 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps, an
     if (state.payment.error && step === 'add_payment') {
       return { status: 200, body: { next_step: step, message: state.payment.error, interval: device.intervalSec } };
     }
-    const guide = step === 'connect_meta' && state.ads_experience === 'new_to_ads' ? { guide: ZOMA_NEW_TO_ADS_STEPS } : {};
+    // The new-advertiser guide already ends with the login note; everyone else gets it on its own.
+    const guide = step !== 'connect_meta'
+      ? {}
+      : state.ads_experience === 'new_to_ads' ? { guide: ZOMA_NEW_TO_ADS_STEPS } : { note: ZOMA_META_LOGIN_NOTE };
     let link: string | undefined;
     try {
       // Meta links are cheap signed URLs (state expires in 10 min), so mint fresh per poll;
