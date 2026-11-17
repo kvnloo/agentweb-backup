@@ -53,8 +53,8 @@ export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => 
  */
 export const ZOMA_GOOGLE_NEW_ACCOUNT_STEPS: readonly string[] = [
   'Create a Google Ads account yourself at https://ads.google.com (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
-  'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign". Zoma never creates a campaign or starts spending when you connect.',
-  'When Google asks for your business country, billing currency and time zone, choose them yourself — Google may pre-fill them from your browser or location, and cannot change them once the account exists.',
+  'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first). Zoma never creates a campaign or starts spending when you connect.',
+  'When Google asks for your billing country, currency and time zone, choose them yourself — Google may pre-fill them from your browser or location, and it does not let anyone change the currency or time zone once the account exists.',
 ];
 
 /** Ad-account setup for someone who has never run ads, in the order they need it. */

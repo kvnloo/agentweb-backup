@@ -162,7 +162,7 @@ describe('completeGoogleConnect', () => {
     expect(step.retryUrl).toContain('accounts.google.com');
     const text = step.steps.join(' ');
     expect(text).toContain('Create an account without a campaign');
-    expect(text).toMatch(/country, billing currency and time zone, choose them yourself/);
+    expect(text).toMatch(/billing country, currency and time zone, choose them yourself/);
     expect(createAccount).not.toHaveBeenCalled();
   });
 
@@ -178,7 +178,7 @@ describe('completeGoogleConnect', () => {
     const text = step.steps.join(' ');
     expect(text).toMatch(/If its setup is unfinished, finish it there; do not create another account yet/);
     expect(text).toContain('Create an account without a campaign');
-    expect(text).toMatch(/Zoma cannot either/);
+    expect(text).toMatch(/Zoma cannot change any of them/);
     expect(text).not.toMatch(/Create a Google Ads account yourself/);
     expect(step.message).toMatch(/deactivated/);
     expect(createAccount).not.toHaveBeenCalled();

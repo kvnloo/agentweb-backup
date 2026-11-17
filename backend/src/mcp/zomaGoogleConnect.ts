@@ -57,8 +57,8 @@ const EXPIRED: PageStep = {
 /** Google lists the account but reports it not enabled (signup unfinished, or deactivated). */
 const UNFINISHED_ACCOUNT_STEPS: readonly string[] = [
   'Open https://ads.google.com signed in with the same Google account and look at that account first. If its setup is unfinished, finish it there; do not create another account yet.',
-  'Check the country, currency and time zone Google shows for it. Google does not let anyone change them once the account exists, and Zoma cannot either. If they are wrong (for example pre-filled from your browser or location), a new account is the only fix: create it yourself, choosing them yourself.',
-  'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign".',
+  'Check the billing country, currency and time zone Google shows for it. Google does not let anyone change the currency or time zone once the account exists, and Zoma cannot change any of them. If they are wrong (for example pre-filled from your browser or location), create a new account yourself and choose them yourself.',
+  'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first).',
 ];
 
 /** A manager (MCC) login with no active client ad account under it. */
@@ -167,7 +167,7 @@ export async function completeGoogleConnect(
       title: 'Google Ads not connected',
       message: scopes
         ? 'Google Ads permission was not granted. Try again and allow all requested permissions (a Google Workspace admin can also restrict third-party apps).'
-        : 'We could not finish connecting Google Ads. Please try again.',
+        : 'We could not finish connecting Google Ads. Please try again. (If this page was reloaded after it said "Google Ads connected", you are already done.)',
     });
   }
 
@@ -206,7 +206,7 @@ async function connectAccounts(userId: string, tokenSessionId: string, customerI
   }
   if (!result.ok) {
     logZomaSetup({ userId, step: 'google_connect', outcome: 'rejected', reason: result.reason });
-    return failedPage(userId, deps, { status: 400, title: 'Google Ads not connected', message: 'This connection expired before it finished.' });
+    return failedPage(userId, deps, { status: 400, title: 'Google Ads not connected', message: 'This connection expired before it finished. (If it already said "Google Ads connected", you are already done.)' });
   }
   logZomaSetup({ userId, step: 'google_connect', outcome: 'ok', reason: `${result.connected}_ad_accounts` });
   return connectedPage(result.connected);
