@@ -22,6 +22,8 @@ import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
 import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 import { validateRef } from '../services/journeyAttribution';
+import { toZomaVoice, zomaErrorNextStep, zomaNextStep } from '../mcp/zomaNextStep';
+import { ZOMA_ADS_EXPERIENCE_QUESTION, ZOMA_WELCOME } from '../mcp/zomaAdsExperience';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -29,10 +31,11 @@ export const META_TOOLKIT_MAX_PER_MINUTE = 60;
 export function sendMetaToolkitError(res: Response, error: unknown) {
   if (error instanceof MetaToolkitAuthError) {
     if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
+    if (error.status === 403) return res.status(403).json({ error: toZomaVoice(error.message), next_step: zomaErrorNextStep(error.message) });
     return res.status(error.status).json({ error: error.message });
   }
   if (error instanceof MetaToolkitRefusal) {
-    return res.status(400).json({ error: error.message });
+    return res.status(400).json({ error: toZomaVoice(error.message), next_step: zomaErrorNextStep(error.message) });
   }
   console.error('[meta-toolkit] call failed:', error instanceof Error ? error.message : error);
   return res.status(500).json({ error: 'Meta Toolkit call failed.' });
@@ -88,14 +91,17 @@ router.get('/tools', async (req: Request, res: Response) => {
 router.post('/tools/:name/call', async (req: Request, res: Response) => {
   try {
     const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const args = body.args && typeof body.args === 'object' ? body.args : {};
     const result = await handleMetaToolkitCall({
       authorization: req.headers.authorization,
       toolName: req.params.name,
-      args: body.args && typeof body.args === 'object' ? body.args : {},
+      args,
       sessionId: typeof body.session_id === 'string' ? body.session_id : undefined,
       userAgent: req.get('user-agent') ?? undefined,
     });
-    return res.json({ result });
+    // ENG-3134: every response names the next step (zoma_status carries its own in `result`).
+    const next = zomaNextStep(req.params.name, args, result);
+    return res.json({ result, ...(next ? { next_step: next } : {}) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -122,10 +128,28 @@ function rpcError(res: Response, id: unknown, code: number, message: string, htt
   return res.status(httpStatus).json({ jsonrpc: '2.0', id: id ?? null, error: { code, message } });
 }
 
-function toolResultContent(result: unknown) {
-  const text = typeof result === 'string' ? result : JSON.stringify(result ?? null);
-  return [{ type: 'text', text }];
+/**
+ * ENG-3134: the result as text (Emma-app references rewritten for Zoma), then — on every response
+ * except the friend path and zoma_status, which carry their own — one "Next step:" line.
+ */
+function toolResultContent(result: unknown, nextStep: string | null) {
+  // The friend path is exactly its one sentence (zoma_status for a "just a friend" answer).
+  const friend = (result as any)?.ads_experience === 'not_interested' && typeof (result as any)?.summary === 'string';
+  const text = friend ? (result as any).summary : toZomaVoice(typeof result === 'string' ? result : JSON.stringify(result ?? null));
+  return [{ type: 'text', text }, ...(nextStep ? [{ type: 'text', text: `Next step: ${nextStep}` }] : [])];
 }
+
+/**
+ * ENG-3134: MCP `instructions` (shown to the agent on connect). The first thing the user hears is
+ * the welcome, then one question; zoma_status records the answer and returns the Meta connect link.
+ */
+export const ZOMA_MCP_INSTRUCTIONS = [
+  `${ZOMA_WELCOME} Zoma lets you run the user's Meta (and Google) ads safely from this chat.`,
+  `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
+    'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
+  'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
+    'Every change to ads is a two-step preview → confirm; never confirm without the user\'s explicit approval. Each tool response ends with the next step to take.',
+].join('\n');
 
 // No SSE stream is offered; MCP Streamable HTTP requires 405 for GET in that case.
 router.get('/mcp', (_req: Request, res: Response) => {
@@ -162,7 +186,8 @@ router.post('/mcp', async (req: Request, res: Response) => {
               ? params.protocolVersion
               : META_TOOLKIT_MCP_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'agentweb-meta-toolkit', version: '1.0.0' },
+          serverInfo: { name: 'agentweb-meta-toolkit', title: 'Zoma', version: '1.0.0' },
+          instructions: ZOMA_MCP_INSTRUCTIONS,
         });
       case 'ping':
         return rpcResult(res, id, {});
@@ -180,21 +205,22 @@ router.post('/mcp', async (req: Request, res: Response) => {
         ) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call arguments must be an object.');
         }
+        const callArgs = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
         try {
           const result = await handleMetaToolkitCall({
             authorization: req.headers.authorization,
             toolName: params.name,
-            args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
+            args: callArgs,
             sessionId: req.get('mcp-session-id') ?? undefined,
             userAgent: req.get('user-agent') ?? undefined,
             // ENG-2906: `?ref=` on the MCP URL; validated (or dropped) when the event is recorded.
             ref: typeof req.query.ref === 'string' ? req.query.ref : undefined,
           });
-          return rpcResult(res, id, { content: toolResultContent(result), isError: false });
+          return rpcResult(res, id, { content: toolResultContent(result, zomaNextStep(params.name, callArgs, result)), isError: false });
         } catch (error) {
           // A refusal is a tool-level failure the model should see, not a transport error.
           if (error instanceof MetaToolkitRefusal) {
-            return rpcResult(res, id, { content: toolResultContent(error.message), isError: true });
+            return rpcResult(res, id, { content: toolResultContent(error.message, zomaErrorNextStep(error.message)), isError: true });
           }
           throw error;
         }
@@ -216,7 +242,9 @@ router.post('/mcp', async (req: Request, res: Response) => {
           ),
         );
       }
-      return rpcError(res, id, -32001, error.message, error.status);
+      // ENG-3134: a 403 is about the caller's own setup ("No usable Meta ad account is connected"); say the fix.
+      const message = error.status === 403 ? `${toZomaVoice(error.message)} Next step: ${zomaErrorNextStep(error.message)}` : error.message;
+      return rpcError(res, id, -32001, message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);
     return rpcError(res, id, -32603, 'Meta Toolkit call failed.');

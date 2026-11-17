@@ -376,7 +376,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -2617,25 +2617,7 @@ export class AgentModeService {
     params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
-      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
-      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
-      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
-      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
-      // Studio" slot, and default routing lands on the degraded one. Skip it
-      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
-      // uptime recovers — remove this then, since it forfeits the BYOK cost
-      // discount in exchange for reliability.
-      //
-      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
-      // are the slugs OpenRouter's separate BYOK-credential-creation API
-      // uses, not what `provider.ignore` matches on here. This param matches
-      // against the `provider_name` string from GET /v1/models/{id}/endpoints
-      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
-      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
-      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
-      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
-      // proposed the slug form once already and was reverted for this reason
-      // — verify empirically against live traffic before changing this line.
+      // No default exclusions today; see openRouterIgnoredProviders.
       params.provider.ignore = ignoredProviders;
     }
     if (providerIgnore?.length) {
@@ -3134,9 +3116,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3170,7 +3151,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two
