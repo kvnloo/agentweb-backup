@@ -11,6 +11,7 @@ import { describeMetaAdsCapability } from '../utils/metaAdsScope';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
+import { withConnectedPlatforms } from '../utils/visibleConnectedPlatforms';
 import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
 import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
@@ -448,8 +449,9 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       };
     });
 
-    // Include allowed platforms so frontend can show/hide platform cards
-    const allowedConnectedAccounts = await getAllowedConnectedAccounts(userId);
+    // Include allowed platforms so frontend can show/hide platform cards. A platform the
+    // user already has connected stays visible even when their plan omits it (ENG-3126).
+    const allowedConnectedAccounts = withConnectedPlatforms(await getAllowedConnectedAccounts(userId), accounts);
 
     res.json({ success: true, accounts: accountsWithStatus, allowedConnectedAccounts });
   } catch (error) {

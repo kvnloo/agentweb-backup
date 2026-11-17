@@ -31,11 +31,20 @@ Alternative (no token): `claude mcp add --transport http zoma https://api.agentw
 `codex mcp add zoma --url https://api.agentweb.pro/api/meta-toolkit/mcp`; the first connection opens the AgentWeb login in the browser.
 
 ## Setup status (each step is verified by a tool — never assume)
-1. Call `zoma_status`. It shows a checklist and the single next step with a link.
-2. Relay the link (add a payment method, then connect Meta). Wait for the user to say they are done.
-3. Call `zoma_status` again. Repeat until it says "All set".
+1. Call `zoma_status`. The first time, it returns "Hey, welcome to Zoma." and one question: "How familiar are you with ads?". Say the welcome, ask the question, and call `zoma_status` again with `ads_experience` set to the answer (`runs_ads`, `new_to_ads` or `not_interested`).
+2. The answer leads straight to the Meta connect link. Relay it as given; the user finishes on Zoma's own pages and comes back to you. Wait for them to say they are done.
+3. Call `zoma_status` again. Repeat until it says "All set"; it then gives this guide's link and a first question to ask.
+4. If the user is "just a friend" (`not_interested`), the whole answer is "Thanks for signing up and trying out Zoma." — relay it and stop.
+
+Every tool response ends with the next step to take.
 
 Reads work without a payment method. Changes to ads need a payment method on file and a connected Meta ad account whose connection granted ads management.
+
+## Reporting: `zoma_ads_report`
+The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC, conversions and ROAS per campaign (or `level: "account"` for one total), read-only.
+- Range: `date_preset` (`today`, `yesterday`, `last_7d` default, `last_14d`, `last_30d`, `last_90d`, `this_month`, `last_month`, `maximum`) or `since` + `until` (`YYYY-MM-DD`).
+- Narrow with `campaign_ids`. Conversions are the account's purchases (else leads, else registrations); pass `conversion_event` to choose a Meta action type. ROAS = purchase value / spend.
+- Example: `{"since": "2026-11-01", "until": "2026-11-15"}` → per-campaign rows, totals and a one-paragraph `summary`.
 
 ## Reads
 - `list_meta_ads_campaigns`, `get_meta_ads_metrics`, `call_meta_ads_insights_api` for campaigns and performance.

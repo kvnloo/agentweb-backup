@@ -5,8 +5,10 @@
  * steps (after Meta, after the account picker, Stripe's success/cancel return) instead of
  * relying on an AgentWeb portal session, which may belong to a different account.
  *
- * These tokens never carry a userId: the user always comes from the device item the token
- * names. They are signed with a key DERIVED from JWT_SECRET (never the raw secret), so a Zoma
+ * Device-flow tokens never carry a userId: the user always comes from the device item the token
+ * names. ENG-3134: an MCP-connected user (OAuth / aw_ key) has no device item, so their Meta
+ * connect state and account picker use `zoma: ZOMA_MCP_SETUP` plus `uid` — the same signed,
+ * short-lived binding the Meta OAuth state itself already carries. They are signed with a key DERIVED from JWT_SECRET (never the raw secret), so a Zoma
  * link token can never verify as an AgentWeb auth token, nor the reverse.
  */
 import crypto from 'crypto';
@@ -20,10 +22,15 @@ export const ZOMA_DONE_PATH = '/api/zoma/done';
 
 export type ZomaLinkPurpose = 'continue' | 'pick_meta_account';
 
+/** `zoma` value of a Meta connect state / picker link minted for an MCP-connected user (no device). */
+export const ZOMA_MCP_SETUP = 'mcp';
+
 export interface ZomaLinkClaims {
   purpose: ZomaLinkPurpose;
-  /** deviceId (sha256 of the device_code) of the setup this link belongs to. */
+  /** deviceId (sha256 of the device_code) of the setup this link belongs to, or ZOMA_MCP_SETUP. */
   zoma: string;
+  /** ZOMA_MCP_SETUP links only: the user the link was minted for. */
+  uid?: string;
   /** pick_meta_account only: the token session from finalize + the accounts offered. */
   tokenSessionId?: string;
   accounts?: Array<{ account_id: string; name: string; currency: string; account_status: number }>;
@@ -42,7 +49,9 @@ export function makeZomaLinkCodec(rootSecret: () => string): ZomaLinkCodec {
       if (typeof token !== 'string' || !token) return null;
       try {
         const claims = jwt.verify(token, key(), { algorithms: ['HS256'] }) as ZomaLinkClaims;
-        return claims.purpose === purpose && typeof claims.zoma === 'string' && /^[0-9a-f]{64}$/.test(claims.zoma) ? claims : null;
+        if (claims.purpose !== purpose || typeof claims.zoma !== 'string') return null;
+        if (/^[0-9a-f]{64}$/.test(claims.zoma)) return claims;
+        return claims.zoma === ZOMA_MCP_SETUP && typeof claims.uid === 'string' && claims.uid ? claims : null;
       } catch {
         return null;
       }

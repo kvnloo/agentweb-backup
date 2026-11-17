@@ -9,7 +9,7 @@
  * token/cost counters (`tokenUsageService.ts`) are NOT reset by any scheduled
  * job — they reset lazily, in place, the moment a read or increment notices
  * the stored `month` no longer matches `getCurrentUsageMonth()` (see
- * `getUserTokenUsage` / `incrementUserTokenUsage` in tokenUsageService.ts).
+ * `getUserTokenUsage` in tokenUsageService.ts).
  * There is no central "month rolled over" event to subscribe to, and nothing
  * to extend directly: a hypothetical edit at the lazy-reset call sites would
  * only fire for a user who happens to incur usage that month, which is
