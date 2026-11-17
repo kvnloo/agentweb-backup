@@ -65,6 +65,7 @@ import metaAuthRoutes from '../routes/metaAuth';
 import zomaRoutes from '../routes/zoma';
 import { buildZomaScoreboard } from '../services/zomaScoreboard';
 import { linkifyHttps } from '../routes/zoma';
+import { getMetaCredentials } from '../utils/secretsManager';
 
 const app = express();
 app.use(express.json());
@@ -116,6 +117,18 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     expect(status.next_step).toContain('has access to the ad account');
     expect(status.next_step).toContain('added to it or to the Business portfolio that owns it');
     expect(status.next_step).not.toContain(EMMA_APP);
+  });
+
+  it('still guides when the Meta connect link cannot be minted (credentials unreadable), never an RPC error', async () => {
+    (getMetaCredentials as jest.Mock).mockRejectedValueOnce(new Error('secret unavailable'));
+    const res = await call('zoma_status', { ads_experience: 'runs_ads' }).expect(200);
+    expect(res.body.error).toBeUndefined();
+    const status = JSON.parse(texts(res)[0]);
+    expect(status.meta.ready).toBe(false);
+    expect(status.meta.link).toBeUndefined();
+    expect(status.summary).toContain('could not be created just now');
+    expect(status.summary).toContain('does not need to use the same email as your Zoma login');
+    expect(status.summary).not.toContain('All set');
   });
 
   it('a new advertiser whose Meta create button fails gets a provider route, is told it is Meta\'s page, and a way back', async () => {
