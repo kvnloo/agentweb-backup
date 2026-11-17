@@ -35,6 +35,8 @@ export interface McpUsageEventStore {
   queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]>;
   /** Range read on the existing (loopId, tsSession) key; ts-prefixed sort keys only. */
   queryByLoopIdTsRange?(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]>;
+  /** Exact-key read (one GetItem). Used for rows written with a dedupeKey, whose sort key carries no timestamp. */
+  get?(loopId: string, tsSession: string): Promise<DynamoAttributeMap | undefined>;
 }
 
 export interface McpConnectionAttemptInput {
@@ -196,6 +198,11 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
       lastKey = result.LastEvaluatedKey;
     } while (lastKey);
     return items;
+  }
+
+  async get(loopId: string, tsSession: string): Promise<DynamoAttributeMap | undefined> {
+    const result = await this.doc.get({ TableName: LOOP_EVENTS_TABLE, Key: { loopId, tsSession } }).promise();
+    return result.Item as DynamoAttributeMap | undefined;
   }
 
   async queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]> {
@@ -412,7 +419,11 @@ export type ZomaBillingFunnelStep =
   | 'trial_reminder_sent'
   | 'trial_converted'
   | 'trial_canceled'
-  | 'subscription_canceled';
+  | 'subscription_canceled'
+  /** ENG-3133: weekly ad-performance email (claim = one send per user per week; opt_out = the user's unsubscribe). */
+  | 'weekly_report_claimed'
+  | 'weekly_report_sent'
+  | 'weekly_report_opt_out';
 
 export interface ZomaBillingFunnelInput {
   userId: string;
@@ -433,7 +444,7 @@ export async function recordZomaBillingFunnel(
   // With a dedupeKey the sort key carries no timestamp: a key that embeds `ts` is different on every
   // call, so the conditional put below could never see a repeat.
   const tsSession = input.dedupeKey
-    ? `${EVT_ZOMA_BILLING_FUNNEL}#${input.userId}#${input.step}#${input.dedupeKey}`
+    ? zomaFunnelDedupeSortKey(input.userId, input.step, input.dedupeKey)
     : `${ts}#${input.userId}#${EVT_ZOMA_BILLING_FUNNEL}#${input.step}#${Math.random().toString(36).slice(2, 10)}`;
   const item = eventItem({
     eventType: EVT_ZOMA_BILLING_FUNNEL,
@@ -453,6 +464,21 @@ export async function recordZomaBillingFunnel(
     if (error?.code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return false;
     throw error;
   }
+}
+
+/** The sort key `recordZomaBillingFunnel` writes for a row that has a dedupeKey (no timestamp in it). */
+export const zomaFunnelDedupeSortKey = (userId: string, step: ZomaBillingFunnelStep, dedupeKey: string) =>
+  `${EVT_ZOMA_BILLING_FUNNEL}#${userId}#${step}#${dedupeKey}`;
+
+/** True when the funnel row (userId, step, dedupeKey) exists. One GetItem; a store without `get` answers false. */
+export async function hasZomaFunnelRow(
+  userId: string,
+  step: ZomaBillingFunnelStep,
+  dedupeKey: string,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!userId || !store.get) return false;
+  return !!(await store.get(EMMA_MCP_LOOP_ID, zomaFunnelDedupeSortKey(userId, step, dedupeKey)));
 }
 
 /** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
