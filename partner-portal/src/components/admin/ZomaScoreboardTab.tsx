@@ -35,7 +35,7 @@ interface FirstAdLive {
 interface ScoreboardRow {
   userId: string;
   email: string;
-  excluded?: "internal" | "test";
+  excluded?: "internal" | "test" | "pal";
   signupRef?: string;
   zomaStage?: string;
   createdAt?: string;
@@ -50,7 +50,7 @@ interface Scoreboard {
   generatedAt: string;
   activeWindowDays: number;
   definitions: { active: string; firstSuccessfulAd: string; excluded: string };
-  summary: { zomaUsers: number; activeUsers7d: number; firstAdUsers: number; excludedAccounts: number };
+  summary: { zomaUsers: number; activeUsers7d: number; firstAdUsers: number; excludedAccounts: number; palUsers?: number };
   rows: ScoreboardRow[];
 }
 
@@ -164,7 +164,7 @@ export default function ZomaScoreboardTab() {
         <>
           <Grid container spacing={2} sx={{ mb: 2 }}>
             <Grid item xs={12} sm={4}>
-              <StatCard label="Zoma users" value={board.summary.zomaUsers} caption={`${board.summary.excludedAccounts} team/test excluded`} />
+              <StatCard label="Zoma users" value={board.summary.zomaUsers} caption={`${board.summary.excludedAccounts} team/test/pal excluded${board.summary.palUsers ? ` (${board.summary.palUsers} pal${board.summary.palUsers === 1 ? "" : "s"})` : ""}`} />
             </Grid>
             <Grid item xs={12} sm={4}>
               <StatCard label={`Active (${board.activeWindowDays}d)`} value={board.summary.activeUsers7d} caption={board.definitions.active} />
@@ -199,7 +199,7 @@ export default function ZomaScoreboardTab() {
                   <TableRow key={row.userId} sx={row.excluded ? { opacity: 0.55 } : undefined}>
                     <TableCell>
                       {row.email}
-                      {row.excluded && <Chip size="small" label={row.excluded === "internal" ? "team" : "test"} sx={{ ml: 1 }} />}
+                      {row.excluded && <Chip size="small" label={row.excluded === "internal" ? "team" : row.excluded} sx={{ ml: 1 }} />}
                       {row.signupRef && (
                         <Typography variant="caption" color="text.secondary" display="block">ref {row.signupRef}</Typography>
                       )}

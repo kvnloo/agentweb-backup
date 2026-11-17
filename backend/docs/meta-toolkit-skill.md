@@ -31,11 +31,20 @@ Alternative (no token): `claude mcp add --transport http zoma https://api.agentw
 `codex mcp add zoma --url https://api.agentweb.pro/api/meta-toolkit/mcp`; the first connection opens the AgentWeb login in the browser.
 
 ## Setup status (each step is verified by a tool — never assume)
-1. Call `zoma_status`. It shows a checklist and the single next step with a link.
-2. Relay the link (add a payment method, then connect Meta). Wait for the user to say they are done.
-3. Call `zoma_status` again. Repeat until it says "All set".
+1. Call `zoma_status`. The first time, it returns "Hey, welcome to Zoma." and one question: "How familiar are you with ads?". Say the welcome, ask the question, and call `zoma_status` again with `ads_experience` set to the answer (`runs_ads`, `new_to_ads` or `not_interested`).
+2. The answer leads straight to the Meta connect link. Relay it as given; the user finishes on Zoma's own pages and comes back to you. Wait for them to say they are done.
+3. Call `zoma_status` again. Repeat until it says "All set"; it then gives this guide's link and a first question to ask.
+4. If the user is "just a friend" (`not_interested`), the whole answer is "Thanks for signing up and trying out Zoma." — relay it and stop.
+
+Every tool response ends with the next step to take.
 
 Reads work without a payment method. Changes to ads need a payment method on file and a connected Meta ad account whose connection granted ads management.
+
+## Reporting: `zoma_ads_report`
+The first tool for "how are my ads doing?". Spend, impressions, clicks, CTR, CPC, conversions and ROAS per campaign (or `level: "account"` for one total), read-only.
+- Range: `date_preset` (`today`, `yesterday`, `last_7d` default, `last_14d`, `last_30d`, `last_90d`, `this_month`, `last_month`, `maximum`) or `since` + `until` (`YYYY-MM-DD`).
+- Narrow with `campaign_ids`. Conversions are the account's purchases (else leads, else registrations); pass `conversion_event` to choose a Meta action type. ROAS = purchase value / spend.
+- Example: `{"since": "2026-11-01", "until": "2026-11-15"}` → per-campaign rows, totals and a one-paragraph `summary`.
 
 ## Reads
 - `list_meta_ads_campaigns`, `get_meta_ads_metrics`, `call_meta_ads_insights_api` for campaigns and performance.
@@ -109,6 +118,7 @@ Writes use the same two-call preview and approval flow as other writes (call wit
 
 If a result says `TERMS_NOT_ACCEPTED`, give the user `terms_url` (Meta's Custom Audience Terms for that ad account), wait until they accept, then retry the same request. Audiences never spend on their own; ads that use them are created PAUSED through `AD CREATE` as usual.
 
+<!-- zoma-google:start -->
 ## Google Ads (when enabled for the account)
 `call_google_ads_api` uses the same two-call preview → `confirm: true` + `preview_token` flow and the same `verification: CONFIRMED` rule. Keywords, ads and asset groups are always created PAUSED; enabling each is its own UPDATE `status: ENABLED` preview.
 - **Keywords:** `KEYWORD ADD` (`ad_group_resource_name`, `keywords: [{text, matchType}]`, matchType BROAD / PHRASE / EXACT), `UPDATE` (`criterion_resource_name`, `status`), `REMOVE` (`criterion_resource_name`, permanent).
@@ -116,6 +126,7 @@ If a result says `TERMS_NOT_ACCEPTED`, give the user `terms_url` (Meta's Custom 
 - **Responsive search ad:** `AD CREATE` with `ad_group_resource_name`, 3–15 `headlines` (≤30 characters each), 2–4 `descriptions` (≤90 each) and an https `final_url`. Copy and URL cannot be edited later. Enable with `AD UPDATE` (`ad_resource_name`, `status`).
 - **Assets:** `ASSET UPLOAD` runs without a preview, because an asset can't spend until something uses it. Use `asset_type` IMAGE or LOGO with `data` set to an https image URL or the `file_url` from `zoma_prepare_upload`, TEXT with the text as `data`, or VIDEO with a YouTube video id. It returns the asset resource name.
 - **Performance Max, end to end:** (1) upload the logo (`LOGO`), the square and landscape images (`IMAGE`); (2) `BUDGET CREATE`; (3) `CAMPAIGN CREATE` with `type: PERFORMANCE_MAX`, `brand_business_name` (≤25 characters) and `brand_logo_asset_resource_name`; (4) `ASSET_GROUP CREATE` with `name`, `campaign_resource_name`, `final_url`, 3–15 `headlines` (≤30), 1–5 `long_headlines` (≤90), 2–5 `descriptions` (≤90, at least one ≤60), `square_image_assets`, `landscape_image_assets`, and optionally `logo_assets` / `video_assets`; (5) `ASSET_GROUP UPDATE status: ENABLED`, then `CAMPAIGN UPDATE status: ENABLED`, each with its own approval.
+<!-- zoma-google:end -->
 
 ## Usage
 Call `zoma_usage` when the user asks what they have used this month. Billing is not enabled yet; usage is only recorded.

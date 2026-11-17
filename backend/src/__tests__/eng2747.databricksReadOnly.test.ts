@@ -17,11 +17,12 @@ jest.mock('../utils/scheduledPublishConsentGuard', () => ({
 }));
 jest.mock('../services/evaluationPolicy', () => ({ enforceEvaluationTool: jest.fn().mockResolvedValue(undefined) }));
 
-import { authenticateMetaToolkitCaller, handleMetaToolkitCall, MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
-import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
+import { authenticateMetaToolkitCaller, handleMetaToolkitCall, MetaToolkitAuthError, MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
+import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
 import { annotateToolkitTools, READ_ONLY_TOOLKIT_TOOLS } from '../mcp/toolkitToolAnnotations';
 import {
+  DATABRICKS_READ_ONLY_MESSAGE,
   databricksToolView,
   isDatabricksAllowedCall,
   isDatabricksClient,
@@ -119,14 +120,82 @@ describe('ENG-2747 Databricks allowed calls', () => {
 describe('ENG-2747 gateway enforcement', () => {
   it('refuses a write from a Databricks-origin OAuth client before any upstream call or metering', async () => {
     const { deps, raw } = makeDeps([DATABRICKS_REDIRECT]);
-    await expect(handleMetaToolkitCall({ authorization: OAUTH, ...createCampaign }, deps)).rejects.toThrow(/read-only/);
+    // Databricks replaces the text of any MCP tool error with a generic line, so the refusal comes back as a
+    // normal result that carries the reason (still refused, still not executed or metered).
+    await expect(handleMetaToolkitCall({ authorization: OAUTH, ...createCampaign }, deps)).resolves.toEqual({
+      success: false,
+      message: DATABRICKS_READ_ONLY_MESSAGE,
+    });
     await expect(
       handleMetaToolkitCall({ authorization: OAUTH, toolName: 'zoma_prepare_upload', args: {} }, deps),
-    ).rejects.toThrow(/read-only/);
+    ).resolves.toMatchObject({ success: false, message: expect.stringMatching(/read-only/) });
+    // A model that retries with its own confirm flag gets the same refusal.
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'call_meta_marketing_api', args: { action: 'UPDATE', confirm: true } }, deps),
+    ).resolves.toMatchObject({ success: false, message: DATABRICKS_READ_ONLY_MESSAGE });
     expect(raw.executeWrite).not.toHaveBeenCalled();
     expect(raw.prepareUpload).not.toHaveBeenCalled();
     expect(raw.listAccounts).not.toHaveBeenCalled();
     expect(raw.recordUsage).not.toHaveBeenCalled();
+  });
+
+  it('returns a refusal raised after the gate (Meta rejecting a read) to Databricks as a result, and keeps throwing it for everyone else', async () => {
+    const { deps, raw } = makeDeps([DATABRICKS_REDIRECT]);
+    raw.execute.mockRejectedValueOnce(new MetaToolkitRefusal('Meta rejected this read'));
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, deps),
+    ).resolves.toEqual({ success: false, message: 'Meta rejected this read' });
+    expect(raw.recordUsage).not.toHaveBeenCalled();
+
+    const other = makeDeps([CLAUDE_REDIRECT]);
+    other.raw.execute.mockRejectedValueOnce(new MetaToolkitRefusal('Meta rejected this read'));
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, other.deps),
+    ).rejects.toThrow('Meta rejected this read');
+  });
+
+  it('tells a Databricks caller with no usable Meta account why (403), but keeps 429 and plain errors as errors', async () => {
+    const noAccount = makeDeps([DATABRICKS_REDIRECT]);
+    noAccount.raw.listAccounts.mockResolvedValue([]);
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, noAccount.deps),
+    ).resolves.toMatchObject({ success: false, message: expect.stringMatching(/No usable .* is connected/) });
+    expect(noAccount.raw.execute).not.toHaveBeenCalled();
+    expect(noAccount.raw.recordUsage).not.toHaveBeenCalled();
+
+    // Everyone else still gets the thrown 403, and rate limits / unexpected failures stay protocol errors.
+    const other = makeDeps([CLAUDE_REDIRECT]);
+    other.raw.listAccounts.mockResolvedValue([]);
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, other.deps),
+    ).rejects.toMatchObject({ status: 403 });
+
+    const limited = makeDeps([DATABRICKS_REDIRECT]);
+    limited.raw.execute.mockRejectedValueOnce(new MetaToolkitAuthError('slow down', 429, 5));
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, limited.deps),
+    ).rejects.toMatchObject({ status: 429 });
+
+    const broken = makeDeps([DATABRICKS_REDIRECT]);
+    broken.raw.execute.mockRejectedValueOnce(new Error('boom'));
+    await expect(
+      handleMetaToolkitCall({ authorization: OAUTH, toolName: 'list_meta_ads_campaigns', args: {} }, broken.deps),
+    ).rejects.toThrow('boom');
+  });
+
+  it('logs a gate refusal with the tool name and action only, never the arguments', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { deps } = makeDeps([DATABRICKS_REDIRECT]);
+      await handleMetaToolkitCall(
+        { authorization: OAUTH, toolName: 'call_meta_marketing_api', args: { action: 'UPDATE', confirm: true, params: { name: 'secret campaign copy' } } },
+        deps,
+      );
+      expect(warn).toHaveBeenCalledWith('[meta-toolkit] databricks read-only gate refused', { tool: 'call_meta_marketing_api', action: 'UPDATE' });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('secret campaign copy');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('lets a Databricks-origin OAuth client read', async () => {

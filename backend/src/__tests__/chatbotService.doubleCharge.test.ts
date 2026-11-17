@@ -1,7 +1,7 @@
 /**
- * ENG-1134 / ENG-1430: quota charging belongs at the shared LLM-call boundary.
- * Persisting a message must never charge again, and the Emma sidebar must not
- * create a second provider client or meter beside AgentModeService.callLLM.
+ * ENG-1430: quota charging belongs at the shared LLM-call boundary; the Emma
+ * sidebar must not create a second provider client or meter beside
+ * AgentModeService.callLLM.
  */
 
 const queryPromiseMock = jest.fn();
@@ -45,11 +45,6 @@ jest.mock('../services/agentModeService', () => {
   return { AgentModeService, agentModeService: mockAgentModeService };
 });
 
-const mockIncrementUserTokenUsage = jest.fn().mockResolvedValue(undefined);
-jest.mock('../services/tokenUsageService', () => ({
-  incrementUserTokenUsage: (...args: unknown[]) => mockIncrementUserTokenUsage(...args),
-}));
-
 const mockGetAzureClient = jest.fn();
 jest.mock('../utils/llmClients', () => ({
   getAzureClient: (...args: unknown[]) => mockGetAzureClient(...(args as [])),
@@ -73,7 +68,7 @@ jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: false }),
 }));
 
-import { chatbotDb, generateChatResponse, __resetEmmaSystemContextCache } from '../services/chatbotService';
+import { generateChatResponse, __resetEmmaSystemContextCache } from '../services/chatbotService';
 
 function completion(content = 'Hi') {
   return {
@@ -116,27 +111,6 @@ beforeEach(() => {
   mockCallLLM.mockResolvedValue(completion());
 });
 
-describe('ENG-1134: message persistence must not charge the quota counter', () => {
-  const usageMessage = {
-    role: 'assistant' as const,
-    content: 'hello',
-    usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, estimated_cost: 0.74 },
-  };
-
-  it('does not charge the counter when a usage-carrying message is appended', async () => {
-    await chatbotDb.addMessageToSession('sess-1', usageMessage as never);
-    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
-  });
-
-  it('does not charge the counter for a batch append either', async () => {
-    await chatbotDb.addMessagesToSession('sess-1', [
-      usageMessage,
-      { ...usageMessage, content: 'second' },
-    ] as never);
-    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
-  });
-});
-
 describe('ENG-1430: Emma has one shared record-and-charge point', () => {
   it('delegates the billable turn and its attribution to callLLM exactly once', async () => {
     await generateChatResponse('sess-1', 'Hello', {
@@ -154,7 +128,6 @@ describe('ENG-1430: Emma has one shared record-and-charge point', () => {
         usageContext: { userId: 'user-1', sessionId: 'sess-1', feature: 'chat' },
       }),
     );
-    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
   });
 
   it('does not instantiate an Azure chat client beside callLLM', async () => {

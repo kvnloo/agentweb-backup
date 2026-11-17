@@ -377,7 +377,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -3117,9 +3117,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3153,7 +3152,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two
@@ -4396,8 +4395,8 @@ export class AgentModeService {
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
 
-        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
-        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
+        // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
@@ -15909,6 +15908,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const meta = error?.response?.data?.error;
       const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
       wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      throw wrapped;
+    }
+  }
+
+  /**
+   * ENG-3033: create the ad creative that points at an existing Instagram post, on the caller's
+   * own ad account. metaToolkitBoost proves the Instagram account, Page and post belong to the
+   * account before calling. A creative cannot spend. `outcomeUnknown` marks a failure without a
+   * definite Meta answer.
+   */
+  public async toolkitMetaBoostCreative(
+    userId: string, account_id: string, spec: { name: string; page_id: string; ig_account_id: string; ig_media_id: string },
+  ): Promise<{ id?: string }> {
+    for (const k of ['page_id', 'ig_account_id', 'ig_media_id'] as const) {
+      if (!/^\d+$/.test(String(spec?.[k] ?? ''))) throw new Error(`Invalid ${k}.`);
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.post(
+        `https://graph.facebook.com/${apiVersion}/act_${String(accountId).replace(/^act_/, '')}/adcreatives`,
+        new URLSearchParams({
+          name: String(spec.name).slice(0, 200),
+          object_id: spec.page_id,
+          instagram_user_id: spec.ig_account_id,
+          source_instagram_media_id: spec.ig_media_id,
+        }).toString(),
+        { params: { access_token: accessToken }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30_000, maxContentLength: 5_000_000 },
+      );
+      return { id: data?.id ? String(data.id) : undefined };
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
       throw wrapped;
     }
   }

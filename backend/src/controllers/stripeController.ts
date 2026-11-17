@@ -25,6 +25,7 @@ import {
   PAYG_OVERAGE_PURCHASE_TYPE,
 } from '../services/stripeService';
 import { invoiceLinePriceId, invoiceSubscriptionId } from '../utils/stripeInvoiceFields';
+import { handleZomaBillingWebhookEvent } from '../mcp/zomaBilling';
 import { emitStripeSignals, emitAccountSignal } from '../services/serverSignalEmitter';
 import {
   InMemoryPaymentFeedbackAskLedger,
@@ -107,6 +108,13 @@ export async function handleWebhook(req: Request, res: Response) {
   }
 
   try {
+    // ENG-3131: Zoma plan objects (own Stripe customer, tagged metadata) are handled on their own
+    // and never reach the Emma subscription handlers or the CRM/billing-signal mirrors, which would
+    // sync the user row's tier from a price they do not know.
+    if (await handleZomaBillingWebhookEvent(event as any)) {
+      return res.json({ received: true });
+    }
+
     switch (event.type) {
       case 'checkout.session.completed':
         if (isSetupModeCheckoutSession(event.data.object)) {

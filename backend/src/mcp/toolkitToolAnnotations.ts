@@ -96,6 +96,8 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_get_ig_accounts',
   'ads_get_ig_media',
   'ads_library_search',
+  // Zoma reporting (ENG-3134): one Meta insights read
+  'zoma_ads_report',
   // Google Ads
   'call_google_ads_reporting_api',
 ]);

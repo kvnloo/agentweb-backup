@@ -45,7 +45,6 @@ jest.mock('../utils/sseProgress', () => ({
 // own suite in agentModeController.ishareUsageGate.test.ts).
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, percentUsed: 0 }),
-  incrementUserTokenUsage: jest.fn(),
 }));
 
 import { chatbotDb } from '../services/chatbotService';

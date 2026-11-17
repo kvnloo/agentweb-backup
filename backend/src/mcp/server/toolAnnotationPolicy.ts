@@ -111,6 +111,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   pause_smartlead_push: 'write',
   preview_smartlead_push: 'read',
   publish_landing_page_changes: 'write',
+  read_client_meta_activity: 'write',
   read_email: 'read',
   read_knowledge_base_files: 'write',
   read_landing_page_file: 'write',
