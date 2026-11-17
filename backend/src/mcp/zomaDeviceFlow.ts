@@ -10,8 +10,12 @@
  *      (completeMetaConnect — never the browser's portal session), then straight to Stripe
  *      setup-mode Checkout, whose success_url is Zoma's "you're set" page. Done steps are skipped.
  *   2c. ENG-3128: before Meta, the browser is asked "How familiar are you with ads?"
- *      (answerAdsExperience). runs_ads -> Meta -> payment; new_to_ads -> a setup guide, then
- *      Meta -> payment; not_interested -> a thank-you page and nothing else (no token).
+ *      (answerAdsExperience). ENG-3134: runs_ads and new_to_ads both go straight to Meta connect
+ *      -> payment (a new advertiser without an ad account gets the setup guide on the "no ad
+ *      account" page); not_interested -> a thank-you page and nothing else (no token).
+ *   2d. ENG-3134: an MCP-connected user (OAuth / aw_ key, no device) gets a Meta link whose
+ *      state carries `zoma: ZOMA_MCP_SETUP`; it finishes on these same Zoma pages for the state's
+ *      user (completeMetaConnect / selectMetaAccounts), never in the AgentWeb (Emma) portal.
  *   3. pollSetup          POST /api/zoma/setup/poll     -> RFC errors until bound, then
  *      next_step from getZomaReadiness (ads_experience | connect_meta | add_payment |
  *      not_interested | fix_meta_page | complete). The poll body may carry `ads_experience` so an agent can
@@ -46,11 +50,13 @@ import {
   ZOMA_ADS_EXPERIENCE_VALUES,
   ZOMA_NEW_TO_ADS_STEPS,
   ZOMA_NOT_INTERESTED_MESSAGE,
+  ZOMA_WELCOME,
   type ZomaAdsExperience,
 } from './zomaAdsExperience';
 import {
   defaultZomaLinkCodec,
   ZOMA_CONTINUE_PATH,
+  ZOMA_MCP_SETUP,
   ZOMA_DONE_PATH,
   ZOMA_META_SELECT_PATH,
   type ZomaLinkClaims,
@@ -80,6 +86,18 @@ const META_LINK_UNAVAILABLE = 'Could not create the Meta connect link right now;
 export type ZomaNextStep = 'sign_in' | 'ads_experience' | ZomaLinkStep | ZomaBlockerStep | 'not_interested' | 'complete';
 export const ZOMA_ADS_EXPERIENCE_PATH = '/api/zoma/ads-experience';
 
+/**
+ * ENG-3134: the Meta connect link zoma_status hands an MCP-connected user. Its callback finishes
+ * on Zoma's own pages (completeMetaConnect), not the AgentWeb portal.
+ */
+export async function buildZomaMcpMetaConnectUrl(userId: string): Promise<string> {
+  const { buildMetaConnectUrl } = await import('../services/metaConnectUrl');
+  return buildMetaConnectUrl(userId, 'marketing', { zoma: ZOMA_MCP_SETUP });
+}
+
+/** ENG-3134: what to say to the agent once a browser step is finished. */
+export const ZOMA_BACK_TO_AGENT = 'Go back to your agent and say: "Check my Zoma setup".';
+
 export interface ZomaDeviceFlowDeps {
   store: ZomaDeviceStore;
   now: () => number;
@@ -88,6 +106,8 @@ export interface ZomaDeviceFlowDeps {
   readiness: (userId: string) => Promise<ZomaReadiness>;
   /** Meta connect URL whose signed state carries `zoma: deviceId` (routes the callback to Zoma). */
   mintMetaLink: (userId: string, deviceId: string) => Promise<string>;
+  /** ENG-3134: Meta connect URL for an MCP-connected user (state `zoma: ZOMA_MCP_SETUP`); defaults to buildZomaMcpMetaConnectUrl. */
+  mintMcpMetaLink?: (userId: string) => Promise<string>;
   mintPaymentLink: (userId: string, urls: { successUrl: string; cancelUrl: string }) => Promise<string>;
   ensureClient: (redirectUri: string) => Promise<void>;
   consumeAuthCode: (code: string, redirectUri: string, verifier: string) => Promise<{ userId: string } | null>;
@@ -115,6 +135,7 @@ export const defaultZomaDeviceFlowDeps: ZomaDeviceFlowDeps = {
     const { buildMetaConnectUrl } = await import('../services/metaConnectUrl');
     return buildMetaConnectUrl(userId, 'marketing', { zoma: deviceId });
   },
+  mintMcpMetaLink: (userId) => buildZomaMcpMetaConnectUrl(userId),
   mintPaymentLink: (userId, urls) => createZomaPaymentSetupLink(userId, urls),
   ensureClient: (redirectUri) => mcpOAuthService.ensureFirstPartyClient(ZOMA_DEVICE_CLIENT_ID, ZOMA_DEVICE_CLIENT_NAME, redirectUri),
   consumeAuthCode: (code, redirectUri, verifier) =>
@@ -488,7 +509,7 @@ async function recordAdsExperience(
 /**
  * POST /api/zoma/ads-experience — the "How familiar are you with ads?" form.
  *   runs_ads        -> straight on to the next unfinished step (Meta, then payment)
- *   new_to_ads      -> the ad-account setup guide, with a link onward to connecting
+ *   new_to_ads      -> straight on too (ENG-3134); the setup guide shows if Meta finds no ad account
  *   not_interested  -> thank-you; nothing further
  */
 export async function answerAdsExperience(
@@ -505,17 +526,8 @@ export async function answerAdsExperience(
   if (!answer) return askAdsExperience(deps, device.deviceId, 'Choose one of the options.');
   await recordAdsExperience(deps, device, answer);
   if (answer === 'not_interested') return THANK_YOU_PAGE;
-  if (answer === 'new_to_ads') {
-    return {
-      kind: 'page',
-      status: 200,
-      title: 'Set up your ad accounts',
-      message: 'Running ads needs an ad account. Set these up first (each takes a few minutes), then come back and connect them.',
-      steps: ZOMA_NEW_TO_ADS_STEPS,
-      retryUrl: continueLink(deps, device.deviceId),
-      retryLabel: "I've set these up — connect my ad accounts",
-    };
-  }
+  // ENG-3134: both ads answers lead straight to Meta connect. Someone with no ad account yet gets
+  // the setup guide on the "No ad account found" page Meta's empty answer leads to.
   return continueInBrowser(device.deviceId, deps);
 }
 
@@ -542,6 +554,9 @@ export async function completeMetaConnect(
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
 ): Promise<BrowserStep> {
   const claims = deps.verifyMetaState(params.state);
+  if (claims?.zoma === ZOMA_MCP_SETUP && typeof claims.userId === 'string' && claims.userId) {
+    return completeMcpMetaConnect(claims.userId, params, deps);
+  }
   const deviceId = typeof claims?.zoma === 'string' && /^[0-9a-f]{64}$/.test(claims.zoma) ? claims.zoma : null;
   if (!claims || !deviceId || typeof claims.userId !== 'string' || !claims.userId) {
     logZomaSetup({ step: 'meta_callback', outcome: 'rejected', reason: claims ? 'not_a_zoma_state' : 'invalid_state' });
@@ -573,16 +588,7 @@ export async function completeMetaConnect(
   if (accounts.length === 0) {
     const reason = result.flow === 'marketing' && result.adAccountsError ? 'ad_accounts_unavailable' : 'no_ad_accounts';
     await track(deps, device.deviceId, device.userId, 'meta_callback', 'failed', reason);
-    return {
-      kind: 'page',
-      status: 400,
-      title: 'No ad account found',
-      message:
-        reason === 'no_ad_accounts'
-          ? 'Meta did not share any ad accounts. Reconnect and make sure you select your ad account.'
-          : 'Meta did not return your ad accounts just now. Please try again.',
-      retryUrl,
-    };
+    return noAdAccountPage(reason, retryUrl);
   }
   await track(deps, device.deviceId, device.userId, 'meta_callback', 'ok', `${accounts.length}_ad_accounts`);
   if (accounts.length === 1) return connectAndContinue(deps, device, accounts, result.tokenSessionId);
@@ -593,6 +599,120 @@ export async function completeMetaConnect(
     600, // the parked Meta token session lives 10 minutes
   );
   return { kind: 'pick_account', action: ZOMA_META_SELECT_PATH, token, accounts: toPickerAccounts(selection) };
+}
+
+/**
+ * Meta returned no ad account. ENG-3134: a new advertiser lands here straight from the question,
+ * so the page carries the ad-account setup guide and the reconnect button (same flow, no detour).
+ */
+function noAdAccountPage(reason: 'no_ad_accounts' | 'ad_accounts_unavailable', retryUrl: string): PageStep {
+  if (reason === 'ad_accounts_unavailable') {
+    return { kind: 'page', status: 400, title: 'No ad account found', message: 'Meta did not return your ad accounts just now. Please try again.', retryUrl };
+  }
+  return {
+    kind: 'page',
+    status: 400,
+    title: 'No ad account found',
+    message: 'Meta did not share any ad accounts. If you already have one, reconnect and select it. If you have never run ads, set one up first (a few minutes), then reconnect:',
+    steps: ZOMA_NEW_TO_ADS_STEPS.slice(0, -1),
+    retryUrl,
+    retryLabel: 'Reconnect Meta',
+  };
+}
+
+/** ENG-3134: the end of an MCP user's Meta connect — the Page blocker if any, else back to the agent. */
+async function mcpMetaConnectedPage(userId: string, deps: ZomaDeviceFlowDeps): Promise<PageStep> {
+  let blocker: ZomaMetaPageBlocker | null = null;
+  try {
+    blocker = (await deps.readiness(userId)).blocker;
+  } catch (error) {
+    logZomaSetup({ userId, step: 'meta_connect', outcome: 'error', reason: error });
+  }
+  if (blocker) {
+    let link: string | undefined;
+    try {
+      link = await (deps.mintMcpMetaLink ?? buildZomaMcpMetaConnectUrl)(userId);
+    } catch (error) {
+      logZomaSetup({ userId, step: 'meta_link', outcome: 'error', reason: error });
+    }
+    logZomaSetup({ userId, step: 'meta_page_blocked', outcome: blocker.reason });
+    return {
+      kind: 'page',
+      status: 200,
+      title: 'One more step: your Facebook Page',
+      message: blocker.message,
+      steps: metaPageFixSteps(blocker.reason, {
+        pageId: blocker.page_id,
+        connectText: link ? 'use the Reconnect Meta button below and log in with the same Facebook account.' : 'ask your agent for a fresh Meta connect link (it runs zoma_status) and log in with the same Facebook account.',
+      }),
+      ...(link ? { retryUrl: link, retryLabel: 'Reconnect Meta' } : {}),
+    };
+  }
+  return { kind: 'page', status: 200, title: 'Meta connected', message: `Your Meta ad account is connected to Zoma. ${ZOMA_BACK_TO_AGENT}`, done: true };
+}
+
+/** ENG-3134: Meta callback for an MCP-connected user — finalized server-side for the signed state's user. */
+async function completeMcpMetaConnect(
+  userId: string,
+  params: { code?: unknown; error?: unknown; error_reason?: unknown },
+  deps: ZomaDeviceFlowDeps,
+): Promise<BrowserStep> {
+  const retry = async (): Promise<string | undefined> => {
+    try {
+      return await (deps.mintMcpMetaLink ?? buildZomaMcpMetaConnectUrl)(userId);
+    } catch (error) {
+      logZomaSetup({ userId, step: 'meta_link', outcome: 'error', reason: error });
+      return undefined;
+    }
+  };
+  const failed = async (status: number, title: string, message: string): Promise<PageStep> => {
+    const retryUrl = await retry();
+    return { kind: 'page', status, title, message: retryUrl ? message : `${message} ${ZOMA_BACK_TO_AGENT}`, ...(retryUrl ? { retryUrl, retryLabel: 'Connect Meta again' } : {}) };
+  };
+  if (params.error !== undefined || typeof params.code !== 'string' || !params.code) {
+    const reason = typeof params.error_reason === 'string' ? params.error_reason : typeof params.error === 'string' ? params.error : 'no_code';
+    logZomaSetup({ userId, step: 'meta_callback', outcome: 'denied', reason });
+    return failed(400, 'Meta not connected', 'Meta was not connected. Zoma needs access to your ad account to continue.');
+  }
+  let result: MetaFinalizeResult;
+  try {
+    result = await deps.finalizeMeta(userId, params.code);
+  } catch (error) {
+    logZomaSetup({ userId, step: 'meta_callback', outcome: 'failed', reason: error });
+    return failed(502, 'Meta not connected', 'We could not finish connecting Meta. Please try again.');
+  }
+  const accounts = result.flow === 'marketing' ? result.adAccounts ?? [] : [];
+  if (accounts.length === 0) {
+    const reason = result.flow === 'marketing' && result.adAccountsError ? 'ad_accounts_unavailable' : 'no_ad_accounts';
+    logZomaSetup({ userId, step: 'meta_callback', outcome: 'failed', reason });
+    const retryUrl = await retry();
+    const page = noAdAccountPage(reason, retryUrl ?? '');
+    return retryUrl ? page : { ...page, retryUrl: undefined, message: `${page.message} ${ZOMA_BACK_TO_AGENT}` };
+  }
+  logZomaSetup({ userId, step: 'meta_callback', outcome: 'ok', reason: `${accounts.length}_ad_accounts` });
+  if (accounts.length === 1) return connectMcpAccounts(userId, accounts, result.tokenSessionId, deps);
+  const selection = accounts.map((a) => ({ account_id: a.account_id, name: a.name, currency: a.currency, account_status: a.account_status }));
+  const token = deps.links.sign(
+    { purpose: 'pick_meta_account', zoma: ZOMA_MCP_SETUP, uid: userId, tokenSessionId: result.tokenSessionId, accounts: selection },
+    600,
+  );
+  return { kind: 'pick_account', action: ZOMA_META_SELECT_PATH, token, accounts: toPickerAccounts(selection) };
+}
+
+async function connectMcpAccounts(
+  userId: string,
+  accounts: MetaAdAccountSelection[],
+  tokenSessionId: string,
+  deps: ZomaDeviceFlowDeps,
+): Promise<BrowserStep> {
+  try {
+    await deps.connectAdAccounts(userId, accounts, tokenSessionId);
+  } catch (error) {
+    logZomaSetup({ userId, step: 'meta_connect', outcome: 'failed', reason: error });
+    return { kind: 'page', status: 502, title: 'Meta not connected', message: `We could not save your ad account. ${ZOMA_BACK_TO_AGENT}` };
+  }
+  logZomaSetup({ userId, step: 'meta_connect', outcome: 'ok', reason: `${accounts.length}_ad_accounts` });
+  return mcpMetaConnectedPage(userId, deps);
 }
 
 async function connectAndContinue(
@@ -617,19 +737,34 @@ async function connectAndContinue(
   return continueInBrowser(device.deviceId, deps);
 }
 
+/** Only accounts Meta offered (carried in the signed picker link) can be chosen. */
+function pickedAccounts(claims: ZomaLinkClaims, raw: unknown) {
+  const wanted = new Set((Array.isArray(raw) ? raw : [raw]).filter((v): v is string => typeof v === 'string'));
+  return (claims.accounts ?? []).filter((a) => wanted.has(a.account_id));
+}
+
 /** POST /api/zoma/meta/select — the server-rendered picker. Only accounts Meta offered can be chosen. */
 export async function selectMetaAccounts(
   params: { t?: unknown; account_id?: unknown },
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
 ): Promise<BrowserStep> {
   const claims: ZomaLinkClaims | null = deps.links.verify(params.t, 'pick_meta_account');
+  if (claims?.zoma === ZOMA_MCP_SETUP && claims.uid) {
+    const chosenMcp = pickedAccounts(claims, params.account_id);
+    if (!claims.tokenSessionId || !Array.isArray(claims.accounts)) {
+      return { ...EXPIRED_PAGE, message: `This page has expired. ${ZOMA_BACK_TO_AGENT}` };
+    }
+    if (chosenMcp.length === 0) {
+      return { kind: 'pick_account', action: ZOMA_META_SELECT_PATH, token: params.t as string, accounts: toPickerAccounts(claims.accounts), message: 'Choose at least one ad account.' };
+    }
+    return connectMcpAccounts(claims.uid, chosenMcp, claims.tokenSessionId, deps);
+  }
   const device = claims ? journeyDevice(await deps.store.getDevice(claims.zoma), deps.now()) : null;
   if (!claims || !device || !claims.tokenSessionId || !Array.isArray(claims.accounts)) {
     logZomaSetup({ step: 'meta_connect', outcome: 'rejected', reason: 'invalid_picker_link' });
     return { ...EXPIRED_PAGE, message: 'This page has expired. Ask your agent for a new Meta connection link.' };
   }
-  const wanted = new Set((Array.isArray(params.account_id) ? params.account_id : [params.account_id]).filter((v): v is string => typeof v === 'string'));
-  const chosen = claims.accounts.filter((a) => wanted.has(a.account_id));
+  const chosen = pickedAccounts(claims, params.account_id);
   if (chosen.length === 0) {
     return {
       kind: 'pick_account',
@@ -644,9 +779,16 @@ export async function selectMetaAccounts(
 
 /** GET /api/zoma/done — Stripe's success/cancel return. */
 export async function finishPayment(
-  params: { t?: unknown; session_id?: unknown; canceled?: unknown },
+  params: { t?: unknown; session_id?: unknown; canceled?: unknown; mcp?: unknown },
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
 ): Promise<BrowserStep> {
+  // ENG-3134: Stripe's return for a card added from zoma_status (no device). Informational only:
+  // zoma_status re-derives payment state live, so nothing here is trusted or written.
+  if (params.t === undefined && params.mcp !== undefined) {
+    return params.canceled !== undefined
+      ? { kind: 'page', status: 200, title: 'Payment method not added', message: `Nothing was saved or charged. ${ZOMA_BACK_TO_AGENT}` }
+      : { kind: 'page', status: 200, title: 'Payment method added', message: `Nothing was charged. ${ZOMA_BACK_TO_AGENT}`, done: true };
+  }
   const claims = deps.links.verify(params.t, 'continue');
   const raw = claims ? await deps.store.getDevice(claims.zoma) : null;
   if (!claims || !raw) {
@@ -785,7 +927,7 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps, an
         next_step: 'ads_experience',
         question: ZOMA_ADS_EXPERIENCE_QUESTION,
         options: ZOMA_ADS_EXPERIENCE_OPTIONS,
-        message: `Ask the user "${ZOMA_ADS_EXPERIENCE_QUESTION}" and poll again with ads_experience set to the value of their answer.`,
+        message: `Say "${ZOMA_WELCOME}" to the user, then ask "${ZOMA_ADS_EXPERIENCE_QUESTION}" and poll again with ads_experience set to the value of their answer.`,
         interval: device.intervalSec,
       },
     };
