@@ -90,6 +90,15 @@ export const SCHEDULE_WRITE_TOOL_NAMES: ReadonlySet<string> = new Set([
   'emma_schedule_recurring_work',
 ]);
 
+/**
+ * Whether the owner's "full autonomy" waiver (ENG-396: a headless run auto-takes Emma's recommended option on a blocking question,
+ * even an irreversible one) applies to this schedule's run. It is the owner's opt-in for a prompt THEY wrote, so a schedule a
+ * share-link visitor wrote into does not get it until the owner adopts the schedule.
+ */
+export function autonomyWaiverApplies(schedule: { fullAutonomy?: unknown; provenance?: unknown } | null | undefined): boolean {
+  return schedule?.fullAutonomy === true && !isScheduleMarked(schedule);
+}
+
 /** Retry attempts a marked run gets. An unmarked run keeps its 20; a marked run's refused calls would otherwise burn the owner's credits on them. */
 export const MARKED_RUN_MAX_ATTEMPTS = 3;
 

@@ -75,9 +75,9 @@ import { MAX_READ_ONLY_PRESS_ATTEMPTS, isReadOnlyOnlyUnmet, shouldStopPressingFo
 import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } from '../utils/sendPressCircuitBreaker';
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
-import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized, filterSlackSendFromRequiredIfWithheld } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, describeSlackSendState, filterSlackSendFromRequiredIfWithheld, type SlackSendState } from '../utils/schedulePublishApproval';
 import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/toolRestrictionProfiles';
-import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
+import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
 import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
 import { isDeepStrictEqual } from 'util';
@@ -331,7 +331,10 @@ async function applyScheduleEditWithConsentNarrowing(
     let expectation: Record<string, any> | undefined;
 
     if (snapshot?.autopublishAuthorized === true) {
-      const stored = resolveSchedulePublishAuthorization(snapshot);
+      // ENG-2816 (step 3): the STORED grant, without the rule that a marked schedule never publishes. Removing a publish tool from a
+      // marked schedule must still narrow what the owner granted, or the removed tool's grant would come back the day the owner
+      // adopts the schedule. (Whether a run may publish is decided elsewhere, and a marked schedule still may not.)
+      const stored = resolveSchedulePublishAuthorization(snapshot, { ignoreProvenance: true });
       if (stored.authorized) {
         const stillRequired = getRequiredPublishTools(updates.requiredFunctionCalls);
         const narrowed = narrowPublishAuthorization(stored, {
@@ -5033,6 +5036,10 @@ async function runVerifiedChatInner(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
+    // ENG-2816 (step 3): whether this run may send Slack messages unattended AS IT IS NOW (and why not, when it may not), for the
+    // mid-run publish-revocation notice below. That notice re-injects the unattended directive, and without this it told the
+    // model Slack sends were authorized whatever the schedule said. Absent for callers with no schedule: the old default.
+    slackSendNow?: () => SlackSendState;
     // ENG-930: the schedule's OWN requiredFunctionCalls, publish-capable names
     // only (via getRequiredPublishTools) — i.e. BEFORE
     // `filterRequiredFunctionsToAuthorizedScope` (ENG-827) may have removed one
@@ -5078,6 +5085,7 @@ async function runVerifiedChatInner(
     isUnattendedRun = true,
     publishAuthorization,
     refreshPublishAuthorization,
+    slackSendNow,
     publishAuthorized,
     originalPublishTools = [],
     approvedRevisionImageSources,
@@ -5493,7 +5501,12 @@ async function runVerifiedChatInner(
             // runVerifiedChatInner's signature for one edge case. The primary
             // directive injection (agentModeService.ts, every turn's system prompt)
             // already resolves and respects the real opt-out.
-            getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
+            // ENG-2816 (step 3): Slack is whatever the run's schedule says it is NOW (a withheld run stays withheld; a schedule a
+            // visitor marked mid-run becomes withheld), instead of the default "authorized".
+            getUnattendedExecutionDirective(
+              'scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools,
+              slackSendNow ? slackSendNow().authorized : true, slackSendNow?.().reason,
+            );
           console.log(
             `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
             `authorized tools [${livePublishAuthorization.tools.join(', ') || 'none'}] -> ` +
@@ -5502,6 +5515,12 @@ async function runVerifiedChatInner(
           requiredFunctions = requiredFunctions.filter(rf =>
             filterRequiredFunctionsToAuthorizedScope([rf.functionName], narrowed).length > 0
           );
+        }
+        // ENG-2816 (step 3): a schedule marked mid-run also withholds Slack, so the checker must stop demanding it too (the same
+        // contradiction the publish filter above prevents). Not tied to the publish narrowing: a run with no publish tool can be
+        // marked mid-run as well.
+        if (slackSendNow && !slackSendNow().authorized) {
+          requiredFunctions = requiredFunctions.filter(rf => rf.functionName !== 'slack_send_message');
         }
         livePublishAuthorization = narrowed;
       } catch (err) {
@@ -7976,7 +7995,12 @@ export async function runScheduledChat(
     // Slack has no mid-run revocation action, so a single fresh read here is the whole
     // gate (see filterSlackSendFromRequiredIfWithheld's doc comment for the incident this
     // closes).
-    const slackSendAuthorized = resolveSlackSendAuthorized(schedule);
+    // ENG-2816 (step 3): a schedule a share-link visitor wrote into is WITHHELD here too (describeSlackSendState), exactly like
+    // `requireSlackApproval: true`: the directive stops granting the live-approval bypass and the checker stops demanding the send.
+    const slackSendState = describeSlackSendState(schedule);
+    const slackSendAuthorized = slackSendState.authorized;
+    // What the mid-run notice reports; only ever narrowed (a run admitted withheld stays withheld).
+    let effectiveSlackSend: SlackSendState = slackSendState;
     // ENG-827: stamp the admitted authorization on the session before the first turn.
     //
     // The dispatch-time guard re-reads the schedule so a revocation stops an in-flight
@@ -8079,7 +8103,9 @@ export async function runScheduledChat(
       // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
-      fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-2816 (step 3): the owner's full-autonomy waiver (auto-take irreversible decisions) was given for a prompt the owner wrote.
+      // It does not carry over to a schedule a share-link visitor wrote into.
+      fullAutonomy: autonomyWaiverApplies(schedule),
       // ENG-827: same object that filtered `requiredFunctions` above, so the prompt
       // and the checker state one decision rather than two independent reads.
       publishAuthorization,
@@ -8087,6 +8113,7 @@ export async function runScheduledChat(
       // run lasts minutes. Re-read it each turn so revoking actually stops an
       // in-flight publish instead of taking effect only on the NEXT run. Narrowing
       // is monotonic, so this can never grant rights the admission snapshot lacked.
+      slackSendNow: () => effectiveSlackSend,
       refreshPublishAuthorization: async () => {
         // Never throws: a failed read resolves to null, which narrows to UNAUTHORIZED.
         // Absorbing the failure HERE rather than in runVerifiedChat's catch is what
@@ -8095,7 +8122,10 @@ export async function runScheduledChat(
         // once again report requirements the run was never held to.
         let latest: SchedulePublishAuthorization | null = null;
         try {
-          latest = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId));
+          const latestSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+          latest = resolveSchedulePublishAuthorization(latestSchedule);
+          // ENG-2816 (step 3): a visitor marking the schedule mid-run withholds Slack for the rest of it (narrowing only).
+          if (isScheduleMarked(latestSchedule)) effectiveSlackSend = { authorized: false, reason: 'visitor_edited' };
         } catch (err) {
           console.error(
             `AgentMode: publish-consent re-check failed for schedule ${schedule.scheduleId}; ` +
@@ -9078,7 +9108,7 @@ export async function runScheduledChat(
     const recoveredRequired = requiredCallsForRun(schedule);
     const recoveredHeldToNames = filterSlackSendFromRequiredIfWithheld(
       filterRequiredFunctionsToAuthorizedScope(recoveredRequired.functionCalls, recoveredAdmittedAuthorization),
-      resolveSlackSendAuthorized(schedule)
+      describeSlackSendState(schedule).authorized
     );
 
     // The entire block below reads a real, external, potentially-malformed record (the

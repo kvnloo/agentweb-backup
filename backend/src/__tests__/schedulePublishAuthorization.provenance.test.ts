@@ -59,6 +59,15 @@ describe('publish authorization of a marked schedule (ENG-2816 step 3)', () => {
     expect(describePublishAuthorizationWithholdReason({ ...publishing })).toBeUndefined();
   });
 
+  it('`ignoreProvenance` answers "what grant is STORED" (only the consent-narrowing write asks); the default is unchanged', () => {
+    const marked = { ...publishing, autopublishAuthorized: true, autopublishAuthorizedTools: ['post_on_connected_account'], provenance: ['startingMessage'] };
+    expect(resolveSchedulePublishAuthorization(marked).authorized).toBe(false);
+    expect(resolveSchedulePublishAuthorization(marked, { ignoreProvenance: true })).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
+    // ...and it leaves every OTHER rule alone: an owner's hold still wins.
+    expect(resolveSchedulePublishAuthorization({ ...marked, requirePublishApproval: true }, { ignoreProvenance: true }).authorized).toBe(false);
+    expect(resolveSchedulePublishAuthorization({ ...marked, autopublishAuthorized: false }, { ignoreProvenance: true }).authorized).toBe(false);
+  });
+
   it('a missing schedule is still unauthorized (unchanged)', () => {
     expect(resolveSchedulePublishAuthorization(null)).toEqual({ authorized: false, tools: [] });
     expect(resolveSchedulePublishAuthorization(undefined)).toEqual({ authorized: false, tools: [] });

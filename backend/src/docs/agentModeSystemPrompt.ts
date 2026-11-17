@@ -856,7 +856,11 @@ export function getUnattendedExecutionDirective(
   // resolveScheduledSlackSendAuthorized / resolveSlackSendAuthorized). Defaults to
   // true so every call site that hasn't been updated to resolve and pass it keeps
   // today's behavior unchanged.
-  slackSendAuthorized: boolean = true
+  slackSendAuthorized: boolean = true,
+  // ENG-2816 (step 3): why Slack sends are withheld, when it is not the owner's "Require approval before Slack sends" setting. A
+  // schedule a share-link visitor wrote into is withheld until the owner adopts it, and the model must say THAT, not blame a setting
+  // the owner never touched. Only read on the withheld branch.
+  slackWithholdReason?: 'visitor_edited'
 ): string {
   if (sessionType !== 'scheduled') return '';
   // ENG-1045: an authorized literal tool (e.g. post_on_connected_account) also
@@ -942,8 +946,12 @@ SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL — ENG-2204):
   : `
 
 SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD (CRITICAL — ENG-2204):
-- The owner has turned ON "Require approval before Slack sends" for this schedule. The base instruction elsewhere in this prompt (show the draft, ask "Should I send this?") is therefore NOT lifted for this run, even though no human is present to answer it.
-- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it to the knowledge base, and state plainly in your final report that nothing was sent to Slack because this schedule requires approval before Slack sends.`
+- ${slackWithholdReason === 'visitor_edited'
+    ? 'This schedule was set up or edited through a share link and has not been adopted by its owner, so unattended Slack sends are NOT authorized for it.'
+    : 'The owner has turned ON "Require approval before Slack sends" for this schedule.'} The base instruction elsewhere in this prompt (show the draft, ask "Should I send this?") is therefore NOT lifted for this run, even though no human is present to answer it.
+- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it to the knowledge base, and state plainly in your final report that nothing was sent to Slack because ${slackWithholdReason === 'visitor_edited'
+    ? 'this schedule was set up through a share link and has not been adopted by its owner (the owner can adopt it in the portal).'
+    : 'this schedule requires approval before Slack sends.'}`
 }${publishAuthorization === 'unknown'
   ? ''
   : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
