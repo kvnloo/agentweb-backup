@@ -24,6 +24,13 @@ import {
   type ConversionUploadFailure,
 } from '../utils/googleAdsOfflineConversions';
 
+/** Google's authorizationError CUSTOMER_NOT_ENABLED, read defensively: this runs inside a catch and must never throw. */
+function isCustomerNotEnabled(err: any): boolean {
+  const details = err?.response?.data?.error?.details;
+  if (!Array.isArray(details)) return false;
+  return details.some((d: any) => Array.isArray(d?.errors) && d.errors.some((e: any) => e?.errorCode?.authorizationError === 'CUSTOMER_NOT_ENABLED'));
+}
+
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 
 /**
@@ -654,7 +661,12 @@ export class GoogleAdsService {
   // A leaf the user can access both directly and through a discovered manager is shown only
   // under the manager (deduped out of the top level). Managers themselves are not connectable.
 
-  async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
+  /**
+   * @param diagnostics Optional out-param (same trade-off as `search`'s `completeness`): ids Google lists as
+   *   accessible but refuses to read with CUSTOMER_NOT_ENABLED — an account whose signup was started and never
+   *   finished (or that was deactivated). They are not connectable, but "you have no account" would be untrue.
+   */
+  async listAccountHierarchy(accessToken: string, diagnostics?: { notEnabledCustomerIds?: string[] }): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
       timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
@@ -706,6 +718,7 @@ export class GoogleAdsService {
         }
       } catch (err: any) {
         // Couldn't even identify this account — skip it, but log so the drop isn't silent.
+        if (diagnostics && isCustomerNotEnabled(err)) (diagnostics.notEnabledCustomerIds ??= []).push(customerId);
         console.warn(`[GoogleAds] listAccountHierarchy: skipping customer ${customerId} (probe failed):`, err?.message || err);
       }
     }

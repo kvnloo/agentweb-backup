@@ -10,6 +10,8 @@
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
  *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup or an MCP user's zoma_status link (forwarded by /api/oauth/meta/callback)
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
+ *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
+ *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
@@ -37,6 +39,7 @@ import {
   type BrowserStep,
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
+import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
 import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 
@@ -57,6 +60,18 @@ function throttle(bucket: string, maxPerMinute: number) {
 
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
+
+// Step text carries provider URLs the user must open; plain text is not clickable, so https URLs become links.
+export function linkifyHttps(text: string): string {
+  return text
+    .split(/(https:\/\/[^\s<>"']+)/)
+    .map((part, i) => {
+      if (i % 2 === 0) return escapeHtml(part);
+      const url = part.replace(/[.,;:!?)\]]+$/, '');
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${escapeHtml(part.slice(url.length))}`;
+    })
+    .join('');
+}
 
 // Browsers enforce form-action on the redirect chain a form submit starts, and the picker's
 // submit continues on to Stripe Checkout (or back to Meta), so that page allows those hops.
@@ -127,7 +142,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
     );
   }
   const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">${escapeHtml(step.retryLabel ?? 'Try again')}</a></p>` : '';
-  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>` : '';
+  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${linkifyHttps(s)}</li>`).join('')}</ol>` : '';
   return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${steps}${retry}`);
 }
 
@@ -138,6 +153,7 @@ function failPage(res: Response, step: string, error: unknown) {
 
 export function createZomaRouter(
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
+  googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps,
   billingDeps?: Parameters<typeof openZomaCheckout>[1],
 ): Router {
   const router = Router();
@@ -200,6 +216,23 @@ export function createZomaRouter(
       return renderStep(res, await selectMetaAccounts({ t: req.body?.t, account_id: req.body?.account_id }, deps), req);
     } catch (error) {
       return failPage(res, 'meta_connect', error);
+    }
+  });
+
+  router.get('/google/callback', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const q = req.query;
+      return renderStep(res, await completeGoogleConnect({ code: q.code, state: q.state, error: q.error }, googleDeps));
+    } catch (error) {
+      return failPage(res, 'google_callback', error);
+    }
+  });
+
+  router.post('/google/select', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await selectGoogleAccounts({ t: req.body?.t, account_id: req.body?.account_id }, googleDeps), req);
+    } catch (error) {
+      return failPage(res, 'google_connect', error);
     }
   });
 

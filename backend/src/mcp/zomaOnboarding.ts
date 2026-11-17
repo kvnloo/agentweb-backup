@@ -33,7 +33,7 @@ import {
 import { type ZomaToolName } from './zomaToolDefinitions';
 import {
   adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
-  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_META_LOGIN_NOTE, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
 } from './zomaAdsExperience';
 import {
   formatZomaBillingUsage, formatZomaPlanLine, getZomaBillingConfig, getZomaBillingUsage, getZomaPlanSummary,
@@ -294,7 +294,8 @@ function summarizeGoogle(account: ConnectedAccount): ZomaGoogleAdsAccountSummary
 }
 
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
-  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId);
+  // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
+  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
 }
 
 /**
@@ -375,7 +376,13 @@ export async function getZomaReadiness(
   const allAccounts = await deps.listAccounts(userId);
   const accounts = usableAccounts(allAccounts, META_PROVIDER, deps.now());
   const meta: ZomaReadiness['meta'] = { ready: accounts.length > 0, accounts: accounts.map(summarize) };
-  if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
+  if (!meta.ready && mintLinks) {
+    try {
+      meta.link = await deps.buildMetaConnectUrl(userId);
+    } catch (error) {
+      console.error('[zoma] meta connect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
 
   const writes_enabled = payment.ready && meta.ready;
   let blocker = metaPageBlocker(accounts);
@@ -455,9 +462,14 @@ function nextStep(
       meta.link
         ? `Connect Meta (Facebook login) and pick your ad account → ${meta.link}`
         : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
-      ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
+      // ENG-3135: never fall back to the bare ads.google.com — that is Google's campaign signup.
+      ...(google
+        ? [google.link
+          ? `Or connect an existing Google Ads account → ${google.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
+        : []),
       'Tell me when it is connected and I will re-check.',
-      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
+      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
     ].join('\n');
   }
   if (!payment.ready) {
