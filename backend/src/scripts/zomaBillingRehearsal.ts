@@ -177,6 +177,7 @@ async function main() {
     const sessionId = String(refusal.link).split('/').pop() as string;
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items'] });
     check('the Checkout belongs to the test-clock customer (one customer for the user)', session.customer === customer.id, { sessionCustomer: session.customer, clockCustomer: customer.id });
+    check('Checkout is USD-only (adaptive pricing off, no converted amount)', (session as any).adaptive_pricing?.enabled === false && session.currency === 'usd', { adaptive_pricing: (session as any).adaptive_pricing, currency: session.currency });
     check('Checkout is subscription mode with plan + metered overage + $1 fee, 7-day trial',
       session.mode === 'subscription' && session.line_items?.data.length === 3, { mode: session.mode, items: session.line_items?.data.map((l) => `${l.price?.id === feePrice.id ? 'fee' : l.price?.id === planPrice.id ? 'plan' : 'overage'}:${l.amount_total}`) });
     const opened = await billing.openZomaCheckout(sessionId, deps);
