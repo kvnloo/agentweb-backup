@@ -654,7 +654,12 @@ export class GoogleAdsService {
   // A leaf the user can access both directly and through a discovered manager is shown only
   // under the manager (deduped out of the top level). Managers themselves are not connectable.
 
-  async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
+  /**
+   * @param diagnostics Optional out-param (same trade-off as `search`'s `completeness`): ids Google lists as
+   *   accessible but refuses to read with CUSTOMER_NOT_ENABLED — an account whose signup was started and never
+   *   finished (or that was deactivated). They are not connectable, but "you have no account" would be untrue.
+   */
+  async listAccountHierarchy(accessToken: string, diagnostics?: { notEnabledCustomerIds?: string[] }): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
       timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
@@ -706,6 +711,8 @@ export class GoogleAdsService {
         }
       } catch (err: any) {
         // Couldn't even identify this account — skip it, but log so the drop isn't silent.
+        const codes: unknown[] = (err?.response?.data?.error?.details ?? []).flatMap((d: any) => (d?.errors ?? []).map((e: any) => e?.errorCode?.authorizationError));
+        if (diagnostics && codes.includes('CUSTOMER_NOT_ENABLED')) (diagnostics.notEnabledCustomerIds ??= []).push(customerId);
         console.warn(`[GoogleAds] listAccountHierarchy: skipping customer ${customerId} (probe failed):`, err?.message || err);
       }
     }

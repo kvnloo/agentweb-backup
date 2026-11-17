@@ -23,9 +23,11 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   } catch { return null; }
 };
 
+// Signature-checked but expiry-ignored: a Zoma user who lingers past the 15-minute state must still land on
+// Zoma's "expired — ask your agent" page (the Zoma handler enforces expiry), not in the Emma portal.
 const isZomaState = (state: string): boolean => {
   try {
-    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret(), { ignoreExpiration: true }) as StatePayload;
     return typeof decoded.zoma === 'string' && decoded.zoma.length > 0;
   } catch { return false; }
 };

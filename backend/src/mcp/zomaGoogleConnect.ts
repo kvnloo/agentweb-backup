@@ -54,6 +54,13 @@ const EXPIRED: PageStep = {
   message: `This Google Ads connection link is invalid or has expired. ${ZOMA_BACK_TO_AGENT}`,
 };
 
+/** Google lists the account but reports it not enabled: signup was started (often via the campaign-first flow) and never finished. */
+const UNFINISHED_ACCOUNT_STEPS: readonly string[] = [
+  'Open https://ads.google.com signed in with the same Google account and finish setting up the account Google already created. Do not start a second account yet.',
+  'Check the country, currency and time zone Google shows for it. Google does not let you change them once the account exists, so if they are wrong (for example pre-filled from your browser or location), create a new account instead and choose them yourself.',
+  'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign".',
+];
+
 const NOTHING_CHANGED = 'Connecting only reads your accounts — no campaign was created and nothing was spent.';
 
 async function retryLink(userId: string, deps: ZomaGoogleDeps): Promise<string | undefined> {
@@ -117,6 +124,15 @@ export async function completeGoogleConnect(
   }
 
   const leaves = result.connectableLeaves;
+  if (leaves.length === 0 && result.notEnabledCustomerIds?.length) {
+    const ids = result.notEnabledCustomerIds.filter((id) => /^\d+$/.test(id)).join(', ');
+    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'google_ads_account_not_enabled' });
+    return failedPage(
+      userId, deps, 400, 'Google Ads account not finished',
+      `Google found a Google Ads account on this login${ids ? ` (${ids})` : ''}, but it is not active yet — its setup was started and not finished. Zoma did not create it and did not change it. To finish it:`,
+      [...UNFINISHED_ACCOUNT_STEPS, 'Then connect Google Ads again.'],
+    );
+  }
   if (leaves.length === 0) {
     logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'no_google_ads_accounts' });
     return failedPage(

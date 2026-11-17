@@ -62,6 +62,8 @@ export interface GoogleAdsFinalizeResult {
   accountTree: GoogleAdsAccountNode[];
   connectableLeaves: GoogleAdLeaf[];
   tokenSessionId: string;
+  /** Accounts Google lists but reports CUSTOMER_NOT_ENABLED (signup started, not finished, or deactivated). */
+  notEnabledCustomerIds: string[];
 }
 
 export async function finalizeGoogleAdsOAuth(params: { userId: string; code: string }): Promise<GoogleAdsFinalizeResult> {
@@ -104,7 +106,8 @@ export async function finalizeGoogleAdsOAuth(params: { userId: string; code: str
     throw new GoogleAdsInsufficientScopesError(grantedScopes);
   }
 
-  const accountTree = await googleAdsService.listAccountHierarchy(access_token);
+  const diagnostics: { notEnabledCustomerIds?: string[] } = {};
+  const accountTree = await googleAdsService.listAccountHierarchy(access_token, diagnostics);
 
   // Mark leaves the user has already connected so the modal can disable them.
   const existing = await getAccountsByUserId(userId);
@@ -123,10 +126,11 @@ export async function finalizeGoogleAdsOAuth(params: { userId: string; code: str
   console.log('[GoogleAds OAuth /finalize] success', {
     userId,
     accountCount: connectableLeaves.length,
+    notEnabledAccountCount: diagnostics.notEnabledCustomerIds?.length ?? 0,
     grantedScopes,
   });
 
-  return { accountTree: markedTree, connectableLeaves, tokenSessionId };
+  return { accountTree: markedTree, connectableLeaves, tokenSessionId, notEnabledCustomerIds: diagnostics.notEnabledCustomerIds ?? [] };
 }
 
 export type GoogleAdsConnectResult =
