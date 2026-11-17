@@ -903,6 +903,54 @@ describe('CRM Group Email Endpoints', () => {
         (deletePendingBatch as jest.Mock).mockResolvedValue(undefined);
       });
 
+      it('ENG-3076: the in-request and background paths build the identical message for the same lead', async () => {
+        mailboxSenderConfig();
+        const providerSend = jest.spyOn(sendAsSenderModule, 'sendAsSender').mockResolvedValue(undefined as any);
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        const target = { leadId: 'lead-x', email: 'ada@test.com', firstName: 'Ada', companyName: 'Acme' };
+        const body = {
+          senderId: 'ol-1', senderEmail: 'hunter@baldwin.com', senderName: 'Hunter',
+          subject: 'Hi {{firstName}}', htmlContent: '<p>Hello {{firstName}}</p>',
+          textContent: 'Hello {{firstName}}', unsubscribeFooterHtml: '<p><a href="{{unsubscribeUrl}}">Stop</a></p>',
+        };
+        const messageFor = () => providerSend.mock.calls.map((c: any[]) => c[2]).find((m: any) => m.to === target.email);
+
+        // Path 1: in-request loop (<= MAILBOX_SYNC_LEAD_LIMIT leads).
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [target], lastEvaluatedKey: undefined });
+        mockReq.body = { ...body };
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+        expect(mockRes.status).not.toHaveBeenCalledWith(202);
+        const inRequest = messageFor();
+        expect(inRequest).toBeDefined();
+        providerSend.mockClear();
+
+        // Path 2: background mailbox run (> MAILBOX_SYNC_LEAD_LIMIT leads).
+        let record: any = null;
+        let tick = 0;
+        (getPendingBatch as jest.Mock).mockImplementation(async () => (record ? { ...record } : null));
+        (upsertPendingBatch as jest.Mock).mockImplementation(async (_u: string, b: any) => { record = { ...b, updatedAt: `t${++tick}` }; });
+        (deletePendingBatch as jest.Mock).mockImplementation(async () => { record = null; });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [target, ...manyLeads(60).map((l) => ({ ...l, firstName: 'F', companyName: 'C' }))], lastEvaluatedKey: undefined });
+        mockReq.body = { ...body };
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+        expect(mockRes.status).toHaveBeenCalledWith(202);
+        for (let i = 0; i < 50 && record !== null; i++) await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setTimeout(r, 50));
+        const background = messageFor();
+
+        expect(background).toEqual(inRequest);
+        expect(inRequest.subject).toBe('Hi Ada');
+        expect(inRequest.text).toBe('Hello Ada');
+        expect(inRequest.html).toContain('<p>Hello Ada</p>');
+        expect(inRequest.html).toMatch(/[?&]sig=[0-9a-f]+/);
+        expect(inRequest.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+
+        providerSend.mockRestore();
+        (getPendingBatch as jest.Mock).mockResolvedValue(null);
+        (upsertPendingBatch as jest.Mock).mockResolvedValue(undefined);
+        (deletePendingBatch as jest.Mock).mockResolvedValue(undefined);
+      });
+
       it('ENG-2929: refuses a second send while a live background run owns the list', async () => {
         mailboxSenderConfig();
         (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });

@@ -118,7 +118,11 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
       sessionId: 's-9',
       userAgent: 'claude-code/2',
     });
-    expect(res.body.result).toEqual({ content: [{ type: 'text', text: '{"rows":[1]}' }], isError: false });
+    // ENG-3134: the result, then one actionable next step.
+    expect(res.body.result.isError).toBe(false);
+    expect(res.body.result.content[0]).toEqual({ type: 'text', text: '{"rows":[1]}' });
+    expect(res.body.result.content[1].text).toMatch(/^Next step: /);
+    expect(res.body.result.content).toHaveLength(2);
   });
 
   it('tools/call auth failures are HTTP 401/403, never executed past the gateway', async () => {
@@ -132,7 +136,9 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
   it('tools/call refusal is an isError tool result', async () => {
     mockHandle.mockRejectedValue(new MockRefusal('Write blocked by anomaly gate.'));
     const res = await rpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'call_meta_marketing_api' } }, 'Bearer x').expect(200);
-    expect(res.body.result).toEqual({ content: [{ type: 'text', text: 'Write blocked by anomaly gate.' }], isError: true });
+    expect(res.body.result.isError).toBe(true);
+    expect(res.body.result.content[0]).toEqual({ type: 'text', text: 'Write blocked by anomaly gate.' });
+    expect(res.body.result.content[1].text).toMatch(/^Next step: .*zoma_status/);
   });
 
   it('unexpected errors are -32603 without leaking details', async () => {

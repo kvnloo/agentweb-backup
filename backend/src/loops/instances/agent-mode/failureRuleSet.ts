@@ -46,6 +46,13 @@ export interface AgentFailureProposalPayload {
    * for this failure class, so a filed issue links straight to evidence.
    */
   sampleTraces?: string[];
+  /**
+   * ENG-3088: when each failure in this class happened (ISO, oldest first), so
+   * intake can tell a window that merely still contains old failures from one
+   * with a failure newer than the last thing posted on the issue. Set as a
+   * non-enumerable property, so it is never serialised or stored.
+   */
+  failureTimes?: string[];
   directive: string;
 }
 
@@ -85,6 +92,8 @@ interface ToolStats {
   errorClassesByType: Map<string, Map<string, number>>;
   /** ENG-589: up to MAX_SAMPLE_TRACES distinct trace refs per failure class. */
   tracesByType: Map<string, string[]>;
+  /** ENG-3088: event time (ms) of every failure per failure class. */
+  timesByType: Map<string, number[]>;
 }
 
 const MAX_SAMPLE_TRACES = 3;
@@ -208,6 +217,7 @@ export class AgentFailureRuleSet
         messagesByType: new Map<string, string>(),
         errorClassesByType: new Map<string, Map<string, number>>(),
         tracesByType: new Map<string, string[]>(),
+        timesByType: new Map<string, number[]>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -229,6 +239,12 @@ export class AgentFailureRuleSet
         const ref = `run ${String(e.subjectId)}${sid ? ` (session ${sid})` : ''}`;
         if (traces.length < MAX_SAMPLE_TRACES && !traces.includes(ref)) traces.push(ref);
         stats.tracesByType.set(ft, traces);
+        const at = e.ts instanceof Date ? e.ts.getTime() : NaN;
+        if (Number.isFinite(at)) {
+          const times = stats.timesByType.get(ft) ?? [];
+          times.push(at);
+          stats.timesByType.set(ft, times);
+        }
       }
       byTool.set(toolName, stats);
     }
@@ -324,6 +340,15 @@ export class AgentFailureRuleSet
             failureRatePct: Math.round(failureRate * 100),
             topErrorClass,
           },
+        });
+        // ENG-3088: run-scoped input for intake only. Non-enumerable on purpose: the proposal is
+        // JSON-serialised into the learning store and the fix spec, and this must not become a
+        // stored field there.
+        Object.defineProperty(proposals[proposals.length - 1].payload, 'failureTimes', {
+          value: [...(stats.timesByType.get(failureType) ?? [])]
+            .sort((x, y) => x - y)
+            .map((ms) => new Date(ms).toISOString()),
+          enumerable: false,
         });
       }
     }

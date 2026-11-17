@@ -63,7 +63,6 @@ jest.mock('../utils/sseProgress', () => ({
 jest.mock('../services/tokenUsageService', () => ({
   TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
-  incrementUserTokenUsage: jest.fn(),
 }));
 
 import { chatbotDb } from '../services/chatbotService';

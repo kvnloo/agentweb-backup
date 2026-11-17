@@ -9,6 +9,7 @@ import { fetchPublicHtml, SsrfBlockedError } from "../utils/ssrfGuard";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
+import { forgetSubscriberLookup } from "../services/subscriberLookup";
 import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
@@ -2957,6 +2958,7 @@ router.post("/tasks/:taskId/subscribers", async (req, res) => {
     }
 
     const subscriber = await subscriberDb.addSubscriber(taskId, email);
+    forgetSubscriberLookup(taskId);
     res.status(201).json(subscriber);
   } catch (error: any) {
     console.error("Error adding subscriber:", error);
