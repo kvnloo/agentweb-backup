@@ -618,6 +618,66 @@ describe('Connected Accounts Routes', () => {
         });
     });
 
+    describe('GET /connected-accounts keeps connected platforms visible on a restricted plan (ENG-3126)', () => {
+        const { getAllowedConnectedAccounts } = require('../services/subscriptionService');
+        const googleAdsRow = {
+            platform: 'google_ads',
+            account_id: 'gads-123',
+            account_name: 'Free User Ads',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            config: { customer_id: '1234567890', test_account: false, refresh_token: 'rt', access_token: 'at' },
+        };
+
+        it('a Free-plan user (google_ads not in plan) with a connected Google Ads account sees google_ads allowed and the account with its status', async () => {
+            (getAllowedConnectedAccounts as jest.Mock).mockResolvedValueOnce(['gmail', 'linkedin']);
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([googleAdsRow]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.allowedConnectedAccounts).toEqual(expect.arrayContaining(['gmail', 'linkedin', 'google_ads']));
+            expect(response.body.accounts).toHaveLength(1);
+            expect(response.body.accounts[0].platform).toBe('google_ads');
+            expect(response.body.accounts[0].status).toBeDefined();
+        });
+
+        it('a Free-plan user with NO Google Ads account is not offered google_ads (plan gate still applies)', async () => {
+            (getAllowedConnectedAccounts as jest.Mock).mockResolvedValueOnce(['gmail', 'linkedin']);
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.allowedConnectedAccounts).toEqual(['gmail', 'linkedin']);
+        });
+
+        it('a connected Instagram (meta instagram_business row) keeps the instagram card visible', async () => {
+            (getAllowedConnectedAccounts as jest.Mock).mockResolvedValueOnce(['gmail']);
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([{
+                platform: 'meta',
+                account_id: 'ig-1',
+                account_name: 'IG',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: { account_type: 'instagram_business', access_token: 't', token_expires_at: Date.now() + 100000 },
+            }]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.body.allowedConnectedAccounts).toEqual(expect.arrayContaining(['gmail', 'meta', 'instagram']));
+        });
+
+        it('does not duplicate a platform that is both allowed and connected', async () => {
+            (getAllowedConnectedAccounts as jest.Mock).mockResolvedValueOnce(['google_ads']);
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([googleAdsRow]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.body.allowedConnectedAccounts).toEqual(['google_ads']);
+        });
+    });
+
     describe('removing a Smartlead connection takes AgentWeb\'s webhook off the campaigns, after the connection is gone (ENG-673)', () => {
         beforeEach(() => {
             smartleadOrder.length = 0;
