@@ -24,7 +24,7 @@ import {
   getUserXOrgRollup,
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
-import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
+import { buildUnitEconomicsReport, buildUnitEconomicsCsv } from "../services/llmUnitEconomicsService";
 import { listSpendEventsBounded } from "../services/spendEventDb";
 import { boundBreakdownRows, buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
 import { projectMonth } from "../services/spendProjection";
@@ -500,7 +500,10 @@ router.get(
  *
  *   GET /api/admin/usage/unit-economics?month=YYYY-MM
  *       [&tier=Pro][&state=hard_only][&account=<id-or-email substring>]
- *       [&model=<model id>][&purchasedOnly=true]
+ *       [&model=<model id>][&purchasedOnly=true][&format=csv]
+ *
+ * Each row/tier carries targetAllInUsd / varianceUsd / overTarget (live hard
+ * threshold + overhead envelope). Admin-only: customer APIs must never expose them.
  */
 router.get(
   "/usage/unit-economics",
@@ -512,6 +515,10 @@ router.get(
       if (!MONTH_RE.test(month)) {
         return res.status(400).json({ message: "month must be YYYY-MM" });
       }
+      const format = req.query.format;
+      if (format !== undefined && format !== "json" && format !== "csv") {
+        return res.status(400).json({ message: "format must be json or csv" });
+      }
       const report = await buildUnitEconomicsReport(month, {
         tier: req.query.tier ? String(req.query.tier) : undefined,
         usageState: req.query.state ? String(req.query.state) : undefined,
@@ -519,6 +526,11 @@ router.get(
         model: req.query.model ? String(req.query.model) : undefined,
         purchasedOnly: String(req.query.purchasedOnly || "") === "true",
       });
+      if (format === "csv") {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="unit-economics-${month}.csv"`);
+        return res.send(buildUnitEconomicsCsv(report));
+      }
       return res.json(report);
     } catch (error) {
       console.error("[adminUsage] unit-economics failed:", error);

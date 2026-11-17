@@ -27,7 +27,7 @@ jest.mock('../utils/sseProgress', () => ({
   progressStore: { delete: jest.fn().mockReturnValue(true), has: jest.fn().mockReturnValue(false), add: jest.fn() },
   getLatestProgress: jest.fn().mockReturnValue(undefined), requestCancel: jest.fn(), clearCancel: jest.fn(), isCancelled: jest.fn().mockReturnValue(false), emitProgress: jest.fn(),
 }));
-jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn(), incrementUserTokenUsage: jest.fn() }));
+jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn() }));
 
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';

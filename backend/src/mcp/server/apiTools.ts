@@ -4301,6 +4301,50 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
 });
 
 mcpToolRegistry.register({
+  name: 'read_client_meta_activity',
+  definition: {
+    name: 'read_client_meta_activity',
+    description: `Read the Meta ad account change history (who changed what, when) for one named client. Admin-only tool, read-only — nothing is written to Meta.
+
+Resolves the client the same way assess_client_health does, with one difference: a name that matches more than one client is refused, so pass the exact email when a name is ambiguous.
+
+Returns:
+- 'ad_account_id' and 'client': the account that was actually read and whose it is. Check these before quoting the history.
+- 'events': one page of Meta activity events (event_time, event_type, object_id, object_name, object_type, actor_name, extra_data). When Meta supplies old and new values (for example a budget change), they are also given as 'before' and 'after'. Fields Meta did not return are absent.
+- 'paging': cursors; pass paging.cursors.after as 'after' to read the next page.
+
+A result with success:false means nothing was read ('reason' says why: ambiguous_client, client_not_found, no_meta_connection, credential_pair_mismatch, invalid_argument, meta_read_failed). Never report a failed read as "no changes".`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: { type: 'string', description: 'ISO date or unix seconds; earliest event.' },
+        until: { type: 'string', description: 'ISO date or unix seconds; latest event.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Events per page (default 50).' },
+        after: { type: 'string', description: 'Paging cursor from a previous result.' }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const queryParams: Record<string, string> = {};
+    for (const key of ['since', 'until', 'limit', 'after']) {
+      if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') queryParams[key] = String(args[key]);
+    }
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-activity`,
+      context: ctx(context),
+      queryParams
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'check_account_tracking_health',
   definition: {
     name: 'check_account_tracking_health',
