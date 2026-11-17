@@ -1,34 +1,29 @@
 /**
  * ENG-3133 — the weekly Zoma ad-performance email.
  *
- * Once a week, every active Zoma user gets a short summary: how their connected Meta ad account
- * did over the last 7 days, and the changes Zoma made for them in that time. It keeps users in the
- * loop during the trial and after it. Dark until ZOMA_WEEKLY_REPORT_ENABLED=true.
+ * Once a week, every Zoma user who used Zoma in the last 7 days gets a short summary: how their
+ * connected Meta and Google Ads accounts did over those 7 days, and the changes Zoma made for them.
+ * It keeps users in the loop during the trial and after it. Dark until ZOMA_WEEKLY_REPORT_ENABLED=true.
  *
- * Who gets it: a Zoma user who is not an internal/test/admin account and not a "pal" lead, who has
- * not unsubscribed, who made at least one successful Zoma call in the last 7 days, and who has
- * something to report (ad delivery on the connected Meta account, or a confirmed change Zoma made).
- * A user with nothing to say gets no email that week.
+ * Who gets it: a Zoma user who is not an internal/test/admin account or a "pal" lead, who has not
+ * unsubscribed, and who made at least one successful Zoma call in the last 7 days. Nobody else.
+ * The email always says something true about each connected ad account (numbers, "no delivery", or
+ * "could not read it"), or that no ad account is connected yet.
  *
- * Exactly once per user per ISO week, across instances: a conditional write claims
- * (user, ISO week) BEFORE the send, so a repeated or concurrent pass can never send twice. A failed
- * send is logged and not retried that week (a missed weekly email is cheaper than a duplicate).
+ * Exactly once per user per ISO week, across instances: a conditional write claims (user, ISO week)
+ * BEFORE the send, so a repeated or concurrent pass can never send twice. A failed send is logged and
+ * not retried that week (a missed weekly email is cheaper than a duplicate).
  *
- * Opt-out is scoped to this email only. The unsubscribe link is signed and shows a confirm button
- * first (GET never changes anything, so mail scanners that open links cannot unsubscribe anyone).
- * The opt-out is a row in the existing MCP usage-event table (a funnel row with a dedupeKey), not a
- * user-row write: no new table, column or index.
+ * Opt-out is scoped to this email only and lives on the user record (`zomaWeeklyReportOptOutAt`, like
+ * `dripUnsubscribed` and `slackShipNotifyDisabled`): it travels with the account, is covered by the
+ * users table's point-in-time recovery, and is already on the row the job scans. The unsubscribe link
+ * is signed; GET shows a confirm button and changes nothing (mail scanners that open links cannot
+ * unsubscribe anyone), POST records it.
  */
 import crypto from 'crypto';
 import { getJwtSecret } from '../config/jwt';
 import { accountFlag } from '../services/journeyProductBackfill';
-import {
-  getMcpUserUsage,
-  hasZomaFunnelRow,
-  recordZomaBillingFunnel,
-  type McpUserUsage,
-  type ZomaBillingFunnelInput,
-} from '../services/mcpUsageEventsService';
+import { getMcpUserUsage, hasZomaFunnelRow, recordZomaBillingFunnel, type McpUserUsage } from '../services/mcpUsageEventsService';
 import type { ZomaUserRecord } from '../services/zomaScoreboard';
 import { getBackendUrl } from './oauth/authChallenge';
 import { ZOMA_PAL, zomaLeadClassification } from './zomaAdsExperience';
@@ -88,21 +83,40 @@ export function inSendWindow(ms: number, cfg: Pick<ZomaWeeklyReportConfig, 'week
   return d.getUTCDay() === cfg.weekday && d.getUTCHours() >= cfg.hour;
 }
 
-/** The week's account-level Meta totals (from the `zoma_ads_report` totals, never its agent-facing text). */
+/** Internal/test/admin accounts and "pal" leads never get product email. */
+export function isReportRecipient(user: Pick<ZomaUserRecord, 'email' | 'isAdmin' | 'zomaAdsExperience'>): boolean {
+  if (!user.email) return false;
+  if (accountFlag(user.email, user.isAdmin)) return false;
+  return zomaLeadClassification(user.zomaAdsExperience) !== ZOMA_PAL;
+}
+
+export type AdPlatform = 'meta' | 'google_ads';
+const PLATFORM_LABEL: Record<AdPlatform, string> = { meta: 'Meta ads', google_ads: 'Google Ads' };
+const WRITE_PLATFORM_LABEL: Record<string, string> = { meta: 'Meta', google_ads: 'Google Ads' };
+
+/** One ad account's totals for the week. */
 export interface ZomaAdsWeek {
   currency?: string;
   spend: number;
   impressions: number;
   clicks: number;
   conversions: number;
+  /** Meta only; null when there is none. */
   roas: number | null;
+  /** Meta only: the conversion event the report counted. */
   conversionEvent: string | null;
 }
+
+/** What the report can say about one connected ad platform. */
+export type PlatformWeek =
+  | { platform: AdPlatform; status: 'delivered'; ads: ZomaAdsWeek }
+  | { platform: AdPlatform; status: 'no_delivery' }
+  | { platform: AdPlatform; status: 'unreadable' };
 
 const int = (n: number) => Math.round(n).toLocaleString('en-US');
 const money = (n: number, currency?: string) => `${n.toFixed(2)}${currency ? ` ${currency}` : ''}`;
 
-/** Plain lines for the email: spend and results only. */
+/** Plain lines for one platform's delivery: spend and results only. */
 export function adsWeekLines(ads: ZomaAdsWeek): string[] {
   return [
     `Spend: ${money(ads.spend, ads.currency)}`,
@@ -113,17 +127,14 @@ export function adsWeekLines(ads: ZomaAdsWeek): string[] {
   ];
 }
 
-/** A user with no ad delivery and no confirmed change this week has nothing to report. */
-export function hasSomethingToReport(usage: Pick<McpUserUsage, 'toolCalls' | 'writes'>, ads: ZomaAdsWeek | undefined): boolean {
-  return usage.toolCalls > 0 && (!!ads || usage.writes.confirmed > 0);
+/** The line(s) that describe one platform, or the whole "no account connected" case. */
+function platformLines(week: PlatformWeek): string[] {
+  const label = PLATFORM_LABEL[week.platform];
+  if (week.status === 'delivered') return adsWeekLines(week.ads);
+  if (week.status === 'no_delivery') return [`No ad delivery was recorded on your connected ${label} account this week.`];
+  return [`We could not read your ${label} account this week. It may need to be reconnected: ask your agent to run zoma_status.`];
 }
-
-/** Internal/test/admin accounts and "pal" leads never get product email. */
-export function isReportRecipient(user: Pick<ZomaUserRecord, 'email' | 'isAdmin' | 'zomaAdsExperience'>): boolean {
-  if (!user.email) return false;
-  if (accountFlag(user.email, user.isAdmin)) return false;
-  return zomaLeadClassification(user.zomaAdsExperience) !== ZOMA_PAL;
-}
+const NO_ACCOUNT_LINE = 'No ad account is connected to Zoma yet. Ask your agent to run zoma_status for the connect link.';
 
 const b64url = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
 
@@ -131,7 +142,7 @@ function signature(userId: string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(`${UNSUBSCRIBE_CONTEXT}:${userId}`).digest('base64url');
 }
 
-/** `<base64url user id>.<hmac>`. Never expires: opting out must always work. */
+/** `<base64url user id>.<hmac>`. Signed with the JWT secret, like the CRM unsubscribe links. */
 export function signUnsubscribeToken(userId: string, secret: string = getJwtSecret()): string {
   return `${b64url(userId)}.${signature(userId, secret)}`;
 }
@@ -155,25 +166,27 @@ export function verifyUnsubscribeToken(token: unknown, secret: string = getJwtSe
 
 const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-/** "update campaign" from a recorded write; letters, digits, underscore and space only. */
+/** "update campaign (Meta)" from a recorded write; letters, digits, underscore and space only. */
 function describeWrite(w: McpUserUsage['recentWrites'][number]): string {
   const clean = (v: unknown) => String(v ?? '').toLowerCase().replace(/[^a-z0-9_ ]/g, '').replace(/_/g, ' ').trim().slice(0, 40);
-  return [clean(w.action), clean(w.entityType)].filter(Boolean).join(' ') || 'change';
+  const what = [clean(w.action), clean(w.entityType)].filter(Boolean).join(' ') || 'change';
+  const where = WRITE_PLATFORM_LABEL[String(w.platform ?? '')];
+  return where ? `${what} (${where})` : what;
 }
 
 export interface WeeklyReportEmailInput {
   usage: McpUserUsage;
-  ads?: ZomaAdsWeek;
+  /** One entry per connected ad platform; empty when no usable ad account is connected. */
+  platforms: PlatformWeek[];
   range: { start: string; end: string };
   unsubscribeUrl: string;
 }
 
 export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: string; text: string; html: string } {
-  const { usage, ads, range, unsubscribeUrl } = input;
+  const { usage, platforms, range, unsubscribeUrl } = input;
   const day = (iso: string) => iso.slice(0, 10);
   const confirmed = usage.writes.confirmed;
   const recent = usage.recentWrites.filter((w) => w.verification === 'CONFIRMED').slice(-5).reverse();
-  const perfLines = ads ? adsWeekLines(ads) : ['No ad delivery was recorded on your connected Meta ad account this week.'];
   const changes = confirmed > 0
     ? `Zoma made ${confirmed} confirmed change${confirmed === 1 ? '' : 's'} to your ads this week.`
     : 'Zoma made no changes to your ads this week.';
@@ -181,11 +194,15 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
   const callLine = `Your agent made ${usage.toolCalls.toLocaleString('en-US')} successful Zoma call${usage.toolCalls === 1 ? '' : 's'} this week.`;
   const subject = 'Your Zoma week in ads';
 
+  const perfText = platforms.length
+    ? platforms.flatMap((p, i) => [...(i ? [''] : []), PLATFORM_LABEL[p.platform], ...platformLines(p)])
+    : [NO_ACCOUNT_LINE];
+
   const text = [
     `Here is your Zoma week, ${day(range.start)} to ${day(range.end)}.`,
     '',
     'How your ads did',
-    ...perfLines,
+    ...perfText,
     '',
     'What Zoma changed',
     changes,
@@ -198,9 +215,21 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
     `Stop this weekly email: ${unsubscribeUrl}`,
   ].join('\n');
 
+  const perfHtml = platforms.length
+    ? platforms
+        .map((p) => {
+          const lines = platformLines(p);
+          const body = p.status === 'delivered'
+            ? `<ul>${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>`
+            : `<p>${escapeHtml(lines[0])}</p>`;
+          return `<h4>${escapeHtml(PLATFORM_LABEL[p.platform])}</h4>${body}`;
+        })
+        .join('')
+    : `<p>${escapeHtml(NO_ACCOUNT_LINE)}</p>`;
+
   const html = [
     `<p>Here is your Zoma week, ${escapeHtml(day(range.start))} to ${escapeHtml(day(range.end))}.</p>`,
-    `<h3>How your ads did</h3>${ads ? `<ul>${perfLines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>` : `<p>${escapeHtml(perfLines[0])}</p>`}`,
+    `<h3>How your ads did</h3>${perfHtml}`,
     `<h3>What Zoma changed</h3><p>${escapeHtml(changes)}</p>`,
     recentLines.length ? `<ul>${recent.map((w) => `<li>${escapeHtml(day(w.ts))}: ${escapeHtml(describeWrite(w))}</li>`).join('')}</ul>` : '',
     `<p>${escapeHtml(callLine)}</p>`,
@@ -218,14 +247,18 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
 export interface ZomaWeeklyReportDeps {
   config: () => ZomaWeeklyReportConfig;
   listUsers: () => Promise<ZomaUserRecord[]>;
+  /** A fresh, consistent read of the user's opt-out, right before the send. */
   hasOptedOut: (userId: string) => Promise<boolean>;
   hasClaimed: (userId: string, week: string) => Promise<boolean>;
   /** Conditional write: true for the one caller that claims (user, week). */
   claim: (userId: string, week: string) => Promise<boolean>;
   recordSent: (userId: string, week: string) => Promise<unknown>;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
-  /** Account-level Meta totals for the range, or undefined when there was no delivery or no usable ad account. */
-  getAdsWeek: (userId: string, range: { start: string; end: string }) => Promise<ZomaAdsWeek | undefined>;
+  /**
+   * One entry per connected ad platform (empty when none is connected). Must report a failed read as
+   * `unreadable` rather than as "no delivery", and must not throw for a single platform's failure.
+   */
+  getAdsWeeks: (userId: string, range: { start: string; end: string }) => Promise<PlatformWeek[]>;
   sendEmail: (to: string, subject: string, text: string, html: string) => Promise<'sent' | 'suppressed' | 'failed' | void>;
   backendUrl: () => string;
   secret: () => string;
@@ -258,19 +291,19 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
     try {
       if (!isReportRecipient(user)) continue;
       result.checked += 1;
-      if (await deps.hasOptedOut(user.userId)) continue;
+      if (user.zomaWeeklyReportOptOutAt) continue;
       if (await deps.hasClaimed(user.userId, week)) continue;
       const usage = await deps.getUsage(user.userId, range);
       if (usage.toolCalls < 1) continue;
-      const ads = await deps.getAdsWeek(user.userId, range).catch((error) => {
-        console.error('[zoma-weekly-report] ads totals failed:', error instanceof Error ? error.message : error);
-        return undefined;
-      });
-      if (!hasSomethingToReport(usage, ads)) continue;
+      // A failure here skips the user for this pass (nothing claimed, retried next hour) instead of
+      // sending an email that claims "no ad account".
+      const platforms = await deps.getAdsWeeks(user.userId, range);
+      // The scan row can be stale: re-read the opt-out, consistently, right before claiming.
+      if (await deps.hasOptedOut(user.userId)) continue;
       // Claim BEFORE sending: a concurrent or repeated pass loses the conditional write and sends nothing.
       if (!(await deps.claim(user.userId, week))) continue;
       claimedThisPass += 1;
-      const email = weeklyReportEmail({ usage, ads, range, unsubscribeUrl: zomaUnsubscribeUrl(user.userId, deps) });
+      const email = weeklyReportEmail({ usage, platforms, range, unsubscribeUrl: zomaUnsubscribeUrl(user.userId, deps) });
       const outcome = await deps.sendEmail(user.email, email.subject, email.text, email.html);
       if (outcome === 'failed') {
         result.failed += 1;
@@ -292,17 +325,73 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
 // Opt-out (used by the unsubscribe routes)
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Record the opt-out on the user record. Idempotent. Returns false when there is no such user (a deleted
+ * account has nothing to stop); any other failure is thrown so the caller can tell the user to retry.
+ */
 export async function recordWeeklyReportOptOut(
   userId: string,
-  record: (input: ZomaBillingFunnelInput) => Promise<boolean> = recordZomaBillingFunnel,
+  setOptOut: (userId: string, at: string) => Promise<void> = defaultSetOptOut,
+  now: () => Date = () => new Date(),
 ): Promise<boolean> {
-  // dedupeKey = userId: one row per user, so a repeated click is a no-op.
-  return record({ userId, step: 'weekly_report_opt_out', dedupeKey: userId });
+  try {
+    await setOptOut(userId, now().toISOString());
+    return true;
+  } catch (error) {
+    if (error instanceof Error && /not found/i.test(error.message)) return false;
+    throw error;
+  }
+}
+
+async function defaultSetOptOut(userId: string, at: string): Promise<void> {
+  const { userDb } = await import('../services/db');
+  await userDb.updateUser(userId, { zomaWeeklyReportOptOutAt: at });
 }
 
 // ---------------------------------------------------------------------------------------------
 // Production wiring
 // ---------------------------------------------------------------------------------------------
+
+const num = (v: unknown): number => {
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) ? n : 0;
+};
+
+async function metaWeek(account: any, accountId: string, range: { start: string; end: string }): Promise<PlatformWeek> {
+  const { runZomaAdsReport } = await import('./zomaAdsReport');
+  const report = await runZomaAdsReport(account, accountId, { level: 'account', since: range.start.slice(0, 10), until: range.end.slice(0, 10) });
+  const t = report.totals;
+  if (!(t.spend > 0 || t.impressions > 0)) return { platform: 'meta', status: 'no_delivery' };
+  return {
+    platform: 'meta',
+    status: 'delivered',
+    ads: { currency: report.currency, spend: t.spend, impressions: t.impressions, clicks: t.clicks, conversions: t.conversions, roas: t.roas, conversionEvent: report.conversion_event },
+  };
+}
+
+/** Account-level Google Ads totals for the exact window, summed over the (single) customer row. */
+async function googleWeek(userId: string, customerId: string, range: { start: string; end: string }): Promise<PlatformWeek> {
+  const { googleAdsService } = await import('../services/googleAdsService');
+  const since = range.start.slice(0, 10);
+  const until = range.end.slice(0, 10);
+  const rows: any[] = await googleAdsService.queryReporting(
+    userId,
+    customerId,
+    `SELECT customer.currency_code, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions FROM customer WHERE segments.date BETWEEN '${since}' AND '${until}'`,
+  );
+  let spend = 0, impressions = 0, clicks = 0, conversions = 0;
+  let currency: string | undefined;
+  for (const r of rows ?? []) {
+    const m = r?.metrics ?? {};
+    spend += num(m.costMicros ?? m.cost_micros) / 1_000_000;
+    impressions += num(m.impressions);
+    clicks += num(m.clicks);
+    conversions += num(m.conversions);
+    currency = currency ?? r?.customer?.currencyCode ?? r?.customer?.currency_code;
+  }
+  if (!(spend > 0 || impressions > 0)) return { platform: 'google_ads', status: 'no_delivery' };
+  return { platform: 'google_ads', status: 'delivered', ads: { currency, spend, impressions, clicks, conversions, roas: null, conversionEvent: null } };
+}
 
 export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
   config: () => getZomaWeeklyReportConfig(),
@@ -310,23 +399,37 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
     const { defaultScoreboardDeps } = await import('../services/zomaScoreboard');
     return defaultScoreboardDeps().listZomaUsers();
   },
-  hasOptedOut: (userId) => hasZomaFunnelRow(userId, 'weekly_report_opt_out', userId),
+  async hasOptedOut(userId) {
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserByIdConsistent(userId);
+    return !!user?.zomaWeeklyReportOptOutAt;
+  },
   hasClaimed: (userId, week) => hasZomaFunnelRow(userId, 'weekly_report_claimed', `${userId}#${week}`),
   claim: (userId, week) => recordZomaBillingFunnel({ userId, step: 'weekly_report_claimed', dedupeKey: `${userId}#${week}` }),
   recordSent: (userId, week) => recordZomaBillingFunnel({ userId, step: 'weekly_report_sent', dedupeKey: `${userId}#${week}` }),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
-  async getAdsWeek(userId, range) {
-    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER }, { runZomaAdsReport }] = await Promise.all([
-      import('../services/connectedAccountsDb'), import('./zomaProviders'), import('./zomaAdsReport'),
+  async getAdsWeeks(userId, range) {
+    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER, GOOGLE_ADS_PROVIDER }] = await Promise.all([
+      import('../services/connectedAccountsDb'), import('./zomaProviders'),
     ]);
     const now = Date.now();
-    const account = (await getAccountsByUserIdIncludingOrgShared(userId)).find((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now));
-    const accountId = account && META_PROVIDER.accountIds(account)[0];
-    if (!account || !accountId) return undefined;
-    const report = await runZomaAdsReport(account, accountId, { level: 'account', since: range.start.slice(0, 10), until: range.end.slice(0, 10) });
-    const t = report.totals;
-    if (!(t.spend > 0 || t.impressions > 0)) return undefined;
-    return { currency: report.currency, spend: t.spend, impressions: t.impressions, clicks: t.clicks, conversions: t.conversions, roas: t.roas, conversionEvent: report.conversion_event };
+    const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
+    const weeks: PlatformWeek[] = [];
+    const guarded = async (platform: AdPlatform, run: () => Promise<PlatformWeek>) => {
+      try {
+        weeks.push(await run());
+      } catch (error) {
+        console.error(`[zoma-weekly-report] ${platform} read failed:`, error instanceof Error ? error.message : error);
+        weeks.push({ platform, status: 'unreadable' });
+      }
+    };
+    const meta = accounts.find((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now));
+    const metaId = meta && META_PROVIDER.accountIds(meta)[0];
+    if (meta && metaId) await guarded('meta', () => metaWeek(meta, metaId, range));
+    const google = accounts.find((a) => GOOGLE_ADS_PROVIDER.isAdAccount(a) && GOOGLE_ADS_PROVIDER.isUsable(a, now));
+    const googleId = google && GOOGLE_ADS_PROVIDER.accountIds(google)[0];
+    if (google && googleId) await guarded('google_ads', () => googleWeek(userId, googleId, range));
+    return weeks;
   },
   async sendEmail(to, subject, text, html) {
     const { emailService } = await import('../services/emailService');

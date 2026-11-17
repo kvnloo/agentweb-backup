@@ -421,10 +421,9 @@ export type ZomaBillingFunnelStep =
   | 'trial_converted'
   | 'trial_canceled'
   | 'subscription_canceled'
-  /** ENG-3133: weekly ad-performance email (claim = one send per user per week; opt_out = the user's unsubscribe). */
+  /** ENG-3133: weekly ad-performance email (claim = one send per user per ISO week). The opt-out lives on the user record. */
   | 'weekly_report_claimed'
-  | 'weekly_report_sent'
-  | 'weekly_report_opt_out';
+  | 'weekly_report_sent';
 
 export interface ZomaBillingFunnelInput {
   userId: string;
