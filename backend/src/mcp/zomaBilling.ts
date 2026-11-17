@@ -159,8 +159,14 @@ export const planAllowsPublish = (state: ZomaPlanState) =>
 /** A live subscription whose $1 payment has not settled: wait for it, never mint a second plan. */
 export const planPaymentPending = (state: ZomaPlanState) => state.status === 'trialing' && !planAllowsPublish(state);
 
+/** A plan that exists but whose payment failed: fix the card on that plan, never buy a second one. */
+export const planPaymentFailed = (state: ZomaPlanState) => state.status === 'past_due' || state.status === 'unpaid';
+
 export const PAYMENT_PENDING_MESSAGE =
-  'Your Zoma payment is not confirmed yet, so nothing went live. Finish payment in your existing Stripe checkout or billing portal, then try again. Do not start a second plan.';
+  'Your Zoma payment is still being confirmed, so nothing went live. Wait a minute and ask again. If it keeps failing, check your card with Stripe.';
+
+export const paymentFailedMessage = (cfg: Pick<ZomaBillingConfig, 'billingPortalUrl'>) =>
+  `The last Zoma payment did not go through, so nothing went live. Update your card on the existing plan${cfg.billingPortalUrl ? ` → ${cfg.billingPortalUrl}` : ' (see the payment-failed email from Stripe)'}, then ask again. Do not start a second plan.`;
 
 const isoFromEpoch = (s: unknown) => (typeof s === 'number' && s > 0 ? new Date(s * 1000).toISOString() : undefined);
 
@@ -440,6 +446,7 @@ export async function assertZomaPublishAllowed(
   }
   if (planAllowsPublish(state)) return;
   if (planPaymentPending(state)) throw new ZomaPaywallError(PAYMENT_PENDING_MESSAGE);
+  if (planPaymentFailed(state)) throw new ZomaPaywallError(paymentFailedMessage(cfg));
   let link: string | undefined;
   try {
     link = await createZomaTrialCheckoutLink(userId, deps);
@@ -453,9 +460,6 @@ export async function assertZomaPublishAllowed(
     dimensions: { surface: 'write_guard', platform: context.platform, toolName: context.toolName, planStatus: state.status },
   }).catch((e) => console.error('[zoma-billing] funnel record failed:', e));
   if (!link) throw new ZomaPaywallError('Going live needs the Zoma plan, but the payment link could not be created right now. Nothing was changed. Try again shortly.');
-  if (state.status === 'past_due' || state.status === 'unpaid') {
-    throw new ZomaPaywallError(`The last Zoma payment did not go through, so nothing went live. Restart the plan → ${link}`, link);
-  }
   throw new ZomaPaywallError(paywallMessage(cfg, link), link);
 }
 
@@ -467,8 +471,8 @@ export interface ZomaPlanSummary {
   status: ZomaPlanStatus;
   publish_enabled: boolean;
   trial_ends_at?: string;
-  /** Cancelled during the trial: it ends and will not renew. */
-  cancels_at_trial_end?: boolean;
+  /** Cancelled: the plan ends at the end of the current period and will not renew. */
+  cancels_at_period_end?: boolean;
   period?: { start: string; end: string };
   link?: string;
   error?: string;
@@ -484,11 +488,13 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       status: state.status,
       publish_enabled: planAllowsPublish(state),
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
-      ...(state.cancelAtPeriodEnd ? { cancels_at_trial_end: true } : {}),
+      ...(state.cancelAtPeriodEnd ? { cancels_at_period_end: true } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
     if (planPaymentPending(state)) {
       summary.error = PAYMENT_PENDING_MESSAGE;
+    } else if (planPaymentFailed(state)) {
+      summary.error = paymentFailedMessage(cfg);
     } else if (!summary.publish_enabled) {
       summary.link = await createZomaTrialCheckoutLink(userId, deps);
       void deps.recordFunnel({ userId, step: 'paywall_shown', dedupeKey: `zoma_status#${new Date(deps.now()).toISOString().slice(0, 13)}`, dimensions: { surface: 'zoma_status', planStatus: state.status } })
@@ -506,11 +512,15 @@ export function formatZomaPlanLine(plan: ZomaPlanSummary, cfg: ZomaBillingConfig
   if (plan.error) return `  ${box} Zoma plan (needed to make ads live): ${plan.error}`;
   if (plan.status === 'trialing') {
     const until = plan.trial_ends_at ? ` until ${plan.trial_ends_at.slice(0, 10)}` : '';
-    return plan.cancels_at_trial_end
+    return plan.cancels_at_period_end
       ? `  [x] Zoma plan: trial${until}, cancelled, it will not renew`
       : `  [x] Zoma plan: trial${until}, then ${dollars(cfg.planCents)}/month`;
   }
-  if (plan.status === 'active') return `  [x] Zoma plan: active (${dollars(cfg.planCents)}/month, ${cfg.includedCalls.toLocaleString('en-US')} calls included)`;
+  if (plan.status === 'active') {
+    return plan.cancels_at_period_end
+      ? `  [x] Zoma plan: active until ${plan.period?.end.slice(0, 10) ?? 'the end of the period'}, cancelled, it will not renew`
+      : `  [x] Zoma plan: active (${dollars(cfg.planCents)}/month, ${cfg.includedCalls.toLocaleString('en-US')} calls included)`;
+  }
   return `  ${box} Zoma plan (only needed to make ads live; reads and drafts are free): ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${plan.link}`;
 }
 
@@ -700,7 +710,7 @@ export function trialReminderEmail(input: { usage: McpUserUsage; adsSummary?: st
   const text = [
     'Hi,',
     '',
-    `Your Zoma trial ends on ${endDate}. After that the plan is ${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included and ${cfg.overageCentsPerCall}¢ per call after that.`,
+    `Your Zoma trial ends on ${endDate} (UTC). Unless you cancel before then, your card is charged automatically for the plan: ${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included and ${cfg.overageCentsPerCall}¢ per call after that.`,
     '',
     ...(adsSummary ? [`How your ads are doing: ${adsSummary}`, ''] : []),
     summary,
@@ -718,9 +728,9 @@ export function trialReminderEmail(input: { usage: McpUserUsage; adsSummary?: st
  * Hourly job: email every Zoma trial on its reminder day, once.
  *
  * Each pass first claims the (subscription, hour) with a conditional funnel write, so only one
- * backend instance sends in a given hour. The "sent" marker goes on the subscription only after
- * the mail left (`sendEmail` never throws; it reports 'sent' | 'suppressed' | 'failed'), so a
- * failed send is retried on the next pass and a delivered one is never repeated.
+ * backend instance sends in a given hour, then puts the "sent" marker on the subscription, then
+ * sends (`sendEmail` never throws; it reports 'sent' | 'suppressed' | 'failed'). A failed send
+ * removes the marker so the next pass retries; a delivered one is never repeated.
  */
 export async function runZomaTrialReminders(deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<{ checked: number; sent: number }> {
   const cfg = deps.config();
@@ -737,6 +747,9 @@ export async function runZomaTrialReminders(deps: ZomaBillingDeps = defaultZomaB
       if (!user?.email) continue;
       const claimed = await deps.recordFunnel({ userId: userId!, step: 'trial_reminder_claimed', dedupeKey: `${sub.id}#${hour}`, dimensions: { subscriptionId: sub.id } });
       if (!claimed) continue;
+      // The marker is written BEFORE the send: if this write fails nothing is sent (retried next hour), so a
+      // marker that cannot be stored can never turn into one email per hour. A failed send removes it again.
+      await deps.setSubscriptionMetadata(sub.id, { [TRIAL_REMINDER_METADATA_KEY]: new Date(now).toISOString() });
       const range = { start: new Date(sub.trial_start! * 1000).toISOString(), end: new Date(now).toISOString() };
       const [usage, adsSummary] = await Promise.all([
         deps.getUsage(userId!, range),
@@ -746,9 +759,11 @@ export async function runZomaTrialReminders(deps: ZomaBillingDeps = defaultZomaB
       const outcome = await deps.sendEmail(user.email, email.subject, email.text, email.html);
       if (outcome === 'failed') {
         console.error(`[zoma-billing] trial reminder for ${sub.id} was not delivered; retrying next pass`);
+        // Stripe drops a metadata key set to ''. If this fails the user misses the email, but never gets two.
+        await deps.setSubscriptionMetadata(sub.id, { [TRIAL_REMINDER_METADATA_KEY]: '' })
+          .catch((e) => console.error('[zoma-billing] could not clear the reminder marker:', e instanceof Error ? e.message : e));
         continue;
       }
-      await deps.setSubscriptionMetadata(sub.id, { [TRIAL_REMINDER_METADATA_KEY]: new Date(now).toISOString() });
       // 'suppressed' is the non-prod mail guard: nothing left the box, so it is done but not counted.
       if (outcome !== 'sent') continue;
       sent += 1;
