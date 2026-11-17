@@ -10,6 +10,14 @@ jest.mock('../middleware/auth', () => ({
     req.user = { userId: 'test-user-123', email: 'test@example.com', isAdmin: false };
     next();
   },
+  isRealAdmin: jest.requireActual('../middleware/auth').isRealAdmin,
+}));
+
+// ENG-2988: the handlers ask the storage access policy, which reads these. The tests below use the caller's own keys (no lookups needed).
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  taskDb: { getTaskById: jest.fn(), getTaskExecutionOwnerById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
 }));
 
 // Mock axios
@@ -34,6 +42,7 @@ jest.mock('../services/chatbotService', () => ({
   ChatbotDB: jest.fn().mockImplementation(() => ({
     clearSearchableTextByUrl: jest.fn().mockResolvedValue(undefined),
   })),
+  chatbotDb: { getChatSessionRecord: jest.fn() },
 }));
 
 import request from 'supertest';
@@ -74,7 +83,7 @@ describe('Files routes', () => {
     it('should require authentication', async () => {
       const response = await request(app)
         .get('/api/files/content')
-        .query({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/test.html' });
+        .query({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/files/1/abc/test.html' });
 
       expect(response.status).toBe(401);
     });
@@ -102,12 +111,12 @@ describe('Files routes', () => {
       const response = await request(app)
         .get('/api/files/content')
         .set('Authorization', `Bearer ${validToken}`)
-        .query({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/test.html' });
+        .query({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/test-user-123/files/1/abc/test.html' });
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('success', true);
       expect(response.body).toHaveProperty('content', htmlContent);
-      expect(mockGetS3ObjectStream).toHaveBeenCalledWith('test.html', expect.any(String));
+      expect(mockGetS3ObjectStream).toHaveBeenCalledWith('users/test-user-123/files/1/abc/test.html', expect.any(String));
     });
 
     it('should reject missing URL parameter', async () => {

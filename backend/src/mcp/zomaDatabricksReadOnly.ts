@@ -58,7 +58,7 @@ export function isDatabricksAllowedCall(toolName: string, args: unknown): boolea
 
 export const DATABRICKS_READ_ONLY_MESSAGE =
   'Zoma on Databricks is read-only: this call can change your ad account, so it is not available from Databricks. ' +
-  'Reads work here. To make changes, connect Zoma directly from Claude, ChatGPT, Codex or Cursor (https://docs.agentweb.pro/zoma).';
+  'Reads work here. To make changes, connect Zoma directly from Claude, ChatGPT, Codex or Cursor (https://api.agentweb.pro/api/meta-toolkit/skill.md).';
 
 type ToolSchema = { properties?: Record<string, { enum?: unknown[] } | undefined> };
 

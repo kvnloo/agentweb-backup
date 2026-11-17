@@ -81,7 +81,6 @@ jest.mock('../services/llmUsagePolicyResolverService', () => ({
 jest.mock('../services/tokenUsageService', () => ({
   TURN_ADMISSION: { recordAdmission: true },
   checkTokenUsage: jest.fn(),
-  incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
 }));
 

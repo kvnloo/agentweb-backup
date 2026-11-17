@@ -6,6 +6,7 @@
  * user records and `now`; this module derives stage, stall state, the next
  * action, and the daily follow-up list. Nothing imports this yet.
  */
+import type { ZomaLeadClassification } from "../mcp/zomaAdsExperience";
 
 export type OnboardingStatus = "not_started" | "in_progress" | "complete";
 export type AdAccountStatus = "not_connected" | "connected" | "error";
@@ -33,6 +34,8 @@ export interface ZomaTrackedUser {
   nextFollowUpDate?: string | null;
   contactOwner?: string | null;
   currentBlocker?: string | null;
+  /** ENG-3128: answer to "How familiar are you with ads?"; `not_interested` users are never chased. */
+  adsExperience?: string | null;
 }
 
 /** People notified when a user needs help (issue: "notify Harsha + Fangfang"). */
@@ -81,8 +84,16 @@ function lastProgress(u: ZomaTrackedUser): Date | null {
   return new Date(Math.max(...dates.map((d) => d.getTime())));
 }
 
+/**
+ * ENG-3128: "Not interested, just a friend" — not a prospect. Listed in the full tracker,
+ * but never stalled, never needing help, never due, and not counted as active.
+ */
+export function isNotInterestedUser(u: ZomaTrackedUser): boolean {
+  return u.adsExperience === "not_interested";
+}
+
 export function isStalled(u: ZomaTrackedUser, now: Date): boolean {
-  if (deriveStage(u) === "activated") return false;
+  if (deriveStage(u) === "activated" || isNotInterestedUser(u)) return false;
   const last = lastProgress(u);
   // Unknown dates fail toward attention: a user we cannot date is surfaced.
   if (!last) return true;
@@ -90,6 +101,7 @@ export function isStalled(u: ZomaTrackedUser, now: Date): boolean {
 }
 
 export function nextAction(u: ZomaTrackedUser): string | null {
+  if (isNotInterestedUser(u)) return null;
   if (u.currentBlocker?.trim()) return `Resolve blocker: ${u.currentBlocker.trim()}`;
   if (u.adAccountStatus === "error") return "Help fix ad account connection";
   switch (deriveStage(u)) {
@@ -107,7 +119,7 @@ export function nextAction(u: ZomaTrackedUser): string | null {
 }
 
 export function needsHelp(u: ZomaTrackedUser, now: Date): boolean {
-  if (deriveStage(u) === "activated") return false;
+  if (deriveStage(u) === "activated" || isNotInterestedUser(u)) return false;
   return Boolean(u.currentBlocker?.trim()) || u.adAccountStatus === "error" || isStalled(u, now);
 }
 
@@ -120,6 +132,10 @@ export interface QueueRow {
   nextAction: string | null;
   owner: string;
   due: boolean;
+  /** ENG-3128: "just a friend" — excluded from active-user counts and follow-ups. */
+  notInterested: boolean;
+  /** ENG-3134: internal lead classification; a friend is a `pal`, never a potential user. */
+  classification: ZomaLeadClassification;
 }
 
 export function buildQueueRow(u: ZomaTrackedUser, now: Date): QueueRow {
@@ -127,6 +143,7 @@ export function buildQueueRow(u: ZomaTrackedUser, now: Date): QueueRow {
   const help = needsHelp(u, now);
   const followUp = parse(u.nextFollowUpDate);
   const stage = deriveStage(u);
+  const notInterested = isNotInterestedUser(u);
   return {
     email: u.email,
     name: u.name,
@@ -135,7 +152,9 @@ export function buildQueueRow(u: ZomaTrackedUser, now: Date): QueueRow {
     needsHelp: help,
     nextAction: nextAction(u),
     owner: u.contactOwner?.trim() || "unassigned",
-    due: stage !== "activated" && (help || !followUp || followUp <= now),
+    due: !notInterested && stage !== "activated" && (help || !followUp || followUp <= now),
+    notInterested,
+    classification: notInterested ? "pal" : "prospect",
   };
 }
 
@@ -157,6 +176,11 @@ export function dailyFollowUpList(users: ZomaTrackedUser[], now: Date): QueueRow
         order.indexOf(a.stage) - order.indexOf(b.stage) ||
         a.email.localeCompare(b.email),
     );
+}
+
+/** Users counted as active prospects: everyone except "just a friend". */
+export function activeUserCount(users: ZomaTrackedUser[], now: Date): number {
+  return buildTracker(users, now).filter((r) => !r.notInterested).length;
 }
 
 export function helpAlert(rows: QueueRow[]): { notify: readonly string[]; users: QueueRow[] } | null {

@@ -2,18 +2,32 @@
 
 Post-merge verifiers use this to prove kill-switch / ceiling paths on backend
 staging instead of production. Script: `.github/scripts/staging-env-override.sh`.
-It only targets environments whose name contains `staging` and only accepts
-allowlisted keys (`LEAD_MAGNET_EXECUTE_DISABLED`, `LEAD_MAGNET_MAX_EXECUTIONS_PER_DAY`).
-Extend `ALLOWED_KEYS` in the script (with a test) to add more.
+It runs only when `EB_ENVIRONMENT_NAME` is exactly the backend staging
+environment name, `Agentweb-backend-env-1`. It refuses production
+(`Agentweb-backend-env-prod-3`) and every other name, and exits 2 before any
+AWS call. Both names are constants in the script; if an environment is renamed,
+change the constant and its test together (ENG-3087).
+
+It only accepts allowlisted keys (`LEAD_MAGNET_EXECUTE_DISABLED`,
+`LEAD_MAGNET_MAX_EXECUTIONS_PER_DAY`). Extend `ALLOWED_KEYS` in the script
+(with a test) to add more.
+
+The two names are variables on the GitHub `staging` environment, not on the
+repository, so `gh variable get <name>` without `--env` reports "not found". Look them
+up with `--env staging`:
 
 ```bash
-export EB_ENVIRONMENT_NAME=<repo var EB_BACKEND_STAGING_ENVIRONMENT_NAME>
-export EB_APPLICATION_NAME=<repo var EB_BACKEND_STAGING_APPLICATION_NAME>
+export EB_ENVIRONMENT_NAME="$(gh variable get EB_BACKEND_STAGING_ENVIRONMENT_NAME --env staging --repo AgentWebPro/agentweb)"
+export EB_APPLICATION_NAME="$(gh variable get EB_BACKEND_STAGING_APPLICATION_NAME --env staging --repo AgentWebPro/agentweb)"
 
 bash .github/scripts/staging-env-override.sh set LEAD_MAGNET_EXECUTE_DISABLED=true
 bash .github/scripts/staging-env-override.sh show
 bash .github/scripts/staging-env-override.sh restore LEAD_MAGNET_EXECUTE_DISABLED
 ```
+
+`AWS_REGION` defaults to `us-west-2`, where both backend environments run.
+`show` prints one line per `LEAD_MAGNET_*` override and prints nothing when
+none is set.
 
 Each `set`/`restore` waits for the environment to return to `Ready`; EB
 restarts the app, which also clears the per-process lead-magnet rate-limit

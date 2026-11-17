@@ -7231,6 +7231,35 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
   }
 });
 
+// ENG-3076: builds one recipient's group email (variables, signed unsubscribe link + footer,
+// RFC 8058 one-click headers). Both send paths in group-email/send call this.
+// Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in routes/crmPublic.ts
+// accepts the legacy unsigned form as a fallback for emails sent before signing.
+export function buildGroupEmailRecipientMessage(
+  lead: any,
+  opts: {
+    listId: string;
+    subject: string;
+    html: string;
+    textContent?: string;
+    unsubscribeFooterHtml?: string;
+    customerFrontendUrl: string;
+    backendPublicUrl: string;
+  },
+): { to: string; subject: string; html: string; text?: string; headers: Record<string, string> } {
+  const ids = { listId: opts.listId, leadId: lead.leadId, email: lead.email };
+  const unsubscribeUrl = signUnsubscribeUrl({ baseUrl: opts.customerFrontendUrl, ...ids });
+  const html = injectUnsubscribeUrl(substituteVariables(opts.html, lead), unsubscribeUrl, opts.unsubscribeFooterHtml);
+  const oneClickUrl = signOneClickUnsubscribeUrl({ baseUrl: opts.backendPublicUrl, ...ids });
+  return {
+    to: lead.email,
+    subject: substituteVariables(opts.subject, lead),
+    html,
+    text: opts.textContent ? substituteVariables(opts.textContent, lead) : undefined,
+    headers: listUnsubscribeHeaders(oneClickUrl),
+  };
+}
+
 // ENG-2929: mailbox sends above this many leads run in the background (see group-email/send).
 const MAILBOX_SYNC_LEAD_LIMIT = 50;
 // A background run that hasn't written progress for this long is presumed dead (instance
@@ -7515,6 +7544,18 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const BACKEND_PUBLIC_URL = process.env.BACKEND_URL || 'https://api.agentweb.pro';
+    // ENG-3076: one builder for both the background mailbox run and the in-request loop,
+    // so a recipient's unsubscribe link and headers never depend on list size or sender type.
+    const buildRecipientMessage = (lead: any) =>
+      buildGroupEmailRecipientMessage(lead, {
+        listId,
+        subject,
+        html: sendHtml,
+        textContent,
+        unsubscribeFooterHtml,
+        customerFrontendUrl: CUSTOMER_FRONTEND_URL,
+        backendPublicUrl: BACKEND_PUBLIC_URL,
+      });
 
     // ENG-266 Part 3 / ENG-2929: a mailbox send (Gmail/Graph) budgets ~600ms/send, so more
     // than MAILBOX_SYNC_LEAD_LIMIT leads would outlive the 60s ALB timeout inside one request.
@@ -7551,19 +7592,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         unsubscribeFooterHtml,
         socketId,
         leads: eligibleLeads,
-        buildMessage: (lead: any) => {
-          let personalizedHtml = substituteVariables(sendHtml, lead);
-          const unsubscribeUrl = signUnsubscribeUrl({ baseUrl: CUSTOMER_FRONTEND_URL, listId, leadId: lead.leadId, email: lead.email });
-          personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
-          const oneClickUrl = signOneClickUnsubscribeUrl({ baseUrl: BACKEND_PUBLIC_URL, listId, leadId: lead.leadId, email: lead.email });
-          return {
-            to: lead.email,
-            subject: substituteVariables(subject, lead),
-            html: personalizedHtml,
-            text: textContent ? substituteVariables(textContent, lead) : undefined,
-            headers: listUnsubscribeHeaders(oneClickUrl),
-          };
-        },
+        buildMessage: buildRecipientMessage,
       });
       if (!started.ok) {
         return res.status(409).json({ message: started.message, code: 'GROUP_EMAIL_ALREADY_SENDING' });
@@ -7603,37 +7632,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     for (let i = 0; i < eligibleLeads.length; i++) {
       const lead = eligibleLeads[i];
       try {
-        // Substitute variables in subject and content
-        const personalizedSubject = substituteVariables(subject, lead);
-        let personalizedHtml = substituteVariables(sendHtml, lead);
-        const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
-
-        // Inject unsubscribe URL — updates existing link or appends footer if none found
-        // Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in
-        // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
-        // for emails sent before this change.
-        const unsubscribeUrl = signUnsubscribeUrl({
-          baseUrl: CUSTOMER_FRONTEND_URL,
-          listId,
-          leadId: lead.leadId,
-          email: lead.email,
-        });
-        personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
-        // ENG-2367: RFC 8058 one-click header, same signature, backend POST target.
-        const oneClickUrl = signOneClickUnsubscribeUrl({
-          baseUrl: BACKEND_PUBLIC_URL,
-          listId,
-          leadId: lead.leadId,
-          email: lead.email,
-        });
-
-        await sendAsSender(userId, sender, {
-          to: lead.email,
-          subject: personalizedSubject,
-          html: personalizedHtml,
-          text: personalizedText,
-          headers: listUnsubscribeHeaders(oneClickUrl),
-        });
+        await sendAsSender(userId, sender, buildRecipientMessage(lead));
         sent++;
       } catch (err: any) {
         if (err instanceof SenderDailyLimitExceededError) {
