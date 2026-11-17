@@ -51,11 +51,11 @@ export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => 
  * shares the ad accounts that Facebook login can see.
  */
 export const ZOMA_META_LOGIN_NOTE =
-  'The Facebook login you connect does not need to use the same email as your Zoma login: Zoma links whichever Facebook account you sign in with to this Zoma account. It must be the Facebook login that created the ad account or belongs to the Business portfolio that owns it; a different Facebook login shows Zoma no ad accounts.';
+  'The Facebook login you connect does not need to use the same email as your Zoma login: Zoma links whichever Facebook account you sign in with to this Zoma account. It must be a Facebook login that has access to the ad account (the one that created it, or one added to it or to the Business portfolio that owns it); any other Facebook login shows Zoma no ad accounts.';
 
 /** Meta hosts ad-account creation, so a failed Create button is Meta's; Zoma gives a current route and a way back. */
 export const ZOMA_AD_ACCOUNT_CREATE_FALLBACK =
-  'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as the portfolio admin, or open Ads Manager (https://adsmanager.facebook.com) with the same Facebook login, where Meta usually offers to create one; if it still fails, report it to Meta (https://www.facebook.com/business/help) with the exact message. Once the account exists, reconnect Meta using the same connect link/button.';
+  'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as the portfolio admin, or try Ads Manager (https://adsmanager.facebook.com) with the same Facebook login; if it still fails, report it to Meta (https://www.facebook.com/business/help) with the exact message. Once the account exists, reconnect Meta using the same connect link/button.';
 
 /** Ad-account setup for someone who has never run ads, in the order they need it. */
 export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [

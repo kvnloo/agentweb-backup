@@ -64,6 +64,7 @@ import metaToolkitRoutes from '../routes/metaToolkit';
 import metaAuthRoutes from '../routes/metaAuth';
 import zomaRoutes from '../routes/zoma';
 import { buildZomaScoreboard } from '../services/zomaScoreboard';
+import { linkifyHttps } from '../routes/zoma';
 
 const app = express();
 app.use(express.json());
@@ -112,7 +113,8 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     const { status } = await metaState('runs_ads');
     expect(status.meta.ready).toBe(false);
     expect(status.next_step).toContain('does not need to use the same email as your Zoma login');
-    expect(status.next_step).toContain('created the ad account or belongs to the Business portfolio');
+    expect(status.next_step).toContain('has access to the ad account');
+    expect(status.next_step).toContain('added to it or to the Business portfolio that owns it');
     expect(status.next_step).not.toContain(EMMA_APP);
   });
 
@@ -134,7 +136,11 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     const page = await request(app).get('/api/zoma/meta/callback').query({ code: 'c', state }).expect(400);
     expect(page.text).toContain('No ad account found');
     expect(page.text).toContain('does not need to use the same email as your Zoma login');
-    expect(page.text).toContain('a different Facebook login shows Zoma no ad accounts');
+    expect(page.text).toContain('any other Facebook login shows Zoma no ad accounts');
+    // Provider routes are clickable, not plain text, and open safely in a new tab.
+    expect(page.text).toContain('<a href="https://business.facebook.com/settings/ad-accounts" target="_blank" rel="noopener noreferrer">https://business.facebook.com/settings/ad-accounts</a>');
+    expect(page.text).toContain('<a href="https://adsmanager.facebook.com" target="_blank" rel="noopener noreferrer">https://adsmanager.facebook.com</a>');
+    expect(page.text).not.toContain('usually offers');
     expect(page.text).toContain('adsmanager.facebook.com');
     expect(page.text).toContain('Reconnect Meta');
     expect(page.text).not.toContain(EMMA_APP);
@@ -172,5 +178,38 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     const fixed = JSON.parse(texts(await call('zoma_status').expect(200))[0]);
     expect(fixed.blocker).toBeNull();
     expect(fixed.summary).toContain('All set.');
+  });
+});
+
+describe('ENG-3136 clickable provider links on Zoma pages', () => {
+  it('links https URLs, keeps trailing punctuation outside the link, and escapes everything else', () => {
+    expect(linkifyHttps('Create one (https://business.facebook.com/overview).')).toBe(
+      'Create one (<a href="https://business.facebook.com/overview" target="_blank" rel="noopener noreferrer">https://business.facebook.com/overview</a>).',
+    );
+    expect(linkifyHttps('<script>alert(1)</script> & "x"')).toBe('&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;');
+    // A query string is escaped inside the attribute; a quote can never break out of it.
+    expect(linkifyHttps('go https://x.test/a?b=1&c=2"onmouseover="y')).toBe(
+      'go <a href="https://x.test/a?b=1&amp;c=2" target="_blank" rel="noopener noreferrer">https://x.test/a?b=1&amp;c=2</a>&quot;onmouseover=&quot;y',
+    );
+    // Only https is linked: javascript:/http: text stays inert.
+    expect(linkifyHttps('javascript:alert(1) http://a.test')).toBe('javascript:alert(1) http://a.test');
+  });
+
+  it('the Page-blocker page after a Meta connect also renders its Page-create route as a link', async () => {
+    users.set('u1', { userId: 'u1', email: 'nikhil@gmail.com', zomaAdsExperience: 'runs_ads' });
+    const { state } = await metaState('runs_ads');
+    finalizeMetaOAuth.mockResolvedValue({
+      flow: 'marketing', tokenSessionId: 'ts-p', preconnectInstructions: '',
+      adAccounts: [{ account_id: '111', name: 'Phoenix Shop', currency: 'USD', account_status: 1 }],
+    });
+    connectMetaAdAccounts.mockImplementation(async () => {
+      accounts = [{ ...metaAccount, config: { ...metaAccount.config, has_meta_pages: false, meta_page_count: 0 } }];
+    });
+    const res = await request(app).get('/api/zoma/meta/callback').query({ code: 'c', state }).expect(200);
+    expect(res.text).toContain('One more step: your Facebook Page');
+    expect(res.text).toContain('<a href="https://www.facebook.com/pages/create" target="_blank" rel="noopener noreferrer">');
+    expect(res.text).toContain('Reconnect Meta');
+    expect(res.text).not.toContain('All set');
+    expect(res.text).not.toContain('Meta connected');
   });
 });
