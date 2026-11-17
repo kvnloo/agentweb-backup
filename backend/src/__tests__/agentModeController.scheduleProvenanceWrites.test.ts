@@ -1103,3 +1103,66 @@ describe('a digest that cannot be computed omits contentVersion on that row, nev
     expect(items.find((i) => i.scheduleId === 'good').contentVersion).toMatch(/^[0-9a-f]{32}$/);
   });
 });
+
+describe('a visitor can only RAISE the publish and Slack holds, and cannot set the autonomy waiver (defence in depth)', () => {
+  const given = (schedule: Record<string, unknown>) => mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+
+  it('a visitor body with requirePublishApproval/requireSlackApproval false on stored-true holds drops the false: the write carries no value for them', async () => {
+    given(stored({ requirePublishApproval: true, requireSlackApproval: true }));
+    await update(visitorByClaim, { requirePublishApproval: false, requireSlackApproval: false, startingMessage: 'x' });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+    expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+    expect(updatedWith().provenanceAdd).toEqual(['startingMessage']); // the rest of the edit still lands
+  });
+
+  it('a visitor body with true writes true (raising is allowed), whatever is stored', async () => {
+    given(stored({ requirePublishApproval: false, requireSlackApproval: false }));
+    await update(visitorByClaim, { requirePublishApproval: true, requireSlackApproval: true });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+    expect(updatedWith().requireSlackApproval).toBe(true);
+  });
+
+  it('non-boolean junk from a visitor is not a raise and not a write', async () => {
+    given(stored({ requirePublishApproval: true }));
+    await update(visitorByClaim, { requirePublishApproval: 'false', requireSlackApproval: 0 });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+    expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+  });
+
+  it('a newly added publish tool still raises the hold when the same body said false (the add wins; never lowered)', async () => {
+    given(stored({ requiredFunctionCalls: ['t1'], requirePublishApproval: false }));
+    await update(visitorByClaim, { requirePublishApproval: false, requiredFunctionCalls: ['t1', 'post_on_connected_account'] });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+  });
+
+  it('a visitor body fullAutonomy is ignored (stored value kept, false or true); absent behaves as before', async () => {
+    given(stored({ fullAutonomy: false }));
+    await update(visitorByClaim, { fullAutonomy: true });
+    expect(updatedWith().fullAutonomy).toBe(false);
+
+    mockScheduleDb.updateSchedule.mockClear();
+    given(stored({ fullAutonomy: true }));
+    await update(visitorByClaim, { fullAutonomy: false });
+    expect(updatedWith().fullAutonomy).toBe(true);
+
+    mockScheduleDb.updateSchedule.mockClear();
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(updatedWith().fullAutonomy).toBe(true);
+  });
+
+  it('OWNER writes are unchanged: the false lowers a stored true, the true raises, fullAutonomy follows the body', async () => {
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      given(stored({ requirePublishApproval: true, requireSlackApproval: true, fullAutonomy: false }));
+      await update(caller, { requirePublishApproval: false, requireSlackApproval: false, fullAutonomy: true });
+      expect(updatedWith().requirePublishApproval).toBe(false);
+      expect(updatedWith().requireSlackApproval).toBe(false);
+      expect(updatedWith().fullAutonomy).toBe(true);
+    }
+    mockScheduleDb.updateSchedule.mockClear();
+    given(stored());
+    await update(portalOwner, { requirePublishApproval: true, requireSlackApproval: true });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+    expect(updatedWith().requireSlackApproval).toBe(true);
+  });
+});
