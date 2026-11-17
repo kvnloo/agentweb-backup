@@ -209,17 +209,58 @@ function evaluateSetValue(
   throw new Error(`inMemoryDynamo: unsupported SET value: ${rawValue}`);
 }
 
+/**
+ * The members of a String Set value, whichever way the test holds it: a DocumentClient `DynamoDBSet` (what `createSet` hands the
+ * code under test, and what a read hands it back), or a bare array. Anything else is a malformed ADD / DELETE operand, which real
+ * DynamoDB rejects with a ValidationException, so this throws rather than guessing.
+ */
+function setMembers(value: any, clause: string): string[] {
+  const members = value && typeof value === 'object' && Array.isArray(value.values) ? value.values : Array.isArray(value) ? value : null;
+  if (!members) {
+    throw Object.assign(new Error(`ValidationException: operand of ${clause} is not a set`), { code: 'ValidationException' });
+  }
+  return members;
+}
+
+let realDocumentClient: { createSet(list: string[]): unknown } | undefined;
+
+/**
+ * A new String Set, so a stored set is never mutated in place by a later write. Built by the REAL SDK's `createSet` (the tests that
+ * use this helper mock 'aws-sdk' with the fake client), so it is the same `DynamoDBSet` object the code under test builds and a
+ * real read returns, not a look-alike.
+ */
+function newStringSet(members: string[]) {
+  if (!realDocumentClient) {
+    const actual = jest.requireActual('aws-sdk');
+    realDocumentClient = new actual.DynamoDB.DocumentClient({ region: 'us-west-2' });
+  }
+  return realDocumentClient!.createSet(members) as { values: string[] };
+}
+
 function applyUpdateExpression(
   item: Record<string, any>,
   expression: string,
   names: Record<string, string>,
   values: Record<string, any>,
 ) {
-  const setMatch = expression.match(/SET\s+(.*?)(?=\s+REMOVE\s+|$)/is);
-  const removeMatch = expression.match(/REMOVE\s+(.*)$/is);
+  // Each verb's body runs to the next verb (or the end). ADD and DELETE are the String Set / number operations real DynamoDB
+  // has; they may follow SET and REMOVE in one expression, and ADD and DELETE on the SAME path may not share one.
+  const setMatch = expression.match(/SET\s+(.*?)(?=\s+(?:REMOVE|ADD|DELETE)\s+|$)/is);
+  const removeMatch = expression.match(/REMOVE\s+(.*?)(?=\s+(?:ADD|DELETE)\s+|$)/is);
+  const addMatch = expression.match(/(?:^|\s)ADD\s+(.*?)(?=\s+DELETE\s+|$)/is);
+  const deleteMatch = expression.match(/(?:^|\s)DELETE\s+(.*)$/is);
 
-  if (!setMatch && !removeMatch) {
+  if (!setMatch && !removeMatch && !addMatch && !deleteMatch) {
     throw new Error(`inMemoryDynamo: unsupported UpdateExpression: ${expression}`);
+  }
+  if (addMatch && deleteMatch) {
+    const touched = (body: string) => body.split(',').map((part) => resolveName(part.trim().split(/\s+/)[0], names));
+    const overlap = touched(addMatch[1]).filter((attr) => touched(deleteMatch[1]).includes(attr));
+    if (overlap.length > 0) {
+      throw Object.assign(new Error(`ValidationException: Two document paths overlap with each other: ${overlap[0]}`), {
+        code: 'ValidationException',
+      });
+    }
   }
   // A bare `SET ` with no assignments is a syntax error in real DynamoDB.
   if (/SET\s*(REMOVE|$)/i.test(expression.trim()) && !setMatch?.[1]?.trim()) {
@@ -250,6 +291,41 @@ function applyUpdateExpression(
       }
       delete item[resolveName(target, names)];
     }
+  }
+
+  // ADD: a number adds to the attribute (absent counts as 0); a String Set unions into it (absent is an empty set). Adding a
+  // set to an attribute that holds something else (a List, say) is a type mismatch, as it is in DynamoDB.
+  for (const clause of addMatch?.[1] ? splitTopLevelCommas(addMatch[1]) : []) {
+    const [rawTarget, rawValue] = clause.trim().split(/\s+/);
+    const attr = resolveName(rawTarget, names);
+    const operand = values[rawValue];
+    if (typeof operand === 'number') {
+      item[attr] = (item[attr] ?? 0) + operand;
+      continue;
+    }
+    const incoming = setMembers(operand, `ADD ${rawTarget}`);
+    if (item[attr] !== undefined && !(typeof item[attr] === 'object' && Array.isArray(item[attr].values))) {
+      throw Object.assign(new Error(`ValidationException: An operand in the update expression has an incorrect data type (ADD ${attr})`), {
+        code: 'ValidationException',
+      });
+    }
+    item[attr] = newStringSet([...new Set([...(item[attr]?.values ?? []), ...incoming])]);
+  }
+
+  // DELETE: removes the operand's members from a String Set; a set left empty is removed from the item, as DynamoDB does.
+  for (const clause of deleteMatch?.[1] ? splitTopLevelCommas(deleteMatch[1]) : []) {
+    const [rawTarget, rawValue] = clause.trim().split(/\s+/);
+    const attr = resolveName(rawTarget, names);
+    const outgoing = new Set(setMembers(values[rawValue], `DELETE ${rawTarget}`));
+    if (item[attr] === undefined) continue;
+    if (!(typeof item[attr] === 'object' && Array.isArray(item[attr].values))) {
+      throw Object.assign(new Error(`ValidationException: An operand in the update expression has an incorrect data type (DELETE ${attr})`), {
+        code: 'ValidationException',
+      });
+    }
+    const left = item[attr].values.filter((member: string) => !outgoing.has(member));
+    if (left.length === 0) delete item[attr];
+    else item[attr] = newStringSet(left);
   }
 }
 
@@ -288,6 +364,11 @@ export class InMemoryDynamo {
   get documentClient() {
     const self = this;
     return class DocumentClient {
+      /** The real DocumentClient's `createSet`: code under test builds its ADD / DELETE operands with it. */
+      createSet(list: any[]) {
+        return newStringSet(list);
+      }
+
       put(params: any) {
         return {
           promise: async () => {

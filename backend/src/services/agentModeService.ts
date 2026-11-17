@@ -12,7 +12,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -9928,6 +9929,8 @@ export class AgentModeService {
         ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
         : reason === 'not_granted'
         ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
+        : reason === 'visitor_edited'
+        ? `this schedule was set up or edited through a share link, so ${toolName} cannot publish on the owner's behalf in an unattended run until the owner adopts the schedule.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
     const unblockInstruction =
       reason === 'require_publish_approval'
@@ -9936,6 +9939,8 @@ export class AgentModeService {
         ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
         : reason === 'not_granted'
         ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything. The owner can grant this themselves: open this schedule, confirm the publish tool (e.g. ${toolName}) is selected under Required Actions and saved, then use the "Publish without my review" control (Standing publish authorization) so future runs can post unattended.`
+        : reason === 'visitor_edited'
+        ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF or to use "Publish without my review" — neither lifts this. The owner can adopt the schedule in the portal; a publish grant only takes effect after that.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
@@ -10011,6 +10016,83 @@ export class AgentModeService {
 
 
 
+  /**
+   * ENG-2816 (step 3): is this tool call part of a scheduled run whose schedule a share-link visitor set up or edited?
+   *
+   * A visitor acts under the owner's userId, so a schedule they write is stored as the owner's own and its later runs would carry
+   * the owner's full tool set. The schedule's `provenance` (utils/scheduleProvenance.ts) says which content a visitor wrote; this
+   * is the one place every run entry ends up (cron, manual, test, variables submit, resume, retry loop, self-improvement,
+   * approval resume, continuations), so enforcing it here covers them all without carrying a flag through each.
+   *
+   * Two outcomes, both read LIVE (a consistent read of the schedule, not a stamp taken at run start):
+   *  - the profile refuses this tool name and the schedule is marked, or cannot be verified: refuse (fail closed);
+   *  - this tool's self-call reaches a schedule write route (SCHEDULE_WRITE_TOOL_NAMES) and the schedule is marked: hand back the
+   *    profile, so the call carries the claim and the write it makes is itself a visitor write (it re-marks what it writes: a
+   *    marked run, such as its own reflection turn, can neither lift nor launder the mark).
+   *
+   * Only a tool in one of those two sets pays for the reads. Every other tool, and every call outside a scheduled session, is
+   * untouched, as is a schedule with no `provenance` (every schedule that predates this change).
+   */
+  private async scheduledRunRestriction(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    const unrestricted = { refusal: null };
+    if (!sessionId) return unrestricted;
+    // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
+    if (extraContext?.restrictionProfile) return unrestricted;
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (!refusedByProfile && !carriesClaim) return unrestricted;
+
+    const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we resort to refusing (same as the publish gate below).
+      try {
+        session = await chatbotDb.getChatSession(sessionId);
+      } catch (retryError) {
+        console.error(`AgentMode ENG-2816: could not read session ${sessionId} to check schedule provenance for ${toolName}; refusing rather than assuming it is the owner's:`, retryError);
+        return unverifiable;
+      }
+    }
+
+    if (!session) {
+      // No session record. For an attended caller that is just a session id with nothing scheduled behind it. For an unattended
+      // run it is the deleted-mid-run case (deleting a scheduled session does not cancel its worker): unknown, so refuse.
+      return extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+    }
+    if (classifySessionForPublishGate(session) !== 'scheduled') return unrestricted;
+
+    const scheduleId = extractScheduleId(session.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(`AgentMode ENG-2816: scheduled session ${sessionId} has no parseable scheduleId; refusing ${toolName} rather than assuming it is unmarked.`);
+      return unverifiable;
+    }
+
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (scheduleError) {
+      console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
+      return unverifiable;
+    }
+    // A deleted or missing schedule cannot be shown to be the owner's.
+    if (!schedule) return unverifiable;
+
+    if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
+
+    if (refusedByProfile) {
+      console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+    }
+    return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
@@ -10018,6 +10100,11 @@ export class AgentModeService {
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
     const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
+    // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
+    if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
