@@ -1,0 +1,7 @@
+## ENG-3136: Zoma guided Meta ad-account setup — provider-owned create step, login/email semantics, resume (2026-11-17)
+
+- Source: Fathom onboarding with a new advertiser (2026-11-16). Meta's own "create ad account" submit did nothing; they fell back to a personal Facebook login with a different email and Zoma never said whether that is allowed.
+- Owner of the failed button: Meta's Business Settings page. Zoma/Emma render no create button and never create ad accounts (no automation was added). Real provider walkthrough with submit-failure repro is NOT done (Meta login-gated); the three guide links were confirmed to resolve (HTTP 200, login-gated) on 2026-11-17. Label: external prerequisite.
+- Facebook email does not have to match the Zoma email: the Meta state JWT binds the connection to the Zoma user that minted the link; no email comparison exists in `metaOAuthFinalize`. The Facebook login must be the one that owns (or belongs to the portfolio owning) the ad account, else Meta shares none and Zoma shows "No ad account found".
+- New text (`zomaAdsExperience.ts`): `ZOMA_META_LOGIN_NOTE` (zoma_status connect step, poll `guide`, "No ad account found" page) and `ZOMA_AD_ACCOUNT_CREATE_FALLBACK` (Ads Manager route, Meta Business Help, "tell me the message", re-check). Page-blocker (ENG-3125/3128) scope unchanged.
+- Pre-existing, unrelated: `eng3134.zomaRedesign.test.ts` "zoma_ads_report … computed metrics" fails on main.
