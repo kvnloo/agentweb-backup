@@ -33,13 +33,23 @@ export const ZOMA_TOOL_DEFINITIONS = [
   {
     name: 'zoma_status',
     description:
-      "Start here. Checks the user's Zoma setup (AgentWeb login, payment method on file, connected Meta ad account) and returns the next step with a direct link. Reads work without a payment method; changes to ads need both a payment method and a connected Meta ad account. Call this when the user asks to set up Zoma, and again after they say they finished a step.",
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      "Start here. Checks the user's Zoma setup (AgentWeb login, how familiar they are with ads, connected Meta ad account, payment method on file) and returns the next step with a direct link. The first step is a question: ask the user \"How familiar are you with ads?\" and call again with ads_experience set to their answer. Reads work without a payment method; changes to ads need both a payment method and a connected Meta ad account. Call this when the user asks to set up Zoma, and again after they say they finished a step.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ads_experience: {
+          type: 'string',
+          enum: ['runs_ads', 'new_to_ads', 'not_interested'],
+          description: 'The user\'s answer to "How familiar are you with ads?": runs_ads = already runs ads or uses the Meta/Google MCP; new_to_ads = interested but never ran ads; not_interested = not interested, just a friend. Omit to only check status.',
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'zoma_usage',
     description:
-      "Shows this month's Zoma usage for the logged-in user: tool calls, and writes sent to Meta with their read-back result (confirmed, mismatch, unconfirmed). Call when the user asks what they have used. Billing is not enabled yet; usage is only recorded.",
+      "Shows this month's Zoma usage for the logged-in user: tool calls, and writes sent to Meta with their read-back result (confirmed, mismatch, unconfirmed). Call when the user asks what they have used. When billing is on, also shows the plan's included calls, calls used, overage and billing period.",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {

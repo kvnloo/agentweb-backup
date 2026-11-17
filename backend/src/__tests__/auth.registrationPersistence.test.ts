@@ -252,3 +252,57 @@ describe('register persistence boundary', () => {
     expect(mockOnUserRegistered).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('ENG-3124 Zoma signup is separate from Emma signup', () => {
+  const { mintZomaSignupIntent, encodeGoogleOAuthState } = require('../services/zomaSignupIntent');
+  const gmail = 'founder@gmail.com';
+  const google = (state: string) => {
+    const done = jest.fn();
+    return googleCallback({ query: { state } } as any, '', '', { id: 'g-1', emails: [{ value: gmail }] } as any, done).then(() => done);
+  };
+
+  it('Google sign-in with a signed Zoma intent creates a personal-email account attributed to the consent flow', async () => {
+    const done = await google(encodeGoogleOAuthState('customer', mintZomaSignupIntent()));
+    expect(mockCreateUser).toHaveBeenCalledWith(gmail, expect.any(String), expect.any(String), true, false, ['customer'], expect.anything(), 'g-1', undefined, undefined, undefined);
+    expect(mockUpdateUser).toHaveBeenCalledWith('persisted-user', expect.objectContaining({ signupSource: 'mcp' }));
+    expect(done).toHaveBeenCalledWith(null, expect.objectContaining({ userId: 'persisted-user', token: 'signed.jwt' }));
+  });
+
+  it('Google sign-in with a Zoma intent applies the Zoma capacity gate', async () => {
+    process.env.ZOMA_WAITLIST_ENABLED = 'true';
+    try {
+      mockAdmitZoma.mockResolvedValue('waitlisted');
+      const done = await google(encodeGoogleOAuthState('customer', mintZomaSignupIntent()));
+      expect(done).toHaveBeenCalledWith(expect.objectContaining({ code: 'waitlisted' }), null);
+      expect(mockCreateUser).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.ZOMA_WAITLIST_ENABLED;
+    }
+  });
+
+  it.each([
+    ['no intent', 'customer'],
+    ['a tampered intent', `customer~${'9'.repeat(10)}.forged`],
+  ])('Google sign-in with a personal email and %s is still rejected (Emma requires a company email)', async (_label, state) => {
+    const done = await google(state);
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ code: 'personal_email_not_allowed' }), null);
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('email signup with a personal email and a signed Zoma intent is created', async () => {
+    const r = await request(app).post('/register').send({ email: gmail, password: 'ValidPass123!', signupSource: 'mcp', signupIntent: mintZomaSignupIntent() });
+    expect(r.status).toBe(201);
+    expect(mockCreateUser).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no intent', {}],
+    ['the unsigned signupProduct marker', { signupProduct: 'zoma' }],
+    ['a tampered intent', { signupIntent: '9999999999.forged' }],
+  ])('email signup with a personal email and %s is rejected', async (_label, extra) => {
+    const r = await request(app).post('/register').send({ email: gmail, password: 'ValidPass123!', ...extra });
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('personal_email_not_allowed');
+    expect(mockCreateUser).not.toHaveBeenCalled();
+  });
+});
