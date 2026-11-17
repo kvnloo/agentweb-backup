@@ -39,6 +39,7 @@ import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite,
 import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
+import { isMetaBoostTool, runMetaBoostTool } from './metaToolkitBoost';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
@@ -120,6 +121,8 @@ export interface MetaToolkitGatewayDeps {
   runEventSourceTool?: typeof runMetaEventSourceTool;
   /** ENG-2980 experiment eligibility + A/B / lift writes; defaults to runMetaExperimentWriteTool. */
   runExperimentWriteTool?: typeof runMetaExperimentWriteTool;
+  /** ENG-3033 ads_boost_ig_post (preview → confirm, created PAUSED); defaults to runMetaBoostTool. */
+  runBoostTool?: typeof runMetaBoostTool;
   /** ENG-2926 catalog create/update, feeds, upload sessions, feed rules; defaults to runMetaCatalogFeedTool. */
   runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
@@ -548,7 +551,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
         || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
         || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
-        || isMetaExperimentWrite(request.toolName),
+        || isMetaExperimentWrite(request.toolName) || isMetaBoostTool(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors' || request.toolName === 'ads_get_help_article') {
@@ -560,7 +563,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
       || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
       || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
-        || isMetaExperimentWrite(request.toolName);
+        || isMetaExperimentWrite(request.toolName) || isMetaBoostTool(request.toolName);
   return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
@@ -632,6 +635,14 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
     await meter('meta', pages);
     return stripCredentials(pages);
+  }
+
+  // ENG-3033: boost an Instagram post. A write tool: preview → confirm, every entity created PAUSED.
+  if (isMetaBoostTool(request.toolName)) {
+    const result: any = await (deps.runBoostTool ?? runMetaBoostTool)(request.toolName, caller.userId, accountId, args);
+    await recordExecutedWrite('AD', 'CREATE', result);
+    await meter('meta');
+    return stripCredentials(result);
   }
 
   // ENG-2980: experiment eligibility (read) + preview-confirmed A/B and lift writes.
