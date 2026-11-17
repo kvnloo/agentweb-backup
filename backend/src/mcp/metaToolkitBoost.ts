@@ -167,8 +167,6 @@ export async function runMetaBoostTool(
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;
   }
-  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
-
   const read = async (path: string, params: Record<string, string>) => {
     try {
       return await deps.readGraph(userId, accountId, path, params);
@@ -197,6 +195,10 @@ export async function runMetaBoostTool(
   if (!media) {
     throw new MetaToolkitRefusal(`Post ${spec.ig_media_id} was not found among the recent posts of Instagram account ${spec.ig_account_id}. Nothing was changed.`);
   }
+
+  // Report ownership failures before reconnect guidance, but never prepare a write
+  // without a recorded ads_management grant.
+  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
 
   // Money: echoed in the account currency and converted by the same normalizer the writers use.
   let money: { params: any; confirmation: string };

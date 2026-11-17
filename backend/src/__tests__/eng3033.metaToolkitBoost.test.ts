@@ -176,6 +176,18 @@ describe('ENG-3033 ads_boost_ig_post', () => {
     }
   });
 
+  it.each([false, true])('AC5: foreign Instagram ownership takes precedence over a missing ads_management grant (confirm=%s)', async (confirm) => {
+    const { deps, reads } = makeDeps({
+      igAccounts: [{ id: '556' }],
+      accounts: [{ ...grantedAccount, config: { ...grantedAccount.config, granted_scopes: ['ads_read'] } }],
+    });
+    await expect(run({ ...args, confirm }, deps)).rejects.toThrow(/Instagram account 555 is not available to this ad account/);
+    expect(reads).toEqual(['act_123/instagram_accounts']);
+    expect(deps.preview).not.toHaveBeenCalled();
+    expect(deps.dispatch).not.toHaveBeenCalled();
+    expect(deps.createCreative).not.toHaveBeenCalled();
+  });
+
   it('AC5: ownership is re-checked at confirm, so a post removed after the preview is not boosted', async () => {
     const { deps, dispatched } = makeDeps();
     const preview: any = await run(args, deps);
@@ -239,7 +251,10 @@ describe('ENG-3033 ads_boost_ig_post', () => {
     await expect(run(args, makeDeps({ notReady: true }).deps)).rejects.toThrow(/payment method/);
     const noScope = makeDeps({ accounts: [{ ...grantedAccount, config: { ...grantedAccount.config, granted_scopes: ['ads_read'] } }] });
     await expect(run(args, noScope.deps)).rejects.toThrow(/ads_management/);
-    expect(noScope.deps.readGraph).not.toHaveBeenCalled();
+    expect(noScope.reads).toEqual(['act_123/instagram_accounts', 'act_123/promote_pages', '555/media']);
+    expect(noScope.deps.preview).not.toHaveBeenCalled();
+    expect(noScope.deps.dispatch).not.toHaveBeenCalled();
+    expect(noScope.deps.createCreative).not.toHaveBeenCalled();
     await expect(run(args, makeDeps({ refusePreviewOf: 'CAMPAIGN' }).deps)).rejects.toThrow(/CAMPAIGN gate refused/);
   });
 
