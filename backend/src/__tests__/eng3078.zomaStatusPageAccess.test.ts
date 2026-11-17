@@ -18,7 +18,12 @@ import { assertZomaWriteReady, getZomaReadiness, runZomaTool, type ZomaOnboardin
 import { buildMetaAdsWrongPageMessage, META_ADS_NO_PAGES_MESSAGE } from '../utils/metaAdsScope';
 
 const NOW = 1_800_000_000_000;
-const ALL_SET = 'All set. Ask me about your Meta ads, e.g. "how are my campaigns doing this week?"';
+// ENG-3134: "All set" now links Zoma's docs and gives a concrete first prompt (zoma_ads_report).
+const ALL_SET = [
+  'All set. Your ad account is connected to Zoma.',
+  'Docs: https://api.agentweb.pro/api/meta-toolkit/skill.md',
+  'Try asking: "Show my Meta ad spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for the last 7 days." (runs zoma_ads_report).',
+].join('\n');
 // The exact text a fully set-up user gets on main today (Google Ads provider off).
 const TODAY_SUMMARY = [
   'Zoma setup:',
@@ -54,7 +59,7 @@ function deps(accounts: any[], over: Partial<ZomaOnboardingDeps> = {}): ZomaOnbo
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://facebook.example/connect'),
     buildGoogleAdsConnectUrl: jest.fn().mockResolvedValue('https://accounts.google.example/connect'),
     googleEnabled: () => false,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
     ...over,

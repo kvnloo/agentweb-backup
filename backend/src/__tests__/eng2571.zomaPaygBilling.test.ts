@@ -281,7 +281,7 @@ describe('Zoma setup Checkout + customer creation', () => {
       findLiveCustomerId: (user: any, id: string) => stripeService.findLiveCustomerIdForUser(user, id),
       createCustomerForUser: (id: string, email: string | undefined) => stripeService.createCustomerForUser(id, email),
       createPaymentMethodSetupSession: (p: any) => stripeService.createPaymentMethodSetupSession(p),
-      frontendUrl: () => 'https://app.agentweb.pro',
+      pagesUrl: () => 'https://api.agentweb.pro',
     } as unknown as ZomaOnboardingDeps;
     const url = await createZomaPaymentSetupLink('u1', { successUrl: 's', cancelUrl: 'c' }, deps);
     expect(url).toBe('https://checkout.stripe.com/c/pay/cs_new');
@@ -294,7 +294,7 @@ describe('Zoma setup Checkout + customer creation', () => {
       findLiveCustomerId: (u: any, id: string) => stripeService.findLiveCustomerIdForUser(u, id),
       createCustomerForUser: (id: string, email: string | undefined) => stripeService.createCustomerForUser(id, email),
       createPaymentMethodSetupSession: (p: any) => stripeService.createPaymentMethodSetupSession(p),
-      frontendUrl: () => 'https://app.agentweb.pro',
+      pagesUrl: () => 'https://api.agentweb.pro',
     } as unknown as ZomaOnboardingDeps;
   }
 

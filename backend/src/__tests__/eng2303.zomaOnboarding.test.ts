@@ -39,7 +39,7 @@ function deps(over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Reco
     resolvePaymentMethod: jest.fn().mockResolvedValue(NO_CARD),
     createPaymentMethodSetupSession: jest.fn().mockResolvedValue({ url: 'https://checkout.stripe.com/c/pay/cs_setup' }),
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://www.facebook.com/v23.0/dialog/oauth?client_id=x'),
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     ...over,
   } as any;
@@ -57,8 +57,9 @@ describe('ENG-2303 zoma_status onboarding', () => {
     expect(d.createPaymentMethodSetupSession).toHaveBeenCalledWith({
       stripeCustomerId: 'cus_new',
       userId: 'u1',
-      successUrl: 'https://app.agentweb.pro/settings?zoma=payment_method_added',
-      cancelUrl: 'https://app.agentweb.pro/settings?zoma=payment_method_canceled',
+      // ENG-3134: Stripe returns to Zoma's own page on the API, never the AgentWeb (Emma) app.
+      successUrl: 'https://api.agentweb.pro/api/zoma/done?mcp=1',
+      cancelUrl: 'https://api.agentweb.pro/api/zoma/done?mcp=1&canceled=1',
     });
   });
 

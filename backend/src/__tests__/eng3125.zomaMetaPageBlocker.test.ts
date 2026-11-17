@@ -59,7 +59,7 @@ function onboardingDeps(accounts: any[]): ZomaOnboardingDeps & Record<string, je
     createPaymentMethodSetupSession: jest.fn(),
     buildMetaConnectUrl: jest.fn().mockResolvedValue(CONNECT),
     googleEnabled: () => false,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
   } as any;

@@ -5,8 +5,10 @@ process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
  *   - unanswered: zoma_status asks the question first and mints no setup links
  *   - zoma_status { ads_experience } persists the answer on the user; an invalid value is refused
  *   - runs_ads: straight to connecting ad accounts (Meta, Google), then the card, then done
- *   - new_to_ads: guided ad-account setup steps, then connect
- *   - not_interested: thank-you, no further steps, nothing minted
+ *   - new_to_ads: ENG-3134 — the Meta connect link first, the ad-account setup guide after it
+ *   - not_interested: exactly the thank-you, no further steps, nothing minted (ENG-3134)
+ *   - ENG-3134: the first answer is "Hey, welcome to Zoma." and the one question, no checklist
+ *   - ENG-3134: a friend is classified `pal` in the lead list
  *   - no step ever routes to the Emma app
  *   - not_interested users are excluded from the scoreboard and activation-queue counts
  */
@@ -43,7 +45,7 @@ function deps(user: Record<string, unknown>, over: Partial<ZomaOnboardingDeps> =
     buildMetaConnectUrl: jest.fn().mockResolvedValue(META_LINK),
     buildGoogleAdsConnectUrl: jest.fn().mockResolvedValue(GOOGLE_LINK),
     googleEnabled: () => true,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
     saveAdsExperience: jest.fn(async (_u: string, answer: string) => {
@@ -64,7 +66,9 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
     expect(r.next_step).toContain('How familiar are you with ads?');
     for (const value of ['runs_ads', 'new_to_ads', 'not_interested']) expect(r.next_step).toContain(value);
     expect(r.next_step).toContain('Not interested, just a friend');
-    expect(r.summary).toContain('[ ] How familiar you are with ads');
+    // ENG-3134: first contact is the welcome and the one question, not a setup checklist.
+    expect(r.summary.startsWith('Hey, welcome to Zoma.')).toBe(true);
+    expect(r.summary).not.toContain('[ ]');
     expect(d.buildMetaConnectUrl).not.toHaveBeenCalled();
     expect(d.createPaymentMethodSetupSession).not.toHaveBeenCalled();
     expect(d.createCustomerForUser).not.toHaveBeenCalled();
@@ -102,8 +106,9 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
     expect(r.next_step).toMatch(/Facebook Page/);
     expect(r.next_step).toMatch(/ad account/);
     expect(r.next_step).toMatch(/Google Ads account/);
-    // Guide first, then the connect links.
-    expect(r.next_step.indexOf('Facebook Page')).toBeLessThan(r.next_step.indexOf(META_LINK));
+    // ENG-3134: the answer leads straight to Meta connect; the guide follows the link.
+    expect(r.next_step.indexOf(META_LINK)).toBeLessThan(r.next_step.indexOf('Facebook Page'));
+    expect(r.next_step.startsWith('Connect Meta')).toBe(true);
     expect(r.next_step).toContain(GOOGLE_LINK);
     expect(r.next_step).not.toContain(EMMA_APP);
   });
@@ -112,10 +117,9 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
     const d = deps({});
     const r = await status(d, { ads_experience: 'not_interested' });
     expect(d.saveAdsExperience).toHaveBeenCalledWith('u1', 'not_interested');
-    expect(r.next_step).toBe(ZOMA_NOT_INTERESTED_MESSAGE);
-    expect(r.meta.link).toBeUndefined();
-    expect(r.payment.link).toBeUndefined();
-    expect(r.google_ads.link).toBeUndefined();
+    // ENG-3134: the whole answer is exactly the thank-you; no setup state or links ride along.
+    expect(r).toEqual({ summary: 'Thanks for signing up and trying out Zoma.', ads_experience: 'not_interested', next_step: null });
+    expect(ZOMA_NOT_INTERESTED_MESSAGE).toBe('Thanks for signing up and trying out Zoma.');
     expect(d.buildMetaConnectUrl).not.toHaveBeenCalled();
     expect(d.createPaymentMethodSetupSession).not.toHaveBeenCalled();
     expect(r.summary).not.toContain(EMMA_APP);
@@ -149,8 +153,8 @@ describe('ENG-3128 "just a friend" users are excluded from active-user counts', 
       [write('u1'), write('u2')],
     ));
     const friend = sb.rows.find((r) => r.userId === 'u2')!;
-    expect(friend).toMatchObject({ excluded: 'not_interested', active7d: false });
-    expect(sb.summary).toEqual({ zomaUsers: 2, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 1 });
+    expect(friend).toMatchObject({ excluded: 'pal', active7d: false });
+    expect(sb.summary).toEqual({ zomaUsers: 2, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 1, palUsers: 1 });
   });
 
   it('activation queue: not_interested is never due, stalled, or needing help, and not in the active count', () => {
@@ -158,7 +162,8 @@ describe('ENG-3128 "just a friend" users are excluded from active-user counts', 
     const friend: ZomaTrackedUser = { name: 'Pal', email: 'pal@gmail.com', dateInvited: '2026-11-01T00:00:00Z', adsExperience: 'not_interested', currentBlocker: 'none' };
     const prospect: ZomaTrackedUser = { name: 'Ann', email: 'ann@acme.co', dateInvited: '2026-11-01T00:00:00Z', adsExperience: 'new_to_ads' };
     const rows = buildTracker([friend, prospect], now);
-    expect(rows.find((r) => r.email === 'pal@gmail.com')).toMatchObject({ notInterested: true, due: false, needsHelp: false, stalled: false, nextAction: null });
+    expect(rows.find((r) => r.email === 'pal@gmail.com')).toMatchObject({ notInterested: true, classification: 'pal', due: false, needsHelp: false, stalled: false, nextAction: null });
+    expect(rows.find((r) => r.email === 'ann@acme.co')).toMatchObject({ classification: 'prospect' });
     expect(dailyFollowUpList([friend, prospect], now).map((r) => r.email)).toEqual(['ann@acme.co']);
     expect(helpAlert(rows)?.users.map((r) => r.email)).toEqual(['ann@acme.co']);
     expect(activeUserCount([friend, prospect], now)).toBe(1);
