@@ -30,8 +30,20 @@ export function parseZomaAdsExperience(raw: unknown): ZomaAdsExperience | null {
 
 export const isNotInterested = (raw: unknown) => parseZomaAdsExperience(raw) === 'not_interested';
 
-export const ZOMA_NOT_INTERESTED_MESSAGE =
-  "Thanks for checking out Zoma! There's nothing else to set up. If you ever want to run ads, just tell your agent and it can pick up from here.";
+/** The first words of a newly connected Zoma agent (ENG-3134). */
+export const ZOMA_WELCOME = 'Hey, welcome to Zoma.';
+
+/** The whole friend path: exactly this, nothing more (ENG-3134). */
+export const ZOMA_NOT_INTERESTED_MESSAGE = 'Thanks for signing up and trying out Zoma.';
+
+/**
+ * Internal lead classification (ENG-3134). A "just a friend" answer is a `pal`: listed in the lead
+ * list and notifications as a pal and never counted as a potential user. Everyone else is a
+ * `prospect` (including users who have not answered yet).
+ */
+export type ZomaLeadClassification = 'pal' | 'prospect';
+export const ZOMA_PAL: ZomaLeadClassification = 'pal';
+export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => (isNotInterested(raw) ? 'pal' : 'prospect');
 
 /** Ad-account setup for someone who has never run ads, in the order they need it. */
 export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
@@ -42,17 +54,19 @@ export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
   'Then connect those ad accounts to Zoma.',
 ];
 
-/** Agent-facing question block: what to ask, and how to record each answer. */
+/** Agent-facing question block: greet, ask the one question, and how to record each answer. */
 export function adsExperienceQuestionText(recordWith: string): string {
   return [
-    `Ask the user: "${ZOMA_ADS_EXPERIENCE_QUESTION}"`,
+    ZOMA_WELCOME,
+    '',
+    `Say "${ZOMA_WELCOME}" to the user, then ask this one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}"`,
     ...ZOMA_ADS_EXPERIENCE_OPTIONS.map((o, i) => `  ${i + 1}. ${o.label}  → ${o.value}`),
     `Record their answer with ${recordWith}.`,
   ].join('\n');
 }
 
 export function newToAdsGuideText(): string {
-  return ['Set up your ad accounts first:', ...ZOMA_NEW_TO_ADS_STEPS.map((s, i) => `  ${i + 1}. ${s}`)].join('\n');
+  return ['No Meta ad account yet? Set one up, then use the same connect link:', ...ZOMA_NEW_TO_ADS_STEPS.map((s, i) => `  ${i + 1}. ${s}`)].join('\n');
 }
 
 export interface ZomaAdsExperienceStore {
