@@ -276,7 +276,7 @@ export function createZomaRouter(
 
   router.get('/billing/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     if (req.query.result === 'paid') {
-      return page(res, 200, "You're on the Zoma plan", '<p>Your trial has started. Go back to your agent and ask it to try the launch again.</p>');
+      return page(res, 200, "You're on the Zoma plan", '<p>Your trial has started: $1 was charged today. After 7 days your card is charged $50/month automatically unless you cancel before then. Go back to your agent and ask it to try the launch again.</p>');
     }
     // Funnel only (ENG-3131 R5): a failed write must never change what the user sees.
     await recordZomaCheckoutCanceled(req.query, billingDeps).catch((e) => console.error('[zoma-billing] cancel record failed:', e));

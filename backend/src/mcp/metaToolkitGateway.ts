@@ -409,7 +409,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   // a billing failure is logged and never fails the call.
   const meter = async (platform?: string, result?: unknown) => {
     if (result !== undefined && !isBillableResult(result)) {
-      // Not metered and not counted as usage, but still audited: a failed write attempt must leave a row.
+      // Not metered and not counted as usage, but still audited: any call that failed in-band (read or write) leaves a row.
       void Promise.resolve()
         .then(() =>
           (deps.recordFailure ?? recordMcpToolFailed)({
