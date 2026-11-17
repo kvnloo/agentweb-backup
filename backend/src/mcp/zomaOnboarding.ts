@@ -95,7 +95,7 @@ export interface ZomaReadiness {
   meta: { ready: boolean; accounts: ZomaMetaAccountSummary[]; link?: string };
   /**
    * ENG-2823/ENG-2973: always present. While the Google Ads provider is disabled
-   * (ZOMA_GOOGLE_ADS_ENABLED off) it is `{ available: false, ready: false, accounts: [],
+   * (ZOMA_GOOGLE_ENABLED off) it is `{ available: false, ready: false, accounts: [],
    * writes_enabled: false, reason: 'google_ads_provider_disabled' }` so callers can tell
    * "not offered on this deployment" apart from a missing field.
    */
@@ -521,12 +521,13 @@ export function currentUsageMonth(now: number): { start: string; end: string } {
   };
 }
 
-export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage): string {
+export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage, google: boolean = googleToolkitEnabled()): string {
   const lines = [
     `Zoma usage ${u.start.slice(0, 7)} (UTC month):`,
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
-    ...u.recentWrites.map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
+    // Google writes are listed (and labelled) only while ZOMA_GOOGLE_ENABLED is on.
+    ...u.recentWrites.filter((w) => google || w.platform !== 'google_ads').map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
     ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');

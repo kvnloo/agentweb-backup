@@ -59,6 +59,13 @@ function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
   return caller?.databricksOrigin ? databricksToolView(tools) : tools;
 }
 
+/** The Google section of the agent guide (between zoma-google markers) is served only while ZOMA_GOOGLE_ENABLED is on. */
+const GOOGLE_DOC_SECTION = /<!-- zoma-google:start -->[\s\S]*?<!-- zoma-google:end -->\n?/g;
+const GOOGLE_DOC_MARKERS = /<!-- zoma-google:(start|end) -->\n?/g;
+export function zomaSkillDoc(doc: string, google: boolean = googleToolkitEnabled()): string {
+  return google ? doc.replace(GOOGLE_DOC_MARKERS, '') : doc.replace(GOOGLE_DOC_SECTION, '');
+}
+
 const router = Router();
 
 router.use((req: Request, res: Response, next) => {
@@ -73,7 +80,8 @@ router.use((req: Request, res: Response, next) => {
 /** ENG-2303 P5 — public agent guide for the toolkit (served from backend/docs, like /skill.md). */
 router.get('/skill.md', (_req: Request, res: Response) => {
   try {
-    res.type('text/markdown').send(fs.readFileSync(path.join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf-8'));
+    const doc = fs.readFileSync(path.join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf-8');
+    res.type('text/markdown').send(zomaSkillDoc(doc));
   } catch {
     res.status(404).json({ error: 'Documentation not found' });
   }
@@ -143,13 +151,15 @@ function toolResultContent(result: unknown, nextStep: string | null) {
  * ENG-3134: MCP `instructions` (shown to the agent on connect). The first thing the user hears is
  * the welcome, then one question; zoma_status records the answer and returns the Meta connect link.
  */
-export const ZOMA_MCP_INSTRUCTIONS = [
-  `${ZOMA_WELCOME} Zoma lets you run the user's Meta (and Google) ads safely from this chat.`,
-  `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
-    'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
-  'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
-    'Every change to ads is a two-step preview → confirm; never confirm without the user\'s explicit approval. Each tool response ends with the next step to take.',
-].join('\n');
+export function zomaMcpInstructions(google: boolean = googleToolkitEnabled()): string {
+  return [
+    `${ZOMA_WELCOME} Zoma lets you run the user's ${google ? 'Meta (and Google)' : 'Meta'} ads safely from this chat.`,
+    `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
+      'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
+    'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
+      'Every change to ads is a two-step preview → confirm; never confirm without the user\'s explicit approval. Each tool response ends with the next step to take.',
+  ].join('\n');
+}
 
 // No SSE stream is offered; MCP Streamable HTTP requires 405 for GET in that case.
 router.get('/mcp', (_req: Request, res: Response) => {
@@ -187,7 +197,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
               : META_TOOLKIT_MCP_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'agentweb-meta-toolkit', title: 'Zoma', version: '1.0.0' },
-          instructions: ZOMA_MCP_INSTRUCTIONS,
+          instructions: zomaMcpInstructions(),
         });
       case 'ping':
         return rpcResult(res, id, {});
