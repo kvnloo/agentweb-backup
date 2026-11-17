@@ -23,6 +23,7 @@ import {
   createZomaTrialCheckoutLink,
   getZomaBillingConfig,
   getZomaBillingUsage,
+  formatZomaPlanLine,
   getZomaPlanSummary,
   planAllowsPublish,
   planStateFromSubscriptions,
@@ -71,6 +72,7 @@ function billingDeps(over: Partial<ZomaBillingDeps> = {}, env: NodeJS.ProcessEnv
     listSubscriptions: jest.fn().mockResolvedValue([]),
     createCheckoutSession: jest.fn().mockResolvedValue({ id: 'cs_test_1', url: 'https://checkout.stripe.com/c/pay/cs_test_1' }),
     retrieveCheckoutSession: jest.fn(),
+    findOpenCheckoutSession: jest.fn().mockResolvedValue(null),
     sendMeterEvent: jest.fn().mockResolvedValue(undefined),
     searchTrialingSubscriptions: jest.fn().mockResolvedValue([]),
     setSubscriptionMetadata: jest.fn().mockResolvedValue(undefined),
@@ -200,6 +202,28 @@ describe('ENG-3130 only successful calls are billable', () => {
       expect(d.executeWrite).toHaveBeenCalled();
     });
 
+    const googleWrite = (d: MetaToolkitGatewayDeps, status: string) => handleMetaToolkitCall({
+      authorization: 'Bearer aw_k', toolName: 'call_google_ads_api',
+      args: { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: 'customers/1/campaigns/2', status },
+    }, d);
+
+    describe('Google Ads (dark behind ZOMA_GOOGLE_ADS_ENABLED)', () => {
+      beforeAll(() => { process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true'; });
+      afterAll(() => { delete process.env.ZOMA_GOOGLE_ADS_ENABLED; });
+    it('a Google Ads go-live (status ENABLED) is refused with the pay link before anything is sent', async () => {
+      const d = gatewayDeps({ assertPublishAllowed: paywalled() });
+      await expect(googleWrite(d, 'ENABLED')).rejects.toThrow(/Going live needs the Zoma plan → https:\/\/pay/);
+      expect(d.assertPublishAllowed).toHaveBeenCalledWith('u1', { platform: 'google_ads', toolName: 'call_google_ads_api' });
+      expect(d.recordUsage).not.toHaveBeenCalled();
+    });
+
+    it('a Google Ads pause (status PAUSED) is not gated', async () => {
+      const d = gatewayDeps({ assertPublishAllowed: paywalled() });
+      await googleWrite(d, 'PAUSED').catch(() => undefined);
+      expect(d.assertPublishAllowed).not.toHaveBeenCalled();
+    });
+    });
+
     it('a read is not gated', async () => {
       const d = gatewayDeps({ execute: jest.fn().mockResolvedValue({ data: [] }) as any, assertPublishAllowed: paywalled() });
       await handleMetaToolkitCall({ authorization: 'Bearer aw_k', toolName: 'get_campaigns', args: {} }, d);
@@ -236,7 +260,7 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
     expect(err).toBeInstanceOf(ZomaPaywallError);
     expect(err.link).toBe('https://api.example.com/api/zoma/billing/checkout/cs_test_1');
     expect(err.message).toContain('$1 7-day trial → https://api.example.com/api/zoma/billing/checkout/cs_test_1');
-    expect(err.message).toContain('$50/month with 5,000 calls included, then 1¢ per call');
+    expect(err.message).toContain('charged $50/month automatically (cancel before day 7 to avoid it), with 5,000 calls included, then 1¢ per call');
     expect(err.message).not.toMatch(/emma|app\.agentweb/i);
     expect(d.recordFunnel).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u1', step: 'paywall_shown', dimensions: expect.objectContaining({ surface: 'write_guard', planStatus: 'none' }) }));
   });
@@ -277,6 +301,19 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
     expect(planAllowsPublish(planStateFromSubscriptions('cus_1', [sub({ status: 'active', latest_invoice: { id: 'in_renewal', status } as any })]))).toBe(true);
   });
 
+  it('zoma_status says a cancelled trial will not renew', async () => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ cancel_at_period_end: true })]) });
+    const line = formatZomaPlanLine((await getZomaPlanSummary('u1', d))!, d.config());
+    expect(line).toContain('cancelled, it will not renew');
+    expect(line).not.toContain('then $50/month');
+  });
+
+  it('paywall_shown is recorded at most once an hour per surface', async () => {
+    const d = billingDeps();
+    await assertZomaPublishAllowed('u1', { platform: 'meta' }, d).catch(() => undefined);
+    expect(d.recordFunnel).toHaveBeenCalledWith(expect.objectContaining({ step: 'paywall_shown', dedupeKey: 'write_guard#2026-11-16T12' }));
+  });
+
   it('fails closed when Stripe cannot be read', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const d = billingDeps({ findCustomerId: jest.fn().mockRejectedValue(new Error('stripe down')) });
@@ -289,7 +326,7 @@ describe('ENG-3131 trial checkout', () => {
     const d = billingDeps();
     const link = await createZomaTrialCheckoutLink('u1', d);
     expect(link).toBe('https://api.example.com/api/zoma/billing/checkout/cs_test_1');
-    expect(d.createCustomer).toHaveBeenCalledWith('u1', 'u1@example.com');
+    expect(d.createCustomer).toHaveBeenCalledWith('u1');
     const params = (d.createCheckoutSession as jest.Mock).mock.calls[0][0];
     expect(params).toMatchObject({
       mode: 'subscription',
@@ -300,6 +337,16 @@ describe('ENG-3131 trial checkout', () => {
       success_url: 'https://api.example.com/api/zoma/billing/done?result=paid',
       cancel_url: expect.stringMatching(/^https:\/\/api\.example\.com\/api\/zoma\/billing\/done\?result=canceled&u=u1&s=[0-9a-f]{32}$/),
     });
+  });
+
+  it('reuses a still-open Checkout instead of minting a second one', async () => {
+    const d = billingDeps({
+      findCustomerId: jest.fn().mockResolvedValue('cus_1'),
+      findOpenCheckoutSession: jest.fn().mockResolvedValue({ id: 'cs_open' }),
+    });
+    await expect(createZomaTrialCheckoutLink('u1', d)).resolves.toBe('https://api.example.com/api/zoma/billing/checkout/cs_open');
+    expect(d.findOpenCheckoutSession).toHaveBeenCalledWith('cus_1', 60 * 60 * 1000);
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
   });
 
   it('refuses to mint a link when a price id is missing', async () => {
@@ -383,7 +430,7 @@ describe('ENG-3131 webhook transitions', () => {
     ['checkout.session.expired', { id: 'cs_1', metadata: zomaMeta }, undefined, 'checkout_expired'],
     ['customer.subscription.updated', { id: 'sub_1', status: 'active', metadata: zomaMeta }, { status: 'trialing' }, 'trial_converted'],
     ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200, metadata: zomaMeta }, undefined, 'trial_canceled'],
-    ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 900, metadata: zomaMeta }, undefined, 'subscription_canceled'],
+    ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200 + 2 * 3600, metadata: zomaMeta }, undefined, 'subscription_canceled'],
   ])('%s → %s funnel step (deduped on the Stripe event id)', async (type, object, prev, step) => {
     const recordFunnel = jest.fn().mockResolvedValue(true);
     await expect(handleZomaBillingWebhookEvent(evt(type, object, prev), { recordFunnel })).resolves.toBe(true);
@@ -435,6 +482,10 @@ describe('ENG-3131 day-3 trial reminder', () => {
     expect(trialReminderDue(sub(), at('2026-11-17T00:00:00Z'), 3)).toBe(false);
     expect(trialReminderDue(sub({ metadata: { product: 'zoma_plan', [TRIAL_REMINDER_METADATA_KEY]: 'x' } }), at('2026-11-14T00:00:00Z'), 3)).toBe(false);
     expect(trialReminderDue(sub({ status: 'active' }), at('2026-11-14T00:00:00Z'), 3)).toBe(false);
+  });
+
+  it('does not remind a user who already cancelled the trial', () => {
+    expect(trialReminderDue(sub({ cancel_at_period_end: true }), at('2026-11-14T00:00:00Z'), 3)).toBe(false);
   });
 
   it('claims the hour, sends, then marks the subscription and records the funnel step', async () => {
@@ -527,5 +578,22 @@ describe('ENG-3131 cancel at card entry', () => {
     await createZomaTrialCheckoutLink('u1', d);
     const params = (d.createCheckoutSession as jest.Mock).mock.calls[0][0];
     expect(params.cancel_url).toMatch(/\/api\/zoma\/billing\/done\?result=canceled&u=u1&s=[0-9a-f]{32}$/);
+  });
+});
+
+describe('ENG-3131 funnel dedupe key', () => {
+  it('a repeat with the same dedupeKey is refused even when the clock has moved', async () => {
+    const seen = new Set<string>();
+    const store = {
+      put: async (item: any) => {
+        if (seen.has(item.tsSession)) throw Object.assign(new Error('exists'), { code: 'ConditionalCheckFailedException' });
+        seen.add(item.tsSession);
+      },
+      queryByLoopId: async () => [],
+    } as any;
+    const input = { userId: 'u1', step: 'trial_reminder_claimed' as const, dedupeKey: 'sub_1#2026-11-13T05' };
+    await expect(recordZomaBillingFunnel({ ...input, now: new Date('2026-11-13T05:00:01Z') }, store)).resolves.toBe(true);
+    await expect(recordZomaBillingFunnel({ ...input, now: new Date('2026-11-13T05:40:00Z') }, store)).resolves.toBe(false);
+    await expect(recordZomaBillingFunnel({ ...input, dedupeKey: 'sub_1#2026-11-13T06' }, store)).resolves.toBe(true);
   });
 });
