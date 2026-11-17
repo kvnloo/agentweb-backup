@@ -76,7 +76,7 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
   const refused = (r: any) => {
     expect(r.success).toBe(false);
     expect(r.message).toBe(TOOL_FILE_REFUSAL_MESSAGE);
-    expect(r.errorClass).toBe('not_found');
+    expect(r.errorClass).toBe('invalid_args'); // a bad argument, not a config/account fault (ENG-2993)
     expect(JSON.stringify(r)).not.toMatch(/users\/|bucket|tool-responses/i); // nothing about the target comes back
   };
 
@@ -90,6 +90,24 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
     it('refuses another bucket even when the key would be allowed in ours (the bucket check stands on its own)', async () => {
       const r = await performDataAnalysis(['s3://some-other-private-bucket/users/me/files/1/abc/data.csv'], 'summarise', 'me');
       refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
+    it.each([[`${OUR_BUCKET}-backup`], [`${OUR_BUCKET}.s3.amazonaws.com`], [OUR_BUCKET.toUpperCase()], [`prefix-${OUR_BUCKET}`]])(
+      'refuses a bucket whose name only resembles ours (%s), even with a key that would be allowed',
+      async (bucket) => {
+        const r = await performDataAnalysis([`s3://${bucket}/users/me/files/1/abc/data.csv`], 'summarise', 'me');
+        refused(r);
+        expect(readS3).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not read, and says "try again", when the lookup fails on an s3:// file', async () => {
+      process.env.TEST_LOOKUP_FAILS = '1';
+      const r = await performDataAnalysis([`s3://${OUR_BUCKET}/tool-responses/${MY_SESSION}/call1.txt`], 'summarise', 'me');
+      expect(r.success).toBe(false);
+      expect(r.message).toBe(TOOL_FILE_UNAVAILABLE_MESSAGE);
+      expect(r.errorClass).toBe('upstream_5xx');
       expect(readS3).not.toHaveBeenCalled();
     });
 
@@ -232,6 +250,13 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       const r = await performDataAnalysis([], `Use tool-responses/${OTHER_SESSION}/call1.txt and total the clicks.`, 'me');
       expect(readS3).not.toHaveBeenCalled();
       expect(r.success).toBe(false); // the same "could not be read" outcome as for a key that is not there
+    });
+
+    it('does not read a key named in the text when the lookup fails (never a pass)', async () => {
+      process.env.TEST_LOOKUP_FAILS = '1';
+      const r = await performDataAnalysis([], `Use tool-responses/${MY_SESSION}/call1.txt and total the clicks.`, 'me');
+      expect(readS3).not.toHaveBeenCalled();
+      expect(r.success).toBe(false);
     });
 
     it('does not follow a key that climbs out of the caller\'s own tool-response folder', async () => {

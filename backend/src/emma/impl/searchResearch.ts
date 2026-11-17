@@ -353,11 +353,13 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     // module must not load when it is merely required (see the header note and searchResearch.moduleIsolation.test.ts).
     const { TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE, createToolFileAccess } = await import('./toolStorageAccess');
     const fileAccess = createToolFileAccess('perform_data_analysis', userId);
+    // `invalid_args`, not `not_found`: the model named a file the caller may not read, a bad argument. `not_found` is bucketed as a
+    // config/account fault ("resolve the account, not the code"), the phantom cluster ENG-2993 removed for dead caller URLs.
     const refuseFile = () => ({
       success: false,
       message: TOOL_FILE_REFUSAL_MESSAGE,
       error: 'File not accessible',
-      errorClass: 'not_found',
+      errorClass: 'invalid_args',
     });
     // The check itself could not run (a lookup failed): tell the model to retry, not that the file is gone.
     const fileCheckUnavailable = () => ({
