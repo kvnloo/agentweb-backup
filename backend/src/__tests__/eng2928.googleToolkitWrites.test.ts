@@ -531,11 +531,11 @@ describe('ENG-2928 surface, scopes and metering', () => {
     } as unknown as MetaToolkitGatewayDeps & Record<string, jest.Mock>;
   }
 
-  const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
-  beforeEach(() => { process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true'; });
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
+  beforeEach(() => { process.env.ZOMA_GOOGLE_ENABLED = 'true'; });
   afterAll(() => {
-    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prev;
   });
 
   it.each([
