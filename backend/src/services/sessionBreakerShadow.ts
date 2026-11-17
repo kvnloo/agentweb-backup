@@ -1,7 +1,9 @@
 /**
  * ENG-2953 (ENG-2812.3): SHADOW wiring of the ENG-2820 session turn/spend breaker.
  *
- * DARK — off unless SESSION_BREAKER_SHADOW=true. When on, every agent-loop LLM turn is
+ * ON BY DEFAULT (log-only) since ENG-2812: prod's Elastic Beanstalk environment-variable block
+ * is at CloudFormation's 4096-character cap, so a new env property cannot be added there. Set
+ * SESSION_BREAKER_SHADOW=false (or 0 / off) to turn it off. Every agent-loop LLM turn is
  * counted against a process-local per-session accumulator and the pure evaluator is run.
  * A non-`continue` decision emits ONE structured `session_breaker_would_pause` log line per
  * cap multiple crossed. It never pauses, never alters the response, never writes to any
@@ -23,9 +25,10 @@ function positiveNumber(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/** Returns null (no-op) unless SESSION_BREAKER_SHADOW is exactly "true". */
+/** Returns null (no-op) only when SESSION_BREAKER_SHADOW is "false", "0" or "off"; on otherwise. */
 export function readSessionBreakerShadowConfig(env: Env = process.env): SessionBreakerShadowConfig | null {
-  if (env.SESSION_BREAKER_SHADOW !== 'true') return null;
+  const flag = (env.SESSION_BREAKER_SHADOW ?? '').trim().toLowerCase();
+  if (flag === 'false' || flag === '0' || flag === 'off') return null;
   return {
     caps: {
       maxTurns: positiveNumber(env.SESSION_BREAKER_SHADOW_MAX_TURNS, 40),
