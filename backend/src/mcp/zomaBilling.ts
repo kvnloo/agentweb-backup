@@ -164,10 +164,15 @@ export const PAYMENT_PENDING_MESSAGE =
 
 const isoFromEpoch = (s: unknown) => (typeof s === 'number' && s > 0 ? new Date(s * 1000).toISOString() : undefined);
 
+const invoiceIsPaid = (sub: Stripe.Subscription) =>
+  typeof sub.latest_invoice === 'object' && sub.latest_invoice !== null && sub.latest_invoice.status === 'paid';
+
 /** Most relevant Zoma plan subscription: one that allows publishing, else the newest. */
 export function planStateFromSubscriptions(customerId: string | null, subs: Stripe.Subscription[]): ZomaPlanState {
   const zoma = subs.filter((s) => s.metadata?.product === ZOMA_PLAN_PRODUCT_TAG).sort((a, b) => b.created - a.created);
-  const sub = zoma.find((s) => s.status === 'trialing' || s.status === 'active') ?? zoma[0];
+  // An entitled plan wins over a newer trial whose $1 has not settled; then any live one; then the newest.
+  const live = zoma.filter((s) => s.status === 'trialing' || s.status === 'active');
+  const sub = live.find((s) => s.status === 'active' || invoiceIsPaid(s)) ?? live[0] ?? zoma[0];
   if (!sub) return { status: 'none', ...(customerId ? { customerId } : {}) };
   const item: any = sub.items?.data?.[0];
   return {
@@ -179,7 +184,7 @@ export function planStateFromSubscriptions(customerId: string | null, subs: Stri
     periodStart: isoFromEpoch(item?.current_period_start ?? (sub as any).current_period_start),
     periodEnd: isoFromEpoch(item?.current_period_end ?? (sub as any).current_period_end),
     cancelAtPeriodEnd: sub.cancel_at_period_end === true,
-    latestInvoicePaid: typeof sub.latest_invoice === 'object' && sub.latest_invoice !== null && sub.latest_invoice.status === 'paid',
+    latestInvoicePaid: invoiceIsPaid(sub),
   };
 }
 
@@ -318,7 +323,7 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
   now: () => Date.now(),
 };
 
-export async function getZomaPlanState(userId: string, deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<ZomaPlanState> {
+export async function getZomaPlanState(userId: string, deps: Pick<ZomaBillingDeps, 'findCustomerId' | 'listSubscriptions'> = defaultZomaBillingDeps): Promise<ZomaPlanState> {
   const customerId = await deps.findCustomerId(userId);
   if (!customerId) return { status: 'none' };
   return planStateFromSubscriptions(customerId, await deps.listSubscriptions(customerId));
@@ -652,13 +657,15 @@ export async function handleZomaBillingWebhookEvent(
  */
 export async function openZomaCheckout(
   sessionId: string,
-  deps: Pick<ZomaBillingDeps, 'retrieveCheckoutSession' | 'recordFunnel'> = defaultZomaBillingDeps,
+  deps: Pick<ZomaBillingDeps, 'retrieveCheckoutSession' | 'recordFunnel' | 'findCustomerId' | 'listSubscriptions'> = defaultZomaBillingDeps,
 ): Promise<{ kind: 'redirect'; url: string } | { kind: 'gone' | 'not_found' }> {
   if (!/^cs_[A-Za-z0-9_]+$/.test(sessionId)) return { kind: 'not_found' };
   const session = await deps.retrieveCheckoutSession(sessionId);
   if (!session || session.metadata?.product !== ZOMA_PLAN_PRODUCT_TAG) return { kind: 'not_found' };
   if (session.status !== 'open' || !session.url) return { kind: 'gone' };
   const userId = session.metadata?.userId;
+  // A link minted before the user subscribed stays open for 23h; completing it would start a second plan.
+  if (userId && ['trialing', 'active'].includes((await getZomaPlanState(userId, deps)).status)) return { kind: 'gone' };
   if (userId) {
     await deps.recordFunnel({ userId, step: 'checkout_started', dedupeKey: session.id, now: new Date(session.created * 1000) })
       .catch((e) => console.error('[zoma-billing] funnel record failed:', e));
