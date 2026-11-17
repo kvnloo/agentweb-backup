@@ -33,8 +33,7 @@ export interface GoogleToolkitCaller {
 export interface GoogleToolkitGatewayDeps {
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   now: () => number;
-  /** Records the single mcp_tool_used event (platform google_ads) for this call. */
-  /** Called after the call finishes; skips (ENG-3130) a result that reports failure. */
+  /** Records the single mcp_tool_used event (platform google_ads) once the call finishes; skips (ENG-3130) a result that reports failure. */
   meter: (result?: unknown) => Promise<unknown>;
   recordWrite: typeof recordMcpWriteExecuted;
   executeRead?: typeof executeGoogleToolkitRead;

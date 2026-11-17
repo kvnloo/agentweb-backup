@@ -391,12 +391,16 @@ export async function recordZomaBillingFunnel(
 ): Promise<boolean> {
   if (!input.userId) return false;
   const ts = (input.now ?? new Date()).toISOString();
-  const suffix = input.dedupeKey ? `${input.step}#${input.dedupeKey}` : `${input.step}#${Math.random().toString(36).slice(2, 10)}`;
+  // With a dedupeKey the sort key carries no timestamp: a key that embeds `ts` is different on every
+  // call, so the conditional put below could never see a repeat.
+  const tsSession = input.dedupeKey
+    ? `${EVT_ZOMA_BILLING_FUNNEL}#${input.userId}#${input.step}#${input.dedupeKey}`
+    : `${ts}#${input.userId}#${EVT_ZOMA_BILLING_FUNNEL}#${input.step}#${Math.random().toString(36).slice(2, 10)}`;
   const item = eventItem({
     eventType: EVT_ZOMA_BILLING_FUNNEL,
     subjectId: input.userId,
     ts,
-    tsSession: `${ts}#${input.userId}#${EVT_ZOMA_BILLING_FUNNEL}#${suffix}`,
+    tsSession,
     dimensions: { product: 'zoma', step: input.step, ...(input.dimensions ?? {}) },
   });
   if (!input.dedupeKey) {

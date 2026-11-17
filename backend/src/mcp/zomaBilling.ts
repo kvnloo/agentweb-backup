@@ -31,6 +31,8 @@ import { getBackendUrl } from './oauth/authChallenge';
 import { ZomaNotReadyError } from './zomaErrors';
 
 export const ZOMA_PLAN_PRODUCT_TAG = 'zoma_plan';
+/** Stripe ends a trial that has no payment method a little after trial_end, not at the same second. */
+const TRIAL_END_GRACE_S = 60 * 60;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------------------------
@@ -203,10 +205,12 @@ export interface ZomaBillingDeps {
   config: () => ZomaBillingConfig;
   getUser: (userId: string) => Promise<any>;
   findCustomerId: (userId: string) => Promise<string | null>;
-  createCustomer: (userId: string, email: string | undefined) => Promise<string>;
+  createCustomer: (userId: string) => Promise<string>;
   listSubscriptions: (customerId: string) => Promise<Stripe.Subscription[]>;
   createCheckoutSession: (params: Stripe.Checkout.SessionCreateParams) => Promise<{ id: string; url?: string | null }>;
   retrieveCheckoutSession: (id: string) => Promise<Stripe.Checkout.Session | null>;
+  /** An open Zoma plan Checkout for this customer with at least `minLifeMs` left, so one link serves repeat asks. */
+  findOpenCheckoutSession: (customerId: string, minLifeMs: number) => Promise<{ id: string } | null>;
   sendMeterEvent: (p: { eventName: string; customerId: string; value: number; identifier: string; timestamp: number }) => Promise<void>;
   searchTrialingSubscriptions: () => Promise<Stripe.Subscription[]>;
   setSubscriptionMetadata: (subscriptionId: string, metadata: Record<string, string>) => Promise<void>;
@@ -239,10 +243,11 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
     const found = await stripe().customers.search({ query: `metadata['zomaBillingUserId']:'${userId}'`, limit: 10 });
     return found.data.find((c) => !(c as any).deleted)?.id ?? null;
   },
-  async createCustomer(userId, email) {
+  async createCustomer(userId) {
+    // No email on purpose: Emma looks customers up by email alone, and must never adopt this one.
     // The idempotency key collapses concurrent first checkouts while search still lags.
     const customer = await stripe().customers.create(
-      { email, metadata: { zomaBillingUserId: userId, product: ZOMA_PLAN_PRODUCT_TAG } },
+      { metadata: { zomaBillingUserId: userId, product: ZOMA_PLAN_PRODUCT_TAG } },
       { idempotencyKey: `zoma-plan-customer-${userId}` },
     );
     return customer.id;
@@ -253,6 +258,11 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
   async createCheckoutSession(params) {
     const session = await stripe().checkout.sessions.create(params);
     return { id: session.id, url: session.url };
+  },
+  async findOpenCheckoutSession(customerId, minLifeMs) {
+    const open = await stripe().checkout.sessions.list({ customer: customerId, status: 'open', limit: 10 });
+    const usable = open.data.find((s) => s.metadata?.product === ZOMA_PLAN_PRODUCT_TAG && s.url && s.expires_at * 1000 - Date.now() > minLifeMs);
+    return usable ? { id: usable.id } : null;
   },
   async retrieveCheckoutSession(id) {
     try {
@@ -329,7 +339,10 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
   if (missing.length) throw new Error(`Zoma billing is enabled but not configured: ${missing.join(', ')}`);
   const user = await deps.getUser(userId);
   if (!user) throw new ZomaNotReadyError('No AgentWeb account was found for this login.');
-  const customerId = (await deps.findCustomerId(userId)) ?? (await deps.createCustomer(userId, user.email));
+  const customerId = (await deps.findCustomerId(userId)) ?? (await deps.createCustomer(userId));
+  // A second open session would let one user buy two plans (two $1 charges, two metered subscriptions).
+  const reusable = await deps.findOpenCheckoutSession(customerId, 60 * 60 * 1000);
+  if (reusable) return zomaCheckoutRedirectUrl(reusable.id, deps);
   const done = `${deps.backendUrl().replace(/\/+$/, '')}/api/zoma/billing/done`;
   const metadata = { product: ZOMA_PLAN_PRODUCT_TAG, userId };
   const session = await deps.createCheckoutSession({
@@ -388,7 +401,7 @@ export async function recordZomaCheckoutCanceled(
 export function paywallMessage(cfg: ZomaBillingConfig, link: string): string {
   return [
     `Going live needs the Zoma plan. Start it with a ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${link}`,
-    `After the trial it is ${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included, then ${cfg.overageCentsPerCall}¢ per call. Reads and drafts stay free; nothing was changed in the ad account.`,
+    `After the trial your card is charged ${dollars(cfg.planCents)}/month automatically (cancel before day ${cfg.trialDays} to avoid it), with ${cfg.includedCalls.toLocaleString('en-US')} calls included, then ${cfg.overageCentsPerCall}¢ per call. Reads and drafts stay free until then; nothing was changed in the ad account.`,
     'Tell me when it is done and I will try again.',
   ].join('\n');
 }
@@ -431,6 +444,7 @@ export async function assertZomaPublishAllowed(
   void deps.recordFunnel({
     userId,
     step: 'paywall_shown',
+    dedupeKey: `write_guard#${new Date(deps.now()).toISOString().slice(0, 13)}`,
     dimensions: { surface: 'write_guard', platform: context.platform, toolName: context.toolName, planStatus: state.status },
   }).catch((e) => console.error('[zoma-billing] funnel record failed:', e));
   if (!link) throw new ZomaPaywallError('Going live needs the Zoma plan, but the payment link could not be created right now. Nothing was changed. Try again shortly.');
@@ -448,6 +462,8 @@ export interface ZomaPlanSummary {
   status: ZomaPlanStatus;
   publish_enabled: boolean;
   trial_ends_at?: string;
+  /** Cancelled during the trial: it ends and will not renew. */
+  cancels_at_trial_end?: boolean;
   period?: { start: string; end: string };
   link?: string;
   error?: string;
@@ -463,13 +479,14 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       status: state.status,
       publish_enabled: planAllowsPublish(state),
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
+      ...(state.cancelAtPeriodEnd ? { cancels_at_trial_end: true } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
     if (planPaymentPending(state)) {
       summary.error = PAYMENT_PENDING_MESSAGE;
     } else if (!summary.publish_enabled) {
       summary.link = await createZomaTrialCheckoutLink(userId, deps);
-      void deps.recordFunnel({ userId, step: 'paywall_shown', dimensions: { surface: 'zoma_status', planStatus: state.status } })
+      void deps.recordFunnel({ userId, step: 'paywall_shown', dedupeKey: `zoma_status#${new Date(deps.now()).toISOString().slice(0, 13)}`, dimensions: { surface: 'zoma_status', planStatus: state.status } })
         .catch((e) => console.error('[zoma-billing] funnel record failed:', e));
     }
     return summary;
@@ -482,7 +499,12 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
 export function formatZomaPlanLine(plan: ZomaPlanSummary, cfg: ZomaBillingConfig): string {
   const box = plan.publish_enabled ? '[x]' : '[ ]';
   if (plan.error) return `  ${box} Zoma plan (needed to make ads live): ${plan.error}`;
-  if (plan.status === 'trialing') return `  [x] Zoma plan: trial${plan.trial_ends_at ? ` until ${plan.trial_ends_at.slice(0, 10)}` : ''}, then ${dollars(cfg.planCents)}/month`;
+  if (plan.status === 'trialing') {
+    const until = plan.trial_ends_at ? ` until ${plan.trial_ends_at.slice(0, 10)}` : '';
+    return plan.cancels_at_trial_end
+      ? `  [x] Zoma plan: trial${until}, cancelled, it will not renew`
+      : `  [x] Zoma plan: trial${until}, then ${dollars(cfg.planCents)}/month`;
+  }
   if (plan.status === 'active') return `  [x] Zoma plan: active (${dollars(cfg.planCents)}/month, ${cfg.includedCalls.toLocaleString('en-US')} calls included)`;
   return `  ${box} Zoma plan (only needed to make ads live; reads and drafts are free): ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${plan.link}`;
 }
@@ -613,7 +635,7 @@ export async function handleZomaBillingWebhookEvent(
       }
       break;
     case 'customer.subscription.deleted': {
-      const endedInTrial = typeof obj.trial_end === 'number' && typeof obj.ended_at === 'number' && obj.ended_at <= obj.trial_end;
+      const endedInTrial = typeof obj.trial_end === 'number' && typeof obj.ended_at === 'number' && obj.ended_at <= obj.trial_end + TRIAL_END_GRACE_S;
       await record(endedInTrial ? 'trial_canceled' : 'subscription_canceled', { subscriptionId: obj.id });
       break;
     }
@@ -651,8 +673,10 @@ export async function openZomaCheckout(
 export const TRIAL_REMINDER_METADATA_KEY = 'zoma_trial_reminder_sent_at';
 
 /** Due once the trial is `reminderDay` days old, not yet sent, and the trial has not ended. */
-export function trialReminderDue(sub: Pick<Stripe.Subscription, 'status' | 'trial_start' | 'trial_end' | 'metadata'>, now: number, reminderDay: number): boolean {
+export function trialReminderDue(sub: Pick<Stripe.Subscription, 'status' | 'trial_start' | 'trial_end' | 'metadata' | 'cancel_at_period_end'>, now: number, reminderDay: number): boolean {
   if (sub.status !== 'trialing' || !sub.trial_start || !sub.trial_end) return false;
+  // They already cancelled: "cancel before you are charged" would be wrong and unwelcome.
+  if (sub.cancel_at_period_end) return false;
   if (sub.metadata?.[TRIAL_REMINDER_METADATA_KEY]) return false;
   return now >= sub.trial_start * 1000 + reminderDay * DAY_MS && now < sub.trial_end * 1000;
 }

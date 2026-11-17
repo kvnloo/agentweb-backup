@@ -304,6 +304,8 @@ async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
  */
 async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
   // Card requirement paused (2026-11-10, eng lead). Set ZOMA_REQUIRE_PAYMENT_METHOD=true to re-enable.
+  // ENG-3131: a card is now asked for at the first publish (zomaBilling.ts), so leave this unset: setting
+  // it brings back the card wall at signup, which the paid-launch plan rules out.
   if (process.env.ZOMA_REQUIRE_PAYMENT_METHOD !== 'true') return true;
   return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
