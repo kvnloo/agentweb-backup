@@ -19,8 +19,8 @@
  *     passes; never inferred. See isFirstSuccessfulAd for the exact predicate.
  *   - team/test accounts (our domains, admins, fixtures — journeyProductBackfill.accountFlag)
  *     are listed but flagged and excluded from every summary count.
- *   - ENG-3128: users who answered "Not interested, just a friend" (zomaAdsExperience
- *     not_interested) are listed, flagged `not_interested`, and likewise excluded.
+ *   - ENG-3128/ENG-3134: users who answered "Not interested, just a friend" (zomaAdsExperience
+ *     not_interested) are listed, classified `pal`, and likewise excluded from every count.
  *
  * Reads only existing data (AW-Users attribution + MCP usage events). The one write is the
  * conditional first-ad marker plus the existing forward-only zomaStage → ad_live.
@@ -31,7 +31,7 @@ import { accountFlag, type AccountFlag } from './journeyProductBackfill';
 import { EMMA_MCP_LOOP_ID, EVT_MCP_WRITE_EXECUTED } from './mcpUsageEventsService';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import { classifyZomaWrite, type ZomaWriteKind } from './zomaWriteKind';
-import { isNotInterested } from '../mcp/zomaAdsExperience';
+import { ZOMA_PAL, zomaLeadClassification } from '../mcp/zomaAdsExperience';
 
 export { classifyZomaWrite, zomaWriteKindFor, type ZomaWriteKind } from './zomaWriteKind';
 
@@ -64,7 +64,7 @@ export interface ZomaUserRecord {
 }
 
 /** Why a row is listed but never counted. */
-export type ScoreboardExclusion = AccountFlag | 'not_interested';
+export type ScoreboardExclusion = AccountFlag | typeof ZOMA_PAL;
 
 export interface FirstAdLive {
   at: string;
@@ -106,7 +106,7 @@ export interface Scoreboard {
   generatedAt: string;
   activeWindowDays: number;
   definitions: Record<'active' | 'firstSuccessfulAd' | 'excluded', string>;
-  summary: { zomaUsers: number; activeUsers7d: number; firstAdUsers: number; excludedAccounts: number };
+  summary: { zomaUsers: number; activeUsers7d: number; firstAdUsers: number; excludedAccounts: number; palUsers: number };
   rows: ScoreboardRow[];
 }
 
@@ -139,7 +139,7 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
     const writes7d = zeroWrites();
     for (const e of ok) { writes7d[classifyZomaWrite(e)] += 1; writes7d.total += 1; }
     const excluded: ScoreboardExclusion | undefined =
-      accountFlag(user.email, user.isAdmin) ?? (isNotInterested(user.zomaAdsExperience) ? 'not_interested' : undefined);
+      accountFlag(user.email, user.isAdmin) ?? (zomaLeadClassification(user.zomaAdsExperience) === ZOMA_PAL ? ZOMA_PAL : undefined);
     const approvals = ok.filter((e) => classifyZomaWrite(e) === 'approve').length;
     return {
       userId: user.userId,
@@ -171,13 +171,14 @@ export async function buildZomaScoreboard(deps: ScoreboardDeps = defaultScoreboa
     definitions: {
       active: 'Non-team/test account with at least one provider-confirmed Zoma create, edit, pause or go-live approval in the last 7 days.',
       firstSuccessfulAd: 'First Zoma-created campaign whose go-live was approved through Zoma, with at least 1 lifetime impression and provider evidence it was ACTIVE at/after that approval or delivered (paused since still counts).',
-      excluded: 'Team (our domains or admin), test/fixture accounts, and users who said they are not interested in ads ("just a friend") are listed but never counted.',
+      excluded: 'Team (our domains or admin), test/fixture accounts, and pals (said they are not interested in ads, "just a friend") are listed but never counted as potential users.',
     },
     summary: {
       zomaUsers: counted.length,
       activeUsers7d: counted.filter((r) => r.active7d).length,
       firstAdUsers: counted.filter((r) => r.firstAdLive).length,
       excludedAccounts: rows.length - counted.length,
+      palUsers: rows.filter((r) => r.excluded === ZOMA_PAL).length,
     },
     rows,
   };

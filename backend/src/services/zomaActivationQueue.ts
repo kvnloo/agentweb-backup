@@ -6,6 +6,7 @@
  * user records and `now`; this module derives stage, stall state, the next
  * action, and the daily follow-up list. Nothing imports this yet.
  */
+import type { ZomaLeadClassification } from "../mcp/zomaAdsExperience";
 
 export type OnboardingStatus = "not_started" | "in_progress" | "complete";
 export type AdAccountStatus = "not_connected" | "connected" | "error";
@@ -133,6 +134,8 @@ export interface QueueRow {
   due: boolean;
   /** ENG-3128: "just a friend" — excluded from active-user counts and follow-ups. */
   notInterested: boolean;
+  /** ENG-3134: internal lead classification; a friend is a `pal`, never a potential user. */
+  classification: ZomaLeadClassification;
 }
 
 export function buildQueueRow(u: ZomaTrackedUser, now: Date): QueueRow {
@@ -151,6 +154,7 @@ export function buildQueueRow(u: ZomaTrackedUser, now: Date): QueueRow {
     owner: u.contactOwner?.trim() || "unassigned",
     due: !notInterested && stage !== "activated" && (help || !followUp || followUp <= now),
     notInterested,
+    classification: notInterested ? "pal" : "prospect",
   };
 }
 
