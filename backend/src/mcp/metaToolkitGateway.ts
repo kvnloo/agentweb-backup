@@ -19,7 +19,7 @@ import {
   getAccountsByUserIdIncludingOrgShared,
   type ConnectedAccount,
 } from '../services/connectedAccountsDb';
-import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
+import { recordMcpToolFailed, recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
@@ -130,6 +130,8 @@ export interface MetaToolkitGatewayDeps {
   executeAudience?: (userId: string, args: any) => Promise<any>;
   /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
   getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
+  /** ENG-3130: audit row for a call that failed in-band (never metered); defaults to recordMcpToolFailed. */
+  recordFailure?: typeof recordMcpToolFailed;
   /** ENG-3130: one Stripe meter event per successful call; defaults to reportZomaBillableCall (no-op while billing is off). */
   reportBillableCall?: (userId: string, identifier: string) => Promise<unknown>;
   /** ENG-3131: paywall before a write that makes ads live; defaults to assertZomaPublishAllowed (no-op while billing is off). */
@@ -406,7 +408,26 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   // metered either. Each metered call is one Stripe meter event (no-op while billing is off);
   // a billing failure is logged and never fails the call.
   const meter = async (platform?: string, result?: unknown) => {
-    if (result !== undefined && !isBillableResult(result)) return false;
+    if (result !== undefined && !isBillableResult(result)) {
+      // Not metered and not counted as usage, but still audited: a failed write attempt must leave a row.
+      void Promise.resolve()
+        .then(() =>
+          (deps.recordFailure ?? recordMcpToolFailed)({
+            product: TOOLKIT_PRODUCT,
+            userId: caller.userId,
+            toolName: request.toolName,
+            ...(platform ? { platform } : {}),
+            authMethod: caller.authMethod,
+            apiKeyId: caller.apiKeyId,
+            clientId: caller.clientId,
+            ...(caller.databricksOrigin ? { clientType: 'databricks' as const } : {}),
+            sessionId: request.sessionId,
+            userAgent: request.userAgent,
+          }),
+        )
+        .catch((error) => console.error('[meta-toolkit] failed-call audit failed:', error instanceof Error ? error.message : error));
+      return false;
+    }
     void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
     void Promise.resolve()
       .then(() => (deps.reportBillableCall ?? reportZomaBillableCall)(caller.userId, `zoma-${crypto.randomUUID()}`))

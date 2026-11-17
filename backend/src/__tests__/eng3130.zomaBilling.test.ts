@@ -163,6 +163,45 @@ describe('ENG-3130 only successful calls are billable', () => {
     expect(d.reportBillableCall).not.toHaveBeenCalled();
   });
 
+  it('a failed write attempt still leaves an audit row, and it is never metered', async () => {
+    const d = gatewayDeps({
+      executeWrite: jest.fn().mockResolvedValue({ success: false, error: 'Meta said no' }),
+      recordFailure: jest.fn().mockResolvedValue(true) as any,
+    });
+    await write(d, { name: 'x' });
+    expect(d.recordFailure).toHaveBeenCalledTimes(1);
+    expect(d.recordFailure).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u1', toolName: 'call_meta_marketing_api', platform: 'meta' }));
+    // No arguments or error text in the audit row.
+    expect(JSON.stringify((d.recordFailure as jest.Mock).mock.calls[0][0])).not.toMatch(/Meta said no|"name":"x"/);
+    expect(d.recordUsage).not.toHaveBeenCalled();
+    expect(d.reportBillableCall).not.toHaveBeenCalled();
+  });
+
+  it('a successful or thrown call writes no failure row', async () => {
+    const ok = gatewayDeps({
+      executeWrite: jest.fn().mockResolvedValue({ success: true, verification: 'CONFIRMED', id: '5' }),
+      recordFailure: jest.fn().mockResolvedValue(true) as any,
+    });
+    await write(ok, { name: 'x' });
+    expect(ok.recordFailure).not.toHaveBeenCalled();
+    const thrown = gatewayDeps({
+      executeWrite: jest.fn().mockRejectedValue(new MetaToolkitRefusal('nope')),
+      recordFailure: jest.fn().mockResolvedValue(true) as any,
+    });
+    await expect(write(thrown, { name: 'x' })).rejects.toThrow('nope');
+    expect(thrown.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it('a failure-audit error never fails the call', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const d = gatewayDeps({
+      executeWrite: jest.fn().mockResolvedValue({ success: false, error: 'x' }),
+      recordFailure: jest.fn().mockRejectedValue(new Error('dynamo down')) as any,
+    });
+    const res: any = await write(d, { name: 'x' });
+    expect(res.success).toBe(false);
+  });
+
   it('a call that throws is never metered', async () => {
     const d = gatewayDeps({ executeWrite: jest.fn().mockRejectedValue(new MetaToolkitRefusal('nope')) });
     await expect(write(d, { name: 'x' })).rejects.toThrow('nope');
