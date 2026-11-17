@@ -15,6 +15,8 @@ import { GoogleAdsInsufficientScopesError } from './googleAdsOAuthErrors';
 import type { GoogleAdsAccountNode, GoogleAdLeaf } from './googleAdsService';
 import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from './oauthFlowSessions';
 
+// Token sessions live in the shared AW-OAuthSessions row (one-time use) so /finalize and
+// /connect may land on different backend instances (ENG-3042).
 interface TokenSession extends LocalOAuthFlowSession {
   tokens: { access_token: string; refresh_token?: string; expires_in: number; };
   // Flat list of every connectable leaf across the tree — the trusted source for connect
@@ -22,11 +24,12 @@ interface TokenSession extends LocalOAuthFlowSession {
   connectableLeaves: GoogleAdLeaf[];
 }
 
-// Pending token sessions live on the shared AW-OAuthSessions table (one-time use) so /connect
-// works when it lands on a different backend task than /finalize (ENG-3042).
 const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], connectableLeaves: GoogleAdLeaf[]): Promise<string> =>
   storeOAuthFlowSession<TokenSession>('google_ads', {
-    userId, tokens, connectableLeaves, expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
+    userId,
+    tokens,
+    connectableLeaves,
+    expires: Date.now() + OAUTH_FLOW_SESSION_TTL_MS,
   });
 
 const retrieveTokenSession = (sessionId: string, userId: string): Promise<TokenSession | null> =>
