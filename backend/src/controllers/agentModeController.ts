@@ -15133,7 +15133,8 @@ export const agentModeController = {
         // ENG-396: when on, a headless run auto-takes Emma's recommended option on a
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
-        fullAutonomy: fullAutonomy === true,
+        // ENG-2816: a share-link visitor cannot hand a schedule the autonomy waiver (it would survive the owner's Adopt).
+        fullAutonomy: !visitorWrite && fullAutonomy === true,
         // ENG-803: owner opt-OUT that holds this schedule's runs at the publish step.
         // Default false = publish, which is what scheduled runs have always done, so
         // no existing schedule changes behaviour. Kept distinct from fullAutonomy

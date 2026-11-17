@@ -151,6 +151,14 @@ describe('createScheduledChat', () => {
     expect(created().provenance).toEqual(['startingMessage', 'selfImprove']);
   });
 
+  it('a visitor create cannot set the autonomy waiver; an owner create still can', async () => {
+    await create(visitorByClaim, { startingMessage: 'Hi', fullAutonomy: true });
+    expect(created().fullAutonomy).toBe(false);
+    mockScheduleDb.createSchedule.mockClear();
+    await create(portalOwner, { startingMessage: 'Hi', fullAutonomy: true });
+    expect(created().fullAutonomy).toBe(true);
+  });
+
   it('an owner create that carries selfImprove marks nothing', async () => {
     await create(portalOwner, { startingMessage: 'Hi', selfImprove: true });
     expect(created()).not.toHaveProperty('provenance');
