@@ -54,11 +54,17 @@ const EXPIRED: PageStep = {
   message: `This Google Ads connection link is invalid or has expired. ${ZOMA_BACK_TO_AGENT}`,
 };
 
-/** Google lists the account but reports it not enabled: signup was started (often via the campaign-first flow) and never finished. */
+/** Google lists the account but reports it not enabled: signup was started (often via the campaign-first flow) and not finished, or it was deactivated. */
 const UNFINISHED_ACCOUNT_STEPS: readonly string[] = [
-  'Open https://ads.google.com signed in with the same Google account and finish setting up the account Google already created. Do not start a second account yet.',
-  'Check the country, currency and time zone Google shows for it. Google does not let you change them once the account exists, so if they are wrong (for example pre-filled from your browser or location), create a new account instead and choose them yourself.',
+  'Open https://ads.google.com signed in with the same Google account and look at that account first. If its setup is unfinished, finish it there; do not create another account yet.',
+  'Check the country, currency and time zone Google shows for it. Google does not let anyone change them once the account exists, and Zoma cannot either. If they are wrong (for example pre-filled from your browser or location), a new account is the only fix: create it yourself, choosing them yourself.',
   'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign".',
+];
+
+/** Google shared a manager (MCC) login but no active client ad account under it that Zoma can connect. */
+const MANAGER_ONLY_STEPS: readonly string[] = [
+  'Connect again and sign in with the Google account that owns the ad account itself (not only the manager login).',
+  'Or, in Google Ads, make sure the client ad account under your manager is active (not cancelled or still being set up). Zoma only connects active ad accounts.',
 ];
 
 const NOTHING_CHANGED = 'Connecting only reads your accounts — no campaign was created and nothing was spent.';
@@ -129,8 +135,16 @@ export async function completeGoogleConnect(
     logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'google_ads_account_not_enabled' });
     return failedPage(
       userId, deps, 400, 'Google Ads account not finished',
-      `Google found a Google Ads account on this login${ids ? ` (${ids})` : ''}, but it is not active yet — its setup was started and not finished. Zoma did not create it and did not change it. To finish it:`,
+      `Google found a Google Ads account on this login${ids ? ` (${ids})` : ''}, but it is not active — its setup was started and not finished, or it was deactivated. Zoma did not create it and did not change it.`,
       [...UNFINISHED_ACCOUNT_STEPS, 'Then connect Google Ads again.'],
+    );
+  }
+  if (leaves.length === 0 && result.accountTree?.length) {
+    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'manager_without_connectable_accounts' });
+    return failedPage(
+      userId, deps, 400, 'No active Google Ads account to connect',
+      'Google shared a manager (MCC) account on this login, but no active ad account under it that Zoma can connect. Zoma did not create or change anything.',
+      MANAGER_ONLY_STEPS,
     );
   }
   if (leaves.length === 0) {
