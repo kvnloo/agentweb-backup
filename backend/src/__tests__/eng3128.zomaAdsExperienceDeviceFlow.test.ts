@@ -3,7 +3,7 @@ process.env.ZOMA_REQUIRE_PAYMENT_METHOD = 'true';
  * ENG-3128 — "How familiar are you with ads?" on the Zoma device-flow page and in the poll.
  *   - after approval the browser is asked the question before anything else
  *   - runs_ads -> straight to Meta connect (then card, then done)
- *   - new_to_ads -> ad-account setup guide, with a link onward to connecting
+ *   - new_to_ads -> ENG-3134: straight to Meta connect, like runs_ads
  *   - not_interested -> thank-you page, no further steps; the poll ends without a token
  *   - the poll exposes the question as next_step and accepts the answer, so an agent can ask in chat
  *   - no page links to the Emma app
@@ -142,17 +142,15 @@ describe('ENG-3128 device-flow page', () => {
     expect(await continueInBrowser(deviceId, h.deps)).toMatchObject({ kind: 'page', done: true, title: "You're set" });
   });
 
-  it('new_to_ads: guided setup steps, with a link onward that leads to Meta connect', async () => {
+  // ENG-3134 (supersedes the ENG-3128 guide-first page): the answer leads straight to Meta connect.
+  // The setup guide is on the "No ad account found" page, covered in eng3134.zomaRedesign.test.ts.
+  it('new_to_ads: stored, then straight to Meta connect (no detour page)', async () => {
     const h = harness();
     const { deviceId } = await approved(h);
     const step = await answerAdsExperience({ t: await askedToken(h, deviceId), answer: 'new_to_ads' }, h.deps);
     expect(h.deps.saveAdsExperience).toHaveBeenCalledWith('user-1', 'new_to_ads');
-    expect(step).toMatchObject({ kind: 'page', status: 200, steps: ZOMA_NEW_TO_ADS_STEPS });
-    expect(h.deps.mintMetaLink).not.toHaveBeenCalled();
-    const onward = new URL((step as any).retryUrl);
-    expect(onward.pathname).toBe('/api/zoma/continue');
+    expect(step).toEqual({ kind: 'redirect', url: META });
     expect(JSON.stringify(step)).not.toContain(EMMA_APP);
-    expect(await continueInBrowser(deviceId, h.deps)).toEqual({ kind: 'redirect', url: META });
   });
 
   it('not_interested: thank-you page, and resuming later still shows it (no Meta, no card)', async () => {

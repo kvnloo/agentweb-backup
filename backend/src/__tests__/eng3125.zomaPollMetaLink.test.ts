@@ -46,7 +46,7 @@ function harness() {
     resolvePaymentMethod: jest.fn().mockResolvedValue({ hasPaymentMethod: true }),
     buildMetaConnectUrl: jest.fn(),
     googleEnabled: () => false,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
   };
   const deps: ZomaDeviceFlowDeps = {
