@@ -46,6 +46,18 @@ export const ZOMA_PAL: ZomaLeadClassification = 'pal';
 export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => (isNotInterested(raw) ? 'pal' : 'prospect');
 
 /**
+ * ENG-3135: creating a Google Ads account happens on Google's own site (Zoma cannot and does not
+ * create one). Google's default signup pushes toward building a campaign, and currency and time zone are
+ * permanent once the account exists (Google's help) — so the guidance is explicit: no campaign, and the
+ * user chooses those values themselves.
+ */
+export const ZOMA_GOOGLE_NEW_ACCOUNT_STEPS: readonly string[] = [
+  'Create a Google Ads account yourself, following Google\'s own sign-up guide at https://support.google.com/google-ads/answer/6366720 (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
+  'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first). Zoma never creates a campaign or starts spending when you connect.',
+  'When Google asks for your billing country, currency and time zone, choose them yourself, because Google does not let anyone change the currency or time zone once the account exists.',
+];
+
+/**
  * Which Facebook login Zoma wants (ENG-3136). Zoma binds the Meta connection to the Zoma account that
  * started the link, never by comparing emails, so a different Facebook email is fine — but Meta only
  * shares the ad accounts that Facebook login can see.
@@ -63,7 +75,7 @@ export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
   'Meta: create a Facebook Page for your business at https://www.facebook.com/pages/create — Meta ads run from a Page.',
   'Meta: in Business settings → Accounts → Ad accounts, create an ad account and set its currency and time zone (https://business.facebook.com/settings/ad-accounts).',
   ZOMA_AD_ACCOUNT_CREATE_FALLBACK,
-  'Google (optional): create a Google Ads account at https://ads.google.com — choose "Switch to Expert Mode" and "Create an account without a campaign" so nothing starts spending.',
+  ...ZOMA_GOOGLE_NEW_ACCOUNT_STEPS.map((s, i) => (i === 0 ? `Google (optional): ${s}` : s)),
   `Then connect those ad accounts to Zoma. ${ZOMA_META_LOGIN_NOTE}`,
 ];
 

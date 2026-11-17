@@ -113,6 +113,12 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
     expect(r.next_step).not.toContain(EMMA_APP);
   });
 
+  it('new_to_ads guide carries the Google no-campaign and user-chosen country/currency/time zone guidance', () => {
+    const guide = ZOMA_NEW_TO_ADS_STEPS.join(' ');
+    expect(guide).toContain('Create an account without a campaign');
+    expect(guide).toContain('choose them yourself');
+  });
+
   it('not_interested: thank-you with no further steps, nothing minted', async () => {
     const d = deps({});
     const r = await status(d, { ads_experience: 'not_interested' });
