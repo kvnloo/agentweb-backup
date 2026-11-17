@@ -238,6 +238,9 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  /** ENG-3128: answer to the Zoma "How familiar are you with ads?" question (see mcp/zomaAdsExperience.ts). */
+  zomaAdsExperience?: string;
+  zomaAdsExperienceAt?: string;
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;

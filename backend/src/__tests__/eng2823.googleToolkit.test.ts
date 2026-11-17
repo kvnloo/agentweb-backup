@@ -348,7 +348,7 @@ describe('ENG-2823 providers and setup status', () => {
   });
 
   const onboardingDeps = (accounts: any[], googleEnabled: boolean) => ({
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', zomaAdsExperience: 'runs_ads' }),
     listAccounts: jest.fn().mockResolvedValue(accounts),
     findLiveCustomerId: jest.fn(),
     createCustomerForUser: jest.fn(),
@@ -357,7 +357,7 @@ describe('ENG-2823 providers and setup status', () => {
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://facebook.example/connect'),
     buildGoogleAdsConnectUrl: jest.fn().mockResolvedValue('https://accounts.google.example/connect'),
     googleEnabled: () => googleEnabled,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
   }) as any;
