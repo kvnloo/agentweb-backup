@@ -15,7 +15,7 @@ const account: any = { platform: 'meta', account_id: '111', config: { account_ty
 it.each([[false, false], [true, false], [false, true], [true, true]])('readiness card=%s account=%s emits only real observed milestones', async (paid, connected) => {
   await getZomaReadiness('u1', {
     getUser: async () => ({ userId: 'u1' }), resolvePaymentMethod: async () => ({ hasPaymentMethod: paid }),
-    listAccounts: async () => connected ? [account] : [], now: Date.now, frontendUrl: () => 'https://example.com',
+    listAccounts: async () => connected ? [account] : [], now: Date.now, frontendUrl: () => 'https://example.com', pagesUrl: () => 'https://api.example.com',
     findLiveCustomerId: async () => 'cus_1', createPaymentMethodSetupSession: async () => ({ url: 'https://stripe.test/setup' }),
     buildMetaConnectUrl: async () => 'https://meta.test/connect', googleEnabled: () => false,
   } as any);
