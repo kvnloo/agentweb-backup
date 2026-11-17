@@ -123,10 +123,30 @@ describe('ENG-3129 Page gate on Zoma Meta creates', () => {
   it('a repeat confirm of a CREATE that already succeeded returns the recorded outcome, not a Page refusal', async () => {
     const token = 'v1.recorded.x';
     const recorded = { status: 'EXECUTED', success: true, id: '777' };
-    const d = writeDeps(undefined, { tokenOutcomes: new Map([[token, { exp: 1_900_000_000_000, outcome: recorded }]]) });
+    const d = writeDeps(undefined, { tokenOutcomes: new Map([[token, { exp: 1_900_000_000_000, outcome: recorded, requestKey: JSON.stringify(['u1', { account_id: ACCOUNT, action: 'CREATE', ad_set_id: '22', entity_type: 'AD', params: { creative_id: '33', name: 'Ad' } }]) }]]) });
     const result = await executeMetaToolkitWrite('u1', { ...adCreate, confirm: true, preview_token: token }, d);
     expect(result).toMatchObject({ ...recorded, replayed: true });
     expectNoMetaCall(d);
+  });
+
+  it('a recorded CREATE token reused with changed arguments does not replay the other request\'s success', async () => {
+    const token = 'v1.recorded.x';
+    const recorded = { status: 'EXECUTED', success: true, id: '777' };
+    const requestKey = JSON.stringify(['u1', { account_id: ACCOUNT, action: 'CREATE', ad_set_id: '22', entity_type: 'AD', params: { creative_id: '33', name: 'Ad' } }]);
+    const d = writeDeps(undefined, { tokenOutcomes: new Map([[token, { exp: 1_900_000_000_000, outcome: recorded, requestKey }]]) });
+    const other = { ...adCreate, params: { name: 'Other ad', creative_id: '33' }, confirm: true, preview_token: token };
+    await refusalOf(executeMetaToolkitWrite('u1', other, d));
+    expectNoMetaCall(d);
+  });
+
+  it('with Page access, a recorded token reused with changed arguments gets PREVIEW_MISMATCH, not a replay', async () => {
+    const token = 'v1.1900000000000.x';
+    const requestKey = JSON.stringify(['u1', { account_id: ACCOUNT, action: 'CREATE', ad_set_id: '22', entity_type: 'AD', params: { creative_id: '33', name: 'Ad' } }]);
+    const d = writeDeps({ has_meta_pages: true }, { tokenOutcomes: new Map([[token, { exp: 1_900_000_000_000, outcome: { status: 'EXECUTED', success: true, id: '777' }, requestKey }]]) });
+    const result: any = await executeMetaToolkitWrite('u1', { ...adCreate, params: { name: 'Other ad', creative_id: '33' }, confirm: true, preview_token: token }, d);
+    expect(result.status).toBe('PREVIEW_MISMATCH');
+    expect(result.replayed).toBeUndefined();
+    expect(d.dispatch).not.toHaveBeenCalled();
   });
 
   it('names Page X when the account\'s existing ads run under a specific Page', async () => {

@@ -94,7 +94,8 @@ export interface MetaToolkitWriteDeps {
   now: () => number;
   consumedTokens: ConsumedTokens;
   /** ENG-2931: outcome per consumed preview token, replayed on a repeat confirm. */
-  tokenOutcomes?: Map<string, { exp: number; outcome: any }>;
+  /** requestKey binds a recorded CREATE outcome to its exact request (see createRequestKey). */
+  tokenOutcomes?: Map<string, { exp: number; outcome: any; requestKey?: string }>;
 }
 
 /**
@@ -315,6 +316,13 @@ function statusLine(action: string, params: any): string {
  * Execute (or preview) one guarded write. `args.account_id` must already be the resolved,
  * ownership-checked ad account (the gateway does that before calling here).
  */
+/** Stable identity of a CREATE request (user + every argument except confirm/preview_token). */
+function createRequestKey(userId: string, args: any): string {
+  const stable = (v: any): any => Array.isArray(v) ? v.map(stable)
+    : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, stable(v[k])])) : v;
+  return JSON.stringify([userId, stable(args)]);
+}
+
 export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps: MetaToolkitWriteDeps = defaultDeps) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
   const entity = String(args.entity_type);
@@ -333,9 +341,12 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   if (action === 'CREATE') {
     // A repeat confirm of a CREATE that already ran gets its recorded outcome, not a
     // "nothing was sent" Page refusal; only new CREATE dispatch is gated.
+    // The replay is bound to the request that recorded it: the same token with changed
+    // arguments falls through to the gate (and later PREVIEW_MISMATCH), never a stale success.
     if (confirm === true && typeof previewToken === 'string') {
-      const replay = replayTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, deps.now());
-      if (replay) return replay;
+      const outcomes = (deps.tokenOutcomes ??= new Map());
+      const replay = replayTokenOutcome(outcomes, previewToken, deps.now());
+      if (replay && outcomes.get(previewToken)?.requestKey === createRequestKey(userId, args)) return replay;
     }
     await assertMetaPageAccessForCreate(accounts, accountId, { connectLink: deps.connectLink && (() => deps.connectLink!(userId)) });
   }
@@ -533,7 +544,10 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       message: `UNCONFIRMED: Meta accepted the ${action} request${id ? ` (id ${id})` : ''}, but the read-back could not confirm it. Do not report this as done and do not retry blindly — check the ${entity} first.`,
     };
   })();
-  return rememberTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, outcome);
+  const outcomes = (deps.tokenOutcomes ??= new Map());
+  rememberTokenOutcome(outcomes, previewToken, outcome);
+  if (action === 'CREATE') outcomes.get(previewToken)!.requestKey = createRequestKey(userId, args);
+  return outcome;
 }
 
 function verify(action: string, params: any, minor: any, readBack: Record<string, any> | null): WriteVerification {
