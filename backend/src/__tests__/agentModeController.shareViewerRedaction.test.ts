@@ -59,7 +59,6 @@ jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn().mockResolvedValue({
     allowed: true, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-10',
   }),
-  incrementUserTokenUsage: jest.fn(),
 }));
 
 import { chatbotDb } from '../services/chatbotService';
