@@ -339,6 +339,24 @@ describe('ENG-3131 trial checkout', () => {
     });
   });
 
+  it('an old pay link no longer opens once the user has a live plan (no second subscription)', async () => {
+    const d = billingDeps({
+      retrieveCheckoutSession: jest.fn().mockResolvedValue({ id: 'cs_old', status: 'open', url: 'https://checkout.stripe.com/x', created: sec('2026-11-16T11:00:00Z'), metadata: { product: 'zoma_plan', userId: 'u1' } }),
+      findCustomerId: jest.fn().mockResolvedValue('cus_1'),
+      listSubscriptions: jest.fn().mockResolvedValue([sub()]),
+    });
+    await expect(openZomaCheckout('cs_old', d)).resolves.toEqual({ kind: 'gone' });
+    expect(d.recordFunnel).not.toHaveBeenCalled();
+  });
+
+  it('an entitled subscription wins over a newer trial whose $1 has not settled', () => {
+    const entitled = sub({ id: 'sub_old', status: 'active', created: sec('2026-10-01T00:00:00Z') });
+    const unpaidTrial = sub({ id: 'sub_new', created: sec('2026-11-10T00:00:00Z'), latest_invoice: { id: 'in', status: 'open' } as any });
+    const state = planStateFromSubscriptions('cus_1', [unpaidTrial, entitled]);
+    expect(state).toMatchObject({ subscriptionId: 'sub_old', status: 'active' });
+    expect(planAllowsPublish(state)).toBe(true);
+  });
+
   it('reuses a still-open Checkout instead of minting a second one', async () => {
     const d = billingDeps({
       findCustomerId: jest.fn().mockResolvedValue('cus_1'),
