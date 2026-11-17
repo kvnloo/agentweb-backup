@@ -1816,7 +1816,7 @@ const AUTO_CONTINUATION_PREEMPT_POLL_MS = parseInt(process.env.AUTO_CONTINUATION
 export async function preemptAutoContinuationAndWait(
   sessionId: string,
   ownerUserId?: string,
-  // ENG-2816 (step 3): the SHARE route passes true. A share-link visitor's message may preempt a continuation of a VISITOR's turn,
+  // ENG-2816 (step 3): the SHARE route passes true for a request that is not the owner's. A share-link visitor's message may preempt a continuation of a VISITOR's turn,
   // but not one of the OWNER's own turn (a visitor must not be able to cancel the owner's work by sending a message): for that the
   // visitor is answered exactly as if the lock were held (409 SESSION_BUSY). Whose continuation it is comes from the visitor-turn
   // marker, which scheduleAutoMediaContinuation sets for a continuation of a visitor's request and never for an owner's. The
@@ -13267,7 +13267,11 @@ export const agentModeController = {
       // message takes priority over their own background continuation. (Asked only here, in the failed-claim branch.)
       if (!tryClaimSessionGeneration(session.sessionId, session.userId)) {
         const onlyVisitorContinuations = !(await isSessionOwnerRequest(req, session.userId));
-        if (!(await preemptAutoContinuationAndWait(session.sessionId, session.userId, onlyVisitorContinuations))) {
+        // The owner check awaits (a token lookup), and the lock can be released during it. If the continuation finished meanwhile
+        // there is nothing left to preempt, and answering 409 on a lock that is now free would turn the owner away for no reason:
+        // claim once more first, and preempt (then 409) only if that also fails.
+        if (!tryClaimSessionGeneration(session.sessionId, session.userId)
+          && !(await preemptAutoContinuationAndWait(session.sessionId, session.userId, onlyVisitorContinuations))) {
           return res.status(409).json({
             error: 'Session is busy',
             message: 'A response is already being generated for this session. Please wait.',
@@ -15482,7 +15486,9 @@ export const agentModeController = {
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
-        fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-2816 (step 3): a share-link visitor's body never changes the autonomy waiver (it is not one of the tracked content
+        // fields, so nothing would mark it, and it would survive adoption); the stored value is kept as it is.
+        fullAutonomy: (fullAutonomy !== undefined && !visitorWrite) ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
         // ENG-803/ENG-827 (Greptile): the publish opt-out is written ONLY when this
         // request actually carries it. Copying it forward from `existingSchedule` is a
         // read-modify-write, and this field decides whether an unattended run may post
@@ -15493,14 +15499,16 @@ export const agentModeController = {
         // key leaves the stored value untouched, which is the only race-free way to
         // preserve it. Every other field here is last-writer-wins and recoverable;
         // this one authorizes an irreversible public post, so it is not.
-        ...(requirePublishApproval !== undefined
+        // ENG-2816 (step 3): ...and a share-link visitor can only RAISE this hold (or the Slack one below), never lower it: a false in
+        // a visitor's body is dropped, so the stored value stays whatever it was.
+        ...(requirePublishApproval !== undefined && (!visitorWrite || requirePublishApproval === true)
           ? { requirePublishApproval: requirePublishApproval === true }
           : {}),
         // ENG-2204: same write-only-if-present rationale as requirePublishApproval
         // immediately above — this field decides whether an unattended run may call
         // slack_send_message directly, so a read-modify-write here has the identical
         // race (an unrelated update silently reverting an owner's just-set opt-out).
-        ...(requireSlackApproval !== undefined
+        ...(requireSlackApproval !== undefined && (!visitorWrite || requireSlackApproval === true)
           ? { requireSlackApproval: requireSlackApproval === true }
           : {}),
         // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —

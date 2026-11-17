@@ -421,6 +421,52 @@ describe('a visitor\'s message preempts only a continuation of a VISITOR\'s turn
       expect(tryClaimSessionGeneration(SESSION_ID, OWNER_ID)).toBe(false);
     });
 
+    describe('the continuation finishes DURING the owner check (the lock is free by the time it is looked at again)', () => {
+      /** The owner lookup is where the await happens: the continuation ends (lock released, bookkeeping cleared) while it runs. */
+      const continuationEndsDuring = (auth: any) =>
+        mockGetUserFromToken.mockImplementation(async () => {
+          releaseSessionGeneration(SESSION_ID);
+          autoContinuationSessions.delete(SESSION_ID);
+          return auth;
+        });
+
+      it.each([
+        ['the owner (login verifies)', 'Bearer owner.jwt', OWNER_AUTH],
+        ['a visitor with a login that does not verify', 'Bearer garbage.jwt', { user: null }],
+      ])('%s is NOT turned away: the second claim wins, nothing is cancelled, and the turn runs', async (_name, authorization, auth) => {
+        holdContinuation(false);
+        continuationEndsDuring(auth);
+        const res = fakeRes();
+        await agentModeController.generateSharedResponse(shareRequest({ authorization }), res);
+        expect(res.status).not.toHaveBeenCalledWith(409);
+        expect(cancel).not.toHaveBeenCalled();
+        expect(workerCancel()).not.toHaveBeenCalled();
+        expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      });
+
+      it('and a continuation that is STILL running after the check behaves exactly as before (owner preempts, non-owner gets the unchanged 409)', async () => {
+        mockGetUserFromToken.mockResolvedValue({ user: null });
+        holdContinuation(false);
+        const refused = fakeRes();
+        await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer garbage.jwt' }), refused);
+        expect(refused.status).toHaveBeenCalledWith(409);
+        expect(refused.json).toHaveBeenCalledWith({
+          error: 'Session is busy',
+          message: 'A response is already being generated for this session. Please wait.',
+          code: 'SESSION_BUSY',
+          userMessageSaved: false,
+        });
+        expect(cancel).not.toHaveBeenCalled();
+
+        mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
+        setTimeout(() => releaseSessionGeneration(SESSION_ID), 30);
+        const preempted = fakeRes();
+        await agentModeController.generateSharedResponse(shareRequest({ authorization: 'Bearer owner.jwt' }), preempted);
+        expect(cancel).toHaveBeenCalledWith(SESSION_ID);
+        expect(preempted.status).not.toHaveBeenCalledWith(409);
+      });
+    });
+
     it('an owner login against a plain HELD lock (not a continuation) is still a 409: only continuations are ever preempted', async () => {
       mockGetUserFromToken.mockResolvedValue(OWNER_AUTH);
       tryClaimSessionGeneration(SESSION_ID, OWNER_ID);
