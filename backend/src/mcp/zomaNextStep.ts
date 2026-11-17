@@ -8,6 +8,7 @@
  * gets nothing appended — its whole answer is the thank-you.
  */
 import { ZOMA_NOT_INTERESTED_MESSAGE } from './zomaAdsExperience';
+import { googleToolkitEnabled } from './zomaToolDefinitions';
 
 /** Shared Meta refusals (also used by the Emma app) name the Emma settings screen; Zoma users never see it. */
 const EMMA_RECONNECT = /under Settings -> ?Connected accounts/g;
@@ -22,7 +23,9 @@ const SETUP_NEXT = 'Call zoma_status: it returns the exact fix (with a link if o
 /** Next step after a refused / failed call, from its message. */
 export function zomaErrorNextStep(message: string): string {
   if (/Multiple (Meta ad accounts|Google Ads accounts)/i.test(message)) {
-    return 'Ask the user which account to use, then retry with account_id (Meta) or customer_id (Google) set to it.';
+    return googleToolkitEnabled()
+      ? 'Ask the user which account to use, then retry with account_id (Meta) or customer_id (Google) set to it.'
+      : 'Ask the user which account to use, then retry with account_id set to it.';
   }
   if (/preview_token|PREVIEW/i.test(message)) {
     return 'Call again without confirm to get a fresh PREVIEW, show it to the user, and confirm only after they approve it.';

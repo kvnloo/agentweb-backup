@@ -19,6 +19,7 @@ import { defaultZomaLinkCodec, ZOMA_GOOGLE_SELECT_PATH, ZOMA_MCP_SETUP, type Zom
 import { ZOMA_GOOGLE_NEW_ACCOUNT_STEPS } from './zomaAdsExperience';
 import { ZOMA_BACK_TO_AGENT, type BrowserStep } from './zomaDeviceFlow';
 import { logZomaSetup } from './zomaSetupLog';
+import { googleToolkitEnabled } from './zomaToolDefinitions';
 import { GoogleAdsInsufficientScopesError, googleAdsErrorCodes } from '../services/googleAdsOAuthErrors';
 import type { GoogleAdsConnectResult, GoogleAdsFinalizeResult } from '../services/googleAdsOAuthFinalize';
 
@@ -31,6 +32,8 @@ export interface ZomaGoogleDeps {
   finalize: (userId: string, code: string) => Promise<GoogleAdsFinalizeResult>;
   connect: (userId: string, tokenSessionId: string, customerIds: string[]) => Promise<GoogleAdsConnectResult>;
   mintLink: (userId: string) => Promise<string>;
+  /** ZOMA_GOOGLE_ENABLED; defaults to googleToolkitEnabled(). Off: these pages are not offered. */
+  enabled?: () => boolean;
 }
 
 export const defaultZomaGoogleDeps: ZomaGoogleDeps = {
@@ -50,6 +53,16 @@ export const defaultZomaGoogleDeps: ZomaGoogleDeps = {
   mintLink: async (userId) =>
     (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP }),
 };
+
+/** ZOMA_GOOGLE_ENABLED off: a Zoma Google page names nothing Google-specific. */
+const UNAVAILABLE: PageStep = {
+  kind: 'page',
+  status: 404,
+  title: 'Zoma setup',
+  message: `This link is not available. ${ZOMA_BACK_TO_AGENT}`,
+};
+
+const googleOff = (deps: ZomaGoogleDeps) => !(deps.enabled ?? googleToolkitEnabled)();
 
 const EXPIRED: PageStep = {
   kind: 'page',
@@ -149,6 +162,10 @@ export async function completeGoogleConnect(
   params: { code?: unknown; state?: unknown; error?: unknown },
   deps: ZomaGoogleDeps = defaultZomaGoogleDeps,
 ): Promise<BrowserStep> {
+  if (googleOff(deps)) {
+    logZomaSetup({ step: 'google_callback', outcome: 'rejected', reason: 'google_disabled' });
+    return UNAVAILABLE;
+  }
   const claims = deps.verifyState(params.state);
   if (!claims || claims.zoma !== ZOMA_MCP_SETUP || typeof claims.userId !== 'string' || !claims.userId) {
     logZomaSetup({ step: 'google_callback', outcome: 'rejected', reason: claims ? 'not_a_zoma_state' : 'invalid_state' });
@@ -232,6 +249,10 @@ export async function selectGoogleAccounts(
   params: { t?: unknown; account_id?: unknown },
   deps: ZomaGoogleDeps = defaultZomaGoogleDeps,
 ): Promise<BrowserStep> {
+  if (googleOff(deps)) {
+    logZomaSetup({ step: 'google_connect', outcome: 'rejected', reason: 'google_disabled' });
+    return UNAVAILABLE;
+  }
   const claims = deps.links.verify(params.t, 'pick_google_account');
   if (!claims || claims.zoma !== ZOMA_MCP_SETUP || !claims.uid || !claims.tokenSessionId || !Array.isArray(claims.googleAccounts)) {
     logZomaSetup({ step: 'google_connect', outcome: 'rejected', reason: 'invalid_picker_link' });
