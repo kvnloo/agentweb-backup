@@ -12,26 +12,37 @@
  * `metadata.userId` and is found again by search instead of being written to the user row.
  *
  * Reads never depend on this module. Writes (ENG-2303 P3) call `assertZomaWriteReady`.
+ *
+ * ENG-3134 (Zoma redesign): nothing here sends the user to the AgentWeb (Emma) app. The Meta
+ * link finishes on Zoma's own pages (state `zoma: ZOMA_MCP_SETUP`), the card link returns to
+ * Zoma's own page, and the first answer is "Hey, welcome to Zoma." plus one question.
  */
 import { userDb } from '../services/db';
 import { stripeService, type UserPaymentMethod } from '../services/stripeService';
 import { buildMetaConnectUrl } from '../services/metaConnectUrl';
+import { getBackendUrl } from './oauth/authChallenge';
+import { ZOMA_MCP_SETUP } from './zomaSetupLinks';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
-import { getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
+import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import {
   GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable,
   ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
 } from './zomaProviders';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
+import {
+  adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_META_LOGIN_NOTE, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+} from './zomaAdsExperience';
+import {
+  formatZomaBillingUsage, formatZomaPlanLine, getZomaBillingConfig, getZomaBillingUsage, getZomaPlanSummary,
+  type ZomaBillingUsage, type ZomaPlanSummary,
+} from './zomaBilling';
 
-export class ZomaNotReadyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ZomaNotReadyError';
-  }
-}
+import { ZomaNotReadyError } from './zomaErrors';
+
+export { ZomaNotReadyError };
 
 export interface ZomaMetaAccountSummary {
   account_id: string;
@@ -44,6 +55,31 @@ export interface ZomaMetaAccountSummary {
    * Page is accessible. Absent for granted and for never-probed, which must change nothing.
    */
   page_access?: 'missing';
+}
+
+/**
+ * ENG-3125: why a connected Meta ad account still cannot create ads — no Facebook Page the
+ * connection can use. Derived from the stored Page probe (ENG-2232), never from a live call.
+ */
+export type ZomaMetaPageBlockerReason = 'no_page_exists' | 'page_not_granted' | 'no_advertiser_role';
+
+export const META_CREATE_PAGE_URL = 'https://www.facebook.com/pages/create';
+export const META_BUSINESS_PAGES_SETTINGS_URL = 'https://business.facebook.com/settings/pages';
+
+export interface ZomaMetaPageBlocker {
+  type: 'meta_page_access';
+  reason: ZomaMetaPageBlockerReason;
+  /** Ad accounts (without act_) whose Page access is confirmed missing. */
+  account_ids: string[];
+  /** The Page this account's existing ads run under, when known. */
+  page_id?: string;
+  /** The canonical refusal text the ad write gate returns (ENG-3078). */
+  message: string;
+  /** Step-by-step instructions an agent can relay verbatim. */
+  steps: string[];
+  /** Fresh Meta connect link (auth_type=rerequest, so Meta re-offers Page selection). */
+  link?: string;
+  create_page_url?: string;
 }
 
 export interface ZomaGoogleAdsAccountSummary {
@@ -73,7 +109,25 @@ export interface ZomaReadiness {
   };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
+  /**
+   * ENG-3128: answer to "How familiar are you with ads?" (null until answered). It is asked
+   * before any other step; `not_interested` ends setup with a thank-you and no further steps.
+   */
+  ads_experience: ZomaAdsExperience | null;
+  /**
+   * ENG-3125: Meta is connected but ads will fail for lack of a usable Facebook Page. While
+   * set, setup is not complete: zoma_status never says "All set" and the device flow never
+   * issues its token or shows "You're set".
+   */
+  blocker: ZomaMetaPageBlocker | null;
+  /**
+   * ENG-3131: present only while ZOMA_BILLING_ENABLED=true. Reads and drafts never need it;
+   * a write that makes ads live needs `publish_enabled`. `link` is the $1 trial Checkout.
+   */
+  plan?: ZomaPlanSummary;
   next_step: string | null;
+  /** ENG-3134: Zoma's guide. */
+  docs_url?: string;
 }
 
 export interface ZomaOnboardingDeps {
@@ -88,9 +142,16 @@ export interface ZomaOnboardingDeps {
   buildGoogleAdsConnectUrl?: (userId: string) => Promise<string>;
   /** ENG-2823: defaults to googleToolkitEnabled(). */
   googleEnabled?: () => boolean;
-  frontendUrl: () => string;
+  /** ENG-3134: origin of Zoma's own pages (card return, docs) — the API, never the Emma app. */
+  pagesUrl: () => string;
   now: () => number;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
+  /** ENG-3128: persist the ads-experience answer on the user row. */
+  saveAdsExperience?: (userId: string, answer: ZomaAdsExperience) => Promise<void>;
+  /** ENG-3131 plan section of zoma_status; undefined while billing is off. */
+  getPlan?: (userId: string) => Promise<ZomaPlanSummary | undefined>;
+  /** ENG-3130 included/used/overage block of zoma_usage; undefined while billing is off. */
+  getBillingUsage?: (userId: string) => Promise<ZomaBillingUsage | undefined>;
 }
 
 const defaultDeps: ZomaOnboardingDeps = {
@@ -100,10 +161,14 @@ const defaultDeps: ZomaOnboardingDeps = {
   createCustomerForUser: (userId, email) => stripeService.createCustomerForUser(userId, email),
   resolvePaymentMethod: (user, userId) => stripeService.resolveUserPaymentMethod(user, userId),
   createPaymentMethodSetupSession: (p) => stripeService.createPaymentMethodSetupSession(p),
-  buildMetaConnectUrl: (userId) => buildMetaConnectUrl(userId, 'marketing'),
-  frontendUrl: () => process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro',
+  // ENG-3134: the callback finishes on Zoma's pages for this user, not in the AgentWeb portal.
+  buildMetaConnectUrl: (userId) => buildMetaConnectUrl(userId, 'marketing', { zoma: ZOMA_MCP_SETUP }),
+  pagesUrl: getBackendUrl,
   now: () => Date.now(),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
+  saveAdsExperience: (userId, answer) => defaultAdsExperienceStore.save(userId, answer, new Date().toISOString()),
+  getPlan: (userId) => getZomaPlanSummary(userId),
+  getBillingUsage: (userId) => getZomaBillingUsage(userId),
 };
 
 /** Same usability rule the toolkit gateway applies to account resolution (now in zomaProviders). */
@@ -126,15 +191,92 @@ function summarize(account: ConnectedAccount): ZomaMetaAccountSummary {
   };
 }
 
+const declinedPagePermission = (cfg: any): boolean =>
+  Array.isArray(cfg?.declined_required_permissions) &&
+  cfg.declined_required_permissions.some((p: unknown) => typeof p === 'string' && p.startsWith('pages_'));
+
 /**
- * ENG-3078: the same refusal text the ad write gate returns (emma/impl/adsApis.ts), one per
- * distinct message, for usable Meta accounts whose Page access is confirmed missing.
+ * ENG-3125: classify a confirmed-missing Page state from what the connect/sweep probe stored.
+ *  - existing ads run under a Page this connection cannot reach:
+ *      the connection shares no Pages at all  -> page_not_granted (Page skipped on "Choose Pages")
+ *      it shares other Pages but not that one -> no_advertiser_role (no "Create ads" access to it)
+ *  - a pages_* permission was declined         -> page_not_granted
+ *  - zero Pages and no Page of record          -> no_page_exists
  */
-function metaPageProblem(accounts: ConnectedAccount[]): string | null {
-  const messages = accounts
-    .filter((a) => getMetaPagesAccessState(a.config as any) === 'missing')
-    .map((a) => getMetaAdsNoPagesMessage(a.config as any));
-  return messages.length ? [...new Set(messages)].join('\n') : null;
+export function classifyMetaPageBlocker(cfg: any): ZomaMetaPageBlockerReason {
+  const accessible = getAccessiblePageIds(cfg);
+  const pageCount = typeof cfg?.meta_page_count === 'number' ? cfg.meta_page_count : accessible?.length;
+  const existingPage = typeof cfg?.existing_ads_page_id === 'string' && cfg.existing_ads_page_id ? cfg.existing_ads_page_id : undefined;
+  if (existingPage) return (pageCount ?? 0) > 0 ? 'no_advertiser_role' : 'page_not_granted';
+  if (declinedPagePermission(cfg)) return 'page_not_granted';
+  if (pageCount === 0) return 'no_page_exists';
+  return 'page_not_granted';
+}
+
+/** ENG-3125: agent-relayable fix steps per reason. `link` is a fresh Meta connect link. */
+export function metaPageFixSteps(
+  reason: ZomaMetaPageBlockerReason,
+  opts: { link?: string; pageId?: string; connectText?: string } = {},
+): string[] {
+  const connectTail = opts.connectText ?? (opts.link
+    ? `open this Meta connect link and log in with the same Facebook account → ${opts.link}`
+    : 'ask me for a fresh Meta connect link, open it and log in with the same Facebook account.');
+  const connect = connectTail.charAt(0).toUpperCase() + connectTail.slice(1);
+  const page = opts.pageId ? `Facebook Page ${opts.pageId}` : 'the Facebook Page you advertise from';
+  const done = 'Tell me when it is done and I will re-check.';
+  if (reason === 'no_page_exists') {
+    return [
+      `Create a Facebook Page for the business (skip if you already have one) → ${META_CREATE_PAGE_URL}`,
+      connect,
+      'When Meta asks which Pages to share, select that Page (or all current and future Pages) and approve every requested permission.',
+      done,
+    ];
+  }
+  if (reason === 'page_not_granted') {
+    return [
+      connect,
+      'When Meta opens, choose Edit access (Edit settings) instead of continuing with the previous choices.',
+      `On the Pages step select ${page} — or all current and future Pages — then approve every requested permission.`,
+      done,
+    ];
+  }
+  return [
+    `This Facebook account does not have "Create ads" (Advertiser) access to ${page}.`,
+    `Ask whoever manages that Page to open Meta Business Settings → Pages → select the Page → Assign people, and give you the "Create ads" / Ads task (${META_BUSINESS_PAGES_SETTINGS_URL}). For a Page outside a Business portfolio: Page settings → Page access → Add new, with Ads task access.`,
+    `Once access is granted, ${connectTail}`,
+    `On the Pages step select ${page} and approve every requested permission.`,
+    done,
+  ];
+}
+
+/**
+ * ENG-3125 (was ENG-3078's plain message): a structured blocker for usable Meta accounts whose
+ * Page access is confirmed missing. Never-probed (unknown) and granted change nothing.
+ */
+export function metaPageBlocker(accounts: ConnectedAccount[], link?: string): ZomaMetaPageBlocker | null {
+  const missing = accounts.filter((a) => getMetaPagesAccessState(a.config as any) === 'missing');
+  if (missing.length === 0) return null;
+  const cfg: any = missing[0].config;
+  const reason = classifyMetaPageBlocker(cfg);
+  const pageId = typeof cfg?.existing_ads_page_id === 'string' && cfg.existing_ads_page_id ? cfg.existing_ads_page_id : undefined;
+  return {
+    type: 'meta_page_access',
+    reason,
+    account_ids: missing.map((a) => summarize(a).account_id),
+    ...(pageId ? { page_id: pageId } : {}),
+    message: [...new Set(missing.map((a) => getMetaAdsNoPagesMessage(a.config as any)))].join('\n'),
+    steps: metaPageFixSteps(reason, { link, pageId }),
+    ...(link ? { link } : {}),
+    ...(reason === 'no_page_exists' ? { create_page_url: META_CREATE_PAGE_URL } : {}),
+  };
+}
+
+/** ENG-3127: the Page step leads with the fact that reads still work; only ad creation is blocked. */
+export const META_PAGE_READS_OK = 'Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:';
+
+/** The blocker as zoma_status next_step text: reads-still-work lead, the canonical problem, then numbered steps. */
+export function formatMetaPageBlocker(b: ZomaMetaPageBlocker): string {
+  return [META_PAGE_READS_OK, b.message, '', 'To fix it:', ...b.steps.map((step, i) => `${i + 1}. ${step}`)].join('\n');
 }
 
 function usableAccounts(accounts: ConnectedAccount[], provider: ZomaProvider, now: number): ConnectedAccount[] {
@@ -152,7 +294,8 @@ function summarizeGoogle(account: ConnectedAccount): ZomaGoogleAdsAccountSummary
 }
 
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
-  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId);
+  // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
+  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
 }
 
 /**
@@ -162,6 +305,8 @@ async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
  */
 async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
   // Card requirement paused (2026-11-10, eng lead). Set ZOMA_REQUIRE_PAYMENT_METHOD=true to re-enable.
+  // ENG-3131: a card is now asked for at the first publish (zomaBilling.ts), so leave this unset: setting
+  // it brings back the card wall at signup, which the paid-launch plan rules out.
   if (process.env.ZOMA_REQUIRE_PAYMENT_METHOD !== 'true') return true;
   return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
@@ -175,12 +320,12 @@ async function paymentSetupLink(
   // Deleted or unknown candidates are skipped (ENG-2571): a just-deleted customer can still
   // come back from the eventually consistent search, and the row id can be stale.
   const customerId = (await deps.findLiveCustomerId(user, userId)) ?? (await deps.createCustomerForUser(userId, user?.email));
-  const base = deps.frontendUrl().replace(/\/+$/, '');
+  const done = `${deps.pagesUrl().replace(/\/+$/, '')}/api/zoma/done?mcp=1`;
   const session = await deps.createPaymentMethodSetupSession({
     stripeCustomerId: customerId,
     userId,
-    successUrl: returnUrls?.successUrl ?? `${base}/settings?zoma=payment_method_added`,
-    cancelUrl: returnUrls?.cancelUrl ?? `${base}/settings?zoma=payment_method_canceled`,
+    successUrl: returnUrls?.successUrl ?? done,
+    cancelUrl: returnUrls?.cancelUrl ?? `${done}&canceled=1`,
   });
   if (!session?.url) throw new Error('Stripe did not return a Checkout URL.');
   return session.url;
@@ -211,9 +356,11 @@ export async function getZomaReadiness(
   deps: ZomaOnboardingDeps = defaultDeps,
   opts: { mintLinks?: boolean } = {},
 ): Promise<ZomaReadiness> {
-  const mintLinks = opts.mintLinks !== false;
   const user = await deps.getUser(userId);
   if (!user) throw new ZomaNotReadyError('No AgentWeb account was found for this login.');
+  const adsExperience = parseZomaAdsExperience(user.zomaAdsExperience);
+  // ENG-3128: no setup links until the question is answered, and none for "just a friend".
+  const mintLinks = opts.mintLinks !== false && adsExperience !== null && adsExperience !== 'not_interested';
 
   const payment: ZomaReadiness['payment'] = { ready: false };
   try {
@@ -229,11 +376,25 @@ export async function getZomaReadiness(
   const allAccounts = await deps.listAccounts(userId);
   const accounts = usableAccounts(allAccounts, META_PROVIDER, deps.now());
   const meta: ZomaReadiness['meta'] = { ready: accounts.length > 0, accounts: accounts.map(summarize) };
-  if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
+  if (!meta.ready && mintLinks) {
+    try {
+      meta.link = await deps.buildMetaConnectUrl(userId);
+    } catch (error) {
+      console.error('[zoma] meta connect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
 
   const writes_enabled = payment.ready && meta.ready;
+  let blocker = metaPageBlocker(accounts);
+  if (blocker && mintLinks) {
+    try {
+      blocker = metaPageBlocker(accounts, await deps.buildMetaConnectUrl(userId));
+    } catch (error) {
+      console.error('[zoma] meta reconnect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
   const readiness: ZomaReadiness = {
-    email: user.email, payment, meta, writes_enabled, next_step: null,
+    email: user.email, payment, meta, writes_enabled, ads_experience: adsExperience, blocker, next_step: null,
     google_ads: { available: false, ready: false, accounts: [], writes_enabled: false, reason: 'google_ads_provider_disabled' },
   };
 
@@ -256,12 +417,61 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
-  readiness.next_step = nextStep(payment, meta, readiness.google_ads) ?? metaPageProblem(accounts);
+  if (mintLinks && deps.getPlan) {
+    const plan = await deps.getPlan(userId);
+    if (plan) readiness.plan = plan;
+  }
+  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
+  readiness.docs_url = zomaDocsUrl(deps);
   return readiness;
 }
 
-function nextStep(payment: ZomaReadiness['payment'], meta: ZomaReadiness['meta'], googleAds: ZomaReadiness['google_ads']): string | null {
+/** ENG-3134: Zoma's own guide (served by the API, no AgentWeb/Emma app). */
+export const zomaDocsUrl = (deps: Pick<ZomaOnboardingDeps, 'pagesUrl'> = defaultDeps) =>
+  `${deps.pagesUrl().replace(/\/+$/, '')}/api/meta-toolkit/skill.md`;
+
+/** ENG-3134: the concrete first thing to ask once an ad account is connected. */
+export const ZOMA_FIRST_PROMPT =
+  'Show my Meta ad spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for the last 7 days.';
+
+/** ENG-3134: the "connected" answer — docs plus a concrete next prompt (zoma_ads_report is Meta-only). */
+export function zomaAllSetText(docsUrl: string, metaConnected = true): string {
+  return [
+    'All set. Your ad account is connected to Zoma.',
+    `Docs: ${docsUrl}`,
+    metaConnected
+      ? `Try asking: "${ZOMA_FIRST_PROMPT}" (runs zoma_ads_report).`
+      : 'Try asking: "How did my Google Ads campaigns do over the last 7 days?"',
+  ].join('\n');
+}
+
+/** ENG-3128 order: the ads question, then ad accounts (with setup guidance for new advertisers), then the card. */
+function nextStep(
+  adsExperience: ZomaAdsExperience | null,
+  payment: ZomaReadiness['payment'],
+  meta: ZomaReadiness['meta'],
+  googleAds: ZomaReadiness['google_ads'],
+): string | null {
+  if (adsExperience === null) return adsExperienceQuestionText('zoma_status { "ads_experience": "<value>" }');
+  if (adsExperience === 'not_interested') return ZOMA_NOT_INTERESTED_MESSAGE;
   const google = googleAds.available ? googleAds : undefined;
+  if (!meta.ready && !google?.ready) {
+    // ENG-3134: the answer leads straight to Meta connect; a new advertiser gets the setup guide
+    // after the link (same link once they have an ad account), never instead of it.
+    return [
+      meta.link
+        ? `Connect Meta (Facebook login) and pick your ad account → ${meta.link}`
+        : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
+      // ENG-3135: never fall back to the bare ads.google.com — that is Google's campaign signup.
+      ...(google
+        ? [google.link
+          ? `Or connect an existing Google Ads account → ${google.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
+        : []),
+      'Tell me when it is connected and I will re-check.',
+      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
+    ].join('\n');
+  }
   if (!payment.ready) {
     if (payment.error) return payment.error;
     return [
@@ -270,25 +480,24 @@ function nextStep(payment: ZomaReadiness['payment'], meta: ZomaReadiness['meta']
       'Tell me when it is done and I will re-check.',
     ].join('\n');
   }
-  if (!meta.ready && !google?.ready) {
-    return [
-      `Connect Meta (Facebook Business login) and pick your ad account → ${meta.link}`,
-      ...(google ? [`Or connect Google Ads → ${google.link ?? 'Settings → Connected accounts'}`] : []),
-      'Tell me when it is connected and I will re-check.',
-    ].join('\n');
-  }
   return null;
 }
 
 export function formatZomaStatus(r: ZomaReadiness): string {
+  // ENG-3134: first contact is the welcome and one question — no checklist yet. A friend gets
+  // exactly the thank-you, nothing else.
+  if (r.ads_experience === null && r.next_step) return r.next_step;
+  if (r.ads_experience === 'not_interested') return ZOMA_NOT_INTERESTED_MESSAGE;
   const box = (ok: boolean) => (ok ? '[x]' : '[ ]');
   const lines = [
     'Zoma setup:',
     `  [x] AgentWeb login${r.email ? ` (${r.email})` : ''}`,
+    `  ${box(r.ads_experience !== null)} How familiar you are with ads${r.ads_experience ? ` (${r.ads_experience})` : ''}`,
     `  ${box(r.payment.ready)} Payment method on file`,
     `  ${box(r.meta.ready)} Meta ad account connected${
       r.meta.accounts.length ? ` (${r.meta.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})` : ''
     }${!r.meta.ready && r.google_ads.available && r.google_ads.ready && r.meta.link ? ` → ${r.meta.link}` : ''}`,
+    ...(r.blocker ? ['  [ ] Facebook Page usable for ads'] : []),
     ...(r.google_ads.available
       ? [`  ${box(r.google_ads.ready)} Google Ads account connected${
         r.google_ads.accounts.length
@@ -296,8 +505,9 @@ export function formatZomaStatus(r: ZomaReadiness): string {
           : r.google_ads.link ? ` → ${r.google_ads.link}` : ''
       }`]
       : []),
+    ...(r.plan ? [formatZomaPlanLine(r.plan, getZomaBillingConfig())] : []),
     '',
-    r.next_step ?? 'All set. Ask me about your Meta ads, e.g. "how are my campaigns doing this week?"',
+    r.next_step ?? zomaAllSetText(r.docs_url ?? zomaDocsUrl(), r.meta.ready),
   ];
   return lines.join('\n');
 }
@@ -311,26 +521,38 @@ export function currentUsageMonth(now: number): { start: string; end: string } {
   };
 }
 
-export function formatZomaUsage(u: McpUserUsage): string {
+export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage): string {
   const lines = [
     `Zoma usage ${u.start.slice(0, 7)} (UTC month):`,
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
     ...u.recentWrites.map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
-    'Billing is not enabled yet; usage is only recorded.',
+    ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');
 }
 
 /** Tool entry point for the toolkit gateway. Returns the text plus the structured state. */
-export async function runZomaTool(name: ZomaToolName, _args: unknown, context: { userId: string }, deps: ZomaOnboardingDeps = defaultDeps) {
+export async function runZomaTool(name: ZomaToolName, args: unknown, context: { userId: string }, deps: ZomaOnboardingDeps = defaultDeps) {
   if (name === 'zoma_status') {
+    // ENG-3128: an agent that asked "How familiar are you with ads?" in chat records the answer here.
+    const raw = (args as { ads_experience?: unknown } | null | undefined)?.ads_experience;
+    if (raw !== undefined) {
+      const answer = parseZomaAdsExperience(raw);
+      if (!answer) throw new ZomaNotReadyError(`ads_experience must be one of: ${ZOMA_ADS_EXPERIENCE_VALUES.join(', ')}.`);
+      await (deps.saveAdsExperience ?? defaultDeps.saveAdsExperience!)(context.userId, answer);
+    }
     const readiness = await getZomaReadiness(context.userId, deps);
+    // ENG-3134: a friend's whole answer is the thank-you — no checklist, links or setup state.
+    if (readiness.ads_experience === 'not_interested') {
+      return { summary: ZOMA_NOT_INTERESTED_MESSAGE, ads_experience: readiness.ads_experience, next_step: null };
+    }
     return { summary: formatZomaStatus(readiness), ...readiness };
   }
   if (name === 'zoma_usage') {
     const usage = await deps.getUsage(context.userId, currentUsageMonth(deps.now()));
-    return { summary: formatZomaUsage(usage), ...usage };
+    const billing = deps.getBillingUsage ? await deps.getBillingUsage(context.userId) : undefined;
+    return { summary: formatZomaUsage(usage, billing), ...usage, ...(billing ? { billing } : {}) };
   }
   throw new ZomaNotReadyError(`Unknown Zoma tool ${name}.`);
 }
