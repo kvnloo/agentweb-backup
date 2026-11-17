@@ -282,7 +282,8 @@ function summarizeGoogle(account: ConnectedAccount): ZomaGoogleAdsAccountSummary
 }
 
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
-  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId);
+  // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
+  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
 }
 
 /**
@@ -437,7 +438,12 @@ function nextStep(
       meta.link
         ? `Connect Meta (Facebook login) and pick your ad account → ${meta.link}`
         : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
-      ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
+      // ENG-3135: never fall back to the bare ads.google.com — that is Google's campaign signup.
+      ...(google
+        ? [google.link
+          ? `Or connect an existing Google Ads account → ${google.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
+        : []),
       'Tell me when it is connected and I will re-check.',
       ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
     ].join('\n');

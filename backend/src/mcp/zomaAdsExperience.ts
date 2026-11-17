@@ -45,12 +45,24 @@ export type ZomaLeadClassification = 'pal' | 'prospect';
 export const ZOMA_PAL: ZomaLeadClassification = 'pal';
 export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => (isNotInterested(raw) ? 'pal' : 'prospect');
 
+/**
+ * ENG-3135: creating a Google Ads account happens on Google's own site (Zoma cannot and does not
+ * create one). The default ads.google.com signup walks into building a Search campaign and pre-fills
+ * country/currency/time zone from the browser, which Google then fixes permanently — so the guidance is
+ * explicit: no campaign, and the user chooses those three values themselves.
+ */
+export const ZOMA_GOOGLE_NEW_ACCOUNT_STEPS: readonly string[] = [
+  'Create a Google Ads account yourself at https://ads.google.com (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
+  'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign". Zoma never creates a campaign or starts spending when you connect.',
+  'When Google asks for your business country, billing currency and time zone, choose them yourself — Google may pre-fill them from your browser or location, and cannot change them once the account exists.',
+];
+
 /** Ad-account setup for someone who has never run ads, in the order they need it. */
 export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
   'Meta: create a Business portfolio at https://business.facebook.com/overview (use the Facebook login you want to manage ads with).',
   'Meta: create a Facebook Page for your business at https://www.facebook.com/pages/create — Meta ads run from a Page.',
   'Meta: in Business settings → Accounts → Ad accounts, create an ad account and set its currency and time zone (https://business.facebook.com/settings/ad-accounts).',
-  'Google (optional): create a Google Ads account at https://ads.google.com — choose "Switch to Expert Mode" and "Create an account without a campaign" so nothing starts spending.',
+  ...ZOMA_GOOGLE_NEW_ACCOUNT_STEPS.slice(0, 1).map((s) => `Google (optional): ${s}`),
   'Then connect those ad accounts to Zoma.',
 ];
 

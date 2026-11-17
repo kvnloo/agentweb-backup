@@ -10,6 +10,8 @@
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
  *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup or an MCP user's zoma_status link (forwarded by /api/oauth/meta/callback)
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
+ *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
+ *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
@@ -35,6 +37,7 @@ import {
   type BrowserStep,
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
+import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
@@ -133,7 +136,7 @@ function failPage(res: Response, step: string, error: unknown) {
   return page(res, 500, 'Zoma setup', '<p>Something went wrong. Try again in a moment, or ask your agent to start Zoma setup again.</p>');
 }
 
-export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps): Router {
+export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps, googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps): Router {
   const router = Router();
 
   router.post('/setup', throttle('setup', ZOMA_SETUP_MAX_PER_MINUTE), async (req: Request, res: Response) => {
@@ -194,6 +197,23 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
       return renderStep(res, await selectMetaAccounts({ t: req.body?.t, account_id: req.body?.account_id }, deps), req);
     } catch (error) {
       return failPage(res, 'meta_connect', error);
+    }
+  });
+
+  router.get('/google/callback', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const q = req.query;
+      return renderStep(res, await completeGoogleConnect({ code: q.code, state: q.state, error: q.error }, googleDeps));
+    } catch (error) {
+      return failPage(res, 'google_callback', error);
+    }
+  });
+
+  router.post('/google/select', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await selectGoogleAccounts({ t: req.body?.t, account_id: req.body?.account_id }, googleDeps), req);
+    } catch (error) {
+      return failPage(res, 'google_connect', error);
     }
   });
 
