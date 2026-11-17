@@ -4394,8 +4394,8 @@ export class AgentModeService {
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
 
-        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
-        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
+        // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
