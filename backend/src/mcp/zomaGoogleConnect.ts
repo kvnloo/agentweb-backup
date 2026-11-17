@@ -19,7 +19,7 @@ import { defaultZomaLinkCodec, ZOMA_GOOGLE_SELECT_PATH, ZOMA_MCP_SETUP, type Zom
 import { ZOMA_GOOGLE_NEW_ACCOUNT_STEPS } from './zomaAdsExperience';
 import { ZOMA_BACK_TO_AGENT, type BrowserStep } from './zomaDeviceFlow';
 import { logZomaSetup } from './zomaSetupLog';
-import { GoogleAdsInsufficientScopesError } from '../services/googleAdsOAuthErrors';
+import { GoogleAdsInsufficientScopesError, googleAdsErrorCodes } from '../services/googleAdsOAuthErrors';
 import type { GoogleAdsConnectResult, GoogleAdsFinalizeResult } from '../services/googleAdsOAuthFinalize';
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
@@ -132,6 +132,10 @@ function noConnectableAccountPage(userId: string, result: GoogleAdsFinalizeResul
     });
   }
   logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'no_google_ads_accounts' });
+  return noGoogleAdsAccountPage(userId, deps);
+}
+
+function noGoogleAdsAccountPage(userId: string, deps: ZomaGoogleDeps): Promise<PageStep> {
   return failedPage(userId, deps, {
     status: 400,
     title: 'No Google Ads account found',
@@ -165,8 +169,14 @@ export async function completeGoogleConnect(
   try {
     result = await deps.finalize(userId, params.code);
   } catch (error) {
+    const codes = googleAdsErrorCodes(error);
+    // Google answers 401 NOT_ADS_USER when this login has never used Google Ads: that is "no account", not a failure.
+    if (codes.includes('NOT_ADS_USER')) {
+      logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'no_google_ads_accounts [NOT_ADS_USER]' });
+      return noGoogleAdsAccountPage(userId, deps);
+    }
     const scopes = error instanceof GoogleAdsInsufficientScopesError;
-    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: scopes ? 'insufficient_scopes' : error });
+    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: scopes ? 'insufficient_scopes' : `${error instanceof Error ? error.message : error}${codes.length ? ` [${codes.join(',')}]` : ''}` });
     return failedPage(userId, deps, {
       status: scopes ? 422 : 502,
       title: 'Google Ads not connected',
