@@ -66,10 +66,23 @@ export interface LinkedInAccountRoutingDecision {
  * if none qualifies — the caller falls through to the existing refusal,
  * which is exactly today's single-account behavior when nothing can help.
  *
+ * ENG-3101: a candidate that passes both checks is then asked whether its
+ * LinkedIn session is alive (`probeAccountSession`, the same 10-minute-cached
+ * probe the write preflight uses). A candidate whose session is proven
+ * `disconnected` is skipped and the scan moves on; `unknown` (timeout, 5xx,
+ * a probe that throws) does NOT exclude it, for the same reason the preflight
+ * does not block on it. Before this, the first candidate with headroom was
+ * taken even when its session was already known to be dead, and the write was
+ * then refused as "disconnected" while live accounts sat unused. Only a
+ * candidate that would otherwise be chosen is probed, so a routed write costs
+ * at most one uncached probe per dead account plus one for the pick.
+ *
  * Read-only: does not call `reserveWriteSlot`/persist any daily-volume
  * state, and does not arm, clear, or otherwise touch the cooldown breaker
  * for any account. The caller still must run the full pace/reserve flow
- * against whichever account this returns.
+ * against whichever account this returns. It does not record session health
+ * either: each skipped dead candidate is handed to
+ * `deps.onDisconnectedCandidate`, and the caller decides what to store.
  *
  * `preFetchedAccounts`: the caller (agentModeService.ts) already runs
  * `getAccountsWithOwnerIncludingOrgShared` once to resolve the REQUESTED
@@ -84,6 +97,7 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
   requestedAccountId: string,
   requestedAccount: ResolvedLinkedInAccount,
   preFetchedAccounts?: any[],
+  deps: { onDisconnectedCandidate?: (accountId: string) => Promise<void> } = {},
 ): Promise<LinkedInAccountRoutingDecision | null> {
   const isInvite = action === 'send-invite';
   const requestedUnderCooldown = isInvite && linkedInOutreachService.isUnderInvitationCooldown(requestedAccountId);
@@ -115,6 +129,23 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
       connectedAt: account.connectedAt,
     });
     if (!slot.allowed) continue;
+
+    // ENG-3101: never substitute an account whose session is proven dead.
+    let sessionState: 'connected' | 'disconnected' | 'unknown';
+    try {
+      sessionState = await linkedInOutreachService.probeAccountSession(candidateAccountId);
+    } catch {
+      sessionState = 'unknown';
+    }
+    if (sessionState === 'disconnected') {
+      console.log(`[linkedInAccountRouting] skipping candidate ${candidateAccountId}: disconnected session`);
+      try {
+        await deps.onDisconnectedCandidate?.(candidateAccountId);
+      } catch (error) {
+        console.error(`[linkedInAccountRouting] onDisconnectedCandidate failed for ${candidateAccountId}:`, error);
+      }
+      continue;
+    }
 
     const requestedReason = requestedUnderCooldown
       ? 'was under an active LinkedIn invitation cooldown'
