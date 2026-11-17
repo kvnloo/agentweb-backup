@@ -52,7 +52,7 @@ export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => 
  * user chooses those values themselves.
  */
 export const ZOMA_GOOGLE_NEW_ACCOUNT_STEPS: readonly string[] = [
-  'Create a Google Ads account yourself at https://ads.google.com (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
+  'Create a Google Ads account yourself, following Google\'s own sign-up guide at https://support.google.com/google-ads/answer/6366720 (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
   'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first). Zoma never creates a campaign or starts spending when you connect.',
   'When Google asks for your billing country, currency and time zone, choose them yourself, because Google does not let anyone change the currency or time zone once the account exists.',
 ];

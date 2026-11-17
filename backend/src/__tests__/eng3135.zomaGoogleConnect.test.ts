@@ -171,6 +171,8 @@ describe('completeGoogleConnect', () => {
     const text = step.steps.join(' ');
     expect(text).toContain('Create an account without a campaign');
     expect(text).toMatch(/billing country, currency and time zone, choose them yourself/);
+    expect(text).not.toMatch(/https:\/\/ads\.google\.com/);
+    expect(text).toContain('support.google.com/google-ads/answer/6366720');
     expect(createAccount).not.toHaveBeenCalled();
   });
 
