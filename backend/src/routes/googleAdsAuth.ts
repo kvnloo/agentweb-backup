@@ -3,11 +3,8 @@ import jwt from 'jsonwebtoken';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { buildGoogleAdsConnectUrl } from '../services/googleAdsConnectUrl';
-import {
-  connectGoogleAdsAccounts,
-  finalizeGoogleAdsOAuth,
-  GoogleAdsInsufficientScopesError,
-} from '../services/googleAdsOAuthFinalize';
+import { connectGoogleAdsAccounts, finalizeGoogleAdsOAuth } from '../services/googleAdsOAuthFinalize';
+import { GoogleAdsInsufficientScopesError } from '../services/googleAdsOAuthErrors';
 import { ZOMA_GOOGLE_CALLBACK_PATH } from '../mcp/zomaSetupLinks';
 
 const router = express.Router();

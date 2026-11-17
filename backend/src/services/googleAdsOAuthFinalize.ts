@@ -12,6 +12,7 @@ import { getGoogleAdsConfig } from '../config/integrations';
 import { createAccount, getAccountsByUserId } from './connectedAccountsDb';
 import { zomaMilestone } from './journeyMilestones';
 import { googleAdsService } from './googleAdsService';
+import { GoogleAdsInsufficientScopesError } from './googleAdsOAuthErrors';
 import type { GoogleAdsAccountNode, GoogleAdLeaf } from './googleAdsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -50,13 +51,6 @@ const retrieveTokenSession = (sessionId: string, userId: string): TokenSession |
   tokenSessions.delete(sessionId);
   return session;
 };
-
-/** Google issued a token but the adwords scope was not granted. */
-export class GoogleAdsInsufficientScopesError extends Error {
-  constructor(public readonly grantedScopes: string[]) {
-    super('insufficient_scopes');
-  }
-}
 
 export interface GoogleAdsFinalizeResult {
   accountTree: GoogleAdsAccountNode[];

@@ -12,7 +12,7 @@ import { getJwtSecret } from '../config/jwt';
 const STATE_EXPIRATION = '15m';
 
 export const generateGoogleAdsOAuthState = (userId: string, extra: Record<string, string> = {}): string =>
-  jwt.sign({ userId, ...extra, nonce: crypto.randomBytes(16).toString('hex') }, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
+  jwt.sign({ ...extra, userId, nonce: crypto.randomBytes(16).toString('hex') }, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 
 /**
  * `stateExtra` adds signed claims to the OAuth state (ENG-3135: `{ zoma: 'mcp' }` routes the

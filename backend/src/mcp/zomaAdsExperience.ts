@@ -47,14 +47,14 @@ export const zomaLeadClassification = (raw: unknown): ZomaLeadClassification => 
 
 /**
  * ENG-3135: creating a Google Ads account happens on Google's own site (Zoma cannot and does not
- * create one). The default ads.google.com signup walks into building a Search campaign and pre-fills
- * country/currency/time zone from the browser, which Google then fixes permanently — so the guidance is
- * explicit: no campaign, and the user chooses those three values themselves.
+ * create one). Google's default signup pushes toward building a campaign, and currency and time zone are
+ * permanent once the account exists (Google's help) — so the guidance is explicit: no campaign, and the
+ * user chooses those values themselves.
  */
 export const ZOMA_GOOGLE_NEW_ACCOUNT_STEPS: readonly string[] = [
   'Create a Google Ads account yourself at https://ads.google.com (sign in with the Google account you want to manage ads with). Zoma never creates the account for you.',
   'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first). Zoma never creates a campaign or starts spending when you connect.',
-  'When Google asks for your billing country, currency and time zone, choose them yourself — Google may pre-fill them from your browser or location, and it does not let anyone change the currency or time zone once the account exists.',
+  'When Google asks for your billing country, currency and time zone, choose them yourself, because Google does not let anyone change the currency or time zone once the account exists.',
 ];
 
 /** Ad-account setup for someone who has never run ads, in the order they need it. */

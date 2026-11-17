@@ -6,6 +6,9 @@
  * user is finalized server-side (never the browser's portal session), the account picker is a Zoma
  * page, and every end state points back to the agent.
  *
+ * The signed state is a bearer link (15 minutes, not bound to a browser), like the Meta connect link: whoever
+ * completes consent with it connects THEIR Google account to that user. It is minted only for the user's own agent.
+ *
  * Connecting is read-only toward Google: it lists accounts and stores a connected_accounts row. It
  * creates no campaign, budget, billing setup or account, and sets no country/currency/time zone. A
  * user with no Google Ads account is shown how to create one themselves, without a campaign.
@@ -16,6 +19,7 @@ import { defaultZomaLinkCodec, ZOMA_GOOGLE_SELECT_PATH, ZOMA_MCP_SETUP, type Zom
 import { ZOMA_GOOGLE_NEW_ACCOUNT_STEPS } from './zomaAdsExperience';
 import { ZOMA_BACK_TO_AGENT, type BrowserStep } from './zomaDeviceFlow';
 import { logZomaSetup } from './zomaSetupLog';
+import { GoogleAdsInsufficientScopesError } from '../services/googleAdsOAuthErrors';
 import type { GoogleAdsConnectResult, GoogleAdsFinalizeResult } from '../services/googleAdsOAuthFinalize';
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
@@ -57,13 +61,14 @@ const EXPIRED: PageStep = {
 /** Google lists the account but reports it not enabled (signup unfinished, or deactivated). */
 const UNFINISHED_ACCOUNT_STEPS: readonly string[] = [
   'Open https://ads.google.com signed in with the same Google account and look at that account first. If its setup is unfinished, finish it there; do not create another account yet.',
-  'Check the billing country, currency and time zone Google shows for it. Google does not let anyone change the currency or time zone once the account exists, and Zoma cannot change any of them. If they are wrong (for example pre-filled from your browser or location), create a new account yourself and choose them yourself.',
+  'Check the billing country, currency and time zone Google shows for it. Google does not let anyone change the currency or time zone once the account exists, and Zoma cannot change any of them. If they are wrong, create a new account yourself and choose them yourself.',
   'If Google pushes you to build a campaign, do not: choose "Create an account without a campaign" (if you only see a Smart campaign setup, look for "Switch to Expert Mode" first).',
 ];
 
 /** A manager (MCC) login with no active client ad account under it. */
 const MANAGER_ONLY_STEPS: readonly string[] = [
-  'Connect again and sign in with the Google account that owns the ad account itself (not only the manager login).',
+  'Connect again in a minute in case Google had a temporary problem listing the accounts under your manager.',
+  'Or connect again and sign in with the Google account that owns the ad account itself (not only the manager login).',
   'Or, in Google Ads, make sure the client ad account under your manager is active (not cancelled or still being set up). Zoma only connects active ad accounts.',
 ];
 
@@ -122,7 +127,7 @@ function noConnectableAccountPage(userId: string, result: GoogleAdsFinalizeResul
     return failedPage(userId, deps, {
       status: 400,
       title: 'No active Google Ads account to connect',
-      message: 'Google shared a manager (MCC) account on this login, but no active ad account under it that Zoma can connect. Zoma did not create or change anything.',
+      message: 'Google shared a manager (MCC) account on this login, but Zoma could not find an active ad account under it to connect (this can also be a temporary Google problem). Zoma did not create or change anything.',
       steps: MANAGER_ONLY_STEPS,
     });
   }
@@ -160,7 +165,7 @@ export async function completeGoogleConnect(
   try {
     result = await deps.finalize(userId, params.code);
   } catch (error) {
-    const scopes = error instanceof Error && error.message === 'insufficient_scopes';
+    const scopes = error instanceof GoogleAdsInsufficientScopesError;
     logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: scopes ? 'insufficient_scopes' : error });
     return failedPage(userId, deps, {
       status: scopes ? 422 : 502,
