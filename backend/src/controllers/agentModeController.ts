@@ -77,7 +77,10 @@ import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassific
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized, filterSlackSendFromRequiredIfWithheld } from '../utils/schedulePublishApproval';
 import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/toolRestrictionProfiles';
-import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS } from '../utils/scheduleProvenance';
+import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
+import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
+import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
+import { isDeepStrictEqual } from 'util';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -1666,6 +1669,8 @@ export function isSessionGeneratingForUser(sessionId: string, userId: string | u
 export function releaseSessionGeneration(sessionId: string): void {
   activeSessionGenerations.delete(sessionId);
   sessionGenerationOwners.delete(sessionId);
+  // ENG-2816 (step 3): the visitor-turn marker lives exactly as long as the lock it shadows (see shareVisitorTurnMarker.ts).
+  clearShareVisitorTurn(sessionId);
 }
 
 /**
@@ -2073,6 +2078,8 @@ async function scheduleAutoMediaContinuation(
   // manually while we were about to auto-continue) — don't fight it. If that turn still
   // leaves the batch incomplete, its own response re-triggers this path.
   if (!tryClaimSessionGeneration(sessionId, userId)) return;
+  // ENG-2816 (step 3): a continuation of a visitor's request is still a visitor's turn (the first turn's marker went with its lock).
+  if (isInteractiveShare) markShareVisitorTurn(sessionId);
   // ENG-1239: mark the lock as continuation-held so a real customer request that collides
   // with it (the OTHER direction from the check above) can preempt instead of just
   // 409ing — see preemptAutoContinuationAndWait.
@@ -6699,6 +6706,52 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 
 // ENG-1978: waits between re-checks of an unresolved entitlement before a scheduled run is deferred.
 const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
+
+/**
+ * ENG-2816 (step 3): is this schedule write a SHARE-LINK VISITOR's?
+ *
+ * A visitor acts under the owner's userId, so the request looks like the owner's own. Two independent signals say otherwise, and
+ * EITHER is enough (a write that cannot be shown to be the owner's is treated as a visitor's):
+ *  - the self-call token carries a restriction claim (`req.restrictionProfile`, set only from a verified `_svc` token): typed chat
+ *    and voice both put the visitor's profile in the tool context, and ctx() / mcpFetch sign it into the token;
+ *  - the self-call names (X-AgentWeb-Session) a session that a share route is running a visitor's turn on right now. This covers
+ *    a hop that dropped the claim; voice has only the claim.
+ * Only a SELF-call can be either: a portal login is a person, and a person is never marked here.
+ */
+function isVisitorScheduleWrite(req: Request): boolean {
+  const authReq = req as AuthenticatedRequest;
+  if (authReq.restrictionProfile) return true;
+  if (authReq.isSelfCall !== true) return false;
+  const sessionId = typeof req.header === 'function'
+    ? req.header(SCHEDULED_SESSION_HEADER)
+    : (req.headers as Record<string, string | undefined> | undefined)?.[SCHEDULED_SESSION_HEADER.toLowerCase()];
+  return isShareVisitorTurn(sessionId);
+}
+
+/**
+ * ENG-2816 (step 3): may THIS request take a visitor mark off? Only a real portal login can: not a self-call (Emma in the owner's own
+ * chat, or a marked run's own reflection turn, cannot tell the owner from a visitor), not a delegate (an admin acting as the owner is
+ * not the owner), and not a visitor's write. Positive owner evidence or nothing: see planProvenanceChange.
+ */
+function ownerMayLiftProvenance(req: Request): boolean {
+  const authReq = req as AuthenticatedRequest;
+  return authReq.isSelfCall !== true && !authReq.delegateInfo?.isDelegated && !isVisitorScheduleWrite(req);
+}
+
+/**
+ * ENG-2816 (step 3): what a schedule write does to its provenance, from the request and the schedule as stored.
+ * `changedFields` are the tracked fields whose new value differs from the stored one (the caller compares what it will actually
+ * write against what is stored, so a routine whole-form portal save changes none).
+ */
+function provenancePlanForWrite(req: Request, schedule: any, changedFields: string[]) {
+  return planProvenanceChange({
+    visitorWrite: isVisitorScheduleWrite(req),
+    ownerMayLift: ownerMayLiftProvenance(req),
+    stored: readScheduleProvenance(schedule?.provenance),
+    presentFields: trackedFieldsInBody(req.body),
+    changedFields,
+  });
+}
 
 /**
  * ENG-2816 (step 3): what a scheduled run is held to calling. A marked schedule (one a share-link visitor wrote content into) runs
@@ -13148,6 +13201,10 @@ export const agentModeController = {
           userMessageSaved: false,
         });
       }
+      // ENG-2816 (step 3): this turn is a visitor's until the owner is recognised (below). Marked where the lock is claimed, not
+      // where that is decided, so there is no moment in which a visitor's turn holds the session unmarked: the marker is what the
+      // schedule write handlers and the stop route read, and it is cleared with the lock.
+      markShareVisitorTurn(session.sessionId);
 
       try {
 
@@ -13368,6 +13425,9 @@ export const agentModeController = {
       const viewerIsOwner = await isSessionOwnerRequest(req, session.userId);
       sharedTurnIsVisitor = !viewerIsOwner;
       if (viewerIsOwner) {
+        // ENG-2816 (step 3): the owner's own turn through their share link is not a visitor's: its schedule writes are the owner's,
+        // and a visitor's stop must not cancel it.
+        clearShareVisitorTurn(session.sessionId);
         // Telemetry then reads `regular` rather than `interactive_share`, so leave a trace of this decision (no token).
         console.log(`[ENG-2816] share link ${session.sessionId}: the viewer is the session owner; running an owner turn`);
       }
@@ -15068,6 +15128,16 @@ export const agentModeController = {
         }
       }
 
+      // ENG-2816 (step 3): a schedule a share-link visitor creates is stored as the owner's own, so say who wrote it: every tracked
+      // content field the request carries is marked, in the same write that creates the schedule.
+      if (isVisitorScheduleWrite(req)) {
+        const marks = trackedFieldsInBody(req.body);
+        if (marks.length > 0) {
+          scheduledChat.provenance = marks;
+          console.log(`[ENG-2816] schedule ${scheduleId} created through a share link; marked [${marks.join(', ')}]`);
+        }
+      }
+
       await scheduleDb.createSchedule(scheduledChat);
 
       res.status(201).json({
@@ -15501,6 +15571,31 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
+      // ENG-2816 (step 3): who wrote this content. A visitor's write marks the tracked fields it carries; the owner's own portal
+      // save takes a mark off a field only when that field is in the request AND its new value differs from the stored one (the
+      // portal posts the whole form, so "was sent" proves nothing). `changed` compares what this write will STORE against what is
+      // stored, with the same normalisation the write uses, so a routine save changes nothing. The marks ride the SAME write.
+      const storedVariableValues: Record<string, string> = {};
+      normalizedVariables.forEach((variable) => {
+        const existingValue = existingValues[variable.name];
+        if (typeof existingValue === 'string' && existingValue.trim().length > 0) storedVariableValues[variable.name] = existingValue.trim();
+      });
+      const changedTrackedFields: string[] = [];
+      if (startingMessage !== undefined && effectiveStartingMessage !== previousStartingMessage) changedTrackedFields.push('startingMessage');
+      if (keywords !== undefined && !sameSet(keywords, existingSchedule.keywords, (x) => x)) changedTrackedFields.push('keywords');
+      if (toolsChanged) changedTrackedFields.push('requiredFunctionCalls');
+      if (functionCallMinCalls !== undefined && !isDeepStrictEqual(functionCallMinCalls || {}, existingSchedule.functionCallMinCalls || {})) changedTrackedFields.push('functionCallMinCalls');
+      if (variables !== undefined && !isDeepStrictEqual(normalizedVariables, existingSchedule.variables || [])) changedTrackedFields.push('variables');
+      if (variableValues !== undefined && !isDeepStrictEqual(normalizedVariableValues, storedVariableValues)) changedTrackedFields.push('variableValues');
+      if (recipientsChanged) changedTrackedFields.push('emailNotifications');
+      const provenancePlan = provenancePlanForWrite(req, existingSchedule, changedTrackedFields);
+      Object.assign(updates, provenancePlan);
+      if (provenancePlan.provenanceAdd) {
+        console.log(`[ENG-2816] schedule ${scheduleId} edited through a share link; marked [${provenancePlan.provenanceAdd.join(', ')}]`);
+      } else if (provenancePlan.provenanceRemove) {
+        console.log(`[ENG-2816] schedule ${scheduleId}: the owner changed [${provenancePlan.provenanceRemove.join(', ')}]; visitor mark lifted`);
+      }
+
       // ENG-1048: DynamoDB caps an item at 400KB, and a schedule row grows without
       // bound along two axes — promptRevisions (a full prompt snapshot per edit) and
       // runResults. A schedule with a ~35k-character prompt drifts into the ceiling,
@@ -15696,12 +15791,30 @@ export const agentModeController = {
       const missingVariableNames = getMissingScheduledChatVariableNames(variables, sanitizedValues);
       const nowIso = new Date().toISOString();
 
+      // ENG-2816 (step 3): variable values are substituted into the run's prompt, so they are tracked like the prompt itself. A
+      // visitor's submission marks them (in this same write); the owner's own portal submission lifts the mark only when it
+      // changes the stored values. A schedule this write marks is a marked schedule for the run it starts right below.
+      const storedForSubmission: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const stored = (schedule.variableValues as Record<string, unknown> | undefined)?.[variable.name];
+        if (typeof stored === 'string' && stored.trim().length > 0) storedForSubmission[variable.name] = stored.trim();
+      });
+      const submissionProvenance = provenancePlanForWrite(
+        req,
+        schedule,
+        isDeepStrictEqual(sanitizedValues, storedForSubmission) ? [] : ['variableValues']
+      );
+      if (submissionProvenance.provenanceAdd) {
+        console.log(`[ENG-2816] schedule ${scheduleId}: variable values submitted through a share link; marked [${submissionProvenance.provenanceAdd.join(', ')}]`);
+      }
+
       await scheduleDb.updateSchedule(scheduleId, {
         variableValues: sanitizedValues,
         variableRequestStatus: missingVariableNames.length > 0 ? 'pending' : 'provided',
         variableValuesUpdatedAt: nowIso,
         variableRequestAccessTokenConsumedAt: nowIso,
         updatedAt: nowIso,
+        ...submissionProvenance,
       });
 
       if (missingVariableNames.length === 0 && triggerRun !== false) {
@@ -15709,7 +15822,11 @@ export const agentModeController = {
           ...schedule,
           variableValues: sanitizedValues,
           variableRequestStatus: 'provided',
-          variableValuesUpdatedAt: nowIso
+          variableValuesUpdatedAt: nowIso,
+          // The run starts from the pre-write snapshot above, so it needs the marks this write just made (or lifted).
+          ...(submissionProvenance.provenanceAdd || submissionProvenance.provenanceRemove
+            ? { provenance: applyProvenancePlan(readScheduleProvenance(schedule.provenance), submissionProvenance) }
+            : {}),
         };
 
         // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
@@ -16229,6 +16346,76 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Set scheduled chat publish consent error:', error);
       res.status(500).json({ error: 'Failed to update publish consent' });
+    }
+  },
+
+  /**
+   * POST /api/agent-mode/scheduled-chats/:scheduleId/adopt-visitor-edits
+   *
+   * ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into. Removes EVERY visitor mark, after which the
+   * schedule runs with the owner's full tool set again (and its publish authorization resolves from the owner's own settings).
+   *
+   * The owner has to say so, so the guards are the publish-consent endpoint's and stricter:
+   *   - a real portal login only: never a self-call (Emma in the owner's own chat, a marked run's reflection turn, an external
+   *     MCP client: none of them can tell the owner from a visitor), never a delegated session (an admin acting as the owner is not
+   *     the owner), never a write that is a visitor's;
+   *   - the schedule must be the caller's own;
+   *   - the write is bound to the version of the schedule the owner looked at (`updatedAt`): a visitor edit that lands between
+   *     the owner's read and this write makes it 409 instead of adopting content the owner never saw.
+   * Nothing in the MCP tool bodies exposes this route or any provenance (tested).
+   */
+  async adoptScheduledChatVisitorEdits(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const authReq = req as AuthenticatedRequest;
+
+      if (authReq.isSelfCall === true || isVisitorScheduleWrite(req)) {
+        return res.status(403).json({
+          error: 'Only the account owner can adopt a schedule, from the portal. Ask them to open the schedule and choose "Adopt".',
+        });
+      }
+      if (authReq.delegateInfo?.isDelegated) {
+        return res.status(403).json({
+          error: 'A schedule can only be adopted by the account owner themselves, not from a delegated session.',
+        });
+      }
+
+      // Consistent: the decision is about what is stored right now, not a replica that may not have seen a visitor's last edit.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const marks = readScheduleProvenance(schedule.provenance);
+      if (marks.length === 0) {
+        return res.json({ adopted: false, provenance: [], message: 'Nothing to adopt: no part of this schedule was written through a share link.' });
+      }
+
+      try {
+        await scheduleDb.updateSchedule(
+          scheduleId,
+          { provenanceRemove: marks, updatedAt: new Date().toISOString() },
+          { updatedAt: schedule.updatedAt }
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
+          return res.status(409).json({
+            error: 'This schedule changed while you were adopting it, so nothing was saved. Reopen it to see its current content, then adopt it again.',
+          });
+        }
+        throw writeError;
+      }
+
+      console.log(`[ENG-2816] schedule ${scheduleId} adopted by owner ${user.userId}; visitor marks removed [${marks.join(', ')}]`);
+      res.json({
+        adopted: true,
+        provenance: [],
+        message: 'You adopted this schedule. It now runs with your full tool set.',
+      });
+    } catch (error) {
+      console.error('AgentMode: Adopt scheduled chat visitor edits error:', error);
+      res.status(500).json({ error: 'Failed to adopt scheduled chat' });
     }
   },
 
@@ -18641,6 +18828,15 @@ export const agentModeController = {
       if (!visibilityDecision.ok) {
         return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
       }
+      // ENG-2816 (step 3): a share-link visitor acts as the owner and must not widen who a template reaches, or send it for review
+      // (an owner-approved route to every customer's picker). A template has no provenance to mark, so the write is refused.
+      if (
+        isVisitorScheduleWrite(req)
+        && visibilityDecision.visibility !== undefined
+        && visibilityDecision.visibility !== canonicalizeVisibility(existing.visibility)
+      ) {
+        return res.status(403).json({ error: "A template's visibility cannot be changed from a share link. Ask the account owner to do it from their own session." });
+      }
 
       // ENG-669: a system template's model is AgentWeb's choice: schedules created from it inherit the pin as a SYSTEM
       // model, exempt from the tier model allowlist. So only an administrator may change it. Not a change: re-sending
@@ -18900,6 +19096,14 @@ export const agentModeController = {
         }
       }
 
+      // ENG-2816 (step 3): a schedule a share-link visitor creates from a template is a visitor's schedule. The content comes from the
+      // template, and a template carries no provenance of its own (a visitor may have written it), so every tracked field is
+      // marked, not just the ones the request names. Over-marking is safe; the owner adopts it.
+      if (isVisitorScheduleWrite(req)) {
+        scheduledChat.provenance = [...SCHEDULE_PROVENANCE_FIELDS];
+        console.log(`[ENG-2816] schedule ${scheduleId} created from template ${templateId} through a share link; marked every tracked field`);
+      }
+
       await scheduleDb.createSchedule(scheduledChat);
 
       // Increment template usage count
@@ -18937,6 +19141,10 @@ export const agentModeController = {
       }
       if (template.visibility !== 'private') {
         return res.status(400).json({ error: 'Only private templates can be submitted for review' });
+      }
+      // ENG-2816 (step 3): see updateScheduleTemplate. A share-link visitor cannot move a template toward review.
+      if (isVisitorScheduleWrite(req)) {
+        return res.status(403).json({ error: 'A template cannot be submitted for review from a share link. Ask the account owner to do it from their own session.' });
       }
 
       await scheduleTemplateDb.updateTemplate(templateId, {

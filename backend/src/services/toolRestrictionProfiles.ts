@@ -111,6 +111,17 @@ export function isKnownRestrictionProfile(value: unknown): value is RestrictionP
 }
 
 /**
+ * The profile a restriction CLAIM names, where a claim is a value that travels with a self-call (the `_rp` claim of a self-call
+ * token, or the `restrictionProfile` of a tool context on its way into one). Absent means no claim. A known id is itself. A claim
+ * that is PRESENT but not a known id is read as the strictest known profile, not as no claim: whoever put it there meant to
+ * restrict, and a stale or mistyped id must never loosen anything (the same rule `restrictionRefusal` applies).
+ */
+export function normalizeRestrictionClaim(value: unknown): RestrictionProfileId | undefined {
+  if (value === undefined || value === null || value === false || value === '') return undefined;
+  return isKnownRestrictionProfile(value) ? value : 'share_visitor';
+}
+
+/**
  * The refusal when a tool call could not be checked against its schedule's provenance (the session or schedule could not be read,
  * or the schedule is gone). Unverifiable is treated as marked: refusing costs one retry, running as the owner costs the hole.
  */
