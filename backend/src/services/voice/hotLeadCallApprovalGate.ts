@@ -148,8 +148,10 @@ export type ApprovalQuestionInput = { kind: string; priceText: string } & (
     /** Who will be phoned, for example "Dana Lee (***0100)"; at least one. */
     members: string[];
     limits: EnableLimits;
-    /** Calling comes with the paid add-on, bought on approval: the card quotes the flat price (priceText) instead of per-minute rates. */
+    /** Calls are billed through the add-on: the card quotes the flat price (priceText) instead of per-minute rates. */
     addon?: boolean;
+    /** The add-on is bought on this approval; false when the organization already has it. */
+    purchase?: boolean;
   }
 );
 
@@ -164,17 +166,17 @@ function questionText(input: ApprovalQuestionInput): string {
       const { limits } = input;
       const hours = limits.callingHours ? `, only ${limits.callingHours.start}-${limits.callingHours.end} ${limits.callingHours.timezone}` : '';
       const billing = input.addon
-        ? `This costs ${input.priceText}. Calls beyond your monthly limit are not placed.`
+        ? `${input.purchase ? `This costs ${input.priceText}.` : `Your hot lead calls add-on (${input.priceText}) already covers these calls.`} Calls beyond your monthly limit are not placed.`
         : `Both calls are billed to the organization owner per minute at the current rate of ${input.priceText}, each rounded up to a whole minute.`;
       return `Turn on hot lead calling? When a lead arrives from your landing page, AgentWeb will phone ${input.members.join(', ')} from your number${input.number ? ` ${input.number}` : ''}, and then the lead. ${billing} Limits: ${limits.maxCallsPerHour} leads per hour, ${limits.maxCallsPerDay} per day, ${limits.maxCallsPerMonth} per month, at most ${limits.maxAttemptsPerLead} call attempts per lead${hours}. You can turn it off at any time.`;
     }
   }
 }
 
-const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string, addon?: boolean) => string }> = {
+const APPROVE_OPTIONS: Record<HotLeadCallApprovalAction, { label: string; consequence: (priceText: string, addon?: boolean, purchase?: boolean) => string }> = {
   provision: { label: 'Buy the number', consequence: priceText => `Buys the number now and charges ${priceText} until it is released.` },
   release: { label: 'Release the number', consequence: () => 'Releases the number and turns calling off.' },
-  enable: { label: 'Turn calling on', consequence: (priceText, addon) => (addon ? `Adds the add-on to your subscription (${priceText}) and starts calls for new leads now.` : `Calls start for new leads now, billed at ${priceText}.`) },
+  enable: { label: 'Turn calling on', consequence: (priceText, addon, purchase) => (addon ? (purchase ? `Adds the add-on to your subscription (${priceText}) and starts calls for new leads now.` : 'Calls start for new leads now, covered by your add-on.') : `Calls start for new leads now, billed at ${priceText}.`) },
 };
 
 /**
@@ -191,7 +193,7 @@ export function buildApprovalQuestion(input: ApprovalQuestionInput): QuestionDec
       recommended: true,
       why: 'Nothing is spent or changed unless you approve.',
     },
-    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText, input.action === 'enable' && input.addon) },
+    { id: APPROVE_OPTION_ID, label: approve.label, consequence: approve.consequence(input.priceText, input.action === 'enable' && input.addon, input.action === 'enable' && input.purchase) },
   ];
   return { question: questionText(input), options, allowEmmaDecide: false, kind: input.kind, immutable: true };
 }

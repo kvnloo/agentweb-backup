@@ -8,7 +8,7 @@
  * So an org root's partition holds the root's own calls and nothing else.
  *
  * The damage compounds rather than merely omitting rows. `costUsedMicroUsd` comes
- * from `getUserTokenUsage(billingUserId)`, and `incrementUserTokenUsage` resolves
+ * from `getUserTokenUsage(billingUserId)`, and the (retired) counter writer resolved
  * to the billing root before incrementing — so the numerator IS pooled while the
  * daily burn read from the ledger is not. The forecast then divides a whole
  * account's consumption by one person's burn rate and reports a runway several

@@ -33,7 +33,6 @@ jest.mock("../services/usageRecorderService", () => ({
   recordUsage: (...args: unknown[]) => mockRecordUsage(...args),
 }));
 jest.mock("../services/tokenUsageService", () => ({
-  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
   resolveBillingUserId: (userId: string) => Promise.resolve(userId === "member-1" ? "owner-1" : userId),
 }));
 jest.mock("../services/usageRecordDb", () => ({

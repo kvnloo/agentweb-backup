@@ -11,7 +11,7 @@
  * though the root is billed for the whole org.
  *
  * The failure compounds rather than merely dropping rows. `costUsedMicroUsd`
- * comes from `getUserTokenUsage(billingUserId)`, and `incrementUserTokenUsage`
+ * comes from `getUserTokenUsage(billingUserId)`, and the (retired) legacy counter writer
  * resolves to the billing root before incrementing — so the consumed-cost
  * numerator IS pooled while a root-partition-only daily burn is not. Dividing a
  * whole account's consumption by one person's burn rate reports a runway several

@@ -13266,7 +13266,7 @@ export const agentModeController = {
       // ENG-705: this route is registered before `router.use(authenticateToken)`,
       // so the caller is anonymous — but the spend is not. Gate on the share
       // OWNER's allowance (the account `generateSessionResponse` already bills
-      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // via the spend ledger) so an unauthenticated visitor can never
       // cause more vendor spend than the owner could cause themselves. This runs
       // before any LLM call: refuse loudly, never a degraded-but-billed path.
       const usageStatus = await checkTokenUsage(session.userId, TURN_ADMISSION);
