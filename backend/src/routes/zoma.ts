@@ -38,7 +38,7 @@ import {
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
-import { openZomaCheckout } from '../mcp/zomaBilling';
+import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
 export const ZOMA_POLL_MAX_PER_MINUTE = 60;
@@ -241,10 +241,12 @@ export function createZomaRouter(
     }
   });
 
-  router.get('/billing/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), (req: Request, res: Response) => {
+  router.get('/billing/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     if (req.query.result === 'paid') {
       return page(res, 200, "You're on the Zoma plan", '<p>Your trial has started. Go back to your agent and ask it to try the launch again.</p>');
     }
+    // Funnel only (ENG-3131 R5): a failed write must never change what the user sees.
+    await recordZomaCheckoutCanceled(req.query, billingDeps).catch((e) => console.error('[zoma-billing] cancel record failed:', e));
     return page(res, 200, 'Zoma plan', '<p>Checkout was canceled and nothing was charged. Reads and drafts still work. Ask your agent for the link again whenever you want to go live.</p>');
   });
 

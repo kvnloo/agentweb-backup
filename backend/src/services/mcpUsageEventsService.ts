@@ -368,6 +368,8 @@ export type ZomaBillingFunnelStep =
   | 'checkout_started'
   | 'paid'
   | 'checkout_canceled'
+  | 'checkout_expired'
+  | 'trial_reminder_claimed'
   | 'trial_reminder_sent'
   | 'trial_converted'
   | 'trial_canceled'

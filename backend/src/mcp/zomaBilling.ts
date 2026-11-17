@@ -16,7 +16,9 @@
  * Overage is billed by Stripe: every successful call is one meter event, and the overage
  * price is a graduated metered price whose first tier (0–5,000 units) is $0.
  */
+import crypto from 'crypto';
 import type Stripe from 'stripe';
+import { getJwtSecret } from '../config/jwt';
 import { createStripeClient } from '../services/stripeClientFactory';
 import { userDb } from '../services/db';
 import {
@@ -140,9 +142,23 @@ export interface ZomaPlanState {
   periodStart?: string;
   periodEnd?: string;
   cancelAtPeriodEnd?: boolean;
+  /** The $1 fee invoice (the only invoice a trial has) is paid. Stripe can start a trial before it settles. */
+  latestInvoicePaid?: boolean;
 }
 
-export const planAllowsPublish = (state: ZomaPlanState) => state.status === 'trialing' || state.status === 'active';
+/**
+ * `active` is paid by definition (a failed renewal moves the subscription to past_due), so its
+ * latest invoice, often a draft for the first hour of a cycle, is not consulted. A `trialing`
+ * subscription needs its upfront $1 invoice paid first.
+ */
+export const planAllowsPublish = (state: ZomaPlanState) =>
+  state.status === 'active' || (state.status === 'trialing' && state.latestInvoicePaid === true);
+
+/** A live subscription whose $1 payment has not settled: wait for it, never mint a second plan. */
+export const planPaymentPending = (state: ZomaPlanState) => state.status === 'trialing' && !planAllowsPublish(state);
+
+export const PAYMENT_PENDING_MESSAGE =
+  'Your Zoma payment is not confirmed yet, so nothing went live. Finish payment in your existing Stripe checkout or billing portal, then try again. Do not start a second plan.';
 
 const isoFromEpoch = (s: unknown) => (typeof s === 'number' && s > 0 ? new Date(s * 1000).toISOString() : undefined);
 
@@ -161,6 +177,7 @@ export function planStateFromSubscriptions(customerId: string | null, subs: Stri
     periodStart: isoFromEpoch(item?.current_period_start ?? (sub as any).current_period_start),
     periodEnd: isoFromEpoch(item?.current_period_end ?? (sub as any).current_period_end),
     cancelAtPeriodEnd: sub.cancel_at_period_end === true,
+    latestInvoicePaid: typeof sub.latest_invoice === 'object' && sub.latest_invoice !== null && sub.latest_invoice.status === 'paid',
   };
 }
 
@@ -193,8 +210,10 @@ export interface ZomaBillingDeps {
   sendMeterEvent: (p: { eventName: string; customerId: string; value: number; identifier: string; timestamp: number }) => Promise<void>;
   searchTrialingSubscriptions: () => Promise<Stripe.Subscription[]>;
   setSubscriptionMetadata: (subscriptionId: string, metadata: Record<string, string>) => Promise<void>;
-  sendEmail: (to: string, subject: string, text: string, html: string) => Promise<unknown>;
+  sendEmail: (to: string, subject: string, text: string, html: string) => Promise<'sent' | 'suppressed' | 'failed' | void>;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
+  /** One-line account-level ad performance for the range, or undefined when there is nothing to report. */
+  getAdsSummary: (userId: string, range: { start: string; end: string }) => Promise<string | undefined>;
   recordFunnel: (input: ZomaBillingFunnelInput) => Promise<boolean>;
   backendUrl: () => string;
   now: () => number;
@@ -229,7 +248,7 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
     return customer.id;
   },
   async listSubscriptions(customerId) {
-    return (await stripe().subscriptions.list({ customer: customerId, status: 'all', limit: 20 })).data;
+    return (await stripe().subscriptions.list({ customer: customerId, status: 'all', limit: 20, expand: ['data.latest_invoice'] })).data;
   },
   async createCheckoutSession(params) {
     const session = await stripe().checkout.sessions.create(params);
@@ -273,6 +292,17 @@ export const defaultZomaBillingDeps: ZomaBillingDeps = {
     return emailService.sendEmail(to, subject, text, html);
   },
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
+  async getAdsSummary(userId, range) {
+    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER }, { runZomaAdsReport }] = await Promise.all([
+      import('../services/connectedAccountsDb'), import('./zomaProviders'), import('./zomaAdsReport'),
+    ]);
+    const now = Date.now();
+    const account = (await getAccountsByUserIdIncludingOrgShared(userId)).find((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now));
+    const accountId = account && META_PROVIDER.accountIds(account)[0];
+    if (!account || !accountId) return undefined;
+    const report = await runZomaAdsReport(account, accountId, { level: 'account', since: range.start.slice(0, 10), until: range.end.slice(0, 10) });
+    return report.totals.spend > 0 || report.totals.impressions > 0 ? report.summary : undefined;
+  },
   recordFunnel: (input) => recordZomaBillingFunnel(input),
   backendUrl: getBackendUrl,
   now: () => Date.now(),
@@ -319,7 +349,7 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
     },
     metadata,
     success_url: `${done}?result=paid`,
-    cancel_url: `${done}?result=canceled`,
+    cancel_url: zomaCheckoutCancelUrl(done, userId),
     // Stripe allows 30 min – 24 h; the agent may relay the link a while after minting it.
     expires_at: Math.floor(deps.now() / 1000) + 23 * 60 * 60,
     custom_text: {
@@ -330,6 +360,29 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
   });
   if (!session.url) throw new Error('Stripe did not return a Checkout URL.');
   return zomaCheckoutRedirectUrl(session.id, deps);
+}
+
+// Stripe does not substitute the session id into cancel_url, so the cancel redirect carries the
+// user id with an HMAC. The signature stops anyone from inflating another user's cancel count.
+const cancelSignature = (userId: string, secret: string) =>
+  crypto.createHmac('sha256', secret).update(`zoma-checkout-cancel:${userId}`).digest('hex').slice(0, 32);
+
+export function zomaCheckoutCancelUrl(doneUrl: string, userId: string, secret: string = getJwtSecret()): string {
+  return `${doneUrl}?${new URLSearchParams({ result: 'canceled', u: userId, s: cancelSignature(userId, secret) })}`;
+}
+
+/** The user landed on the cancel redirect: they left Stripe at card entry. At most once per hour. */
+export async function recordZomaCheckoutCanceled(
+  query: { u?: unknown; s?: unknown },
+  deps: Pick<ZomaBillingDeps, 'recordFunnel'> = defaultZomaBillingDeps,
+  now: number = Date.now(),
+  secret: string = getJwtSecret(),
+): Promise<boolean> {
+  const userId = typeof query.u === 'string' ? query.u : '';
+  const given = Buffer.from(typeof query.s === 'string' ? query.s : '');
+  const expected = Buffer.from(userId ? cancelSignature(userId, secret) : '');
+  if (!userId || given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return false;
+  return deps.recordFunnel({ userId, step: 'checkout_canceled', dedupeKey: `${userId}#${new Date(now).toISOString().slice(0, 13)}`, dimensions: { surface: 'cancel_redirect' } });
 }
 
 export function paywallMessage(cfg: ZomaBillingConfig, link: string): string {
@@ -368,6 +421,7 @@ export async function assertZomaPublishAllowed(
     throw new ZomaPaywallError('Could not check the Zoma plan right now, so nothing went live. Try again shortly.');
   }
   if (planAllowsPublish(state)) return;
+  if (planPaymentPending(state)) throw new ZomaPaywallError(PAYMENT_PENDING_MESSAGE);
   let link: string | undefined;
   try {
     link = await createZomaTrialCheckoutLink(userId, deps);
@@ -411,7 +465,9 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
-    if (!summary.publish_enabled) {
+    if (planPaymentPending(state)) {
+      summary.error = PAYMENT_PENDING_MESSAGE;
+    } else if (!summary.publish_enabled) {
       summary.link = await createZomaTrialCheckoutLink(userId, deps);
       void deps.recordFunnel({ userId, step: 'paywall_shown', dimensions: { surface: 'zoma_status', planStatus: state.status } })
         .catch((e) => console.error('[zoma-billing] funnel record failed:', e));
@@ -548,7 +604,8 @@ export async function handleZomaBillingWebhookEvent(
       break;
     }
     case 'checkout.session.expired':
-      await record('checkout_canceled', { sessionId: obj.id });
+      // Not a user action: the 23h session lapsed unused. The cancel redirect records checkout_canceled.
+      await record('checkout_expired', { sessionId: obj.id });
       break;
     case 'customer.subscription.updated':
       if (event.data.previous_attributes?.status === 'trialing' && obj.status === 'active') {
@@ -600,8 +657,8 @@ export function trialReminderDue(sub: Pick<Stripe.Subscription, 'status' | 'tria
   return now >= sub.trial_start * 1000 + reminderDay * DAY_MS && now < sub.trial_end * 1000;
 }
 
-export function trialReminderEmail(input: { usage: McpUserUsage; trialEnd: string; cfg: ZomaBillingConfig }) {
-  const { usage, cfg } = input;
+export function trialReminderEmail(input: { usage: McpUserUsage; adsSummary?: string; trialEnd: string; cfg: ZomaBillingConfig }) {
+  const { usage, cfg, adsSummary } = input;
   const kinds = usage.recentWrites.length ? `\nRecent changes: ${usage.recentWrites.map((w) => `${w.action ?? ''} ${w.entityType ?? ''}`.trim()).join(', ')}.` : '';
   const endDate = input.trialEnd.slice(0, 10);
   const summary = [
@@ -614,6 +671,7 @@ export function trialReminderEmail(input: { usage: McpUserUsage; trialEnd: strin
     '',
     `Your Zoma trial ends on ${endDate}. After that the plan is ${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included and ${cfg.overageCentsPerCall}¢ per call after that.`,
     '',
+    ...(adsSummary ? [`How your ads are doing: ${adsSummary}`, ''] : []),
     summary,
     '',
     cfg.billingPortalUrl
@@ -626,13 +684,18 @@ export function trialReminderEmail(input: { usage: McpUserUsage; trialEnd: strin
 }
 
 /**
- * Hourly job: email every Zoma trial on its reminder day, once. The marker is written to the
- * subscription BEFORE sending, so a crash can miss one email but never sends two.
+ * Hourly job: email every Zoma trial on its reminder day, once.
+ *
+ * Each pass first claims the (subscription, hour) with a conditional funnel write, so only one
+ * backend instance sends in a given hour. The "sent" marker goes on the subscription only after
+ * the mail left (`sendEmail` never throws; it reports 'sent' | 'suppressed' | 'failed'), so a
+ * failed send is retried on the next pass and a delivered one is never repeated.
  */
 export async function runZomaTrialReminders(deps: ZomaBillingDeps = defaultZomaBillingDeps): Promise<{ checked: number; sent: number }> {
   const cfg = deps.config();
   if (!cfg.enabled) return { checked: 0, sent: 0 };
   const now = deps.now();
+  const hour = new Date(now).toISOString().slice(0, 13);
   const subs = await deps.searchTrialingSubscriptions();
   let sent = 0;
   for (const sub of subs) {
@@ -641,14 +704,22 @@ export async function runZomaTrialReminders(deps: ZomaBillingDeps = defaultZomaB
     try {
       const user = userId ? await deps.getUser(userId) : null;
       if (!user?.email) continue;
+      const claimed = await deps.recordFunnel({ userId: userId!, step: 'trial_reminder_claimed', dedupeKey: `${sub.id}#${hour}`, dimensions: { subscriptionId: sub.id } });
+      if (!claimed) continue;
+      const range = { start: new Date(sub.trial_start! * 1000).toISOString(), end: new Date(now).toISOString() };
+      const [usage, adsSummary] = await Promise.all([
+        deps.getUsage(userId!, range),
+        deps.getAdsSummary(userId!, range).catch((e) => { console.error('[zoma-billing] ads summary failed:', e instanceof Error ? e.message : e); return undefined; }),
+      ]);
+      const email = trialReminderEmail({ usage, adsSummary, trialEnd: new Date(sub.trial_end! * 1000).toISOString(), cfg });
+      const outcome = await deps.sendEmail(user.email, email.subject, email.text, email.html);
+      if (outcome === 'failed') {
+        console.error(`[zoma-billing] trial reminder for ${sub.id} was not delivered; retrying next pass`);
+        continue;
+      }
       await deps.setSubscriptionMetadata(sub.id, { [TRIAL_REMINDER_METADATA_KEY]: new Date(now).toISOString() });
-      const usage = await deps.getUsage(userId!, { start: new Date(sub.trial_start! * 1000).toISOString(), end: new Date(now).toISOString() });
-      const email = trialReminderEmail({
-        usage,
-        trialEnd: new Date(sub.trial_end! * 1000).toISOString(),
-        cfg,
-      });
-      await deps.sendEmail(user.email, email.subject, email.text, email.html);
+      // 'suppressed' is the non-prod mail guard: nothing left the box, so it is done but not counted.
+      if (outcome !== 'sent') continue;
       sent += 1;
       await deps.recordFunnel({ userId: userId!, step: 'trial_reminder_sent', dedupeKey: sub.id, dimensions: { subscriptionId: sub.id } })
         .catch((e) => console.error('[zoma-billing] funnel record failed:', e));
