@@ -517,7 +517,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     return result;
   }
 
-  // ENG-2823: Google Ads provider (dark until ZOMA_GOOGLE_ADS_ENABLED=true). Loaded lazily so
+  // ENG-2823: Google Ads provider (dark until ZOMA_GOOGLE_ENABLED=true). Loaded lazily so
   // the Meta path never imports the Google stack.
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
