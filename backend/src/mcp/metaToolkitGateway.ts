@@ -46,6 +46,7 @@ import { executeMetaToolkitAudience } from './metaToolkitAudiences';
 import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClient } from './zomaDatabricksReadOnly';
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
+import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
 
 /**
  * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
@@ -129,6 +130,8 @@ export interface MetaToolkitGatewayDeps {
   getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
   /** ENG-3127: last-30-day spend of a connected Meta ad account; defaults to a Graph insights read. */
   accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
+  /** ENG-3134 zoma_ads_report; defaults to runZomaAdsReport (Graph insights read). */
+  runAdsReport?: (account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -514,6 +517,18 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+
+  // ENG-3134: reporting on the resolved (owned, usable) account with that connection's own token.
+  if (isZomaAdsReportTool(request.toolName)) {
+    const account = (await deps.listAccounts(caller.userId)).find(
+      (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
+    );
+    if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
+    const report = await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
+    await meter('meta');
+    journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
+    return stripCredentials(report);
+  }
 
   if (isSignalsRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
