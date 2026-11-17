@@ -52,6 +52,7 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'cancel_smartlead_push',
   'assess_client_health',
   'check_account_tracking_health',
+  'read_client_meta_activity',
   'configure_landing_page_subdomain',
   'create_blog_article',
   'create_knowledge_base_file',
