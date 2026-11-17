@@ -58,6 +58,18 @@ function throttle(bucket: string, maxPerMinute: number) {
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
 
+// Step text carries provider URLs the user must open; plain text is not clickable, so https URLs become links.
+export function linkifyHttps(text: string): string {
+  return text
+    .split(/(https:\/\/[^\s<>"']+)/)
+    .map((part, i) => {
+      if (i % 2 === 0) return escapeHtml(part);
+      const url = part.replace(/[.,;:!?)\]]+$/, '');
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${escapeHtml(part.slice(url.length))}`;
+    })
+    .join('');
+}
+
 // Browsers enforce form-action on the redirect chain a form submit starts, and the picker's
 // submit continues on to Stripe Checkout (or back to Meta), so that page allows those hops.
 const PICKER_FORM_ACTION = "'self' https://checkout.stripe.com https://www.facebook.com";
@@ -127,7 +139,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
     );
   }
   const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">${escapeHtml(step.retryLabel ?? 'Try again')}</a></p>` : '';
-  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>` : '';
+  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${linkifyHttps(s)}</li>`).join('')}</ol>` : '';
   return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${steps}${retry}`);
 }
 

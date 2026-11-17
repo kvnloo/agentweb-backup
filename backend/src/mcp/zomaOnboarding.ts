@@ -33,7 +33,7 @@ import {
 import { type ZomaToolName } from './zomaToolDefinitions';
 import {
   adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
-  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_META_LOGIN_NOTE, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
 } from './zomaAdsExperience';
 
 export class ZomaNotReadyError extends Error {
@@ -362,7 +362,13 @@ export async function getZomaReadiness(
   const allAccounts = await deps.listAccounts(userId);
   const accounts = usableAccounts(allAccounts, META_PROVIDER, deps.now());
   const meta: ZomaReadiness['meta'] = { ready: accounts.length > 0, accounts: accounts.map(summarize) };
-  if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
+  if (!meta.ready && mintLinks) {
+    try {
+      meta.link = await deps.buildMetaConnectUrl(userId);
+    } catch (error) {
+      console.error('[zoma] meta connect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
 
   const writes_enabled = payment.ready && meta.ready;
   let blocker = metaPageBlocker(accounts);
@@ -445,7 +451,7 @@ function nextStep(
           : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
         : []),
       'Tell me when it is connected and I will re-check.',
-      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
+      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
     ].join('\n');
   }
   if (!payment.ready) {
