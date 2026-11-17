@@ -124,7 +124,8 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     expect(next).toContain('https://adsmanager.facebook.com');
     expect(next).toContain('https://www.facebook.com/business/help');
     expect(next).toContain('https://business.facebook.com/settings/ad-accounts');
-    expect(next).toContain('re-check');
+    expect(next).toContain('reconnect Meta using the same connect link');
+    expect(next.split('does not need to use the same email as your Zoma login')).toHaveLength(2);
   });
 
   it('a Facebook login with no ad account: guided page, nothing saved, no false success, resumes on reconnect', async () => {
