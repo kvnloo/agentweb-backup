@@ -23,13 +23,7 @@ import {
   summarizePartialFailure,
   type ConversionUploadFailure,
 } from '../utils/googleAdsOfflineConversions';
-
-/** Google's authorizationError CUSTOMER_NOT_ENABLED, read defensively: this runs inside a catch and must never throw. */
-function isCustomerNotEnabled(err: any): boolean {
-  const details = err?.response?.data?.error?.details;
-  if (!Array.isArray(details)) return false;
-  return details.some((d: any) => Array.isArray(d?.errors) && d.errors.some((e: any) => e?.errorCode?.authorizationError === 'CUSTOMER_NOT_ENABLED'));
-}
+import { googleAdsErrorCodes } from './googleAdsOAuthErrors';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 
@@ -718,7 +712,7 @@ export class GoogleAdsService {
         }
       } catch (err: any) {
         // Couldn't even identify this account — skip it, but log so the drop isn't silent.
-        if (diagnostics && isCustomerNotEnabled(err)) (diagnostics.notEnabledCustomerIds ??= []).push(customerId);
+        if (diagnostics && googleAdsErrorCodes(err).includes('CUSTOMER_NOT_ENABLED')) (diagnostics.notEnabledCustomerIds ??= []).push(customerId);
         console.warn(`[GoogleAds] listAccountHierarchy: skipping customer ${customerId} (probe failed):`, err?.message || err);
       }
     }
