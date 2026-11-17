@@ -22,7 +22,7 @@ import {
   pollSetup, startSetup, ZOMA_ADS_EXPERIENCE_PATH, type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
 import type { ZomaDeviceRecord, ZomaDeviceStore, ZomaTokenRecord } from '../mcp/zomaDeviceStore';
-import { ZOMA_NEW_TO_ADS_STEPS, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience } from '../mcp/zomaAdsExperience';
+import { ZOMA_META_LOGIN_NOTE, ZOMA_NEW_TO_ADS_STEPS, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience } from '../mcp/zomaAdsExperience';
 import { defaultZomaLinkCodec } from '../mcp/zomaSetupLinks';
 import { createZomaRouter } from '../routes/zoma';
 
@@ -210,7 +210,7 @@ describe('ENG-3128 poll (agent asks in chat)', () => {
     const { deviceCode } = await approved(h);
     const r = await pollSetup(deviceCode, h.deps, { adsExperience: 'runs_ads' });
     expect(h.deps.saveAdsExperience).toHaveBeenCalledWith('user-1', 'runs_ads');
-    expect(r.body).toMatchObject({ next_step: 'connect_meta', link: META });
+    expect(r.body).toMatchObject({ next_step: 'connect_meta', link: META, note: ZOMA_META_LOGIN_NOTE });
     expect(r.body).not.toHaveProperty('guide');
   });
 
@@ -219,6 +219,8 @@ describe('ENG-3128 poll (agent asks in chat)', () => {
     const { deviceCode } = await approved(h);
     const r = await pollSetup(deviceCode, h.deps, { adsExperience: 'new_to_ads' });
     expect(r.body).toMatchObject({ next_step: 'connect_meta', link: META, guide: ZOMA_NEW_TO_ADS_STEPS });
+    // The guide already ends with the login note, so it is not repeated as a separate field.
+    expect(r.body).not.toHaveProperty('note');
   });
 
   it('not_interested via poll: next_step not_interested, thank-you message, never a token', async () => {

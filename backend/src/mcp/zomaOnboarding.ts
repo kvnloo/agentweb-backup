@@ -33,15 +33,16 @@ import {
 import { type ZomaToolName } from './zomaToolDefinitions';
 import {
   adsExperienceQuestionText, defaultAdsExperienceStore, newToAdsGuideText, parseZomaAdsExperience,
-  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
+  ZOMA_ADS_EXPERIENCE_VALUES, ZOMA_META_LOGIN_NOTE, ZOMA_NOT_INTERESTED_MESSAGE, type ZomaAdsExperience,
 } from './zomaAdsExperience';
+import {
+  formatZomaBillingUsage, formatZomaPlanLine, getZomaBillingConfig, getZomaBillingUsage, getZomaPlanSummary,
+  type ZomaBillingUsage, type ZomaPlanSummary,
+} from './zomaBilling';
 
-export class ZomaNotReadyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ZomaNotReadyError';
-  }
-}
+import { ZomaNotReadyError } from './zomaErrors';
+
+export { ZomaNotReadyError };
 
 export interface ZomaMetaAccountSummary {
   account_id: string;
@@ -119,6 +120,11 @@ export interface ZomaReadiness {
    * issues its token or shows "You're set".
    */
   blocker: ZomaMetaPageBlocker | null;
+  /**
+   * ENG-3131: present only while ZOMA_BILLING_ENABLED=true. Reads and drafts never need it;
+   * a write that makes ads live needs `publish_enabled`. `link` is the $1 trial Checkout.
+   */
+  plan?: ZomaPlanSummary;
   next_step: string | null;
   /** ENG-3134: Zoma's guide. */
   docs_url?: string;
@@ -142,6 +148,10 @@ export interface ZomaOnboardingDeps {
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
   /** ENG-3128: persist the ads-experience answer on the user row. */
   saveAdsExperience?: (userId: string, answer: ZomaAdsExperience) => Promise<void>;
+  /** ENG-3131 plan section of zoma_status; undefined while billing is off. */
+  getPlan?: (userId: string) => Promise<ZomaPlanSummary | undefined>;
+  /** ENG-3130 included/used/overage block of zoma_usage; undefined while billing is off. */
+  getBillingUsage?: (userId: string) => Promise<ZomaBillingUsage | undefined>;
 }
 
 const defaultDeps: ZomaOnboardingDeps = {
@@ -157,6 +167,8 @@ const defaultDeps: ZomaOnboardingDeps = {
   now: () => Date.now(),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
   saveAdsExperience: (userId, answer) => defaultAdsExperienceStore.save(userId, answer, new Date().toISOString()),
+  getPlan: (userId) => getZomaPlanSummary(userId),
+  getBillingUsage: (userId) => getZomaBillingUsage(userId),
 };
 
 /** Same usability rule the toolkit gateway applies to account resolution (now in zomaProviders). */
@@ -282,7 +294,8 @@ function summarizeGoogle(account: ConnectedAccount): ZomaGoogleAdsAccountSummary
 }
 
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
-  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId);
+  // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
+  return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
 }
 
 /**
@@ -292,6 +305,8 @@ async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
  */
 async function hasPaymentMethod(user: any, userId: string, deps: ZomaOnboardingDeps): Promise<boolean> {
   // Card requirement paused (2026-11-10, eng lead). Set ZOMA_REQUIRE_PAYMENT_METHOD=true to re-enable.
+  // ENG-3131: a card is now asked for at the first publish (zomaBilling.ts), so leave this unset: setting
+  // it brings back the card wall at signup, which the paid-launch plan rules out.
   if (process.env.ZOMA_REQUIRE_PAYMENT_METHOD !== 'true') return true;
   return (await deps.resolvePaymentMethod(user, userId)).hasPaymentMethod;
 }
@@ -361,7 +376,13 @@ export async function getZomaReadiness(
   const allAccounts = await deps.listAccounts(userId);
   const accounts = usableAccounts(allAccounts, META_PROVIDER, deps.now());
   const meta: ZomaReadiness['meta'] = { ready: accounts.length > 0, accounts: accounts.map(summarize) };
-  if (!meta.ready && mintLinks) meta.link = await deps.buildMetaConnectUrl(userId);
+  if (!meta.ready && mintLinks) {
+    try {
+      meta.link = await deps.buildMetaConnectUrl(userId);
+    } catch (error) {
+      console.error('[zoma] meta connect link failed:', error instanceof Error ? error.message : error);
+    }
+  }
 
   const writes_enabled = payment.ready && meta.ready;
   let blocker = metaPageBlocker(accounts);
@@ -395,6 +416,10 @@ export async function getZomaReadiness(
       }
     }
     readiness.google_ads = g;
+  }
+  if (mintLinks && deps.getPlan) {
+    const plan = await deps.getPlan(userId);
+    if (plan) readiness.plan = plan;
   }
   readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   readiness.docs_url = zomaDocsUrl(deps);
@@ -437,9 +462,14 @@ function nextStep(
       meta.link
         ? `Connect Meta (Facebook login) and pick your ad account → ${meta.link}`
         : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
-      ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
+      // ENG-3135: never fall back to the bare ads.google.com — that is Google's campaign signup.
+      ...(google
+        ? [google.link
+          ? `Or connect an existing Google Ads account → ${google.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
+        : []),
       'Tell me when it is connected and I will re-check.',
-      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
+      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
     ].join('\n');
   }
   if (!payment.ready) {
@@ -475,6 +505,7 @@ export function formatZomaStatus(r: ZomaReadiness): string {
           : r.google_ads.link ? ` → ${r.google_ads.link}` : ''
       }`]
       : []),
+    ...(r.plan ? [formatZomaPlanLine(r.plan, getZomaBillingConfig())] : []),
     '',
     r.next_step ?? zomaAllSetText(r.docs_url ?? zomaDocsUrl(), r.meta.ready),
   ];
@@ -490,13 +521,13 @@ export function currentUsageMonth(now: number): { start: string; end: string } {
   };
 }
 
-export function formatZomaUsage(u: McpUserUsage): string {
+export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage): string {
   const lines = [
     `Zoma usage ${u.start.slice(0, 7)} (UTC month):`,
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
     ...u.recentWrites.map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
-    'Billing is not enabled yet; usage is only recorded.',
+    ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');
 }
@@ -520,7 +551,8 @@ export async function runZomaTool(name: ZomaToolName, args: unknown, context: { 
   }
   if (name === 'zoma_usage') {
     const usage = await deps.getUsage(context.userId, currentUsageMonth(deps.now()));
-    return { summary: formatZomaUsage(usage), ...usage };
+    const billing = deps.getBillingUsage ? await deps.getBillingUsage(context.userId) : undefined;
+    return { summary: formatZomaUsage(usage, billing), ...usage, ...(billing ? { billing } : {}) };
   }
   throw new ZomaNotReadyError(`Unknown Zoma tool ${name}.`);
 }
