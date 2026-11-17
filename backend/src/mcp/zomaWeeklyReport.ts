@@ -88,9 +88,34 @@ export function inSendWindow(ms: number, cfg: Pick<ZomaWeeklyReportConfig, 'week
   return d.getUTCDay() === cfg.weekday && d.getUTCHours() >= cfg.hour;
 }
 
+/** The week's account-level Meta totals (from the `zoma_ads_report` totals, never its agent-facing text). */
+export interface ZomaAdsWeek {
+  currency?: string;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  conversions: number;
+  roas: number | null;
+  conversionEvent: string | null;
+}
+
+const int = (n: number) => Math.round(n).toLocaleString('en-US');
+const money = (n: number, currency?: string) => `${n.toFixed(2)}${currency ? ` ${currency}` : ''}`;
+
+/** Plain lines for the email: spend and results only. */
+export function adsWeekLines(ads: ZomaAdsWeek): string[] {
+  return [
+    `Spend: ${money(ads.spend, ads.currency)}`,
+    `Impressions: ${int(ads.impressions)}`,
+    `Clicks: ${int(ads.clicks)}`,
+    `Conversions: ${int(ads.conversions)}${ads.conversionEvent ? ` (${ads.conversionEvent})` : ''}`,
+    ...(ads.roas !== null && ads.roas > 0 ? [`Return on ad spend: ${ads.roas}x`] : []),
+  ];
+}
+
 /** A user with no ad delivery and no confirmed change this week has nothing to report. */
-export function hasSomethingToReport(usage: Pick<McpUserUsage, 'toolCalls' | 'writes'>, adsSummary: string | undefined): boolean {
-  return usage.toolCalls > 0 && (!!adsSummary || usage.writes.confirmed > 0);
+export function hasSomethingToReport(usage: Pick<McpUserUsage, 'toolCalls' | 'writes'>, ads: ZomaAdsWeek | undefined): boolean {
+  return usage.toolCalls > 0 && (!!ads || usage.writes.confirmed > 0);
 }
 
 /** Internal/test/admin accounts and "pal" leads never get product email. */
@@ -138,17 +163,17 @@ function describeWrite(w: McpUserUsage['recentWrites'][number]): string {
 
 export interface WeeklyReportEmailInput {
   usage: McpUserUsage;
-  adsSummary?: string;
+  ads?: ZomaAdsWeek;
   range: { start: string; end: string };
   unsubscribeUrl: string;
 }
 
 export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: string; text: string; html: string } {
-  const { usage, adsSummary, range, unsubscribeUrl } = input;
+  const { usage, ads, range, unsubscribeUrl } = input;
   const day = (iso: string) => iso.slice(0, 10);
   const confirmed = usage.writes.confirmed;
   const recent = usage.recentWrites.filter((w) => w.verification === 'CONFIRMED').slice(-5).reverse();
-  const perf = adsSummary ?? 'No ad delivery was recorded on your connected Meta ad account this week.';
+  const perfLines = ads ? adsWeekLines(ads) : ['No ad delivery was recorded on your connected Meta ad account this week.'];
   const changes = confirmed > 0
     ? `Zoma made ${confirmed} confirmed change${confirmed === 1 ? '' : 's'} to your ads this week.`
     : 'Zoma made no changes to your ads this week.';
@@ -160,7 +185,7 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
     `Here is your Zoma week, ${day(range.start)} to ${day(range.end)}.`,
     '',
     'How your ads did',
-    perf,
+    ...perfLines,
     '',
     'What Zoma changed',
     changes,
@@ -175,7 +200,7 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
 
   const html = [
     `<p>Here is your Zoma week, ${escapeHtml(day(range.start))} to ${escapeHtml(day(range.end))}.</p>`,
-    `<h3>How your ads did</h3><p>${escapeHtml(perf)}</p>`,
+    `<h3>How your ads did</h3>${ads ? `<ul>${perfLines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>` : `<p>${escapeHtml(perfLines[0])}</p>`}`,
     `<h3>What Zoma changed</h3><p>${escapeHtml(changes)}</p>`,
     recentLines.length ? `<ul>${recent.map((w) => `<li>${escapeHtml(day(w.ts))}: ${escapeHtml(describeWrite(w))}</li>`).join('')}</ul>` : '',
     `<p>${escapeHtml(callLine)}</p>`,
@@ -199,8 +224,8 @@ export interface ZomaWeeklyReportDeps {
   claim: (userId: string, week: string) => Promise<boolean>;
   recordSent: (userId: string, week: string) => Promise<unknown>;
   getUsage: (userId: string, range: { start: string; end: string }) => Promise<McpUserUsage>;
-  /** One-line account-level Meta ad performance for the range, or undefined when there was no delivery. */
-  getAdsSummary: (userId: string, range: { start: string; end: string }) => Promise<string | undefined>;
+  /** Account-level Meta totals for the range, or undefined when there was no delivery or no usable ad account. */
+  getAdsWeek: (userId: string, range: { start: string; end: string }) => Promise<ZomaAdsWeek | undefined>;
   sendEmail: (to: string, subject: string, text: string, html: string) => Promise<'sent' | 'suppressed' | 'failed' | void>;
   backendUrl: () => string;
   secret: () => string;
@@ -237,15 +262,15 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
       if (await deps.hasClaimed(user.userId, week)) continue;
       const usage = await deps.getUsage(user.userId, range);
       if (usage.toolCalls < 1) continue;
-      const adsSummary = await deps.getAdsSummary(user.userId, range).catch((error) => {
-        console.error('[zoma-weekly-report] ads summary failed:', error instanceof Error ? error.message : error);
+      const ads = await deps.getAdsWeek(user.userId, range).catch((error) => {
+        console.error('[zoma-weekly-report] ads totals failed:', error instanceof Error ? error.message : error);
         return undefined;
       });
-      if (!hasSomethingToReport(usage, adsSummary)) continue;
+      if (!hasSomethingToReport(usage, ads)) continue;
       // Claim BEFORE sending: a concurrent or repeated pass loses the conditional write and sends nothing.
       if (!(await deps.claim(user.userId, week))) continue;
       claimedThisPass += 1;
-      const email = weeklyReportEmail({ usage, adsSummary, range, unsubscribeUrl: zomaUnsubscribeUrl(user.userId, deps) });
+      const email = weeklyReportEmail({ usage, ads, range, unsubscribeUrl: zomaUnsubscribeUrl(user.userId, deps) });
       const outcome = await deps.sendEmail(user.email, email.subject, email.text, email.html);
       if (outcome === 'failed') {
         result.failed += 1;
@@ -290,7 +315,7 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
   claim: (userId, week) => recordZomaBillingFunnel({ userId, step: 'weekly_report_claimed', dedupeKey: `${userId}#${week}` }),
   recordSent: (userId, week) => recordZomaBillingFunnel({ userId, step: 'weekly_report_sent', dedupeKey: `${userId}#${week}` }),
   getUsage: (userId, range) => getMcpUserUsage(userId, range),
-  async getAdsSummary(userId, range) {
+  async getAdsWeek(userId, range) {
     const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER }, { runZomaAdsReport }] = await Promise.all([
       import('../services/connectedAccountsDb'), import('./zomaProviders'), import('./zomaAdsReport'),
     ]);
@@ -299,7 +324,9 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
     const accountId = account && META_PROVIDER.accountIds(account)[0];
     if (!account || !accountId) return undefined;
     const report = await runZomaAdsReport(account, accountId, { level: 'account', since: range.start.slice(0, 10), until: range.end.slice(0, 10) });
-    return report.totals.spend > 0 || report.totals.impressions > 0 ? report.summary : undefined;
+    const t = report.totals;
+    if (!(t.spend > 0 || t.impressions > 0)) return undefined;
+    return { currency: report.currency, spend: t.spend, impressions: t.impressions, clicks: t.clicks, conversions: t.conversions, roas: t.roas, conversionEvent: report.conversion_event };
   },
   async sendEmail(to, subject, text, html) {
     const { emailService } = await import('../services/emailService');

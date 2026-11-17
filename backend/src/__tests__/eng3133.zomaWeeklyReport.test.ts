@@ -18,10 +18,17 @@ jest.mock('../services/mcpUsageEventsService', () => ({
   recordZomaBillingFunnel: (...a: any[]) => mockRecordFunnel(...a),
 }));
 
+const mockRunReport = jest.fn();
+jest.mock('../mcp/zomaAdsReport', () => ({
+  ...jest.requireActual('../mcp/zomaAdsReport'),
+  runZomaAdsReport: (...a: any[]) => mockRunReport(...a),
+}));
+
 import express from 'express';
 import request from 'supertest';
 import { createZomaRouter } from '../routes/zoma';
 import {
+  adsWeekLines,
   getZomaWeeklyReportConfig,
   hasSomethingToReport,
   inSendWindow,
@@ -33,6 +40,8 @@ import {
   verifyUnsubscribeToken,
   weeklyReportEmail,
   zomaUnsubscribeUrl,
+  defaultZomaWeeklyReportDeps,
+  type ZomaAdsWeek,
   type ZomaWeeklyReportConfig,
   type ZomaWeeklyReportDeps,
 } from '../mcp/zomaWeeklyReport';
@@ -59,6 +68,8 @@ const usage = (over: Partial<McpUserUsage> = {}): McpUserUsage => ({
   ...over,
 });
 
+const ADS: ZomaAdsWeek = { currency: 'USD', spend: 120.5, impressions: 14000, clicks: 310, conversions: 22, roas: 2.4, conversionEvent: 'purchase' };
+
 const customer = (id: string, over: Record<string, unknown> = {}) => ({ userId: id, email: `${id}@acme.co`, ...over }) as any;
 
 function makeDeps(over: Partial<ZomaWeeklyReportDeps> = {}): ZomaWeeklyReportDeps & { sent: any[] } {
@@ -71,7 +82,7 @@ function makeDeps(over: Partial<ZomaWeeklyReportDeps> = {}): ZomaWeeklyReportDep
     claim: jest.fn().mockResolvedValue(true),
     recordSent: jest.fn().mockResolvedValue(true),
     getUsage: jest.fn().mockResolvedValue(usage()),
-    getAdsSummary: jest.fn().mockResolvedValue('Spent $120.50 on 14,000 impressions, 310 clicks, 22 conversions.'),
+    getAdsWeek: jest.fn().mockResolvedValue(ADS),
     sendEmail: jest.fn(async (...a: any[]) => { sent.push(a); return 'sent'; }),
     backendUrl: () => 'https://api.test/',
     secret: () => SECRET,
@@ -121,8 +132,8 @@ describe('pure rules', () => {
     [{ toolCalls: 3, writes: { total: 0, confirmed: 0, mismatch: 0, unconfirmed: 0 } }, 'Spent $5', true],
     [{ toolCalls: 3, writes: { total: 1, confirmed: 1, mismatch: 0, unconfirmed: 0 } }, undefined, true],
     [{ toolCalls: 3, writes: { total: 1, confirmed: 0, mismatch: 1, unconfirmed: 0 } }, undefined, false],
-  ])('has something to report: %j / %s -> %s', (u, summary, expected) => {
-    expect(hasSomethingToReport(u as any, summary as any)).toBe(expected);
+  ])('has something to report: %j / %j -> %s', (u, ads, expected) => {
+    expect(hasSomethingToReport(u as any, ads as any)).toBe(expected);
   });
 
   it('recipients: real customers only', () => {
@@ -156,24 +167,29 @@ describe('unsubscribe token', () => {
 
 describe('the email', () => {
   const range = { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' };
-  it('shows performance, the confirmed changes, the call count and the unsubscribe link', () => {
-    const e = weeklyReportEmail({ usage: usage(), adsSummary: 'Spent $120.50 on 14,000 impressions.', range, unsubscribeUrl: 'https://api.test/u?t=abc' });
+  it('shows spend and results, the confirmed changes, the call count and the unsubscribe link', () => {
+    const e = weeklyReportEmail({ usage: usage(), ads: ADS, range, unsubscribeUrl: 'https://api.test/u?t=abc' });
     expect(e.subject).toBe('Your Zoma week in ads');
     expect(e.text).toContain('2026-11-16 to 2026-11-23');
-    expect(e.text).toContain('Spent $120.50 on 14,000 impressions.');
+    expect(e.text).toContain('Spend: 120.50 USD');
+    expect(e.text).toContain('Impressions: 14,000');
+    expect(e.text).toContain('Clicks: 310');
+    expect(e.text).toContain('Conversions: 22 (purchase)');
+    expect(e.text).toContain('Return on ad spend: 2.4x');
     expect(e.text).toContain('Zoma made 2 confirmed changes to your ads this week.');
     expect(e.text).toContain('- 2026-11-20: create ad set');
     expect(e.text).toContain('- 2026-11-18: update campaign');
     expect(e.text).toContain('Your agent made 12 successful Zoma calls this week.');
     expect(e.text).toContain('Stop this weekly email: https://api.test/u?t=abc');
+    expect(e.html).toContain('<li>Spend: 120.50 USD</li>');
     expect(e.html).toContain('href="https://api.test/u?t=abc"');
     expect(e.html).toContain('support@agentweb.pro');
   });
-  it('never includes object ids, and escapes the summary and url in the HTML', () => {
-    const e = weeklyReportEmail({ usage: usage(), adsSummary: '<script>alert(1)</script> & more', range, unsubscribeUrl: 'https://api.test/u?t="x"&y=1' });
-    expect(e.text + e.html).not.toMatch(/120000111|120000222/);
+  it('never includes object ids or the ad account id, and escapes values and the url in the HTML', () => {
+    const e = weeklyReportEmail({ usage: usage(), ads: { ...ADS, conversionEvent: '<script>alert(1)</script>' }, range, unsubscribeUrl: 'https://api.test/u?t="x"&y=1' });
+    expect(e.text + e.html).not.toMatch(/120000111|120000222|act_/);
     expect(e.html).not.toContain('<script>');
-    expect(e.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt; &amp; more');
+    expect(e.html).toContain('Conversions: 22 (&lt;script&gt;alert(1)&lt;/script&gt;)');
     expect(e.html).toContain('t=&quot;x&quot;&amp;y=1');
   });
   it('handles no delivery, one change, and only confirmed changes are listed', () => {
@@ -182,17 +198,23 @@ describe('the email', () => {
         { ts: '2026-11-19T10:00:00.000Z', entityType: 'AD', action: 'UPDATE', verification: 'MISMATCH' },
         { ts: '2026-11-20T10:00:00.000Z', entityType: 'AD', action: 'PAUSE', verification: 'CONFIRMED' },
       ] }),
-      adsSummary: undefined, range, unsubscribeUrl: 'u',
+      ads: undefined, range, unsubscribeUrl: 'u',
     });
     expect(e.text).toContain('No ad delivery was recorded on your connected Meta ad account this week.');
+    expect(e.html).toContain('<p>No ad delivery was recorded');
     expect(e.text).toContain('Zoma made 1 confirmed change to your ads this week.');
     expect(e.text).toContain('- 2026-11-20: pause ad');
     expect(e.text).not.toContain('2026-11-19');
     expect(e.text).toContain('Your agent made 1 successful Zoma call this week.');
   });
   it('says so when Zoma changed nothing', () => {
-    const e = weeklyReportEmail({ usage: usage({ writes: { total: 0, confirmed: 0, mismatch: 0, unconfirmed: 0 }, recentWrites: [] }), adsSummary: 'Spent $5.', range, unsubscribeUrl: 'u' });
+    const e = weeklyReportEmail({ usage: usage({ writes: { total: 0, confirmed: 0, mismatch: 0, unconfirmed: 0 }, recentWrites: [] }), ads: ADS, range, unsubscribeUrl: 'u' });
     expect(e.text).toContain('Zoma made no changes to your ads this week.');
+  });
+  it('ad lines: no conversion event label or ROAS when there are none, no currency when unknown', () => {
+    expect(adsWeekLines({ spend: 5, impressions: 100, clicks: 2, conversions: 0, roas: null, conversionEvent: null }))
+      .toEqual(['Spend: 5.00', 'Impressions: 100', 'Clicks: 2', 'Conversions: 0']);
+    expect(adsWeekLines({ ...ADS, roas: 0 })).not.toContain('Return on ad spend: 0x');
   });
 });
 
@@ -248,7 +270,7 @@ describe('runZomaWeeklyReports', () => {
       listUsers: jest.fn().mockResolvedValue(users),
       hasOptedOut: jest.fn(async (id: string) => id === 'opted'),
       getUsage,
-      getAdsSummary: jest.fn(async (id: string) => (id === 'empty' ? undefined : 'Spent $5.')),
+      getAdsWeek: jest.fn(async (id: string) => (id === 'empty' ? undefined : ADS)),
     });
     const r = await runZomaWeeklyReports(d);
     expect(r.sent).toBe(0);
@@ -256,13 +278,13 @@ describe('runZomaWeeklyReports', () => {
     expect(d.claim).not.toHaveBeenCalled();
   });
 
-  it('an ads-summary failure falls back to the confirmed changes; with none, the user is skipped', async () => {
+  it('an ad-totals failure falls back to the confirmed changes; with none, the user is skipped', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const withWrites = makeDeps({ getAdsSummary: jest.fn().mockRejectedValue(new Error('meta down')) });
+    const withWrites = makeDeps({ getAdsWeek: jest.fn().mockRejectedValue(new Error('meta down')) });
     expect(await runZomaWeeklyReports(withWrites)).toMatchObject({ sent: 1 });
     expect(withWrites.sent[0][2]).toContain('No ad delivery was recorded');
     const noWrites = makeDeps({
-      getAdsSummary: jest.fn().mockRejectedValue(new Error('meta down')),
+      getAdsWeek: jest.fn().mockRejectedValue(new Error('meta down')),
       getUsage: jest.fn().mockResolvedValue(usage({ writes: { total: 0, confirmed: 0, mismatch: 0, unconfirmed: 0 } })),
     });
     expect(await runZomaWeeklyReports(noWrites)).toMatchObject({ sent: 0 });
@@ -373,5 +395,43 @@ describe('unsubscribe routes', () => {
     const none = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({});
     expect(none.status).toBe(400);
     expect(mockRecordFunnel).not.toHaveBeenCalled();
+  });
+});
+
+describe('the production ad-totals wiring (getAdsWeek)', () => {
+  const accounts = require('../services/connectedAccountsDb');
+  const metaAccount = {
+    platform: 'meta', account_id: '1339', account_name: 'Acme',
+    config: { account_type: 'ad_account', ad_account_id: '1339', access_token: 't', token_expires_at: Date.now() + 3_600_000, granted_scopes: ['ads_read', 'ads_management'] },
+  };
+  const range = { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' };
+  const report = (totals: Record<string, unknown>) => ({
+    account_id: '1339', currency: 'USD', level: 'account', conversion_event: 'lead', rows: [{}], summary: 'Meta ads report for act_1339 ... (agent-facing text, must not be used)',
+    totals: { spend: 0, impressions: 0, clicks: 0, ctr: null, cpc: null, conversions: 0, conversion_value: 0, roas: null, ...totals },
+  });
+  beforeEach(() => { mockRunReport.mockReset(); accounts.getAccountsByUserIdIncludingOrgShared.mockReset(); });
+
+  it('maps the report totals, not the agent-facing summary text', async () => {
+    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]);
+    mockRunReport.mockResolvedValue(report({ spend: 12.3, impressions: 1200, clicks: 40, conversions: 3, roas: 2.4 }));
+    const ads = await defaultZomaWeeklyReportDeps.getAdsWeek('u1', range);
+    expect(ads).toEqual({ currency: 'USD', spend: 12.3, impressions: 1200, clicks: 40, conversions: 3, roas: 2.4, conversionEvent: 'lead' });
+    expect(JSON.stringify(ads)).not.toMatch(/act_|agent-facing/);
+    expect(mockRunReport).toHaveBeenCalledWith(metaAccount, '1339', { level: 'account', since: '2026-11-16', until: '2026-11-23' });
+  });
+  it('no delivery (no spend, no impressions) is undefined', async () => {
+    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]);
+    mockRunReport.mockResolvedValue(report({}));
+    await expect(defaultZomaWeeklyReportDeps.getAdsWeek('u1', range)).resolves.toBeUndefined();
+  });
+  it('impressions without spend still count as delivery', async () => {
+    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]);
+    mockRunReport.mockResolvedValue(report({ impressions: 50 }));
+    await expect(defaultZomaWeeklyReportDeps.getAdsWeek('u1', range)).resolves.toMatchObject({ spend: 0, impressions: 50 });
+  });
+  it('no usable Meta ad account means no report call', async () => {
+    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
+    await expect(defaultZomaWeeklyReportDeps.getAdsWeek('u1', range)).resolves.toBeUndefined();
+    expect(mockRunReport).not.toHaveBeenCalled();
   });
 });
