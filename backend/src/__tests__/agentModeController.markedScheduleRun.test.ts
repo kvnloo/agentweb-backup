@@ -217,3 +217,31 @@ describe('a MARKED schedule\'s run (ENG-2816 step 3)', () => {
     expect(recorded.functionCallMisses).toEqual(['get_marketing_tips', 'save_memory', 'luma_get_guests']);
   });
 });
+
+// The executeTool gate judges "could not be verified" by attendance: an unverifiable answer refuses a caller that says it is
+// UNATTENDED (isUnattendedRun === true) and leaves anyone else alone. So every entry that runs a schedule's turns must say so. They
+// all end in the worker, which receives the flag per turn and hands it to every tool call (executePreparedAgentTool).
+describe('every entry that runs a schedule\'s turns says it is unattended (ENG-2816 step 3)', () => {
+  const workerFlags = () => mockWorker.runInWorker.mock.calls.map((call) => (call[0] as any).isUnattendedRun);
+
+  it('a real run: the first attempt AND every retry', async () => {
+    mockWorker.runInWorker.mockResolvedValue(nothing as any);
+    await runScheduledChat(schedule({ provenance: ['startingMessage'] }), USER, false);
+    expect(workerFlags()).toHaveLength(MARKED_RUN_MAX_ATTEMPTS);
+    expect(workerFlags().every((flag) => flag === true)).toBe(true);
+  });
+
+  it('a test run (test_scheduled_chat) shares the same path', async () => {
+    mockWorker.runInWorker.mockResolvedValue(nothing as any);
+    await runScheduledChat(schedule({ provenance: ['startingMessage'] }), USER, true);
+    expect(workerFlags().length).toBeGreaterThan(0);
+    expect(workerFlags().every((flag) => flag === true)).toBe(true);
+  });
+
+  it('the self-improvement reflection turn is unattended too (it is a second worker turn after the run)', async () => {
+    mockWorker.runInWorker.mockResolvedValue(partial as any);
+    await runScheduledChat(schedule({ provenance: ['startingMessage'], selfImprove: true, requiredFunctionCalls: ['get_marketing_tips'], functionCallMinCalls: {} }), USER, false);
+    expect(workerFlags().length).toBeGreaterThanOrEqual(2);
+    expect(workerFlags().every((flag) => flag === true)).toBe(true);
+  });
+});

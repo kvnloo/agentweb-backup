@@ -10025,13 +10025,22 @@ export class AgentModeService {
    * approval resume, continuations), so enforcing it here covers them all without carrying a flag through each.
    *
    * Two outcomes, both read LIVE (a consistent read of the schedule, not a stamp taken at run start):
-   *  - the profile refuses this tool name and the schedule is marked, or cannot be verified: refuse (fail closed);
+   *  - the profile refuses this tool name and the schedule is marked: refuse, for EVERYONE (attended or not);
    *  - this tool's self-call reaches a schedule write route (SCHEDULE_WRITE_TOOL_NAMES) and the schedule is marked: hand back the
-   *    profile, so the call carries the claim and the write it makes is itself a visitor write (it re-marks what it writes: a
-   *    marked run, such as its own reflection turn, can neither lift nor launder the mark).
+   *    profile, so the call carries the claim and the write it makes is itself a visitor write (it adds marks and never takes one
+   *    off: a marked run, such as its own reflection turn, cannot launder the mark).
    *
-   * Only a tool in one of those two sets pays for the reads. Every other tool, and every call outside a scheduled session, is
-   * untouched, as is a schedule with no `provenance` (every schedule that predates this change).
+   * UNVERIFIABLE is judged by who is calling. The purpose of failing closed is to stop an UNATTENDED run (nobody is watching it) from
+   * running as the owner when its schedule cannot be shown to be unmarked, so an unverifiable answer refuses only a caller that says
+   * it is unattended (`isUnattendedRun === true`: every scheduled, test, retry and self-improvement turn does). A person typing in a
+   * chat (attended, or a caller that did not say) is never refused merely because something could not be checked: an owner who
+   * reopens an old "Scheduled: X" session after deleting the schedule keeps save_memory, connect_account, manage_scheduled_chat and
+   * their admin tools. The one exception is a failed SCHEDULE read in a session that is known to be a scheduled run: that refuses
+   * everyone (rare, and a transient blip is cheaper than running a visitor's schedule as the owner).
+   *
+   * Only a tool in one of those two sets pays for the reads, and the session is read as a record only (no transcript, no message
+   * migration). Every other tool, every call outside a scheduled session, and every schedule with no `provenance` (every schedule
+   * that predates this change) is untouched.
    */
   private async scheduledRunRestriction(
     toolName: string,
@@ -10047,42 +10056,43 @@ export class AgentModeService {
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
     const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
+    // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
 
     let session: any;
     try {
-      session = await chatbotDb.getChatSession(sessionId);
+      session = await chatbotDb.getChatSessionRecord(sessionId, true);
     } catch (firstError) {
-      // One retry absorbs a single throttled read before we resort to refusing (same as the publish gate below).
+      // One retry absorbs a single throttled read before we give up (same as the publish gate below).
       try {
-        session = await chatbotDb.getChatSession(sessionId);
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
       } catch (retryError) {
-        console.error(`AgentMode ENG-2816: could not read session ${sessionId} to check schedule provenance for ${toolName}; refusing rather than assuming it is the owner's:`, retryError);
-        return unverifiable;
+        console.error(`AgentMode ENG-2816: could not read session ${sessionId} to check schedule provenance for ${toolName}:`, retryError);
+        return whenUnverifiable;
       }
     }
 
-    if (!session) {
-      // No session record. For an attended caller that is just a session id with nothing scheduled behind it. For an unattended
-      // run it is the deleted-mid-run case (deleting a scheduled session does not cancel its worker): unknown, so refuse.
-      return extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
-    }
+    // No session record: for an unattended run that is the deleted-mid-run case (deleting a scheduled session does not cancel its
+    // worker); for anyone else it is just a session id with nothing scheduled behind it.
+    if (!session) return whenUnverifiable;
     if (classifySessionForPublishGate(session) !== 'scheduled') return unrestricted;
 
     const scheduleId = extractScheduleId(session.pageIdentifier);
     if (!scheduleId) {
-      console.warn(`AgentMode ENG-2816: scheduled session ${sessionId} has no parseable scheduleId; refusing ${toolName} rather than assuming it is unmarked.`);
-      return unverifiable;
+      console.warn(`AgentMode ENG-2816: scheduled session ${sessionId} has no parseable scheduleId; cannot check provenance for ${toolName}.`);
+      return whenUnverifiable;
     }
 
     let schedule: any;
     try {
       schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
     } catch (scheduleError) {
+      // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
       console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
       return unverifiable;
     }
-    // A deleted or missing schedule cannot be shown to be the owner's.
-    if (!schedule) return unverifiable;
+    // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
+    if (!schedule) return whenUnverifiable;
 
     if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
 

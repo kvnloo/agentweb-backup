@@ -47,6 +47,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   let service: AgentModeService;
   let dispatch: jest.SpyInstance;
   let getSession: jest.SpyInstance;
+  let getTranscript: jest.SpyInstance;
   let getSchedule: jest.SpyInstance;
 
   beforeEach(async () => {
@@ -55,7 +56,9 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
     service = new AgentModeService();
     await service.initialize();
     dispatch = jest.spyOn((service as any).toolRegistry, 'execute').mockResolvedValue({ ran: true });
-    getSession = jest.spyOn(chatbotDb, 'getChatSession').mockResolvedValue(scheduledSession as any);
+    // The session is read as a RECORD (no transcript, no message migration), consistently.
+    getSession = jest.spyOn(chatbotDb, 'getChatSessionRecord').mockResolvedValue(scheduledSession as any);
+    getTranscript = jest.spyOn(chatbotDb, 'getChatSession').mockResolvedValue(scheduledSession as any);
     getSchedule = jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id' } as any);
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -119,9 +122,29 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(dispatch).not.toHaveBeenCalled();
     });
 
-    it('does not use the share_visitor wording ("shared sessions") for a scheduled run', async () => {
+    it('uses the scheduled-run wording, never the share_visitor wording ("shared sessions")', async () => {
       marked();
-      await expect(run('save_memory')).rejects.not.toMatchObject({ message: expect.stringContaining('shared sessions') });
+      const error: Error = await run('save_memory').then(() => { throw new Error('expected a refusal'); }, (e: Error) => e);
+      expect(error.name).toBe('ToolRestrictionDenied');
+      expect(error.message).toContain('is not available in this scheduled run');
+      expect(error.message).toContain('set up or edited through a share link');
+      expect(error.message).not.toContain('shared sessions');
+    });
+
+    it('restricts a marked schedule for an ATTENDED caller too (a schedule that was read and is marked binds everyone)', async () => {
+      marked();
+      for (const ctx of [{ isUnattendedRun: false }, undefined, {}]) {
+        await expect(run('save_memory', ctx as any)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        await expect(run('connect_account', ctx as any)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('reads the session as a record, consistently, and never the transcript', async () => {
+      marked();
+      await expect(run('save_memory')).rejects.toBeDefined();
+      expect(getSession).toHaveBeenCalledWith('run-session', true);
+      expect(getTranscript).not.toHaveBeenCalled();
     });
 
     it('reads the schedule with a CONSISTENT read, by the id the session carries', async () => {
@@ -181,49 +204,81 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
     });
   });
 
-  describe('fails closed when the schedule cannot be verified', () => {
-    it('refuses when the schedule has gone missing (deleted mid-run)', async () => {
-      getSchedule.mockResolvedValue(undefined);
-      await expect(run('save_memory', { isUnattendedRun: true })).rejects.toMatchObject({
-        deniedBy: 'restriction_profile',
-        message: expect.stringContaining('could not be verified'),
+  describe('what "could not be verified" means depends on who is calling (attendance)', () => {
+    const unattended = { isUnattendedRun: true };
+    const attended = { isUnattendedRun: false };
+    const refused = (tool: string, ctx?: Record<string, unknown>) =>
+      expect(run(tool, ctx)).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('could not be verified') });
+    const keepsTools = async (ctx?: Record<string, unknown>) => {
+      for (const tool of ['save_memory', 'connect_account', 'manage_scheduled_chat', 'read_linear_issues', 'luma_get_guests']) {
+        dispatch.mockClear();
+        await expect(run(tool, ctx)).resolves.toEqual({ ran: true });
+        // An attended caller is not handed the visitor profile either: there is nothing to say it is a visitor's.
+        expect(dispatch.mock.calls[0][2]).not.toHaveProperty('restrictionProfile');
+      }
+    };
+
+    describe('the schedule is gone (deleted)', () => {
+      beforeEach(() => getSchedule.mockResolvedValue(undefined));
+      it('an UNATTENDED run is refused', async () => {
+        await refused('save_memory', unattended);
+        await refused('manage_scheduled_chat', unattended);
+        expect(dispatch).not.toHaveBeenCalled();
       });
-      expect(dispatch).not.toHaveBeenCalled();
+      it('an owner reopening the old "Scheduled: X" session keeps every tool (attended, or a caller that did not say)', async () => {
+        await keepsTools(attended);
+        await keepsTools(undefined);
+      });
     });
 
-    it('refuses when the schedule read fails', async () => {
-      getSchedule.mockRejectedValue(new Error('DynamoDB blip'));
-      await expect(run('save_memory')).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('could not be verified') });
-      expect(dispatch).not.toHaveBeenCalled();
+    describe('the session carries no parseable schedule id', () => {
+      beforeEach(() => getSession.mockResolvedValue({ ...scheduledSession, pageIdentifier: 'Scheduled: no id here' } as any));
+      it('an UNATTENDED run is refused, without reading any schedule', async () => {
+        await refused('save_memory', unattended);
+        expect(getSchedule).not.toHaveBeenCalled();
+      });
+      it('an attended caller keeps its tools', async () => {
+        await keepsTools(attended);
+        await keepsTools(undefined);
+      });
     });
 
-    it('refuses a schedule-writing tool when the schedule read fails (it cannot be given the claim)', async () => {
-      getSchedule.mockRejectedValue(new Error('DynamoDB blip'));
-      await expect(run('manage_scheduled_chat')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
-      expect(dispatch).not.toHaveBeenCalled();
+    describe('the session cannot be read (throttled twice)', () => {
+      beforeEach(() => getSession.mockRejectedValue(new Error('throttled')));
+      it('an UNATTENDED run is refused, after one retry', async () => {
+        await refused('save_memory', unattended);
+        expect(getSession).toHaveBeenCalledTimes(2);
+      });
+      it('an ordinary owner chat is NOT refused: a throttled read must never take the owner\'s tools away', async () => {
+        await keepsTools(attended);
+        await keepsTools(undefined);
+        expect(getSchedule).not.toHaveBeenCalled();
+      });
+      it('recovers when only the FIRST read fails', async () => {
+        getSession.mockReset();
+        getSession.mockRejectedValueOnce(new Error('throttled')).mockResolvedValue(scheduledSession as any);
+        await expect(run('save_memory', unattended)).resolves.toEqual({ ran: true });
+      });
     });
 
-    it('refuses when the session read fails twice, and recovers when only the first read fails', async () => {
-      getSession.mockRejectedValue(new Error('throttled'));
-      await expect(run('save_memory')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
-      expect(getSession).toHaveBeenCalledTimes(2);
-
-      getSession.mockReset();
-      getSession.mockRejectedValueOnce(new Error('throttled')).mockResolvedValue(scheduledSession as any);
-      await expect(run('save_memory')).resolves.toEqual({ ran: true });
+    describe('there is no session record at all', () => {
+      beforeEach(() => getSession.mockResolvedValue(null as any));
+      it('an UNATTENDED run (deleted mid-run) is refused; an attended caller is not', async () => {
+        await refused('save_memory', unattended);
+        await keepsTools(attended);
+        await keepsTools(undefined);
+      });
     });
 
-    it('refuses a scheduled session whose schedule id cannot be parsed', async () => {
-      getSession.mockResolvedValue({ ...scheduledSession, pageIdentifier: 'Scheduled: no id here' } as any);
-      await expect(run('save_memory')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
-      expect(getSchedule).not.toHaveBeenCalled();
-    });
-
-    it('a missing session record refuses an UNATTENDED run (deleted mid-run) but not an attended caller', async () => {
-      getSession.mockResolvedValue(null as any);
-      await expect(run('save_memory', { isUnattendedRun: true })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
-      await expect(run('save_memory', { isUnattendedRun: false })).resolves.toEqual({ ran: true });
-      await expect(run('save_memory', undefined)).resolves.toEqual({ ran: true });
+    describe('the schedule READ fails while the session is known to be scheduled', () => {
+      beforeEach(() => getSchedule.mockRejectedValue(new Error('DynamoDB blip')));
+      it('refuses EVERYONE (rare, and an unknown schedule must not run as the owner)', async () => {
+        await refused('save_memory', unattended);
+        await refused('save_memory', attended);
+        await refused('save_memory', undefined);
+        await refused('manage_scheduled_chat', unattended);
+        expect(dispatch).not.toHaveBeenCalled();
+      });
     });
   });
 
