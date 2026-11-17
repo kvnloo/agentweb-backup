@@ -120,6 +120,15 @@ describe('ENG-3129 Page gate on Zoma Meta creates', () => {
     expectNoMetaCall(d);
   });
 
+  it('a repeat confirm of a CREATE that already succeeded returns the recorded outcome, not a Page refusal', async () => {
+    const token = 'v1.recorded.x';
+    const recorded = { status: 'EXECUTED', success: true, id: '777' };
+    const d = writeDeps(undefined, { tokenOutcomes: new Map([[token, { exp: 1_900_000_000_000, outcome: recorded }]]) });
+    const result = await executeMetaToolkitWrite('u1', { ...adCreate, confirm: true, preview_token: token }, d);
+    expect(result).toMatchObject({ ...recorded, replayed: true });
+    expectNoMetaCall(d);
+  });
+
   it('names Page X when the account\'s existing ads run under a specific Page', async () => {
     const d = writeDeps({ has_meta_pages: false, existing_ads_page_id: '9001' });
     const message = await refusalOf(executeMetaToolkitWrite('u1', { ...adCreate, entity_type: 'CAMPAIGN', params: { name: 'C', objective: 'OUTCOME_LEADS' } }, d));

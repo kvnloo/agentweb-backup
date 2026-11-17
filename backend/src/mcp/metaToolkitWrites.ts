@@ -331,6 +331,12 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   const accounts = await deps.listAccounts(userId);
   assertAdsManagementGranted(accounts, accountId);
   if (action === 'CREATE') {
+    // A repeat confirm of a CREATE that already ran gets its recorded outcome, not a
+    // "nothing was sent" Page refusal; only new CREATE dispatch is gated.
+    if (confirm === true && typeof previewToken === 'string') {
+      const replay = replayTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, deps.now());
+      if (replay) return replay;
+    }
     await assertMetaPageAccessForCreate(accounts, accountId, { connectLink: deps.connectLink && (() => deps.connectLink!(userId)) });
   }
 
