@@ -85,6 +85,19 @@ describe('GET /api/oauth/google-ads/callback', () => {
     const denied = await request(app).get('/callback').query({ error: 'access_denied', state: zomaState() });
     expect(denied.headers.location).toMatch(/^\/api\/zoma\/google\/callback\?.*error=access_denied/);
   });
+  it('an EXPIRED Zoma state still lands on Zoma (which shows the expired page), never the portal', async () => {
+    const expired = jwt.sign({ userId: 'u1', zoma: ZOMA_MCP_SETUP, nonce: 'n' }, getJwtSecret(), { expiresIn: -60 });
+    const res = await request(app).get('/callback').query({ code: 'c0de', state: expired });
+    expect(res.headers.location).toMatch(/^\/api\/zoma\/google\/callback\?/);
+    expect(await completeGoogleConnect({ code: 'c0de', state: expired }, defaultZomaGoogleDeps)).toMatchObject({ kind: 'page', status: 400 });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+  it('a forged (wrongly signed) state is not treated as Zoma', async () => {
+    process.env.CUSTOMER_FRONTEND_URL = 'https://app.test';
+    const forged = jwt.sign({ userId: 'u1', zoma: ZOMA_MCP_SETUP }, 'not-the-secret');
+    const res = await request(app).get('/callback').query({ code: 'c0de', state: forged });
+    expect(res.headers.location).toMatch(/^https:\/\/app\.test\//);
+  });
   it('leaves portal states going to the customer portal', async () => {
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.test';
     const res = await request(app).get('/callback').query({ code: 'c0de', state: portalState() });
@@ -151,6 +164,32 @@ describe('completeGoogleConnect', () => {
     expect(text).toContain('Create an account without a campaign');
     expect(text).toMatch(/country, billing currency and time zone, choose them yourself/);
     expect(createAccount).not.toHaveBeenCalled();
+  });
+
+  it('account exists but Google has not enabled it: finish THAT account, never "create one"', async () => {
+    tree.mockImplementation(async (_token: string, diag?: { notEnabledCustomerIds?: string[] }) => {
+      if (diag) diag.notEnabledCustomerIds = ['6197536133'];
+      return [];
+    });
+    const step: any = await completeGoogleConnect({ code: 'c', state: zomaState() }, deps());
+    expect(step).toMatchObject({ kind: 'page', status: 400, title: 'Google Ads account not finished', retryLabel: 'Connect Google Ads again' });
+    expect(step.message).toContain('6197536133');
+    expect(step.message).toMatch(/did not create it/);
+    const text = step.steps.join(' ');
+    expect(text).toMatch(/finish setting up the account Google already created/);
+    expect(text).toContain('Create an account without a campaign');
+    expect(text).toMatch(/Do not start a second account yet/);
+    expect(text).not.toMatch(/Create a Google Ads account yourself/);
+    expect(createAccount).not.toHaveBeenCalled();
+  });
+
+  it('a usable account still connects when another one is not enabled', async () => {
+    tree.mockImplementation(async (_token: string, diag?: { notEnabledCustomerIds?: string[] }) => {
+      if (diag) diag.notEnabledCustomerIds = ['6197536133'];
+      return [leaf('1112223333')];
+    });
+    expect(await completeGoogleConnect({ code: 'c', state: zomaState() }, deps())).toMatchObject({ status: 200, title: 'Google Ads connected' });
+    expect(createAccount).toHaveBeenCalledTimes(1);
   });
 
   it('denied consent, missing adwords scope, and token-exchange failure give a retry, never a connection', async () => {
