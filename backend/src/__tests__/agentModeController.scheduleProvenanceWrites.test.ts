@@ -39,6 +39,7 @@ jest.mock('../services/db', () => ({
 
 import { scheduleDb, userDb, scheduleTemplateDb } from '../services/db';
 import { agentModeController } from '../controllers/agentModeController';
+import { isSubscriptionFeatureEnabled } from '../services/subscriptionService';
 import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULE_PROVENANCE_FIELDS, scheduleContentVersion } from '../utils/scheduleProvenance';
 import { resolveSchedulePublishAuthorization, describePublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
@@ -756,8 +757,8 @@ describe('a visitor-created schedule stays on "Require approval before publishin
     }
   });
 
-  it('a visitor EDIT of an existing schedule does not touch requirePublishApproval (owner schedules are unaffected)', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ requirePublishApproval: false }) as any);
+  it('a visitor EDIT that adds no new publish tool does not touch requirePublishApproval (owner schedules are unaffected; adding one is the next describe)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ requirePublishApproval: false, requiredFunctionCalls: ['post_on_connected_account'] }) as any);
     await update(visitorByClaim, { startingMessage: 'new', requiredFunctionCalls: ['post_on_connected_account'] });
     expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
   });
@@ -830,5 +831,275 @@ describe('consent narrowing on an edit of a MARKED schedule', () => {
     const [, payload] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
     expect(payload.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
     expect(payload.provenanceAdd).toEqual(['requiredFunctionCalls']);
+  });
+});
+
+// ENG-2816 (step 3), round 3.
+describe('a publish tool or Slack send a VISITOR newly adds is held too (M2)', () => {
+  const PUBLISH = 'post_on_connected_account';
+  const consentless = (extra: Record<string, unknown> = {}) => stored({ requiredFunctionCalls: ['t1'], ...extra });
+  const given = (schedule: Record<string, unknown>) => mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+
+  it('a visitor edit that adds a publish tool to a consent-less schedule stores the hold, in the same write; adopting then still drafts', async () => {
+    const before = consentless();
+    given(before);
+    await update(visitorByClaim, { requiredFunctionCalls: ['t1', PUBLISH] });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+    expect(updatedWith().provenanceAdd).toEqual(['requiredFunctionCalls']);
+
+    // What is stored after that write, then the owner adopts (the whole provenance attribute comes off).
+    const { provenance: _marks, ...adopted } = { ...before, ...updatedWith(), provenance: ['requiredFunctionCalls'] };
+    delete (adopted as any).provenanceAdd;
+    expect(resolveSchedulePublishAuthorization(adopted)).toEqual({ authorized: false, tools: [] });
+    expect(describePublishAuthorizationWithholdReason(adopted)).toBe('require_publish_approval');
+  });
+
+  it('CONTROL: without the hold, the same adopted schedule WOULD publish (the thing this prevents)', () => {
+    expect(resolveSchedulePublishAuthorization({ ...consentless(), requiredFunctionCalls: ['t1', PUBLISH] })).toEqual({ authorized: true, tools: [PUBLISH] });
+  });
+
+  it('a visitor edit that adds slack_send_message stores requireSlackApproval', async () => {
+    given(consentless());
+    await update(visitorByClaim, { requiredFunctionCalls: ['t1', 'slack_send_message'] });
+    expect(updatedWith().requireSlackApproval).toBe(true);
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+  });
+
+  it('a publish tool added next to ones the schedule already had is still a NEW tool', async () => {
+    given(consentless({ requiredFunctionCalls: [PUBLISH] }));
+    await update(visitorByClaim, { requiredFunctionCalls: [PUBLISH, 'publish_blog_article'] });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+  });
+
+  it('a visitor edit that adds NOTHING new leaves a pre-existing publishing schedule\'s settings alone (no-op, unrelated edit, tool removed, reorder)', async () => {
+    given(consentless({ requiredFunctionCalls: [PUBLISH, 'slack_send_message'] }));
+    for (const body of [
+      { requiredFunctionCalls: [PUBLISH, 'slack_send_message'] },
+      { startingMessage: 'something else entirely' },
+      { requiredFunctionCalls: [PUBLISH] },
+      { requiredFunctionCalls: ['slack_send_message', PUBLISH, 'a_read_tool'] },
+    ]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      await update(visitorByClaim, body);
+      expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+      expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+    }
+  });
+
+  it('an OWNER edit never changes either setting, whatever it adds', async () => {
+    given(consentless());
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      await update(caller, { requiredFunctionCalls: ['t1', PUBLISH, 'slack_send_message'] });
+      expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+      expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+    }
+  });
+
+  it('an existing owner consent is untouched (the grant is scoped to the tools the owner approved)', async () => {
+    given(consentless({ requiredFunctionCalls: [PUBLISH], autopublishAuthorized: true, autopublishAuthorizedTools: [PUBLISH] }));
+    await update(visitorByClaim, { requiredFunctionCalls: [PUBLISH, 'publish_blog_article'] });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+  });
+
+  it('an existing hold is never lowered (the write only ever sets true)', async () => {
+    given(consentless({ requirePublishApproval: true, requireSlackApproval: true }));
+    await update(visitorByClaim, { requiredFunctionCalls: ['t1'] });
+    expect(updatedWith().requirePublishApproval).not.toBe(false);
+    expect(updatedWith().requireSlackApproval).not.toBe(false);
+    mockScheduleDb.updateSchedule.mockClear();
+    await update(visitorByClaim, { requiredFunctionCalls: ['t1', PUBLISH, 'slack_send_message'] });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+    expect(updatedWith().requireSlackApproval).toBe(true);
+  });
+
+  describe('creates', () => {
+    it('a visitor create that requires slack_send_message also stores requireSlackApproval (it already stores the publish hold)', async () => {
+      await create(visitorByClaim, { startingMessage: 'Hi', requiredFunctionCalls: ['slack_send_message'] });
+      expect(created().requireSlackApproval).toBe(true);
+      expect(created().requirePublishApproval).toBe(true);
+    });
+
+    it('a visitor create that does not require it does not', async () => {
+      await create(visitorByClaim, { startingMessage: 'Hi', requiredFunctionCalls: ['get_marketing_tips'] });
+      expect(created().requireSlackApproval).toBe(false);
+    });
+
+    it('an owner create is exactly as before, Slack tool or not', async () => {
+      for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+        mockScheduleDb.createSchedule.mockClear();
+        await create(caller, { startingMessage: 'Hi', requiredFunctionCalls: ['slack_send_message'] });
+        expect(created().requireSlackApproval).toBe(false);
+        expect(created().requirePublishApproval).toBe(false);
+      }
+    });
+
+    it('a visitor create from a template stores requireSlackApproval when the schedule requires the send (template or override)', async () => {
+      const template = (tools: string[]) => ({
+        templateId: 't1', createdBy: USER, visibility: 'private', name: 'T', startingMessage: 'm', variables: [], keywords: [], requiredFunctionCalls: tools,
+        functionCallMinCalls: {}, suggestedFrequency: 'daily', emailNotifications: [OWNER_EMAIL], llmModel: '',
+      });
+      const use = (caller: Caller, body: Record<string, unknown> = {}) =>
+        agentModeController.createScheduleFromTemplate(makeReq(caller, { body, params: { templateId: 't1' } }) as any, makeRes());
+
+      mockTemplateDb.getTemplateById.mockResolvedValue(template(['slack_send_message']) as any);
+      await use(visitorByClaim);
+      expect(created().requireSlackApproval).toBe(true);
+
+      mockScheduleDb.createSchedule.mockClear();
+      mockTemplateDb.getTemplateById.mockResolvedValue(template([]) as any);
+      await use(visitorByClaim, { requiredFunctionCalls: ['slack_send_message'] });
+      expect(created().requireSlackApproval).toBe(true);
+
+      mockScheduleDb.createSchedule.mockClear();
+      await use(visitorByClaim);
+      expect(created()).not.toHaveProperty('requireSlackApproval');
+
+      for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+        mockScheduleDb.createSchedule.mockClear();
+        mockTemplateDb.getTemplateById.mockResolvedValue(template(['slack_send_message']) as any);
+        await use(caller);
+        expect(created()).not.toHaveProperty('requireSlackApproval');
+      }
+    });
+  });
+});
+
+describe('the "is this a visitor write?" question is asked ONCE, before anything is awaited (L1)', () => {
+  /** The turn ends (its lock is released, the marker goes) while the handler is still awaiting its first dependency. */
+  const turnEndsDuringFirstAwait = () =>
+    (isSubscriptionFeatureEnabled as jest.Mock).mockImplementationOnce(async () => { clearShareVisitorTurn('visitor-session'); return true; });
+
+  it('createScheduledChat', async () => {
+    turnEndsDuringFirstAwait();
+    await create(visitorByMarkerOnly, { startingMessage: 'Hi', requiredFunctionCalls: ['slack_send_message'] });
+    expect(created().provenance).toEqual(['startingMessage', 'requiredFunctionCalls']);
+    expect(created().requirePublishApproval).toBe(true);
+    expect(created().requireSlackApproval).toBe(true);
+  });
+
+  it('updateScheduledChat', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    turnEndsDuringFirstAwait();
+    await update(visitorByMarkerOnly, { startingMessage: 'visitor wrote this' });
+    expect(updatedWith().provenanceAdd).toEqual(['startingMessage']);
+    expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('s1', { consistent: true });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0] as any[])[2]).toEqual({ updatedAt: stored().updatedAt });
+  });
+
+  it('submitScheduledChatVariables', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ startingMessage: 'Hello {{who}}', variables: [{ name: 'who' }], variableValues: { who: 'Alice' } }) as any);
+    turnEndsDuringFirstAwait();
+    await agentModeController.submitScheduledChatVariables(
+      makeReq(visitorByMarkerOnly, { body: { variableValues: { who: 'Mallory' }, triggerRun: false }, params: { scheduleId: 's1' } }), makeRes());
+    expect(updatedWith().provenanceAdd).toEqual(['variableValues']);
+  });
+
+  it('createScheduleFromTemplate', async () => {
+    mockTemplateDb.getTemplateById.mockResolvedValue({
+      templateId: 't1', createdBy: USER, visibility: 'private', name: 'T', startingMessage: 'm', variables: [], keywords: [], requiredFunctionCalls: [],
+      functionCallMinCalls: {}, suggestedFrequency: 'daily', emailNotifications: [OWNER_EMAIL], llmModel: '',
+    } as any);
+    turnEndsDuringFirstAwait();
+    await agentModeController.createScheduleFromTemplate(makeReq(visitorByMarkerOnly, { body: {}, params: { templateId: 't1' } }) as any, makeRes());
+    expect(created().provenance).toEqual([...SCHEDULE_PROVENANCE_FIELDS]);
+    expect(created().requirePublishApproval).toBe(true);
+  });
+});
+
+describe('a visitor UPDATE lands on the version it was diffed against, or not at all (L3)', () => {
+  const conditionalFailure = () => Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' });
+  const errorOf = (res: any) => (res.json.mock.calls[0]?.[0] as any)?.error as string;
+
+  it('every visitor write is conditioned on the updatedAt of the consistent read; an owner write passes no condition at all', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect((mockScheduleDb.updateSchedule.mock.calls[0] as any[])[2]).toEqual({ updatedAt: stored().updatedAt });
+
+    for (const caller of [portalOwner, emmaInOwnersChat, delegate]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      await update(caller, { keywords: ['z'] });
+      expect(mockScheduleDb.updateSchedule.mock.calls[0]).toHaveLength(2); // (scheduleId, payload): exactly the call it always was
+    }
+  });
+
+  it('a row with no updatedAt is conditioned on the attribute still being absent', async () => {
+    const { updatedAt: _gone, ...legacy } = stored();
+    mockScheduleDb.getScheduleById.mockResolvedValue(legacy as any);
+    await update(visitorByClaim, { keywords: ['z'] });
+    const expectation = (mockScheduleDb.updateSchedule.mock.calls[0] as any[])[2];
+    expect(Object.prototype.hasOwnProperty.call(expectation, 'updatedAt')).toBe(true);
+    expect(expectation.updatedAt).toBeUndefined();
+  });
+
+  it('STALE READ: a second writer lands between the read and the write -> 409 with a clear retry message, nothing written', async () => {
+    mockScheduleDb.getScheduleById
+      .mockResolvedValueOnce(stored() as any)                                             // the visitor's consistent read
+      .mockResolvedValue(stored({ updatedAt: '2026-11-17T09:00:00.000Z', keywords: ['b', 'a', 'planted'] }) as any); // what is there now
+    mockScheduleDb.updateSchedule.mockRejectedValue(conditionalFailure());
+
+    const res = await update(visitorByClaim, { keywords: ['z'] });
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(errorOf(res)).toContain('changed while your edit was being saved');
+    expect(errorOf(res)).toContain('retry');
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('a re-read that fails cannot show the schedule did not move, so it is a 409 too', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValueOnce(stored() as any).mockRejectedValue(new Error('blip'));
+    mockScheduleDb.updateSchedule.mockRejectedValue(conditionalFailure());
+    expect((await update(visitorByClaim, { keywords: ['z'] })).status).toHaveBeenCalledWith(409);
+  });
+
+  it('a failure that is NOT the baseline (the schedule did not move) keeps its own handling: the consent retry loop, then success', async () => {
+    const grantedSchedule = stored({
+      requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+      autopublishAuthorized: true, autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+    });
+    mockScheduleDb.getScheduleById.mockResolvedValue(grantedSchedule as any); // same updatedAt on every read: the baseline did not move
+    mockScheduleDb.updateSchedule.mockRejectedValueOnce(conditionalFailure()).mockResolvedValue(undefined as any);
+
+    const res = await update(visitorByClaim, { requiredFunctionCalls: ['post_on_connected_account'] });
+
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+  });
+
+  it('the version condition rides WITH the consent-narrowing condition in the same write', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({
+      requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+      autopublishAuthorized: true, autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+    }) as any);
+    await update(visitorByClaim, { requiredFunctionCalls: ['post_on_connected_account'] });
+    const [, payload, expectation] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
+    expect(payload.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
+    expect(expectation).toMatchObject({ updatedAt: stored().updatedAt, autopublishAuthorized: true });
+  });
+
+  it('an OWNER edit that loses a race keeps the existing behaviour (no new 409 path, no extra read)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    mockScheduleDb.updateSchedule.mockRejectedValue(conditionalFailure());
+    const res = await update(portalOwner, { keywords: ['z'] });
+    expect(errorOf(res)).not.toContain('changed while your edit was being saved');
+  });
+});
+
+describe('a digest that cannot be computed omits contentVersion on that row, never failing the list (L5)', () => {
+  it('one row with a pathological value loses its contentVersion; every other row keeps it, and there is no 500', async () => {
+    const circular: any = {};
+    circular.self = circular;
+    const bad = { ...stored({ scheduleId: 'bad', variables: [circular] }), type: 'scheduled_chat', createdAt: '2026-11-17T00:00:00.000Z' };
+    const good = { ...stored({ scheduleId: 'good' }), type: 'scheduled_chat', createdAt: '2026-11-16T00:00:00.000Z' };
+    mockScheduleDb.getSchedulesByUserId.mockResolvedValue([bad, good] as any);
+
+    const res = makeRes();
+    await agentModeController.getScheduledChats(makeReq(portalOwner, { body: {} }) as any, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(500);
+    const items = res.json.mock.calls[0][0] as any[];
+    expect(items).toHaveLength(2);
+    expect(items.find((i) => i.scheduleId === 'bad')).not.toHaveProperty('contentVersion');
+    expect(items.find((i) => i.scheduleId === 'good').contentVersion).toMatch(/^[0-9a-f]{32}$/);
   });
 });
