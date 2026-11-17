@@ -1,6 +1,8 @@
 import axios from 'axios';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { classifyMetaReadFailure, META_RECONNECT_MESSAGE, META_PERMISSION_MESSAGE } from '../utils/metaReadErrorClass';
+import { META_ADS_NO_PAGES_MESSAGE } from '../utils/metaAdsScope';
+import { metaPageAccessFixSteps } from './metaPageAccessRefusal';
 
 /**
  * ENG-2921 slice 1: read-only account diagnostics. `ads_account_get_activity_logs` reads the
@@ -53,20 +55,48 @@ export const DIAGNOSTICS_READ_DEFINITIONS = names.map((name) => ({
     }
     : {
       type: 'object',
-      properties: { code: { type: 'string', pattern: '^[0-9]+$', description: 'Meta error code (error.code or error_subcode).' } },
+      properties: {
+        code: { type: 'string', pattern: '^[0-9]+$', description: 'Meta error code (error.code or error_subcode).' },
+        message: { type: 'string', description: 'Optional: Meta\'s error.message, so a permission code can be told apart (e.g. a Facebook Page refusal).' },
+      },
       required: ['code'],
       additionalProperties: false,
     },
 }));
 
+/**
+ * ENG-3129: Page-permission refusals. 283 is Graph's "Requires extended permission" for Page
+ * permissions (pages_*). The generic permission codes 10 / 200–299 are Page refusals only when
+ * Meta's message says so (a Page, page_id, or a pages_* permission) — otherwise they keep the
+ * generic ad-account hint.
+ */
+const PAGE_PERMISSION_CODES = new Set(['283']);
+const PAGE_ERROR_TEXT = /\bpages?\b|page_id|pages_[a-z_]+/i;
+
+function isPagePermissionError(code: string, message: string): boolean {
+  if (PAGE_PERMISSION_CODES.has(code)) return true;
+  const n = Number(code);
+  return (n === 10 || (n >= 200 && n <= 299)) && PAGE_ERROR_TEXT.test(message);
+}
+
 const TIME = /^(\d{1,10}|\d{4}-\d{2}-\d{2}(T[0-9:.]+(Z|[+-]\d{2}:?\d{2})?)?)$/;
 
 /** Pure: no credentials, no network. */
 export function explainMetaError(args: any) {
-  const extra = Object.keys(args ?? {}).filter((k) => k !== 'code' && k !== 'account_id');
+  const extra = Object.keys(args ?? {}).filter((k) => k !== 'code' && k !== 'account_id' && k !== 'message');
   if (extra.length) throw new MetaToolkitRefusal(`Unsupported error-explainer argument: ${extra[0]}`);
   const code = String(args?.code ?? '').trim();
   if (!/^\d+$/.test(code)) throw new MetaToolkitRefusal('code must be a numeric Meta error code.');
+  if (args?.message !== undefined && typeof args.message !== 'string') throw new MetaToolkitRefusal('message must be a string.');
+  if (isPagePermissionError(code, args?.message ?? '')) {
+    return {
+      code,
+      known: true,
+      page_access: 'missing',
+      meaning: META_ADS_NO_PAGES_MESSAGE,
+      action: metaPageAccessFixSteps().map((step, i) => `${i + 1}. ${step}`).join('\n'),
+    };
+  }
   const known = META_ERROR_EXPLANATIONS[code];
   return known
     ? { code, known: true, ...known }
