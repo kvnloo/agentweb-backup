@@ -33,7 +33,7 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 jest.mock('../services/db', () => ({
-  scheduleDb: { getScheduleById: jest.fn(), createSchedule: jest.fn(), updateSchedule: jest.fn() },
+  scheduleDb: { getScheduleById: jest.fn(), createSchedule: jest.fn(), updateSchedule: jest.fn(), getSchedulesByUserId: jest.fn() },
   userDb: { getUserById: jest.fn() },
   scheduleTemplateDb: { getTemplateById: jest.fn(), updateTemplate: jest.fn(), incrementUsageCount: jest.fn(), createTemplate: jest.fn() },
 }));
@@ -474,5 +474,28 @@ describe('POST /scheduled-chats/:id/adopt-visitor-edits', () => {
     mockScheduleDb.updateSchedule.mockRejectedValue(Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' }));
     const res = await adopt(portalOwner);
     expect(res.status).toHaveBeenCalledWith(409);
+  });
+});
+
+describe('GET /scheduled-chats (what list_scheduled_chats and the portal read)', () => {
+  const list = async () => {
+    const res = makeRes();
+    await agentModeController.getScheduledChats(makeReq(portalOwner, { body: {} }) as any, res);
+    return res.json.mock.calls[0][0] as any[];
+  };
+
+  it('shows a marked schedule\'s provenance as an array, so Emma and the owner can see why it is restricted', async () => {
+    mockScheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { ...stored({ provenance: ['keywords', 'startingMessage'] }), type: 'scheduled_chat', createdAt: '2026-11-17T00:00:00.000Z' },
+    ] as any);
+    const [item] = await list();
+    expect(item.provenance).toEqual(['keywords', 'startingMessage']);
+    expect(Array.isArray(item.provenance)).toBe(true);
+  });
+
+  it('adds nothing to an unmarked schedule', async () => {
+    mockScheduleDb.getSchedulesByUserId.mockResolvedValue([{ ...stored(), type: 'scheduled_chat', createdAt: '2026-11-17T00:00:00.000Z' }] as any);
+    const [item] = await list();
+    expect(item).not.toHaveProperty('provenance');
   });
 });

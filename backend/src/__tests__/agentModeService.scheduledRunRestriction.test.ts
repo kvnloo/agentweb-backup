@@ -26,6 +26,10 @@ jest.mock('axios', () => {
   return { get: jest.fn(), post: jest.fn(), create: jest.fn(() => instance) };
 });
 jest.mock('../services/emailService', () => ({ emailService: { sendSessionNotificationEmail: jest.fn().mockResolvedValue({ sent: true, duplicate: false }) } }));
+// The one thing replaced on the self-call path: what mcpFetch is handed. Everything in front of it (executeTool, the tool registry,
+// the real manage_scheduled_chat tool body and ctx()) is real.
+jest.mock('../mcp/server/httpClient', () => ({ ...jest.requireActual('../mcp/server/httpClient'), mcpFetch: jest.fn() }));
+import { mcpFetch } from '../mcp/server/httpClient';
 
 const SCHEDULE_ID = 'aaaa1111-bbbb-2222';
 const scheduledSession = {
@@ -148,6 +152,32 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       await run('manage_scheduled_chat', frozen);
       expect(frozen).toEqual({ isUnattendedRun: false });
       expect(dispatch.mock.calls[0][2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', isUnattendedRun: false });
+    });
+  });
+
+  describe('the claim reaches the self-call a marked run makes (end to end through the real tool body)', () => {
+    const selfCall = () => (mcpFetch as jest.Mock).mock.calls[0][0];
+
+    beforeEach(() => {
+      dispatch.mockRestore();
+      (mcpFetch as jest.Mock).mockReset().mockResolvedValue({ ok: true });
+    });
+
+    it('a MARKED run\'s own manage_scheduled_chat call hands mcpFetch the visitor-schedule profile (so its write is a visitor write)', async () => {
+      marked();
+      await (service as any).executeTool('gpt-4', 'manage_scheduled_chat', { action: 'toggle', schedule_id: 's1', status: 'paused' }, 'owner-user-id', 'run-session', false, { isUnattendedRun: true });
+      expect(mcpFetch).toHaveBeenCalledTimes(1);
+      expect(selfCall().context).toMatchObject({ userId: 'owner-user-id', sessionId: 'run-session', restrictionProfile: 'share_visitor_schedule' });
+    });
+
+    it('an UNMARKED run\'s call carries no restriction', async () => {
+      await (service as any).executeTool('gpt-4', 'manage_scheduled_chat', { action: 'toggle', schedule_id: 's1', status: 'paused' }, 'owner-user-id', 'run-session', false, { isUnattendedRun: true });
+      expect(selfCall().context.restrictionProfile).toBeUndefined();
+    });
+
+    it('a share visitor\'s own typed call keeps the profile it was given (voice and text pass it in the context)', async () => {
+      await (service as any).executeTool('gpt-4', 'manage_scheduled_chat', { action: 'toggle', schedule_id: 's1', status: 'paused' }, 'owner-user-id', 'chat-session', false, Object.freeze({ restrictionProfile: 'share_visitor', isUnattendedRun: false }));
+      expect(selfCall().context.restrictionProfile).toBe('share_visitor');
     });
   });
 
