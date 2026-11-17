@@ -439,8 +439,7 @@ function nextStep(
         : 'Call zoma_status again for a fresh Meta connect link (the link could not be created just now).',
       ...(google ? [`Or connect Google Ads → ${google.link ?? 'https://ads.google.com'}`] : []),
       'Tell me when it is connected and I will re-check.',
-      ZOMA_META_LOGIN_NOTE,
-      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : []),
+      ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
     ].join('\n');
   }
   if (!payment.ready) {
