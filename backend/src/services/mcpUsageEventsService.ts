@@ -15,6 +15,8 @@ export const EVT_MCP_TOOL_USED = 'mcp_tool_used';
 export const EVT_MCP_FIRST_TOOL_USED = 'mcp_first_tool_used';
 /** ENG-2303 P4: a Meta Toolkit write that was dispatched to Meta (the billable unit). */
 export const EVT_MCP_WRITE_EXECUTED = 'mcp_write_executed';
+/** ENG-3130: a call that failed in-band. Audit only: never counted as a tool call and never billed. */
+export const EVT_MCP_TOOL_FAILED = 'mcp_tool_failed';
 
 export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'zoma_token' | 'unknown';
 export type McpClientType =
@@ -317,6 +319,43 @@ export async function recordMcpToolUse(
       userAgent: cleanString(input.userAgent),
       platform: cleanString(input.platform),
       ref: validateRef(input.ref),
+    },
+  });
+
+  await store.put(item);
+  return true;
+}
+
+/**
+ * ENG-3130: audit row for a call that finished but reported failure in-band (`success:false`).
+ * Same table and key shape as tool use, but a different event type: it is not in
+ * MCP_USAGE_EVENT_TYPES and `getMcpUserUsage` counts only `mcp_tool_used`, so a failed call is
+ * never counted as usage and never billed. Tool name, platform and client only, no arguments or
+ * error text (they can hold ad copy and ids).
+ */
+export async function recordMcpToolFailed(
+  input: McpToolUseInput,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!input.userId) return false;
+
+  const ts = (input.now ?? new Date()).toISOString();
+  const item = eventItem({
+    eventType: EVT_MCP_TOOL_FAILED,
+    subjectId: input.userId,
+    ts,
+    tsSession: `${ts}#${input.userId}#${EVT_MCP_TOOL_FAILED}#${Math.random().toString(36).slice(2, 10)}`,
+    dimensions: {
+      product: normalizeProduct(input.product),
+      outcome: 'failed',
+      authMethod: input.authMethod ?? 'unknown',
+      apiKeyId: cleanString(input.apiKeyId),
+      clientId: cleanString(input.clientId),
+      clientType: input.clientType ?? classifyMcpClient(input),
+      sessionId: cleanString(input.sessionId),
+      toolName: input.toolName,
+      userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
     },
   });
 
