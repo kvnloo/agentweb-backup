@@ -80,6 +80,25 @@ describe('ENG-2920 Zoma Pages / Instagram / Ad Library reads', () => {
     expect(d.calls[0].params).toMatchObject({ ad_reached_countries: '["US"]', search_terms: 'shoes', ad_active_status: 'ALL' });
   });
 
+  it('ads_library_search logs a Meta rejection (Meta fields only) and points a permission error at identity confirmation', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const rejected: any = new Error('(#10) Application does not have permission for this action');
+      rejected.metaError = { code: 10, error_subcode: 2332004, message: rejected.message };
+      const d = { readGraph: jest.fn().mockRejectedValue(rejected) };
+      const search = { ad_reached_countries: ['US'], search_terms: 'shoes' };
+      await expect(runMetaPagesTool('ads_library_search', 'u', '42', search, d)).rejects.toThrow(/does not have permission[\s\S]*facebook\.com\/ID/);
+      expect(warn).toHaveBeenCalledWith('[meta-toolkit] ads_library_search rejected by Meta', expect.objectContaining({ code: 10, subcode: 2332004 }));
+      // A missing-scope error and an unrelated failure on the same call carry no identity hint.
+      d.readGraph.mockRejectedValue(Object.assign(new Error('(#200) Requires ads_read permission'), { metaError: { code: 200, message: '(#200) Requires ads_read permission' } }));
+      await expect(runMetaPagesTool('ads_library_search', 'u', '42', search, d)).rejects.toThrow(/^Could not read from Meta: \(#200\) Requires ads_read permission\.$/);
+      d.readGraph.mockRejectedValue(Object.assign(new Error('Please reduce the amount of data'), { metaError: { code: 1, message: 'Please reduce the amount of data' } }));
+      await expect(runMetaPagesTool('ads_library_search', 'u', '42', search, d)).rejects.toThrow(/^Could not read from Meta: Please reduce the amount of data\.$/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('rejects out-of-range limits and wraps Meta errors as refusals', async () => {
     const d = deps({});
     await expect(runMetaPagesTool('ads_get_ig_accounts', 'u', '42', { limit: 500 }, d)).rejects.toThrow(/limit/);
