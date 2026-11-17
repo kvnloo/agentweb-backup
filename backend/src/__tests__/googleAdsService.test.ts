@@ -305,7 +305,7 @@ describe('listAccountHierarchy', () => {
 });
 
 describe('listAccountHierarchy: accounts Google lists but has not enabled (ENG-3135)', () => {
-  // Body copied from the prod 403 on 2026-11-16 that left a user with "0 accounts".
+  // Shape of the prod 403 that left a user with "0 accounts" (ENG-3135).
   const notEnabled = Object.assign(new Error('Request failed with status code 403'), {
     response: { status: 403, data: { error: { code: 403, status: 'PERMISSION_DENIED', details: [
       { errors: [{ errorCode: { authorizationError: 'CUSTOMER_NOT_ENABLED' }, message: 'not yet enabled or has been deactivated' }] },
@@ -315,13 +315,13 @@ describe('listAccountHierarchy: accounts Google lists but has not enabled (ENG-3
   it('reports a CUSTOMER_NOT_ENABLED probe failure through the out-param and still lists the usable accounts', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/6197536133', 'customers/111'] } });
+    mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: ['customers/9990001111', 'customers/111'] } });
     mockAxiosPost
       .mockRejectedValueOnce(notEnabled)
       .mockResolvedValueOnce({ data: { results: [{ customer: { id: '111', descriptiveName: 'Live', currencyCode: 'USD', manager: false } }] } });
     const diagnostics: { notEnabledCustomerIds?: string[] } = {};
     const tree = await service.listAccountHierarchy('test-access-token', diagnostics);
-    expect(diagnostics.notEnabledCustomerIds).toEqual(['6197536133']);
+    expect(diagnostics.notEnabledCustomerIds).toEqual(['9990001111']);
     expect(tree.map((n: any) => n.customerId)).toEqual(['111']);
     warnSpy.mockRestore();
     errSpy.mockRestore();

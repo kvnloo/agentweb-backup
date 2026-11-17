@@ -176,12 +176,12 @@ describe('completeGoogleConnect', () => {
 
   it('account exists but Google has not enabled it: finish THAT account, never "create one"', async () => {
     tree.mockImplementation(async (_token: string, diag?: { notEnabledCustomerIds?: string[] }) => {
-      if (diag) diag.notEnabledCustomerIds = ['6197536133'];
+      if (diag) diag.notEnabledCustomerIds = ['9990001111'];
       return [];
     });
     const step: any = await completeGoogleConnect({ code: 'c', state: zomaState() }, deps());
     expect(step).toMatchObject({ kind: 'page', status: 400, title: 'Google Ads account not finished', retryLabel: 'Connect Google Ads again' });
-    expect(step.message).toContain('6197536133');
+    expect(step.message).toContain('9990001111');
     expect(step.message).toMatch(/did not create it/);
     const text = step.steps.join(' ');
     expect(text).toMatch(/If its setup is unfinished, finish it there; do not create another account yet/);
@@ -202,7 +202,7 @@ describe('completeGoogleConnect', () => {
 
   it('a usable account still connects when another one is not enabled', async () => {
     tree.mockImplementation(async (_token: string, diag?: { notEnabledCustomerIds?: string[] }) => {
-      if (diag) diag.notEnabledCustomerIds = ['6197536133'];
+      if (diag) diag.notEnabledCustomerIds = ['9990001111'];
       return [leaf('1112223333')];
     });
     expect(await completeGoogleConnect({ code: 'c', state: zomaState() }, deps())).toMatchObject({ status: 200, title: 'Google Ads connected' });
