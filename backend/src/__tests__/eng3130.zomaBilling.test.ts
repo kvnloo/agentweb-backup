@@ -310,7 +310,16 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
     expect(d.createCheckoutSession).not.toHaveBeenCalled();
   });
 
-  it.each(['past_due', 'canceled', 'incomplete_expired'])('a %s plan is paywalled', async (status) => {
+  it.each(['past_due', 'unpaid'])('a %s plan is told to fix the card on it, with no second Checkout', async (status) => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: status as any })]) });
+    await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toThrow(/did not go through.*Do not start a second plan/);
+    const summary = await getZomaPlanSummary('u1', d);
+    expect(summary?.link).toBeUndefined();
+    expect(summary?.error).toMatch(/did not go through/);
+    expect(d.createCheckoutSession).not.toHaveBeenCalled();
+  });
+
+  it.each(['canceled', 'incomplete_expired'])('a %s plan is paywalled', async (status) => {
     const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: status as any })]) });
     await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toBeInstanceOf(ZomaPaywallError);
   });
@@ -325,7 +334,7 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
       findCustomerId: jest.fn().mockResolvedValue('cus_1'),
       listSubscriptions: jest.fn().mockResolvedValue([sub({ latest_invoice: { id: 'in_fee', status: 'open' } as any })]),
     });
-    await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toThrow(/payment is not confirmed/i);
+    await expect(assertZomaPublishAllowed('u1', { platform: 'meta' }, d)).rejects.toThrow(/payment is still being confirmed/i);
     const summary = await getZomaPlanSummary('u1', d);
     expect(summary).toMatchObject({ status: 'trialing', publish_enabled: false });
     expect(summary?.link).toBeUndefined();
@@ -338,6 +347,12 @@ describe('ENG-3131 assertZomaPublishAllowed', () => {
 
   it.each(['draft', 'open', 'paid'])('an active plan publishes whatever its renewal invoice is (%s)', (status) => {
     expect(planAllowsPublish(planStateFromSubscriptions('cus_1', [sub({ status: 'active', latest_invoice: { id: 'in_renewal', status } as any })]))).toBe(true);
+  });
+
+  it('zoma_status says a cancelled paying plan ends and will not renew', async () => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: 'active', cancel_at_period_end: true })]) });
+    const line = formatZomaPlanLine((await getZomaPlanSummary('u1', d))!, d.config());
+    expect(line).toMatch(/active until 2026-11-17, cancelled, it will not renew/);
   });
 
   it('zoma_status says a cancelled trial will not renew', async () => {
@@ -487,6 +502,8 @@ describe('ENG-3131 webhook transitions', () => {
     ['checkout.session.expired', { id: 'cs_1', metadata: zomaMeta }, undefined, 'checkout_expired'],
     ['customer.subscription.updated', { id: 'sub_1', status: 'active', metadata: zomaMeta }, { status: 'trialing' }, 'trial_converted'],
     ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200, metadata: zomaMeta }, undefined, 'trial_canceled'],
+    ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200 + 1800, metadata: zomaMeta }, undefined, 'trial_canceled'],
+    ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200 + 3601, metadata: zomaMeta }, undefined, 'subscription_canceled'],
     ['customer.subscription.deleted', { id: 'sub_1', status: 'canceled', trial_end: 200, ended_at: 200 + 2 * 3600, metadata: zomaMeta }, undefined, 'subscription_canceled'],
   ])('%s → %s funnel step (deduped on the Stripe event id)', async (type, object, prev, step) => {
     const recordFunnel = jest.fn().mockResolvedValue(true);
@@ -554,7 +571,7 @@ describe('ENG-3131 day-3 trial reminder', () => {
       sendEmail: jest.fn(async () => { order.push('send'); return 'sent' as const; }),
     });
     await expect(runZomaTrialReminders(d)).resolves.toEqual({ checked: 2, sent: 1 });
-    expect(order).toEqual(['send', 'mark']);
+    expect(order).toEqual(['mark', 'send']);
     expect(d.recordFunnel).toHaveBeenCalledWith(expect.objectContaining({ step: 'trial_reminder_claimed', dedupeKey: 'sub_1#2026-11-13T05' }));
     expect(d.setSubscriptionMetadata).toHaveBeenCalledWith('sub_1', { [TRIAL_REMINDER_METADATA_KEY]: '2026-11-13T05:00:00.000Z' });
     expect(d.getUsage).toHaveBeenCalledWith('u1', { start: new Date(start).toISOString(), end: '2026-11-13T05:00:00.000Z' });
@@ -569,12 +586,22 @@ describe('ENG-3131 day-3 trial reminder', () => {
 
   const dueDeps = (over: Partial<ZomaBillingDeps> = {}) => billingDeps({ now: () => at('2026-11-13T05:00:00Z'), searchTrialingSubscriptions: jest.fn().mockResolvedValue([sub()]), ...over });
 
-  it('a failed send leaves the subscription unmarked so the next pass retries it', async () => {
+  it('a failed send clears the marker again so the next pass retries it', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const d = dueDeps({ sendEmail: jest.fn().mockResolvedValue('failed') });
     await expect(runZomaTrialReminders(d)).resolves.toEqual({ checked: 1, sent: 0 });
-    expect(d.setSubscriptionMetadata).not.toHaveBeenCalled();
+    expect((d.setSubscriptionMetadata as jest.Mock).mock.calls).toEqual([
+      ['sub_1', { [TRIAL_REMINDER_METADATA_KEY]: expect.any(String) }],
+      ['sub_1', { [TRIAL_REMINDER_METADATA_KEY]: '' }],
+    ]);
     expect(d.recordFunnel).not.toHaveBeenCalledWith(expect.objectContaining({ step: 'trial_reminder_sent' }));
+  });
+
+  it('when the marker cannot be written nothing is sent, so it can never repeat every hour', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const d = dueDeps({ setSubscriptionMetadata: jest.fn().mockRejectedValue(new Error('stripe 429')) });
+    await expect(runZomaTrialReminders(d)).resolves.toEqual({ checked: 1, sent: 0 });
+    expect(d.sendEmail).not.toHaveBeenCalled();
   });
 
   it('a mail the non-prod guard suppressed is marked done but not counted as sent', async () => {
