@@ -19,7 +19,7 @@ import {
   getAccountsByUserIdIncludingOrgShared,
   type ConnectedAccount,
 } from '../services/connectedAccountsDb';
-import { recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
+import { recordMcpToolFailed, recordMcpToolUse, recordMcpWriteExecuted, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
@@ -40,6 +40,7 @@ import { EVENT_SOURCE_WRITE_KIND, isMetaEventSourceTool, isMetaEventSourceWrite,
 import { CATALOG_FEED_WRITE_KIND, isMetaCatalogFeedTool, isMetaCatalogFeedWrite, runMetaCatalogFeedTool } from './metaToolkitCatalogFeeds';
 import { CATALOG_WRITE_KIND, isMetaCatalogWrite, isMetaCatalogWriteTool, runMetaCatalogWriteTool } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, runMetaPagesTool } from './metaToolkitPages';
+import { isMetaBoostTool, runMetaBoostTool } from './metaToolkitBoost';
 import { executeMetaToolkitCreative, isCreativeAssetRequest, prepareZomaUpload } from './metaToolkitCreatives';
 import { isLifecycleWriteRequest } from './metaToolkitWriteSurface';
 import { executeMetaToolkitLifecycle } from './metaToolkitLifecycle';
@@ -48,6 +49,8 @@ import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClie
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
 import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
+import crypto from 'crypto';
+import { assertZomaPublishAllowed, isBillableResult, isZomaPublishWrite, reportZomaBillableCall } from './zomaBilling';
 
 /**
  * ENG-2906: every toolkit surface (Meta, Google, zoma_ tokens) is the Zoma product. The first
@@ -121,6 +124,8 @@ export interface MetaToolkitGatewayDeps {
   runEventSourceTool?: typeof runMetaEventSourceTool;
   /** ENG-2980 experiment eligibility + A/B / lift writes; defaults to runMetaExperimentWriteTool. */
   runExperimentWriteTool?: typeof runMetaExperimentWriteTool;
+  /** ENG-3033 ads_boost_ig_post (preview → confirm, created PAUSED); defaults to runMetaBoostTool. */
+  runBoostTool?: typeof runMetaBoostTool;
   /** ENG-2926 catalog create/update, feeds, upload sessions, feed rules; defaults to runMetaCatalogFeedTool. */
   runCatalogFeedTool?: typeof runMetaCatalogFeedTool;
   /** ENG-2920 read-only Pages/Instagram/Ad Library tools; defaults to runMetaPagesTool. */
@@ -131,6 +136,12 @@ export interface MetaToolkitGatewayDeps {
   executeAudience?: (userId: string, args: any) => Promise<any>;
   /** ENG-2747: redirect URIs of an OAuth client (null when unknown); defaults to mcpOAuthService.getClient. */
   getOAuthClientRedirectUris?: (clientId: string) => Promise<string[] | null>;
+  /** ENG-3130: audit row for a call that failed in-band (never metered); defaults to recordMcpToolFailed. */
+  recordFailure?: typeof recordMcpToolFailed;
+  /** ENG-3130: one Stripe meter event per successful call; defaults to reportZomaBillableCall (no-op while billing is off). */
+  reportBillableCall?: (userId: string, identifier: string) => Promise<unknown>;
+  /** ENG-3131: paywall before a write that makes ads live; defaults to assertZomaPublishAllowed (no-op while billing is off). */
+  assertPublishAllowed?: (userId: string, context: { platform: string; toolName?: string }) => Promise<void>;
   /** ENG-3127: last-30-day spend of a connected Meta ad account; defaults to a Graph insights read. */
   accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
   /** ENG-3134 zoma_ads_report; defaults to runZomaAdsReport (Graph insights read). */
@@ -398,8 +409,35 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     });
     throw new MetaToolkitRefusal(DATABRICKS_READ_ONLY_MESSAGE);
   }
-  const meter = (platform?: string) => {
+  // ENG-3130: a call is billable only when it succeeded. Thrown calls never get here; a result
+  // that reports failure in-band (success:false, not a preview or a dispatched write) is not
+  // metered either. Each metered call is one Stripe meter event (no-op while billing is off);
+  // a billing failure is logged and never fails the call.
+  const meter = async (platform?: string, result?: unknown) => {
+    if (result !== undefined && !isBillableResult(result)) {
+      // Not metered and not counted as usage, but still audited: any call that failed in-band (read or write) leaves a row.
+      void Promise.resolve()
+        .then(() =>
+          (deps.recordFailure ?? recordMcpToolFailed)({
+            product: TOOLKIT_PRODUCT,
+            userId: caller.userId,
+            toolName: request.toolName,
+            ...(platform ? { platform } : {}),
+            authMethod: caller.authMethod,
+            apiKeyId: caller.apiKeyId,
+            clientId: caller.clientId,
+            ...(caller.databricksOrigin ? { clientType: 'databricks' as const } : {}),
+            sessionId: request.sessionId,
+            userAgent: request.userAgent,
+          }),
+        )
+        .catch((error) => console.error('[meta-toolkit] failed-call audit failed:', error instanceof Error ? error.message : error));
+      return false;
+    }
     void noteProductUse(caller.userId, TOOLKIT_PRODUCT);
+    void Promise.resolve()
+      .then(() => (deps.reportBillableCall ?? reportZomaBillableCall)(caller.userId, `zoma-${crypto.randomUUID()}`))
+      .catch((error) => console.error('[meta-toolkit] billing meter failed:', error instanceof Error ? error.message : error));
     return deps.recordUsage({
       product: TOOLKIT_PRODUCT,
       userId: caller.userId,
@@ -414,6 +452,17 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       userAgent: request.userAgent,
       ref: request.ref,
     });
+  };
+
+  // ENG-3131: the paywall sits in front of writes that make ads live (preview included, so the
+  // user never approves a launch that cannot run). Reads, drafts and paused creates never reach it.
+  const assertPublishAllowed = async (platform: 'meta' | 'google_ads') => {
+    try {
+      await (deps.assertPublishAllowed ?? assertZomaPublishAllowed)(caller.userId, { platform, toolName: request.toolName });
+    } catch (error) {
+      if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
+      throw error;
+    }
   };
 
   // ENG-2303 P4: a write that reached Meta (it has a read-back verdict) is metered as its
@@ -449,7 +498,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (request.toolName === 'zoma_prepare_upload') {
     assertMetaToolkitScope(caller, request.toolName, true);
     const result = await (deps.prepareUpload ?? prepareZomaUpload)(caller.userId, request.args ?? {});
-    await meter();
+    await meter(undefined, result);
     return result;
   }
 
@@ -467,22 +516,23 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
       throw error;
     }
-    await meter();
+    await meter(undefined, result);
     return result;
   }
 
-  // ENG-2823: Google Ads provider (dark until ZOMA_GOOGLE_ADS_ENABLED=true). Loaded lazily so
+  // ENG-2823: Google Ads provider (dark until ZOMA_GOOGLE_ENABLED=true). Loaded lazily so
   // the Meta path never imports the Google stack.
   if (googleToolkitEnabled()) {
     const google = await import('./googleToolkitGateway');
     if (google.isGoogleToolkitTool(request.toolName)) {
       const googleWrite = google.isGoogleToolkitWrite(request.toolName, request.args ?? {});
       assertMetaToolkitScope(caller, request.toolName, googleWrite);
+      if (googleWrite && isZomaPublishWrite('google_ads', request.args)) await assertPublishAllowed('google_ads');
       const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
       const googleResult = await google.handleGoogleToolkitCall(caller, request, {
         listAccounts: deps.listAccounts,
         now: deps.now,
-        meter: () => meter('google_ads'),
+        meter: (result) => meter('google_ads', result),
         recordWrite: async (input) => {
           const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
           journeyAfterCall(caller.userId, 'first_write', { platform: 'google_ads', toolName: request.toolName });
@@ -504,19 +554,19 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
         || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
         || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
-        || isMetaExperimentWrite(request.toolName),
+        || isMetaExperimentWrite(request.toolName) || isMetaBoostTool(request.toolName),
   );
   // ENG-2921: the error explainer is pure (static table) and needs no ad account.
   if (request.toolName === 'ads_get_errors' || request.toolName === 'ads_get_help_article') {
     const result = request.toolName === 'ads_get_errors' ? explainMetaError(args) : getMetaHelpArticles(args);
-    await meter('meta');
+    await meter('meta', result);
     return result;
   }
   const metaWrite = audienceTool ? isAudienceWriteRequest(args)
     : isCreativeAssetRequest(request.toolName, args) || isGuardedWriteRequest(request.toolName, args)
       || isLifecycleWriteRequest(request.toolName, args) || isMetaCatalogWrite(request.toolName)
       || isMetaEventSourceWrite(request.toolName) || isMetaCatalogFeedWrite(request.toolName)
-        || isMetaExperimentWrite(request.toolName);
+        || isMetaExperimentWrite(request.toolName) || isMetaBoostTool(request.toolName);
   return withMetaToolkitBackoff(metaWrite, deps.sleep, async () => {
   const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
@@ -537,14 +587,14 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaSignals(caller.userId, request.toolName, args);
     // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
-    if ((result as any)?.success !== false) await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
   // ENG-2916: read-only account health / learning phase on the resolved (owned) account.
   if (isMetaHealthTool(request.toolName)) {
     const health = await (deps.runHealthTool ?? runMetaHealthTool)(request.toolName, caller.userId, accountId, args);
-    await meter('meta');
+    await meter('meta', health);
     return stripCredentials(health);
   }
 
@@ -558,7 +608,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   // ENG-2918: read-only catalog tools, scoped to the resolved account's business catalogs.
   if (isMetaCatalogTool(request.toolName)) {
     const catalogs = await (deps.runCatalogTool ?? runMetaCatalogTool)(request.toolName, caller.userId, accountId, args);
-    await meter('meta');
+    await meter('meta', catalogs);
     return stripCredentials(catalogs);
   }
 
@@ -568,7 +618,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const result: any = await (deps.runCatalogWriteTool ?? runMetaCatalogWriteTool)(request.toolName, caller.userId, accountId, args);
     const kind = CATALOG_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
-    await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
@@ -577,7 +627,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const result: any = await (deps.runEventSourceTool ?? runMetaEventSourceTool)(request.toolName, caller.userId, accountId, args);
     const kind = EVENT_SOURCE_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
-    await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
@@ -586,15 +636,23 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const result: any = await (deps.runCatalogFeedTool ?? runMetaCatalogFeedTool)(request.toolName, caller.userId, accountId, args);
     const kind = CATALOG_FEED_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
-    await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
   // ENG-2920: read-only Pages / Instagram / Ad Library tools, scoped to the resolved account.
   if (isMetaPagesTool(request.toolName)) {
     const pages = await (deps.runPagesTool ?? runMetaPagesTool)(request.toolName, caller.userId, accountId, args);
-    await meter('meta');
+    await meter('meta', pages);
     return stripCredentials(pages);
+  }
+
+  // ENG-3033: boost an Instagram post. A write tool: preview → confirm, every entity created PAUSED.
+  if (isMetaBoostTool(request.toolName)) {
+    const result: any = await (deps.runBoostTool ?? runMetaBoostTool)(request.toolName, caller.userId, accountId, args);
+    await recordExecutedWrite('AD', 'CREATE', result);
+    await meter('meta');
+    return stripCredentials(result);
   }
 
   // ENG-2980: experiment eligibility (read) + preview-confirmed A/B and lift writes.
@@ -602,7 +660,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const result: any = await (deps.runExperimentWriteTool ?? runMetaExperimentWriteTool)(request.toolName, caller.userId, accountId, args);
     const kind = EXPERIMENT_WRITE_KIND[request.toolName];
     if (kind) await recordExecutedWrite(kind.entityType, kind.action, result);
-    await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
@@ -611,7 +669,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaExperiments(caller.userId, request.toolName, args);
     // A Meta failure comes back as success:false (not thrown); like a refusal, it is not metered.
-    if ((result as any)?.success !== false) await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
@@ -619,7 +677,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (isDiagnosticsRead(request.toolName)) {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.readToolkitMetaActivityLog(caller.userId, args);
-    await meter('meta');
+    await meter('meta', result);
     return stripCredentials(result);
   }
 
@@ -629,6 +687,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   const creativeAsset = isCreativeAssetRequest(request.toolName, args);
   const lifecycle = !audienceTool && isLifecycleWriteRequest(request.toolName, args);
   const guardedWrite = audienceTool || creativeAsset || lifecycle || isGuardedWriteRequest(request.toolName, args);
+  if (!audienceTool && !creativeAsset && !lifecycle && guardedWrite && isZomaPublishWrite('meta', args)) await assertPublishAllowed('meta');
   let result: any;
   if (audienceTool) result = await (deps.executeAudience ?? executeMetaToolkitAudience)(caller.userId, args);
   else if (creativeAsset) result = await (deps.executeCreative ?? executeMetaToolkitCreative)(caller.userId, args);
@@ -643,7 +702,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write, args.params);
   }
 
-  await meter('meta');
+  await meter('meta', result);
   if (!guardedWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
   return stripCredentials(result);
   });

@@ -16,7 +16,7 @@
 import { SIGNAL_READ_DEFINITIONS } from './metaToolkitSignals';
 import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
-import { isZomaTool, ZOMA_TOOL_DEFINITIONS } from './zomaToolDefinitions';
+import { isZomaTool, zomaToolDefinitions } from './zomaToolDefinitions';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { GUARDED_WRITE_ACTIONS, LIFECYCLE_WRITE_ACTIONS } from './metaToolkitWriteSurface';
 import { isMetaHealthTool, META_HEALTH_TOOL_DEFINITIONS } from './metaToolkitHealth';
@@ -26,6 +26,7 @@ import { isMetaCatalogFeedTool, META_CATALOG_FEED_TOOL_DEFINITIONS } from './met
 import { isMetaEventSourceTool, META_EVENT_SOURCE_TOOL_DEFINITIONS } from './metaToolkitEventSources';
 import { isMetaCatalogWriteTool, META_CATALOG_WRITE_TOOL_DEFINITIONS } from './metaToolkitCatalogWrites';
 import { isMetaPagesTool, META_PAGES_TOOL_DEFINITIONS } from './metaToolkitPages';
+import { isMetaBoostTool, META_BOOST_TOOL_DEFINITIONS } from './metaToolkitBoost';
 import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } from './metaToolkitExperimentWrites';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
@@ -137,9 +138,11 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     // ENG-2926: catalog create/update, feeds, upload sessions, feed rules (deletes are preview → confirm).
     ...META_CATALOG_FEED_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     ...META_PAGES_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-3033: boost an Instagram post (preview → confirm; campaign, ad set and ad created PAUSED).
+    ...META_BOOST_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3032: read-only image / video library lists.
     ...META_ASSET_LIBRARY_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
-    ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    ...zomaToolDefinitions().map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
     JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
   ];
@@ -147,7 +150,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name) || isMetaAssetLibraryTool(name)) return;
+  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name) || isMetaAssetLibraryTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

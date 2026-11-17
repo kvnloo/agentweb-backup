@@ -172,7 +172,7 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   same(PG, 'ENG-2920', 'ads_get_user_pages'),
   same(PG, 'ENG-2920', 'ads_get_ig_accounts'),
   same(PG, 'ENG-2920', 'ads_get_ig_media'),
-  gap(PG, 'ENG-2920', 'ads_boost_ig_post'),
+  same(PG, 'ENG-3033', 'ads_boost_ig_post'),
   same(PG, 'ENG-2920', 'ads_library_search'),
 
   // ENG-2921
