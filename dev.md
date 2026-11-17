@@ -1,3 +1,41 @@
+## ENG-3076: group-email send builds each recipient message in one place (2026-11-16)
+
+- `buildGroupEmailRecipientMessage` in `backend/src/routes/crm.ts` now builds subject, html, text and List-Unsubscribe headers for both the background mailbox run and the in-request loop. Behavior unchanged; a characterization test asserts both paths produce the identical message.
+
+## ENG-3070: admin read of a named client's Meta change history (2026-11-16)
+
+New admin-only tool `read_client_meta_activity` (`backend/src/mcp/server/apiTools.ts`) calls `GET /api/client-health/:client/meta-activity`, served by `readClientMetaActivity` in `backend/src/services/clientHealthService.ts`. It reads one page of the Meta `activities` edge for the named client's ad account through the existing `executeActivityLogRead` (`backend/src/mcp/metaToolkitDiagnostics.ts`). Nothing is written to Meta. The tool is not listed on the public MCP surface.
+
+The client lookup and the account/token pairing were lifted out of `assessClientHealth` into `findClientMatches` and `resolveClientMetaAccount`; `assessClientHealth` calls both and still takes the first name match. The new read refuses instead when a name matches more than one client.
+
+Every failure returns `success: false` with a `reason`: `not_admin`, `client_not_found`, `ambiguous_client`, `no_meta_connection`, `credential_pair_mismatch`, `invalid_argument`, `meta_read_failed`. A failed Meta read is never returned as an empty history. A connected account that has an id but no token of its own is not read with the shared token.
+
+`before` and `after` are Meta's own `extra_data.old_value` / `new_value`, passed through unchanged; their inner shape per event type was not checked against a live account.
+
+## ENG-3067: shadow-only claim check on server-side outreach drafts (2026-11-16)
+
+`backend/src/services/outreachClaimCheck.ts` adds `findUnsupportedSenderClaims`, a pure function (no I/O, no LLM, no network) that returns percentages, money amounts, numbers with a unit and named customers/partners a draft states which the sender's `brandData` and market strategy text do not contain. Anything in the lead record counts as the recipient's and is not flagged. Missing facts return `{ status: 'no_facts' }`.
+
+`updateEmailDraftForLead` (`backend/src/emma/impl/leads.ts`) calls `logOutreachClaimCheckShadow` after the email draft and after the LinkedIn note. It logs one JSON line, `event: outreach_claim_check_shadow`, with channel, lead list ID and counts by kind. No draft text is logged. It never blocks, rewrites or surfaces anything, and an error inside it is swallowed.
+
+A zero count is not proof a draft is grounded. The check cannot see qualitative claims, spelled-out or paraphrased numbers, a supported number attached to the wrong thing, or customer names outside its trigger phrases.
+
+## ENG-2783: hot lead calls launch fixes (2026-11-16)
+
+Found by walking the customer path before launch; each checked against the code and prod data first.
+
+- The portal read-out told a customer on the right plan "Your plan may not include hot-lead calls" once the paid add-on was required and not yet bought. `entitled` is now the plan check, and a blocker explains the add-on and that Emma sells it (the portal cannot buy it). An org that is already on and has lost the add-on sees the same blocker in Emma's read-out.
+- Emma no longer sells the add-on while the global `hot_lead_call_mode` switch is off, and checks again right before charging: setup does not need the switch, so without this a customer could pay $70 for calls that cannot happen. An org that already has the add-on is not blocked.
+- The add now confirms the created item with a read before mirroring it, and refuses when the read fails (the retry finds the paid item, no second charge). Duplicate-item cleanup moved to a helper that works on the items just read.
+- Launch order, because of who is on which plan (27 of 33 Pro accounts have no Stripe subscription): billing required first, then tick `hot_lead_call` on the plans, then the kill switch. Ticking a plan while billing is off lets every owner on it call at AgentWeb's Twilio cost.
+
+## ENG-2783: hot lead calls add-on, findings from the Stripe sandbox run (2026-11-16)
+
+The real add-on code was run against a Stripe sandbox account (test mode); two problems turned up.
+
+- The idempotency key repeats within a minute, so cancelling the add-on and buying it again at once made Stripe replay the first response, an item that was already removed. The add reported success and mirrored an item that does not exist. It now writes the mirror only when the created item is really on the subscription, and otherwise asks the customer to try again in a couple of minutes.
+- The plan lookup (`findBasePlanItem`) skipped only the seat item. The add-on item comes from price_data, so if it ever listed first it would be read as the plan: wrong tier, and a plan change could overwrite the add-on's price. It now skips the add-on item too, and the three tier-derivation sites that read `items.data[0]` use it.
+
 ## ENG-2783: hot lead calls add-on, review fixes (2026-11-16)
 
 Four review findings on the billing add-on (#4048), each checked against the code before the change.

@@ -376,7 +376,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -3116,9 +3116,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3152,7 +3151,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two

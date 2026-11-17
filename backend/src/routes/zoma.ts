@@ -4,13 +4,14 @@
  *
  *   POST /api/zoma/setup              (unauthenticated) start; RFC 8628 device authorization response
  *                                     optional `ref` (body or query, /^[a-z0-9_-]{1,64}$/) for attribution
- *   POST /api/zoma/setup/poll         {device_code} -> RFC errors, then next_step + link, then the token once
+ *   POST /api/zoma/setup/poll         {device_code[, ads_experience]} -> RFC errors, then next_step + link, then the token once
+ *   POST /api/zoma/ads-experience     ENG-3128 "How familiar are you with ads?" form submit
  *   GET  /api/zoma/activate           verification page; ?user_code= -> AgentWeb sign-in + consent
  *   GET  /api/zoma/activate/callback  consent result; binds the device code, then continues the journey
- *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup (forwarded by /api/oauth/meta/callback)
+ *   GET  /api/zoma/meta/callback      Meta OAuth result for a Zoma setup or an MCP user's zoma_status link (forwarded by /api/oauth/meta/callback)
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
  *   GET  /api/zoma/continue           resume the journey from a signed link
- *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set"
+ *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
  *
  * None of these read the browser's AgentWeb session: the setup's user always comes from the
@@ -19,6 +20,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { rateLimiter } from '../middleware/rateLimiter';
 import {
+  answerAdsExperience,
   beginVerification,
   completeMetaConnect,
   completeVerification,
@@ -85,6 +87,24 @@ function codeForm(message?: string) {
 
 function renderStep(res: Response, step: BrowserStep, req?: Request) {
   if (step.kind === 'redirect') return res.redirect(req?.method === 'POST' ? 303 : 302, step.url);
+  if (step.kind === 'ask_ads_experience') {
+    const options = step.options
+      .map(
+        (o, i) =>
+          `<label><input type="radio" name="answer" value="${escapeHtml(o.value)}"${i === 0 ? ' required' : ''}> ${escapeHtml(o.label)}</label>`,
+      )
+      .join('');
+    return page(
+      res,
+      200,
+      step.question,
+      (step.message ? `<p><strong>${escapeHtml(step.message)}</strong></p>` : '<p>So Zoma can set you up the right way.</p>') +
+        `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}` +
+        `<p><button type="submit">Continue</button></p></form>`,
+      // A "runs_ads" answer continues on to Meta (or Stripe) from this submit.
+      PICKER_FORM_ACTION,
+    );
+  }
   if (step.kind === 'pick_account') {
     const options = step.accounts
       .map(
@@ -103,8 +123,9 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       PICKER_FORM_ACTION,
     );
   }
-  const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">Try again</a></p>` : '';
-  return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${retry}`);
+  const retry = step.retryUrl ? `<p><a class="button" href="${escapeHtml(step.retryUrl)}">${escapeHtml(step.retryLabel ?? 'Try again')}</a></p>` : '';
+  const steps = step.steps?.length ? `<ol>${step.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>` : '';
+  return page(res, step.status, step.title, `<p>${escapeHtml(step.message)}</p>${steps}${retry}`);
 }
 
 function failPage(res: Response, step: string, error: unknown) {
@@ -129,7 +150,7 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
   router.post('/setup/poll', throttle('poll', ZOMA_POLL_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       res.setHeader('Cache-Control', 'no-store');
-      const result = await pollSetup(req.body?.device_code, deps);
+      const result = await pollSetup(req.body?.device_code, deps, { adsExperience: req.body?.ads_experience });
       return res.status(result.status).json(result.body);
     } catch (error) {
       logZomaSetup({ step: 'poll', outcome: 'error', reason: error });
@@ -176,6 +197,14 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
     }
   });
 
+  router.post('/ads-experience', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await answerAdsExperience({ t: req.body?.t, answer: req.body?.answer }, deps), req);
+    } catch (error) {
+      return failPage(res, 'ads_experience', error);
+    }
+  });
+
   router.get('/continue', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       return renderStep(res, await resumeInBrowser(req.query.t, deps));
@@ -187,7 +216,7 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
   router.get('/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       const q = req.query;
-      return renderStep(res, await finishPayment({ t: q.t, session_id: q.session_id, canceled: q.canceled }, deps));
+      return renderStep(res, await finishPayment({ t: q.t, session_id: q.session_id, canceled: q.canceled, mcp: q.mcp }, deps));
     } catch (error) {
       return failPage(res, 'checkout_completed', error);
     }

@@ -31,6 +31,7 @@ const NOT_AVAILABLE = 'The hot lead calls add-on cannot be billed right now. Not
 const TRIAL_SUBSCRIPTION = 'The hot lead calls add-on can be added once your subscription has taken its first payment (it is in a trial now). Nothing was charged or turned on.';
 const NOT_MONTHLY = 'The hot lead calls add-on is billed monthly and can only be added to a monthly subscription. Nothing was charged or turned on; please contact support.';
 const PAID_NOT_SAVED = 'Your payment for the hot lead calls add-on went through, but we could not finish turning it on. Calling is still off. Try again in a moment: you will not be charged twice.';
+const NOT_CONFIRMED = 'The hot lead calls add-on could not be confirmed on your subscription, so calling was not turned on. You will not be charged twice: try again in a couple of minutes, or contact support.';
 const NO_SUBSCRIPTION = 'The hot lead calls add-on is added to the organization owner’s paid subscription, and none is active. Subscribe to a plan first, then try again. Nothing was charged or turned on.';
 
 let _stripe: Stripe | null = null;
@@ -86,27 +87,24 @@ function productIdOf(item: Stripe.SubscriptionItem): string | undefined {
   return typeof product === 'string' ? product : product?.id;
 }
 
-/** Keeps the earliest add-on item on the subscription and deletes the rest with a credit; returns the kept item id. */
-async function removeDuplicateItems(stripe: Stripe, subscriptionId: string, productId: string, orgId: string): Promise<string> {
-  const fresh = await stripe.subscriptions.retrieve(subscriptionId);
-  const items = fresh.items.data
+/**
+ * Keeps the earliest add-on item in `items` (a subscription's items as Stripe just returned them) and deletes the rest
+ * with a credit; returns the kept item id, or null when there is no add-on item at all. A failed deletion is logged,
+ * never thrown (the add-on is paid), and is retried on the next add. The caller must already have read `items` from Stripe.
+ */
+async function dedupeAddonItems(stripe: Stripe, items: Stripe.SubscriptionItem[], productId: string, orgId: string): Promise<string | null> {
+  const mine = items
     .filter((i) => productIdOf(i) === productId)
     .sort((a, b) => a.created - b.created || a.id.localeCompare(b.id));
-  for (const extra of items.slice(1)) {
-    await stripe.subscriptionItems.del(extra.id, { proration_behavior: 'always_invoice' });
-    console.warn('[hotLeadCallBilling] removed a duplicate add-on item', { orgId });
+  for (const extra of mine.slice(1)) {
+    try {
+      await stripe.subscriptionItems.del(extra.id, { proration_behavior: 'always_invoice' });
+      console.warn('[hotLeadCallBilling] removed a duplicate add-on item', { orgId });
+    } catch (err) {
+      console.error('[hotLeadCallBilling] duplicate cleanup failed; it is retried on the next add', { orgId, type: (err as { type?: string })?.type ?? 'error' });
+    }
   }
-  return items[0].id;
-}
-
-/** removeDuplicateItems that logs a failure instead of throwing (the add-on is paid); the next add attempt retries it. */
-async function removeDuplicatesQuietly(stripe: Stripe, subscriptionId: string, productId: string, orgId: string, fallbackId: string): Promise<string> {
-  try {
-    return await removeDuplicateItems(stripe, subscriptionId, productId, orgId);
-  } catch (err) {
-    console.error('[hotLeadCallBilling] duplicate cleanup failed; it is retried on the next add', { orgId, type: (err as { type?: string })?.type ?? 'error' });
-    return fallbackId;
-  }
+  return mine[0]?.id ?? null;
 }
 
 /**
@@ -143,9 +141,8 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
     if (existing) {
       // Paid already (for example a retry after the settings write failed): make sure entitlement can see it now.
       // A duplicate left by an earlier failed cleanup is retried here, so it cannot keep billing for good.
-      const keptId = subscription.items.data.filter((i) => productIdOf(i) === productId).length > 1
-        ? await removeDuplicatesQuietly(stripe, subscription.id, productId, orgId, existing.id)
-        : existing.id;
+      const keptId = await dedupeAddonItems(stripe, subscription.items.data, productId, orgId);
+      if (!keptId) throw new HotLeadCallBillingError(NOT_CONFIRMED);
       if (!await writeMirror(orgId, { itemId: keptId, status: 'active' })) throw new HotLeadCallBillingError(PAID_NOT_SAVED);
       return { itemId: keptId, alreadyPresent: true };
     }
@@ -156,7 +153,7 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
 
     // The key only stops a double click racing the live check above from creating two items; it is bucketed per
     // minute so a retry after a failure is a fresh request instead of Stripe replaying the old error.
-    const item = await stripe.subscriptionItems.create({
+    await stripe.subscriptionItems.create({
       subscription: subscription.id,
       price_data: { currency: 'usd', unit_amount: HOT_LEAD_CALL_ADDON_PRICE_CENTS, product: productId, recurring: { interval: 'month' } },
       quantity: 1,
@@ -165,9 +162,20 @@ export async function addHotLeadCallBilling(orgId: string): Promise<{ itemId: st
       payment_behavior: 'error_if_incomplete',
     }, { idempotencyKey: `hot-lead-call-addon:${orgId}:${subscription.id}:${Math.floor(Date.now() / 60_000)}` });
     console.info('[hotLeadCallBilling] add-on added', { orgId, priceCents: HOT_LEAD_CALL_ADDON_PRICE_CENTS });
-    // Two requests straddling a minute boundary can both pass the live check above and use different keys, so look again
-    // and remove any extra item (credited), keeping the earliest one. A failure here is logged, never thrown: the add-on is paid.
-    const keptId = await removeDuplicatesQuietly(stripe, subscription.id, productId, orgId, item.id);
+    // Confirm by reading the subscription again: the idempotency key repeats within a minute, so Stripe can replay an
+    // earlier response for an item that has since been removed (cancel, then buy again at once). Only an item that is
+    // really on the subscription may be mirrored; when the read fails nothing is mirrored and the retry finds the item.
+    const fresh = await stripe.subscriptions.retrieve(subscription.id).catch((err) => {
+      console.error('[hotLeadCallBilling] could not confirm the created item', { orgId, type: (err as { type?: string })?.type ?? 'error' });
+      return null;
+    });
+    // Two requests straddling a minute boundary can both pass the live check above and use different keys, so remove
+    // any extra item (credited), keeping the earliest one.
+    const keptId = fresh ? await dedupeAddonItems(stripe, fresh.items.data, productId, orgId) : null;
+    if (!keptId) {
+      console.error('[hotLeadCallBilling] created item is not confirmed on the subscription', { orgId });
+      throw new HotLeadCallBillingError(NOT_CONFIRMED);
+    }
     // Entitlement reads the mirror; do not wait for the webhook (it can lag or arrive out of order). When it cannot be
     // stored, calling must not turn on (dispatch would refuse it); the retry finds the paid item and writes the mirror.
     if (!await writeMirror(orgId, { itemId: keptId, status: 'active' })) throw new HotLeadCallBillingError(PAID_NOT_SAVED);

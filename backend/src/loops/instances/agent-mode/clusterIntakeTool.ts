@@ -26,6 +26,8 @@ export interface CanonicalRef {
   identifier: string;
   issueId: string;
   description: string;
+  /** ISO creation time, when the port provides it (ENG-3088). */
+  createdAt?: string;
 }
 
 export interface ClusterIntakePorts {
@@ -34,6 +36,8 @@ export interface ClusterIntakePorts {
   findClosedAuto: (isMatch: (i: CanonicalRef) => boolean) => Promise<CanonicalRef | null>;
   reopen: (issueId: string) => Promise<void>;
   comment: (issueId: string, body: string) => Promise<void>;
+  /** ENG-3088: what has already been posted on a canonical, to find the last recurrence post. */
+  listComments: (issueId: string) => Promise<{ body: string; createdAt?: string }[]>;
   /** ENG-1099: Linear is only mutated from production; elsewhere the reopen path is suppressed. */
   isProduction: () => boolean;
 }
@@ -62,6 +66,7 @@ const defaultPorts = (): ClusterIntakePorts => ({
     (await import('../../../services/linearService')).findMostRecentClosedIssueByLabel('Auto', isMatch),
   reopen: async (id) => (await import('../../../services/linearService')).reopenIssue(id, 'Todo'),
   comment: async (id, body) => (await import('../../../services/linearService')).addIssueComment(id, body),
+  listComments: async (id) => (await import('../../../services/linearService')).getIssueCommentsDetailed(id),
   isProduction: () => process.env.NODE_ENV === 'production',
 });
 
@@ -90,6 +95,26 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
       'Alert Class': alertClass,
     };
     try {
+      // ENG-3088: the 7-day window keeps an old failure over threshold for days. Only a failure
+      // newer than the last thing posted on the canonical is a recurrence worth a comment/reopen.
+      const fresh = await this.newSinceLastPost(alertClass, payload);
+      if (fresh && fresh.newFailures === 0) {
+        const intake = {
+          pageId: fresh.canonical.identifier,
+          url: `${LINEAR_ISSUE_BASE}/${fresh.canonical.identifier}`,
+          deduped: true,
+          tracker: 'Linear' as const,
+          noNewFailures: true,
+          alertClass,
+        };
+        return { ...mutation, artifact: { ...mutation.artifact, intake } };
+      }
+      if (fresh) {
+        // Re-insert the class so it stays the last context line (see above).
+        delete context['Alert Class'];
+        context['New Since Last Comment'] = `${fresh.newFailures} of ${payload.failures} failures`;
+        context['Alert Class'] = alertClass;
+      }
       const intake = await this.reopenOnce(alertClass, payload, context)
         ?? (await this.ports.fileIssue({
           title: this.title(payload),
@@ -105,6 +130,36 @@ export class ClusterIntakeTool implements MutationTools<Payload> {
         artifact: { ...mutation.artifact, intake: { alertClass } },
         error: `intake failed: ${err instanceof Error ? err.message : String(err)}`,
       };
+    }
+  }
+
+  /**
+   * ENG-3088: how many of this cluster's failures are newer than the last filing/recurrence post on
+   * its canonical (open, else closed). The baseline is read back from Linear itself (issue creation
+   * time and "Recurred on"/"Reopened" comment times), so nothing new is stored. Returns null when
+   * there is no canonical (first filing) or the baseline cannot be established: the caller then
+   * posts exactly as before (fail open).
+   */
+  private async newSinceLastPost(
+    alertClass: string,
+    payload: AgentFailureProposalPayload,
+  ): Promise<{ canonical: CanonicalRef; newFailures: number } | null> {
+    const times = (payload.failureTimes ?? []).map((t) => Date.parse(t)).filter(Number.isFinite);
+    if (times.length === 0 || times.length !== payload.failures) return null;
+    try {
+      const matches = classMatcher(alertClass);
+      const canonical =
+        (await this.ports.listOpenAuto()).find(matches) ?? (await this.ports.findClosedAuto(matches));
+      if (!canonical) return null;
+      const posts = (await this.ports.listComments(canonical.issueId))
+        .filter((c) => /^(?:Recurred on|Reopened) /.test((c.body || '').trim()))
+        .map((c) => Date.parse(c.createdAt ?? ''));
+      const marks = [Date.parse(canonical.createdAt ?? ''), ...posts].filter(Number.isFinite);
+      if (marks.length === 0) return null;
+      const baseline = Math.max(...marks);
+      return { canonical, newFailures: times.filter((t) => t > baseline).length };
+    } catch {
+      return null;
     }
   }
 
