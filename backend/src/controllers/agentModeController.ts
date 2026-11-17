@@ -80,7 +80,6 @@ import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/
 import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
 import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
-import { isDeepStrictEqual } from 'util';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -6748,28 +6747,11 @@ function isVisitorScheduleWrite(req: Request): boolean {
 }
 
 /**
- * ENG-2816 (step 3): may THIS request take a visitor mark off? Only a real portal login can: not a self-call (Emma in the owner's own
- * chat, or a marked run's own reflection turn, cannot tell the owner from a visitor), not a delegate (an admin acting as the owner is
- * not the owner), and not a visitor's write. Positive owner evidence or nothing: see planProvenanceChange.
+ * ENG-2816 (step 3): what a schedule write does to its provenance. A visitor's write marks `fields` (the tracked fields it changes);
+ * every other write, the owner's own portal save included, leaves provenance alone. Nothing but the adopt route takes a mark off.
  */
-function ownerMayLiftProvenance(req: Request): boolean {
-  const authReq = req as AuthenticatedRequest;
-  return authReq.isSelfCall !== true && !authReq.delegateInfo?.isDelegated && !isVisitorScheduleWrite(req);
-}
-
-/**
- * ENG-2816 (step 3): what a schedule write does to its provenance, from the request and the schedule as stored.
- * `changedFields` are the tracked fields whose new value differs from the stored one (the caller compares what it will actually
- * write against what is stored, so a routine whole-form portal save changes none).
- */
-function provenancePlanForWrite(req: Request, schedule: any, changedFields: string[]) {
-  return planProvenanceChange({
-    visitorWrite: isVisitorScheduleWrite(req),
-    ownerMayLift: ownerMayLiftProvenance(req),
-    stored: readScheduleProvenance(schedule?.provenance),
-    presentFields: trackedFieldsInBody(req.body),
-    changedFields,
-  });
+function provenancePlanForWrite(req: Request, fields: string[]) {
+  return planProvenanceChange({ visitorWrite: isVisitorScheduleWrite(req), fields });
 }
 
 /**
@@ -15615,29 +15597,12 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
-      // ENG-2816 (step 3): who wrote this content. A visitor's write marks the tracked fields it carries; the owner's own portal
-      // save takes a mark off a field only when that field is in the request AND its new value differs from the stored one (the
-      // portal posts the whole form, so "was sent" proves nothing). `changed` compares what this write will STORE against what is
-      // stored, with the same normalisation the write uses, so a routine save changes nothing. The marks ride the SAME write.
-      const storedVariableValues: Record<string, string> = {};
-      normalizedVariables.forEach((variable) => {
-        const existingValue = existingValues[variable.name];
-        if (typeof existingValue === 'string' && existingValue.trim().length > 0) storedVariableValues[variable.name] = existingValue.trim();
-      });
-      const changedTrackedFields: string[] = [];
-      if (startingMessage !== undefined && effectiveStartingMessage !== previousStartingMessage) changedTrackedFields.push('startingMessage');
-      if (keywords !== undefined && !sameSet(keywords, existingSchedule.keywords, (x) => x)) changedTrackedFields.push('keywords');
-      if (toolsChanged) changedTrackedFields.push('requiredFunctionCalls');
-      if (functionCallMinCalls !== undefined && !isDeepStrictEqual(functionCallMinCalls || {}, existingSchedule.functionCallMinCalls || {})) changedTrackedFields.push('functionCallMinCalls');
-      if (variables !== undefined && !isDeepStrictEqual(normalizedVariables, existingSchedule.variables || [])) changedTrackedFields.push('variables');
-      if (variableValues !== undefined && !isDeepStrictEqual(normalizedVariableValues, storedVariableValues)) changedTrackedFields.push('variableValues');
-      if (recipientsChanged) changedTrackedFields.push('emailNotifications');
-      const provenancePlan = provenancePlanForWrite(req, existingSchedule, changedTrackedFields);
+      // ENG-2816 (step 3): who wrote this content. A visitor's write marks the tracked fields it carries, in the SAME write as the
+      // content; an owner's write (portal, Emma in their own chat, a delegate) never touches provenance, and no edit removes a mark.
+      const provenancePlan = provenancePlanForWrite(req, trackedFieldsInBody(req.body));
       Object.assign(updates, provenancePlan);
       if (provenancePlan.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId} edited through a share link; marked [${provenancePlan.provenanceAdd.join(', ')}]`);
-      } else if (provenancePlan.provenanceRemove) {
-        console.log(`[ENG-2816] schedule ${scheduleId}: the owner changed [${provenancePlan.provenanceRemove.join(', ')}]; visitor mark lifted`);
       }
 
       // ENG-1048: DynamoDB caps an item at 400KB, and a schedule row grows without
@@ -15836,18 +15801,9 @@ export const agentModeController = {
       const nowIso = new Date().toISOString();
 
       // ENG-2816 (step 3): variable values are substituted into the run's prompt, so they are tracked like the prompt itself. A
-      // visitor's submission marks them (in this same write); the owner's own portal submission lifts the mark only when it
-      // changes the stored values. A schedule this write marks is a marked schedule for the run it starts right below.
-      const storedForSubmission: Record<string, string> = {};
-      variables.forEach((variable) => {
-        const stored = (schedule.variableValues as Record<string, unknown> | undefined)?.[variable.name];
-        if (typeof stored === 'string' && stored.trim().length > 0) storedForSubmission[variable.name] = stored.trim();
-      });
-      const submissionProvenance = provenancePlanForWrite(
-        req,
-        schedule,
-        isDeepStrictEqual(sanitizedValues, storedForSubmission) ? [] : ['variableValues']
-      );
+      // visitor's submission marks them in this same write; an owner's never touches provenance. A schedule this write marks is a
+      // marked schedule for the run it starts right below.
+      const submissionProvenance = provenancePlanForWrite(req, ['variableValues']);
       if (submissionProvenance.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId}: variable values submitted through a share link; marked [${submissionProvenance.provenanceAdd.join(', ')}]`);
       }
@@ -15867,8 +15823,8 @@ export const agentModeController = {
           variableValues: sanitizedValues,
           variableRequestStatus: 'provided',
           variableValuesUpdatedAt: nowIso,
-          // The run starts from the pre-write snapshot above, so it needs the marks this write just made (or lifted).
-          ...(submissionProvenance.provenanceAdd || submissionProvenance.provenanceRemove
+          // The run starts from the pre-write snapshot above, so it needs the marks this write just made.
+          ...(submissionProvenance.provenanceAdd
             ? { provenance: applyProvenancePlan(readScheduleProvenance(schedule.provenance), submissionProvenance) }
             : {}),
         };
@@ -16395,18 +16351,23 @@ export const agentModeController = {
 
   /**
    * POST /api/agent-mode/scheduled-chats/:scheduleId/adopt-visitor-edits
+   * Body: { expectedUpdatedAt: string }
    *
-   * ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into. Removes EVERY visitor mark, after which the
-   * schedule runs with the owner's full tool set again (and its publish authorization resolves from the owner's own settings).
+   * ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into. This is the ONLY way a visitor mark comes
+   * off (editing the schedule never removes one). It removes the whole `provenance` attribute, after which the schedule runs with
+   * the owner's full tool set again and its publish authorization resolves from the owner's own settings.
    *
    * The owner has to say so, so the guards are the publish-consent endpoint's and stricter:
-   *   - a real portal login only: never a self-call (Emma in the owner's own chat, a marked run's reflection turn, an external
-   *     MCP client: none of them can tell the owner from a visitor), never a delegated session (an admin acting as the owner is not
-   *     the owner), never a write that is a visitor's;
+   *   - a real portal login only: never a self-call (Emma in the owner's own chat, a marked run's reflection turn, an external MCP
+   *     client: none of them can tell the owner from a visitor), never a delegated session (an admin acting as the owner is not the
+   *     owner), never a write that is a visitor's;
    *   - the schedule must be the caller's own;
-   *   - the write is bound to the version of the schedule the owner looked at (`updatedAt`): a visitor edit that lands between
-   *     the owner's read and this write makes it 409 instead of adopting content the owner never saw.
-   * Nothing in the MCP tool bodies exposes this route or any provenance (tested).
+   *   - the owner adopts WHAT THEY LOOKED AT: the body must carry the `updatedAt` of the schedule version the portal loaded
+   *     (`expectedUpdatedAt`, required: 400 without it), it must equal the stored one (409 if a visitor edit landed since), and the
+   *     write itself is conditioned on that same value, so an edit that lands between this read and the write also loses (409)
+   *     instead of being adopted unseen.
+   * The mark is removed with REMOVE of the attribute, not a set operation, so a value that is not a well-formed set can still be
+   * adopted. Nothing in the MCP tool bodies exposes this route or any provenance (tested).
    */
   async adoptScheduledChatVisitorEdits(req: Request, res: Response) {
     try {
@@ -16425,6 +16386,13 @@ export const agentModeController = {
         });
       }
 
+      const expectedUpdatedAt = (req.body as { expectedUpdatedAt?: unknown } | undefined)?.expectedUpdatedAt;
+      if (typeof expectedUpdatedAt !== 'string' || expectedUpdatedAt === '') {
+        return res.status(400).json({
+          error: 'expectedUpdatedAt is required: send the updatedAt of the schedule version you reviewed, so what you adopt is what you saw.',
+        });
+      }
+
       // Consistent: the decision is about what is stored right now, not a replica that may not have seen a visitor's last edit.
       const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       if (!schedule || schedule.userId !== user.userId) {
@@ -16436,17 +16404,22 @@ export const agentModeController = {
         return res.json({ adopted: false, provenance: [], message: 'Nothing to adopt: no part of this schedule was written through a share link.' });
       }
 
+      const changedSince = {
+        error: 'This schedule changed since you opened it, so nothing was adopted. Reopen it to see its current content, then adopt it again.',
+      };
+      if (schedule.updatedAt !== expectedUpdatedAt) return res.status(409).json(changedSince);
+
       try {
         await scheduleDb.updateSchedule(
           scheduleId,
-          { provenanceRemove: marks, updatedAt: new Date().toISOString() },
-          { updatedAt: schedule.updatedAt }
+          { updatedAt: new Date().toISOString() },
+          { updatedAt: schedule.updatedAt },
+          undefined,
+          ['provenance']
         );
       } catch (writeError: any) {
         if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
-          return res.status(409).json({
-            error: 'This schedule changed while you were adopting it, so nothing was saved. Reopen it to see its current content, then adopt it again.',
-          });
+          return res.status(409).json(changedSince);
         }
         throw writeError;
       }

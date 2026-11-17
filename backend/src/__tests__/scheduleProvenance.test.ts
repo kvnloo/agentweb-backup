@@ -9,8 +9,10 @@ import {
   SCHEDULE_PROVENANCE_FIELDS,
   SCHEDULE_WRITE_TOOL_NAMES,
   UNREADABLE_PROVENANCE,
+  applyProvenancePlan,
   isScheduleMarked,
   minCallsWithoutRefused,
+  planProvenanceChange,
   readScheduleProvenance,
   trackedFieldsInBody,
   withoutRefusedNames,
@@ -126,5 +128,32 @@ describe('marked-run helpers', () => {
       'manage_scheduled_chat',
       'submit_scheduled_chat_variables',
     ]);
+  });
+});
+
+describe('planProvenanceChange: marks are only ever ADDED, and only by a visitor', () => {
+  it('a visitor write adds the fields it names', () => {
+    expect(planProvenanceChange({ visitorWrite: true, fields: ['keywords', 'startingMessage'] })).toEqual({ provenanceAdd: ['keywords', 'startingMessage'] });
+  });
+
+  it('a visitor write that names nothing adds nothing', () => {
+    expect(planProvenanceChange({ visitorWrite: true, fields: [] })).toEqual({});
+  });
+
+  it('an owner write never touches provenance, whatever it changes (no edit takes a mark off)', () => {
+    expect(planProvenanceChange({ visitorWrite: false, fields: ['keywords', 'startingMessage'] })).toEqual({});
+    expect(planProvenanceChange({ visitorWrite: false, fields: [] })).toEqual({});
+  });
+
+  it('the plan has no way to remove a mark', () => {
+    for (const visitorWrite of [true, false]) {
+      expect(planProvenanceChange({ visitorWrite, fields: ['keywords'] })).not.toHaveProperty('provenanceRemove');
+    }
+  });
+
+  it('applyProvenancePlan: the marks a snapshot will carry after the write (sorted, de-duplicated)', () => {
+    expect(applyProvenancePlan(['keywords'], { provenanceAdd: ['startingMessage', 'keywords'] })).toEqual(['keywords', 'startingMessage']);
+    expect(applyProvenancePlan(['keywords'], {})).toEqual(['keywords']);
+    expect(applyProvenancePlan([], {})).toEqual([]);
   });
 });

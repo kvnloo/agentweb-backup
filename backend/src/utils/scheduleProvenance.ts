@@ -116,47 +116,27 @@ export function minCallsWithoutRefused(
   return Object.fromEntries(Object.entries(source).filter(([name]) => !isRefused(name)));
 }
 
-/** What one write does to a schedule's provenance: members to add, or members to remove, never both (see `updateSchedule`). */
+/** What one write does to a schedule's provenance: the members to ADD. A write only ever adds; nothing but the adopt route takes a mark off. */
 export interface ProvenancePlan {
   provenanceAdd?: string[];
-  provenanceRemove?: string[];
 }
 
 /**
- * Decide what a schedule write does to its provenance. Marking and lifting are NOT symmetric, on purpose:
+ * Decide what a schedule write does to its provenance.
  *
- *  - a VISITOR's write marks every tracked field the request carries (presence, not change: over-marking is safe, and a visitor
- *    re-sending the owner's own value still means the visitor is now the last writer of it);
- *  - the mark comes off ONLY on positive evidence that the owner themselves changed the content: a real portal login (not a
- *    self-call, not a delegate, not a visitor's write), for a field that is in the request AND whose new value differs from the
- *    stored one. The portal posts the whole form on every save, so "the field was sent" proves nothing; "the value changed"
- *    does. Anything else leaves the marks alone. A self-call (Emma in the owner's own chat, a marked run's own reflection turn)
- *    never lifts: it cannot tell the owner from a visitor.
+ * A VISITOR's write marks the tracked fields it names (`fields`: the caller passes the ones whose value it changes, or all it
+ * carries when it cannot tell). Every other write leaves provenance alone, the owner's own included: an owner editing a marked field
+ * does NOT unmark it. "The owner changed this list" is not "the owner reviewed it" (the owner adds a third address and the visitor's
+ * stays), and a portal save of a whole form says nothing about which parts were read. The only way a mark comes off is the owner
+ * saying so, on purpose, through the adopt route.
  *
- * Pure: the caller works out the four inputs from the request and the stored schedule.
+ * Pure: the caller works out the inputs from the request and the stored schedule.
  */
-export function planProvenanceChange(input: {
-  visitorWrite: boolean;
-  ownerMayLift: boolean;
-  /** The schedule's current marks, as read (`readScheduleProvenance`). */
-  stored: string[];
-  /** The tracked fields the request carries. */
-  presentFields: string[];
-  /** Of those, the ones whose new value differs from what is stored. */
-  changedFields: string[];
-}): ProvenancePlan {
-  if (input.visitorWrite) {
-    return input.presentFields.length > 0 ? { provenanceAdd: [...input.presentFields] } : {};
-  }
-  if (!input.ownerMayLift) return {};
-  const lifted = input.changedFields.filter((field) => input.stored.includes(field));
-  return lifted.length > 0 ? { provenanceRemove: lifted } : {};
+export function planProvenanceChange(input: { visitorWrite: boolean; fields: string[] }): ProvenancePlan {
+  return input.visitorWrite && input.fields.length > 0 ? { provenanceAdd: [...input.fields] } : {};
 }
 
 /** The marks a schedule will carry once `plan` has been applied to `stored` (for a run that starts from the pre-write snapshot). */
 export function applyProvenancePlan(stored: string[], plan: ProvenancePlan): string[] {
-  const next = new Set(stored);
-  for (const field of plan.provenanceAdd ?? []) next.add(field);
-  for (const field of plan.provenanceRemove ?? []) next.delete(field);
-  return [...next].sort();
+  return [...new Set([...stored, ...(plan.provenanceAdd ?? [])])].sort();
 }

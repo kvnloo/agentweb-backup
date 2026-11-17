@@ -92,10 +92,9 @@ describe('scheduleDb.updateSchedule and provenance', () => {
     expect(stored()!.provenance.values).toEqual(['startingMessage']);
   });
 
-  it('never stores provenanceAdd / provenanceRemove as attributes', async () => {
+  it('never stores provenanceAdd as an attribute', async () => {
     await scheduleDb.updateSchedule('sch-1', { keywords: ['a'], provenanceAdd: ['keywords'] });
     expect(stored()).not.toHaveProperty('provenanceAdd');
-    expect(stored()).not.toHaveProperty('provenanceRemove');
     expect(sent.update[0].UpdateExpression).not.toContain('#provenanceAdd');
   });
 
@@ -105,31 +104,38 @@ describe('scheduleDb.updateSchedule and provenance', () => {
     expect(stored()!.provenance.values.sort()).toEqual(['keywords', 'startingMessage']);
   });
 
-  it('DELETEs only the named members in one expression with the content change; an emptied set leaves no attribute', async () => {
+  it('takes the whole attribute off through removeAttributes (the adopt route), in one write with an `expect` on the version', async () => {
     await scheduleDb.updateSchedule('sch-1', { provenanceAdd: ['keywords', 'startingMessage'] });
     sent.update.length = 0;
 
-    await scheduleDb.updateSchedule('sch-1', { startingMessage: 'owner rewrote it', provenanceRemove: ['startingMessage'] });
+    await scheduleDb.updateSchedule('sch-1', { updatedAt: '2026-11-18T00:00:00.000Z' }, { updatedAt: stored()!.updatedAt }, undefined, ['provenance']);
+
     expect(sent.update).toHaveLength(1);
-    expect(sent.update[0].UpdateExpression).toBe('SET #startingMessage = :startingMessage DELETE #provenance :provenanceRemove');
-    expect(stored()!.provenance.values).toEqual(['keywords']);
-
-    await scheduleDb.updateSchedule('sch-1', { provenanceRemove: ['keywords'] });
+    expect(sent.update[0].UpdateExpression).toBe('SET #updatedAt = :updatedAt REMOVE #provenance');
     expect(stored()).not.toHaveProperty('provenance');
+    expect(stored()!.updatedAt).toBe('2026-11-18T00:00:00.000Z');
   });
 
-  it('a DELETE on a schedule with no provenance, or of a member not in it, is a harmless no-op', async () => {
-    await expect(scheduleDb.updateSchedule('sch-1', { provenanceRemove: ['keywords'] })).resolves.toBeDefined();
-    expect(stored()).not.toHaveProperty('provenance');
+  it('removes a provenance value that is NOT a well-formed set too (a set operation could not)', async () => {
+    for (const garbage of [17, 'startingMessage', ['startingMessage'], { oops: true }]) {
+      db.tables.get(TABLE)!.set('sch-1', { ...stored()!, provenance: garbage });
+      await scheduleDb.updateSchedule('sch-1', { updatedAt: 'x' }, undefined, undefined, ['provenance']);
+      expect(stored()).not.toHaveProperty('provenance');
+    }
+  });
+
+  it('a stale `expect` leaves the marks in place (the owner adopts what they saw, or nothing)', async () => {
     await scheduleDb.updateSchedule('sch-1', { provenanceAdd: ['keywords'] });
-    await scheduleDb.updateSchedule('sch-1', { provenanceRemove: ['variables'] });
+    await expect(
+      scheduleDb.updateSchedule('sch-1', { updatedAt: 'new' }, { updatedAt: 'a-version-the-owner-never-saw' }, undefined, ['provenance'])
+    ).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
     expect(stored()!.provenance.values).toEqual(['keywords']);
   });
 
-  it('refuses a write that both adds and removes (ADD and DELETE on one path cannot share an expression), sending nothing', async () => {
+  it('refuses a write that both adds a mark and removes the attribute, sending nothing', async () => {
     await expect(
-      scheduleDb.updateSchedule('sch-1', { provenanceAdd: ['keywords'], provenanceRemove: ['startingMessage'] })
-    ).rejects.toThrow(/not both/);
+      scheduleDb.updateSchedule('sch-1', { provenanceAdd: ['keywords'] }, undefined, undefined, ['provenance'])
+    ).rejects.toThrow(/cannot be added to and removed/);
     expect(sent.update).toHaveLength(0);
   });
 
@@ -149,7 +155,7 @@ describe('scheduleDb.updateSchedule and provenance', () => {
 
   it('writes nothing when there is nothing at all to write (unchanged)', async () => {
     await expect(scheduleDb.updateSchedule('sch-1', {})).resolves.toBeUndefined();
-    await expect(scheduleDb.updateSchedule('sch-1', { provenanceAdd: [], provenanceRemove: [] })).resolves.toBeUndefined();
+    await expect(scheduleDb.updateSchedule('sch-1', { provenanceAdd: [] })).resolves.toBeUndefined();
     expect(sent.update).toHaveLength(0);
   });
 
