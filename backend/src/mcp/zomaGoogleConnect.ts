@@ -54,14 +54,14 @@ const EXPIRED: PageStep = {
   message: `This Google Ads connection link is invalid or has expired. ${ZOMA_BACK_TO_AGENT}`,
 };
 
-/** Google lists the account but reports it not enabled: signup was started (often via the campaign-first flow) and not finished, or it was deactivated. */
+/** Google lists the account but reports it not enabled (signup unfinished, or deactivated). */
 const UNFINISHED_ACCOUNT_STEPS: readonly string[] = [
   'Open https://ads.google.com signed in with the same Google account and look at that account first. If its setup is unfinished, finish it there; do not create another account yet.',
   'Check the country, currency and time zone Google shows for it. Google does not let anyone change them once the account exists, and Zoma cannot either. If they are wrong (for example pre-filled from your browser or location), a new account is the only fix: create it yourself, choosing them yourself.',
   'If Google pushes you to build a campaign, do not: choose "Switch to Expert Mode", then "Create an account without a campaign".',
 ];
 
-/** Google shared a manager (MCC) login but no active client ad account under it that Zoma can connect. */
+/** A manager (MCC) login with no active client ad account under it. */
 const MANAGER_ONLY_STEPS: readonly string[] = [
   'Connect again and sign in with the Google account that owns the ad account itself (not only the manager login).',
   'Or, in Google Ads, make sure the client ad account under your manager is active (not cancelled or still being set up). Zoma only connects active ad accounts.',
@@ -78,7 +78,14 @@ async function retryLink(userId: string, deps: ZomaGoogleDeps): Promise<string |
   }
 }
 
-async function failedPage(userId: string, deps: ZomaGoogleDeps, status: number, title: string, message: string, steps?: readonly string[]): Promise<PageStep> {
+interface FailedPage {
+  status: number;
+  title: string;
+  message: string;
+  steps?: readonly string[];
+}
+
+async function failedPage(userId: string, deps: ZomaGoogleDeps, { status, title, message, steps }: FailedPage): Promise<PageStep> {
   const retryUrl = await retryLink(userId, deps);
   return {
     kind: 'page',
@@ -98,6 +105,36 @@ const connectedPage = (count: number): PageStep => ({
   done: true,
 });
 
+/** Nothing to connect: say why (unfinished account, manager without clients, or no account), never "create one" when one exists. */
+function noConnectableAccountPage(userId: string, result: GoogleAdsFinalizeResult, deps: ZomaGoogleDeps): Promise<PageStep> {
+  if (result.notEnabledCustomerIds.length > 0) {
+    const ids = result.notEnabledCustomerIds.filter((id) => /^\d+$/.test(id)).join(', ');
+    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'google_ads_account_not_enabled' });
+    return failedPage(userId, deps, {
+      status: 400,
+      title: 'Google Ads account not finished',
+      message: `Google found a Google Ads account on this login${ids ? ` (${ids})` : ''}, but it is not active — its setup was started and not finished, or it was deactivated. Zoma did not create it and did not change it.`,
+      steps: [...UNFINISHED_ACCOUNT_STEPS, 'Then connect Google Ads again.'],
+    });
+  }
+  if (result.accountTree.length > 0) {
+    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'manager_without_connectable_accounts' });
+    return failedPage(userId, deps, {
+      status: 400,
+      title: 'No active Google Ads account to connect',
+      message: 'Google shared a manager (MCC) account on this login, but no active ad account under it that Zoma can connect. Zoma did not create or change anything.',
+      steps: MANAGER_ONLY_STEPS,
+    });
+  }
+  logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'no_google_ads_accounts' });
+  return failedPage(userId, deps, {
+    status: 400,
+    title: 'No Google Ads account found',
+    message: 'Google did not share any Google Ads accounts. If you already have one, connect again and sign in with the Google account that owns it. If you do not have one yet, create it yourself first (a few minutes), then connect again:',
+    steps: ZOMA_GOOGLE_NEW_ACCOUNT_STEPS,
+  });
+}
+
 /** GET /api/zoma/google/callback — finalized server-side for the signed state's user. */
 export async function completeGoogleConnect(
   params: { code?: unknown; state?: unknown; error?: unknown },
@@ -112,7 +149,11 @@ export async function completeGoogleConnect(
   if (params.error !== undefined || typeof params.code !== 'string' || !params.code) {
     const reason = typeof params.error === 'string' ? params.error : 'no_code';
     logZomaSetup({ userId, step: 'google_callback', outcome: 'denied', reason });
-    return failedPage(userId, deps, 400, 'Google Ads not connected', 'Google Ads was not connected. Zoma needs read access to your Google Ads account to continue.');
+    return failedPage(userId, deps, {
+      status: 400,
+      title: 'Google Ads not connected',
+      message: 'Google Ads was not connected. Zoma needs read access to your Google Ads account to continue.',
+    });
   }
 
   let result: GoogleAdsFinalizeResult;
@@ -121,40 +162,17 @@ export async function completeGoogleConnect(
   } catch (error) {
     const scopes = error instanceof Error && error.message === 'insufficient_scopes';
     logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: scopes ? 'insufficient_scopes' : error });
-    return failedPage(
-      userId, deps, scopes ? 422 : 502, 'Google Ads not connected',
-      scopes
+    return failedPage(userId, deps, {
+      status: scopes ? 422 : 502,
+      title: 'Google Ads not connected',
+      message: scopes
         ? 'Google Ads permission was not granted. Try again and allow all requested permissions (a Google Workspace admin can also restrict third-party apps).'
         : 'We could not finish connecting Google Ads. Please try again.',
-    );
+    });
   }
 
   const leaves = result.connectableLeaves;
-  if (leaves.length === 0 && result.notEnabledCustomerIds?.length) {
-    const ids = result.notEnabledCustomerIds.filter((id) => /^\d+$/.test(id)).join(', ');
-    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'google_ads_account_not_enabled' });
-    return failedPage(
-      userId, deps, 400, 'Google Ads account not finished',
-      `Google found a Google Ads account on this login${ids ? ` (${ids})` : ''}, but it is not active — its setup was started and not finished, or it was deactivated. Zoma did not create it and did not change it.`,
-      [...UNFINISHED_ACCOUNT_STEPS, 'Then connect Google Ads again.'],
-    );
-  }
-  if (leaves.length === 0 && result.accountTree?.length) {
-    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'manager_without_connectable_accounts' });
-    return failedPage(
-      userId, deps, 400, 'No active Google Ads account to connect',
-      'Google shared a manager (MCC) account on this login, but no active ad account under it that Zoma can connect. Zoma did not create or change anything.',
-      MANAGER_ONLY_STEPS,
-    );
-  }
-  if (leaves.length === 0) {
-    logZomaSetup({ userId, step: 'google_callback', outcome: 'failed', reason: 'no_google_ads_accounts' });
-    return failedPage(
-      userId, deps, 400, 'No Google Ads account found',
-      'Google did not share any Google Ads accounts. If you already have one, connect again and sign in with the Google account that owns it. If you do not have one yet, create it yourself first (a few minutes), then connect again:',
-      ZOMA_GOOGLE_NEW_ACCOUNT_STEPS,
-    );
-  }
+  if (leaves.length === 0) return noConnectableAccountPage(userId, result, deps);
   logZomaSetup({ userId, step: 'google_callback', outcome: 'ok', reason: `${leaves.length}_ad_accounts` });
   if (leaves.length === 1) return connectAccounts(userId, result.tokenSessionId, [leaves[0].customerId], deps);
 
@@ -184,11 +202,11 @@ async function connectAccounts(userId: string, tokenSessionId: string, customerI
     result = await deps.connect(userId, tokenSessionId, customerIds);
   } catch (error) {
     logZomaSetup({ userId, step: 'google_connect', outcome: 'failed', reason: error });
-    return failedPage(userId, deps, 502, 'Google Ads not connected', 'We could not save your Google Ads account.');
+    return failedPage(userId, deps, { status: 502, title: 'Google Ads not connected', message: 'We could not save your Google Ads account.' });
   }
   if (!result.ok) {
     logZomaSetup({ userId, step: 'google_connect', outcome: 'rejected', reason: result.reason });
-    return failedPage(userId, deps, 400, 'Google Ads not connected', 'This connection expired before it finished.');
+    return failedPage(userId, deps, { status: 400, title: 'Google Ads not connected', message: 'This connection expired before it finished.' });
   }
   logZomaSetup({ userId, step: 'google_connect', outcome: 'ok', reason: `${result.connected}_ad_accounts` });
   return connectedPage(result.connected);
