@@ -146,6 +146,8 @@ export interface ZomaPlanState {
   cancelAtPeriodEnd?: boolean;
   /** The $1 fee invoice (the only invoice a trial has) is paid. Stripe can start a trial before it settles. */
   latestInvoicePaid?: boolean;
+  /** The user has held a Zoma plan before (a cancelled one counts): no second $1 trial. */
+  hadPlan?: boolean;
 }
 
 /**
@@ -191,6 +193,8 @@ export function planStateFromSubscriptions(customerId: string | null, subs: Stri
     periodEnd: isoFromEpoch(item?.current_period_end ?? (sub as any).current_period_end),
     cancelAtPeriodEnd: sub.cancel_at_period_end === true,
     latestInvoicePaid: invoiceIsPaid(sub),
+    // A subscription that never started (incomplete*) is not a used trial.
+    hadPlan: zoma.some((s) => s.status !== 'incomplete' && s.status !== 'incomplete_expired'),
   };
 }
 
@@ -356,6 +360,9 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
   if (reusable) return zomaCheckoutRedirectUrl(reusable.id, deps);
   const done = `${deps.backendUrl().replace(/\/+$/, '')}/api/zoma/billing/done`;
   const metadata = { product: ZOMA_PLAN_PRODUCT_TAG, userId };
+  // The $1 trial is once per user: someone who already had a plan buys the plan itself, starting today.
+  const returning = planStateFromSubscriptions(customerId, await deps.listSubscriptions(customerId)).hadPlan === true;
+  const terms = `${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included and ${cfg.overageCentsPerCall}¢ per call after that.`;
   const session = await deps.createCheckoutSession({
     mode: 'subscription',
     customer: customerId,
@@ -363,12 +370,16 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
     line_items: [
       { price: cfg.planPriceId!, quantity: 1 },
       { price: cfg.overagePriceId! },
-      { price: cfg.trialFeePriceId!, quantity: 1 },
+      ...(returning ? [] : [{ price: cfg.trialFeePriceId!, quantity: 1 }]),
     ],
     payment_method_collection: 'always',
+    // Prices are quoted in USD everywhere (tool text, email); do not let Checkout show a converted amount.
+    adaptive_pricing: { enabled: false },
     subscription_data: {
-      trial_period_days: cfg.trialDays,
-      trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+      ...(returning ? {} : {
+        trial_period_days: cfg.trialDays,
+        trial_settings: { end_behavior: { missing_payment_method: 'cancel' as const } },
+      }),
       metadata,
     },
     metadata,
@@ -378,7 +389,9 @@ export async function createZomaTrialCheckoutLink(userId: string, deps: ZomaBill
     expires_at: Math.floor(deps.now() / 1000) + 23 * 60 * 60,
     custom_text: {
       submit: {
-        message: `${dollars(cfg.trialFeeCents)} today for a ${cfg.trialDays}-day trial. Then ${dollars(cfg.planCents)}/month with ${cfg.includedCalls.toLocaleString('en-US')} calls included and ${cfg.overageCentsPerCall}¢ per call after that. Cancel any time before the trial ends.`,
+        message: returning
+          ? `${terms} Billed monthly. Cancel any time.`
+          : `${dollars(cfg.trialFeeCents)} today for a ${cfg.trialDays}-day trial. Then ${terms} Cancel any time before the trial ends.`,
       },
     },
   });
@@ -409,10 +422,15 @@ export async function recordZomaCheckoutCanceled(
   return deps.recordFunnel({ userId, step: 'checkout_canceled', dedupeKey: `${userId}#${new Date(now).toISOString().slice(0, 13)}`, dimensions: { surface: 'cancel_redirect' } });
 }
 
-export function paywallMessage(cfg: ZomaBillingConfig, link: string): string {
+export function paywallMessage(cfg: ZomaBillingConfig, link: string, returning = false): string {
+  const calls = `${cfg.includedCalls.toLocaleString('en-US')} calls included, then ${cfg.overageCentsPerCall}¢ per call`;
   return [
-    `Going live needs the Zoma plan. Start it with a ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${link}`,
-    `After the trial your card is charged ${dollars(cfg.planCents)}/month automatically (cancel before day ${cfg.trialDays} to avoid it), with ${cfg.includedCalls.toLocaleString('en-US')} calls included, then ${cfg.overageCentsPerCall}¢ per call. Reads and drafts stay free until then; nothing was changed in the ad account.`,
+    returning
+      ? `Going live needs the Zoma plan: ${dollars(cfg.planCents)}/month, charged today → ${link}`
+      : `Going live needs the Zoma plan. Start it with a ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${link}`,
+    returning
+      ? `That is ${calls}. Cancel any time. Nothing was changed in the ad account.`
+      : `After the trial your card is charged ${dollars(cfg.planCents)}/month automatically (cancel before day ${cfg.trialDays} to avoid it), with ${calls}. Reads and drafts are free until you start the plan, after which every successful call, reads included, counts toward the included calls. Nothing was changed in the ad account.`,
     'Tell me when it is done and I will try again.',
   ].join('\n');
 }
@@ -460,7 +478,7 @@ export async function assertZomaPublishAllowed(
     dimensions: { surface: 'write_guard', platform: context.platform, toolName: context.toolName, planStatus: state.status },
   }).catch((e) => console.error('[zoma-billing] funnel record failed:', e));
   if (!link) throw new ZomaPaywallError('Going live needs the Zoma plan, but the payment link could not be created right now. Nothing was changed. Try again shortly.');
-  throw new ZomaPaywallError(paywallMessage(cfg, link), link);
+  throw new ZomaPaywallError(paywallMessage(cfg, link, state.hadPlan === true), link);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -475,6 +493,8 @@ export interface ZomaPlanSummary {
   cancels_at_period_end?: boolean;
   period?: { start: string; end: string };
   link?: string;
+  /** Had a plan before: the link sells the plan itself, with no trial. */
+  returning?: boolean;
   error?: string;
 }
 
@@ -489,6 +509,7 @@ export async function getZomaPlanSummary(userId: string, deps: ZomaBillingDeps =
       publish_enabled: planAllowsPublish(state),
       ...(state.status === 'trialing' && state.trialEnd ? { trial_ends_at: state.trialEnd } : {}),
       ...(state.cancelAtPeriodEnd ? { cancels_at_period_end: true } : {}),
+      ...(state.hadPlan ? { returning: true } : {}),
       ...(state.periodStart && state.periodEnd ? { period: { start: state.periodStart, end: state.periodEnd } } : {}),
     };
     if (planPaymentPending(state)) {
@@ -521,7 +542,9 @@ export function formatZomaPlanLine(plan: ZomaPlanSummary, cfg: ZomaBillingConfig
       ? `  [x] Zoma plan: active until ${plan.period?.end.slice(0, 10) ?? 'the end of the period'}, cancelled, it will not renew`
       : `  [x] Zoma plan: active (${dollars(cfg.planCents)}/month, ${cfg.includedCalls.toLocaleString('en-US')} calls included)`;
   }
-  return `  ${box} Zoma plan (only needed to make ads live; reads and drafts are free): ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${plan.link}`;
+  return plan.returning
+    ? `  ${box} Zoma plan (needed to make ads live): ${dollars(cfg.planCents)}/month → ${plan.link}`
+    : `  ${box} Zoma plan (only needed to make ads live; reads and drafts are free until you start it): ${dollars(cfg.trialFeeCents)} ${cfg.trialDays}-day trial → ${plan.link}`;
 }
 
 export interface ZomaBillingUsage {

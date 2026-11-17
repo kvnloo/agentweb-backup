@@ -411,6 +411,50 @@ describe('ENG-3131 trial checkout', () => {
     expect(planAllowsPublish(state)).toBe(true);
   });
 
+  it('a first-time buyer gets the $1 trial; Checkout is USD-only', async () => {
+    const d = billingDeps();
+    await createZomaTrialCheckoutLink('u1', d);
+    const params = (d.createCheckoutSession as jest.Mock).mock.calls[0][0];
+    expect(params.adaptive_pricing).toEqual({ enabled: false });
+    expect(params.line_items.map((l: any) => l.price)).toEqual(['price_plan', 'price_overage', 'price_fee']);
+    expect(params.subscription_data.trial_period_days).toBe(7);
+  });
+
+  it.each([
+    ['cancelled', 'canceled'],
+    ['paused', 'paused'],
+  ])('a user with a %s earlier plan gets the plan itself: no trial, no $1 line', async (_label, status) => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: status as any })]) });
+    await createZomaTrialCheckoutLink('u1', d);
+    const params = (d.createCheckoutSession as jest.Mock).mock.calls[0][0];
+    expect(params.line_items.map((l: any) => l.price)).toEqual(['price_plan', 'price_overage']);
+    expect(params.subscription_data.trial_period_days).toBeUndefined();
+    expect(params.subscription_data.trial_settings).toBeUndefined();
+    expect(params.custom_text.submit.message).not.toMatch(/trial/i);
+    expect(params.adaptive_pricing).toEqual({ enabled: false });
+  });
+
+  it('a subscription that never started does not use up the trial', async () => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: 'incomplete_expired' })]) });
+    await createZomaTrialCheckoutLink('u1', d);
+    expect((d.createCheckoutSession as jest.Mock).mock.calls[0][0].subscription_data.trial_period_days).toBe(7);
+  });
+
+  it('the refusal and zoma_status say a returning user is buying the plan, not a trial', async () => {
+    const d = billingDeps({ findCustomerId: jest.fn().mockResolvedValue('cus_1'), listSubscriptions: jest.fn().mockResolvedValue([sub({ status: 'canceled' })]) });
+    const err: any = await assertZomaPublishAllowed('u1', { platform: 'meta' }, d).catch((e) => e);
+    expect(err.message).toMatch(/\$50\/month, charged today/);
+    expect(err.message).not.toMatch(/trial/i);
+    const line = formatZomaPlanLine((await getZomaPlanSummary('u1', d))!, d.config());
+    expect(line).toMatch(/\$50\/month → https:/);
+    expect(line).not.toMatch(/trial/i);
+  });
+
+  it('the first-time paywall says reads are free only until the plan starts, then count', async () => {
+    const err: any = await assertZomaPublishAllowed('u1', { platform: 'meta' }, billingDeps()).catch((e) => e);
+    expect(err.message).toContain('Reads and drafts are free until you start the plan, after which every successful call, reads included, counts toward the included calls.');
+  });
+
   it('reuses a still-open Checkout instead of minting a second one', async () => {
     const d = billingDeps({
       findCustomerId: jest.fn().mockResolvedValue('cus_1'),
