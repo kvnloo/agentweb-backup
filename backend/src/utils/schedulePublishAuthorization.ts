@@ -225,7 +225,7 @@ export function resolveSchedulePublishAuthorization(
   // The legacy default below would otherwise read a visitor-written `requiredFunctionCalls: ['post_on_connected_account']` on a
   // schedule that was never asked as "authorized", and the visitor could post to the owner's connected accounts unattended.
   // Checked before the grant too: a grant that predates a visitor's later edit was given for content the owner has not seen.
-  // The owner lifts it by adopting the schedule (POST .../adopt-visitor-edits) or by editing the marked fields themselves. The
+  // The ONLY way the owner lifts it is by adopting the schedule (POST .../adopt-visitor-edits); editing the schedule does not. The
   // outcome is the reversible one: drafts are saved and the owner is told what is waiting.
   if (!options?.ignoreProvenance && isScheduleMarked(schedule)) return UNAUTHORIZED;
 

@@ -9,7 +9,8 @@
  *
  * It is absent on every schedule that existed before this change and is never backfilled, so an unmarked schedule behaves
  * exactly as it always did. Over-marking is safe (the owner can adopt it); under-marking is the hole this exists to close, so
- * everything here fails toward "marked".
+ * everything here fails toward "marked". Marks are only ever ADDED, by a visitor's write, in the same write as the content; the
+ * only thing that removes them is the owner adopting the schedule (the whole attribute, on purpose, from the portal).
  *
  * This module imports nothing, so the pure publish-authorization resolver and the database layer can both use it without an
  * import cycle.
