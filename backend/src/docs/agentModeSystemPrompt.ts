@@ -752,18 +752,24 @@ export function getScheduledSessionOverride(
   const withheldCauseBullet =
     withholdReason === 'not_granted'
       ? `- This schedule has not been granted standing authorization to publish unattended. This is NOT the "Require approval before publishing" setting — that setting is already OFF on this schedule, so telling the owner to turn it off again will not change anything and is not what is holding this run back.`
+      : withholdReason === 'visitor_edited'
+      ? `- This schedule was set up or edited through a share link, so nothing the owner has set about publishing applies to it yet. This is NOT the "Require approval before publishing" setting, and it is not a missing standing grant: the owner has to adopt the schedule in the portal first.`
       : withholdReason === 'revoked'
       ? `- The owner previously authorized this schedule to publish unattended and has since revoked that authorization. This is NOT the "Require approval before publishing" setting — that is a different, unrelated toggle — and the prompt cannot override a revoked authorization either way.`
       : `- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.`;
   const withheldReasonPhrase =
     withholdReason === 'not_granted'
       ? 'this schedule has not been granted standing publish authorization'
+      : withholdReason === 'visitor_edited'
+      ? 'this schedule was set up or edited through a share link and has not been adopted by the owner'
       : withholdReason === 'revoked'
       ? "this schedule's publish authorization has been revoked"
       : 'this schedule requires approval before publishing';
   const withheldQuoteBullet =
     withholdReason === 'not_granted'
       ? `- Quote THIS block as the reason, and describe it accurately: this schedule is missing a one-time standing publish-authorization grant. Do NOT tell the owner to turn OFF "Require approval before publishing" — it is already off and doing nothing here. Do NOT point them at "Full autonomy" either — it does not affect publishing. The owner CAN grant this themselves: tell them to open this schedule's settings, confirm the publish tool (e.g. post_on_connected_account) is selected under Required Actions and saved, then use the "Publish without my review" control (Standing publish authorization) so future runs can post unattended. Do not invent a different control name or location — use exactly this one. They can also flag it via report_product_issues if they expected this schedule to already be posting.`
+      : withholdReason === 'visitor_edited'
+      ? `- Quote THIS block as the reason, and describe it accurately: this schedule was set up or edited through a share link, so it cannot publish unattended until the owner adopts it in the portal. Do NOT tell the owner to turn OFF "Require approval before publishing" and do NOT point them at "Publish without my review" — neither lifts this.`
       : withholdReason === 'revoked'
       ? `- Quote THIS block as the reason, and describe it accurately: the owner previously granted this schedule standing publish authorization and has since revoked it. This is NOT the "Require approval before publishing" setting — do not tell the owner to toggle that. Tell them plainly that publishing was revoked for this schedule, and that they (or an admin) would need to re-authorize it for a future run to publish.`
       : `- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.`;

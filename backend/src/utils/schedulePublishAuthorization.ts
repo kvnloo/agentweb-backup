@@ -1,6 +1,7 @@
 import { isPublishName } from './hardeningGaps';
 import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedulePublishApproval';
 import { EQUIVALENT_PUBLISH_ROUTES, normalizeAction, normalizePlatform } from './requiredCallSatisfaction';
+import { isScheduleMarked } from './scheduleProvenance';
 
 /**
  * ENG-827 — resolving the unattended publish gate.
@@ -77,6 +78,11 @@ export interface SchedulePublishAuthorizationInput extends SchedulePublishApprov
    * nudge for; NEVER grants consent — see the rejected-signal note above.
    */
   requiredFunctionCalls?: string[];
+  /**
+   * ENG-2816 (step 3): the content fields a share-link visitor wrote (a String Set off the wire, or the array the db layer
+   * returns; see utils/scheduleProvenance.ts). A marked schedule never publishes unattended, whatever else it says.
+   */
+  provenance?: unknown;
 }
 
 /**
@@ -208,6 +214,14 @@ export function resolveSchedulePublishAuthorization(
   // failed leaves the owner's choice genuinely unknown, and unknown must not publish.
   if (!schedule) return UNAUTHORIZED;
 
+  // ENG-2816 (step 3): a schedule a share-link visitor wrote content into is NOT consent from the owner, whatever its fields say.
+  // The legacy default below would otherwise read a visitor-written `requiredFunctionCalls: ['post_on_connected_account']` on a
+  // schedule that was never asked as "authorized", and the visitor could post to the owner's connected accounts unattended.
+  // Checked before the grant too: a grant that predates a visitor's later edit was given for content the owner has not seen.
+  // The owner lifts it by adopting the schedule (POST .../adopt-visitor-edits) or by editing the marked fields themselves. The
+  // outcome is the reversible one: drafts are saved and the owner is told what is waiting.
+  if (isScheduleMarked(schedule)) return UNAUTHORIZED;
+
   // The owner's explicit hold outranks everything below: they asked to review, so review.
   if (schedule.requirePublishApproval === true) return UNAUTHORIZED;
 
@@ -268,8 +282,11 @@ export function resolveSchedulePublishAuthorization(
  *    approved tool scope (consent given but nothing usable — there is no active
  *    grant right now, and unlike an explicit `false` this was never a deliberate
  *    "no").
+ *  - `'visitor_edited'` (ENG-2816 step 3) — a share-link visitor wrote part of the
+ *    schedule, so nothing the owner granted or left unasked applies until they
+ *    adopt it. Checked first: it is the one remedy a grant cannot supply.
  */
-export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'revoked' | 'not_granted';
+export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'revoked' | 'not_granted' | 'visitor_edited';
 
 export function describePublishAuthorizationWithholdReason(
   schedule: SchedulePublishAuthorizationInput | null | undefined
@@ -281,6 +298,9 @@ export function describePublishAuthorizationWithholdReason(
   // caller already guards on `.authorized` before reaching here, but the
   // function's own contract has to hold for any caller that doesn't.
   if (resolveSchedulePublishAuthorization(schedule).authorized) return undefined;
+  // ENG-2816 (step 3): a marked schedule's remedy is not any of the three below (a grant changes nothing until the owner adopts
+  // it), so it must not be reported as one of them.
+  if (isScheduleMarked(schedule)) return 'visitor_edited';
   if (schedule.requirePublishApproval === true) return 'require_publish_approval';
   if (schedule.autopublishAuthorized === false) return 'revoked';
   return 'not_granted';

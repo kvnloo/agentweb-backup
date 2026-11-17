@@ -76,6 +76,8 @@ import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } f
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized, filterSlackSendFromRequiredIfWithheld } from '../utils/schedulePublishApproval';
+import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/toolRestrictionProfiles';
+import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS } from '../utils/scheduleProvenance';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -6698,6 +6700,22 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 // ENG-1978: waits between re-checks of an unresolved entitlement before a scheduled run is deferred.
 const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
 
+/**
+ * ENG-2816 (step 3): what a scheduled run is held to calling. A marked schedule (one a share-link visitor wrote content into) runs
+ * with the share-visitor limits, which refuse some tools outright (`executeTool`, from the live schedule). The deterministic
+ * required-function checker must not demand a tool the run is forbidden to call, or it nags the run through every retry and the
+ * owner pays for up to twenty refused attempts. So for a marked schedule the refused names are dropped from `requiredFunctionCalls`
+ * and `functionCallMinCalls`; an unmarked schedule (every schedule that predates this) gets back exactly what it stores.
+ */
+function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number> } {
+  const functionCalls: string[] = schedule?.requiredFunctionCalls || [];
+  const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
+  if (!isScheduleMarked(schedule)) return { functionCalls, minCalls };
+  // ADMIN_SKILL_TOOL_NAMES can be absent where a test replaces the whole service module; production always has it.
+  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? []) !== null;
+  return { functionCalls: withoutRefusedNames(functionCalls, isRefused), minCalls: minCallsWithoutRefused(minCalls, isRefused) };
+}
+
 // Common function to run a scheduled chat (used by both test and actual execution)
 //
 // ENG-446: the run result IS the run envelope. It carries the canonical
@@ -7878,7 +7896,10 @@ export async function runScheduledChat(
 
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
-    const functionCallMinCalls = schedule.functionCallMinCalls || {};
+    // ENG-2816 (step 3): for a marked schedule, without the tools its runs are forbidden to call (see requiredCallsForRun).
+    const runRequired = requiredCallsForRun(schedule);
+    const runIsMarked = isScheduleMarked(schedule);
+    const functionCallMinCalls = runRequired.minCalls;
 
     // ENG-827: resolve this run's publish authorization exactly ONCE, here, from the
     // schedule snapshot this run was admitted under. The SAME object drives both
@@ -7938,7 +7959,7 @@ export async function runScheduledChat(
     // also ends up holding the final state the run's record must be reported against.
     let effectivePublishAuthorization = publishAuthorization;
     const requiredFunctions = filterSlackSendFromRequiredIfWithheld(
-      filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization),
+      filterRequiredFunctionsToAuthorizedScope(runRequired.functionCalls, publishAuthorization),
       slackSendAuthorized
     )
       .map((funcName: string) => ({
@@ -7986,7 +8007,9 @@ export async function runScheduledChat(
       startingMessage: resolvedStartingMessage,
       keywords: expectedKeywords,
       requiredFunctions,
-      maxAttempts: 20,
+      // ENG-2816 (step 3): a marked run is refused some tools by design, so its retries would only be refused again; the
+      // keywords and completion gate still get a few attempts, but not twenty.
+      maxAttempts: runIsMarked ? MARKED_RUN_MAX_ATTEMPTS : 20,
       attachments: fileAttachments,
       llmModel: modelToUse,
       modelPolicyDecisionForAudit: scheduleModelPolicy,
@@ -8248,7 +8271,7 @@ export async function runScheduledChat(
     // twitter_manage_post) is scoped identically here and in the checker — not the
     // wider, unfiltered `requiredFunctionNames` computed earlier in this function.
     const heldToFunctionNames = filterSlackSendFromRequiredIfWithheld(
-      filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization),
+      filterRequiredFunctionsToAuthorizedScope(runRequired.functionCalls, effectivePublishAuthorization),
       slackSendAuthorized
     );
     heldToFunctionNames.forEach((functionName: string) => {
@@ -8999,8 +9022,9 @@ export async function runScheduledChat(
     // `sendScheduledChatResultEmail` (not merely internal logging), so "safe direction of
     // error" is the actual guarantee being relied on here, not "nobody sees it".
     const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
+    const recoveredRequired = requiredCallsForRun(schedule);
     const recoveredHeldToNames = filterSlackSendFromRequiredIfWithheld(
-      filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization),
+      filterRequiredFunctionsToAuthorizedScope(recoveredRequired.functionCalls, recoveredAdmittedAuthorization),
       resolveSlackSendAuthorized(schedule)
     );
 
@@ -9029,7 +9053,7 @@ export async function runScheduledChat(
       recoveredContent = '';
     }
     const recoveredRequiredNames = Array.isArray(recoveredHeldToNames) ? recoveredHeldToNames : [];
-    const recoveredMinCalls = schedule.functionCallMinCalls || {};
+    const recoveredMinCalls = recoveredRequired.minCalls;
     const recoveredFunctionMatches = recoveredRequiredNames.filter((name: string) =>
       countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
     );
@@ -9379,7 +9403,8 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       keywordMatches: [],
       keywordMisses: schedule.keywords || [],
       functionCallMatches: [],
-      functionCallMisses: schedule.requiredFunctionCalls || [],
+      // ENG-2816 (step 3): a marked schedule is not held to the tools its runs are refused.
+      functionCallMisses: requiredCallsForRun(schedule).functionCalls,
       executionTime: 0,
       sessionId: lease.sessionId || '',
       attempt: 0,
