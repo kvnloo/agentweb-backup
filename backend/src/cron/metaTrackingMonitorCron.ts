@@ -330,6 +330,40 @@ export async function runMetaTrackingMonitor(
     console.error(`${TAG} landing-page rollup failed: ${error?.message}`);
   }
 
+  // ENG-3120: capture-drift sweep over every generated site with a pixel. Read-only (GitHub
+  // contents GET only); its own try/catch so it can never lose the sweep's summary.
+  try {
+    const {
+      runCaptureDriftSweep, sitesFromPages, defaultReadRepoFile,
+    } = await import('../services/captureDriftMonitor');
+    const { getLandingPagesByOwner } = await import('../services/v0Service');
+    await runCaptureDriftSweep({
+      dryRun,
+      listSites: async () => {
+        const all = [];
+        for (const u of users) {
+          if (!u?.userId) continue;
+          try {
+            all.push(...sitesFromPages((await getLandingPagesByOwner(u.userId)) as any[], u));
+          } catch (error: any) {
+            console.warn(`${TAG} capture-drift page list failed for ${u.userId}: ${error?.message}`);
+          }
+        }
+        return all;
+      },
+      readFile: defaultReadRepoFile,
+      ...(dryRun
+        ? {
+            transport: async (subject: string, message: string, context?: Record<string, any>) => {
+              capturedAlerts.push({ subject, message, context });
+            },
+          }
+        : {}),
+    });
+  } catch (error: any) {
+    console.error(`${TAG} capture-drift sweep failed: ${error?.message}`);
+  }
+
   const cacheStats = urlCache.stats();
   summary.unrecognizedActionTypes = [...unknownTypes];
   if (dryRun) summary.capturedAlerts = capturedAlerts;

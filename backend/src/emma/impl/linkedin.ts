@@ -1182,6 +1182,16 @@ export async function linkedinOutreach(
   if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
     const routed = await routeLinkedInWriteToAccountWithHeadroom(
       userId, action, account_id, resolvedLinkedInAccount, linkedInAccountsForRouting,
+      {
+        // ENG-3101: the router now skips a candidate with a dead session instead of
+        // routing onto it. Before, the preflight below met that dead account and
+        // recorded its health; record it here with the same arguments so skipping
+        // it does not also stop the flag and the owner alert that hang off it.
+        onDisconnectedCandidate: async (deadAccountId) => {
+          const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+          await recordUnipileAccountHealth({ accountId: deadAccountId, ownerUserId: userId, state: 'disconnected' });
+        },
+      },
     );
     if (routed) {
       console.log(`[AgentMode] linkedinOutreach: ${routed.reason}`);

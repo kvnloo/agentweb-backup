@@ -13,7 +13,11 @@ import {
 } from '../services/hotLeadCallSettingsService';
 import { callRateText } from '../services/voice/numberProvisioning';
 import { isHotLeadCallBillingActive, isHotLeadCallBillingRequired } from '../services/voice/hotLeadCallEntitlement';
-import { addHotLeadCallBilling, HOT_LEAD_CALL_ADDON_PRICE_TEXT } from '../services/hotLeadCallBillingService';
+import { addHotLeadCallBilling, HotLeadCallBillingError, HOT_LEAD_CALL_ADDON_PRICE_TEXT } from '../services/hotLeadCallBillingService';
+import { isHotLeadCallEnabled } from '../services/voice/hotLeadCallMode';
+
+/** Shown instead of selling the add-on while the global calling switch is off: a customer must never pay for calls that cannot happen. */
+const NOT_OPEN_YET = 'Hot lead calls are not open for your organization yet, so the add-on is not being sold. Nothing was charged or turned on; try again once they are available.';
 
 // A member created from chat with a bare phone has no schedule of their own, so they are available whenever the calling hours are open.
 const ALWAYS_AVAILABLE: HotLeadCallWindow = { days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '24:00' };
@@ -161,23 +165,31 @@ emmaToolRegistry.register({
     const requireEnableApproval = async (next: HotLeadCallConfig) => {
       // With billing required and the add-on not active, the card quotes the flat price (part of the approved digest)
       // and the add-on is bought only after the approval, just before the settings write below.
-      const needsAddon = isHotLeadCallBillingRequired() && !await isHotLeadCallBillingActive(org);
+      const billingRequired = isHotLeadCallBillingRequired();
+      const needsAddon = billingRequired && !await isHotLeadCallBillingActive(org);
+      if (needsAddon && !await isHotLeadCallEnabled()) throw new HotLeadCallBillingError(NOT_OPEN_YET);
       const halt = await requireApproval({
         org,
         context,
-        priceText: needsAddon ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
-        target: canonicalJson(patch),
+        priceText: billingRequired ? HOT_LEAD_CALL_ADDON_PRICE_TEXT : callRateText(),
+        // Whether this approval buys the add-on is part of what was approved: the digest changes if that flips before the answer.
+        target: canonicalJson(needsAddon ? { ...patch, _buysAddon: true } : patch),
         card: {
           action: 'enable',
           number: next.twilioNumber && maskPhone(next.twilioNumber),
           members: next.team.filter(m => m.verifiedAt).map(m => `${m.name} (${maskPhone(m.phone)})`),
           limits: next,
-          addon: needsAddon,
+          addon: billingRequired,
+          purchase: needsAddon,
         },
       });
       if (halt) throw new ApprovalHalt(halt);
       // Throws a plain message when Stripe refuses; the settings are then not written and calling stays off.
-      if (needsAddon) await addHotLeadCallBilling(org.orgId);
+      if (needsAddon) {
+        // The switch may have been turned off while the card was open: look again right before charging.
+        if (!await isHotLeadCallEnabled()) throw new HotLeadCallBillingError(NOT_OPEN_YET);
+        await addHotLeadCallBilling(org.orgId);
+      }
     };
     try {
       const { dto, config } = await applyHotLeadCallSettings(org, caller, { ...body, _revision: hotLeadCallRevisionOf(org.hotLeadCall) }, requireEnableApproval);
