@@ -4020,12 +4020,11 @@ export const scheduleDb = {
       pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-      // ENG-2816 (step 3): NOT stored attributes. Members to ADD to / DELETE from the schedule's `provenance` String Set (see
-      // utils/scheduleProvenance.ts), carried in the SAME UpdateExpression as the content change they describe, so a visitor's
-      // content and its mark land together or not at all. One write does one or the other: DynamoDB does not allow ADD and
-      // DELETE on one path in one expression, and a write that both marks and lifts would not mean anything.
+      // ENG-2816 (step 3): NOT a stored attribute. Members to ADD to the schedule's `provenance` String Set (see
+      // utils/scheduleProvenance.ts), carried in the SAME UpdateExpression as the content change they describe, so a visitor's content
+      // and its mark land together or not at all. Marks are only ever added here; the whole attribute comes off through
+      // `removeAttributes: ['provenance']` (the adopt route), which works on whatever shape the stored value has.
       provenanceAdd: string[];
-      provenanceRemove: string[];
     }>,
     /**
      * ENG-827: attributes that must STILL hold for this write to land, as read a
@@ -4054,17 +4053,17 @@ export const scheduleDb = {
      */
     removeAttributes?: string[]
   ) {
-    // ENG-2816 (step 3): split the two non-stored provenance keys off BEFORE the SET loop below, which would otherwise turn them
-    // into `SET #provenanceAdd = ...` on an attribute that does not exist.
-    const { provenanceAdd, provenanceRemove, ...storedUpdates } = updates as Record<string, any>;
+    // ENG-2816 (step 3): split the non-stored provenance key off BEFORE the SET loop below, which would otherwise turn it into
+    // `SET #provenanceAdd = ...` on an attribute that does not exist.
+    const { provenanceAdd, ...storedUpdates } = updates as Record<string, any>;
     const provenanceToAdd = readScheduleProvenance(provenanceAdd);
-    const provenanceToRemove = readScheduleProvenance(provenanceRemove);
-    if (provenanceToAdd.length > 0 && provenanceToRemove.length > 0) {
-      throw new Error('updateSchedule: provenance can be added to or removed from in one write, not both (ADD and DELETE on one path cannot share an UpdateExpression).');
-    }
     if (storedUpdates.provenance !== undefined) {
-      // A direct SET would store a List, and the next ADD on it would fail. The set is only ever touched through ADD / DELETE.
-      throw new Error('updateSchedule: set provenance through provenanceAdd / provenanceRemove, not as an attribute.');
+      // A direct SET would store a List, and the next ADD on it would fail. The set is only ever touched through ADD, and removed
+      // whole through removeAttributes.
+      throw new Error('updateSchedule: set provenance through provenanceAdd, not as an attribute.');
+    }
+    if (provenanceToAdd.length > 0 && (removeAttributes || []).includes('provenance')) {
+      throw new Error('updateSchedule: provenance cannot be added to and removed in one write.');
     }
     try {
       const updateExpressions: string[] = [];
@@ -4157,15 +4156,11 @@ export const scheduleDb = {
       if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
       if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
       // ENG-2816 (step 3): the provenance mark rides the SAME expression as the content change it describes. A write that carries
-      // only a mark (an adopt) is a real write and must not fall into the "nothing to do" return below.
+      // only a mark is a real write and must not fall into the "nothing to do" return below.
       if (provenanceToAdd.length > 0) {
         expressionAttributeNames['#provenance'] = 'provenance';
         expressionAttributeValues[':provenanceAdd'] = dynamodb.createSet(provenanceToAdd);
         clauses.push('ADD #provenance :provenanceAdd');
-      } else if (provenanceToRemove.length > 0) {
-        expressionAttributeNames['#provenance'] = 'provenance';
-        expressionAttributeValues[':provenanceRemove'] = dynamodb.createSet(provenanceToRemove);
-        clauses.push('DELETE #provenance :provenanceRemove');
       }
       if (clauses.length === 0) {
         // Nothing to do. Returning beats sending an empty expression, which
