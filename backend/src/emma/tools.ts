@@ -18,7 +18,6 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
-import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel, USER_FUNNEL_STATUS_VALUES } from '../utils/userFunnelStatus';
@@ -4537,7 +4536,7 @@ emmaToolRegistry.register({
         media_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
+          description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube. LinkedIn: pass either ONE MP4 video (3 seconds to 30 minutes, up to 150 MB; other video formats are refused) or images, never both. The video upload can take a minute or two.'
         },
         in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
         save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
@@ -7832,17 +7831,6 @@ emmaToolRegistry.register({
         acceptanceChecks: Array.isArray(args.acceptance_checks) ? args.acceptance_checks : undefined,
       }
     );
-
-    // Charge the coding agent's own LLM turns to the caller's monthly usage. This
-    // loop makes its own (often high-cost) LLM calls that the parent agent-mode
-    // meter never sees, so without this its spend escapes the per-user token/cost
-    // cap (ENG-200). Fire-and-forget + fail-open: never block/fail the tool result.
-    if (result.usageTotals && context?.userId) {
-      const { totalTokens, costUsd } = result.usageTotals;
-      incrementUserTokenUsage(context.userId, totalTokens, costUsd).catch((err: unknown) =>
-        console.error('coding_agent: failed to record per-user usage:', err)
-      );
-    }
 
     if (result.success) {
       return {

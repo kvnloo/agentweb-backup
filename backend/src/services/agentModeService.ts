@@ -3116,9 +3116,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3152,7 +3151,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two

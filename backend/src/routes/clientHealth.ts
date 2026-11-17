@@ -46,7 +46,8 @@ router.get("/:clientEmail", async (req: Request, res: Response) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const clientEmail = decodeURIComponent(req.params.clientEmail);
+    // Express has already decoded route params; decoding again breaks a literal "%" (ENG-3084).
+    const clientEmail = req.params.clientEmail;
     const result = await assessClientHealth(userId, clientEmail, authReq.user.isAdmin);
     return res.json(result);
   } catch (error) {
@@ -103,7 +104,7 @@ router.get("/:clientEmail/meta-activity", async (req: Request, res: Response) =>
     const limit = text(req.query.limit);
     const result = await readClientMetaActivity(
       userId,
-      decodeURIComponent(req.params.clientEmail),
+      req.params.clientEmail,
       {
         since: text(req.query.since),
         until: text(req.query.until),
