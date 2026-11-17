@@ -206,6 +206,7 @@ import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DETAIL } from './brandMarketStrategy';
 import { brandMessagingContextFromGuidelines } from '../../services/brandMessagingContext';
+import { logOutreachClaimCheckShadow } from '../../services/outreachClaimCheck';
 import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
@@ -3007,6 +3008,16 @@ ${emailDraftFormat === 'text'
         } else {
           emailDraft.htmlContent = emailData.htmlContent;
         }
+
+        // Shadow only (ENG-3067): counts specifics the brand facts do not contain.
+        // Logs counts, never draft text; cannot change or fail the draft.
+        logOutreachClaimCheckShadow({
+          channel: 'email',
+          listId,
+          draft: { subject: emailData.subject, body: emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent },
+          facts: { brandData: brandGuidelines?.brandData, marketStrategyText: marketStrategy?.exists ? marketStrategy.formattedContent : '' },
+          recipient: lead,
+        });
       }
 
       // Build activity history section for message prompt (reuse already-fetched engagements)
@@ -3138,6 +3149,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
           updatedAt: now,
           sessionId: sessionId
         };
+        logOutreachClaimCheckShadow({
+          channel: 'linkedin_note',
+          listId,
+          draft: { body: messageDraft.content },
+          facts: { brandData: brandGuidelines?.brandData, marketStrategyText: marketStrategy?.exists ? marketStrategy.formattedContent : '' },
+          recipient: lead,
+        });
       }
 
       // Update lead with whichever drafts were actually produced. With both gated off

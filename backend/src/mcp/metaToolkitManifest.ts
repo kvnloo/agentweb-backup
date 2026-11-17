@@ -30,6 +30,7 @@ import { EXPERIMENT_READ_DEFINITIONS } from './metaToolkitExperiments';
 import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } from './metaToolkitExperimentWrites';
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
+import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -139,12 +140,14 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     // ENG-3040: read-only list of the connected ad accounts (handled by the gateway, before account resolution).
     JSON.parse(JSON.stringify(AD_ACCOUNTS_TOOL_DEFINITION)),
     ...ZOMA_TOOL_DEFINITIONS.map((d) => JSON.parse(JSON.stringify(d))),
+    // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
+    JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
   ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name) || name === AD_ACCOUNTS_TOOL_NAME) return;
+  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaExperimentWriteTool(name) || name === AD_ACCOUNTS_TOOL_NAME) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

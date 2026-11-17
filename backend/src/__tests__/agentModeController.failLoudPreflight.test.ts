@@ -74,7 +74,6 @@ jest.mock('../services/llmUsagePolicyResolverService', () => ({
 
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(),
-  incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
 }));
 
@@ -121,7 +120,6 @@ import { isTransientLLMError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 

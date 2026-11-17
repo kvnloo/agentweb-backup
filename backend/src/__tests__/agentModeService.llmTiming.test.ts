@@ -15,7 +15,6 @@ jest.mock('../services/settingsService');
 jest.mock('../services/db');
 jest.mock('../utils/secretsManager');
 jest.mock('../services/tokenUsageService', () => ({
-  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../services/chatbotService', () => ({

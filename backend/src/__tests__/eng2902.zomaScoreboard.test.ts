@@ -38,7 +38,7 @@ describe('active (rolling 7d)', () => {
   it('a customer with one confirmed Zoma write in the last 7 days is active', async () => {
     const sb = await buildZomaScoreboard(scoreboardDeps([user('u1', 'ann@acme.co')], [write('u1', daysAgo(6))]));
     expect(sb.rows[0]).toMatchObject({ userId: 'u1', active7d: true, writes7d: expect.objectContaining({ create: 1, total: 1 }) });
-    expect(sb.summary).toEqual({ zomaUsers: 1, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 0 });
+    expect(sb.summary).toEqual({ zomaUsers: 1, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 0, palUsers: 0 });
   });
 
   it('signup, reads, unconfirmed/mismatched writes and writes older than 7 days never make a user active', async () => {
@@ -71,7 +71,7 @@ describe('active (rolling 7d)', () => {
     expect(sb.rows.find((r) => r.userId === 't1')).toMatchObject({ excluded: 'internal', active7d: false });
     expect(sb.rows.find((r) => r.userId === 't2')).toMatchObject({ excluded: 'test', active7d: false });
     expect(sb.rows.find((r) => r.userId === 't3')).toMatchObject({ excluded: 'internal' });
-    expect(sb.summary).toEqual({ zomaUsers: 1, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 3 });
+    expect(sb.summary).toEqual({ zomaUsers: 1, activeUsers7d: 1, firstAdUsers: 0, excludedAccounts: 3, palUsers: 0 });
     expect(sb.rows[0].userId).toBe('c1'); // counted customers first
   });
 
