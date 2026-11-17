@@ -41,7 +41,7 @@ import net from 'net';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
-import { assertAdsManagementGranted } from './metaToolkitWrites';
+import { assertAdsManagementGranted, assertMetaPageAccessForCreate } from './metaToolkitWrites';
 import { MetaService } from '../services/metaService';
 import { probePublicMediaUrl, SsrfBlockedError } from '../utils/ssrfGuard';
 import { googleToolkitEnabled } from './zomaToolDefinitions';
@@ -91,6 +91,8 @@ export interface MetaToolkitCreativeDeps {
   previewCreative: (userId: string, accountId: string, params: any) => Promise<any>;
   dispatch: (userId: string, dispatch: any) => Promise<{ result: any; createdId?: string }>;
   readCreative: (userId: string, accountId: string, creativeId: string) => Promise<any>;
+  /** ENG-3129: one-click Meta reconnect link for the Page-access refusal. */
+  connectLink?: (userId: string) => Promise<string>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   videoWaitMs: number;
@@ -137,6 +139,7 @@ const defaultDeps: MetaToolkitCreativeDeps = {
   dispatch: async (userId, d) => (await ams()).dispatchToolkitConfirmedMetaWrite(userId, d),
   readCreative: async (userId, accountId, creativeId) =>
     (await ams()).manageMetaAdsAdCreatives(userId, 'GET', accountId, { creative_id: creativeId }),
+  connectLink: async (userId) => (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing'),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   now: () => Date.now(),
   videoWaitMs: 90_000,
@@ -416,7 +419,15 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;
   }
-  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
+  const accounts = await deps.listAccounts(userId);
+  assertAdsManagementGranted(accounts, accountId);
+  // ENG-3129: a creative needs a Page; refuse before any upload/preview reaches Meta. Uploads stay ungated.
+  if (action === 'CREATE' || action === 'BULK_CREATE') {
+    await assertMetaPageAccessForCreate(accounts, accountId, {
+      pageId: typeof params.page_id === 'string' ? params.page_id : undefined,
+      connectLink: deps.connectLink && (() => deps.connectLink!(userId)),
+    });
+  }
 
   if (action === 'UPLOAD_IMAGE') {
     const { fetchUrl } = await resolveAssetUrl(userId, params.image_url, 'image', deps);

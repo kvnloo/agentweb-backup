@@ -35,6 +35,8 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
+import { getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
@@ -83,6 +85,8 @@ export interface MetaToolkitWriteDeps {
   readBack: (userId: string, accountId: string, entity: string, id: string) => Promise<Record<string, any> | null>;
   /** ENG-2913: throws unless the creative belongs to the selected ad account (creative ids are global). */
   assertCreativeOwned: (userId: string, accountId: string, creativeId: string) => Promise<void>;
+  /** ENG-3129: one-click Meta reconnect link for the Page-access refusal. */
+  connectLink?: (userId: string) => Promise<string>;
   /** ENG-2942: account-scoped custom conversion / pixel event reads for AD_SET CREATE. */
   conversionLookup?: (userId: string, accountId: string) => Promise<ConversionLookup>;
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
@@ -121,6 +125,7 @@ const defaultDeps: MetaToolkitWriteDeps = {
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
   assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
   conversionLookup: async (userId, accountId) => (await ams()).toolkitMetaConversionLookup(userId, accountId),
+  connectLink: async (userId) => (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing'),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
@@ -261,11 +266,15 @@ export function fieldDiffLines(params: any, minor: any, prior: Record<string, an
   });
 }
 
-export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
+function findMetaAdAccount(accounts: ConnectedAccount[], accountId: string): ConnectedAccount | undefined {
   const norm = (v: unknown) => String(v ?? '').trim().replace(/^act_/, '');
-  const account = accounts.filter(isMetaAdAccount).find(
+  return accounts.filter(isMetaAdAccount).find(
     (a) => norm((a.config as any)?.ad_account_id) === norm(accountId) || norm(a.account_id) === norm(accountId),
   );
+}
+
+export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
+  const account = findMetaAdAccount(accounts, accountId);
   const state = account ? adsManagementScopeState(account) : 'missing';
   if (state === 'granted') return;
   throw new MetaToolkitRefusal(
@@ -273,6 +282,22 @@ export function assertAdsManagementGranted(accounts: ConnectedAccount[], account
       ? 'This Meta connection was not granted the ads_management permission, so Zoma cannot change ads on it. Reconnect Meta (run zoma_status for the link) and approve ads management.'
       : 'Zoma cannot verify that this Meta connection was granted the ads_management permission. Reconnect Meta (run zoma_status for the link) so the granted permissions are recorded.',
   );
+}
+
+/**
+ * ENG-3129: refuse an ad / creative CREATE on an account whose stored Page probe says no
+ * Facebook Page is accessible, before anything reaches Meta. Only a confirmed 'missing'
+ * refuses; never-probed ('unknown') goes through, as in the Emma gate (adsApis.ts).
+ * A link that cannot be minted degrades to "run zoma_status for the link", never blocks.
+ */
+export async function assertMetaPageAccessForCreate(
+  accounts: ConnectedAccount[], accountId: string,
+  opts: { pageId?: string; connectLink?: () => Promise<string> } = {},
+) {
+  const config = findMetaAdAccount(accounts, accountId)?.config as any;
+  if (getMetaPagesAccessState(config) !== 'missing') return;
+  const link = opts.connectLink ? await opts.connectLink().catch(() => undefined) : undefined;
+  throw new MetaToolkitRefusal(metaPageAccessRefusalText(config, { pageId: opts.pageId, link }));
 }
 
 function errorText(result: any): string {
@@ -303,7 +328,11 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;
   }
-  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
+  const accounts = await deps.listAccounts(userId);
+  assertAdsManagementGranted(accounts, accountId);
+  if (action === 'CREATE') {
+    await assertMetaPageAccessForCreate(accounts, accountId, { connectLink: deps.connectLink && (() => deps.connectLink!(userId)) });
+  }
 
   // Currency echo + minor units, via the same normalizer the writers use.
   let money: { params: any; confirmation: string } = { params, confirmation: '' };
