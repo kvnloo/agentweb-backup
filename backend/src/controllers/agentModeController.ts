@@ -13972,6 +13972,20 @@ export const agentModeController = {
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
+      // ENG-2816 (step 3): a share link runs the visitor's turn inside the OWNER's session, and the cancel flag is keyed by the
+      // session, so cancelling here used to kill the owner's own running turn for anyone holding the share token. A share-token stop
+      // now cancels only when it comes from the owner's own login, or when the turn that is running was started through a share
+      // route by a visitor (the marker set where that turn claimed the session lock, cleared when it releases it). Anything else is
+      // somebody else's turn, so it is left alone.
+      //
+      // The answer is the same `200 {success: true}` either way, so a visitor cannot probe whether an owner turn is running. An
+      // ignored stop does nothing at all: no cancel flag (it would sit there and cancel the NEXT turn), no worker cancel, and no
+      // markProgressComplete (it would tell the owner's live stream their turn is over).
+      if (!(await isSessionOwnerRequest(req, session.userId)) && !isShareVisitorTurn(shareId)) {
+        console.log(`[ENG-2816] ishare stop for session ${shareId} ignored: not the owner's login, and no visitor turn is running`);
+        return res.json({ success: true });
+      }
+
       // Signal cancellation
       requestCancel(shareId);
       generateMarketingResponseWorkerService.cancelSession(shareId);
