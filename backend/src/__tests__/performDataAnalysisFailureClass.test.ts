@@ -16,6 +16,12 @@ jest.mock('../utils/s3Utils', () => ({
   getS3ObjectAsString: jest.fn(),
 }));
 jest.mock('../utils/secretsManager', () => ({ getSecret: jest.fn() }));
+// Who may read which S3 key (ENG-2988 rule) is a boundary here, covered with the real policy in performDataAnalysis.storageAccess.test.ts.
+// Without it a refusal would also answer `not_found` and the empty-file test below would pass for the wrong reason.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
+}));
 
 import {
   performDataAnalysis,
