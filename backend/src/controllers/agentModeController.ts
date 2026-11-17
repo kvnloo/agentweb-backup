@@ -80,6 +80,7 @@ import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/
 import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
 import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
+import { isDeepStrictEqual } from 'util';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -6745,6 +6746,15 @@ function isVisitorScheduleWrite(req: Request): boolean {
     : (req.headers as Record<string, string | undefined> | undefined)?.[SCHEDULED_SESSION_HEADER.toLowerCase()];
   return isShareVisitorTurn(sessionId);
 }
+
+/**
+ * ENG-2816 (step 3): a template carries no provenance (the one new attribute lives on schedule items only), so a share-link visitor's
+ * write to one cannot be marked. Creating, changing and deleting a template are therefore refused for a visitor, who can still USE a
+ * template (the schedule they create from it is marked in full). The owner, Emma in the owner's own chat and a delegate are unaffected.
+ */
+const VISITOR_TEMPLATE_WRITE_REFUSAL = {
+  error: 'Templates cannot be created, changed or deleted from a share link. Ask the account owner to do it from their own session.',
+};
 
 /**
  * ENG-2816 (step 3): what a schedule write does to its provenance. A visitor's write marks `fields` (the tracked fields it changes);
@@ -15281,7 +15291,11 @@ export const agentModeController = {
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
-      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): a visitor's write is compared with what is stored NOW (it decides which fields it marks), so it reads
+      // consistently; every other caller keeps its read exactly as it was.
+      const existingSchedule = isVisitorScheduleWrite(req)
+        ? await scheduleDb.getScheduleById(scheduleId, { consistent: true })
+        : await scheduleDb.getScheduleById(scheduleId);
       if (!existingSchedule || existingSchedule.userId !== user.userId) {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
@@ -15597,9 +15611,28 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
-      // ENG-2816 (step 3): who wrote this content. A visitor's write marks the tracked fields it carries, in the SAME write as the
-      // content; an owner's write (portal, Emma in their own chat, a delegate) never touches provenance, and no edit removes a mark.
-      const provenancePlan = provenancePlanForWrite(req, trackedFieldsInBody(req.body));
+      // ENG-2816 (step 3): who wrote this content. A visitor's write marks the tracked fields whose final written value DIFFERS from
+      // the stored one (strict deep equality, normalised the way this handler normalises, against the consistent read above), in
+      // the SAME write as the content. A field the visitor merely re-sends unchanged is not theirs, so a visitor cannot degrade the
+      // owner's schedule (a publish grant, a tool limit, a retry budget) by sending no-op fields. A comparison that cannot be made
+      // (an unexpected shape) reads as "differs": fail safe, mark it. An owner's write (portal, Emma in their own chat, a
+      // delegate) never touches provenance, and no edit removes a mark.
+      const storedVariableValues: Record<string, string> = {};
+      normalizedVariables.forEach((variable) => {
+        const existingValue = existingValues[variable.name];
+        if (typeof existingValue === 'string' && existingValue.trim().length > 0) storedVariableValues[variable.name] = existingValue.trim();
+      });
+      const present = new Set(trackedFieldsInBody(req.body));
+      const changedTrackedFields = [
+        present.has('startingMessage') && effectiveStartingMessage !== previousStartingMessage && 'startingMessage',
+        present.has('keywords') && !isDeepStrictEqual(updates.keywords, existingSchedule.keywords || []) && 'keywords',
+        present.has('requiredFunctionCalls') && !isDeepStrictEqual(updates.requiredFunctionCalls, existingSchedule.requiredFunctionCalls || []) && 'requiredFunctionCalls',
+        present.has('functionCallMinCalls') && !isDeepStrictEqual(updates.functionCallMinCalls, existingSchedule.functionCallMinCalls || {}) && 'functionCallMinCalls',
+        present.has('variables') && !isDeepStrictEqual(normalizedVariables, existingSchedule.variables || []) && 'variables',
+        present.has('variableValues') && !isDeepStrictEqual(normalizedVariableValues, storedVariableValues) && 'variableValues',
+        present.has('emailNotifications') && !isDeepStrictEqual(effectiveEmailNotifications, normalizeEmailList(existingSchedule.emailNotifications || [])) && 'emailNotifications',
+      ].filter((field): field is string => typeof field === 'string');
+      const provenancePlan = provenancePlanForWrite(req, changedTrackedFields);
       Object.assign(updates, provenancePlan);
       if (provenancePlan.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId} edited through a share link; marked [${provenancePlan.provenanceAdd.join(', ')}]`);
@@ -15779,7 +15812,10 @@ export const agentModeController = {
         return res.status(400).json({ error: 'variableValues object is required' });
       }
 
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): a visitor's write is compared with what is stored NOW (consistent read); everyone else reads as before.
+      const schedule = isVisitorScheduleWrite(req)
+        ? await scheduleDb.getScheduleById(scheduleId, { consistent: true })
+        : await scheduleDb.getScheduleById(scheduleId);
       if (!schedule || schedule.userId !== user.userId) {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
@@ -15801,9 +15837,15 @@ export const agentModeController = {
       const nowIso = new Date().toISOString();
 
       // ENG-2816 (step 3): variable values are substituted into the run's prompt, so they are tracked like the prompt itself. A
-      // visitor's submission marks them in this same write; an owner's never touches provenance. A schedule this write marks is a
-      // marked schedule for the run it starts right below.
-      const submissionProvenance = provenancePlanForWrite(req, ['variableValues']);
+      // visitor's submission marks them in this same write when they DIFFER from the stored values (re-sending the stored values is
+      // not writing anything); an owner's never touches provenance. A schedule this write marks is a marked schedule for the run it
+      // starts right below.
+      const storedForSubmission: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const stored = (schedule.variableValues as Record<string, unknown> | undefined)?.[variable.name];
+        if (typeof stored === 'string' && stored.trim().length > 0) storedForSubmission[variable.name] = stored.trim();
+      });
+      const submissionProvenance = provenancePlanForWrite(req, isDeepStrictEqual(sanitizedValues, storedForSubmission) ? [] : ['variableValues']);
       if (submissionProvenance.provenanceAdd) {
         console.log(`[ENG-2816] schedule ${scheduleId}: variable values submitted through a share link; marked [${submissionProvenance.provenanceAdd.join(', ')}]`);
       }
@@ -15995,6 +16037,10 @@ export const agentModeController = {
         variableValuesUpdatedAt: nowIso,
         variableRequestAccessTokenConsumedAt: nowIso,
         updatedAt: nowIso,
+        // ENG-2816 (step 3): this emailed link is unauthenticated, and on a schedule a visitor has written into, the recipient list
+        // may include an address the visitor chose. Whoever fills it in is not the owner reviewing the schedule, so the values go in
+        // marked, in this same write. A schedule with no marks is written exactly as it always was.
+        ...(isScheduleMarked(schedule) ? { provenanceAdd: ['variableValues'] } : {}),
       });
 
       const scheduleToRun: any = {
@@ -18673,6 +18719,8 @@ export const agentModeController = {
   // POST /api/agent-mode/schedule-templates
   createScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
+      // ENG-2816 (step 3): see VISITOR_TEMPLATE_WRITE_REFUSAL.
+      if (isVisitorScheduleWrite(req)) return res.status(403).json(VISITOR_TEMPLATE_WRITE_REFUSAL);
       const user = req.user as User;
       const {
         name, description, category, visibility,
@@ -18803,6 +18851,8 @@ export const agentModeController = {
   // PUT /api/agent-mode/schedule-templates/:templateId
   updateScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
+      // ENG-2816 (step 3): see VISITOR_TEMPLATE_WRITE_REFUSAL.
+      if (isVisitorScheduleWrite(req)) return res.status(403).json(VISITOR_TEMPLATE_WRITE_REFUSAL);
       const user = req.user as User;
       const { templateId } = req.params;
 
@@ -18845,16 +18895,6 @@ export const agentModeController = {
       if (!visibilityDecision.ok) {
         return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
       }
-      // ENG-2816 (step 3): a share-link visitor acts as the owner and must not widen who a template reaches, or send it for review
-      // (an owner-approved route to every customer's picker). A template has no provenance to mark, so the write is refused.
-      if (
-        isVisitorScheduleWrite(req)
-        && visibilityDecision.visibility !== undefined
-        && visibilityDecision.visibility !== canonicalizeVisibility(existing.visibility)
-      ) {
-        return res.status(403).json({ error: "A template's visibility cannot be changed from a share link. Ask the account owner to do it from their own session." });
-      }
-
       // ENG-669: a system template's model is AgentWeb's choice: schedules created from it inherit the pin as a SYSTEM
       // model, exempt from the tier model allowlist. So only an administrator may change it. Not a change: re-sending
       // the stored value (a client that PUTs the whole object back), an alias of it, or any spelling of "no model"
@@ -18949,6 +18989,8 @@ export const agentModeController = {
   // DELETE /api/agent-mode/schedule-templates/:templateId
   deleteScheduleTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
+      // ENG-2816 (step 3): see VISITOR_TEMPLATE_WRITE_REFUSAL.
+      if (isVisitorScheduleWrite(req)) return res.status(403).json(VISITOR_TEMPLATE_WRITE_REFUSAL);
       const user = req.user as User;
       const { templateId } = req.params;
 
@@ -19149,6 +19191,10 @@ export const agentModeController = {
   // POST /api/agent-mode/schedule-templates/:templateId/submit-for-review
   submitTemplateForReview: async (req: AuthenticatedRequest, res: Response) => {
     try {
+      // ENG-2816 (step 3): a share-link visitor cannot move a template toward review (see VISITOR_TEMPLATE_WRITE_REFUSAL).
+      if (isVisitorScheduleWrite(req)) {
+        return res.status(403).json({ error: 'A template cannot be submitted for review from a share link. Ask the account owner to do it from their own session.' });
+      }
       const user = req.user as User;
       const { templateId } = req.params;
 
@@ -19158,10 +19204,6 @@ export const agentModeController = {
       }
       if (template.visibility !== 'private') {
         return res.status(400).json({ error: 'Only private templates can be submitted for review' });
-      }
-      // ENG-2816 (step 3): see updateScheduleTemplate. A share-link visitor cannot move a template toward review.
-      if (isVisitorScheduleWrite(req)) {
-        return res.status(403).json({ error: 'A template cannot be submitted for review from a share link. Ask the account owner to do it from their own session.' });
       }
 
       await scheduleTemplateDb.updateTemplate(templateId, {

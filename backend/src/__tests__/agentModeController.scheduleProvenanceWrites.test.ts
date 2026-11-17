@@ -202,9 +202,9 @@ describe('updateScheduledChat: marking', () => {
     expect(payload).not.toHaveProperty('provenanceRemove');
   });
 
-  it('a visitor edit marks even when it re-sends the value that was already there (it is now the last writer)', async () => {
+  it('a visitor edit does NOT mark a field it merely re-sends unchanged (it wrote nothing)', async () => {
     await update(visitorByClaim, { keywords: ['a', 'b'] });
-    expect(updatedWith().provenanceAdd).toEqual(['keywords']);
+    expect(updatedWith()).not.toHaveProperty('provenanceAdd');
   });
 
   it('marks through the session marker alone, when the claim was dropped on the way', async () => {
@@ -273,6 +273,72 @@ describe('updateScheduledChat: no edit ever takes a mark off', () => {
   });
 });
 
+describe('marking precision: a visitor marks only what it actually changes (ENG-2816 step 3)', () => {
+  beforeEach(() => mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any));
+
+  it('a whole-form save whose values are all unchanged marks NOTHING and writes no provenance at all', async () => {
+    await update(visitorByClaim, { ...wholeForm(), scheduleName: 'Just a rename' });
+    const payload = updatedWith();
+    expect(payload).not.toHaveProperty('provenanceAdd');
+    expect(payload.scheduleName).toBe('Just a rename');
+  });
+
+  it('a real change among no-ops marks only that field', async () => {
+    await update(visitorByClaim, { ...wholeForm(), startingMessage: 'Hi, and also do this' });
+    expect(updatedWith().provenanceAdd).toEqual(['startingMessage']);
+  });
+
+  it('is strict: a reordered list or a different address list is a change (an edit it cannot show to be a no-op is marked)', async () => {
+    await update(visitorByClaim, { ...wholeForm(), keywords: ['b', 'a'] });
+    expect(updatedWith().provenanceAdd).toEqual(['keywords']);
+    mockScheduleDb.updateSchedule.mockClear();
+    await update(visitorByClaim, { ...wholeForm(), emailNotifications: [OWNER_EMAIL, 'attacker@example.com'] });
+    expect(updatedWith().provenanceAdd).toEqual(['emailNotifications']);
+  });
+
+  it('an unexpected stored shape reads as "differs" and is marked (fail safe)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored({ keywords: 'not-a-list', functionCallMinCalls: [1] }) as any);
+    await update(visitorByClaim, { keywords: ['a'], functionCallMinCalls: { t1: 1 } });
+    expect(updatedWith().provenanceAdd).toEqual(['keywords', 'functionCallMinCalls']);
+  });
+
+  it('cannot be used to degrade an owner\'s schedule: a no-op visitor write leaves a publish-granted schedule unmarked and its grant intact', async () => {
+    const grantedSchedule = stored({ requiredFunctionCalls: ['post_on_connected_account'], autopublishAuthorized: true, autopublishAuthorizedTools: ['post_on_connected_account'] });
+    mockScheduleDb.getScheduleById.mockResolvedValue(grantedSchedule as any);
+    await update(visitorByClaim, { requiredFunctionCalls: ['post_on_connected_account'], keywords: ['a', 'b'], startingMessage: 'Hi' });
+    expect(updatedWith()).not.toHaveProperty('provenanceAdd');
+  });
+
+  it('compares with a CONSISTENT read (never a stale replica), only for a visitor; every other caller reads exactly as before', async () => {
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('s1', { consistent: true });
+
+    mockScheduleDb.getScheduleById.mockClear();
+    await update(portalOwner, { keywords: ['z'] });
+    await update(emmaInOwnersChat, { keywords: ['z'] });
+    expect(mockScheduleDb.getScheduleById).toHaveBeenNthCalledWith(1, 's1');
+    expect(mockScheduleDb.getScheduleById).toHaveBeenNthCalledWith(2, 's1');
+  });
+
+  it('judges a field against the FRESH version, not a stale replica: the same keywords are a change against one and a no-op against the other', async () => {
+    const stale = stored({ keywords: ['old'] });
+    const fresh = stored({ keywords: ['z'] });
+    mockScheduleDb.getScheduleById.mockImplementation((async (_id: string, options?: { consistent?: boolean }) => (options?.consistent ? fresh : stale)) as any);
+
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(updatedWith()).not.toHaveProperty('provenanceAdd'); // identical to what is really stored
+
+    mockScheduleDb.updateSchedule.mockClear();
+    await update(visitorByClaim, { keywords: ['old'] });
+    expect(updatedWith().provenanceAdd).toEqual(['keywords']); // equal only to the stale copy: a real change
+  });
+
+  it('a create is not an edit: it still marks every tracked field it carries', async () => {
+    await create(visitorByClaim, { startingMessage: 'Hi', keywords: [] });
+    expect(created().provenance).toEqual(['startingMessage', 'keywords']);
+  });
+});
+
 describe('submitScheduledChatVariables', () => {
   const withVariable = (extra: Record<string, unknown> = {}) =>
     stored({ startingMessage: 'Hello {{who}}', variables: [{ name: 'who' }], variableValues: { who: 'Alice' }, ...extra });
@@ -291,7 +357,14 @@ describe('submitScheduledChatVariables', () => {
     expect(updatedWith().provenanceAdd).toEqual(['variableValues']);
   });
 
-  it('an owner\'s own submission, whatever it changes, marks nothing and unmarks nothing', async () => {
+  it('a visitor re-submitting the STORED values writes nothing of its own, so marks nothing; and reads consistently', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(withVariable() as any);
+    await submit(visitorByClaim, { who: 'Alice' });
+    expect(updatedWith()).not.toHaveProperty('provenanceAdd');
+    expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('s1', { consistent: true });
+  });
+
+  it('an owner\'s own submission reads as before, and whatever it changes marks nothing and unmarks nothing', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(withVariable({ provenance: ['variableValues'] }) as any);
     for (const values of [{ who: 'Alice' }, { who: 'Bob' }]) {
       mockScheduleDb.updateSchedule.mockClear();
@@ -299,6 +372,7 @@ describe('submitScheduledChatVariables', () => {
       expect(updatedWith()).not.toHaveProperty('provenanceAdd');
       expect(updatedWith()).not.toHaveProperty('provenanceRemove');
     }
+    expect(mockScheduleDb.getScheduleById).toHaveBeenCalledWith('s1');
   });
 
   it('Emma in the owner\'s chat, and a delegate, mark nothing and unmark nothing', async () => {
@@ -339,12 +413,24 @@ describe('createScheduleFromTemplate', () => {
   });
 });
 
-describe('templates: a visitor cannot widen a template\'s reach', () => {
+describe('templates: a visitor cannot create, change, delete or submit one (a template has nowhere to carry a mark)', () => {
   const ownTemplate = (extra: Record<string, unknown> = {}) => ({ templateId: 't1', createdBy: USER, visibility: 'private', name: 'T', startingMessage: 'm', ...extra });
+  const visitors: Array<[string, Caller]> = [['a visitor (claim)', visitorByClaim], ['a marked run', markedRunByClaim], ['a visitor (session marker only)', visitorByMarkerOnly]];
+  const owners: Array<[string, Caller]> = [['a person in the portal', portalOwner], ['Emma in the owner\'s own chat', emmaInOwnersChat], ['a delegated admin', delegate]];
 
+  const createTemplate = async (caller: Caller) => {
+    const res = makeRes();
+    await agentModeController.createScheduleTemplate(makeReq(caller, { body: { name: 'T', startingMessage: 'Hi {{who}}' } }) as any, res);
+    return res;
+  };
   const updateTemplate = async (caller: Caller, body: Record<string, unknown>) => {
     const res = makeRes();
     await agentModeController.updateScheduleTemplate(makeReq(caller, { body, params: { templateId: 't1' } }) as any, res);
+    return res;
+  };
+  const deleteTemplate = async (caller: Caller) => {
+    const res = makeRes();
+    await agentModeController.deleteScheduleTemplate(makeReq(caller, { params: { templateId: 't1' } }) as any, res);
     return res;
   };
   const submitForReview = async (caller: Caller) => {
@@ -352,43 +438,39 @@ describe('templates: a visitor cannot widen a template\'s reach', () => {
     await agentModeController.submitTemplateForReview(makeReq(caller, { params: { templateId: 't1' } }) as any, res);
     return res;
   };
+  beforeEach(() => mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate() as any));
 
-  it('a visitor cannot change visibility (here: pull a template back from review to private), and nothing is written', async () => {
-    mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate({ visibility: 'pending_review' }) as any);
-    for (const caller of [visitorByClaim, markedRunByClaim, visitorByMarkerOnly]) {
-      const res = await updateTemplate(caller, { visibility: 'private' });
+  it.each(visitors)('%s: create, update (any field, visibility or not), delete and submit-for-review are all 403, and nothing is read or written', async (_name, caller) => {
+    for (const res of [
+      await createTemplate(caller),
+      await updateTemplate(caller, { name: 'Renamed', startingMessage: 'new' }),
+      await updateTemplate(caller, { visibility: 'private' }),
+      await deleteTemplate(caller),
+    ]) {
       expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('Ask the account owner to do it from their own session') });
     }
+    expect((await submitForReview(caller)).status).toHaveBeenCalledWith(403);
+    expect(mockTemplateDb.createTemplate).not.toHaveBeenCalled();
     expect(mockTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    expect(mockTemplateDb.getTemplateById).not.toHaveBeenCalled();
   });
 
-  it('the owner can make the same visibility change (unchanged)', async () => {
-    mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate({ visibility: 'pending_review' }) as any);
-    await updateTemplate(portalOwner, { visibility: 'private' });
-    expect(mockTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ visibility: 'private' }), expect.anything());
-  });
-
-  it('a visitor can still edit a template without touching visibility (nothing is taken away)', async () => {
+  it.each(owners)('%s keeps every one of them (nothing is taken from the owner)', async (_name, caller) => {
     mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate() as any);
-    await updateTemplate(visitorByClaim, { name: 'Renamed', startingMessage: 'new' });
+    expect((await createTemplate(caller)).status).toHaveBeenCalledWith(201);
+    await updateTemplate(caller, { name: 'Renamed' });
     expect(mockTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ name: 'Renamed' }), expect.anything());
-  });
-
-  it('a visitor cannot submit a template for review, and the template is not moved', async () => {
-    mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate() as any);
-    for (const caller of [visitorByClaim, markedRunByClaim, visitorByMarkerOnly]) {
-      const res = await submitForReview(caller);
-      expect(res.status).toHaveBeenCalledWith(403);
-    }
-    expect(mockTemplateDb.updateTemplate).not.toHaveBeenCalled();
-  });
-
-  it('the owner (portal, or Emma in their own chat) still can submit for review (unchanged)', async () => {
-    mockTemplateDb.getTemplateById.mockResolvedValue(ownTemplate() as any);
-    await submitForReview(portalOwner);
-    await submitForReview(emmaInOwnersChat);
-    expect(mockTemplateDb.updateTemplate).toHaveBeenCalledTimes(2);
+    mockTemplateDb.updateTemplate.mockClear();
+    await submitForReview(caller);
     expect(mockTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ visibility: 'pending_review' }));
+  });
+
+  it('a visitor can still USE a template: the schedule it creates is marked in full (covered above)', async () => {
+    mockTemplateDb.getTemplateById.mockResolvedValue({ ...ownTemplate(), variables: [], keywords: [], requiredFunctionCalls: [], functionCallMinCalls: {}, suggestedFrequency: 'daily', emailNotifications: [OWNER_EMAIL], llmModel: '' } as any);
+    const res = makeRes();
+    await agentModeController.createScheduleFromTemplate(makeReq(visitorByClaim, { body: {}, params: { templateId: 't1' } }) as any, res);
+    expect(res.status).toHaveBeenCalledWith(201);
   });
 });
 

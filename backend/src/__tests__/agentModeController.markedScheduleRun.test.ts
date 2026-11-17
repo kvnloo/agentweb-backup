@@ -61,6 +61,7 @@ jest.mock('../services/db', () => ({
     heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
+    getScheduledChatByVariableAccessTokenHash: jest.fn(),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
     claimPendingResume: jest.fn().mockResolvedValue(true),
     claimAndPauseUnresumable: jest.fn().mockResolvedValue('paused'),
@@ -103,7 +104,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, userDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { runScheduledChat, recoverAbandonedScheduledRun } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat, recoverAbandonedScheduledRun } from '../controllers/agentModeController';
 import { MARKED_RUN_MAX_ATTEMPTS } from '../utils/scheduleProvenance';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -305,5 +306,47 @@ describe('Slack sends of a MARKED schedule are withheld (ENG-2816 step 3)', () =
       expect(message).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL');
       expect(message).not.toContain('WITHHELD (CRITICAL — ENG-2204)');
     });
+  });
+});
+
+// ENG-2816 (step 3): the emailed variables link is unauthenticated and runs the schedule at once. On a schedule a visitor wrote into,
+// the recipient list may include an address the visitor chose, so whoever fills it in is not the owner reviewing the schedule.
+describe('the public variables link (submitScheduledChatVariablesByAccessToken)', () => {
+  const linkSchedule = (over: Record<string, unknown> = {}) => schedule({
+    requiredFunctionCalls: [], keywords: [], functionCallMinCalls: {}, variables: [{ name: 'who' }], variableValues: {},
+    variableRequestStatus: 'pending', ...over,
+  });
+  const flush = async () => { for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  const submitByLink = async (found: any) => {
+    mockScheduleDb.getScheduledChatByVariableAccessTokenHash.mockResolvedValue(found);
+    mockWorker.runInWorker.mockResolvedValue({ ...nothing, content: 'Done.' } as any);
+    const res: any = { json: jest.fn(), status: jest.fn().mockReturnThis() };
+    await agentModeController.submitScheduledChatVariablesByAccessToken(
+      { params: { accessToken: 'a-token' }, body: { variableValues: { who: 'Mallory' } } } as any, res);
+    await flush();
+    return res;
+  };
+  const firstWrite = () => mockScheduleDb.updateSchedule.mock.calls[0];
+
+  it('on a MARKED schedule the submitted values go in marked, in the same write', async () => {
+    const res = await submitByLink(linkSchedule({ provenance: ['emailNotifications'] }));
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+    expect(firstWrite()[0]).toBe('sched-1');
+    expect(firstWrite()[1]).toMatchObject({ variableValues: { who: 'Mallory' }, variableRequestStatus: 'provided', provenanceAdd: ['variableValues'] });
+  });
+
+  it('on an UNMARKED schedule the write is byte-for-byte what it always was (no provenance key at all)', async () => {
+    await submitByLink(linkSchedule());
+    expect(firstWrite()).toEqual([
+      'sched-1',
+      {
+        variableValues: { who: 'Mallory' },
+        variableRequestStatus: 'provided',
+        variableValuesUpdatedAt: expect.any(String),
+        variableRequestAccessTokenConsumedAt: expect.any(String),
+        updatedAt: expect.any(String),
+      },
+    ]);
+    expect(Object.keys(firstWrite()[1] as object)).not.toContain('provenanceAdd');
   });
 });
