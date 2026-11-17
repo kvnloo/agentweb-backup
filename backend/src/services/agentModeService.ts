@@ -107,7 +107,7 @@ import { boundToolsForModel } from '../utils/boundToolsForModel';
 // (orgProfileResolver.ts is a transitive-AWS-SDK-construction trap module)
 // — so the top-level import origin/main reintroduced here is dead in this
 // class and deliberately dropped, not missed.
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, resolveSlackSendAuthorized } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, describeSlackSendState, type SlackSendState } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
@@ -3034,19 +3034,20 @@ export class AgentModeService {
    * this function cannot verify (no session, no parseable schedule, a read error)
    * withholds rather than authorizes.
    */
-  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<SlackSendState> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
-    if (!scheduleId) return false;
+    if (!scheduleId) return { authorized: false };
     try {
       const schedule = await scheduleDb.getScheduleById(scheduleId);
-      return resolveSlackSendAuthorized(schedule);
+      // ENG-2816 (step 3): also WITHHELD for a schedule a share-link visitor wrote into, and says so (see describeSlackSendState).
+      return describeSlackSendState(schedule);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding the ENG-2204 unattended Slack-send override rather than authorizing it unverified:`,
         error
       );
-      return false;
+      return { authorized: false };
     }
   }
   // ENG-2103 (F2): estimateVideoGenerationCost (main's unchanged pre-existing
@@ -3409,13 +3410,14 @@ export class AgentModeService {
       // ENG-2204: owner opt-out for the Slack-send override — resolved independently
       // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
       // for why this isn't threaded through publishAuthorizationOverride instead.
-      const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
+      const slackSend = await this.resolveScheduledSlackSendAuthorized(currentSession);
       const publishDirective = getUnattendedExecutionDirective(
         'scheduled',
         isAdmin,
         publishAuthorization.authorized ? 'authorized' : 'withheld',
         publishAuthorization.tools,
-        slackSendAuthorized
+        slackSend.authorized,
+        slackSend.reason
       );
       if (publishDirective) messages.push({ role: 'system', content: publishDirective });
     }
@@ -9998,7 +10000,8 @@ export class AgentModeService {
 
     try {
       // resolvePublishAuthorized also returns false for a missing/deleted schedule.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent, so a mark a visitor just wrote cannot be missed by a stale replica.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       if (resolvePublishAuthorized(schedule)) return null;
       console.warn(
         `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} is not authorized to publish.`

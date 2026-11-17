@@ -245,3 +245,65 @@ describe('every entry that runs a schedule\'s turns says it is unattended (ENG-2
     expect(workerFlags().every((flag) => flag === true)).toBe(true);
   });
 });
+
+// ENG-2816 (step 3): the other "unattended default = authorized" gate, Slack sends (ENG-2204), treats a marked schedule as WITHHELD
+// the way `requireSlackApproval: true` does: the checker stops demanding the send, and the mid-run notice stops granting the bypass.
+describe('Slack sends of a MARKED schedule are withheld (ENG-2816 step 3)', () => {
+  const slackSchedule = (over: Record<string, unknown> = {}) =>
+    schedule({ requiredFunctionCalls: ['get_marketing_tips', 'slack_send_message'], functionCallMinCalls: {}, ...over });
+
+  it('is not required to call slack_send_message, so it passes on what it did; an unmarked run still must', async () => {
+    mockWorker.runInWorker.mockResolvedValue(partial as any);
+
+    const marked = await runScheduledChat(slackSchedule({ provenance: ['startingMessage'] }), USER, true);
+    expect(marked).toMatchObject({ passed: true, functionCallMatches: ['get_marketing_tips'], functionCallMisses: [] });
+
+    const unmarked = await runScheduledChat(slackSchedule(), USER, true);
+    expect(unmarked.passed).toBe(false);
+    expect(unmarked.functionCallMisses).toEqual(['slack_send_message']);
+  });
+
+  describe('the mid-run notice (re-injected when consent is withdrawn while the run is in flight)', () => {
+    const grantedPublisher = (over: Record<string, unknown> = {}) => slackSchedule({
+      requiredFunctionCalls: ['post_on_connected_account'], keywords: [],
+      autopublishAuthorized: true, autopublishAuthorizedTools: ['post_on_connected_account'], ...over,
+    });
+    const firstMessage = () => (mockWorker.runInWorker.mock.calls[0][0] as any).messageContent as string;
+    beforeEach(() => mockWorker.runInWorker.mockResolvedValue({ ...nothing, content: 'Drafted.' } as any));
+
+    it('says Slack is withheld because a visitor wrote the schedule, when it is marked MID-RUN', async () => {
+      // Admitted unmarked and authorized; by the first re-read a visitor has marked it.
+      mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ provenance: ['startingMessage'] }) as any);
+      await runScheduledChat(grantedPublisher(), USER, true);
+      const message = firstMessage();
+      expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+      expect(message).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD');
+      expect(message).toContain('set up or edited through a share link and has not been adopted by its owner');
+    });
+
+    it('a run ADMITTED marked was admitted unauthorized, so there is nothing to withdraw and no notice (no bypass is injected)', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ provenance: ['keywords'] }) as any);
+      await runScheduledChat(grantedPublisher({ provenance: ['keywords'] }), USER, true);
+      expect(firstMessage()).not.toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+      expect(firstMessage()).not.toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL');
+    });
+
+    it('honours the owner\'s own Slack opt-out too (this notice used to ignore it)', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ requireSlackApproval: true, autopublishAuthorized: false, autopublishAuthorizedTools: [] }) as any);
+      await runScheduledChat(grantedPublisher({ requireSlackApproval: true }), USER, true);
+      const message = firstMessage();
+      expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+      expect(message).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD');
+      expect(message).toContain('The owner has turned ON "Require approval before Slack sends"');
+    });
+
+    it('an ordinary schedule keeps today\'s notice: Slack authorized', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(grantedPublisher({ autopublishAuthorized: false, autopublishAuthorizedTools: [] }) as any);
+      await runScheduledChat(grantedPublisher(), USER, true);
+      const message = firstMessage();
+      expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+      expect(message).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL');
+      expect(message).not.toContain('WITHHELD (CRITICAL — ENG-2204)');
+    });
+  });
+});

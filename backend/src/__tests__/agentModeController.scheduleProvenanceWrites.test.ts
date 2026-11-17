@@ -499,3 +499,50 @@ describe('GET /scheduled-chats (what list_scheduled_chats and the portal read)',
     expect(item).not.toHaveProperty('provenance');
   });
 });
+
+// ENG-2816 (step 3): the consent-narrowing write derives the STORED grant, not "may this run publish". A marked schedule may not
+// publish, but removing a publish tool from it must still narrow what the owner granted, or the removed tool's grant would come back
+// the day the owner adopts the schedule.
+describe('consent narrowing on an edit of a MARKED schedule', () => {
+  const granted = (over: Record<string, unknown> = {}) => stored({
+    requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+    autopublishAuthorized: true,
+    autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+    ...over,
+  });
+  const edit = (tools: string[]) => update(portalOwner, { ...wholeForm(), requiredFunctionCalls: tools });
+
+  it('narrows the stored grant when the owner removes one publish tool, in the same write, bound to the grant it was derived from', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(granted({ provenance: ['startingMessage'] }) as any);
+    await edit(['post_on_connected_account']);
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+    const [, payload, expectation] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
+    expect(payload.requiredFunctionCalls).toEqual(['post_on_connected_account']);
+    expect(payload.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
+    expect(payload).not.toHaveProperty('autopublishAuthorized'); // still granted, for the one tool that remains
+    expect(expectation).toMatchObject({ autopublishAuthorized: true });
+  });
+
+  it('revokes the stored grant when no publish tool remains', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(granted({ provenance: ['startingMessage'] }) as any);
+    await edit([]);
+    const [, payload] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
+    expect(payload).toMatchObject({ autopublishAuthorized: false, autopublishAuthorizedTools: [], autopublishAuthorizedAt: null, autopublishAuthorizedBy: null });
+  });
+
+  it('does exactly the same for an UNMARKED schedule (nothing changed for existing schedules)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(granted() as any);
+    await edit(['post_on_connected_account']);
+    const [, payload] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
+    expect(payload.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
+  });
+
+  it('and a visitor edit of a marked schedule narrows it the same way (the write also adds its marks)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(granted({ provenance: ['startingMessage'] }) as any);
+    await update(visitorByClaim, { requiredFunctionCalls: ['post_on_connected_account'] });
+    const [, payload] = mockScheduleDb.updateSchedule.mock.calls[0] as any[];
+    expect(payload.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
+    expect(payload.provenanceAdd).toEqual(['requiredFunctionCalls']);
+  });
+});

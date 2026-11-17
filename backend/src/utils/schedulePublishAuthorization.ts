@@ -208,7 +208,14 @@ const UNAUTHORIZED: SchedulePublishAuthorization = { authorized: false, tools: [
  * or a grant with no scope gives the reversible draft-and-notify outcome.
  */
 export function resolveSchedulePublishAuthorization(
-  schedule: SchedulePublishAuthorizationInput | null | undefined
+  schedule: SchedulePublishAuthorizationInput | null | undefined,
+  /**
+   * `ignoreProvenance` answers "what grant is STORED on this schedule", leaving out the ENG-2816 rule that a marked schedule never
+   * publishes. Only the consent-narrowing write uses it: removing a publish tool from a marked schedule must still narrow the
+   * stored grant, or the removed tool's grant would come back the day the owner adopts the schedule. Nothing that decides whether a
+   * run MAY publish passes it.
+   */
+  options?: { ignoreProvenance?: boolean }
 ): SchedulePublishAuthorization {
   // Absence of a RECORD is not absence of an answer: a deleted schedule or a read that
   // failed leaves the owner's choice genuinely unknown, and unknown must not publish.
@@ -220,7 +227,7 @@ export function resolveSchedulePublishAuthorization(
   // Checked before the grant too: a grant that predates a visitor's later edit was given for content the owner has not seen.
   // The owner lifts it by adopting the schedule (POST .../adopt-visitor-edits) or by editing the marked fields themselves. The
   // outcome is the reversible one: drafts are saved and the owner is told what is waiting.
-  if (isScheduleMarked(schedule)) return UNAUTHORIZED;
+  if (!options?.ignoreProvenance && isScheduleMarked(schedule)) return UNAUTHORIZED;
 
   // The owner's explicit hold outranks everything below: they asked to review, so review.
   if (schedule.requirePublishApproval === true) return UNAUTHORIZED;
