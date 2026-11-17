@@ -126,7 +126,7 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     expect(next).toContain('https://adsmanager.facebook.com');
     expect(next).toContain('https://www.facebook.com/business/help');
     expect(next).toContain('https://business.facebook.com/settings/ad-accounts');
-    expect(next).toContain('reconnect Meta using the same connect link');
+    expect(next).toContain('get a fresh Meta connect link (links expire after 10 minutes');
     expect(next.split('does not need to use the same email as your Zoma login')).toHaveLength(2);
   });
 
@@ -154,7 +154,7 @@ describe('ENG-3136 guided Meta ad-account setup', () => {
     expect(again.summary).not.toContain('All set');
     expect(again.meta.link).toContain('facebook.com');
 
-    // The user creates the account at Meta and reconnects with the same link flow.
+    // The user creates the account at Meta and reconnects with a fresh link from zoma_status.
     finalizeMetaOAuth.mockResolvedValue({
       flow: 'marketing', tokenSessionId: 'ts-b', preconnectInstructions: '',
       adAccounts: [{ account_id: '111', name: 'Phoenix Shop', currency: 'USD', account_status: 1 }],

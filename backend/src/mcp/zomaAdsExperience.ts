@@ -55,7 +55,7 @@ export const ZOMA_META_LOGIN_NOTE =
 
 /** Meta hosts ad-account creation, so a failed Create button is Meta's; Zoma gives a current route and a way back. */
 export const ZOMA_AD_ACCOUNT_CREATE_FALLBACK =
-  'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as an admin of the Business portfolio, or try Ads Manager (https://adsmanager.facebook.com) with the same Facebook login; if it still fails, report it to Meta (https://www.facebook.com/business/help) with the exact message. Once the account exists, reconnect Meta using the same connect link/button.';
+  'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as an admin of the Business portfolio, or try Ads Manager (https://adsmanager.facebook.com) with the same Facebook login; if it still fails, report it to Meta (https://www.facebook.com/business/help) with the exact message. Once the account exists, get a fresh Meta connect link (links expire after 10 minutes; ask your agent for a new one) and open it.';
 
 /** Ad-account setup for someone who has never run ads, in the order they need it. */
 export const ZOMA_NEW_TO_ADS_STEPS: readonly string[] = [
@@ -79,7 +79,7 @@ export function adsExperienceQuestionText(recordWith: string): string {
 }
 
 export function newToAdsGuideText(): string {
-  return ['No Meta ad account yet? Set one up, then use the same connect link:', ...ZOMA_NEW_TO_ADS_STEPS.map((s, i) => `  ${i + 1}. ${s}`)].join('\n');
+  return ['No Meta ad account yet? Set one up, then connect with a fresh Meta link (links expire after 10 minutes):', ...ZOMA_NEW_TO_ADS_STEPS.map((s, i) => `  ${i + 1}. ${s}`)].join('\n');
 }
 
 export interface ZomaAdsExperienceStore {
