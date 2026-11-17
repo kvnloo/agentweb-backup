@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto';
 import type { LeadNotificationsConfig, LeadOrigin } from './leadNotificationConfig';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
