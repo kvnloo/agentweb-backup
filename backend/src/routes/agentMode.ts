@@ -354,6 +354,11 @@ router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeControlle
 // still need that migration path if they don't — see that script's header).
 router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/adopt-visitor-edits
+// ENG-2816 (step 3): the owner takes over a schedule a share-link visitor wrote into, removing every visitor mark so its runs get
+// the owner's full tool set again. Portal login only: refuses self-calls (so no MCP tool can reach it), delegates and visitor writes.
+router.post('/scheduled-chats/:scheduleId/adopt-visitor-edits', asyncHandler(agentModeController.adoptScheduledChatVisitorEdits));
+
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)
 router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));
