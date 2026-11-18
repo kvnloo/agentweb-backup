@@ -16,9 +16,13 @@
  * function in zomaBilling.ts. Webhook events are PULLED from Stripe and replayed, signed locally, through the
  * production webhook controller (no public endpoint or Stripe CLI needed).
  *
+ * The agent's path is real too: section 2b and the later gateway checks call `handleMetaToolkitCall` (the same entry the MCP
+ * route uses) with an `UPDATE status=ACTIVE` write, so the paywall, the success-only metering and the failure audit run in
+ * the real gateway against real Stripe. Section 10 cancels the plan and checks the returning-user Checkout (no trial, no $1).
+ *
  * What is not real: the funnel rows go to an in-memory store (same conditional-write semantics as the table), the
- * day-3 email is captured and printed instead of sent, ad performance is a fixed string, and there is no Meta or
- * AgentWeb user. The Meta/Google gateway paywall wiring is covered by the unit tests (eng3130.zomaBilling.test.ts).
+ * day-3 email is captured and printed instead of sent, ad performance is a fixed string, the Meta write itself is a fake
+ * (there is no Meta account here), journey milestones are stubbed, and there is no AgentWeb user.
  *
  * ONE STEP IS MANUAL: hosted Checkout cannot be completed through the API. The script prints the Checkout URL (and
  * writes it to --checkout-url-file); open it and pay with test card 4242 4242 4242 4242, any future expiry, any CVC.
@@ -136,6 +140,30 @@ async function main() {
     };
     const clockDeps = () => ({ ...deps, now: () => clockMs });
 
+    // ---- the real toolkit gateway, with a fake Meta write and in-memory usage/failure rows -----------------------
+    const journey: any = await import('../services/journeyMilestones');
+    journey.noteProductUse = async () => undefined; // would write the (non-existent) user row in the Dev tables
+    journey.zomaMilestone = async () => undefined;
+    const { handleMetaToolkitCall } = await import('../mcp/metaToolkitGateway');
+    const counts = { write: 0, usage: 0, failure: 0 };
+    let writeResult: any = { success: true, verification: 'CONFIRMED', id: '5' };
+    const metaAccount = { platform: 'meta', account_id: '111', config: { account_type: 'ad_account', ad_account_id: '111', access_token: 'rehearsal' } } as any;
+    const gwDeps: any = {
+      validateApiKey: async () => ({ userId, keyId: 'rehearsal-key' }),
+      validateOAuthToken: async () => null,
+      listAccounts: async () => [metaAccount],
+      execute: async () => ({ data: [] }),
+      executeWrite: async () => { counts.write += 1; return writeResult; },
+      recordUsage: async () => { counts.usage += 1; return true; },
+      recordFailure: async () => { counts.failure += 1; return true; },
+      recordWrite: async () => true,
+      now: () => Date.now(),
+      reportBillableCall: (uid: string, id: string) => billing.reportZomaBillableCall(uid, id, deps),
+      assertPublishAllowed: (uid: string, ctx: any) => billing.assertZomaPublishAllowed(uid, ctx, deps),
+    };
+    const gw = (params: Record<string, unknown>, action = 'UPDATE') => handleMetaToolkitCall(
+      { authorization: 'Bearer aw_rehearsal', toolName: 'call_meta_marketing_api', args: { entity_type: 'CAMPAIGN', action, campaign_id: '5', params } }, gwDeps);
+
     // ---- customer on a test clock (the code never creates clocks; this is how the acceptance run does it) -----
     const clock = await stripe.testHelpers.testClocks.create({ frozen_time: Math.floor(Date.now() / 1000), name: `zoma-rehearsal-${RUN}` });
     cleanup.push(() => stripe.testHelpers.testClocks.del(clock.id));
@@ -184,6 +212,19 @@ async function main() {
     check('our pay link redirects to the hosted Stripe page and records checkout_started', opened.kind === 'redirect' && steps().includes('checkout_started'));
     check('paywall_shown recorded once per surface per hour', steps().filter((s) => s === 'paywall_shown').length === 2, { steps: steps() });
 
+    log('\n=== 2b. The agent path through the real gateway, before paying');
+    const gwRefusal: any = await gw({ status: 'ACTIVE' }).then(() => null, (e: any) => e);
+    check('agent sets the campaign ACTIVE: refused with the same pay link, nothing sent to Meta, nothing metered',
+      Boolean(gwRefusal) && String(gwRefusal.message).includes(refusal.link) && counts.write === 0 && counts.usage === 0, { message: String(gwRefusal?.message).slice(0, 160), counts });
+    await gw({ name: 'draft rename' });
+    check('an edit (not a go-live) goes through and is metered', counts.write === 1 && counts.usage === 1, counts);
+    await handleMetaToolkitCall({ authorization: 'Bearer aw_rehearsal', toolName: 'get_campaigns', args: {} }, gwDeps);
+    check('a read goes through and is metered', counts.usage === 2, counts);
+    writeResult = { success: false, error: 'Meta said no' };
+    await gw({ name: 'rejected edit' });
+    check('a write Meta rejects in-band is not metered but leaves one failure audit row', counts.usage === 2 && counts.failure === 1, counts);
+    writeResult = { success: true, verification: 'CONFIRMED', id: '5' };
+
     log('\n=== 3. MANUAL: pay the $1 trial on the hosted Checkout page');
     const url = (opened as any).url as string;
     if (opt('checkout-url-file')) fs.writeFileSync(opt('checkout-url-file') as string, url);
@@ -209,6 +250,9 @@ async function main() {
     check('trial is 7 days', sub && Math.round((sub.trial_end - sub.trial_start) / DAY_S) === 7, { days: sub && (sub.trial_end - sub.trial_start) / DAY_S });
     check('subscription and session carry metadata.product=zoma_plan and the user id', sub?.metadata?.product === 'zoma_plan' && sub?.metadata?.userId === userId, sub?.metadata);
     check('publishing is now allowed', await billing.assertZomaPublishAllowed(userId, { platform: 'meta' }, deps).then(() => true, () => false));
+    const writesBefore = counts.write;
+    const live: any = await gw({ status: 'ACTIVE' }).then((r: any) => r, (e: any) => e);
+    check('agent retries the ACTIVE write through the gateway: it now goes to Meta and succeeds', counts.write === writesBefore + 1 && live?.success === true, { counts, result: live?.message ?? live?.success });
     check('the old pay link is gone (no second plan can be bought)', (await billing.openZomaCheckout(sessionId, deps)).kind === 'gone');
     const line = billing.formatZomaPlanLine((await billing.getZomaPlanSummary(userId, deps))!, deps.config());
     check('zoma_status shows the trial', /\[x\] Zoma plan: trial until \d{4}-\d{2}-\d{2}, then \$50\/month/.test(line), { line });
@@ -288,6 +332,25 @@ async function main() {
     check('every Zoma plan event (session, subscription, invoice) is claimed before the Emma handlers', unclaimed.length === 0, { unclaimed });
     check('funnel recorded paid and trial_converted', steps().includes('paid') && steps().includes('trial_converted'), { steps: steps() });
     note('api_version of events vs pinned', { seen: [...new Set(events.map((e: any) => e.api_version))], pinned: STRIPE_API_VERSION });
+
+    log('\n=== 10. Returning user: the plan was cancelled, so the next go-live buys the plan itself (no trial, no $1)');
+    await stripe.subscriptions.cancel(sub.id);
+    let returning: any = null;
+    await sleepUntilFound('cancelled plan state', async () => {
+      const st = await billing.getZomaPlanState(userId, deps);
+      return st.status === 'canceled' && st.hadPlan ? st : null;
+    });
+    const gwReturning: any = await gw({ status: 'ACTIVE' }).then(() => null, (e: any) => e);
+    returning = gwReturning;
+    check('after cancelling, the go-live refusal sells the plan, charged today, with no trial wording',
+      Boolean(returning) && /\$50\/month, charged today/.test(returning.message) && !/trial/i.test(returning.message), { message: String(returning?.message).slice(0, 200) });
+    const retLink = String(returning?.message).match(/https:\/\/\S*\/api\/zoma\/billing\/checkout\/(cs_[A-Za-z0-9_]+)/);
+    const retSession = retLink ? await stripe.checkout.sessions.retrieve(retLink[1], { expand: ['line_items'] }) : null;
+    check('the returning Checkout has the plan and metered price only, no $1 fee line, $50 due today, USD-only',
+      Boolean(retSession) && retSession!.line_items?.data.length === 2 && retSession!.amount_total === 5000 && retSession!.currency === 'usd' && (retSession as any).adaptive_pricing?.enabled === false,
+      { items: retSession?.line_items?.data.length, amount_total: retSession?.amount_total, currency: retSession?.currency });
+    const retLine = billing.formatZomaPlanLine((await billing.getZomaPlanSummary(userId, deps))!, deps.config());
+    check('zoma_status offers the plan, not a trial', /\$50\/month → https:/.test(retLine) && !/trial/i.test(retLine), { line: retLine.slice(0, 120) });
   } finally {
     if (flag('keep')) {
       log('KEPT (--keep): Stripe test clock, meter, product and prices of run', RUN);
