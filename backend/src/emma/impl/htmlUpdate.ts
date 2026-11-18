@@ -82,6 +82,42 @@ import { performContentReplacements as sharedPerformContentReplacements } from '
 // mock-stops-being-exercised regression this series has hit, just one level
 // deeper (same-module, not cross-module).
 import * as self from './htmlUpdate';
+import { CALLER_URL_MAX_TEXT_BYTES, fetchCallerUrlText } from '../../utils/callerUrlFetch';
+
+/**
+ * Where the edited copy of `fileUrl` will be written, and whether the caller may write exactly there.
+ *
+ * The directory comes from the CALLER's own URL (`extractPathFromS3Url`), and the upload runs with the server's credentials, so without
+ * this check any user could put an edited copy into another tenant's folder (or anywhere in the bucket) by naming that path. Only the
+ * owner writes, as on `/api/files/html`. The key that is authorised is the key that is written: the same directory and the same file
+ * name after the upload's own rewriting. Done before anything is fetched, so a URL that is not the caller's costs no network call.
+ * Loaded lazily: the rule reaches the database layer and `chatbotService`, which this module must not load when merely required.
+ */
+async function authorizeUpdatedFileWrite(
+  fileUrl: string,
+  userId: string,
+): Promise<{ versionedFilename: string; originalPath: string } | { refusal: any }> {
+  const versionedFilename = createVersionedFilename(fileUrl);
+  const originalPath = extractPathFromS3Url(fileUrl);
+  const { sanitizeS3Filename } = await import('../../utils/s3Utils');
+  const {
+    TOOL_FILE_READ_ONLY_MESSAGE,
+    TOOL_FILE_REFUSAL_MESSAGE,
+    TOOL_FILE_UNAVAILABLE_MESSAGE,
+    createToolFileAccess,
+  } = await import('./toolStorageAccess');
+  const decision = await createToolFileAccess('update_html_file', userId).checkWrite(originalPath, sanitizeS3Filename(versionedFilename));
+  if (decision === 'allow') return { versionedFilename, originalPath };
+  if (decision === 'unavailable') {
+    // The check itself could not run (a lookup failed): not a verdict on the caller, so the model may try again.
+    return { refusal: { success: false, message: TOOL_FILE_UNAVAILABLE_MESSAGE, error: 'File access check unavailable', errorClass: 'upstream_5xx' } };
+  }
+  if (decision === 'read_only') {
+    return { refusal: { success: false, message: TOOL_FILE_READ_ONLY_MESSAGE, error: 'File is read-only for you', errorClass: 'invalid_args' } };
+  }
+  // One message for "not there", "not yours" and "not placeable", so a refusal cannot be used to probe for files.
+  return { refusal: { success: false, message: TOOL_FILE_REFUSAL_MESSAGE, error: 'File not accessible', errorClass: 'invalid_args' } };
+}
 
   // Update HTML file with direct content replacement
 export async function updateHtmlFile(
@@ -121,8 +157,12 @@ export async function updateHtmlFile(
         };
       }
 
+      // Only the owner may write the edited copy (checked on the exact key that will be written, before anything is fetched).
+      const target = await authorizeUpdatedFileWrite(fileUrl, userId);
+      if ('refusal' in target) return target.refusal;
+
       // Fetch current file content
-      const currentContent = await self.fetchFileContent(fileUrl);
+      const currentContent = await self.fetchFileContent(fileUrl, userId);
       console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
 
       // Compute hash of current content for verification
@@ -154,11 +194,10 @@ export async function updateHtmlFile(
         };
       }
 
-      // Create versioned filename and upload the updated content
-      const versionedFilename = createVersionedFilename(fileUrl);
+      // Upload the updated content under the name and directory that were authorised above
+      const { versionedFilename, originalPath } = target;
       console.log(`AgentMode: Original file URL: ${fileUrl}`);
       console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
-      const originalPath = extractPathFromS3Url(fileUrl);
       console.log(`AgentMode: Original path: ${originalPath}`);
       const uploadResult = await self.uploadUpdatedFile(replacementResult.updatedContent!, versionedFilename, originalPath);
 
@@ -183,13 +222,11 @@ export async function updateHtmlFile(
   }
 
   // Fetch file content from URL
-export async function fetchFileContent(fileUrl: string): Promise<string> {
+export async function fetchFileContent(fileUrl: string, userId?: string): Promise<string> {
     try {
-      const response = await fetch(fileUrl);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`);
-      }
-      return await response.text();
+      // A URL the caller chose is fetched only through the guarded fetch (public addresses only, redirects re-checked, size and time
+      // bounded); the body is edited and written back as a file, so the server's own network position must not be reachable through it.
+      return await fetchCallerUrlText(fileUrl, { tool: 'update_html_file', userId, maxBytes: CALLER_URL_MAX_TEXT_BYTES });
     } catch (error) {
       console.error('Error fetching file content:', error);
       throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -337,8 +374,12 @@ async function updateHtmlFileCss(
         }
       }
 
+      // Only the owner may write the edited copy (checked on the exact key that will be written, before anything is fetched).
+      const target = await authorizeUpdatedFileWrite(fileUrl, userId);
+      if ('refusal' in target) return target.refusal;
+
       // Fetch current file content
-      const currentContent = await self.fetchFileContent(fileUrl);
+      const currentContent = await self.fetchFileContent(fileUrl, userId);
       console.log(`AgentMode: CSS edit - fetched file, length: ${currentContent.length}`);
 
       // Load into cheerio
@@ -408,9 +449,8 @@ async function updateHtmlFileCss(
       const failedOps = operationResults.filter(r => !r.success);
       console.log(`AgentMode: CSS edit complete, ${operationsApplied}/${operations.length} operations applied, new length: ${updatedContent.length}`);
 
-      // Upload
-      const versionedFilename = createVersionedFilename(fileUrl);
-      const originalPath = extractPathFromS3Url(fileUrl);
+      // Upload under the name and directory that were authorised above
+      const { versionedFilename, originalPath } = target;
       const uploadResult = await self.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
 
       return {

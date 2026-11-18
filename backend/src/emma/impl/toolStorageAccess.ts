@@ -69,11 +69,52 @@ export async function checkOurBucketKeyRead(
   }
 }
 
-/** What a tool holds for one call: the caller, one lookup cache, and the two questions it needs to ask. */
+/** The caller may read the file but only its owner may change it (a teammate on an org-shared file): said plainly, not as "not found". */
+export const TOOL_FILE_READ_ONLY_MESSAGE =
+  'You can read this file but only its owner can change it. To make your own version, create a new file with create_html_file.';
+
+/** `allow`; `refuse` (not yours, not placeable); `read_only` (readable by the caller, writable only by the owner); `unavailable` (retry). */
+export type ToolFileWriteDecision = 'allow' | 'refuse' | 'read_only' | 'unavailable';
+
+/**
+ * May this caller WRITE the object a tool is about to put in our bucket with the server's credentials?
+ *
+ * `dir` and `filename` are exactly what the tool will pass to the upload (`uploadFileToS3WithPath`): the directory as given and the file
+ * name AFTER the upload's own rewriting (`sanitizeS3Filename`), so the key that is authorised is the key that is written, not something
+ * near it. The directory gets the same clean-up the upload applies (surrounding and repeated slashes). Anything the rule cannot place, a
+ * blank caller, and a failed lookup never answer `allow`. Only the owner writes; a tool never carries admin power.
+ */
+export async function checkOurBucketPathWrite(
+  tool: string,
+  userId: string | undefined | null,
+  dir: string,
+  filename: string,
+  lookups: StorageAccessLookups = new StorageAccessLookups(),
+): Promise<ToolFileWriteDecision> {
+  const cleanDir = typeof dir === 'string' ? dir.replace(/^\/+|\/+$/g, '').replace(/\/+/g, '/') : '';
+  const key = canonicalStorageKey(cleanDir ? `${cleanDir}/${filename}` : filename, 'decoded');
+  if (!key || typeof userId !== 'string' || userId.trim() === '') return 'refuse';
+  try {
+    const caller = { userId, isRealAdmin: false };
+    const decision = await decideStorageAccess(caller, key, 'write', lookups);
+    if (decision.allow) return 'allow';
+    if (decision.reason === 'lookup_failed') return 'unavailable';
+    console.warn(JSON.stringify({ event: 'storage_access_denied', route: `tool:${tool}`, access: 'write', shape: decision.shape, reason: decision.reason, userId }));
+    // Same split as the REST route: a teammate who may open the file is told it is read-only; anyone else gets the generic refusal.
+    const read = await decideStorageAccess(caller, key, 'read', lookups);
+    return read.allow ? 'read_only' : 'refuse';
+  } catch (error: any) {
+    console.error(JSON.stringify({ event: 'storage_access_check_failed', route: `tool:${tool}`, error: String(error?.message || error).slice(0, 200) }));
+    return 'unavailable';
+  }
+}
+
+/** What a tool holds for one call: the caller, one lookup cache, and the questions it needs to ask. */
 export function createToolFileAccess(tool: string, userId: string | undefined | null) {
   const lookups = new StorageAccessLookups();
   return {
     isOurBucket,
     check: (rawKey: string): Promise<ToolFileDecision> => checkOurBucketKeyRead(tool, userId, rawKey, lookups),
+    checkWrite: (dir: string, filename: string): Promise<ToolFileWriteDecision> => checkOurBucketPathWrite(tool, userId, dir, filename, lookups),
   };
 }
