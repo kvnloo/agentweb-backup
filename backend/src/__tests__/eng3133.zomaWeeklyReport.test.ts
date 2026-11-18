@@ -30,6 +30,7 @@ import express from 'express';
 import request from 'supertest';
 import { createZomaRouter } from '../routes/zoma';
 import { googleAdsService } from '../services/googleAdsService';
+import { ZOMA_GOOGLE_FLAG } from '../mcp/zomaToolDefinitions'; // the flag's name is owned by the toolkit, not hard-coded here
 import { resendService } from '../services/resendService';
 import { emailService } from '../services/emailService';
 import * as usageService from '../services/mcpUsageEventsService';
@@ -1006,13 +1007,13 @@ describe('the production wiring', () => {
 
   describe('Google Ads', () => {
     beforeEach(() => {
-      process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+      process.env[ZOMA_GOOGLE_FLAG] = 'true';
       accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]);
     });
-    afterEach(() => { delete process.env.ZOMA_GOOGLE_ADS_ENABLED; });
+    afterEach(() => { delete process.env[ZOMA_GOOGLE_FLAG]; });
 
     it('there is no Google section while the Google toolkit is dark, so no advice to run a Google flow that does not exist', async () => {
-      delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+      delete process.env[ZOMA_GOOGLE_FLAG];
       await expect(read()).resolves.toEqual([]);
       expect(queryReporting).not.toHaveBeenCalled();
     });
@@ -1063,13 +1064,13 @@ describe('the production wiring', () => {
   });
 
   it('both platforms are read independently: one failing does not hide the other', async () => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env[ZOMA_GOOGLE_FLAG] = 'true';
     accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, googleAccount]);
     mockRunDaily.mockRejectedValue(new Error('The Meta connection expired or was revoked'));
     queryReporting.mockResolvedValueOnce([gRow('2026-11-17', 4_000_000, 100, 5, 1)]).mockResolvedValueOnce([]);
     const weeks = await read();
     expect(weeks.map((w) => `${w.platform}:${w.status}`)).toEqual(['meta:unreadable', 'google_ads:delivered']);
-    delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+    delete process.env[ZOMA_GOOGLE_FLAG];
   });
 
   describe('several connected accounts', () => {
