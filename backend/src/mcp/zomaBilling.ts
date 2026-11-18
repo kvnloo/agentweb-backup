@@ -21,6 +21,7 @@ import type Stripe from 'stripe';
 import { getJwtSecret } from '../config/jwt';
 import { createStripeClient } from '../services/stripeClientFactory';
 import { userDb } from '../services/db';
+import { createZomaReferralWebhookHandler, type ZomaReferralWebhookHandler } from '../services/zomaReferralWebhook';
 import {
   getMcpUserUsage,
   recordZomaBillingFunnel,
@@ -638,6 +639,9 @@ export function isZomaPlanObject(obj: any): boolean {
   return obj?.metadata?.product === ZOMA_PLAN_PRODUCT_TAG || subscriptionMetadataOfInvoice(obj)?.product === ZOMA_PLAN_PRODUCT_TAG;
 }
 
+/** Built on first use so importing this module never opens a Stripe or DynamoDB client. */
+let defaultReferralHandler: ZomaReferralWebhookHandler | undefined;
+
 /**
  * Handle a Zoma plan Stripe event. Returns true when the event belonged to the plan, in which
  * case the caller must skip the Emma subscription handlers (they would sync the user row's
@@ -648,8 +652,15 @@ export function isZomaPlanObject(obj: any): boolean {
 export async function handleZomaBillingWebhookEvent(
   event: Pick<Stripe.Event, 'id' | 'type' | 'created'> & { data: { object: any; previous_attributes?: any } },
   deps: Pick<ZomaBillingDeps, 'recordFunnel'> = defaultZomaBillingDeps,
+  referral: ZomaReferralWebhookHandler = (defaultReferralHandler ??= createZomaReferralWebhookHandler({ isZomaPlanObject })),
 ): Promise<boolean> {
   const obj = event.data.object;
+  // A credit note carries no plan metadata, so it is matched to a Zoma invoice inside the handler
+  // (ENG-3132, dark behind ZOMA_REFERRAL_ENABLED). It still falls through to the Emma path, which ignores it.
+  if (event.type === 'credit_note.created') {
+    await referral.onCreditNoteCreated(obj);
+    return false;
+  }
   if (!isZomaPlanObject(obj)) return false;
   const userId: string | undefined = obj?.metadata?.userId ?? subscriptionMetadataOfInvoice(obj)?.userId;
   if (!userId) return true;
@@ -677,8 +688,13 @@ export async function handleZomaBillingWebhookEvent(
       await record(endedInTrial ? 'trial_canceled' : 'subscription_canceled', { subscriptionId: obj.id });
       break;
     }
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+      // Both fire per payment; commission is keyed on the invoice id, so the second is a no-op (ENG-3132).
+      await referral.onInvoicePaid(obj);
+      break;
     default:
-      // subscription.created, invoices etc.: Stripe owns the state; nothing to mirror.
+      // subscription.created, other invoice events etc.: Stripe owns the state; nothing to mirror.
       break;
   }
   return true;
