@@ -1112,7 +1112,7 @@ describe('a digest that cannot be computed omits contentVersion on that row, nev
   });
 });
 
-describe('a visitor can only RAISE the publish and Slack holds, and cannot set the autonomy waiver (defence in depth)', () => {
+describe('a visitor body never writes the publish or Slack hold (true or false), and cannot set the autonomy waiver (defence in depth)', () => {
   const given = (schedule: Record<string, unknown>) => mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
 
   it('a visitor body with requirePublishApproval/requireSlackApproval false on stored-true holds drops the false: the write carries no value for them', async () => {
@@ -1123,11 +1123,60 @@ describe('a visitor can only RAISE the publish and Slack holds, and cannot set t
     expect(updatedWith().provenanceAdd).toEqual(['startingMessage']); // the rest of the edit still lands
   });
 
-  it('a visitor body with true writes true (raising is allowed), whatever is stored', async () => {
+  it('a visitor body with TRUE writes nothing either, when no publish tool / Slack send was newly added (it could otherwise switch off an owner schedule\'s publishing without leaving a mark)', async () => {
+    for (const storedHolds of [{ requirePublishApproval: false, requireSlackApproval: false }, {}]) {
+      mockScheduleDb.updateSchedule.mockClear();
+      given(stored(storedHolds));
+      await update(visitorByClaim, { requirePublishApproval: true, requireSlackApproval: true });
+      expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+      expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+    }
+  });
+
+  it('a visitor body with true AND a newly added publish tool / Slack send still gets the hold, from the new-tool rule', async () => {
     given(stored({ requirePublishApproval: false, requireSlackApproval: false }));
-    await update(visitorByClaim, { requirePublishApproval: true, requireSlackApproval: true });
+    await update(visitorByClaim, { requirePublishApproval: true, requireSlackApproval: true, requiredFunctionCalls: ['t1', 'post_on_connected_account', 'slack_send_message'] });
     expect(updatedWith().requirePublishApproval).toBe(true);
     expect(updatedWith().requireSlackApproval).toBe(true);
+    // ...and with the body saying false the new-tool rule still wins (checked in the "never lowered" case below too)
+    mockScheduleDb.updateSchedule.mockClear();
+    await update(visitorByClaim, { requirePublishApproval: false, requireSlackApproval: false, requiredFunctionCalls: ['t1', 'post_on_connected_account', 'slack_send_message'] });
+    expect(updatedWith().requirePublishApproval).toBe(true);
+    expect(updatedWith().requireSlackApproval).toBe(true);
+  });
+
+  it('the marker-only visitor (no claim, only the in-process visitor-turn marker) is held to the same rules', async () => {
+    given(stored({ requirePublishApproval: true, requireSlackApproval: true, fullAutonomy: true }));
+    await update(visitorByMarkerOnly, { requirePublishApproval: false, requireSlackApproval: false, fullAutonomy: false });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+    expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+    expect(updatedWith().fullAutonomy).toBe(true);
+
+    mockScheduleDb.updateSchedule.mockClear();
+    given(stored({ requirePublishApproval: false, requireSlackApproval: false }));
+    await update(visitorByMarkerOnly, { requirePublishApproval: true, requireSlackApproval: true });
+    expect(updatedWith()).not.toHaveProperty('requirePublishApproval');
+    expect(updatedWith()).not.toHaveProperty('requireSlackApproval');
+  });
+
+  it.each([
+    ['a null body', null],
+    ['an array body', []],
+    ['an array body shaped like a form', [{ requirePublishApproval: true, requireSlackApproval: true, fullAutonomy: true }]],
+  ])('%s from a visitor writes no hold and no autonomy value and does not throw out of the handler', async (_name, body) => {
+    given(stored({ requirePublishApproval: true, requireSlackApproval: true, fullAutonomy: false }));
+    const res = makeRes();
+    await agentModeController.updateScheduledChat(
+      Object.assign(makeReq(visitorByClaim, { params: { scheduleId: 's1' } }), { body }) as Request, res);
+    const written = mockScheduleDb.updateSchedule.mock.calls[0]?.[1] as any;
+    if (written) {
+      expect(written).not.toHaveProperty('requirePublishApproval');
+      expect(written).not.toHaveProperty('requireSlackApproval');
+      expect(written.fullAutonomy).toBe(false);
+      expect(written).not.toHaveProperty('provenanceAdd');
+    } else {
+      expect(res.status).toHaveBeenCalled(); // refused or failed before any write: also nothing lowered or raised
+    }
   });
 
   it('non-boolean junk from a visitor is not a raise and not a write', async () => {

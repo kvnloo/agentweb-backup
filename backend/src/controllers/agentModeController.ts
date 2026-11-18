@@ -15500,16 +15500,17 @@ export const agentModeController = {
         // key leaves the stored value untouched, which is the only race-free way to
         // preserve it. Every other field here is last-writer-wins and recoverable;
         // this one authorizes an irreversible public post, so it is not.
-        // ENG-2816 (step 3): ...and a share-link visitor can only RAISE this hold (or the Slack one below), never lower it: a false in
-        // a visitor's body is dropped, so the stored value stays whatever it was.
-        ...(requirePublishApproval !== undefined && (!visitorWrite || requirePublishApproval === true)
+        // ENG-2816 (step 3): ...and a share-link visitor's body does not write this hold (or the Slack one below) AT ALL, true or false:
+        // a false would lower an owner's hold, and a true would let a visitor switch off an owner schedule's publishing without leaving
+        // a mark. For a visitor the holds are set only by the "newly added publish tool / slack_send_message" block further down.
+        ...(requirePublishApproval !== undefined && !visitorWrite
           ? { requirePublishApproval: requirePublishApproval === true }
           : {}),
         // ENG-2204: same write-only-if-present rationale as requirePublishApproval
         // immediately above — this field decides whether an unattended run may call
         // slack_send_message directly, so a read-modify-write here has the identical
         // race (an unrelated update silently reverting an owner's just-set opt-out).
-        ...(requireSlackApproval !== undefined && (!visitorWrite || requireSlackApproval === true)
+        ...(requireSlackApproval !== undefined && !visitorWrite
           ? { requireSlackApproval: requireSlackApproval === true }
           : {}),
         // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
