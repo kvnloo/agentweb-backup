@@ -47,7 +47,8 @@ export interface ShadowTurnUsage {
 }
 
 /**
- * What one agent-loop LLM turn cost AgentWeb, by the same rule the ledger books it (ENG-2720).
+ * What one agent-loop LLM turn cost AgentWeb, by the ledger's rule (ENG-2720), except that a
+ * non-BYOK response with no positive cost is priced from the price book instead of booked as $0.
  * On our own provider key (BYOK, the default route) `usage.cost` is 0 for a plain call: the real
  * bill is `cost_details.upstream_inference_cost` plus any OpenRouter fee. Reading `usage.cost`
  * alone counted every BYOK turn as $0, so the spend cap never fired. `tokenCostUsd` is the
