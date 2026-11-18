@@ -226,10 +226,10 @@ router.post(
           .replace(/"/g, '\\"');
         const searchResult = await stripe.customers.search({
           query: `email:"${escapedEmail}"`,
-          limit: 1,
+          limit: 10,
         });
         const existingByEmail = searchResult.data.find(
-          (c) => !(c as any).deleted
+          (c) => !(c as any).deleted && !c.metadata?.zomaBillingUserId
         );
         if (existingByEmail) {
           customerId = existingByEmail.id;
@@ -315,8 +315,9 @@ router.post('/create-usage-top-up-session', authenticateToken, async (req: Reque
     let customerId = billingUser.stripe_customer_id || null;
     if (!customerId) {
       const escapedEmail = billingUser.email.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      const search = await stripe.customers.search({ query: `email:"${escapedEmail}"`, limit: 1 });
-      customerId = search.data.find((customer) => !(customer as any).deleted)?.id || null;
+      const search = await stripe.customers.search({ query: `email:"${escapedEmail}"`, limit: 10 });
+      // ENG-3131: the Zoma plan customer is never an Emma billing customer.
+      customerId = search.data.find((customer) => !(customer as any).deleted && !customer.metadata?.zomaBillingUserId)?.id || null;
       if (!customerId) {
         customerId = (await stripe.customers.create({ email: billingUser.email, metadata: { userId: billingUserId } })).id;
       }
