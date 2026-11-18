@@ -17182,12 +17182,33 @@ export const agentModeController = {
 
           // Decrement runCount and auto-pause if it reaches 0
           // Note: Both successful and failed runs count toward the run limit
-          await scheduleDb.updateScheduleAfterRun(
-            schedule.scheduleId,
-            now.toISOString(),
-            nextRunTime.toISOString(),
-            true // Decrement runCount (default behavior)
-          );
+          // ENG-3047: one run per fire. The advance lands only if the row still carries
+          // the due time and last run time this caller read (never the clock). Two
+          // callers that read the same due row, or one that read a stale index entry,
+          // cannot both get past here: the loser's write is refused, so it decrements
+          // nothing and starts nothing. Any other failure keeps its existing handling below.
+          const expectedFire = typeof schedule.nextRunTime === 'string' && schedule.nextRunTime.length > 0
+            ? { nextRunTime: schedule.nextRunTime, lastRunTime: schedule.lastRunTime }
+            : undefined;
+          try {
+            await scheduleDb.updateScheduleAfterRun(
+              schedule.scheduleId,
+              now.toISOString(),
+              nextRunTime.toISOString(),
+              true, // Decrement runCount (default behavior)
+              expectedFire
+            );
+          } catch (advanceError: any) {
+            if (advanceError?.preconditionFailed !== true) throw advanceError;
+            console.log(`[ENG-3047] schedule ${schedule.scheduleId} was already advanced past fire ${schedule.nextRunTime}; not starting a second run`);
+            results.push({
+              scheduleId: schedule.scheduleId,
+              scheduleName: schedule.scheduleName,
+              status: 'already_started',
+              nextRunTime: nextRunTime.toISOString()
+            });
+            continue;
+          }
 
           // Increment concurrent run counter
           currentConcurrentRuns++;
