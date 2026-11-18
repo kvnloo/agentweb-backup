@@ -20,6 +20,9 @@ const mockUpdateUser = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: {
     getUserByEmail: (...args: any[]) => mockGetUserByEmail(...args),
+    // ENG-3111: login reads by primary key and stamps the login with one write.
+    getUserByEmailConsistent: (...args: any[]) => mockGetUserByEmail(...args),
+    recordLogin: (...args: any[]) => mockUpdateUser(...args),
     getUserByResetToken: (...args: any[]) => mockGetUserByResetToken(...args),
     getUserById: (...args: any[]) => mockGetUserById(...args),
     updateUser: (...args: any[]) => mockUpdateUser(...args),
