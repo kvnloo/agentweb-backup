@@ -141,6 +141,12 @@ import axios from 'axios';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getSecret } from '../../utils/secretsManager';
 import { getS3ObjectAsString } from '../../utils/s3Utils';
+import {
+  CALLER_URL_BLOCKED_MESSAGE,
+  CallerUrlBlockedError,
+  CallerUrlTooLargeError,
+  fetchCallerUrlBuffer,
+} from '../../utils/callerUrlFetch';
 import { meterUsageFromResponse } from '../../utils/llmClients';
 import {
   parseCsvProvenance,
@@ -288,6 +294,20 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
   if (/could not be read|no longer available|cannot read tool-response|is empty|failed to download or process file/.test(m)) return 'not_found';
   if (/did not return any results/.test(m)) return 'empty_result';
   return 'upstream_5xx';
+}
+
+/** Total time one plain-URL download may take (redirects included). The guarded fetch enforces it as ONE deadline. */
+const DOWNLOAD_TIMEOUT_MS = 30000;
+
+/**
+ * The guarded fetch gives a download ONE total deadline (redirects included). A host that cannot send the file in time surfaces as an
+ * aborted request (axios `ERR_CANCELED`) or a timeout, and is a bad argument for this tool (a slow or huge file), not an account or config fault.
+ */
+function isDownloadTimeout(error: unknown): boolean {
+  const e = error as { code?: unknown; name?: unknown; message?: unknown } | null;
+  if (e?.code === 'ECONNABORTED' || e?.code === 'ETIMEDOUT' || e?.code === 'ERR_CANCELED') return true;
+  if (e?.name === 'CanceledError' || e?.name === 'TimeoutError') return true;
+  return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
 }
 
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
@@ -475,7 +495,9 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
     // Get file size limit from environment or use default (50MB)
-    const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
+    // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
+    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800');
+    const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
 
     // Prepare file data for analysis.
     // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
@@ -584,15 +606,29 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           continue;
         }
 
-        // Download the file
-        const response = await axios.get(fileUrl, {
-          responseType: 'arraybuffer',
-          timeout: 30000
+        // An entry that is not a URL at all (a plain file name, a local path) is a mistake of the caller, not a blocked address: say so, and do
+        // not log it as a refused URL.
+        let parsesAsUrl = true;
+        try { new URL(fileUrl); } catch { parsesAsUrl = false; }
+        if (!parsesAsUrl) {
+          return {
+            success: false,
+            message: `file_urls entry "${fileUrl}" is not a URL. Pass a public https link, an s3:// key from save_file or a tool-responses key, or put the data inline in analysis_instruction.`,
+            errorClass: 'invalid_args',
+          };
+        }
+
+        // Download the file. A URL the caller chose is fetched only through the guarded fetch (public addresses only, every redirect
+        // checked again), and the body is capped at what is left of the total budget, so one URL cannot stream an unbounded body into memory.
+        const { buffer: fileBuffer } = await fetchCallerUrlBuffer(fileUrl, {
+          tool: 'perform_data_analysis',
+          userId,
+          maxBytes: Math.max(maxTotalSize - totalSize, 0),
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
         });
 
         // Check file size
-        const fileData = response.data as ArrayBuffer;
-        totalSize += fileData.byteLength;
+        totalSize += fileBuffer.byteLength;
         if (totalSize > maxTotalSize) {
           return {
             success: false,
@@ -603,7 +639,6 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // Send to Gemini as text/csv so the file materializes on the sandbox
         // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
         // be CSV, JSON, or plain text — the model is told this in the prompt.
-        const fileBuffer = Buffer.from(fileData);
         const base64Content = fileBuffer.toString('base64');
 
         fileParts.push({
@@ -616,7 +651,30 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         fileRawContents.push(fileBuffer.toString('utf-8'));
 
       } catch (error) {
+        // A URL the guard refuses: one generic answer, nothing about why (no address, no DNS text) and no `error` echo, so the
+        // answer cannot be used to map the internal network. A bad argument, not a tool fault.
+        if (error instanceof CallerUrlBlockedError) {
+          return {
+            success: false,
+            message: `Cannot fetch file_urls entry ${fileUrl}: ${CALLER_URL_BLOCKED_MESSAGE} Put the data inline in analysis_instruction, or pass an s3:// key from save_file or a tool-responses key.`,
+            errorClass: 'invalid_args',
+          };
+        }
+        if (error instanceof CallerUrlTooLargeError) {
+          return {
+            success: false,
+            message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+            errorClass: 'invalid_args',
+          };
+        }
         console.error(`Error processing file ${fileUrl}:`, error);
+        if (isDownloadTimeout(error)) {
+          return {
+            success: false,
+            message: `Downloading ${fileUrl} did not finish within the ${DOWNLOAD_TIMEOUT_MS / 1000}-second download limit. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
+            errorClass: 'timeout',
+          };
+        }
         // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
         // the model passed a dead, expired, or non-public link. There is no
         // account to repair, so it must not cluster as not_found -> `config`.
