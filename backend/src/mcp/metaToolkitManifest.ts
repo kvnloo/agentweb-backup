@@ -31,6 +31,7 @@ import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } fro
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport';
+import { isZomaIndustryBenchmarkTool } from './zomaIndustryBenchmark';
 import { measurementReportsEnabled, ZOMA_MEASUREMENT_REPORT_DEFINITION } from './zomaMeasurementReport';
 import { ZOMA_REPORT_SCHEDULE_DEFINITION } from './zomaReportSchedule';
 
@@ -153,7 +154,7 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name)) return;
+  if (isZomaTool(name) || isZomaAdsReportTool(name) || isZomaIndustryBenchmarkTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

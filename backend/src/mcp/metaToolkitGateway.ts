@@ -48,6 +48,7 @@ import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClie
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
 import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
+import { isZomaIndustryBenchmarkTool, runZomaIndustryBenchmark } from './zomaIndustryBenchmark';
 import { isZomaMeasurementReportTool, measurementReportsEnabled, runZomaMeasurementReport } from './zomaMeasurementReport';
 import { enrollReportSchedule, isReportScheduleWrite, isZomaReportScheduleTool, runZomaReportScheduleTool, type ScheduleNotice } from './zomaReportSchedule';
 import crypto from 'crypto';
@@ -145,6 +146,8 @@ export interface MetaToolkitGatewayDeps {
   accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
   /** ENG-3134 zoma_ads_report; defaults to runZomaAdsReport (Graph insights read). */
   runAdsReport?: (account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
+  /** ENG-3156 zoma_industry_benchmark; defaults to runZomaIndustryBenchmark (Graph reads + one classification call). */
+  runIndustryBenchmark?: (account: ConnectedAccount, accountId: string, userId: string, args: any) => Promise<any>;
   /** ENG-3155 zoma_measurement_report (dark until ZOMA_MEASUREMENT_REPORTS_ENABLED); defaults to runZomaMeasurementReport. */
   runMeasurementReport?: (userId: string, account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
   /** ENG-3155 zoma_report_schedule; defaults to runZomaReportScheduleTool. */
@@ -586,12 +589,15 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
   // ENG-3134: reporting on the resolved (owned, usable) account with that connection's own token.
-  if (isZomaAdsReportTool(request.toolName)) {
+  // ENG-3156: the industry benchmark reads the same report on the same account.
+  if (isZomaAdsReportTool(request.toolName) || isZomaIndustryBenchmarkTool(request.toolName)) {
     const account = (await deps.listAccounts(caller.userId)).find(
       (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
     );
     if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
-    const report = await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
+    const report = isZomaIndustryBenchmarkTool(request.toolName)
+      ? await (deps.runIndustryBenchmark ?? ((acc, id, uid, a) => runZomaIndustryBenchmark(acc, id, uid, a)))(account, accountId, caller.userId, args)
+      : await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
     await meter('meta');
     journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
     return stripCredentials(report);

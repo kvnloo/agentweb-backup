@@ -98,6 +98,8 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'ads_library_search',
   // Zoma reporting (ENG-3134): one Meta insights read
   'zoma_ads_report',
+  // Zoma industry benchmark (ENG-3156): insights + ad creatives reads, static benchmark table
+  'zoma_industry_benchmark',
   // Google Ads
   'call_google_ads_reporting_api',
 ]);
