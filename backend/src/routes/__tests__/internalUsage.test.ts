@@ -25,7 +25,6 @@ jest.mock('../../services/usageRecorderService', () => ({
   recordUsage: jest.fn(),
 }));
 jest.mock('../../services/tokenUsageService', () => ({
-  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
   // ENG-1251 Greptile P1: internalUsage.ts now resolves each contributing
   // actor's billing owner before recording the ledger row. Defaults to
   // "same as input" (no pooling) so every existing test in this file keeps

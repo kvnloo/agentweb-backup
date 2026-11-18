@@ -1,3 +1,4 @@
+import { writeFileSync } from 'fs';
 import { LLM_MODEL_REGISTRY, LLMModelConfig, ModelProvider } from './llmModelRegistry';
 import { MODEL_PRICING, ModelPrice, costScoreFromPrice } from '../../utils/llmPricing';
 import { REASONING_EFFORTS, ReasoningEffort, resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
@@ -132,6 +133,24 @@ export const AA_MODELS_URL = 'https://artificialanalysis.ai/api/v2/language/mode
 const AA_MAX_PAGES = 25;
 
 /**
+ * ENG-3029: when AA_FIRST_PAGE_CAPTURE_PATH is set (only by the monitor workflow), write the
+ * first response page there so a jest fixture can be cut from a real response. The file holds
+ * the parsed response body only: no request, no headers, no key. A capture problem is reported
+ * on stderr and never fails the read; stdout is the monitor's plan JSON and is left alone.
+ */
+function captureFirstPage(body: unknown, apiKey: string): void {
+  const path = process.env.AA_FIRST_PAGE_CAPTURE_PATH;
+  if (!path) return;
+  try {
+    const text = JSON.stringify(body, null, 2);
+    if (apiKey && text.includes(apiKey)) throw new Error('the response body contains the API key');
+    writeFileSync(path, text);
+  } catch (error) {
+    console.error(`artificialanalysis.ai: first page not captured: ${error instanceof Error ? error.message : 'unknown error'}`);
+  }
+}
+
+/**
  * Reads every page and returns them as one payload, keeping the feed's
  * `intelligence_index_version`. Throws on any failed or malformed page: the list ends
  * only on an explicit `has_more: false`, never on a missing pagination block.
@@ -143,6 +162,7 @@ export async function fetchArtificialAnalysisModels(apiKey: string, request: typ
     const response = await request(`${AA_MODELS_URL}?page=${page}`, { headers: { 'x-api-key': apiKey }, signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw new Error(`artificialanalysis.ai: HTTP ${response.status}`);
     const body = await response.json() as unknown;
+    if (page === 1) captureFirstPage(body, apiKey);
     data.push(...rows(body));
     if (page === 1) version = object(body)?.intelligence_index_version;
     const hasMore = object(object(body)?.pagination)?.has_more;

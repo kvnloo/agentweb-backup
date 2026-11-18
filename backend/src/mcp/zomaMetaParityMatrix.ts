@@ -50,6 +50,10 @@ const notApplicable = (category: string, source: string, metaTool: string, reaso
 const NO_PUBLIC_INSIGHTS_ENDPOINT =
   'No public Graph endpoint or field: not in the Ad Account reference (fields and edges) or the Ad Account / Campaign / Ad Set Insights references, checked 2026-11-15.';
 
+/** ENG-3056: what was checked before the six pixel rule write rows were marked not_applicable. */
+const NO_PUBLIC_PIXEL_RULE_WRITE =
+  'No public Graph write: the Ads Pixel event_rules and extractors edge references each state that creating, updating and deleting cannot be performed on the endpoint, the Ad Pixel reference lists no other rule edge, and the rule nodes (CalibratorExistingRule, SignalsIWLExtractor) have no reference page, checked 2026-11-16.';
+
 const EDITS = 'Campaign management';
 const AUDS = 'Audiences';
 const CRE = 'Creatives';
@@ -113,13 +117,13 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   same(SIG, 'ENG-2917', 'ads_get_dataset_stats'),
   covered(SIG, 'ENG-2917', 'ads_get_dataset_quality', { tool: MMA, action: 'GET_MATCH_QUALITY', entityType: 'DATASET' }),
   same(SIG, 'ENG-2917', 'ads_pixel_event_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_event_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_event_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   gap(SIG, 'ENG-2917', 'ads_pixel_parameter_read'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_create'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_update'),
-  gap(SIG, 'ENG-2917', 'ads_pixel_parameter_delete'),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_create', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_update', NO_PUBLIC_PIXEL_RULE_WRITE),
+  notApplicable(SIG, 'ENG-3056', 'ads_pixel_parameter_delete', NO_PUBLIC_PIXEL_RULE_WRITE),
   same(SIG, 'ENG-2917', 'ads_get_customconversions'),
 
   // ENG-2918 (canonical official Meta tool names)
@@ -170,7 +174,7 @@ export const ZOMA_META_PARITY_MATRIX: readonly ParityRow[] = [
   same(PG, 'ENG-2920', 'ads_get_user_pages'),
   same(PG, 'ENG-2920', 'ads_get_ig_accounts'),
   same(PG, 'ENG-2920', 'ads_get_ig_media'),
-  gap(PG, 'ENG-2920', 'ads_boost_ig_post'),
+  same(PG, 'ENG-3033', 'ads_boost_ig_post'),
   same(PG, 'ENG-2920', 'ads_library_search'),
 
   // ENG-2921
