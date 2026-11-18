@@ -258,3 +258,17 @@ export async function getPostByUrn(
         return null;
     }
 }
+/**
+ * ENG-3014: remove one stored post by its existing primary key (userId + postId).
+ * Called only after LinkedIn has confirmed the post itself is gone.
+ */
+export async function deletePost(userId: string, postId: string): Promise<void> {
+    try {
+        await dynamodb.delete({
+            TableName: LINKEDIN_POSTS_TABLE,
+            Key: { userId, postId },
+        }).promise();
+    } catch (error) {
+        handleDbError('deletePost', error);
+    }
+}
