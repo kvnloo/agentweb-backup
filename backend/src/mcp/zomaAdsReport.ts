@@ -264,3 +264,90 @@ export async function runZomaAdsReport(
   };
   return { ...report, summary: summarize(report) };
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// ENG-3133: a per-day series for the weekly email. Additive: the tool above is unchanged.
+// ---------------------------------------------------------------------------------------------
+
+export interface ZomaAdsDailyRow {
+  /** YYYY-MM-DD in the ad account's time zone (Meta's `date_start`). */
+  date: string;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  conversions: number;
+  conversion_value: number;
+}
+
+export interface ZomaAdsDaily {
+  account_id: string;
+  currency?: string;
+  conversion_event: string | null;
+  /** Only days Meta returned a row for: a day with no delivery is absent, so callers fill the gaps with zeros. */
+  rows: ZomaAdsDailyRow[];
+}
+
+const MAX_DAILY_SPAN_DAYS = 31;
+
+/**
+ * Account-level insights, one row per day, for an inclusive date window (at most 31 days). One conversion
+ * event is chosen over the whole window so two weeks inside it compare like with like.
+ */
+export async function runZomaAdsDaily(
+  account: ConnectedAccount,
+  accountId: string,
+  range: { since: string; until: string },
+  deps: ZomaAdsReportDeps = defaultDeps(),
+): Promise<ZomaAdsDaily> {
+  if (!validDate(range.since) || !validDate(range.until) || range.since > range.until) {
+    throw new MetaToolkitRefusal('since and until must be dates in YYYY-MM-DD form, with since on or before until.');
+  }
+  const days = (Date.parse(`${range.until}T00:00:00Z`) - Date.parse(`${range.since}T00:00:00Z`)) / 86_400_000 + 1;
+  if (days > MAX_DAILY_SPAN_DAYS) throw new MetaToolkitRefusal(`A daily report covers at most ${MAX_DAILY_SPAN_DAYS} days.`);
+  const token = (account.config as any)?.access_token;
+  if (typeof token !== 'string' || !token) {
+    throw new MetaToolkitRefusal('This Meta connection has no usable access token, so no report was read. Reconnect Meta with a fresh Zoma connect link (call zoma_status).');
+  }
+  const params = new URLSearchParams({
+    level: 'account',
+    fields: ['spend', 'impressions', 'clicks', 'actions', 'action_values', 'account_currency'].join(','),
+    time_increment: '1',
+    time_range: JSON.stringify(range),
+    limit: '100',
+    access_token: token,
+  });
+  const raw: any[] = [];
+  let url: string | undefined = `${deps.graphBaseUrl.replace(/\/+$/, '')}/act_${accountId}/insights?${params.toString()}`;
+  for (let page = 0; url; page++) {
+    if (page >= MAX_PAGES) throw new MetaToolkitRefusal('Meta returned more daily rows than expected. Nothing was changed; try again shortly.');
+    const res = await deps.fetch(url, { signal: AbortSignal.timeout(20000) });
+    let body: any;
+    try {
+      body = await res.json();
+    } catch {
+      throw new MetaToolkitRefusal(`Meta returned an unreadable report (HTTP ${res.status}). Nothing was changed; try again shortly.`);
+    }
+    if (!res.ok || body?.error) throw graphError(res.status, body);
+    if (!Array.isArray(body?.data)) throw new MetaToolkitRefusal('Meta returned a report without data rows. Nothing was changed; try again shortly.');
+    raw.push(...body.data);
+    url = typeof body?.paging?.next === 'string' ? body.paging.next : undefined;
+  }
+  const conversionEvent = chooseConversionEvent(raw, null);
+  const valueEvent = conversionEvent && PURCHASE_TYPES.has(conversionEvent)
+    ? conversionEvent
+    : CONVERSION_PRIORITY[0].find((type) => raw.some((r) => Array.isArray(r?.action_values) && r.action_values.some((x: any) => x?.action_type === type))) ?? null;
+  const rows: ZomaAdsDailyRow[] = raw
+    .filter((r) => typeof r?.date_start === 'string' && DATE.test(r.date_start))
+    .map((r) => ({
+      date: r.date_start,
+      spend: round(num(r.spend)),
+      impressions: Math.round(num(r.impressions)),
+      clicks: Math.round(num(r.clicks)),
+      conversions: round(conversionEvent ? actionValue(r.actions, conversionEvent) : 0, 4),
+      conversion_value: round(valueEvent ? actionValue(r.action_values, valueEvent) : 0),
+    }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+  const currency = raw.find((r) => typeof r?.account_currency === 'string')?.account_currency ?? (account.config as any)?.currency;
+  return { account_id: accountId, ...(currency ? { currency } : {}), conversion_event: conversionEvent, rows };
+}
