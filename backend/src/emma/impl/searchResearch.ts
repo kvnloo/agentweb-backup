@@ -296,7 +296,9 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
   return 'upstream_5xx';
 }
 
-/** ENG-2993: HTTP status of a failed file download (axios response, else message). */
+/** Total time one plain-URL download may take (redirects included). The guarded fetch enforces it as ONE deadline. */
+const DOWNLOAD_TIMEOUT_MS = 30000;
+
 /**
  * The guarded fetch gives a download ONE total deadline (redirects included). A host that cannot send the file in time surfaces as an
  * aborted request (axios `ERR_CANCELED`) or a timeout, and is a bad argument for this tool (a slow or huge file), not an account or config fault.
@@ -308,6 +310,7 @@ function isDownloadTimeout(error: unknown): boolean {
   return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
 }
 
+/** ENG-2993: HTTP status of a failed file download (axios response, else message). */
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
   if (typeof status === 'number') return status;
@@ -493,7 +496,7 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
 
     // Get file size limit from environment or use default (50MB)
     // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
-    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800', 10);
+    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800');
     const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
 
     // Prepare file data for analysis.
@@ -609,7 +612,7 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           tool: 'perform_data_analysis',
           userId,
           maxBytes: Math.max(maxTotalSize - totalSize, 0),
-          timeoutMs: 30000,
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
         });
 
         // Check file size
@@ -652,14 +655,14 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
             errorClass: 'invalid_args',
           };
         }
+        console.error(`Error processing file ${fileUrl}:`, error);
         if (isDownloadTimeout(error)) {
           return {
             success: false,
-            message: `Downloading ${fileUrl} did not finish within 30 seconds. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
+            message: `Downloading ${fileUrl} did not finish within the ${DOWNLOAD_TIMEOUT_MS / 1000}-second download limit. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
             errorClass: 'timeout',
           };
         }
-        console.error(`Error processing file ${fileUrl}:`, error);
         // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
         // the model passed a dead, expired, or non-public link. There is no
         // account to repair, so it must not cluster as not_found -> `config`.
