@@ -21,6 +21,8 @@ interface ClientScopedContext {
   agentUserId?: string;
   isDelegatedAccess?: boolean;
   sessionId?: string;
+  /** ENG-2816 (step 3): the caller's restriction, carried through from ctx() so mcpFetch can sign it into the self-call token. */
+  restrictionProfile?: string;
   overrideToken?: string;
   /** ENG-1557: populated only on a successful client_id resolution, so a
    * write-capable caller (manage_leads action:add) can build its own audit
