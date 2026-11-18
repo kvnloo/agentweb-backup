@@ -2,9 +2,13 @@
 
 - **What users get:** once a week, an email with each connected ad platform's last 7 complete days
   (ending yesterday, never a half-finished day) set against the 7 days before: spend, conversions, cost
-  per conversion and clicks (plus return on ad spend where Meta reports a value), each with its change
-  versus last week; a daily-spend bar chart; the top 3 campaigns by spend; and one deterministic
-  sentence about the week (only when last week gives a baseline). Charts are plain HTML table cells, so
+  per conversion, clicks, click rate and cost per click (plus return on ad spend where Meta reports a
+  value), each with its change versus last week; a daily-spend bar chart with a best/quietest-day line;
+  the top 3 campaigns by spend, each with its cost per conversion and a cheapest-vs-dearest line; up to
+  three plain "worth a look" flags (spend with no conversions all week, spend that stopped for the last
+  2+ days, a top campaign that spent with no conversions); and one deterministic sentence about the
+  week (only when last week gives a baseline). Nothing is guessed: no benchmarks, no causes. A note says
+  recent conversions can still go up (platforms credit them for days after a click). Charts are plain HTML table cells, so
   they render with images off and need no hosting; the text part carries the same numbers. Platforms
   are never added together (currencies can differ). Then what Zoma did: changes made, each with its
   read-back verdict, and the successful call count. A connected account with no delivery says so; one
@@ -15,8 +19,12 @@
   additive in `mcp/zomaAdsReport.ts`; the tool surface is unchanged) plus a campaign-level report for
   the ranking. Google Ads: a daily GAQL on `customer` and a top-3 GAQL on `campaign`, cost micros
   converted to currency units. Both platforms omit days with no delivery, so missing days are
-  zero-filled. A failed campaign ranking drops only that block. The report covers the account Zoma
-  itself works on (the first usable one).
+  zero-filled. A failed campaign ranking drops only that block. Every usable ad account of a platform
+  (up to 3) is read, because Zoma itself picks one by spend (Meta) or refuses as ambiguous (Google):
+  accounts in the same currency are added together (return on ad spend is then dropped), the currency
+  with most accounts is shown, and the rest are counted in a "Not included here" line. "No delivery" is
+  only said when every account was read and none delivered. The Google section appears only while
+  `ZOMA_GOOGLE_ADS_ENABLED` is on (the same flag as the Google toolkit).
 - **Who:** every Zoma user (scoreboard list) who is not an internal/test/admin account or a "pal" lead,
   has not unsubscribed, and made at least one successful call to the Zoma toolkit in the last 7 days
   (Emma's own MCP calls, which share the event type, are filtered out by `product`). Nobody else.
@@ -25,8 +33,10 @@
 - **When:** an hourly job (`ZomaWeeklyReport`, first pass 11 minutes after boot) that acts only inside
   the send window: `ZOMA_WEEKLY_REPORT_WEEKDAY` (default 1 = Monday, UTC) from
   `ZOMA_WEEKLY_REPORT_HOUR` (default 15, UTC) to the end of that day. A no-op unless
-  `ZOMA_WEEKLY_REPORT_ENABLED=true`. `ZOMA_WEEKLY_REPORT_MAX_PER_PASS` (default 200) caps one pass and
-  logs when it is hit. Usage for all users is ONE range query per pass, grouped in memory.
+  `ZOMA_WEEKLY_REPORT_ENABLED=true`. The hour cannot be set earlier than 12:00 UTC (by then every ad
+  account time zone has finished the Sunday the report ends on). `ZOMA_WEEKLY_REPORT_MAX_PER_PASS`
+  (default 200) caps one pass and logs when it is hit. A pass stops after 3 sends in a row fail, so a
+  mail outage cannot burn the week for everyone. Usage for all users is ONE range query per pass, grouped in memory.
 - **Exactly once per user per ISO week, across instances:** a conditional write claims
   (user, ISO week) BEFORE the send; the email is built before the claim so a build failure cannot burn
   the week. A failed send is logged and not retried that week. A transient failure reading an ad
@@ -40,8 +50,9 @@
   `dripUnsubscribed` and `slackShipNotifyDisabled`). The users table has point-in-time recovery, the
   attribute is already on the row the job scans, and it travels with the account. The job checks the scan
   row, then re-reads the user consistently right before the claim and sends to the address read then;
-  an account that cannot be resolved is not emailed. The link is signed (HMAC of the user id with the JWT
-  secret, like the CRM unsubscribe links); `GET /api/zoma/weekly-report/unsubscribe?t=...` shows a
+  an account that cannot be resolved is not emailed. The link (a token derived from the JWT
+  secret) is opaque: AES-256-GCM over the user id, so no internal id is visible in the link and any
+  change is rejected; `GET /api/zoma/weekly-report/unsubscribe?t=...` shows a
   confirm button and changes nothing, `POST` sets the attribute with a partial update of that one user
   (an unknown user creates nothing). The email also carries `List-Unsubscribe` and
   `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (new optional `headers` argument on
@@ -53,6 +64,9 @@
   `queryByLoopIdTsRangeAll` does the one all-users range read). No new table, index or key. Harsha to
   confirm this is outside the data-plane gate (the user-record attribute is a model change).
 - **Known limits:** a user who deletes the account and signs up again loses the opt-out (an
-  email-keyed suppression table would fix that; it is a new table, so out of scope here). A user with
-  several ad accounts gets the one Zoma works on.
+  email-keyed suppression table would fix that; it is a new table, so out of scope here). The candidate
+  list is the scoreboard's Zoma-user list, so a caller whose `products.zoma` flag was never written is
+  not emailed. A write whose own bookkeeping failed is not in the changes count, so the wording says
+  "recorded", not "made". If the mail provider is down for the first three sends of a pass, those three
+  users' week is spent (a missed weekly email was judged cheaper than a duplicate).
 - **Rollback:** leave `ZOMA_WEEKLY_REPORT_ENABLED` unset.
