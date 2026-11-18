@@ -204,11 +204,11 @@ describe('ENG-2959 shape rules', () => {
 });
 
 describe('ENG-2959 key scope', () => {
-  const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
-  beforeEach(() => { process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true'; });
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
+  beforeEach(() => { process.env.ZOMA_GOOGLE_ENABLED = 'true'; });
   afterAll(() => {
-    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prev;
   });
 
   it.each([
