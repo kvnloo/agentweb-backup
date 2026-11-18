@@ -6812,11 +6812,16 @@ function provenancePlanForWrite(visitorWrite: boolean, fields: string[]) {
  * succeeded and does not await it; this function itself never throws and never blocks (everything that waits is inside the
  * detached promise, whose every failure is only logged under the [ENG-3149] prefix). The recipient is the account owner and only
  * the owner: the request's own user (the schedule's owner, since each handler has already checked the schedule belongs to them),
- * with the stored login email looked up only when the request does not carry one; no email means skip. At most a few a
- * rolling hour per owner (see utils/shareScheduleAlertThrottle); beyond that the badge is all the owner gets.
+ * with the stored login email looked up only when the request does not carry one; no email means skip. At most 5 an hour and 15 a
+ * day per owner (see utils/shareScheduleAlertThrottle); beyond that the badge is all the owner gets. A marked run's own write
+ * never alerts (see the first check below).
  */
 function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: string; scheduleName: unknown }): void {
   try {
+    // A MARKED RUN's own write (its self-calls carry the share_visitor_schedule claim) is not a visitor at the keyboard: a run of an
+    // already-flagged schedule that creates schedules each time it runs would otherwise mail the owner on every run, for a
+    // schedule that has already alerted. A real visitor turn (claim share_visitor, or the turn marker with no claim) still alerts.
+    if ((req as AuthenticatedRequest).restrictionProfile === SHARE_VISITOR_SCHEDULE_PROFILE) return;
     const owner = req.user as User | undefined;
     const ownerUserId = owner?.userId;
     if (!ownerUserId) return;
@@ -6831,11 +6836,12 @@ function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: str
         const decision = shareScheduleAlertThrottle.tryAcquire(ownerUserId);
         if (!decision.allowed) {
           if (decision.firstBlock) {
-            console.warn(`[ENG-3149] visitor schedule alert for owner ${ownerUserId} skipped: the hourly cap was reached (the schedule still shows the Visitor-edited badge)`);
+            console.warn(`[ENG-3149] visitor schedule alert for owner ${ownerUserId} skipped: the ${decision.limit === 'day' ? 'daily' : 'hourly'} cap was reached (the schedule still shows the Visitor-edited badge)`);
           }
           return;
         }
-        await emailService.sendVisitorScheduleAlertEmail(to, String(schedule.scheduleName ?? ''), schedule.scheduleId);
+        // Only a real string is shown: anything else (an object with its own toString, say) is not coerced, and reads as "Untitled".
+        await emailService.sendVisitorScheduleAlertEmail(to, typeof schedule.scheduleName === 'string' ? schedule.scheduleName : '', schedule.scheduleId);
       } catch (error) {
         console.error(`[ENG-3149] visitor schedule alert for schedule ${schedule.scheduleId} failed:`, error);
       }
