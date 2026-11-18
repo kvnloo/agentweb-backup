@@ -3,10 +3,13 @@
 - **What users get:** once a week, an email with each connected ad platform's last 7 complete days
   (ending yesterday, never a half-finished day) set against the 7 days before: spend, conversions, cost
   per conversion, clicks, click rate and cost per click (plus return on ad spend where Meta reports a
-  value), each with its change versus last week; a daily-spend bar chart with a best/quietest-day line;
+  value), each with its change versus last week; a daily-spend bar chart with a most-conversions /
+  quiet-days line (a tie is never turned into a winner);
   the top 3 campaigns by spend, each with its cost per conversion and a cheapest-vs-dearest line; up to
   three plain "worth a look" flags (spend with no conversions all week, spend that stopped for the last
-  2+ days, a top campaign that spent with no conversions); and one deterministic sentence about the
+  2+ days, a top campaign that spent with no conversions; Meta flags name the one conversion event the
+  account counts, and say nothing about single campaigns when that event is mixed); and one
+  deterministic sentence about the
   week (only when last week gives a baseline). Nothing is guessed: no benchmarks, no causes. A note says
   recent conversions can still go up (platforms credit them for days after a click). Charts are plain HTML table cells, so
   they render with images off and need no hosting; the text part carries the same numbers. Platforms
@@ -20,10 +23,11 @@
   the ranking. Google Ads: a daily GAQL on `customer` and a top-3 GAQL on `campaign`, cost micros
   converted to currency units. Both platforms omit days with no delivery, so missing days are
   zero-filled. A failed campaign ranking drops only that block. Every usable ad account of a platform
-  (up to 3) is read, because Zoma itself picks one by spend (Meta) or refuses as ambiguous (Google):
-  accounts in the same currency are added together (return on ad spend is then dropped), the currency
-  with most accounts is shown, and the rest are counted in a "Not included here" line. "No delivery" is
-  only said when every account was read and none delivered. The Google section appears only while
+  (up to 5, each stored account read once) is read, because Zoma itself picks one by spend (Meta) or
+  refuses as ambiguous (Google): accounts in the same currency are added together (return on ad spend
+  is then dropped), the currency with most accounts is shown, and the rest are counted in a "Not
+  included here" line. "No delivery" is only said when every account was read and none delivered;
+  accounts beyond the limit are "not checked" and never turn a result into "could not read". The Google section appears only while
   `ZOMA_GOOGLE_ADS_ENABLED` is on (the same flag as the Google toolkit).
 - **Who:** every Zoma user (scoreboard list) who is not an internal/test/admin account or a "pal" lead,
   has not unsubscribed, and made at least one successful call to the Zoma toolkit in the last 7 days
