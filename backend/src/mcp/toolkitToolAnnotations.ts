@@ -115,6 +115,10 @@ const EXPLICIT_ANNOTATIONS: Readonly<Record<string, ToolkitToolAnnotations>> = O
   zoma_status: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   // Mints a one-time presigned upload URL under the caller's own prefix.
   zoma_prepare_upload: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // ENG-3155: reads Meta insights and CRM data; its only write is the hosted copy of the report itself.
+  zoma_measurement_report: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  // ENG-3155: changes only Zoma's own report-email schedule, never the ads.
+  zoma_report_schedule: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 });
 
 /** Annotations for one tool name. Always returns a fresh object; never throws. */
