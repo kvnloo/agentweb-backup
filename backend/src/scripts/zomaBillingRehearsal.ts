@@ -314,6 +314,7 @@ async function main() {
 
     log('\n=== 9. Webhook events pulled from Stripe, replayed through the production controller');
     const { handleWebhook } = await import('../controllers/stripeController');
+    process.env.ZOMA_REFERRAL_ENABLED = 'false'; // replay must never write the real referral ledger (ENG-3132)
     const types = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'invoice.created', 'invoice.finalized', 'invoice.paid', 'invoice.payment_succeeded'];
     const events = (await stripe.events.list({ types, created: { gte: startedAt }, limit: 100 } as any).autoPagingToArray({ limit: 500 }))
       .filter((e: any) => e.data.object.customer === customer.id).reverse();
