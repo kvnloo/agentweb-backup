@@ -13,7 +13,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 jest.mock('../services/socialPlatformService', () => ({ socialPlatformService: { getAdapter: jest.fn() } }));
 jest.mock('../services/linkedInPostsDb', () => ({ getPostsByAccount: jest.fn() }));
 
-import { postOnConnectedAccount } from '../emma/impl/linkedin';
+import { postOnConnectedAccount, __resetDuplicateCaptionRefusalsForTest } from '../emma/impl/linkedin';
 import { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 import { getPostsByAccount } from '../services/linkedInPostsDb';
@@ -28,6 +28,7 @@ describe('ENG-3015 duplicate-caption guard', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    __resetDuplicateCaptionRefusalsForTest();
     (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([account]);
     (getAccountByIdConsistent as jest.Mock).mockResolvedValue(account);
     (socialPlatformService.getAdapter as jest.Mock).mockReturnValue({ createPost });
@@ -59,12 +60,39 @@ describe('ENG-3015 duplicate-caption guard', () => {
     expect(createPost).not.toHaveBeenCalled();
   });
 
-  it('proceeds when the user confirmed (guard not requested)', async () => {
+  it('Opslane P1: a confirm in the SAME run as the refusal is refused (model cannot self-confirm)', async () => {
     (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
-    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, undefined, {});
+    const ctx = { sessionId: 's1', currentRunId: 'run-1' };
+    await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, ctx, { duplicateCaptionGuard: true });
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, ctx, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
+    expect(r).toMatchObject({ success: false, duplicate_caption: true, awaitingUserConfirmation: true });
+    expect(createPost).not.toHaveBeenCalled();
+  });
+
+  it('a confirm with no prior refusal (fabricated flag) is refused', async () => {
+    (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-1' }, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
+    expect(r.success).toBe(false);
+    expect(createPost).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when the user confirms in a later run, exactly once', async () => {
+    (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
+    await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-1' }, { duplicateCaptionGuard: true });
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-2' }, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
     expect(r.success).toBe(true);
     expect(createPost).toHaveBeenCalledTimes(1);
-    expect(getPostsByAccount).not.toHaveBeenCalled();
+    const again = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-2' }, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
+    expect(again.success).toBe(false);
+    expect(createPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unattended run never honours a confirm, even after an earlier refusal', async () => {
+    (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
+    await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-1' }, { duplicateCaptionGuard: true });
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { sessionId: 's1', currentRunId: 'run-2', isUnattendedRun: true }, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
+    expect(r.success).toBe(false);
+    expect(createPost).not.toHaveBeenCalled();
   });
 
   it('proceeds when no stored caption matches', async () => {

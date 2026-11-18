@@ -4540,7 +4540,7 @@ emmaToolRegistry.register({
         },
         in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
         save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' },
-        confirm_duplicate_caption: { type: 'boolean', description: 'LinkedIn only. Set true only after the user confirms publishing a caption the tool reported as already live (duplicate_caption: true).' }
+        confirm_duplicate_caption: { type: 'boolean', description: 'LinkedIn only. Set true only when the user, in a NEW message after the duplicate_caption refusal, confirmed publishing the same caption again. A confirm in the same turn as the refusal, or in a scheduled run, is refused.' }
       },
       required: ['content']
     }
@@ -4552,8 +4552,9 @@ emmaToolRegistry.register({
     return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, {
       ...(args.save_as_draft === true ? { saveAsDraft: true } : {}),
       ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}),
-      // An unattended run cannot hold a user's confirmation, so the flag is ignored there.
-      ...(args.confirm_duplicate_caption === true && context?.isUnattendedRun !== true ? {} : { duplicateCaptionGuard: true }),
+      // The guard always runs; a confirm is honoured only across a user turn (see linkedin.ts).
+      duplicateCaptionGuard: true,
+      ...(args.confirm_duplicate_caption === true ? { confirmDuplicateCaption: true } : {}),
     });
   }
 });

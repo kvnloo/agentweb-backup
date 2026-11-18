@@ -435,7 +435,26 @@ export async function findLiveDuplicateCaption(accountId: string, content: strin
   }
 }
 
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean }): Promise<any> {
+/**
+ * ENG-3015 (Opslane P1 on c944dd2): the model could self-confirm a duplicate caption
+ * in the same turn. A confirm is honoured only when THIS session was refused for the
+ * same account+caption in an EARLIER run (the user answered in a new message). Same
+ * run, no run id, or no recorded refusal (e.g. after a restart) fails closed and
+ * re-asks. Process-local; a lost record only costs one extra confirmation.
+ */
+const duplicateCaptionRefusals = new Map<string, { runId: string; at: number }>();
+const DUPLICATE_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function duplicateRefusalKey(toolContext: any, accountId: string, content: string): string | null {
+  const sessionId = typeof toolContext?.sessionId === 'string' ? toolContext.sessionId : '';
+  return sessionId ? `${sessionId}|${accountId}|${normalizeCaption(content)}` : null;
+}
+
+export function __resetDuplicateCaptionRefusalsForTest(): void {
+  duplicateCaptionRefusals.clear();
+}
+
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean; confirmDuplicateCaption?: boolean }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -555,21 +574,31 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     if (options?.duplicateCaptionGuard === true && account.platform === 'linkedin' && !saveAsDraft) {
       const existing = await findLiveDuplicateCaption(account.account_id, content);
       if (existing) {
-        // Opslane P1 / CodeRabbit: an interactive refusal halts the turn
-        // (awaitingUserConfirmation) so the model cannot self-confirm in the same
-        // reply. An unattended run has nobody to ask: it reports the refusal as its
-        // outcome and never publishes the duplicate (tools.ts ignores the confirm flag there).
         const unattended = toolContext?.isUnattendedRun === true;
-        const message = unattended
-          ? `Not posted: this caption is already live on this LinkedIn account (${existing}). Scheduled runs never re-publish a live caption.`
-          : `Not posted: this caption is already live on this LinkedIn account (${existing}). Ask the user whether to publish it again; only after they confirm in a new message, re-call with confirm_duplicate_caption=true.`;
-        return {
-          success: false,
-          duplicate_caption: true,
-          existing_post_urn: existing,
-          message,
-          ...(unattended ? {} : { awaitingUserConfirmation: true, confirmationPrompt: `This caption is already live on this LinkedIn account (${existing}). Post it again?` }),
-        };
+        const runId = typeof toolContext?.currentRunId === 'string' ? toolContext.currentRunId : '';
+        const key = duplicateRefusalKey(toolContext, account.account_id, content);
+        const prior = key ? duplicateCaptionRefusals.get(key) : undefined;
+        const confirmed = options?.confirmDuplicateCaption === true && !unattended && !!runId && !!prior
+          && prior.runId !== runId && Date.now() - prior.at < DUPLICATE_REFUSAL_TTL_MS;
+        if (confirmed && key) {
+          duplicateCaptionRefusals.delete(key);
+        } else {
+          // Refusal halts an interactive turn (awaitingUserConfirmation); an unattended
+          // run has nobody to ask, so it reports the refusal and never re-publishes.
+          if (key && !unattended && runId && (!prior || prior.runId !== runId)) {
+            duplicateCaptionRefusals.set(key, { runId, at: Date.now() });
+          }
+          const message = unattended
+            ? `Not posted: this caption is already live on this LinkedIn account (${existing}). Scheduled runs never re-publish a live caption.`
+            : `Not posted: this caption is already live on this LinkedIn account (${existing}). Ask the user whether to publish it again and stop; a re-publish works only after the user confirms in a new message.`;
+          return {
+            success: false,
+            duplicate_caption: true,
+            existing_post_urn: existing,
+            message,
+            ...(unattended ? {} : { awaitingUserConfirmation: true, confirmationPrompt: `This caption is already live on this LinkedIn account (${existing}). Post it again?` }),
+          };
+        }
       }
     }
     console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
