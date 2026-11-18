@@ -71,14 +71,20 @@ export function findBasePlanItem(
   const items = subscription.items.data;
   if (items.length <= 1) return items[0];
 
-  const seatProductId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
-  if (!seatProductId) return items[0];
+  // Add-on products that can sit next to the plan item: extra seats and the hot lead calls add-on (ENG-2783).
+  // The add-on item is created from price_data, so its price id is never a plan price: picking it as the plan
+  // would derive the wrong tier and make a plan change overwrite the add-on's price.
+  const addOnProductIds = [process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID, process.env.STRIPE_HOT_LEAD_CALL_PRODUCT_ID]
+    .filter((id): id is string => !!id);
+  if (addOnProductIds.length === 0) return items[0];
 
-  const seatItem = findSeatLineItem(subscription, seatProductId);
-  if (!seatItem) return items[0];
-
-  const nonSeatItems = items.filter((item) => item.id !== seatItem.id);
-  return nonSeatItems[0] ?? items[0];
+  const isAddOn = (item: Stripe.SubscriptionItem): boolean => {
+    const product = item.price?.product;
+    const id = typeof product === 'string' ? product : product?.id;
+    return !!id && addOnProductIds.includes(id);
+  };
+  const planItems = items.filter((item) => !isAddOn(item));
+  return planItems[0] ?? items[0];
 }
 
 /**
@@ -975,13 +981,7 @@ export async function syncSubscriptionFromStripe(
 
     // Derive tier from price if available.
     //
-    // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
-    // seat-billing (ENG-2243..2246) correctness review as low-risk, since a
-    // wrong read here just skips an additive-only tier backfill rather than
-    // corrupting billing state. Don't copy this pattern elsewhere: see
-    // findBasePlanItem's doc comment for why position-based lookup breaks
-    // once a seat item can coexist on the same subscription.
-    const priceId = sub.items?.data?.[0]?.price?.id;
+    const priceId = findBasePlanItem(sub)?.price?.id;
     if (priceId) {
       const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
       if (derivedType) {
@@ -1533,14 +1533,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 
           // Derive tier from the remaining subscription's price.
           //
-          // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone
-          // by the seat-billing (ENG-2243..2246) correctness review as
-          // low-risk: this only sets subscriptionType/allowedPages, and a
-          // seat item sorting first here would just skip that sync rather
-          // than corrupt billing state. See findBasePlanItem's doc comment
-          // for why position-based lookup is otherwise unsafe once a seat
-          // item can coexist on the same subscription.
-          const priceId = activeSub.items?.data?.[0]?.price?.id;
+          const priceId = findBasePlanItem(activeSub)?.price?.id;
           if (priceId) {
             const newType = deriveSubscriptionTypeFromPriceId(priceId);
             if (newType) {
@@ -2364,14 +2357,7 @@ export async function reconcileStripeUser(
 
   // Derive tier.
   //
-  // NOTE: still `items.data[0]`, not `findBasePlanItem`. Same hazard class as
-  // syncSubscriptionFromStripe above (not one of the sites the seat-billing
-  // ENG-2243..2246 correctness review named, but identical in kind): a seat
-  // item sorting first here would just leave this admin-triggered
-  // reconciliation skipping a tier overwrite rather than corrupting billing
-  // state. See findBasePlanItem's doc comment before reusing this pattern
-  // anywhere a subscription's items can include a seat line item.
-  const priceId = sub.items?.data?.[0]?.price?.id;
+  const priceId = findBasePlanItem(sub)?.price?.id;
   const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
 
   // Build updates only for fields that are wrong

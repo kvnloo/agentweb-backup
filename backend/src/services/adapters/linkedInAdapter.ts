@@ -1,4 +1,5 @@
 import { linkedInService } from '../linkedInService';
+import { isVideoUrl, isVideoUrn, LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_ALONE_MESSAGE } from '../linkedInMedia';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { isPublishConsentWithdrawn, PublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
@@ -170,29 +171,40 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
-
+    // A LinkedIn post carries one video or images, never both. Refuse an obvious mix before uploading anything.
+    if ((mediaUrls || []).length > 1 && (mediaUrls || []).some(isVideoUrl)) {
+      return { success: false, message: LINKEDIN_VIDEO_ALONE_MESSAGE };
+    }
 
     try {
       // Get valid token (refreshes if expired)
       const { token, isFresh } = await this.getValidToken(account, userId);
 
-      // Upload images if provided - track failures for transparency
+      // Every attachment must upload: a post published without the media the caller approved cannot be taken back.
       let imageUrns: string[] = [];
-      let failedImageUploads: { url: string; error: string }[] = [];
-      
+
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
-            const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadImageFromUrl(token, authorUrn, url));
+            const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadMediaFromUrl(token, authorUrn, url));
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
-            // The same token will be refused for the post itself; do not publish it without the image.
             if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
+            if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
+            // Auth and rate-limit failures keep their class (reconnect / retry-later) via the outer catch; the post is not created either way.
+            if (isLinkedIn401(uploadError) || uploadError?.response?.status === 429 || /rate limit exceeded/i.test(uploadError?.message || '')) throw uploadError;
             const errorMsg = uploadError?.message || 'Unknown upload error';
-            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
-            failedImageUploads.push({ url, error: errorMsg });
+            console.error(`[LinkedInAdapter] Failed to upload media ${url}:`, errorMsg);
+            const what = uploadError?.isVideoUpload || isVideoUrl(url) ? 'video' : 'image';
+            return { success: false, message: `The ${what} failed to upload to LinkedIn (${errorMsg}). Nothing was posted.` };
           }
         }
+      }
+
+      // The mix check above only sees file extensions; an extensionless video is known by now.
+      const hasVideo = imageUrns.some(isVideoUrn);
+      if (hasVideo && (mediaUrls || []).length > 1) {
+        return { success: false, message: LINKEDIN_VIDEO_ALONE_MESSAGE };
       }
 
       // ENG-827: the image uploads above are network round-trips that can take a
@@ -240,18 +252,14 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Build result with optional warning for failed uploads
       const result: PostResult = {
         success: true,
-        message: imageUrns.length > 0
-          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
-          : 'Posted successfully on LinkedIn',
+        message: hasVideo
+          ? 'Posted successfully on LinkedIn with 1 video'
+          : imageUrns.length > 0
+            ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
+            : 'Posted successfully on LinkedIn',
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };
-      
-      // Add warning if some images failed to upload
-      if (failedImageUploads.length > 0) {
-        result.warning = `${failedImageUploads.length} image(s) failed to upload: ${failedImageUploads.map(f => f.url).join(', ')}`;
-        result.failedUploads = failedImageUploads;
-      }
       
       return result;
     } catch (error: any) {
@@ -263,7 +271,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         return { success: false, message: error.message };
       }
       // Rate limit handling
-      if (error.response?.status === 429) {
+      if (error.response?.status === 429 || /rate limit exceeded/i.test(error?.message || '')) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (isLinkedIn401(error)) {

@@ -257,6 +257,11 @@ router.use(authenticateToken);
 // sub-router so they can be unit-tested without mocking all of crm.ts.
 import enrichSoSubRouter from './crmEnrichSo';
 import { validateLeadEmailInBackground, validateLeadsInBackground } from '../services/enrichSoLeadValidation';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
+
+/** ENG-2996: enrich.so validated this lead's email as deliverable. */
+const isValidatedDeliverable = (lead: any): boolean => lead?.customFields?.email_validation?.status === 'deliverable';
+
 router.use(enrichSoSubRouter);
 
 // Apollo people-enrichment routes (lookup-by-linkedin, reveal-phone, bulk
@@ -2398,6 +2403,12 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
 
+    // ENG-2996: inherit the owner's do-not-contact flags (awaited, before any
+    // sequence enrolment) and validate the new emails in the background.
+    const followups = await applyLeadImportFollowups(listId, list.userId, result.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
+
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -2410,6 +2421,8 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       // nor merged, so without this the caller sees an unexplained gap between
       // `total` and what it can account for.
       anonymizedSkipped: result.anonymizedSkipped || 0,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: result.errors,
       total: leads.length,
     });
@@ -3463,6 +3476,11 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
 
+    // ENG-2996: same import follow-ups as bulk-import (DNC inheritance + validation).
+    const followups = await applyLeadImportFollowups(listId, list.userId, results.created ?? [], {
+      actingUserId: userId, validate: !suppressLeadSideEffects(list),
+    });
+
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
@@ -3495,6 +3513,8 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       // otherwise the row count the user uploaded silently exceeds every
       // number reported back.
       anonymizedSkipped: csvAnonymizedSkipped,
+      inheritedDoNotContact: followups.inheritedDoNotContact.length,
+      doNotContactCheckFailed: followups.doNotContactCheckFailed,
       errors: results.errors,
       message: `Imported ${results.successCount} leads`
         + (csvAlreadyPresent > 0 ? `, ${csvAlreadyPresent} already present and up to date` : '')
@@ -4043,6 +4063,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       const leadBatchSize = 100;
       let connectionsAnonymizedSkipped = 0;
+      const connectionsCreated: Array<{ leadId: string; email?: string }> = [];
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
@@ -4054,6 +4075,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         // error, so they must be carried separately or the connection count
         // the user sees silently under-reports what was submitted.
         connectionsAnonymizedSkipped += results.anonymizedSkipped || 0;
+        connectionsCreated.push(...(results.created ?? []));
         if (results.errors.length > 0) {
           connectionsErrors.push(...results.errors);
         }
@@ -4066,6 +4088,11 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       // Emit final progress
       emitProgress('Import complete!', 100);
 
+      // ENG-2996: same import follow-ups as bulk/CSV import (DNC inheritance + validation).
+      const followups = await applyLeadImportFollowups(listId, list.userId, connectionsCreated, {
+        actingUserId: userId, validate: !suppressLeadSideEffects(list),
+      });
+
       if (connectionsSuccessCount > 0) {
         void autoEnrollListIntoSequences(userId, listId);
       }
@@ -4075,6 +4102,8 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         successCount: connectionsSuccessCount,
         errorCount: connectionsErrorCount,
         anonymizedSkipped: connectionsAnonymizedSkipped,
+        inheritedDoNotContact: followups.inheritedDoNotContact.length,
+        doNotContactCheckFailed: followups.doNotContactCheckFailed,
         errors: connectionsErrors,
         messagesImported: messagesSuccessCount,
         message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`
@@ -7032,7 +7061,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { leadIds } = req.body;
+    const { leadIds, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -7077,9 +7106,12 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // ENG-673: a lead pushed to a customer's Smartlead campaign is emailed from there, so AgentWeb's own group email leaves it out (send, preview
     // and prepare all apply the same rule, or the preview would promise recipients the send does not make).
     const smartlead = leads.filter((l: any) => l.email && !isDoNotContact(l) && isPushedToSmartlead(l)).length;
-    const eligibleLeads = leads.filter((l: any) =>
+    const sendable = leads.filter((l: any) =>
       l.email && !isDoNotContact(l) && !isPushedToSmartlead(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
-    ).length;
+    );
+    // ENG-2996: mirrors the send's opt-in excludeUnvalidated filter.
+    const unvalidatedCount = excludeUnvalidated === true ? sendable.filter((l: any) => !isValidatedDeliverable(l)).length : 0;
+    const eligibleLeads = sendable.length - unvalidatedCount;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
@@ -7098,6 +7130,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       undeliverableCount,
       riskyCount,
       invalidCount,
+      ...(excludeUnvalidated === true ? { unvalidatedCount } : {}),
       undeliverableEmails,
       riskyEmails,
       invalidEmails,
@@ -7197,6 +7230,35 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     return res.status(500).json({ message: 'Failed to prepare group email' });
   }
 });
+
+// ENG-3076: builds one recipient's group email (variables, signed unsubscribe link + footer,
+// RFC 8058 one-click headers). Both send paths in group-email/send call this.
+// Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in routes/crmPublic.ts
+// accepts the legacy unsigned form as a fallback for emails sent before signing.
+export function buildGroupEmailRecipientMessage(
+  lead: any,
+  opts: {
+    listId: string;
+    subject: string;
+    html: string;
+    textContent?: string;
+    unsubscribeFooterHtml?: string;
+    customerFrontendUrl: string;
+    backendPublicUrl: string;
+  },
+): { to: string; subject: string; html: string; text?: string; headers: Record<string, string> } {
+  const ids = { listId: opts.listId, leadId: lead.leadId, email: lead.email };
+  const unsubscribeUrl = signUnsubscribeUrl({ baseUrl: opts.customerFrontendUrl, ...ids });
+  const html = injectUnsubscribeUrl(substituteVariables(opts.html, lead), unsubscribeUrl, opts.unsubscribeFooterHtml);
+  const oneClickUrl = signOneClickUnsubscribeUrl({ baseUrl: opts.backendPublicUrl, ...ids });
+  return {
+    to: lead.email,
+    subject: substituteVariables(opts.subject, lead),
+    html,
+    text: opts.textContent ? substituteVariables(opts.textContent, lead) : undefined,
+    headers: listUnsubscribeHeaders(oneClickUrl),
+  };
+}
 
 // ENG-2929: mailbox sends above this many leads run in the background (see group-email/send).
 const MAILBOX_SYNC_LEAD_LIMIT = 50;
@@ -7373,7 +7435,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
+    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails, excludeUnvalidated } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -7453,6 +7515,16 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedUndeliverable = beforeCount - eligibleLeads.length;
     }
 
+    // ENG-2996: opt-in — send only to addresses enrich.so validated as
+    // deliverable (never-validated, unknown and risky are left out and counted).
+    // Default (flag absent) is unchanged.
+    let skippedUnvalidated = 0;
+    if (excludeUnvalidated === true) {
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter(isValidatedDeliverable);
+      skippedUnvalidated = beforeCount - eligibleLeads.length;
+    }
+
     // Apply dark-mode fix once before per-lead substitution.
     const sendHtml = injectColorSchemeMeta(htmlContent || '');
 
@@ -7472,6 +7544,18 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
     const BACKEND_PUBLIC_URL = process.env.BACKEND_URL || 'https://api.agentweb.pro';
+    // ENG-3076: one builder for both the background mailbox run and the in-request loop,
+    // so a recipient's unsubscribe link and headers never depend on list size or sender type.
+    const buildRecipientMessage = (lead: any) =>
+      buildGroupEmailRecipientMessage(lead, {
+        listId,
+        subject,
+        html: sendHtml,
+        textContent,
+        unsubscribeFooterHtml,
+        customerFrontendUrl: CUSTOMER_FRONTEND_URL,
+        backendPublicUrl: BACKEND_PUBLIC_URL,
+      });
 
     // ENG-266 Part 3 / ENG-2929: a mailbox send (Gmail/Graph) budgets ~600ms/send, so more
     // than MAILBOX_SYNC_LEAD_LIMIT leads would outlive the 60s ALB timeout inside one request.
@@ -7494,6 +7578,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         skippedSmartlead,
         skippedMissingVars,
         skippedUndeliverable,
+        ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
         skippedInvalid,
         skippedNoEmail,
       };
@@ -7507,19 +7592,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         unsubscribeFooterHtml,
         socketId,
         leads: eligibleLeads,
-        buildMessage: (lead: any) => {
-          let personalizedHtml = substituteVariables(sendHtml, lead);
-          const unsubscribeUrl = signUnsubscribeUrl({ baseUrl: CUSTOMER_FRONTEND_URL, listId, leadId: lead.leadId, email: lead.email });
-          personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
-          const oneClickUrl = signOneClickUnsubscribeUrl({ baseUrl: BACKEND_PUBLIC_URL, listId, leadId: lead.leadId, email: lead.email });
-          return {
-            to: lead.email,
-            subject: substituteVariables(subject, lead),
-            html: personalizedHtml,
-            text: textContent ? substituteVariables(textContent, lead) : undefined,
-            headers: listUnsubscribeHeaders(oneClickUrl),
-          };
-        },
+        buildMessage: buildRecipientMessage,
       });
       if (!started.ok) {
         return res.status(409).json({ message: started.message, code: 'GROUP_EMAIL_ALREADY_SENDING' });
@@ -7559,37 +7632,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     for (let i = 0; i < eligibleLeads.length; i++) {
       const lead = eligibleLeads[i];
       try {
-        // Substitute variables in subject and content
-        const personalizedSubject = substituteVariables(subject, lead);
-        let personalizedHtml = substituteVariables(sendHtml, lead);
-        const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
-
-        // Inject unsubscribe URL — updates existing link or appends footer if none found
-        // Signed URL — see backend/src/utils/unsubscribeUrl.ts. Verifier in
-        // routes/crmPublic.ts accepts the legacy unsigned form as a fallback
-        // for emails sent before this change.
-        const unsubscribeUrl = signUnsubscribeUrl({
-          baseUrl: CUSTOMER_FRONTEND_URL,
-          listId,
-          leadId: lead.leadId,
-          email: lead.email,
-        });
-        personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
-        // ENG-2367: RFC 8058 one-click header, same signature, backend POST target.
-        const oneClickUrl = signOneClickUnsubscribeUrl({
-          baseUrl: BACKEND_PUBLIC_URL,
-          listId,
-          leadId: lead.leadId,
-          email: lead.email,
-        });
-
-        await sendAsSender(userId, sender, {
-          to: lead.email,
-          subject: personalizedSubject,
-          html: personalizedHtml,
-          text: personalizedText,
-          headers: listUnsubscribeHeaders(oneClickUrl),
-        });
+        await sendAsSender(userId, sender, buildRecipientMessage(lead));
         sent++;
       } catch (err: any) {
         if (err instanceof SenderDailyLimitExceededError) {
@@ -7665,6 +7708,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedSmartlead,
       skippedMissingVars,
       skippedUndeliverable,
+      ...(excludeUnvalidated === true ? { skippedUnvalidated } : {}),
       skippedInvalid,
       skippedNoEmail,
       skippedDueToLimit,

@@ -62,9 +62,13 @@ const call = (params: any) =>
 
 describe('ENG-2575 CREATIVE UPDATE', () => {
   it('archives a creative via PARTIAL_UPDATE of intendedStatus (the prod-failing call)', async () => {
+    // ENG-3064: the update is read back, so the second request is the GET of the creative.
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, status: 204 })
+      .mockResolvedValueOnce({ data: { intendedStatus: 'ARCHIVED' }, status: 200 });
     const res: any = await call({ creative_id: '1644805286', status: 'ARCHIVED' });
     expect(res.success).toBe(true);
-    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+    expect(mockAxiosFn.mock.calls[1][0].method).toBe('GET');
     const req = mockAxiosFn.mock.calls[0][0];
     expect(req.method).toBe('POST');
     expect(req.url).toBe(
@@ -72,6 +76,13 @@ describe('ENG-2575 CREATIVE UPDATE', () => {
     );
     expect(req.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
     expect(req.data).toEqual({ patch: { $set: { intendedStatus: 'ARCHIVED' } } });
+  });
+
+  it('ENG-3064: LinkedIn accepts the update but the status reads back unchanged -> unsupported_field, not success', async () => {
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, status: 204 })
+      .mockResolvedValueOnce({ data: { intendedStatus: 'ACTIVE' }, status: 200 });
+    const res: any = await call({ creative_id: '1644805286', status: 'ARCHIVED' });
+    expect(res).toMatchObject({ success: false, errorType: 'unsupported_field', errorCode: 'unsupported_field', fields: ['intendedStatus'] });
   });
 
   it('accepts a full creative URN and normalises status case', async () => {

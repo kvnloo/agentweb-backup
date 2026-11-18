@@ -4,7 +4,7 @@ export const HOT_LEAD_CALL_NOT_ENTITLED_MESSAGE =
   'Hot lead calls are not included in your organization’s current plan, so this cannot be set up or turned on. Contact support to add them.';
 
 export const HOT_LEAD_CALL_SUBSCRIBE_MESSAGE =
-  'Hot lead calls need the hot lead calls add-on ($70 per month, includes one calling number and 150 lead calls per month, billed to your subscription). Subscribe to it to turn calling on.';
+  'Hot lead calls need the hot lead calls add-on ($70 per month, includes one calling number and 150 lead calls per month, billed to your subscription). Ask Emma in Agent Mode to turn on hot lead calls: she shows the price and you approve it.';
 
 /**
  * Kill switch for the paid add-on (ENG-2783). Billing is required ONLY when HOT_LEAD_CALL_BILLING_REQUIRED is

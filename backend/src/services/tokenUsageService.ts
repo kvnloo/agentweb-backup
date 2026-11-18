@@ -8,8 +8,6 @@ import { type LlmUsageMode, type LlmUsagePolicy,
 import { resolveLlmUsagePoolDecision } from './llmUsagePoolDecision';
 import type { PaygBlock } from './paygOverage';
 import { withOwnerOpenInvoice } from './paygSettlement';
-import { randomUUID } from 'crypto';
-import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
 
 export interface TokenUsageStatus {
@@ -176,12 +174,6 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
 export function getCurrentMonth(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-}
-
-function getNextResetDate(): string {
-  const now = new Date();
-  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  return nextMonth.toISOString();
 }
 
 /**
@@ -514,184 +506,6 @@ export function deriveBlockedByCost(status: {
     : costCapTriggered && !tokenCapTriggered;
 
   return { costCapTriggered, tokenCapTriggered, blockedByCost };
-}
-
-/**
- * Atomically increment a user's token usage for the current month.
- * For org members, usage is recorded on the org owner's account.
- * Performs lazy monthly reset if the stored month differs from current.
- */
-/**
- * ENG-1250 AC7 / ENG-2286 stage 3: the legacy per-user counter (`AW-Users.tokenUsage`, plus the
- * `AW-LlmChargeEvents` audit rows written with it) is no longer maintained. Admission, the usage views,
- * the admin surfaces and itemization all read the spend ledger now, and `recordUsage` writes every call
- * to it independently of this function. Set to `true` to resume the legacy writes (rollback).
- */
-export const LEGACY_COUNTER_WRITES_ENV = "AW_LEGACY_TOKEN_COUNTER_WRITES";
-
-export function isLegacyCounterWriteEnabled(): boolean {
-  return process.env[LEGACY_COUNTER_WRITES_ENV] === "true";
-}
-
-/**
- * Charge a call to the legacy monthly counter. A NO-OP unless `AW_LEGACY_TOKEN_COUNTER_WRITES=true`; the
- * ledger, not this counter, is the record of spend. Retained (not deleted) for one rollback window and
- * removed in stage 4.
- */
-export async function incrementUserTokenUsage(
-  userId: string,
-  tokens: number,
-  cost: number,
-  audit?: {
-    eventId?: string;
-    model?: string;
-    provider?: string;
-    feature?: string;
-    sessionId?: string;
-    /**
-     * ENG-1251 Greptile P1: overrides the charge event's occurredAt. A
-     * caller that ALSO writes a paired shadow-ledger row for the same
-     * logical usage (internalUsage.ts is the only one today) must derive
-     * this from the exact same instant as that row's date -- otherwise two
-     * independent `new Date()` calls a few awaits apart can straddle a
-     * UTC-midnight boundary, and the itemization reconciliation's
-     * (date, model, feature) key no longer matches between the two.
-     * Omit for every other caller -- defaults to `new Date()`, unchanged.
-     */
-    occurredAt?: string;
-    /**
-     * ENG-1251 Greptile P1: how many underlying calls this ONE charge event
-     * represents. internalUsage.ts sums an engine batch's tokens/cost into
-     * one charge event per (user, model, feature), so that event can stand
-     * in for several calls, not one -- the itemization reconciliation must
-     * subtract the true count from the aggregate row's callCount, or a
-     * multi-call batch under-subtracts and leaves phantom "uncovered" calls
-     * behind. Every other caller charges exactly one call per invocation,
-     * so omitting this defaults to 1, unchanged.
-     */
-    calls?: number;
-  }
-): Promise<void> {
-  if (tokens <= 0 && cost <= 0) return;
-  if (!isLegacyCounterWriteEnabled()) return;
-
-  const currentMonth = getCurrentMonth();
-
-  try {
-    const billingUserId = await resolveBillingUserId(userId);
-    // Persist the evidence before changing the counter. A failed evidence write
-    // therefore fails open (no surprise charge), while a retry with the same
-    // event id is a no-op rather than a duplicate counter increment.
-    //
-    // ENG-1251 Greptile P1: the random fallback below only protects a caller
-    // that truly has no stable identity for this charge. When the SAME usage
-    // report is retried without an eventId, the fallback mints a fresh one
-    // every time and the dedup above never fires — so callers that CAN supply
-    // a real one must. The two highest-volume paths (agentModeService.callLLM,
-    // chatbotService's chat turn) now pass the provider response's own id,
-    // which is identical across a re-processed/retried response and distinct
-    // across genuinely separate calls. Other callers (image/video/voice/deep
-    // research/llmService) still fall through to the random default — each is
-    // either structurally called at most once per success today or lacks a
-    // verified stable id at the call site; tracked as a fast-follow rather
-    // than guessed here.
-    const occurredAt = audit?.occurredAt || new Date().toISOString();
-    const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
-    // ENG-1251 Greptile P1: isNewCharge=false means an event with this ID was
-    // ALREADY RECORDED -- it does NOT mean it was already APPLIED. A prior
-    // attempt could have recorded the event and then been interrupted before
-    // (or during) the atomic apply below -- e.g. a crash, a timeout, or the
-    // retry loop below exhausting its attempts. Returning here on
-    // isNewCharge=false used to strand that event permanently: eventId is
-    // stable across a legitimate retry, so recordLlmChargeEvent would keep
-    // returning false for it forever, and the counter would never be
-    // charged. So this is intentionally NOT gated on isNewCharge -- always
-    // proceed to the atomic apply below; its own idempotency guard
-    // (attribute_not_exists(counterAppliedAt) inside applyMonthlyChargeAtomic)
-    // is what makes re-attempting a truly-already-applied charge a no-op.
-    await recordLlmChargeEvent({
-      billingUserId, eventId, occurredAt, actingUserId: userId,
-      tokens: Math.max(0, Math.round(tokens)), costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
-      model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
-      calls: audit?.calls,
-    });
-
-    // Apply the counter update and mark the audit event applied atomically —
-    // either both land or neither does (ENG-1251 Greptile fix). Previously
-    // these were two separate calls: a markLlmChargeApplied failure after a
-    // successful counter update silently hid an applied charge from
-    // itemization, and a lost concurrency race still marked the event
-    // applied even though the counter was never touched. Bounded retry
-    // against a fresh read handles a genuine concurrent writer (rollover or
-    // same-month increment) the same way the old two-branch logic did.
-    const MAX_ATTEMPTS = 3;
-    let outcome: "applied" | "already_applied" | "lost_race" | "no_user" = "lost_race";
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // Greptile P1: getUserById reads through the UserIdIndex GSI, which
-      // DynamoDB cannot serve as a strongly consistent read. After a lost
-      // race (another writer just committed the counter this attempt is
-      // about to retry against), a GSI read can still return the
-      // pre-transaction row, so this attempt derives isNewMonth from stale
-      // state and fails the SAME way again -- all MAX_ATTEMPTS retries can
-      // exhaust on a staleness window rather than genuine repeated
-      // contention, silently dropping the charge. getUserByIdConsistent
-      // does the same two-step lookup this codebase already uses elsewhere
-      // for exactly this guarantee (see its own docstring): resolve the
-      // key via the GSI, then a strongly consistent read on the base table.
-      const user = await userDb.getUserByIdConsistent(billingUserId);
-      if (!user || !user.email) {
-        outcome = "no_user";
-        break;
-      }
-
-      const existingMonth = user.tokenUsage?.month;
-      const isNewMonth = existingMonth !== currentMonth;
-
-      let history: Array<{ month: string; totalTokens: number; totalCost: number }> | undefined;
-      if (isNewMonth) {
-        // New month — archive previous month to history, reset usage, clear bonus.
-        const prevUsage = user.tokenUsage;
-        const existingHistory = user.tokenUsageHistory || [];
-        history = existingHistory;
-        if (prevUsage && prevUsage.month) {
-          const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
-          history = [...existingHistory, entry].slice(-24);
-        }
-      }
-
-      outcome = await userDb.applyMonthlyChargeAtomic({
-        userId: billingUserId,
-        userEmail: user.email,
-        month: currentMonth,
-        tokens,
-        cost,
-        resetDate: isNewMonth ? getNextResetDate() : (user.tokenUsage?.resetDate || getNextResetDate()),
-        isNewMonth,
-        history,
-        auditTableName: LLM_CHARGE_EVENTS_TABLE,
-        billingUserId,
-        eventId,
-      });
-
-      if (outcome === "applied" || outcome === "already_applied") break;
-      // outcome === "lost_race": another writer rolled the month or incremented
-      // this user concurrently — re-read fresh state and retry.
-    }
-
-    if (outcome === "lost_race") {
-      // Exhausted retries under real contention. Fail open, per the same
-      // contract recordLlmChargeEvent already documents: the counter is NOT
-      // incremented, and the audit event is left unmarked rather than
-      // falsely claiming the charge was applied.
-      console.warn(
-        `[tokenUsageService] Failed to atomically apply charge for ${billingUserId} after ${MAX_ATTEMPTS} attempts ` +
-        `(eventId=${eventId}): concurrent writers kept winning the race. Charge NOT counted.`
-      );
-    }
-  } catch (error) {
-    // Don't block message flow on usage tracking failures
-    console.error(`[tokenUsageService] Failed to increment usage for ${userId}:`, error);
-  }
 }
 
 /**

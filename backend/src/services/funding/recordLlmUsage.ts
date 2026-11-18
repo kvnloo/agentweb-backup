@@ -2,8 +2,8 @@
  * ENG-1816 F1 / ENG-2106 A3 — recordLlmUsage: one metering entry point, funding decided
  * ABOVE the fire-and-forget funnel, not inside it.
  *
- * `meterWithResolvedBilling` -> `meterUserUsage(Async)` -> `recordUsage` +
- * `incrementUserTokenUsage` is fire-and-forget and fail-open at every layer (errors
+ * `meterWithResolvedBilling` -> `meterUserUsage(Async)` -> `recordUsage`
+ * is fire-and-forget and fail-open at every layer (errors
  * are caught and logged, never thrown, by design — metering must never break an LLM
  * call). A funding check placed inside that funnel would fail silently. Placing the
  * branch here, before any of it runs, is what makes the branch itself trustworthy.
@@ -115,7 +115,7 @@ export function openRouterByokCostUsd(
  * (`upstreamCostUsd`) is removed first, so no AgentWeb rail ever sees it.
  *
  * Any other route: touches NO existing rail — not `recordUsage`, not
- * `incrementUserTokenUsage`, not the spend-event path — because `AW-SpendProjection`'s
+ * the spend-event path — because `AW-SpendProjection`'s
  * production writer (PR #3003) folds every settled spend event into that subject's
  * `settledMicroUsd` with no funding dimension. A customer-funded call that reached any
  * existing rail would be folded in and could pause the customer on their own spend the

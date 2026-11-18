@@ -52,6 +52,7 @@ jest.mock('axios', () => {
 import axios from 'axios';
 import fs from 'fs';
 import { LinkedInService } from '../services/linkedInService';
+import { LinkedInUnsupportedMediaError } from '../services/linkedInMedia';
 
 describe('LinkedInService', () => {
   let service: LinkedInService;
@@ -80,7 +81,7 @@ describe('LinkedInService', () => {
         timeout: 15000,
         headers: {
           'X-Restli-Protocol-Version': '2.0.0',
-          'LinkedIn-Version': '202511',
+          'LinkedIn-Version': '202610',
           'Content-Type': 'application/json',
         },
       });
@@ -969,6 +970,19 @@ describe('LinkedInService', () => {
         })
       );
       expect(result).toBe('urn:li:image:789');
+    });
+
+    it('ENG-3003: refuses a URL with no video extension that serves video/mp4, before any LinkedIn upload call', async () => {
+      (axios.get as jest.Mock).mockResolvedValue({
+        data: Buffer.from('fake-video-data'),
+        headers: { 'content-type': 'video/mp4' }
+      });
+
+      await expect(
+        service.uploadImageFromUrl('token', 'urn:li:organization:123', 'https://cdn.example.com/asset/9f3a')
+      ).rejects.toBeInstanceOf(LinkedInUnsupportedMediaError);
+      expect(mockClient.post).not.toHaveBeenCalled();
+      expect(axios.put).not.toHaveBeenCalled();
     });
   });
 

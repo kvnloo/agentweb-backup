@@ -302,9 +302,19 @@ export class ApprovalDB {
       ...(limit && { Limit: limit }),
     };
 
+    const items: AssetApproval[] = [];
+    let startKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     try {
-      const result = await dynamodb.query(params).promise();
-      return (result.Items as AssetApproval[]) || [];
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(limit && { Limit: limit - items.length }),
+          ...(startKey && { ExclusiveStartKey: startKey }),
+        }).promise();
+        items.push(...((result.Items as AssetApproval[]) || []));
+        startKey = result.LastEvaluatedKey;
+      } while (startKey && (!limit || items.length < limit));
+      return limit ? items.slice(0, limit) : items;
     } catch (error) {
       console.error('❌ Error getting approvals by user ID:', error);
       throw new Error('Failed to get approvals by user ID');
@@ -312,8 +322,8 @@ export class ApprovalDB {
   }
 
   /**
-   * Every PENDING approval of a user, following the index to the end. getApprovalsByUserId
-   * returns one page of the newest rows of any status, which can miss older pending ones.
+   * Every PENDING approval of a user, following the index to the end. Filter in
+   * DynamoDB rather than loading approvals of every status into memory.
    */
   async getPendingApprovalsByUserId(userId: string): Promise<AssetApproval[]> {
     const items: AssetApproval[] = [];

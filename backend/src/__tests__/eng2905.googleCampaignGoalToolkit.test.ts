@@ -51,6 +51,6 @@ it.each(['MISMATCH', 'UNCONFIRMED'])('never claims success for %s read-back', as
   (f.deps.dispatch as jest.Mock).mockImplementation(async () => { if (verification === 'UNCONFIRMED') f.set(null); return { success: true }; });
   expect(await executeGoogleToolkitWrite('u', { ...args, confirm: true, preview_token: p.preview_token }, 'USD', f.deps)).toMatchObject({ success: false, verification });
 });
-it('maps provider goal identity without treating a missing biddable as false', () => {
+it('maps provider goal identity (ENG-2995: omitted proto3 false reads as false)', () => {
   expect(mapGoogleReadRow('campaign_conversion_goal' as any, { campaign: { name: 'Brand' }, campaignConversionGoal: { resourceName: rn, category: 'CONTACT', origin: 'WEBSITE', biddable: false } })).toMatchObject({ name: 'Brand', biddable: false });
 });

@@ -1,24 +1,17 @@
 import express from 'express';
-import axios from 'axios';
 import jwt from 'jsonwebtoken';
-import crypto from 'crypto';
-import { getGoogleAdsConfig } from '../config/integrations';
-import { createAccount, getAccountsByUserId } from '../services/connectedAccountsDb';
-import { zomaMilestone } from '../services/journeyMilestones';
-import { googleAdsService } from '../services/googleAdsService';
-import type { GoogleAdsAccountNode, GoogleAdLeaf } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { buildGoogleAdsConnectUrl } from '../services/googleAdsConnectUrl';
+import { connectGoogleAdsAccounts, finalizeGoogleAdsOAuth } from '../services/googleAdsOAuthFinalize';
+import { GoogleAdsInsufficientScopesError } from '../services/googleAdsOAuthErrors';
+import { ZOMA_GOOGLE_CALLBACK_PATH } from '../mcp/zomaSetupLinks';
 
 const router = express.Router();
 
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-interface StatePayload { userId: string; nonce: string; }
-
+interface StatePayload { userId: string; nonce: string; zoma?: string; }
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
@@ -27,40 +20,13 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   } catch { return null; }
 };
 
-// ── Token session store (server-side, one-time use) ──────────────────────────
-
-interface TokenSession {
-  tokens: { access_token: string; refresh_token?: string; expires_in: number; };
-  // Flat list of every connectable leaf across the tree — the trusted source for /connect
-  // validation (the client only sends customerIds; name/currency/loginCustomerId come from here).
-  connectableLeaves: GoogleAdLeaf[];
-  userId: string;
-  expires: number;
-}
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of tokenSessions.entries()) {
-    if (now > s.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], connectableLeaves: GoogleAdLeaf[]): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, connectableLeaves, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): TokenSession | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId);
-  return session;
+// Signature-checked but expiry-ignored: a Zoma user who lingers past the 15-minute state must still land on
+// Zoma's "expired — ask your agent" page (the Zoma handler enforces expiry), not in the Emma portal.
+const isZomaState = (state: string): boolean => {
+  try {
+    const decoded = jwt.verify(state, getJwtSecret(), { ignoreExpiration: true }) as StatePayload;
+    return typeof decoded.zoma === 'string' && decoded.zoma.length > 0;
+  } catch { return false; }
 };
 
 // ── Routes ───────────────────────────────────────────────────────────────────
@@ -85,6 +51,16 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 router.get('/callback', (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+  // ENG-3135: a connect link minted for a Zoma agent (signed state carrying `zoma`) finishes on
+  // Zoma's own server-rendered pages for the state's user — never in the AgentWeb (Emma) portal.
+  // Same registered redirect URI, so no Google OAuth client change. Portal states never carry `zoma`.
+  if (typeof state === 'string' && isZomaState(state)) {
+    const forward = new URLSearchParams();
+    for (const [key, value] of [['code', code], ['state', state], ['error', error]] as const) {
+      if (typeof value === 'string') forward.set(key, value);
+    }
+    return res.redirect(302, `${ZOMA_GOOGLE_CALLBACK_PATH}?${forward.toString()}`);
+  }
   if (error) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=${encodeURIComponent(error as string)}`);
   if (!code) return res.redirect(`${frontendUrl}/oauth/google-ads/callback?error=no_code_provided`);
   res.redirect(`${frontendUrl}/oauth/google-ads/callback?code=${encodeURIComponent(code as string)}&state=${encodeURIComponent(state as string)}`);
@@ -114,72 +90,16 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const config = await getGoogleAdsConfig();
-
-    const tokenResponse = await axios.post(
-      config.tokenUrl,
-      new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        redirect_uri: config.redirectUri,
-      }).toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-
-    const { access_token, refresh_token, expires_in, scope } = tokenResponse.data as {
-      access_token: string;
-      refresh_token?: string;
-      expires_in: number;
-      scope?: string;
-    };
-
-    // Google returns the scopes actually granted. A Google Workspace admin policy
-    // (common in regulated orgs) or an unchecked box on the "unverified app" consent
-    // screen can drop the sensitive adwords scope while still issuing a token for the
-    // userinfo scopes. Without adwords, listAccessibleCustomers fails or returns nothing,
-    // so the connection silently ends with 0 accounts. Detect it here and return an
-    // actionable error instead — mirrors the google_drive finalize flow.
-    const grantedScopes = (scope || '').split(' ').filter(Boolean);
-    const hasAdwords = grantedScopes.some(s => s.includes('/auth/adwords'));
-    if (!hasAdwords) {
-      console.warn('[GoogleAds OAuth /finalize] insufficient_scopes', {
-        userId,
-        grantedScopes,
-        missingScope: 'https://www.googleapis.com/auth/adwords',
-      });
+    const { accountTree, tokenSessionId } = await finalizeGoogleAdsOAuth({ userId, code });
+    res.json({ success: true, accountTree, tokenSessionId });
+  } catch (error: any) {
+    if (error instanceof GoogleAdsInsufficientScopesError) {
       return res.status(422).json({
         error: 'insufficient_scopes',
         message: 'Google Ads permission was not granted. This can happen when your Google Workspace admin restricts third-party app access, or when the Google Ads permission was not approved on the consent screen. Please try again and allow all requested permissions.',
-        grantedScopes,
+        grantedScopes: error.grantedScopes,
       });
     }
-
-    const accountTree = await googleAdsService.listAccountHierarchy(access_token);
-
-    // Mark leaves the user has already connected so the modal can disable them.
-    const existing = await getAccountsByUserId(userId);
-    const connectedIds = new Set(
-      existing.filter(a => a.platform === 'google_ads').map(a => a.account_id)
-    );
-    const markedTree: GoogleAdsAccountNode[] = accountTree.map(node =>
-      node.type === 'leaf'
-        ? { ...node, alreadyConnected: connectedIds.has(node.customerId) }
-        : { ...node, children: node.children.map(c => ({ ...c, alreadyConnected: connectedIds.has(c.customerId) })) }
-    );
-
-    const connectableLeaves = googleAdsService.flattenConnectableLeaves(markedTree);
-    const tokenSessionId = storeTokenSession(userId, { access_token, refresh_token, expires_in }, connectableLeaves);
-
-    console.log('[GoogleAds OAuth /finalize] success', {
-      userId,
-      accountCount: connectableLeaves.length,
-      grantedScopes,
-    });
-
-    res.json({ success: true, accountTree: markedTree, tokenSessionId });
-  } catch (error: any) {
     console.error('[Google Ads OAuth /finalize]', {
       userId,
       status: error.response?.status,
@@ -206,44 +126,15 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId or customerIds' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
-  // Resolve every requested id against the session; reject the whole request if any is unknown.
-  const selected: GoogleAdLeaf[] = [];
-  for (const id of customerIds) {
-    const leaf = session.connectableLeaves.find(l => l.customerId === id);
-    if (!leaf) {
-      return res.status(400).json({ error: `Account ${id} not found in your authorized accounts` });
-    }
-    selected.push(leaf);
-  }
-
   try {
-    const tokenExpiresAt = Date.now() + session.tokens.expires_in * 1000;
-    for (const leaf of selected) {
-      await createAccount(userId, 'google_ads', {
-        account_id: leaf.customerId,
-        account_name: leaf.name || leaf.customerId,
-        config: {
-          account_type: 'google_ads',
-          customer_id: leaf.customerId,
-          currency: leaf.currency || 'USD',
-          login_customer_id: leaf.loginCustomerId,
-          // ENG-1362: recorded at connect time from the discovery query, so nothing
-          // downstream has to infer spend risk from the account name.
-          test_account: leaf.testAccount === true,
-          access_token: session.tokens.access_token,
-          refresh_token: session.tokens.refresh_token,
-          token_expires_at: tokenExpiresAt,
-        },
-      });
+    const result = await connectGoogleAdsAccounts({ userId, tokenSessionId, customerIds });
+    if (!result.ok) {
+      if (result.reason === 'invalid_session') {
+        return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+      }
+      return res.status(400).json({ error: `Account ${result.customerId} not found in your authorized accounts` });
     }
-    // ENG-2906: journey event; zomaStage only moves for users who already use Zoma.
-    void zomaMilestone(userId, 'google_connected', { emit: 'always', requireZoma: true, props: { platform: 'google_ads' } });
-    res.json({ success: true, connected: selected.length });
+    res.json({ success: true, connected: result.connected });
   } catch (error: any) {
     console.error('[Google Ads OAuth /connect]', error);
     res.status(500).json({ error: 'Failed to save Google Ads account' });
