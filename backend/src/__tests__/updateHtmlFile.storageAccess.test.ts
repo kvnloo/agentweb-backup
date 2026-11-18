@@ -63,9 +63,10 @@ const OLD = '<html><body><h1 class="t">Old</h1><p>keep</p></body></html>';
 const url = (key: string) => `${BUCKET_HOST}/${key}`;
 
 /** The two ways the tool edits: a part/full text replacement and a CSS-selector edit. */
-const PART = ['part', [{ old_content: 'Old', new_content: 'New', expected_count: 1 }]] as const;
-const CSS = ['css', [{ action: 'replaceInner', selector: 'h1.t', html: 'New' }]] as const;
-const MODES: Array<[string, readonly [string, any[]]]> = [['part replacement', PART], ['css edit', CSS]];
+type Mode = readonly [string, any[]];
+const PART: Mode = ['part', [{ old_content: 'Old', new_content: 'New', expected_count: 1 }]];
+const CSS: Mode = ['css', [{ action: 'replaceInner', selector: 'h1.t', html: 'New' }]];
+const MODES: Array<[string, Mode]> = [['part replacement', PART], ['css edit', CSS]];
 
 describe('update_html_file: who may write the edited copy', () => {
   let warn: jest.SpyInstance;
