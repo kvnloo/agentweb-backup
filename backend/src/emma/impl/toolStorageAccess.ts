@@ -94,6 +94,12 @@ export async function checkOurBucketPathWrite(
   const cleanDir = typeof dir === 'string' ? dir.replace(/^\/+|\/+$/g, '').replace(/\/+/g, '/') : '';
   const key = canonicalStorageKey(cleanDir ? `${cleanDir}/${filename}` : filename, 'decoded');
   if (!key || typeof userId !== 'string' || userId.trim() === '') return 'refuse';
+  // An anonymous visitor's own folder. The rule lets only an admin change files under `users/anon_*` (after sign-up nobody can be shown to own
+  // them), but while the caller IS that anonymous visitor (the id is assigned by the server to its session, never taken from a request) the
+  // files in its own folder are its own, exactly like a registered user's: the same "the owner's own keys" rule, and the visitor's own page
+  // must stay editable by its own session.
+  const [top, owner, ...rest] = key.split('/');
+  if (top === 'users' && typeof owner === 'string' && owner.startsWith('anon_') && owner === userId && rest.length >= 1) return 'allow';
   try {
     const caller = { userId, isRealAdmin: false };
     const decision = await decideStorageAccess(caller, key, 'write', lookups);
