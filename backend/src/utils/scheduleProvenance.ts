@@ -1,0 +1,193 @@
+/**
+ * ENG-2816 (step 3): which content of a schedule was written by a share-link visitor.
+ *
+ * A share link runs the visitor's turn under the OWNER's userId, so a schedule a visitor creates or edits is stored as the
+ * owner's own and, unless something says otherwise, runs later with the owner's full tool set. `provenance` is that something:
+ * ONE optional String Set on a schedule item (`AW-TaskSchedules`), each member naming a tracked content field whose current
+ * value a visitor wrote. A schedule is "marked" when the set is non-empty; a marked schedule's runs get the
+ * `share_visitor_schedule` restriction profile (toolRestrictionProfiles.ts), enforced live in `executeTool`.
+ *
+ * It is absent on every schedule that existed before this change and is never backfilled, so an unmarked schedule behaves
+ * exactly as it always did. Over-marking is safe (the owner can adopt it); under-marking is the hole this exists to close, so
+ * everything here fails toward "marked". Marks are only ever ADDED, by a visitor's write, in the same write as the content; the
+ * only thing that removes them is the owner adopting the schedule (the whole attribute, on purpose, from the portal).
+ *
+ * This module imports only Node's `crypto`, so the pure publish-authorization resolver and the database layer can both use it
+ * without an import cycle.
+ */
+
+import { createHash } from 'crypto';
+
+/**
+ * The content fields a visitor can change that steer a later run: the prompt, the words and tool names the retry message pastes
+ * in, the variable definitions and values substituted into the prompt, and the recipients (a visitor-chosen recipient also
+ * receives the emailed variables link), and `selfImprove` (switching it on makes the NEXT run's owner-powered reflection turn rewrite
+ * the clean prompt from content the visitor planted in the run). Not tracked, on purpose: `session_id` (create-only), timing,
+ * `llmModel`, name and description.
+ */
+export const SCHEDULE_PROVENANCE_FIELDS = [
+  'startingMessage',
+  'keywords',
+  'requiredFunctionCalls',
+  'functionCallMinCalls',
+  'variables',
+  'variableValues',
+  'emailNotifications',
+  'selfImprove',
+] as const;
+
+export type ScheduleProvenanceField = (typeof SCHEDULE_PROVENANCE_FIELDS)[number];
+
+/** What an unreadable attribute reads as: some mark we cannot interpret is still a mark. */
+export const UNREADABLE_PROVENANCE = '_unreadable';
+
+/**
+ * The tolerant reader: every place that asks "which fields are marked" goes through this one function, whatever shape the value
+ * has in the caller's hand. A DynamoDB String Set (the DocumentClient's `DynamoDBSet`, with `.values`), a JS `Set`, a plain
+ * array (what the db layer and the API return) all read as their members, sorted and de-duplicated. Absent (undefined or null)
+ * reads as none. Anything else we cannot parse reads as MARKED (`[UNREADABLE_PROVENANCE]`), never as none.
+ */
+export function readScheduleProvenance(raw: unknown): string[] {
+  if (raw === undefined || raw === null) return [];
+
+  let members: unknown[];
+  if (Array.isArray(raw)) {
+    members = raw;
+  } else if (raw instanceof Set) {
+    members = [...raw];
+  } else if (typeof raw === 'object' && Array.isArray((raw as { values?: unknown }).values)) {
+    members = (raw as { values: unknown[] }).values;
+  } else if (typeof raw === 'string' && raw.trim() !== '') {
+    members = [raw];
+  } else {
+    return [UNREADABLE_PROVENANCE];
+  }
+
+  const read = new Set<string>();
+  for (const member of members) {
+    read.add(typeof member === 'string' && member.trim() !== '' ? member : UNREADABLE_PROVENANCE);
+  }
+  return [...read].sort();
+}
+
+/** True when a visitor wrote some of this schedule's content. A missing schedule is not "marked": callers decide what missing means. */
+export function isScheduleMarked(schedule: { provenance?: unknown } | null | undefined): boolean {
+  return readScheduleProvenance(schedule?.provenance).length > 0;
+}
+
+/** The tracked fields a request body carries (present means "not undefined": JSON drops undefined, so a field the caller left out is absent). */
+export function trackedFieldsInBody(body: unknown): ScheduleProvenanceField[] {
+  if (!body || typeof body !== 'object') return [];
+  const record = body as Record<string, unknown>;
+  return SCHEDULE_PROVENANCE_FIELDS.filter((field) => record[field] !== undefined);
+}
+
+/**
+ * Tools whose self-call reaches a schedule WRITE route. Their calls inside a marked run carry the run's restriction profile
+ * (see agentModeService.executeTool), so a marked run's own `manage_scheduled_chat update` (the self-improvement reflection turn
+ * does exactly that) is itself a visitor write: it re-marks what it writes and can never lift or launder the mark.
+ */
+export const SCHEDULE_WRITE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'manage_scheduled_chat',
+  'submit_scheduled_chat_variables',
+  'create_schedule_from_template',
+  'manage_schedule_template',
+  'emma_schedule_recurring_work',
+]);
+
+/**
+ * Whether the owner's "full autonomy" waiver (ENG-396: a headless run auto-takes Emma's recommended option on a blocking question,
+ * even an irreversible one) applies to this schedule's run. It is the owner's opt-in for a prompt THEY wrote, so a schedule a
+ * share-link visitor wrote into does not get it until the owner adopts the schedule.
+ */
+export function autonomyWaiverApplies(schedule: { fullAutonomy?: unknown; provenance?: unknown } | null | undefined): boolean {
+  return schedule?.fullAutonomy === true && !isScheduleMarked(schedule);
+}
+
+/** Retry attempts a marked run gets. An unmarked run keeps its 20; a marked run's refused calls would otherwise burn the owner's credits on them. */
+export const MARKED_RUN_MAX_ATTEMPTS = 3;
+
+/** `names` without those the profile refuses (the deterministic checker must not demand a tool the run is forbidden to call). */
+export function withoutRefusedNames(names: string[] | undefined, isRefused: (name: string) => boolean): string[] {
+  return (Array.isArray(names) ? names : []).filter((name) => !isRefused(name));
+}
+
+/** The map `functionCallMinCalls` without the refused names (same reason as `withoutRefusedNames`). */
+export function minCallsWithoutRefused(
+  minCalls: Record<string, number> | undefined,
+  isRefused: (name: string) => boolean
+): Record<string, number> {
+  const source = minCalls && typeof minCalls === 'object' ? minCalls : {};
+  return Object.fromEntries(Object.entries(source).filter(([name]) => !isRefused(name)));
+}
+
+/** What one write does to a schedule's provenance: the members to ADD. A write only ever adds; nothing but the adopt route takes a mark off. */
+export interface ProvenancePlan {
+  provenanceAdd?: string[];
+}
+
+/**
+ * Decide what a schedule write does to its provenance.
+ *
+ * A VISITOR's write marks the tracked fields it names (`fields`: the caller passes the ones whose value it changes, or all it
+ * carries when it cannot tell). Every other write leaves provenance alone, the owner's own included: an owner editing a marked field
+ * does NOT unmark it. "The owner changed this list" is not "the owner reviewed it" (the owner adds a third address and the visitor's
+ * stays), and a portal save of a whole form says nothing about which parts were read. The only way a mark comes off is the owner
+ * saying so, on purpose, through the adopt route.
+ *
+ * Pure: the caller works out the inputs from the request and the stored schedule.
+ */
+export function planProvenanceChange(input: { visitorWrite: boolean; fields: string[] }): ProvenancePlan {
+  return input.visitorWrite && input.fields.length > 0 ? { provenanceAdd: [...input.fields] } : {};
+}
+
+/** The marks a schedule will carry once `plan` has been applied to `stored` (for a run that starts from the pre-write snapshot). */
+export function applyProvenancePlan(stored: string[], plan: ProvenancePlan): string[] {
+  return [...new Set([...stored, ...(plan.provenanceAdd ?? [])])].sort();
+}
+
+const EMPTY_CONTENT: Record<ScheduleProvenanceField, unknown> = {
+  startingMessage: '',
+  keywords: [],
+  requiredFunctionCalls: [],
+  functionCallMinCalls: {},
+  variables: [],
+  variableValues: {},
+  emailNotifications: [],
+  selfImprove: false,
+};
+
+/** `value` with every object's keys in sorted order (arrays keep their order: the order of a list IS content), for hashing. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(source).sort().map((key) => [key, canonical(source[key])]));
+  }
+  // JSON has no `undefined`: an absent field and a null one are the same content.
+  return value === undefined ? null : value;
+}
+
+/**
+ * A stable digest of everything the owner would be adopting: the eight tracked content fields as stored, plus the sorted provenance.
+ * It is COMPUTED on read (the schedule list hands it to the portal as `contentVersion`) and never stored.
+ *
+ * It is what the adopt route compares, instead of `updatedAt`, because `updatedAt` moves for reasons that are not content: every
+ * run's bookkeeping, the cron's claim and pause writes, and a visitor re-submitting identical values or toggling an already-active
+ * schedule. A visitor could keep `updatedAt` moving to make adopting impossible; it cannot change this digest without really
+ * changing content, which is exactly the case where the owner must look again.
+ *
+ * Stable across object key order and provenance order (a set); sensitive to list order and to every tracked value. sha256, the
+ * first 32 hex characters.
+ */
+export function scheduleContentVersion(schedule: Record<string, unknown> | null | undefined): string {
+  const content: Record<string, unknown> = {};
+  // An ABSENT field reads as its empty value, so the write handlers' habit of storing "[]" where nothing was stored (a no-op write)
+  // does not change the digest.
+  for (const field of SCHEDULE_PROVENANCE_FIELDS) {
+    const value = schedule?.[field];
+    content[field] = value === undefined || value === null ? EMPTY_CONTENT[field] : field === 'selfImprove' ? value === true : value;
+  }
+  const canonicalJson = JSON.stringify(canonical({ content, provenance: readScheduleProvenance(schedule?.provenance) }));
+  return createHash('sha256').update(canonicalJson).digest('hex').slice(0, 32);
+}

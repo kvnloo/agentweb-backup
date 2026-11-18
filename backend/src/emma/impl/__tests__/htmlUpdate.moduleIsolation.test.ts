@@ -41,6 +41,13 @@ describe('emma/impl/htmlUpdate.ts self-import makes internal calls spy-observabl
   });
 
   it('a jest.spyOn on the module namespace intercepts updateHtmlFile’s own internal fetchFileContent call', async () => {
+    // Who may write which S3 key is a boundary here (covered with the real policy in updateHtmlFile.storageAccess.test.ts).
+    jest.doMock('../toolStorageAccess', () => ({
+      TOOL_FILE_READ_ONLY_MESSAGE: 'read-only',
+      TOOL_FILE_REFUSAL_MESSAGE: 'refused',
+      TOOL_FILE_UNAVAILABLE_MESSAGE: 'unavailable',
+      createToolFileAccess: () => ({ isOurBucket: () => true, check: async () => 'allow', checkWrite: async () => 'allow' }),
+    }));
     const htmlUpdateImpl = require('../htmlUpdate');
     const fetchSpy = jest
       .spyOn(htmlUpdateImpl, 'fetchFileContent')
@@ -58,6 +65,6 @@ describe('emma/impl/htmlUpdate.ts self-import makes internal calls spy-observabl
     // If the self-import indirection were missing, updateHtmlFile would call
     // the REAL fetchFileContent (a real `fetch()` against a fake URL) instead
     // of this mock, and this assertion would fail.
-    expect(fetchSpy).toHaveBeenCalledWith('https://s3/original.html');
+    expect(fetchSpy).toHaveBeenCalledWith('https://s3/original.html', 'u1');
   });
 });

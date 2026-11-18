@@ -19,6 +19,11 @@ export function ctx(context: any) {
     // does not let the route rebuild it; the guard is keyed on the SESSION, because
     // that is what carries the run's admission scope. So the session crosses too.
     sessionId: context?.sessionId,
+    // ENG-2816 (step 3): the restriction the calling principal runs under (a share-link visitor, or a scheduled run of a schedule a
+    // visitor wrote). A visitor acts under the OWNER's userId, so the self-call token below would otherwise read as the owner's
+    // own; mcpFetch signs this into the token as a claim, and the route on the far side learns who is really writing. Copied here
+    // because this whitelist is the one place a tool's context becomes a self-call's: a field left out of it is a claim lost.
+    restrictionProfile: context?.restrictionProfile,
   };
 }
 
