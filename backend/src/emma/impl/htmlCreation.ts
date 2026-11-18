@@ -142,6 +142,7 @@ import { extractVariables } from '../../utils/templateParser';
 import { isTransientLLMError } from '../../utils/agentModeErrors';
 import { makeToolUsageCallback } from './shared/toolUsageMetering';
 import { getTemplatesForUser } from './shared/htmlTemplates';
+import { CALLER_URL_MAX_TEXT_BYTES, fetchCallerUrlText } from '../../utils/callerUrlFetch';
 import {
   unescapeHtml,
   deepEscapeHtmlValues,
@@ -835,11 +836,13 @@ export async function createHtmlTemplate(
       // If htmlSource looks like a URL, fetch it
       if (htmlSource.startsWith('http://') || htmlSource.startsWith('https://')) {
         console.log('AgentMode: Fetching HTML from URL:', htmlSource);
-        const response = await fetch(htmlSource);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch HTML from URL: ${response.statusText}`);
+        // A URL the caller chose is fetched only through the guarded fetch (public addresses only, redirects re-checked, size and
+        // time bounded): the body becomes a saved template, so the server's own network position must not be reachable through it.
+        try {
+          htmlContent = await fetchCallerUrlText(htmlSource, { tool: 'create_html_template', userId, maxBytes: CALLER_URL_MAX_TEXT_BYTES });
+        } catch (fetchError) {
+          throw new Error(`Failed to fetch HTML from URL: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
         }
-        htmlContent = await response.text();
       }
 
       // Documents large enough to risk truncation by the 16K output cap must NOT
