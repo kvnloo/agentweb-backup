@@ -606,6 +606,18 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           continue;
         }
 
+        // An entry that is not a URL at all (a plain file name, a local path) is a mistake of the caller, not a blocked address: say so, and do
+        // not log it as a refused URL.
+        let parsesAsUrl = true;
+        try { new URL(fileUrl); } catch { parsesAsUrl = false; }
+        if (!parsesAsUrl) {
+          return {
+            success: false,
+            message: `file_urls entry "${fileUrl}" is not a URL. Pass a public https link, an s3:// key from save_file or a tool-responses key, or put the data inline in analysis_instruction.`,
+            errorClass: 'invalid_args',
+          };
+        }
+
         // Download the file. A URL the caller chose is fetched only through the guarded fetch (public addresses only, every redirect
         // checked again), and the body is capped at what is left of the total budget, so one URL cannot stream an unbounded body into memory.
         const { buffer: fileBuffer } = await fetchCallerUrlBuffer(fileUrl, {

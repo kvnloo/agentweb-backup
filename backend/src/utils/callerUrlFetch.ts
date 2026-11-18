@@ -73,9 +73,11 @@ const TOO_LARGE = /too large|maxContentLength|maxBodyLength/i;
 /** The helper's plain error for a redirect to a non-http(s) scheme. A refusal like any other: it gets the same generic answer. */
 const NON_HTTP_REDIRECT = /non-http\(s\) redirect/i;
 
-function refuse(opts: CallerUrlFetchOptions, host: string): never {
-  // Host only: a path or query can carry a token, and the rest is chosen by the caller.
-  console.warn(JSON.stringify({ event: 'caller_url_blocked', tool: opts.tool, userId: opts.userId ?? null, host: host.slice(0, 100) }));
+function refuse(opts: CallerUrlFetchOptions, host: string, notAUrl = false): never {
+  // Host only: a path or query can carry a token, and the rest is chosen by the caller. A string that is not a URL at all is a caller's
+  // mistake (a file name), not an attempt on an address, so it is logged under its own event and kept out of the blocked-URL count.
+  const event = notAUrl ? 'caller_url_invalid' : 'caller_url_blocked';
+  console.warn(JSON.stringify({ event, tool: opts.tool, userId: opts.userId ?? null, host: host.slice(0, 100) }));
   throw new CallerUrlBlockedError();
 }
 
@@ -92,7 +94,7 @@ export async function fetchCallerUrlBuffer(
   try {
     parsed = new URL(rawUrl);
   } catch {
-    return refuse(opts, 'invalid');
+    return refuse(opts, 'invalid', true);
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return refuse(opts, 'not-http');
 
