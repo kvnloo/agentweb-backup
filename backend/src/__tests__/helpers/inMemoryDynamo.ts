@@ -67,6 +67,19 @@ function resolveName(token: string, names: Record<string, string>): string {
 }
 
 /**
+ * The value a condition clause's path points at. A dotted path (`brandGuidelines.updatedAt`, `#a.#b`) is a NESTED read, as in DynamoDB;
+ * before this, it was looked up as one attribute literally named "brandGuidelines.updatedAt", so `attribute_not_exists(a.b)` was always
+ * true and `a.b = :v` always false. A path with no dot is read exactly as before.
+ */
+function readConditionPath(item: Record<string, any> | undefined, token: string, names: Record<string, string>): any {
+  if (!token.includes('.')) return item?.[resolveName(token, names)];
+  return token
+    .split('.')
+    .map((segment) => resolveName(segment, names))
+    .reduce<any>((cur, segment) => (cur === undefined || cur === null ? undefined : cur[segment]), item);
+}
+
+/**
  * `attribute_exists(x) AND attribute_not_exists(y) AND #a = :b AND size(#l) = :n`,
  * plus one parenthesised disjunction: `(attribute_not_exists(#a) OR #a = :a)`.
  *
@@ -115,14 +128,12 @@ function evaluateClause(
 
     let match = clause.match(/^attribute_not_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item === undefined || item[attr] === undefined;
+      return item === undefined || readConditionPath(item, match[1], names) === undefined;
     }
 
     match = clause.match(/^attribute_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item !== undefined && item[attr] !== undefined;
+      return item !== undefined && readConditionPath(item, match[1], names) !== undefined;
     }
 
     match = clause.match(/^size\(\s*([^)]+?)\s*\)\s*=\s*(:[A-Za-z0-9_]+)$/i);
@@ -133,8 +144,7 @@ function evaluateClause(
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*=\s*(:[A-Za-z0-9_]+)$/);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item?.[attr] === values[match[2]];
+      return readConditionPath(item, match[1], names) === values[match[2]];
     }
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*([<>])\s*(:[A-Za-z0-9_]+)$/);
