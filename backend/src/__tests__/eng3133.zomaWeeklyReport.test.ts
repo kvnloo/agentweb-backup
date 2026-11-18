@@ -1,7 +1,8 @@
 /**
  * ENG-3133 — the weekly Zoma ad-performance email.
- * Pure rules, the job with injected dependencies, the production ad-totals wiring (Meta and Google Ads,
- * mocked reports), the opt-out on the user record, and the unsubscribe routes.
+ * Pure rules, the numbers (week-over-week, charts data), the email, the job with injected dependencies, the
+ * production ad wiring (Meta and Google Ads, mocked reports), the opt-out on the user record, the all-users
+ * usage read, the mail headers, and the unsubscribe routes.
  * Mock-only: no Stripe, Dynamo or mail; the live proof is the env1 run described in the PR.
  */
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -18,43 +19,60 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/stripeService', () => ({ stripeService: {} }));
 jest.mock('../middleware/auth', () => ({ authenticateToken: (_q: any, _r: any, n: any) => n() }));
 const mockRunReport = jest.fn();
+const mockRunDaily = jest.fn();
 jest.mock('../mcp/zomaAdsReport', () => ({
   ...jest.requireActual('../mcp/zomaAdsReport'),
   runZomaAdsReport: (...a: any[]) => mockRunReport(...a),
+  runZomaAdsDaily: (...a: any[]) => mockRunDaily(...a),
 }));
 
 import express from 'express';
 import request from 'supertest';
 import { createZomaRouter } from '../routes/zoma';
 import { googleAdsService } from '../services/googleAdsService';
+import { resendService } from '../services/resendService';
+import { emailService } from '../services/emailService';
+import * as usageService from '../services/mcpUsageEventsService';
 import {
-  adsWeekLines,
+  adsWindows,
+  claimKey,
   defaultZomaWeeklyReportDeps,
+  eachDate,
   getZomaWeeklyReportConfig,
   inSendWindow,
+  isPermanentReadError,
   isReportRecipient,
   isoWeekKey,
+  pctChange,
   recordWeeklyReportOptOut,
   runZomaWeeklyReports,
   signUnsubscribeToken,
+  unsubscribeHeaders,
   verifyUnsubscribeToken,
+  weekChips,
+  weekFromDaily,
+  weekInsight,
   weeklyReportEmail,
   zomaUnsubscribeUrl,
+  type DailyPoint,
   type PlatformWeek,
   type ZomaAdsWeek,
   type ZomaWeeklyReportConfig,
   type ZomaWeeklyReportDeps,
 } from '../mcp/zomaWeeklyReport';
-import { hasZomaFunnelRow, recordZomaBillingFunnel, type McpUsageEventStore, type McpUserUsage } from '../services/mcpUsageEventsService';
+import { getMcpUsageByUser, hasZomaFunnelRow, recordZomaBillingFunnel, type McpUsageEventStore, type McpUserUsage } from '../services/mcpUsageEventsService';
 
 const SECRET = 'test-secret';
 // Monday 2026-11-23 16:00 UTC, inside the default window (Monday from 15:00 UTC).
 const MONDAY_16 = Date.UTC(2026, 10, 23, 16, 0, 0);
-const cfg = (over: Partial<ZomaWeeklyReportConfig> = {}): ZomaWeeklyReportConfig => ({ enabled: true, weekday: 1, hour: 15, lookbackDays: 7, maxPerPass: 200, ...over });
+// The ad windows for that send: the last 7 COMPLETE days (Nov 16 to Nov 22) and the 7 before (Nov 9 to Nov 15).
+const WIN = adsWindows(MONDAY_16);
+const USAGE_RANGE = { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' };
+const cfg = (over: Partial<ZomaWeeklyReportConfig> = {}): ZomaWeeklyReportConfig => ({ enabled: true, weekday: 1, hour: 15, maxPerPass: 200, onlyUserIds: null, ...over });
 
 const usage = (over: Partial<McpUserUsage> = {}): McpUserUsage => ({
-  start: '2026-11-16T16:00:00.000Z',
-  end: '2026-11-23T16:00:00.000Z',
+  start: USAGE_RANGE.start,
+  end: USAGE_RANGE.end,
   toolCalls: 12,
   writes: { total: 2, confirmed: 2, mismatch: 0, unconfirmed: 0 },
   recentWrites: [
@@ -64,9 +82,23 @@ const usage = (over: Partial<McpUserUsage> = {}): McpUserUsage => ({
   ...over,
 });
 const noWrites = { total: 0, confirmed: 0, mismatch: 0, unconfirmed: 0 };
+const usageFor = (...ids: string[]) => new Map(ids.map((id) => [id, usage()]));
 
-const META_ADS: ZomaAdsWeek = { currency: 'USD', spend: 120.5, impressions: 14000, clicks: 310, conversions: 22, roas: 2.4, conversionEvent: 'purchase' };
-const GOOGLE_ADS: ZomaAdsWeek = { currency: 'INR', spend: 950, impressions: 5200, clicks: 120, conversions: 4, roas: null, conversionEvent: null };
+const DATES = eachDate('2026-11-16', '2026-11-22');
+const days = (spend: number[], conv: number[]): DailyPoint[] => spend.map((s, i) => ({ date: DATES[i], spend: s, conversions: conv[i] }));
+
+const META_ADS: ZomaAdsWeek = {
+  currency: 'USD', spend: 120, impressions: 14000, clicks: 310, conversions: 22, roas: 2.4, conversionEvent: 'purchase',
+  daily: days([10, 20, 30, 0, 25, 15, 20], [2, 3, 4, 0, 5, 3, 5]),
+  previous: { spend: 100, impressions: 12000, clicks: 250, conversions: 20 },
+  topCampaigns: [{ name: 'Spring Sale', spend: 80, conversions: 15 }, { name: 'Retargeting', spend: 40, conversions: 7 }],
+};
+const GOOGLE_ADS: ZomaAdsWeek = {
+  currency: 'INR', spend: 950, impressions: 5200, clicks: 120, conversions: 4, roas: null, conversionEvent: null,
+  daily: days([100, 150, 200, 0, 250, 150, 100], [0, 1, 1, 0, 1, 0, 1]),
+  previous: { spend: 950, impressions: 5000, clicks: 120, conversions: 4 },
+  topCampaigns: [{ name: 'Brand search', spend: 600, conversions: 3 }],
+};
 const META_WEEK: PlatformWeek = { platform: 'meta', status: 'delivered', ads: META_ADS };
 const GOOGLE_WEEK: PlatformWeek = { platform: 'google_ads', status: 'delivered', ads: GOOGLE_ADS };
 
@@ -77,11 +109,10 @@ function makeDeps(over: Partial<ZomaWeeklyReportDeps> = {}): ZomaWeeklyReportDep
   const deps: any = {
     config: () => cfg(),
     listUsers: jest.fn().mockResolvedValue([customer('u1')]),
-    hasOptedOut: jest.fn().mockResolvedValue(false),
+    freshRecipient: jest.fn(async (id: string) => ({ email: `${id}@acme.co`, optedOut: false })),
     hasClaimed: jest.fn().mockResolvedValue(false),
     claim: jest.fn().mockResolvedValue(true),
-    recordSent: jest.fn().mockResolvedValue(true),
-    getUsage: jest.fn().mockResolvedValue(usage()),
+    getUsageByUser: jest.fn().mockResolvedValue(usageFor('u1')),
     getAdsWeeks: jest.fn().mockResolvedValue([META_WEEK, GOOGLE_WEEK]),
     sendEmail: jest.fn(async (...a: any[]) => { sent.push(a); return 'sent'; }),
     backendUrl: () => 'https://api.test/',
@@ -99,11 +130,15 @@ describe('config', () => {
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_ENABLED: '1' } as any).enabled).toBe(false);
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_ENABLED: 'true' } as any).enabled).toBe(true);
   });
-  it('uses Monday 15:00 UTC, 7 days, 200 per pass by default, and ignores out-of-range values', () => {
-    expect(getZomaWeeklyReportConfig({})).toEqual({ enabled: false, weekday: 1, hour: 15, lookbackDays: 7, maxPerPass: 200 });
+  it('uses Monday 15:00 UTC and 200 per pass by default, and ignores out-of-range values', () => {
+    expect(getZomaWeeklyReportConfig({})).toEqual({ enabled: false, weekday: 1, hour: 15, maxPerPass: 200, onlyUserIds: null });
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_WEEKDAY: '9', ZOMA_WEEKLY_REPORT_HOUR: '24', ZOMA_WEEKLY_REPORT_MAX_PER_PASS: '0' } as any))
-      .toEqual({ enabled: false, weekday: 1, hour: 15, lookbackDays: 7, maxPerPass: 200 });
+      .toEqual({ enabled: false, weekday: 1, hour: 15, maxPerPass: 200, onlyUserIds: null });
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_WEEKDAY: '5', ZOMA_WEEKLY_REPORT_HOUR: '8' } as any)).toMatchObject({ weekday: 5, hour: 8 });
+  });
+  it('a canary list of user ids is parsed from a comma list, blanks ignored', () => {
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_ONLY_USER_IDS: ' u1, u2 ,,' } as any).onlyUserIds).toEqual(['u1', 'u2']);
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_ONLY_USER_IDS: '  ' } as any).onlyUserIds).toBeNull();
   });
 });
 
@@ -134,6 +169,29 @@ describe('pure rules', () => {
     expect(isReportRecipient({ email: 'qa-user@acme.co' })).toBe(false); // test/fixture local part
     expect(isReportRecipient({ email: 'x@example.com' })).toBe(false); // test domain
   });
+
+  it('ad windows are COMPLETE days: the 7 ending yesterday, then the 7 before, never today', () => {
+    expect(WIN).toEqual({ since: '2026-11-16', until: '2026-11-22', prevSince: '2026-11-09', prevUntil: '2026-11-15' });
+    // Sending later the same day, or at 00:00, gives the same windows: the day of the send is never counted.
+    expect(adsWindows(Date.UTC(2026, 10, 23, 23, 59))).toEqual(WIN);
+    expect(adsWindows(Date.UTC(2026, 10, 23, 0, 0))).toEqual(WIN);
+    // Consecutive weekly sends never share a day.
+    const next = adsWindows(Date.UTC(2026, 10, 30, 16, 0));
+    expect(next.since > WIN.until).toBe(true);
+    expect(next.prevUntil).toBe(WIN.until);
+  });
+
+  it('eachDate lists every date inclusive, across month ends', () => {
+    expect(eachDate('2026-11-29', '2026-12-02')).toEqual(['2026-11-29', '2026-11-30', '2026-12-01', '2026-12-02']);
+    expect(eachDate('2026-11-16', '2026-11-22')).toHaveLength(7);
+  });
+
+  it('pctChange is whole percent, and undefined without a usable baseline', () => {
+    expect(pctChange(120, 100)).toBe(20);
+    expect(pctChange(80, 100)).toBe(-20);
+    expect(pctChange(5, 0)).toBeUndefined();
+    expect(pctChange(5, undefined)).toBeUndefined();
+  });
 });
 
 describe('unsubscribe token', () => {
@@ -153,75 +211,230 @@ describe('unsubscribe token', () => {
     expect(url.startsWith('https://api.test/api/zoma/weekly-report/unsubscribe?t=')).toBe(true);
     expect(verifyUnsubscribeToken(decodeURIComponent(url.split('?t=')[1]), SECRET)).toBe('user-9');
   });
+  it('the one-click headers carry the same signed link', () => {
+    expect(unsubscribeHeaders('https://api.test/u?t=abc')).toEqual({
+      'List-Unsubscribe': '<https://api.test/u?t=abc>',
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    });
+  });
+});
+
+describe('the numbers: week-over-week, chips, one insight sentence', () => {
+  it('chips show each number with its change against last week and who it is good for', () => {
+    const chips = Object.fromEntries(weekChips(META_ADS).map((c) => [c.label, c]));
+    expect(chips['Spend']).toMatchObject({ value: '120.00 USD', deltaText: 'up 20% vs last week', arrow: '▲', tone: 'neutral' }); // spending more is neither good nor bad
+    expect(chips['Conversions']).toMatchObject({ value: '22 (purchase)', deltaText: 'up 10% vs last week', tone: 'good' });
+    expect(chips['Cost per conversion']).toMatchObject({ value: '5.45 USD', deltaText: 'up 9% vs last week', arrow: '▲', tone: 'bad' }); // dearer conversions are bad
+    expect(chips['Clicks']).toMatchObject({ value: '310', deltaText: 'up 24% vs last week', tone: 'good' });
+    expect(chips['Return on ad spend']).toMatchObject({ value: '2.4x', tone: 'neutral' });
+  });
+
+  it('a change under 2% is "about the same", and no baseline means no change text at all', () => {
+    const same = weekChips(GOOGLE_ADS);
+    expect(same.find((c) => c.label === 'Spend')).toMatchObject({ deltaText: 'about the same as last week', tone: 'neutral' });
+    expect(same.map((c) => c.label)).not.toContain('Return on ad spend'); // roas null: no chip
+    const noBaseline = weekChips({ ...META_ADS, previous: undefined });
+    expect(noBaseline.every((c) => c.deltaText === undefined)).toBe(true);
+    const zeroBaseline = weekChips({ ...META_ADS, previous: { spend: 0, impressions: 0, clicks: 0, conversions: 0 } });
+    expect(zeroBaseline.every((c) => c.deltaText === undefined)).toBe(true);
+  });
+
+  it('no conversions means "none yet" for cost per conversion, never a division by zero', () => {
+    const c = weekChips({ ...META_ADS, conversions: 0, roas: null }).find((x) => x.label === 'Cost per conversion')!;
+    expect(c).toMatchObject({ value: 'none yet', tone: 'neutral' });
+    expect(c.deltaText).toBeUndefined();
+  });
+
+  it('fractional conversions and an unknown currency read naturally', () => {
+    const c = weekChips({ ...META_ADS, currency: undefined, conversions: 0.4, spend: 5, roas: null, previous: undefined });
+    expect(c.find((x) => x.label === 'Spend')!.value).toBe('5.00');
+    expect(c.find((x) => x.label === 'Conversions')!.value).toBe('0.4 (purchase)');
+  });
+
+  it('Meta action types are shown as plain words', () => {
+    const v = (e: string) => weekChips({ ...META_ADS, conversionEvent: e }).find((c) => c.label === 'Conversions')!.value;
+    expect(v('onsite_conversion.lead_grouped')).toBe('22 (lead grouped)');
+    expect(v('offsite_conversion.fb_pixel_purchase')).toBe('22 (purchase)');
+  });
+
+  it('the insight is one factual sentence, and only when last week gives a baseline', () => {
+    expect(weekInsight(META_ADS)).toBe('Spend is up 20% and conversions are up 10% compared with last week, so each conversion cost 9% more.');
+    expect(weekInsight(GOOGLE_ADS)).toBe('Spend is about the same and conversions are about the same compared with last week.');
+    expect(weekInsight({ ...META_ADS, previous: undefined })).toBeUndefined();
+    expect(weekInsight({ ...META_ADS, previous: { spend: 0, impressions: 0, clicks: 0, conversions: 0 } })).toBeUndefined();
+    expect(weekInsight({ ...META_ADS, spend: 0 })).toBeUndefined();
+  });
+
+  it('conversions and cost per conversion are only discussed when both weeks have conversions', () => {
+    expect(weekInsight({ ...META_ADS, previous: { ...META_ADS.previous!, conversions: 0 } })).toBe('Spend is up 20% compared with last week.');
+    expect(weekInsight({ ...META_ADS, conversions: 0 })).toBe('Spend is up 20% compared with last week.');
+  });
+
+  it('a small cost-per-conversion move is not mentioned, a big drop is', () => {
+    const cheaper = weekInsight({ ...META_ADS, spend: 100, previous: { spend: 100, impressions: 1, clicks: 1, conversions: 11 } });
+    expect(cheaper).toBe('Spend is about the same and conversions are up 100% compared with last week, so each conversion cost 50% less.');
+    const flat = weekInsight({ ...META_ADS, spend: 104, conversions: 21, previous: { spend: 100, impressions: 1, clicks: 1, conversions: 20 } });
+    expect(flat).toBe('Spend is up 4% and conversions are up 5% compared with last week.');
+  });
+});
+
+describe('weekFromDaily', () => {
+  const row = (date: string, spend: number, conversions = 0, value = 0) => ({ date, spend, impressions: spend * 10, clicks: spend / 2, conversions, conversion_value: value });
+  const extra = { currency: 'USD', conversionEvent: 'purchase', topCampaigns: [] };
+
+  it('sums this week and last, fills days with no delivery with zeros, and keeps seven days oldest first', () => {
+    const week = weekFromDaily(
+      [row('2026-11-16', 10, 1, 30), row('2026-11-18', 20, 2, 60), row('2026-11-10', 14, 1), row('2026-11-15', 6)],
+      WIN, extra,
+    )!;
+    expect(week).toMatchObject({ currency: 'USD', spend: 30, impressions: 300, clicks: 15, conversions: 3, roas: 3, conversionEvent: 'purchase' });
+    expect(week.previous).toEqual({ spend: 20, impressions: 200, clicks: 10, conversions: 1 });
+    expect(week.daily.map((d) => d.date)).toEqual(eachDate('2026-11-16', '2026-11-22'));
+    expect(week.daily.map((d) => d.spend)).toEqual([10, 0, 20, 0, 0, 0, 0]);
+    expect(week.daily.map((d) => d.conversions)).toEqual([1, 0, 2, 0, 0, 0, 0]);
+  });
+
+  it('ignores rows outside both windows (a partial today, or anything older)', () => {
+    const week = weekFromDaily([row('2026-11-16', 10), row('2026-11-23', 999), row('2026-11-08', 999)], WIN, extra)!;
+    expect(week.spend).toBe(10);
+    expect(week.previous!.spend).toBe(0);
+  });
+
+  it('two rows for one date are added, not overwritten', () => {
+    const week = weekFromDaily([row('2026-11-16', 10), row('2026-11-16', 5)], WIN, extra)!;
+    expect(week.daily[0].spend).toBe(15);
+  });
+
+  it('no delivery this week is null even when last week delivered; impressions alone count as delivery', () => {
+    expect(weekFromDaily([row('2026-11-10', 50)], WIN, extra)).toBeNull();
+    expect(weekFromDaily([], WIN, extra)).toBeNull();
+    expect(weekFromDaily([{ date: '2026-11-17', spend: 0, impressions: 50, clicks: 0, conversions: 0 }], WIN, extra)).not.toBeNull();
+  });
+
+  it('ROAS only when the platform reports a conversion value', () => {
+    expect(weekFromDaily([row('2026-11-16', 10)], WIN, extra)!.roas).toBeNull();
+    expect(weekFromDaily([row('2026-11-16', 10, 1, 25)], WIN, extra)!.roas).toBe(2.5);
+  });
 });
 
 describe('the email', () => {
-  const range = { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' };
   const email = (over: Partial<Parameters<typeof weeklyReportEmail>[0]> = {}) =>
-    weeklyReportEmail({ usage: usage(), platforms: [META_WEEK, GOOGLE_WEEK], range, unsubscribeUrl: 'https://api.test/u?t=abc', ...over });
+    weeklyReportEmail({ usage: usage(), platforms: [META_WEEK, GOOGLE_WEEK], range: USAGE_RANGE, unsubscribeUrl: 'https://api.test/u?t=abc', ...over });
+  const quiet = usage({ writes: noWrites, recentWrites: [] });
 
-  it('shows spend and results for Meta and Google Ads, the confirmed changes, the call count and the unsubscribe link', () => {
+  it('shows each platform with its numbers and changes, daily spend, top campaigns, the changes, the call count and the unsubscribe link', () => {
     const e = email();
     expect(e.subject).toBe('Your Zoma week in ads');
-    expect(e.text).toContain('2026-11-16 to 2026-11-23');
-    expect(e.text).toMatch(/Meta ads\nSpend: 120\.50 USD\nImpressions: 14,000\nClicks: 310\nConversions: 22 \(purchase\)\nReturn on ad spend: 2\.4x/);
-    expect(e.text).toMatch(/Google Ads\nSpend: 950\.00 INR\nImpressions: 5,200\nClicks: 120\nConversions: 4\n/);
-    expect(e.text).toContain('Zoma made 2 confirmed changes to your ads this week.');
-    expect(e.text).toContain('- 2026-11-20: create ad group (Google Ads)');
-    expect(e.text).toContain('- 2026-11-18: update campaign (Meta)');
-    expect(e.text).toContain('Your agent made 12 successful Zoma calls this week.');
+    expect(e.text).toContain('Your Zoma week in ads, Nov 16 to Nov 22.');
+    expect(e.text).toContain('Meta ads\nSpend is up 20% and conversions are up 10% compared with last week, so each conversion cost 9% more.');
+    expect(e.text).toContain('Spend: 120.00 USD (up 20% vs last week)');
+    expect(e.text).toContain('Conversions: 22 (purchase) (up 10% vs last week)');
+    expect(e.text).toContain('Cost per conversion: 5.45 USD (up 9% vs last week)');
+    expect(e.text).toContain('Return on ad spend: 2.4x');
+    expect(e.text).toContain('Spend per day (USD): Mon 10.00, Tue 20.00, Wed 30.00, Thu 0.00, Fri 25.00, Sat 15.00, Sun 20.00');
+    expect(e.text).toContain('1. Spring Sale: 80.00 USD, 15 conversions');
+    expect(e.text).toContain('2. Retargeting: 40.00 USD, 7 conversions');
+    expect(e.text).toContain('Google Ads\nSpend is about the same and conversions are about the same compared with last week.');
+    expect(e.text).toContain('Spend per day (INR): Mon 100.00');
+    expect(e.text).toContain('Changes made through Zoma: 2 (each one confirmed by reading it back).');
+    expect(e.text).toContain('- Nov 20: create ad group (Google Ads), confirmed');
+    expect(e.text).toContain('- Nov 18: update campaign (Meta), confirmed');
+    expect(e.text).toContain('Your agent made 12 successful Zoma calls in the past 7 days.');
     expect(e.text).toContain('Stop this weekly email: https://api.test/u?t=abc');
-    expect(e.html).toContain('<h4>Meta ads</h4><ul><li>Spend: 120.50 USD</li>');
-    expect(e.html).toContain('<h4>Google Ads</h4><ul><li>Spend: 950.00 INR</li>');
+  });
+
+  it('the HTML draws the charts with table cells (no images, no scripts), one colour per platform', () => {
+    const e = email();
+    expect(e.html).not.toMatch(/<img|<script|<svg|<canvas/i);
+    expect(e.html).toContain('border-left:4px solid #1877f2');
+    expect(e.html).toContain('border-left:4px solid #34a853');
+    expect(e.html).toContain('bgcolor="#1877f2"');
+    expect(e.html).toContain('bgcolor="#34a853"');
+    expect(e.html).toContain('Spend per day (USD)');
+    expect(e.html).toContain('Spend per day (INR)');
+    expect(e.html).toContain('Top campaigns by spend');
+    for (const d of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) expect(e.html).toContain(d);
     expect(e.html).toContain('href="https://api.test/u?t=abc"');
     expect(e.html).toContain('support@agentweb.pro');
   });
 
+  it('a day with no spend is drawn as a flat line, not a bar, and the tallest day gets the full height', () => {
+    const html = email({ platforms: [META_WEEK] }).html;
+    expect(html.match(/height="110" bgcolor="#1877f2"/g)).toHaveLength(1); // Wed, the 30.00 day
+    expect(html).toContain('height="1" bgcolor="#dadce0"'); // Thu, no spend
+  });
+
+  it('never adds the platforms together: currencies differ and a combined number would be wrong', () => {
+    const e = email();
+    expect(e.text + e.html).not.toMatch(/\bTotal\b/i);
+    expect(e.text + e.html).not.toMatch(/1,?070\b/); // 120 + 950
+  });
+
   it('only the platforms that are connected appear, each described truthfully', () => {
-    const metaOnly = email({ platforms: [META_WEEK] });
+    const metaOnly = email({ platforms: [META_WEEK], usage: quiet });
     expect(metaOnly.text).toContain('Meta ads');
-    expect(metaOnly.text).not.toContain('Google Ads\nSpend');
-    const mixed = email({ platforms: [{ platform: 'meta', status: 'no_delivery' }, { platform: 'google_ads', status: 'unreadable' }] });
-    expect(mixed.text).toContain('No ad delivery was recorded on your connected Meta ads account this week.');
+    expect(metaOnly.text).not.toContain('Google Ads');
+    const mixed = email({ platforms: [{ platform: 'meta', status: 'no_delivery' }, { platform: 'google_ads', status: 'unreadable' }], usage: quiet });
+    expect(mixed.text).toContain('No ad delivery was recorded on your Meta ads account this week.');
     expect(mixed.text).toContain('We could not read your Google Ads account this week. It may need to be reconnected: ask your agent to run zoma_status.');
-    expect(mixed.html).toContain('<h4>Meta ads</h4><p>No ad delivery was recorded');
-    expect(mixed.html).toContain('<h4>Google Ads</h4><p>We could not read your Google Ads account');
+    expect(mixed.html).toContain('No ad delivery was recorded on your Meta ads account this week.');
+    expect(mixed.html).toContain('We could not read your Google Ads account this week.');
+    expect(mixed.html).not.toContain('Spend per day');
   });
 
   it('with no connected ad account it says so, and how to connect one', () => {
     const e = email({ platforms: [] });
     expect(e.text).toContain('No ad account is connected to Zoma yet. Ask your agent to run zoma_status for the connect link.');
-    expect(e.html).toContain('<p>No ad account is connected to Zoma yet.');
-    expect(e.text).not.toContain('Spend:');
+    expect(e.html).toContain('No ad account is connected to Zoma yet.');
+    expect(e.text).not.toContain('Spend per day');
   });
 
-  it('never includes object ids or account ids, and escapes values and the url in the HTML', () => {
-    const e = email({ platforms: [{ platform: 'meta', status: 'delivered', ads: { ...META_ADS, conversionEvent: '<script>alert(1)</script>' } }], unsubscribeUrl: 'https://api.test/u?t="x"&y=1' });
+  it('a platform without a previous week still reads fine: no change text, no insight', () => {
+    const e = email({ platforms: [{ platform: 'meta', status: 'delivered', ads: { ...META_ADS, previous: undefined } }], usage: quiet });
+    expect(e.text).toContain('Spend: 120.00 USD\n');
+    expect(e.text).not.toContain('vs last week');
+    expect(e.text).not.toContain('compared with last week');
+  });
+
+  it('never includes object ids or account ids, and escapes every user-typed value in the HTML', () => {
+    const hostile: ZomaAdsWeek = { ...META_ADS, conversionEvent: 'x<b>', topCampaigns: [{ name: '<script>alert(1)</script>', spend: 80, conversions: 1 }] };
+    const e = email({ platforms: [{ platform: 'meta', status: 'delivered', ads: hostile }], unsubscribeUrl: 'https://api.test/u?t="x"&y=1' });
     expect(e.text + e.html).not.toMatch(/120000111|120000222|act_/);
     expect(e.html).not.toContain('<script>');
-    expect(e.html).toContain('Conversions: 22 (&lt;script&gt;alert(1)&lt;/script&gt;)');
+    expect(e.html).not.toContain('x<b>'); // the page uses its own <b> for the insight; the typed one must arrive escaped
+    expect(e.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(e.html).toContain('x&lt;b&gt;');
     expect(e.html).toContain('t=&quot;x&quot;&amp;y=1');
   });
 
-  it('lists only confirmed changes, handles one change and none', () => {
-    const one = email({
+  it('campaign names are one short printable line; an empty one is "Untitled campaign"', () => {
+    const ads: ZomaAdsWeek = { ...META_ADS, topCampaigns: [{ name: 'Line1\nLine2\t\u0007', spend: 3, conversions: 0 }, { name: 'A'.repeat(60), spend: 2, conversions: 0 }, { name: '', spend: 1, conversions: 0 }] };
+    const e = email({ platforms: [{ platform: 'meta', status: 'delivered', ads }], usage: quiet });
+    expect(e.text).toContain('1. Line1 Line2: 3.00 USD');
+    expect(e.text).toContain(`2. ${'A'.repeat(39)}…: 2.00 USD`);
+    expect(e.text).toContain('3. Untitled campaign: 1.00 USD');
+  });
+
+  it('says exactly what happened with changes: none, all confirmed, some not confirmed, none confirmed', () => {
+    expect(email({ usage: quiet }).text).toContain('No changes were made through Zoma this week.');
+    expect(email({ usage: quiet }).text).not.toContain('Latest changes');
+
+    const mixed = email({
       usage: usage({ toolCalls: 1, writes: { total: 3, confirmed: 1, mismatch: 1, unconfirmed: 1 }, recentWrites: [
         { ts: '2026-11-19T10:00:00.000Z', entityType: 'AD', action: 'UPDATE', verification: 'MISMATCH' },
         { ts: '2026-11-20T10:00:00.000Z', entityType: 'AD', action: 'PAUSE', verification: 'CONFIRMED' },
       ] }),
     });
-    expect(one.text).toContain('Zoma made 1 confirmed change to your ads this week.');
-    expect(one.text).toContain('- 2026-11-20: pause ad');
-    expect(one.text).not.toContain('2026-11-19');
-    expect(one.text).toContain('Your agent made 1 successful Zoma call this week.');
-    const none = email({ usage: usage({ writes: noWrites, recentWrites: [] }) });
-    expect(none.text).toContain('Zoma made no changes to your ads this week.');
-  });
+    expect(mixed.text).toContain('Changes sent through Zoma: 3. 1 confirmed by reading them back, 2 could not be confirmed.');
+    expect(mixed.text).toContain('Latest changes:');
+    expect(mixed.text).toContain('- Nov 20: pause ad, confirmed');
+    expect(mixed.text).toContain('- Nov 19: update ad, not confirmed');
+    expect(mixed.text).toContain('Your agent made 1 successful Zoma call in the past 7 days.');
 
-  it('ad lines: no conversion event label or ROAS when there are none, no currency when unknown', () => {
-    expect(adsWeekLines({ spend: 5, impressions: 100, clicks: 2, conversions: 0, roas: null, conversionEvent: null }))
-      .toEqual(['Spend: 5.00', 'Impressions: 100', 'Clicks: 2', 'Conversions: 0']);
-    expect(adsWeekLines({ ...META_ADS, roas: 0 })).not.toContain('Return on ad spend: 0x');
+    // Writes were dispatched but none could be confirmed: never claim "no changes".
+    const none = email({ usage: usage({ writes: { total: 3, confirmed: 0, mismatch: 1, unconfirmed: 2 }, recentWrites: [] }) });
+    expect(none.text).toContain('Changes sent through Zoma: 3. 0 confirmed by reading them back, 3 could not be confirmed.');
+    expect(none.text).not.toContain('No changes were made');
   });
 });
 
@@ -233,11 +446,12 @@ describe('runZomaWeeklyReports', () => {
     const early = makeDeps({ now: () => Date.UTC(2026, 10, 23, 14, 0) });
     expect(await runZomaWeeklyReports(early)).toEqual({ checked: 0, sent: 0, failed: 0 });
     expect(early.listUsers).not.toHaveBeenCalled();
+    expect(early.getUsageByUser).not.toHaveBeenCalled();
     const tuesday = makeDeps({ now: () => Date.UTC(2026, 10, 24, 16, 0) });
     expect((await runZomaWeeklyReports(tuesday)).sent).toBe(0);
   });
 
-  it('sends one email to an eligible user, claiming the ISO week first', async () => {
+  it('sends one email to an eligible user, claiming the ISO week first, with the one-click headers', async () => {
     const d = makeDeps();
     const r = await runZomaWeeklyReports(d);
     expect(r).toEqual({ checked: 1, sent: 1, failed: 0 });
@@ -247,17 +461,33 @@ describe('runZomaWeeklyReports', () => {
     expect(d.sent[0][1]).toBe('Your Zoma week in ads');
     expect(d.sent[0][2]).toContain('Meta ads');
     expect(d.sent[0][2]).toContain('Google Ads');
-    expect(d.recordSent).toHaveBeenCalledWith('u1', '2026-W48');
+    expect(d.sent[0][4]['List-Unsubscribe']).toMatch(/^<https:\/\/api\.test\/api\/zoma\/weekly-report\/unsubscribe\?t=.+>$/);
+    expect(d.sent[0][4]['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
     expect((d.claim as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan((d.sendEmail as jest.Mock).mock.invocationCallOrder[0]);
-    // The window is the last 7 days ending now.
-    expect(d.getUsage).toHaveBeenCalledWith('u1', { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' });
-    expect(d.getAdsWeeks).toHaveBeenCalledWith('u1', { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' });
+    // Usage: the last 7 x 24 hours. Ads: the last 7 complete days, then the 7 before.
+    expect(d.getUsageByUser).toHaveBeenCalledWith(USAGE_RANGE);
+    expect(d.getAdsWeeks).toHaveBeenCalledWith('u1', WIN, { final: false });
+  });
+
+  it('the usage query runs ONCE for the whole pass, however many users there are', async () => {
+    const d = makeDeps({
+      listUsers: jest.fn().mockResolvedValue([customer('a'), customer('b'), customer('c')]),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor('a', 'b', 'c')),
+    });
+    await runZomaWeeklyReports(d);
+    expect(d.getUsageByUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('on the last tick of the window a platform that still cannot be read is reported, not retried', async () => {
+    const d = makeDeps({ now: () => Date.UTC(2026, 10, 23, 23, 30) });
+    await runZomaWeeklyReports(d);
+    expect(d.getAdsWeeks).toHaveBeenCalledWith('u1', adsWindows(Date.UTC(2026, 10, 23, 23, 30)), { final: true });
   });
 
   it('everyone who made a call gets it, even with no ad delivery, no change, or no ad account', async () => {
     const d = makeDeps({
       listUsers: jest.fn().mockResolvedValue([customer('a'), customer('b'), customer('c')]),
-      getUsage: jest.fn().mockResolvedValue(usage({ toolCalls: 1, writes: noWrites, recentWrites: [] })),
+      getUsageByUser: jest.fn().mockResolvedValue(new Map([['a', usage({ toolCalls: 1, writes: noWrites, recentWrites: [] })], ['b', usage({ toolCalls: 1, writes: noWrites, recentWrites: [] })], ['c', usage({ toolCalls: 1, writes: noWrites, recentWrites: [] })]])),
       getAdsWeeks: jest.fn(async (id: string) => (id === 'a' ? [] : id === 'b' ? [{ platform: 'meta', status: 'no_delivery' }] : [GOOGLE_WEEK]) as PlatformWeek[]),
     });
     expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 3, sent: 3 });
@@ -266,18 +496,22 @@ describe('runZomaWeeklyReports', () => {
     expect(d.sent[1][2]).toContain('No ad delivery was recorded');
   });
 
-  it('a user with no successful call in the window gets nothing', async () => {
-    const d = makeDeps({ getUsage: jest.fn().mockResolvedValue(usage({ toolCalls: 0 })) });
-    expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 1, sent: 0 });
-    expect(d.getAdsWeeks).not.toHaveBeenCalled();
-    expect(d.claim).not.toHaveBeenCalled();
-    expect(d.sendEmail).not.toHaveBeenCalled();
+  it('a user with no successful Zoma call gets nothing and costs no per-user work', async () => {
+    const absent = makeDeps({ getUsageByUser: jest.fn().mockResolvedValue(new Map()) });
+    expect(await runZomaWeeklyReports(absent)).toMatchObject({ checked: 1, sent: 0 });
+    expect(absent.hasClaimed).not.toHaveBeenCalled();
+    expect(absent.getAdsWeeks).not.toHaveBeenCalled();
+    expect(absent.freshRecipient).not.toHaveBeenCalled();
+    expect(absent.sendEmail).not.toHaveBeenCalled();
+    const zero = makeDeps({ getUsageByUser: jest.fn().mockResolvedValue(new Map([['u1', usage({ toolCalls: 0 })]])) });
+    expect(await runZomaWeeklyReports(zero)).toMatchObject({ checked: 1, sent: 0 });
+    expect(zero.claim).not.toHaveBeenCalled();
   });
 
   it('a second pass in the same week sends nothing', async () => {
     const d = makeDeps({ hasClaimed: jest.fn().mockResolvedValue(true) });
     expect(await runZomaWeeklyReports(d)).toMatchObject({ sent: 0 });
-    expect(d.getUsage).not.toHaveBeenCalled();
+    expect(d.getAdsWeeks).not.toHaveBeenCalled();
     expect(d.sendEmail).not.toHaveBeenCalled();
   });
 
@@ -287,34 +521,67 @@ describe('runZomaWeeklyReports', () => {
     expect(d.sendEmail).not.toHaveBeenCalled();
   });
 
-  it('skips internal/test accounts, pal leads and users without an email', async () => {
+  it('skips internal/test accounts, pal leads, users without an email, and tombstoned accounts', async () => {
     const d = makeDeps({
       listUsers: jest.fn().mockResolvedValue([
         customer('internal', { email: 'a@agentweb.pro' }), customer('admin', { isAdmin: true }),
         customer('pal', { zomaAdsExperience: 'not_interested' }), customer('noemail', { email: '' }),
+        customer('deleted_abc123'),
       ]),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor('internal', 'admin', 'pal', 'noemail', 'deleted_abc123')),
     });
     expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 0, sent: 0 });
-    expect(d.getUsage).not.toHaveBeenCalled();
+    expect(d.hasClaimed).not.toHaveBeenCalled();
     expect(d.claim).not.toHaveBeenCalled();
   });
 
-  describe('opt-out', () => {
+  it('the canary list restricts the whole pass to the named users', async () => {
+    const d = makeDeps({
+      config: () => cfg({ onlyUserIds: ['b'] }),
+      listUsers: jest.fn().mockResolvedValue([customer('a'), customer('b'), customer('c')]),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor('a', 'b', 'c')),
+    });
+    expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 1, sent: 1 });
+    expect(d.sent.map((s) => s[0])).toEqual(['b@acme.co']);
+  });
+
+  describe('opt-out and the fresh recipient read', () => {
     it('a user already marked opted out in the scan is skipped before any other read', async () => {
-      const d = makeDeps({ listUsers: jest.fn().mockResolvedValue([customer('opted', { zomaWeeklyReportOptOutAt: '2026-11-20T10:00:00.000Z' })]) });
+      const d = makeDeps({ listUsers: jest.fn().mockResolvedValue([customer('opted', { zomaWeeklyReportOptOutAt: '2026-11-20T10:00:00.000Z' })]), getUsageByUser: jest.fn().mockResolvedValue(usageFor('opted')) });
       expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 1, sent: 0 });
       expect(d.hasClaimed).not.toHaveBeenCalled();
-      expect(d.getUsage).not.toHaveBeenCalled();
+      expect(d.getAdsWeeks).not.toHaveBeenCalled();
       expect(d.sendEmail).not.toHaveBeenCalled();
     });
 
     it('a user who unsubscribed after the scan (a stale row) is caught by the fresh read, before the claim', async () => {
-      const d = makeDeps({ hasOptedOut: jest.fn().mockResolvedValue(true) });
+      const d = makeDeps({ freshRecipient: jest.fn().mockResolvedValue({ email: 'u1@acme.co', optedOut: true }) });
       expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 1, sent: 0 });
-      expect(d.hasOptedOut).toHaveBeenCalledWith('u1');
+      expect(d.freshRecipient).toHaveBeenCalledWith('u1');
       expect(d.claim).not.toHaveBeenCalled();
       expect(d.sendEmail).not.toHaveBeenCalled();
     });
+
+    it('an account that cannot be resolved is never emailed (fail closed)', async () => {
+      const d = makeDeps({ freshRecipient: jest.fn().mockResolvedValue(undefined) });
+      expect(await runZomaWeeklyReports(d)).toMatchObject({ checked: 1, sent: 0 });
+      expect(d.claim).not.toHaveBeenCalled();
+      expect(d.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('the email goes to the address read fresh, not to a stale one from the scan', async () => {
+      const d = makeDeps({ freshRecipient: jest.fn().mockResolvedValue({ email: 'changed@acme.co', optedOut: false }) });
+      await runZomaWeeklyReports(d);
+      expect(d.sent.map((s) => s[0])).toEqual(['changed@acme.co']);
+    });
+  });
+
+  it('an email that cannot be built does not burn the week: nothing is claimed', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const d = makeDeps({ secret: () => { throw new Error('no signing secret'); } });
+    expect(await runZomaWeeklyReports(d)).toMatchObject({ sent: 0, failed: 0 });
+    expect(d.claim).not.toHaveBeenCalled();
+    expect(d.sendEmail).not.toHaveBeenCalled();
   });
 
   it('an ad-read failure skips the user for this pass (nothing claimed, retried next hour)', async () => {
@@ -325,37 +592,32 @@ describe('runZomaWeeklyReports', () => {
     expect(d.sendEmail).not.toHaveBeenCalled();
   });
 
-  it('a failed send is counted, logged, not retried in the pass and leaves no sent row', async () => {
+  it('a failed send is counted, logged and not retried in the pass', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const d = makeDeps({ sendEmail: jest.fn().mockResolvedValue('failed') });
     expect(await runZomaWeeklyReports(d)).toEqual({ checked: 1, sent: 0, failed: 1 });
     expect(d.sendEmail).toHaveBeenCalledTimes(1);
-    expect(d.recordSent).not.toHaveBeenCalled();
   });
 
   it('a suppressed send (non-prod mail guard) is neither sent nor failed', async () => {
     const d = makeDeps({ sendEmail: jest.fn().mockResolvedValue('suppressed') });
     expect(await runZomaWeeklyReports(d)).toEqual({ checked: 1, sent: 0, failed: 0 });
-    expect(d.recordSent).not.toHaveBeenCalled();
   });
 
-  it('a sent-row write failure does not undo or repeat the send', async () => {
+  it('one user failing does not stop the others; the per-pass cap holds and says so', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const d = makeDeps({ recordSent: jest.fn().mockRejectedValue(new Error('dynamo')) });
-    expect(await runZomaWeeklyReports(d)).toMatchObject({ sent: 1 });
-    expect(d.sendEmail).toHaveBeenCalledTimes(1);
-  });
-
-  it('one user failing does not stop the others, and the per-pass cap holds', async () => {
-    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const d = makeDeps({
       listUsers: jest.fn().mockResolvedValue([customer('a'), customer('b'), customer('c')]),
-      getUsage: jest.fn(async (id: string) => { if (id === 'a') throw new Error('boom'); return usage(); }),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor('a', 'b', 'c')),
+      hasClaimed: jest.fn(async (id: string) => { if (id === 'a') throw new Error('boom'); return false; }),
       config: () => cfg({ maxPerPass: 1 }),
     });
     const r = await runZomaWeeklyReports(d);
     expect(r.sent).toBe(1); // b was claimed; the cap of 1 stops before c
     expect(d.sent.map((s) => s[0])).toEqual(['b@acme.co']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('cap of 1'));
+    warn.mockRestore();
   });
 
   it('the unsubscribe link in the sent email verifies back to that user', async () => {
@@ -366,89 +628,181 @@ describe('runZomaWeeklyReports', () => {
   });
 });
 
-describe('the production ad-totals wiring (getAdsWeeks)', () => {
+describe('the production wiring', () => {
   const accounts = require('../services/connectedAccountsDb');
-  const range = { start: '2026-11-16T16:00:00.000Z', end: '2026-11-23T16:00:00.000Z' };
   const metaAccount = {
     platform: 'meta', account_id: '1339', account_name: 'Acme',
     config: { account_type: 'ad_account', ad_account_id: '1339', access_token: 't', token_expires_at: Date.now() + 3_600_000, granted_scopes: ['ads_read', 'ads_management'] },
   };
-  const googleAccount = { platform: 'google_ads', account_id: 'g1', account_name: 'Acme G', config: { customer_id: '288-302-9950', refresh_token: 'r' } };
-  const metaReport = (totals: Record<string, unknown>) => ({
-    account_id: '1339', currency: 'USD', level: 'account', conversion_event: 'lead', rows: [{}], summary: 'Meta ads report for act_1339 ... (agent-facing text, must not be used)',
-    totals: { spend: 0, impressions: 0, clicks: 0, ctr: null, cpc: null, conversions: 0, conversion_value: 0, roas: null, ...totals },
+  // Stored ids are undashed (googleAdsOAuthFinalize), which is what the credentials lookup compares against.
+  const googleAccount = { platform: 'google_ads', account_id: 'g1', account_name: 'Acme G', config: { customer_id: '2883029950', refresh_token: 'r' } };
+  const mrow = (date: string, spend: number, conversions = 0) => ({ date, spend, impressions: spend * 10, clicks: spend / 2, conversions, conversion_value: 0 });
+  const metaDaily = (rows: any[]) => ({ account_id: '1339', currency: 'USD', conversion_event: 'lead', rows });
+  const camp = (name: string, spend: number, conversions = 0) => ({ campaign_name: name, spend, conversions });
+  const gRow = (date: string, micros: number, impressions: number, clicks: number, conversions: number) => ({
+    segments: { date }, customer: { resourceName: 'customers/2883029950', currencyCode: 'INR' },
+    metrics: { costMicros: String(micros), impressions: String(impressions), clicks: String(clicks), conversions },
   });
-  const googleRows = (...metrics: Array<Record<string, unknown>>) => metrics.map((m) => ({ customer: { resourceName: 'customers/2883029950', currencyCode: 'INR' }, metrics: m }));
   let queryReporting: jest.SpyInstance;
   beforeEach(() => {
     mockRunReport.mockReset();
+    mockRunDaily.mockReset();
     accounts.getAccountsByUserIdIncludingOrgShared.mockReset();
     queryReporting = jest.spyOn(googleAdsService, 'queryReporting').mockReset();
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
   });
   afterEach(() => queryReporting.mockRestore());
+  const read = (opts = { final: false }) => defaultZomaWeeklyReportDeps.getAdsWeeks('u1', WIN, opts);
 
-  it('Meta: maps the report totals, not the agent-facing summary text', async () => {
-    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]);
-    mockRunReport.mockResolvedValue(metaReport({ spend: 12.3, impressions: 1200, clicks: 40, conversions: 3, roas: 2.4 }));
-    const weeks = await defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range);
-    expect(weeks).toEqual([{ platform: 'meta', status: 'delivered', ads: { currency: 'USD', spend: 12.3, impressions: 1200, clicks: 40, conversions: 3, roas: 2.4, conversionEvent: 'lead' } }]);
-    expect(JSON.stringify(weeks)).not.toMatch(/act_|agent-facing/);
-    expect(mockRunReport).toHaveBeenCalledWith(metaAccount, '1339', { level: 'account', since: '2026-11-16', until: '2026-11-23' });
-    expect(queryReporting).not.toHaveBeenCalled();
+  describe('Meta', () => {
+    beforeEach(() => accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]));
+
+    it('builds the week from one 14-day daily read plus a campaign ranking, never the agent-facing summary', async () => {
+      mockRunDaily.mockResolvedValue(metaDaily([mrow('2026-11-16', 10, 1), mrow('2026-11-18', 20, 2), mrow('2026-11-10', 14, 1)]));
+      mockRunReport.mockResolvedValue({ rows: [camp('Small', 5, 1), camp('Big', 25, 2), camp('Zero', 0), camp('Mid', 10), camp('Tiny', 1)], summary: 'Meta ads report for act_1339 (agent-facing text, must not be used)' });
+      const weeks = await read();
+      expect(weeks).toHaveLength(1);
+      expect(weeks[0]).toMatchObject({
+        platform: 'meta', status: 'delivered',
+        ads: {
+          currency: 'USD', spend: 30, impressions: 300, clicks: 15, conversions: 3, roas: null, conversionEvent: 'lead',
+          previous: { spend: 14, impressions: 140, clicks: 7, conversions: 1 },
+          topCampaigns: [{ name: 'Big', spend: 25, conversions: 2 }, { name: 'Mid', spend: 10, conversions: 0 }, { name: 'Small', spend: 5, conversions: 1 }],
+        },
+      });
+      expect((weeks[0] as any).ads.daily.map((d: DailyPoint) => d.spend)).toEqual([10, 0, 20, 0, 0, 0, 0]);
+      expect(JSON.stringify(weeks)).not.toMatch(/act_|agent-facing/);
+      expect(mockRunDaily).toHaveBeenCalledWith(metaAccount, '1339', { since: '2026-11-09', until: '2026-11-22' });
+      expect(mockRunReport).toHaveBeenCalledWith(metaAccount, '1339', { level: 'campaign', since: '2026-11-16', until: '2026-11-22', conversion_event: 'lead' });
+      expect(queryReporting).not.toHaveBeenCalled();
+    });
+
+    it('no delivery this week (even if last week delivered) is "no delivery", and costs no campaign read', async () => {
+      mockRunDaily.mockResolvedValueOnce(metaDaily([]));
+      await expect(read()).resolves.toEqual([{ platform: 'meta', status: 'no_delivery' }]);
+      mockRunDaily.mockResolvedValueOnce(metaDaily([mrow('2026-11-10', 50)]));
+      await expect(read()).resolves.toEqual([{ platform: 'meta', status: 'no_delivery' }]);
+      expect(mockRunReport).not.toHaveBeenCalled();
+    });
+
+    it('a failed campaign ranking does not hide the rest of the report', async () => {
+      mockRunDaily.mockResolvedValue(metaDaily([mrow('2026-11-16', 10)]));
+      mockRunReport.mockRejectedValue(new Error('campaign read failed'));
+      await expect(read()).resolves.toMatchObject([{ status: 'delivered', ads: { spend: 10, topCampaigns: [] } }]);
+    });
+
+    it('a permanent failure (expired connection) is "unreadable" right away, never "no delivery"', async () => {
+      mockRunDaily.mockRejectedValue(new Error('The Meta connection expired or was revoked, so no report was read. Reconnect Meta with a fresh Zoma connect link (call zoma_status).'));
+      await expect(read()).resolves.toEqual([{ platform: 'meta', status: 'unreadable' }]);
+    });
+
+    it('a transient failure throws (the user is retried next hour) until the last tick, then is "unreadable"', async () => {
+      mockRunDaily.mockRejectedValue(new Error('Meta did not return the report (HTTP 503). Nothing was changed.'));
+      await expect(read({ final: false })).rejects.toThrow('HTTP 503');
+      await expect(read({ final: true })).resolves.toEqual([{ platform: 'meta', status: 'unreadable' }]);
+    });
+
+    it('a connected account whose token has expired is "unreadable", not "not connected"', async () => {
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([{ ...metaAccount, config: { ...metaAccount.config, token_expires_at: Date.now() - 1000 } }]);
+      await expect(read()).resolves.toEqual([{ platform: 'meta', status: 'unreadable' }]);
+      expect(mockRunDaily).not.toHaveBeenCalled();
+    });
   });
 
-  it('Meta: no delivery, impressions without spend, and a failed read ("unreadable", never "no delivery")', async () => {
-    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount]);
-    mockRunReport.mockResolvedValueOnce(metaReport({}));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([{ platform: 'meta', status: 'no_delivery' }]);
-    mockRunReport.mockResolvedValueOnce(metaReport({ impressions: 50 }));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toMatchObject([{ status: 'delivered', ads: { spend: 0, impressions: 50 } }]);
-    mockRunReport.mockRejectedValueOnce(new Error('Meta did not return the report (code 190)'));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([{ platform: 'meta', status: 'unreadable' }]);
-  });
+  describe('Google Ads', () => {
+    beforeEach(() => accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]));
 
-  it('Google Ads: exact-window GAQL, cost micros to currency units, strings to numbers', async () => {
-    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]);
-    queryReporting.mockResolvedValue(googleRows({ clicks: '120', conversions: 4.5, costMicros: '950500000', impressions: '5200' }));
-    const weeks = await defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range);
-    expect(weeks).toEqual([{ platform: 'google_ads', status: 'delivered', ads: { currency: 'INR', spend: 950.5, impressions: 5200, clicks: 120, conversions: 4.5, roas: null, conversionEvent: null } }]);
-    expect(queryReporting).toHaveBeenCalledTimes(1);
-    const [userId, customerId, query] = queryReporting.mock.calls[0];
-    expect(userId).toBe('u1');
-    expect(customerId).toBe('2883029950'); // dashes stripped
-    expect(query).toContain("FROM customer WHERE segments.date BETWEEN '2026-11-16' AND '2026-11-23'");
-    expect(query).toContain('metrics.cost_micros');
-    expect(mockRunReport).not.toHaveBeenCalled();
-  });
+    it('reads a daily series for both weeks and a top-3 campaign ranking, cost micros to currency units', async () => {
+      queryReporting
+        .mockResolvedValueOnce([gRow('2026-11-17', 950_500_000, 5200, 120, 4.5), gRow('2026-11-10', 400_000_000, 100, 10, 1)])
+        .mockResolvedValueOnce([{ campaign: { name: 'Brand' }, metrics: { costMicros: '900000000', conversions: 4 } }, { campaign: { name: 'Generic' }, metrics: { costMicros: '50500000', conversions: 0.5 } }]);
+      const weeks = await read();
+      expect(weeks[0]).toMatchObject({
+        platform: 'google_ads', status: 'delivered',
+        ads: {
+          currency: 'INR', spend: 950.5, impressions: 5200, clicks: 120, conversions: 4.5, roas: null, conversionEvent: null,
+          previous: { spend: 400, impressions: 100, clicks: 10, conversions: 1 },
+          topCampaigns: [{ name: 'Brand', spend: 900, conversions: 4 }, { name: 'Generic', spend: 50.5, conversions: 0.5 }],
+        },
+      });
+      expect((weeks[0] as any).ads.daily[1].spend).toBe(950.5); // Tuesday Nov 17
+      expect(queryReporting).toHaveBeenCalledTimes(2);
+      const [userId, customerId, daily] = queryReporting.mock.calls[0];
+      expect(userId).toBe('u1');
+      expect(customerId).toBe('2883029950');
+      expect(daily).toContain('SELECT segments.date, customer.currency_code');
+      expect(daily).toContain("FROM customer WHERE segments.date BETWEEN '2026-11-09' AND '2026-11-22'");
+      const campaigns = queryReporting.mock.calls[1][2];
+      expect(campaigns).toContain("FROM campaign WHERE segments.date BETWEEN '2026-11-16' AND '2026-11-22'");
+      expect(campaigns).toContain('ORDER BY metrics.cost_micros DESC LIMIT 3');
+      expect(mockRunDaily).not.toHaveBeenCalled();
+    });
 
-  it('Google Ads: several rows are summed; zero spend and zero impressions is "no delivery"; an error is "unreadable"', async () => {
-    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]);
-    queryReporting.mockResolvedValueOnce(googleRows({ clicks: '1', conversions: 0, costMicros: '1000000', impressions: '10' }, { clicks: '2', conversions: 1, costMicros: '2500000', impressions: '20' }));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toMatchObject([{ status: 'delivered', ads: { spend: 3.5, impressions: 30, clicks: 3, conversions: 1 } }]);
-    queryReporting.mockResolvedValueOnce(googleRows({ clicks: '0', conversions: 0, costMicros: '0', impressions: '0' }));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([{ platform: 'google_ads', status: 'no_delivery' }]);
-    queryReporting.mockResolvedValueOnce([]);
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([{ platform: 'google_ads', status: 'no_delivery' }]);
-    queryReporting.mockRejectedValueOnce(new Error('Google Ads auth expired'));
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([{ platform: 'google_ads', status: 'unreadable' }]);
+    it('zero spend and zero impressions, or no rows at all, is "no delivery" and costs no campaign read', async () => {
+      queryReporting.mockResolvedValueOnce([gRow('2026-11-17', 0, 0, 0, 0)]);
+      await expect(read()).resolves.toEqual([{ platform: 'google_ads', status: 'no_delivery' }]);
+      queryReporting.mockResolvedValueOnce([]);
+      await expect(read()).resolves.toEqual([{ platform: 'google_ads', status: 'no_delivery' }]);
+      expect(queryReporting).toHaveBeenCalledTimes(2);
+    });
+
+    it('a failed campaign query keeps the report; a permanent error is "unreadable"; a transient one waits for the last tick', async () => {
+      queryReporting.mockResolvedValueOnce([gRow('2026-11-17', 10_000_000, 100, 5, 1)]).mockRejectedValueOnce(new Error('campaign query failed'));
+      await expect(read()).resolves.toMatchObject([{ status: 'delivered', ads: { spend: 10, topCampaigns: [] } }]);
+      queryReporting.mockRejectedValueOnce(new Error('PERMISSION_DENIED: the caller does not have permission'));
+      await expect(read()).resolves.toEqual([{ platform: 'google_ads', status: 'unreadable' }]);
+      queryReporting.mockRejectedValue(new Error('UNAVAILABLE: try again'));
+      await expect(read({ final: false })).rejects.toThrow('UNAVAILABLE');
+      await expect(read({ final: true })).resolves.toEqual([{ platform: 'google_ads', status: 'unreadable' }]);
+    });
   });
 
   it('both platforms are read independently: one failing does not hide the other', async () => {
     accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, googleAccount]);
-    mockRunReport.mockRejectedValue(new Error('meta down'));
-    queryReporting.mockResolvedValue(googleRows({ clicks: '5', conversions: 1, costMicros: '4000000', impressions: '100' }));
-    const weeks = await defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range);
+    mockRunDaily.mockRejectedValue(new Error('The Meta connection expired or was revoked'));
+    queryReporting.mockResolvedValueOnce([gRow('2026-11-17', 4_000_000, 100, 5, 1)]).mockResolvedValueOnce([]);
+    const weeks = await read();
     expect(weeks.map((w) => `${w.platform}:${w.status}`)).toEqual(['meta:unreadable', 'google_ads:delivered']);
   });
 
-  it('no usable connected ad account means an empty list and no report call', async () => {
-    accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([{ ...googleAccount, config: { customer_id: '', refresh_token: 'r' } }]);
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([]);
+  it('no connected ad account at all is an empty list and no report call', async () => {
     accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
-    await expect(defaultZomaWeeklyReportDeps.getAdsWeeks('u1', range)).resolves.toEqual([]);
-    expect(mockRunReport).not.toHaveBeenCalled();
+    await expect(read()).resolves.toEqual([]);
+    expect(mockRunDaily).not.toHaveBeenCalled();
     expect(queryReporting).not.toHaveBeenCalled();
+  });
+
+  it('isPermanentReadError: connection and permission problems are permanent, outages and rate limits are not', () => {
+    for (const m of ['The Meta connection expired or was revoked', 'Reconnect Meta', 'Google Ads PERMISSION_DENIED', 'invalid_grant', '... (OAuthException, code 190)', 'no usable access token']) {
+      expect(isPermanentReadError(new Error(m))).toBe(true);
+    }
+    for (const m of ['Meta did not return the report (HTTP 503)', 'timeout of 20000ms exceeded', 'Meta did not return the report (rate limit, code 4)', 'UNAVAILABLE', 'fetch failed']) {
+      expect(isPermanentReadError(new Error(m))).toBe(false);
+    }
+  });
+
+  it('the usage read is the Zoma product only (Emma MCP writes the same event type as emma_mcp)', async () => {
+    const spy = jest.spyOn(usageService, 'getMcpUsageByUser').mockResolvedValue(new Map());
+    await defaultZomaWeeklyReportDeps.getUsageByUser(USAGE_RANGE);
+    expect(spy).toHaveBeenCalledWith(USAGE_RANGE, { product: 'zoma' });
+    spy.mockRestore();
+  });
+
+  it('the claim is scoped to the environment: a non-production claim can never block production', async () => {
+    expect(claimKey('u1', '2026-W48', { NODE_ENV: 'production' } as any)).toBe('u1#2026-W48');
+    expect(claimKey('u1', '2026-W48', { NODE_ENV: 'development' } as any)).toBe('nonprod#u1#2026-W48');
+    expect(claimKey('u1', '2026-W48', {} as any)).toBe('nonprod#u1#2026-W48');
+    // And the production wiring really uses it, both to check and to claim.
+    const has = jest.spyOn(usageService, 'hasZomaFunnelRow').mockResolvedValue(false);
+    const rec = jest.spyOn(usageService, 'recordZomaBillingFunnel').mockResolvedValue(true);
+    await defaultZomaWeeklyReportDeps.hasClaimed('u1', '2026-W48');
+    await defaultZomaWeeklyReportDeps.claim('u1', '2026-W48');
+    const key = claimKey('u1', '2026-W48'); // this test run is NODE_ENV=test, so non-production
+    expect(key.startsWith('nonprod#')).toBe(true);
+    expect(has).toHaveBeenCalledWith('u1', 'weekly_report_claimed', key);
+    expect(rec).toHaveBeenCalledWith({ userId: 'u1', step: 'weekly_report_claimed', dedupeKey: key });
+    has.mockRestore();
+    rec.mockRestore();
   });
 });
 
@@ -460,9 +814,11 @@ describe('opt-out on the user record', () => {
     await expect(recordWeeklyReportOptOut('u7', set, () => new Date('2026-11-23T16:05:00Z'))).resolves.toBe(true);
     expect(set).toHaveBeenCalledWith('u7', '2026-11-23T16:05:00.000Z');
   });
-  it('an unknown or deleted user is false (nothing to stop), any other failure is thrown', async () => {
+  it('an unknown or deleted user is false (nothing to stop); any other failure, even one that says "not found", is thrown', async () => {
     await expect(recordWeeklyReportOptOut('gone', jest.fn().mockRejectedValue(new Error("User with ID 'gone' not found or has no email.")))).resolves.toBe(false);
     await expect(recordWeeklyReportOptOut('u7', jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')))).rejects.toThrow('ProvisionedThroughputExceeded');
+    // An AWS "table not found" must never be reported to the user as "you are unsubscribed".
+    await expect(recordWeeklyReportOptOut('u7', jest.fn().mockRejectedValue(new Error('Requested resource not found')))).rejects.toThrow('Requested resource not found');
   });
   it('the default writes only zomaWeeklyReportOptOutAt, with a partial update of that one user', async () => {
     await expect(recordWeeklyReportOptOut('u7')).resolves.toBe(true);
@@ -472,14 +828,18 @@ describe('opt-out on the user record', () => {
     expect(Object.keys(updates)).toEqual(['zomaWeeklyReportOptOutAt']);
     expect(new Date(updates.zomaWeeklyReportOptOutAt).toString()).not.toBe('Invalid Date');
   });
-  it('the fresh read uses the consistent lookup and answers by the flag', async () => {
-    mockGetUserByIdConsistent.mockResolvedValueOnce({ userId: 'u1', zomaWeeklyReportOptOutAt: '2026-11-23T16:05:00.000Z' });
-    await expect(defaultZomaWeeklyReportDeps.hasOptedOut('u1')).resolves.toBe(true);
-    mockGetUserByIdConsistent.mockResolvedValueOnce({ userId: 'u1' });
-    await expect(defaultZomaWeeklyReportDeps.hasOptedOut('u1')).resolves.toBe(false);
-    mockGetUserByIdConsistent.mockResolvedValueOnce(undefined);
-    await expect(defaultZomaWeeklyReportDeps.hasOptedOut('u1')).resolves.toBe(false);
+  it('the fresh read uses the consistent lookup, and answers with the address and the flag', async () => {
+    mockGetUserByIdConsistent.mockResolvedValueOnce({ userId: 'u1', email: 'a@acme.co', zomaWeeklyReportOptOutAt: '2026-11-23T16:05:00.000Z' });
+    await expect(defaultZomaWeeklyReportDeps.freshRecipient('u1')).resolves.toEqual({ email: 'a@acme.co', optedOut: true });
+    mockGetUserByIdConsistent.mockResolvedValueOnce({ userId: 'u1', email: 'a@acme.co' });
+    await expect(defaultZomaWeeklyReportDeps.freshRecipient('u1')).resolves.toEqual({ email: 'a@acme.co', optedOut: false });
     expect(mockGetUserByIdConsistent).toHaveBeenCalledWith('u1');
+  });
+  it('an account that is gone, or has no address, is "unresolved", never "not opted out"', async () => {
+    mockGetUserByIdConsistent.mockResolvedValueOnce(undefined);
+    await expect(defaultZomaWeeklyReportDeps.freshRecipient('u1')).resolves.toBeUndefined();
+    mockGetUserByIdConsistent.mockResolvedValueOnce({ userId: 'u1' });
+    await expect(defaultZomaWeeklyReportDeps.freshRecipient('u1')).resolves.toBeUndefined();
   });
 });
 
@@ -501,10 +861,67 @@ describe('the week claim row', () => {
     await expect(recordZomaBillingFunnel({ userId: 'u7', step: 'weekly_report_claimed', dedupeKey: 'u7#2026-W48' }, store)).resolves.toBe(false); // second claim loses
     await expect(hasZomaFunnelRow('u7', 'weekly_report_claimed', 'u7#2026-W49', store)).resolves.toBe(false);
     await expect(hasZomaFunnelRow('u8', 'weekly_report_claimed', 'u8#2026-W48', store)).resolves.toBe(false);
-    await expect(hasZomaFunnelRow('u7', 'weekly_report_sent', 'u7#2026-W48', store)).resolves.toBe(false);
+    // The environment-scoped key is a different row from the production one.
+    await expect(hasZomaFunnelRow('u7', 'weekly_report_claimed', 'nonprod#u7#2026-W48', store)).resolves.toBe(false);
     // A store without an exact-key read answers false instead of throwing.
     await expect(hasZomaFunnelRow('u7', 'weekly_report_claimed', 'x', { put: jest.fn(), queryByLoopId: jest.fn() } as any)).resolves.toBe(false);
     await expect(hasZomaFunnelRow('', 'weekly_report_claimed', 'x', store)).resolves.toBe(false);
+  });
+});
+
+describe('getMcpUsageByUser: every user from one query', () => {
+  const START = '2026-11-16T16:00:00.000Z';
+  const END = '2026-11-23T16:00:00.000Z';
+  const row = (subjectId: string, eventType: string, ts: string, dimensions: Record<string, string> = {}) =>
+    ({ loopId: 'emma-mcp', tsSession: `${ts}#${subjectId}`, eventType, subjectId, ts, dimensions }) as any;
+  const storeOf = (rows: any[]): McpUsageEventStore & { queryByLoopIdTsRangeAll: jest.Mock } =>
+    ({ put: jest.fn(), queryByLoopId: jest.fn(async () => rows), queryByLoopIdTsRangeAll: jest.fn(async () => rows) }) as any;
+  const rows = [
+    row('u1', 'mcp_tool_used', '2026-11-18T10:00:00.000Z', { product: 'zoma' }),
+    row('u1', 'mcp_tool_used', '2026-11-19T10:00:00.000Z', { product: 'zoma' }),
+    row('u1', 'mcp_tool_used', '2026-11-19T11:00:00.000Z', { product: 'emma_mcp' }), // Emma's own MCP, same event type
+    row('u1', 'mcp_write_executed', '2026-11-20T10:00:00.000Z', { product: 'zoma', verification: 'CONFIRMED', platform: 'meta', entityType: 'CAMPAIGN', action: 'UPDATE' }),
+    row('u2', 'mcp_tool_used', '2026-11-18T10:00:00.000Z', { product: 'emma_mcp' }), // only Emma: not a Zoma user this week
+    row('u3', 'mcp_tool_used', '2026-11-16T15:59:59.000Z', { product: 'zoma' }), // before the window
+    row('u3', 'mcp_tool_used', END, { product: 'zoma' }), // the end is exclusive
+    row('u4', 'mcp_first_tool_use', '2026-11-18T10:00:00.000Z', { product: 'zoma' }), // not a usage event
+  ];
+
+  it('groups by user, counts only Zoma-product rows in the window, and reads the table once', async () => {
+    const store = storeOf(rows);
+    const byUser = await getMcpUsageByUser({ start: START, end: END }, { product: 'zoma' }, store);
+    expect([...byUser.keys()]).toEqual(['u1']);
+    expect(byUser.get('u1')).toMatchObject({ toolCalls: 2, writes: { total: 1, confirmed: 1, mismatch: 0, unconfirmed: 0 } });
+    expect(byUser.get('u1')!.recentWrites).toHaveLength(1);
+    expect(store.queryByLoopIdTsRangeAll).toHaveBeenCalledTimes(1);
+    expect(store.queryByLoopIdTsRangeAll).toHaveBeenCalledWith('emma-mcp', START, END);
+  });
+
+  it('without a product filter every product counts', async () => {
+    const byUser = await getMcpUsageByUser({ start: START, end: END }, {}, storeOf(rows));
+    expect(byUser.get('u1')!.toolCalls).toBe(3);
+    expect(byUser.get('u2')!.toolCalls).toBe(1);
+    expect(byUser.has('u3')).toBe(false);
+    expect(byUser.has('u4')).toBe(false);
+  });
+
+  it('a store without the all-users range read falls back to the plain read with the same answer', async () => {
+    const store: any = { put: jest.fn(), queryByLoopId: jest.fn(async () => rows) };
+    const byUser = await getMcpUsageByUser({ start: START, end: END }, { product: 'zoma' }, store);
+    expect(byUser.get('u1')!.toolCalls).toBe(2);
+    expect(store.queryByLoopId).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('mail headers', () => {
+  it('the system mailer passes headers to the provider only when given', async () => {
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const spy = jest.spyOn(resendService, 'sendEmail').mockResolvedValue({ id: 'x' } as any);
+    await emailService.sendEmail('a@acme.co', 's', 't', '<p>h</p>', undefined, { 'List-Unsubscribe': '<https://x>' });
+    expect(spy.mock.calls[0][0]).toMatchObject({ headers: { 'List-Unsubscribe': '<https://x>' } });
+    await emailService.sendEmail('a@acme.co', 's', 't', '<p>h</p>');
+    expect(spy.mock.calls[1][0]).not.toHaveProperty('headers');
+    spy.mockRestore();
   });
 });
 
@@ -520,9 +937,11 @@ describe('unsubscribe routes', () => {
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
-  it('GET with a bad token is a 400 and changes nothing', async () => {
+  it('GET with a bad token is a 400 that points at support, and changes nothing', async () => {
     const res = await request(app()).get('/api/zoma/weekly-report/unsubscribe').query({ t: 'nope' });
     expect(res.status).toBe(400);
+    expect(res.text).toContain('support@agentweb.pro');
+    expect(res.text).not.toContain('Reply to the email');
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
@@ -534,6 +953,13 @@ describe('unsubscribe routes', () => {
     const [userId, updates] = mockUpdateUser.mock.calls[0];
     expect(userId).toBe('route-user');
     expect(Object.keys(updates)).toEqual(['zomaWeeklyReportOptOutAt']);
+  });
+
+  it('the mail client one-click POST (token in the link, "List-Unsubscribe=One-Click" in the body) unsubscribes', async () => {
+    const res = await request(app()).post(`/api/zoma/weekly-report/unsubscribe?t=${encodeURIComponent(token())}`).type('form').send('List-Unsubscribe=One-Click');
+    expect(res.status).toBe(200);
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser.mock.calls[0][0]).toBe('route-user');
   });
 
   it('POST for a user that no longer exists still confirms and creates nothing', async () => {
@@ -551,11 +977,21 @@ describe('unsubscribe routes', () => {
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
-  it('a database failure is an error page, not a false confirmation', async () => {
+  it('a database failure is an unsubscribe-specific error page, not a false confirmation and not the setup page', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockUpdateUser.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
     const res = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({ t: token() });
-    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.status).toBe(500);
+    expect(res.text).not.toContain('You will not get the weekly Zoma ad report any more');
+    expect(res.text).not.toContain('Zoma setup');
+    expect(res.text).toContain('support@agentweb.pro');
+  });
+
+  it('an AWS "resource not found" error is a failure, never a confirmation', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    mockUpdateUser.mockRejectedValueOnce(new Error('Requested resource not found'));
+    const res = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({ t: token() });
+    expect(res.status).toBe(500);
     expect(res.text).not.toContain('You will not get the weekly Zoma ad report any more');
   });
 });
