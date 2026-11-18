@@ -18913,7 +18913,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * this wrapper's class-bound sibling references.
    */
   async linkedinManagePost(userId: string, args: {
-    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics' | 'delete_post';
     account_id: string;
     post_urn?: string;
     commentary?: string;
@@ -18928,7 +18928,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       listLinkedInComments: this.listLinkedInComments.bind(this),
       reactToLinkedInPost: this.reactToLinkedInPost.bind(this),
       getPostAnalytics: this.getPostAnalytics.bind(this),
+      linkedinDeletePost: this.linkedinDeletePost.bind(this),
     });
+  }
+
+  // ENG-3014: delegating wrapper, injected above so it stays spy-observable like its siblings.
+  async linkedinDeletePost(userId: string, accountId: string, postUrn: string, toolContext?: any): Promise<any> {
+    return linkedinImpl.linkedinDeletePost(userId, accountId, postUrn, toolContext);
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/linkedin.ts. Kept as a
