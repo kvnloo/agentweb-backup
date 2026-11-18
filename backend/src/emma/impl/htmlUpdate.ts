@@ -98,8 +98,12 @@ async function authorizeUpdatedFileWrite(
   userId: string,
 ): Promise<{ versionedFilename: string; originalPath: string } | { refusal: any }> {
   const versionedFilename = createVersionedFilename(fileUrl);
-  const originalPath = extractPathFromS3Url(fileUrl);
-  const { sanitizeS3Filename } = await import('../../utils/s3Utils');
+  const { sanitizeS3Filename, extractS3KeyFromUrl } = await import('../../utils/s3Utils');
+  // The directory of the object the URL names. For one of OUR bucket's URLs, in either S3 link style (virtual-hosted
+  // `<bucket>.s3.<region>.amazonaws.com/<key>` or path-style `s3.<region>.amazonaws.com/<bucket>/<key>`), that is the key's own directory, so the
+  // same page is the same object whichever link names it (the file lookup accepts both). For any other URL it is the URL's path, as before.
+  const bucketKey = extractS3KeyFromUrl(fileUrl);
+  const originalPath = bucketKey !== null ? bucketKey.slice(0, Math.max(bucketKey.lastIndexOf('/'), 0)) : extractPathFromS3Url(fileUrl);
   const {
     TOOL_FILE_READ_ONLY_MESSAGE,
     TOOL_FILE_REFUSAL_MESSAGE,
