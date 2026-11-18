@@ -1271,8 +1271,9 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockAxios.post).toHaveBeenCalledWith(
       expect.stringContaining("/merges"), expect.anything(), expect.anything()
     );
-    // It really did consult live schedule state rather than trusting the admission.
-    expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21");
+    // It really did consult live schedule state rather than trusting the admission (ENG-2816: with a consistent read, so a
+    // visitor's edit that just marked the schedule is seen at once).
+    expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21", { consistent: true });
   });
 
   // The 409 fallback force-advances main instead of merging. It reaches that write
