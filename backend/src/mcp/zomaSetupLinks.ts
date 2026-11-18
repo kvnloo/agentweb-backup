@@ -17,10 +17,12 @@ import { getJwtSecret } from '../config/jwt';
 
 export const ZOMA_META_CALLBACK_PATH = '/api/zoma/meta/callback';
 export const ZOMA_META_SELECT_PATH = '/api/zoma/meta/select';
+export const ZOMA_GOOGLE_CALLBACK_PATH = '/api/zoma/google/callback';
+export const ZOMA_GOOGLE_SELECT_PATH = '/api/zoma/google/select';
 export const ZOMA_CONTINUE_PATH = '/api/zoma/continue';
 export const ZOMA_DONE_PATH = '/api/zoma/done';
 
-export type ZomaLinkPurpose = 'continue' | 'pick_meta_account';
+export type ZomaLinkPurpose = 'continue' | 'pick_meta_account' | 'pick_google_account';
 
 /** `zoma` value of a Meta connect state / picker link minted for an MCP-connected user (no device). */
 export const ZOMA_MCP_SETUP = 'mcp';
@@ -34,6 +36,8 @@ export interface ZomaLinkClaims {
   /** pick_meta_account only: the token session from finalize + the accounts offered. */
   tokenSessionId?: string;
   accounts?: Array<{ account_id: string; name: string; currency: string; account_status: number }>;
+  /** pick_google_account only (ZOMA_MCP_SETUP): the token session from finalize + the ad accounts offered. */
+  googleAccounts?: Array<{ customer_id: string; name: string; currency: string }>;
 }
 
 export interface ZomaLinkCodec {

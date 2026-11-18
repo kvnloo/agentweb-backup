@@ -1202,6 +1202,28 @@ export function validateAndRepairToolArgs(
     }
   }
 
+  // ENG-3089: once the name repair above landed, the same daily run kept failing
+  // on the next required key: fields[i].type (3 of the 4 post-fix failures). A
+  // field with a plain text value and no type is a textbox. Never overwrite a
+  // type the model sent, and never guess for a boolean-looking value (that is a
+  // checkbox or radio, and guessing wrong would toggle the wrong control) —
+  // those fall through to the next-step message in validateSemanticToolContract.
+  if (input.toolName === 'playwright_browser_fill_form' && Array.isArray(repairedArgs.fields)) {
+    let typed = false;
+    const fields = (repairedArgs.fields as unknown[]).map((field) => {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) return field;
+      const f = field as Record<string, unknown>;
+      if (f.type !== undefined && f.type !== null && f.type !== '') return field;
+      if (typeof f.value !== 'string' || isBooleanLikeString(f.value)) return field;
+      typed = true;
+      return { ...f, type: 'textbox' };
+    });
+    if (typed) {
+      repairedArgs.fields = fields;
+      repairs.push('fill_form:field.type');
+    }
+  }
+
   for (const [name, propSchema] of Object.entries(properties)) {
     if (repairedArgs[name] === undefined || repairedArgs[name] === null) continue;
     const typeIssue = validateJsonSchemaType(name, repairedArgs[name], propSchema);
@@ -1830,7 +1852,43 @@ function validateSemanticToolContract(toolName: string, args: Record<string, unk
     }];
   }
 
+  // ENG-3089: Playwright MCP answers a field it cannot act on with a raw zod
+  // dump, which tells the model nothing about what to do next. Name the missing
+  // key and the next step instead. `ref` cannot be repaired here: it only exists
+  // in a page snapshot.
+  if (toolName === 'playwright_browser_fill_form' && Array.isArray(args.fields)) {
+    const issues: AgentToolContractIssue[] = [];
+    args.fields.forEach((field, i) => {
+      if (!field || typeof field !== 'object' || Array.isArray(field)) return;
+      const f = field as Record<string, unknown>;
+      if (!isNonEmptyString(f.ref)) {
+        issues.push({
+          code: 'invalid_args',
+          path: `$.fields[${i}].ref`,
+          message:
+            `fields[${i}] has no "ref". A CSS selector alone is not accepted. Call playwright_browser_snapshot to get ` +
+            `the current page, then retry playwright_browser_fill_form using the ref shown for that field.`,
+        });
+      }
+      if (!FILL_FORM_FIELD_TYPES.includes(f.type as string)) {
+        issues.push({
+          code: 'invalid_args',
+          path: `$.fields[${i}].type`,
+          message: `fields[${i}] needs "type": one of ${FILL_FORM_FIELD_TYPES.join(', ')} (use checkbox or radio with value "true" or "false").`,
+        });
+      }
+    });
+    return issues;
+  }
+
   return [];
+}
+
+const FILL_FORM_FIELD_TYPES = ['textbox', 'checkbox', 'radio', 'combobox', 'slider'];
+
+function isBooleanLikeString(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  return v === 'true' || v === 'false';
 }
 
 function isMissingRequiredValue(value: unknown, schema: any): boolean {
