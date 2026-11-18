@@ -77,6 +77,7 @@ import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassific
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId, describeSlackSendState, filterSlackSendFromRequiredIfWithheld, type SlackSendState } from '../utils/schedulePublishApproval';
 import { restrictionRefusal, SHARE_VISITOR_SCHEDULE_PROFILE } from '../services/toolRestrictionProfiles';
+import { shareScheduleAlertThrottle } from '../utils/shareScheduleAlertThrottle';
 import { isScheduleMarked, withoutRefusedNames, minCallsWithoutRefused, MARKED_RUN_MAX_ATTEMPTS, autonomyWaiverApplies, readScheduleProvenance, trackedFieldsInBody, planProvenanceChange, applyProvenancePlan, scheduleContentVersion, SCHEDULE_PROVENANCE_FIELDS } from '../utils/scheduleProvenance';
 import { markShareVisitorTurn, clearShareVisitorTurn, isShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 import { SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
@@ -6801,6 +6802,47 @@ const VISITOR_TEMPLATE_WRITE_REFUSAL = {
  */
 function provenancePlanForWrite(visitorWrite: boolean, fields: string[]) {
   return planProvenanceChange({ visitorWrite, fields });
+}
+
+/**
+ * ENG-3149: tell the account owner, once, that a share-link visitor has made a schedule's FIRST mark. Until now the owner only saw
+ * the "Visitor-edited" badge, which is easy to miss for a schedule they did not open.
+ *
+ * It is a notification and nothing else, so it can never get in the visitor's way: the caller invokes it AFTER the write has
+ * succeeded and does not await it; this function itself never throws and never blocks (everything that waits is inside the
+ * detached promise, whose every failure is only logged under the [ENG-3149] prefix). The recipient is the account owner and only
+ * the owner: the request's own user (the schedule's owner, since each handler has already checked the schedule belongs to them),
+ * with the stored login email looked up only when the request does not carry one; no email means skip. At most a few a
+ * rolling hour per owner (see utils/shareScheduleAlertThrottle); beyond that the badge is all the owner gets.
+ */
+function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: string; scheduleName: unknown }): void {
+  try {
+    const owner = req.user as User | undefined;
+    const ownerUserId = owner?.userId;
+    if (!ownerUserId) return;
+    void (async () => {
+      try {
+        let to: string | undefined = typeof owner?.email === 'string' && owner.email.trim() !== '' ? owner.email.trim() : undefined;
+        if (!to) {
+          const account = await userDb.getUserById(ownerUserId);
+          to = typeof account?.email === 'string' && account.email.trim() !== '' ? account.email.trim() : undefined;
+        }
+        if (!to) return; // no login email on record: nobody to tell, and nobody else is ever told instead
+        const decision = shareScheduleAlertThrottle.tryAcquire(ownerUserId);
+        if (!decision.allowed) {
+          if (decision.firstBlock) {
+            console.warn(`[ENG-3149] visitor schedule alert for owner ${ownerUserId} skipped: the hourly cap was reached (the schedule still shows the Visitor-edited badge)`);
+          }
+          return;
+        }
+        await emailService.sendVisitorScheduleAlertEmail(to, String(schedule.scheduleName ?? ''), schedule.scheduleId);
+      } catch (error) {
+        console.error(`[ENG-3149] visitor schedule alert for schedule ${schedule.scheduleId} failed:`, error);
+      }
+    })();
+  } catch (error) {
+    console.error(`[ENG-3149] visitor schedule alert for schedule ${schedule.scheduleId} could not start:`, error);
+  }
 }
 
 /**
@@ -15253,6 +15295,11 @@ export const agentModeController = {
 
       await scheduleDb.createSchedule(scheduledChat);
 
+      // ENG-3149: a visitor's schedule is born marked, so this is its first mark: tell the owner (after the write, not awaited).
+      if (visitorWrite && Array.isArray(scheduledChat.provenance) && scheduledChat.provenance.length > 0) {
+        notifyOwnerOfFirstVisitorMark(req, scheduledChat);
+      }
+
       res.status(201).json({
         scheduleId,
         message: 'Scheduled chat created successfully',
@@ -15856,6 +15903,12 @@ export const agentModeController = {
         visitorWrite ? { updatedAt: existingSchedule.updatedAt } : undefined
       );
 
+      // ENG-3149: tell the owner when this visitor write is the schedule's FIRST mark: it adds a mark, and the consistent read it was
+      // diffed against had none. A visitor edit of an already-marked schedule, and one that changes nothing (adds no mark), stay quiet.
+      if (visitorWrite && (provenancePlan.provenanceAdd?.length ?? 0) > 0 && !isScheduleMarked(existingSchedule)) {
+        notifyOwnerOfFirstVisitorMark(req, { scheduleId, scheduleName: effectiveScheduleName });
+      }
+
       res.json({
         message: 'Scheduled chat updated successfully',
         nextRunTime: scheduledNextRunTime,
@@ -15975,6 +16028,11 @@ export const agentModeController = {
         updatedAt: nowIso,
         ...submissionProvenance,
       });
+
+      // ENG-3149: tell the owner when this visitor write is the schedule's FIRST mark (the read it was diffed against had none).
+      if (visitorWrite && (submissionProvenance.provenanceAdd?.length ?? 0) > 0 && !isScheduleMarked(schedule)) {
+        notifyOwnerOfFirstVisitorMark(req, { scheduleId, scheduleName: schedule.scheduleName });
+      }
 
       if (missingVariableNames.length === 0 && triggerRun !== false) {
         const scheduleToRun: any = {
@@ -19297,6 +19355,11 @@ export const agentModeController = {
       }
 
       await scheduleDb.createSchedule(scheduledChat);
+
+      // ENG-3149: a visitor's schedule is born marked, so this is its first mark: tell the owner (after the write, not awaited).
+      if (visitorWrite && Array.isArray(scheduledChat.provenance) && scheduledChat.provenance.length > 0) {
+        notifyOwnerOfFirstVisitorMark(req, scheduledChat);
+      }
 
       // Increment template usage count
       await scheduleTemplateDb.incrementUsageCount(templateId, user.userId);
