@@ -95,9 +95,11 @@ export async function checkOurBucketPathWrite(
   const key = canonicalStorageKey(cleanDir ? `${cleanDir}/${filename}` : filename, 'decoded');
   if (!key || typeof userId !== 'string' || userId.trim() === '') return 'refuse';
   // An anonymous visitor's own folder. The rule lets only an admin change files under `users/anon_*` (after sign-up nobody can be shown to own
-  // them), but while the caller IS that anonymous visitor (the id is assigned by the server to its session, never taken from a request) the
-  // files in its own folder are its own, exactly like a registered user's: the same "the owner's own keys" rule, and the visitor's own page
-  // must stay editable by its own session.
+  // them), but while the caller IS that anonymous visitor the files in its own folder are its own, exactly like a registered user's: the same
+  // "the owner's own keys" rule, and the visitor's own page must stay editable by its own session. The id is server-minted for result-endpoint
+  // and agent sessions (`anon_<uuid>`), but for the anonymous MCP transport it is `anon_<Mcp-Session-Id header>`, i.e. chosen by the client:
+  // that is safe only because an anonymous MCP caller can run nothing but `emma_review_site` (ANONYMOUS_TOOLS, pinned by a test in
+  // updateHtmlFile.storageAccess.test.ts). Do not add a tool that writes to the bucket to that list without revisiting this.
   const [top, owner, ...rest] = key.split('/');
   if (top === 'users' && typeof owner === 'string' && owner.startsWith('anon_') && owner === userId && rest.length >= 1) return 'allow';
   try {
