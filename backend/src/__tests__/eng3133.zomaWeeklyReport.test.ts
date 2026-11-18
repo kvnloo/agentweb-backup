@@ -407,6 +407,15 @@ describe('the email', () => {
     expect(e.html).toContain('t=&quot;x&quot;&amp;y=1');
   });
 
+  it('numbers read consistently: "1 conversion", and the same thousands separators in the daily line as everywhere else', () => {
+    const ads: ZomaAdsWeek = { ...GOOGLE_ADS, daily: days([1559, 0, 12345.5, 10, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0]), topCampaigns: [{ name: 'One', spend: 6200, conversions: 1 }, { name: 'Many', spend: 100, conversions: 2 }, { name: 'Part', spend: 50, conversions: 0.4 }] };
+    const e = email({ platforms: [{ platform: 'google_ads', status: 'delivered', ads }], usage: quiet });
+    expect(e.text).toContain('Spend per day (INR): Mon 1,559.00, Tue 0.00, Wed 12,345.50, Thu 10.00');
+    expect(e.text).toContain('1. One: 6,200.00 INR, 1 conversion\n');
+    expect(e.text).toContain('2. Many: 100.00 INR, 2 conversions\n');
+    expect(e.text).toContain('3. Part: 50.00 INR, 0.4 conversions');
+  });
+
   it('campaign names are one short printable line; an empty one is "Untitled campaign"', () => {
     const ads: ZomaAdsWeek = { ...META_ADS, topCampaigns: [{ name: 'Line1\nLine2\t\u0007', spend: 3, conversions: 0 }, { name: 'A'.repeat(60), spend: 2, conversions: 0 }, { name: '', spend: 1, conversions: 0 }] };
     const e = email({ platforms: [{ platform: 'meta', status: 'delivered', ads }], usage: quiet });
@@ -773,10 +782,12 @@ describe('the production wiring', () => {
   });
 
   it('isPermanentReadError: connection and permission problems are permanent, outages and rate limits are not', () => {
-    for (const m of ['The Meta connection expired or was revoked', 'Reconnect Meta', 'Google Ads PERMISSION_DENIED', 'invalid_grant', '... (OAuthException, code 190)', 'no usable access token']) {
+    for (const m of ['The Meta connection expired or was revoked', 'Reconnect Meta', 'Google Ads PERMISSION_DENIED', 'invalid_grant', '... (OAuthException, code 190)', 'no usable access token',
+      // The real Google error for a dead credential, seen live on env1.
+      'UNAUTHENTICATED — Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential.', 'Meta did not return the report (HTTP 401)']) {
       expect(isPermanentReadError(new Error(m))).toBe(true);
     }
-    for (const m of ['Meta did not return the report (HTTP 503)', 'timeout of 20000ms exceeded', 'Meta did not return the report (rate limit, code 4)', 'UNAVAILABLE', 'fetch failed']) {
+    for (const m of ['Meta did not return the report (HTTP 503)', 'timeout of 20000ms exceeded', 'Meta did not return the report (rate limit, code 4)', 'UNAVAILABLE', 'fetch failed', 'Meta did not return the report (HTTP 5401)']) {
       expect(isPermanentReadError(new Error(m))).toBe(false);
     }
   });
