@@ -226,7 +226,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(result.success).toBe(true);
       expect(fetchCallerUrlText).toHaveBeenCalledWith(
         'https://s3.amazonaws.com/bucket/test.html',
-        expect.objectContaining({ tool: 'create_html_template', userId: 'test-user-123' })
+        expect.objectContaining({ tool: 'create_html_template', userId: 'test-user-123', maxBytes: 20 * 1024 * 1024 })
       );
     });
 

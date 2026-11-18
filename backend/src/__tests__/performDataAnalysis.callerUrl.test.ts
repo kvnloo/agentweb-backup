@@ -8,6 +8,7 @@
  */
 import axios from 'axios';
 import { getSecret } from '../utils/secretsManager';
+import { getS3ObjectAsString } from '../utils/s3Utils';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { toolResultError } from '../utils/toolResultError';
 import * as callerUrlFetch from '../utils/callerUrlFetch';
@@ -30,6 +31,7 @@ import { performDataAnalysis, __resetDataAnalysisConsistencyCacheForTests } from
 const get = axios.get as jest.Mock;
 const post = axios.post as jest.Mock;
 const secret = getSecret as jest.Mock;
+const readS3 = getS3ObjectAsString as jest.Mock;
 
 const geminiOk = () => post.mockResolvedValue({
   data: { candidates: [{ content: { parts: [{ text: 'Analysis complete.' }, { codeExecutionResult: { output: 'ok' } }] } }] },
@@ -121,6 +123,33 @@ describe('perform_data_analysis: plain URLs in file_urls', () => {
       expect(post).not.toHaveBeenCalled();
     });
 
+    // `parseInt('abc')` is NaN, and a NaN limit compares false with everything: the cap would silently switch off.
+    it.each([['abc'], [''], ['-5'], ['NaN']])('a non-numeric or negative size setting (%p) falls back to 50 MB, never to "no cap"', async (setting) => {
+      process.env.DATA_ANALYSIS_FILE_SIZE = setting;
+      fetchSpy.mockResolvedValueOnce(bytes(5));
+      await performDataAnalysis(['https://example.com/a.csv'], 'summarise', 'user-1');
+      expect(fetchSpy.mock.calls[0][1]).toMatchObject({ maxBytes: 52428800 });
+    });
+
+    it('what an earlier s3:// file used is taken off the budget for a later URL: the exact remainder is accepted', async () => {
+      process.env.DATA_ANALYSIS_FILE_SIZE = '100';
+      readS3.mockResolvedValueOnce('a'.repeat(60));
+      fetchSpy.mockResolvedValueOnce(bytes(40));
+      const r = await performDataAnalysis(['s3://agentweb-user-files/users/user-1/files/1/abc/a.csv', 'https://example.com/b.csv'], 'summarise', 'user-1');
+      expect(r.success).toBe(true);
+      expect(fetchSpy.mock.calls[0][1]).toMatchObject({ maxBytes: 40 });
+    });
+
+    it('with nothing left in the budget the fetch is given a cap of zero, never a negative or unlimited one', async () => {
+      process.env.DATA_ANALYSIS_FILE_SIZE = '100';
+      readS3.mockResolvedValueOnce('a'.repeat(100));
+      fetchSpy.mockRejectedValueOnce(new callerUrlFetch.CallerUrlTooLargeError(0));
+      const r = await performDataAnalysis(['s3://agentweb-user-files/users/user-1/files/1/abc/a.csv', 'https://example.com/b.csv'], 'summarise', 'user-1');
+      expect(fetchSpy.mock.calls[0][1]).toMatchObject({ maxBytes: 0 });
+      expect(r.success).toBe(false);
+      expect(r.message).toMatch(/exceeds the 100 bytes limit/);
+    });
+
     it('a file that fits is analysed as before', async () => {
       fetchSpy.mockResolvedValueOnce(bytes(20));
       const r = await performDataAnalysis(['https://example.com/a.csv'], 'summarise', 'user-1');
@@ -137,6 +166,23 @@ describe('perform_data_analysis: plain URLs in file_urls', () => {
       expect(r.errorClass).toBe('invalid_args');
       expect(r.message).toContain('https://example.com/gone.csv');
       expect(r.message).toMatch(/HTTP 404/);
+    });
+
+    // The guarded fetch gives a download ONE total deadline. A host too slow to send the file in time is a bad argument for this tool,
+    // not an account or config fault (it would otherwise cluster as "not found" and read as a config problem in telemetry).
+    it.each([
+      ['an aborted request (the total deadline)', Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' })],
+      ['a socket timeout', Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })],
+      ['redirects that took too long', new Error('Timed out following redirects after 30000ms')],
+    ])('%s: a clear "too slow or too large" answer, classified as a timeout', async (_label, error) => {
+      fetchSpy.mockRejectedValueOnce(error);
+      const r = await performDataAnalysis(['https://example.com/slow.csv'], 'summarise', 'user-1');
+      expect(r.success).toBe(false);
+      expect(r.errorClass).toBe('timeout');
+      expect(r.message).toContain('https://example.com/slow.csv');
+      expect(r.message).toMatch(/did not finish within 30 seconds/);
+      expect(classifyToolErrorClass(toolResultError(r))).toBe('timeout');
+      expect(post).not.toHaveBeenCalled();
     });
 
     it('a network error is still reported as a failed download of that URL', async () => {

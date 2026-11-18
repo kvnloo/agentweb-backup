@@ -31,9 +31,10 @@ jest.mock('../services/storageAccessPolicy', () => {
     '11111111-1111-4111-8111-111111111111': { userId: 'me' },
     '22222222-2222-4222-8222-222222222222': { userId: 'other' },
   };
+  const tasks: Record<string, any> = { 't-mine': { userId: 'me' }, 't-other': { userId: 'other' } };
   class StubLookups extends actual.StorageAccessLookups {
     user(id: string) { return Promise.resolve(users[id] ?? null); }
-    task() { return Promise.resolve(null); }
+    task(id: string) { return Promise.resolve(tasks[id] ?? null); }
     execution() { return Promise.resolve(null); }
     org() { return Promise.resolve(null); }
     session(id: string) {
@@ -114,8 +115,31 @@ describe('update_html_file: who may write the edited copy', () => {
         await edit(mode, url('users/me/files/1700/abc/page.html'));
         expect(fetchText).toHaveBeenCalledWith(
           url('users/me/files/1700/abc/page.html'),
-          expect.objectContaining({ tool: 'update_html_file', userId: 'me' }),
+          expect.objectContaining({ tool: 'update_html_file', userId: 'me', maxBytes: 20 * 1024 * 1024 }),
         );
+      });
+
+      it('a task file the caller owns is editable (the task owner writes)', async () => {
+        const r = await edit(mode, url('tasks/t-mine/attachments/page.html'));
+        expect(r.success).toBe(true);
+        expect(upload).toHaveBeenCalledWith(expect.any(String), 'page_v2.html', 'text/html', 'tasks/t-mine/attachments');
+      });
+
+      // The check is about the key that is written, not the host the file is read from: an owned path on another host is edited in the
+      // caller's own folder, and the read from that host still goes through the guarded fetch.
+      it('an owned path on a host that is not our bucket is allowed, and still fetched through the guard', async () => {
+        const fileUrl = 'https://x.example/users/me/files/1700/abc/page.html';
+        const r = await edit(mode, fileUrl);
+        expect(r.success).toBe(true);
+        expect(fetchText).toHaveBeenCalledWith(fileUrl, expect.objectContaining({ tool: 'update_html_file' }));
+        expect(upload).toHaveBeenCalledWith(expect.any(String), 'page_v2.html', 'text/html', 'users/me/files/1700/abc');
+      });
+
+      it('a doubled slash in the folder is written to the cleaned folder, and that cleaned key is the one that was checked', async () => {
+        const r = await edit(mode, url('users/me//files/1700/abc/page.html'));
+        expect(r.success).toBe(true);
+        expect(upload).toHaveBeenCalledWith(expect.any(String), 'page_v2.html', 'text/html', 'users/me//files/1700/abc');
+        // (the upload cleans the doubled slash itself; updateHtmlFile.writtenKey.test.ts proves the key S3 receives equals the key checked)
       });
 
       it('a file name with characters the upload rewrites is authorised as the name it will actually have', async () => {
@@ -165,19 +189,14 @@ describe('update_html_file: who may write the edited copy', () => {
       });
 
       it.each([
-        ['a `..` that climbs into another user\'s folder (the URL parser resolves it)', 'https://x.example/users/me/files/../../other/files/1700/abc/page.html'],
+        ['a `..` that climbs into another user\'s folder (the URL parser resolves it first)', 'https://x.example/users/me/files/../../other/files/1700/abc/page.html'],
         ['a `..` written with percent-encoding', 'https://x.example/users/me/files/%2e%2e/%2e%2e/other/files/1700/abc/page.html'],
         ['the owner\'s name written with percent-encoding (a different key from the one the rule would place)', url('users/%6de/files/1700/abc/page.html')],
-        ['a doubled slash in the folder', url('users/me//files/1700/abc/page.html')],
+        ['a path-style bucket URL (the bucket name becomes the first folder, which is no key of the caller\'s)', 'https://s3.us-west-2.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+        ['a task of someone else', url('tasks/t-other/attachments/page.html')],
       ])('%s', async (_label, fileUrl) => {
-        const r = await edit(mode, fileUrl);
-        // Either refused outright, or (the URL parser having resolved it to the caller's own folder) written exactly there: never elsewhere.
-        if (r.success) {
-          for (const [, , , dir] of upload.mock.calls) expect(String(dir)).toMatch(/^users\/me\//);
-        } else {
-          expect([TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_READ_ONLY_MESSAGE]).toContain(r.message);
-        }
-        for (const [, , , dir] of upload.mock.calls) expect(String(dir)).not.toMatch(/other/);
+        refused(await edit(mode, fileUrl));
+        nothingTouched();
       });
 
       it.each([
@@ -211,6 +230,39 @@ describe('update_html_file: who may write the edited copy', () => {
         expect(line).toMatchObject({ event: 'storage_access_denied', route: 'tool:update_html_file', access: 'write', userId: 'me' });
         expect(typeof line.shape).toBe('string');
         expect(warn.mock.calls[0][0]).not.toMatch(/secret-plan|abc/);
+      });
+    });
+
+    // A visitor of a result endpoint runs as `anon_<uuid>` and its pages live in `users/anon_<uuid>/...`. The rule lets only an admin change
+    // files under `users/anon_*` (nobody can be shown to own them once the visitor signs up), but the visitor's own session must still be
+    // able to edit the pages it made, like a registered user. Anyone else may read them, never change them.
+    describe('an anonymous visitor\'s own pages', () => {
+      const ANON_FILE = url('users/anon_abc123/files/1700/abc/page.html');
+
+      it('the visitor\'s own session may edit its own page', async () => {
+        const r = await edit(mode, ANON_FILE, 'anon_abc123');
+        expect(r.success).toBe(true);
+        expect(upload).toHaveBeenCalledWith(expect.any(String), 'page_v2.html', 'text/html', 'users/anon_abc123/files/1700/abc');
+        expect(warn).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['another visitor', 'anon_zzz999'],
+        ['a signed-in user', 'me'],
+      ])('%s may read it but not change it: told it is read-only, nothing fetched or written', async (_label, userId) => {
+        const r = await edit(mode, ANON_FILE, userId);
+        expect(r.success).toBe(false);
+        expect(r.message).toBe(TOOL_FILE_READ_ONLY_MESSAGE);
+        nothingTouched();
+      });
+
+      it('a visitor whose id only starts the same way does not get the page (the id must match exactly)', async () => {
+        const r = await edit(mode, ANON_FILE, 'anon_abc12');
+        expect(r.success).toBe(false);
+        nothingTouched();
+        const r2 = await edit(mode, url('users/anon_abc1234/files/1700/abc/page.html'), 'anon_abc123');
+        expect(r2.success).toBe(false);
+        nothingTouched();
       });
     });
 
@@ -280,6 +332,18 @@ describe('checkOurBucketPathWrite: the key that is authorised is the key that is
     expect(await checkOurBucketPathWrite('t', 'me', 'users/other/files/1/abc', 'a.html')).toBe('refuse');
     expect(await checkOurBucketPathWrite('t', 'me', '/users/other/files/1/abc/', 'a.html')).toBe('refuse');
     expect(await checkOurBucketPathWrite('t', 'me', 'users//other//files/1/abc', 'a.html')).toBe('refuse');
+  });
+
+  it('an anonymous visitor writes in its own folder, and in nobody else\'s', async () => {
+    expect(await checkOurBucketPathWrite('t', 'anon_abc123', 'users/anon_abc123/files/1/abc', 'a.html')).toBe('allow');
+    expect(await checkOurBucketPathWrite('t', 'anon_abc123', 'users/anon_zzz999/files/1/abc', 'a.html')).toBe('read_only');
+    expect(await checkOurBucketPathWrite('t', 'anon_abc123', 'users/other/files/1/abc', 'a.html')).toBe('refuse');
+    expect(await checkOurBucketPathWrite('t', 'anon_abc123', 'tool-responses/22222222-2222-4222-8222-222222222222', 'a.html')).toBe('refuse');
+  });
+
+  it('a signed-in user does not get an anonymous visitor\'s folder, and the anonymous exception needs a sub-path', async () => {
+    expect(await checkOurBucketPathWrite('t', 'me', 'users/anon_abc123/files/1/abc', 'a.html')).toBe('read_only');
+    expect(await checkOurBucketPathWrite('t', 'anon_abc123', 'users', 'anon_abc123')).toBe('refuse');
   });
 
   it('a teammate may read but not write', async () => {

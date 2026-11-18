@@ -362,7 +362,7 @@ describe('emma/impl/books.ts (ENG-2103 F2 pilot)', () => {
 
       expect(fetchCallerUrlText).toHaveBeenCalledWith(
         'https://example.com/research.md',
-        expect.objectContaining({ tool: 'generate_book_content', userId: 'user-1' })
+        expect.objectContaining({ tool: 'generate_book_content', userId: 'user-1', maxBytes: 20 * 1024 * 1024 })
       );
       const userPrompt = generateJSONContent.mock.calls[0][1] as string;
       expect(userPrompt).toContain('DEEP RESEARCH TEXT');

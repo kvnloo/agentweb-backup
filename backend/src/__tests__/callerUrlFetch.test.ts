@@ -2,6 +2,7 @@
  * The one place agent tools fetch a URL a caller chose (utils/callerUrlFetch.ts). No real network or DNS: the resolver and the
  * transport are injected, and literal IP addresses are judged by the real resolver (it never does DNS for a literal IP).
  */
+import { lookup as dnsLookup } from 'dns/promises';
 import {
   CALLER_URL_BLOCKED_MESSAGE,
   CALLER_URL_MAX_TEXT_BYTES,
@@ -13,15 +14,21 @@ import {
 } from '../utils/callerUrlFetch';
 import { SsrfBlockedError, resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 
+// No test here may need a DNS lookup: addresses (IPv4 and IPv6 literals) and reserved names are judged without one, and names are stubbed
+// below. A lookup would fail this suite (see the afterEach), so a literal can never pass because "its name did not resolve".
+jest.mock('dns/promises', () => ({ lookup: jest.fn(async () => { throw new Error('DNS lookup attempted'); }) }));
+
 const PUBLIC = { hostname: 'example.com', address: '93.184.216.34', family: 4 };
 
 /**
- * Only example.com and its subdomains resolve (to a public address). Everything else, literal IPs and `localhost` included, goes through
- * the real resolver, which refuses those without any DNS lookup. No test here may reach a name the real resolver would have to look up.
+ * Only example.com, its subdomains and our S3 bucket host resolve (to a public address). Everything else, literal IPs and `localhost`
+ * included, goes through the real resolver, which refuses those without any DNS lookup. No test here may reach a name the real resolver
+ * would have to look up (the `dns/promises` mock above fails the suite if one does).
  */
+const STUB_PUBLIC_HOSTS = (host: string) => host === 'example.com' || host.endsWith('.example.com') || host.endsWith('.amazonaws.com');
 const resolver = async (url: string) => {
   const host = new URL(url).hostname;
-  return host === 'example.com' || host.endsWith('.example.com') ? PUBLIC : resolvePinnedPublicAddress(url);
+  return STUB_PUBLIC_HOSTS(host) ? PUBLIC : resolvePinnedPublicAddress(url);
 };
 
 const ok = (body: string, headers: Record<string, string> = { 'content-type': 'text/csv; charset=utf-8' }) => ({
@@ -41,9 +48,13 @@ const opts = (request: jest.Mock, extra: Record<string, unknown> = {}) => ({
 describe('fetchCallerUrlBuffer / fetchCallerUrlText', () => {
   let warn: jest.SpyInstance;
   beforeEach(() => {
+    (dnsLookup as unknown as jest.Mock).mockClear();
     warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
-  afterEach(() => warn.mockRestore());
+  afterEach(() => {
+    warn.mockRestore();
+    expect(dnsLookup).not.toHaveBeenCalled();
+  });
 
   describe('what still works', () => {
     it('returns the body, the content type without parameters and the final URL for a public https URL', async () => {
@@ -85,6 +96,14 @@ describe('fetchCallerUrlBuffer / fetchCallerUrlText', () => {
       expect(timeoutMs).toBeGreaterThan(CALLER_URL_TIMEOUT_MS - 5000);
     });
 
+    it('a caller-chosen total time is what the transport gets', async () => {
+      const request = jest.fn().mockResolvedValue(ok('x'));
+      await fetchCallerUrlBuffer('https://example.com/x', opts(request, { timeoutMs: 5000 }));
+      const timeoutMs = request.mock.calls[0][2];
+      expect(timeoutMs).toBeLessThanOrEqual(5000);
+      expect(timeoutMs).toBeGreaterThan(4000);
+    });
+
     it('the default text cap is 20 MB and the default time 30 s (the HTML sites use these)', () => {
       expect(CALLER_URL_MAX_TEXT_BYTES).toBe(20 * 1024 * 1024);
       expect(CALLER_URL_TIMEOUT_MS).toBe(30_000);
@@ -124,6 +143,33 @@ describe('fetchCallerUrlBuffer / fetchCallerUrlText', () => {
       expect(request).not.toHaveBeenCalled();
     });
 
+    // IPv6 literals are judged by range (URL.hostname keeps the brackets and the guard strips them), never by a failed name lookup.
+    it.each([
+      ['unspecified ::', 'http://[::]/'],
+      ['IPv4-mapped loopback, hex form', 'http://[::ffff:7f00:1]/'],
+      ['IPv4-compatible loopback', 'http://[::127.0.0.1]/'],
+      ['AWS IPv6 metadata address', 'http://[fd00:ec2::254]/latest/meta-data/'],
+      ['a unique-local address', 'https://[fc00::1]/'],
+      ['a link-local address', 'http://[fe80::1]/'],
+      ['a multicast address', 'http://[ff02::1]/'],
+      ['NAT64 of the metadata address', 'http://[64:ff9b::a9fe:a9fe]/'],
+      ['NAT64 of loopback', 'http://[64:ff9b::7f00:1]/'],
+      ['6to4 of loopback', 'http://[2002:7f00:1::]/'],
+    ])('IPv6: %s is refused, judged by range with no name lookup', async (_label, url) => {
+      const request = jest.fn();
+      await expect(fetchCallerUrlBuffer(url, opts(request))).rejects.toBeInstanceOf(CallerUrlBlockedError);
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a public IPv6 literal', 'https://[2606:4700:4700::1111]/x', '2606:4700:4700::1111'],
+      ['NAT64 of a public IPv4 address', 'https://[64:ff9b::808:808]/x', '64:ff9b::808:808'],
+    ])('IPv6: %s is fetched, pinned to the address as written', async (_label, url, address) => {
+      const request = jest.fn().mockResolvedValue(ok('v6'));
+      await expect(fetchCallerUrlText(url, opts(request))).resolves.toBe('v6');
+      expect(request.mock.calls[0][1]).toMatchObject({ address, family: 6 });
+    });
+
     it.each([
       ['file', 'file:///etc/passwd'],
       ['ftp', 'ftp://example.com/x'],
@@ -151,6 +197,38 @@ describe('fetchCallerUrlBuffer / fetchCallerUrlText', () => {
         .mockResolvedValueOnce({ status: 301, headers: { location: '/internal/admin' }, data: Buffer.alloc(0) })
         .mockResolvedValueOnce(ok('page'));
       await expect(fetchCallerUrlText('https://example.com/a', opts(request))).resolves.toBe('page');
+    });
+
+    it('more than 5 redirect hops end the fetch (an ordinary error, not a refusal), after exactly 6 requests', async () => {
+      const request = jest.fn().mockImplementation(async (u: string) => ({ status: 302, headers: { location: `${u}x` }, data: Buffer.alloc(0) }));
+      const err: any = await fetchCallerUrlBuffer('https://example.com/r', opts(request)).catch((e) => e);
+      expect(err).not.toBeInstanceOf(CallerUrlBlockedError);
+      expect(err.message).toMatch(/Too many redirects/);
+      expect(request).toHaveBeenCalledTimes(6);
+    });
+
+    it.each([['file:///etc/passwd'], ['ftp://example.com/x'], ['gopher://example.com/_x']])(
+      'a public URL that redirects to %s gets the same generic refusal as any other blocked URL',
+      async (location) => {
+        const request = jest.fn().mockResolvedValueOnce({ status: 302, headers: { location }, data: Buffer.alloc(0) });
+        const err: any = await fetchCallerUrlBuffer('https://example.com/r', opts(request)).catch((e) => e);
+        expect(err).toBeInstanceOf(CallerUrlBlockedError);
+        expect(err.message).toBe(CALLER_URL_BLOCKED_MESSAGE);
+        expect(JSON.stringify(err.message)).not.toMatch(/file|ftp|gopher|redirect/i);
+        expect(request).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('a redirect to a host that does not resolve is refused generically after the first hop', async () => {
+      const request = jest.fn().mockResolvedValueOnce({ status: 302, headers: { location: 'https://gone.invalid/x' }, data: Buffer.alloc(0) });
+      const resolvePinned = jest.fn(async (u: string) => {
+        if (u.includes('gone.invalid')) throw new SsrfBlockedError('DNS lookup failed: getaddrinfo ENOTFOUND gone.invalid');
+        return PUBLIC;
+      });
+      const err: any = await fetchCallerUrlBuffer('https://example.com/r', { tool: 't', maxBytes: 10, deps: { resolvePinned, request } }).catch((e) => e);
+      expect(err).toBeInstanceOf(CallerUrlBlockedError);
+      expect(err.message).toBe(CALLER_URL_BLOCKED_MESSAGE);
+      expect(request).toHaveBeenCalledTimes(1);
     });
 
     it('a host that does not resolve and a host that resolves to a private address give the SAME error text (no network map)', async () => {
