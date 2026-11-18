@@ -115,7 +115,10 @@ export const ACTION_SCOPED_PUBLISH_TOOLS: Record<string, { publishing: string[];
     ],
   },
   linkedin_manage_post: {
-    publishing: ['repost', 'comment'],
+    // ENG-3014: delete_post sits on the gated side. It publishes nothing, but its
+    // contract is explicit user approval, and an unattended run has no user to ask —
+    // so it needs the same standing owner authorization a repost does.
+    publishing: ['repost', 'comment', 'delete_post'],
     nonPublishing: ['react', 'list_comments', 'get_analytics'],
   },
 };
