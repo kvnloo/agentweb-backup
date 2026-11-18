@@ -9,6 +9,8 @@ import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolFailureType } from '../utils/toolFailureType';
 
+// The download goes through utils/callerUrlFetch (guarded, covered in callerUrlFetch.test.ts); here it is handed to the axios mock below.
+jest.mock('../utils/callerUrlFetch', () => require('./helpers/callerUrlFetchAxiosBridge').callerUrlFetchViaAxiosMock());
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
 jest.mock('@google/generative-ai', () => ({ GoogleGenerativeAI: jest.fn().mockImplementation(() => ({})) }));
 jest.mock('../utils/s3Utils', () => ({
