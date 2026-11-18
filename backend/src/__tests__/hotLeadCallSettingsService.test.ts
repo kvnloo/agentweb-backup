@@ -257,6 +257,31 @@ describe('updateHotLeadCallSettings: field errors by position', () => {
       expect((await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), enabled: true })).enabled).toBe(true);
     });
   });
+  describe('the portal read-out when the plan has the feature but the add-on is not active', () => {
+    afterEach(() => { delete process.env.HOT_LEAD_CALL_BILLING_REQUIRED; });
+    it('stays entitled, and says how to get the add-on instead of "your plan does not include it"', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      table.org.hotLeadCall = stored({ enabled: false });
+      const dto = await getHotLeadCallSettings(org(), OWNER);
+      expect(dto.entitled).toBe(true);
+      expect(dto.canEnable).toBe(false);
+      expect(dto.blockers.join(' ')).toMatch(/add-on.*Ask Emma/);
+      expect(dto.blockers).not.toContain('Your plan does not include hot-lead calls');
+    });
+    it('shows the add-on blocker to an org that is already on, so an enabled org that cannot call sees why', async () => {
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      table.org.hotLeadCall = stored({ enabled: true });
+      table.org.hotLeadCallBilling = { itemId: 'si_1', status: 'past_due', updatedAt: 'x' };
+      expect((await getHotLeadCallSettings(org(), OWNER)).blockers.join(' ')).toMatch(/add-on/);
+    });
+    it('has no add-on blocker once the add-on is active, or when billing is not required', async () => {
+      table.org.hotLeadCall = stored({ enabled: false });
+      expect((await getHotLeadCallSettings(org(), OWNER)).blockers.join(' ')).not.toMatch(/add-on/);
+      process.env.HOT_LEAD_CALL_BILLING_REQUIRED = 'true';
+      table.org.hotLeadCallBilling = { itemId: 'si_1', status: 'active', updatedAt: 'x' };
+      expect((await getHotLeadCallSettings(org(), OWNER)).blockers.join(' ')).not.toMatch(/add-on/);
+    });
+  });
   it('does not require calling hours until calling is enabled', async () => {
     delete table.org.hotLeadCall;
     const dto = await updateHotLeadCallSettings(org(), OWNER, { _revision: rev(), team: [member()], announcedName: 'New Co', maxAttemptsPerLead: 2 });

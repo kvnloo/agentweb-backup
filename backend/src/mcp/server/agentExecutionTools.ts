@@ -43,8 +43,16 @@ export const AGENT_EXECUTION_TOOLS: readonly string[] = Object.freeze([
  * is the scope decision tracked under ENG-2910.
  */
 export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
+  // Smartlead MCP reads/stop controls never start or resume an Emma agent run.
+  'list_smartlead_campaigns',
+  'get_smartlead_campaign_stats',
+  'preview_smartlead_push',
+  'get_smartlead_push_status',
+  'pause_smartlead_push',
+  'cancel_smartlead_push',
   'assess_client_health',
   'check_account_tracking_health',
+  'read_client_meta_activity',
   'configure_landing_page_subdomain',
   'create_blog_article',
   'create_knowledge_base_file',

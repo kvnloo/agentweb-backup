@@ -1,6 +1,7 @@
+import { writeFileSync } from 'fs';
 import { LLM_MODEL_REGISTRY, LLMModelConfig, ModelProvider } from './llmModelRegistry';
 import { MODEL_PRICING, ModelPrice, costScoreFromPrice } from '../../utils/llmPricing';
-import { resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
+import { REASONING_EFFORTS, ReasoningEffort, resolveOpenRouterUpstreamModelId } from '../../utils/openRouterGatewayContract';
 import { blendedPrice, inferFamily, supersession } from './modelSupersession';
 import { PriceOverride, priceOverrideReports, summarizePriceOverrides } from './catalogReview';
 
@@ -24,6 +25,12 @@ function rate(value: unknown): number | undefined {
   // Avoid binary scaling noise causing a price-book diff on unchanged quotes.
   const n = Number((Number(value) * 1e6).toPrecision(15));
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+/** OpenRouter's `reasoning.supported_efforts`, all-or-nothing: one unknown value drops the whole list. */
+function supportedEfforts(reasoning: unknown): ReasoningEffort[] | undefined {
+  const efforts = object(reasoning)?.supported_efforts;
+  if (!Array.isArray(efforts) || efforts.length === 0) return;
+  return efforts.every(e => (REASONING_EFFORTS as readonly unknown[]).includes(e)) ? efforts as ReasoningEffort[] : undefined;
 }
 export interface CatalogCandidate {
   id: string; config: LLMModelConfig; price: ModelPrice;
@@ -78,6 +85,7 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
     if (invalidCache) continue;
     const id = `openrouter/${row.id}`;
     const inputs = architecture?.input_modalities;
+    const efforts = supportedEfforts(row?.reasoning);
     result.set(id, { id, price, listing: {
       priceOverrides: summarizePriceOverrides(p),
       acceptsImages: Array.isArray(inputs) && inputs.includes('image'),
@@ -91,6 +99,8 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
       adminOnly: true,
       provider, family: inferFamily(id), supportsTemperature: params.includes('temperature'),
       supportsTools: true, supportsToolChoice: params.includes('tool_choice'),
+      // Capability snapshot only: no reasoningEffort default, so callLLM still sends no `reasoning` param.
+      ...(efforts ? { supportedReasoningEfforts: efforts } : {}),
       // Vision stays opt-in until the describe_image path is verified.
       ...(provider === 'google' || provider === 'openai' ? { maxTools: 128 } : {}),
     } });
@@ -112,20 +122,91 @@ const AA_SLUG_OVERRIDES: Readonly<Record<string, string>> = {
   'openrouter/deepseek/deepseek-v4-pro-0813': 'deepseek-v4-pro',
 };
 
+/**
+ * Artificial Analysis language-model list. The legacy /api/v2/data/llms/models path
+ * returns 410 since 2026-11-04 (ENG-3026); the documented replacement that every key
+ * tier may call is the Free-shape list. Docs: https://artificialanalysis.ai/data-api/docs
+ * (migration table: https://artificialanalysis.ai/data-api/migrate-v2-data).
+ */
+export const AA_MODELS_URL = 'https://artificialanalysis.ai/api/v2/language/models/free';
+/** 200 rows per page upstream; a list that outgrows this is an error, never a silent partial read. */
+const AA_MAX_PAGES = 25;
+
+/**
+ * ENG-3029: when AA_FIRST_PAGE_CAPTURE_PATH is set (only by the monitor workflow), write the
+ * first response page there so a jest fixture can be cut from a real response. The file holds
+ * the parsed response body only: no request, no headers, no key. A capture problem is reported
+ * on stderr and never fails the read; stdout is the monitor's plan JSON and is left alone.
+ */
+function captureFirstPage(body: unknown, apiKey: string): void {
+  const path = process.env.AA_FIRST_PAGE_CAPTURE_PATH;
+  if (!path) return;
+  try {
+    const text = JSON.stringify(body, null, 2);
+    if (apiKey && text.includes(apiKey)) throw new Error('the response body contains the API key');
+    writeFileSync(path, text);
+  } catch (error) {
+    console.error(`artificialanalysis.ai: first page not captured: ${error instanceof Error ? error.message : 'unknown error'}`);
+  }
+}
+
+/**
+ * Reads every page and returns them as one payload, keeping the feed's
+ * `intelligence_index_version`. Throws on any failed or malformed page: the list ends
+ * only on an explicit `has_more: false`, never on a missing pagination block.
+ */
+export async function fetchArtificialAnalysisModels(apiKey: string, request: typeof fetch = fetch): Promise<{ data: unknown[]; intelligence_index_version?: unknown }> {
+  const data: unknown[] = [];
+  let version: unknown;
+  for (let page = 1; page <= AA_MAX_PAGES; page++) {
+    const response = await request(`${AA_MODELS_URL}?page=${page}`, { headers: { 'x-api-key': apiKey }, signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`artificialanalysis.ai: HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    if (page === 1) captureFirstPage(body, apiKey);
+    data.push(...rows(body));
+    if (page === 1) version = object(body)?.intelligence_index_version;
+    const hasMore = object(object(body)?.pagination)?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error('artificialanalysis.ai: page without pagination.has_more');
+    if (!hasMore) return { data, ...(version === undefined ? {} : { intelligence_index_version: version }) };
+  }
+  throw new Error(`artificialanalysis.ai: more than ${AA_MAX_PAGES} pages`);
+}
+
+/**
+ * The model's lab as a comparable string. The retired endpoint sent `model_creator.slug`;
+ * the current one sends only `id` (a UUID) and `name`, so the name is the fallback.
+ */
+export function aaCreator(row: Record<string, unknown> | undefined): string | undefined {
+  const creator = object(row?.model_creator);
+  const value = typeof creator?.slug === 'string' ? creator.slug : creator?.name;
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
 /** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
- * Source: https://artificialanalysis.ai/api-reference
+ * Source: https://artificialanalysis.ai/data-api/docs
  */
 export function refreshScores(registry: Registry, payload: unknown | undefined, date: string) {
   const changes: Record<string, Partial<LLMModelConfig>> = {};
   const reports: string[] = [];
   if (payload === undefined) return { changes, reports: ['Artificial Analysis skipped: ARTIFICIAL_ANALYSIS_API_KEY is missing; scores unchanged.'] };
   const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  // Artificial Analysis says scores are comparable only within one Intelligence Index
+  // major version. This does not decide a migration; it makes the mix a review item.
+  const feedVersion = object(payload)?.intelligence_index_version;
+  const feedMajor = typeof feedVersion === 'number' || typeof feedVersion === 'string' ? /^\d+/.exec(String(feedVersion))?.[0] : undefined;
+  if (feedMajor) {
+    const other = Object.entries(registry).filter(([, config]) => {
+      const labelled = /Intelligence Index v(\d+)/.exec(config.qualityScoreSource ?? '')?.[1];
+      return labelled !== undefined && labelled !== feedMajor;
+    }).map(([id]) => id);
+    if (other.length) reports.push(`⚠️ AA INDEX VERSION: the feed is Intelligence Index v${feedVersion}, but ${other.length} registry score(s) are labelled with a different major version (${other.slice(0, 3).join(', ')}${other.length > 3 ? ', ...' : ''}). Scores are not comparable across major versions.`);
+  }
   const scores = rows(payload).flatMap(value => {
-    const row = object(value), creator = object(row?.model_creator), evaluations = object(row?.evaluations);
+    const row = object(value), creator = aaCreator(row), evaluations = object(row?.evaluations);
     const score = evaluations?.artificial_analysis_intelligence_index;
-    if (!row || typeof row.slug !== 'string' || typeof creator?.slug !== 'string'
+    if (!row || typeof row.slug !== 'string' || creator === undefined
       || typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) return [];
-    return [{ slug: row.slug, provider: normalize(creator.slug), score,
+    return [{ slug: row.slug, provider: normalize(creator), score,
       name: typeof row.name === 'string' ? row.name : row.slug }];
   });
   for (const [id, config] of Object.entries(registry)) {
@@ -166,7 +247,7 @@ export async function refreshModelCatalog(options: {
     return res.json() as Promise<unknown>;
   };
   const catalog = options.catalog ?? await get('https://openrouter.ai/api/v1/models');
-  const aa = options.aa ?? (apiKey ? await get('https://artificialanalysis.ai/api/v2/data/llms/models', { 'x-api-key': apiKey }) : undefined);
+  const aa = options.aa ?? (apiKey ? await fetchArtificialAnalysisModels(apiKey, request) : undefined);
   const additions = discoverNewModels(catalog, registry, options.additionIds)
     .filter(m => !options.additionIds || options.additionIds.includes(m.id));
   const next: Record<string, Readonly<LLMModelConfig>> = { ...registry };
@@ -216,7 +297,9 @@ export async function refreshModelCatalog(options: {
     reports.push(...priceOverrideReports(model.id, model.listing.priceOverrides));
     const todo = ['description and tier (placeholders now)'];
     if (model.listing.acceptsImages) todo.push('accepts images (supportsVision left opt-in)');
-    if (model.listing.supportsReasoningEffort) todo.push('supports reasoning_effort (supportedReasoningEfforts not set; its Artificial Analysis score may be measured at a higher effort than the default)');
+    if (model.listing.supportsReasoningEffort) todo.push(model.config.supportedReasoningEfforts
+      ? 'supports reasoning_effort (supportedReasoningEfforts captured from OpenRouter; its Artificial Analysis score may be measured at a higher effort than the default)'
+      : 'supports reasoning_effort (supportedReasoningEfforts not set; its Artificial Analysis score may be measured at a higher effort than the default)');
     reports.push(`ℹ️ BEFORE CUSTOMER EXPOSURE: ${model.id} — set ${todo.join('; ')}.`);
   }
   for (const [id, config] of Object.entries(next)) {

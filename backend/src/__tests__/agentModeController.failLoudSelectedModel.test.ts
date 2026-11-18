@@ -81,7 +81,6 @@ jest.mock('../services/llmUsagePolicyResolverService', () => ({
 
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(),
-  incrementUserTokenUsage: jest.fn(),
   deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
 }));
 
@@ -149,7 +148,7 @@ import { agentModeService } from '../services/agentModeService';
 import { userDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
-import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage } from '../services/tokenUsageService';
 import { isRunStoreEnabled, claimIdempotency } from '../services/agentMode/runStore';
 import { modelAccess } from '../services/agentMode/modelAccessInstance';
 import { workPlanStepModels } from '../services/agentMode/workPlanStepModelsInstance';
@@ -160,7 +159,6 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
-const mockIncrementUsage = incrementUserTokenUsage as jest.Mock;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 
@@ -291,7 +289,6 @@ describe('POST /generate (fail-loud)', () => {
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
     expect(mockChatbotDb.addMessagesToSession).not.toHaveBeenCalled();
-    expect(mockIncrementUsage).not.toHaveBeenCalled();
     expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
   };
 
@@ -835,7 +832,6 @@ describe('ENG-669 tier model allowlist', () => {
         expect(mockWorker.runInWorker).not.toHaveBeenCalled();
         expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
         expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
-        expect(mockIncrementUsage).not.toHaveBeenCalled();
         expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
       };
 

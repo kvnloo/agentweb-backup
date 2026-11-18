@@ -669,6 +669,54 @@ describe('CRM Group Email Endpoints', () => {
       expect(response.skippedUndeliverable).toBe(1);
     });
 
+    describe('ENG-2996 — opt-in excludeUnvalidated', () => {
+      const mixedLeads = [
+        { leadId: '1', email: 'good@acmecorp.com', customFields: { email_validation: { status: 'deliverable' } } },
+        { leadId: '2', email: 'never@acmecorp.com' },
+        { leadId: '3', email: 'unknown@acmecorp.com', customFields: { email_validation: { status: 'unknown' } } },
+        { leadId: '4', email: 'risky@acmecorp.com', customFields: { email_validation: { status: 'risky' } } },
+      ];
+      const sendBody = { senderEmail: 'me@test.com', senderName: 'Me', subject: 'Hi', htmlContent: '<p>Hello</p>' };
+
+      beforeEach(() => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mixedLeads, lastEvaluatedKey: undefined });
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      });
+
+      it('sends only validated-deliverable leads when excludeUnvalidated=true, reporting the rest', async () => {
+        mockReq.body = { ...sendBody, excludeUnvalidated: true };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+        expect((resendService.sendEmail as jest.Mock).mock.calls[0][0].to).toBe('good@acmecorp.com');
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(1);
+        expect(response.skippedUnvalidated).toBe(3);
+      });
+
+      it('default (no flag) is unchanged: unvalidated, unknown and risky leads are still sent', async () => {
+        mockReq.body = { ...sendBody };
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).toHaveBeenCalledTimes(4);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(4);
+        expect(response).not.toHaveProperty('skippedUnvalidated');
+      });
+
+      it('preview honors the same flag so its eligible count matches the send', async () => {
+        mockReq.body = { excludeUnvalidated: true };
+        const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+        await handler!(mockReq, mockRes);
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.eligibleLeads).toBe(1);
+        expect(response.unvalidatedCount).toBe(3);
+      });
+    });
+
     // ENG-1194 code review: malformed-syntax/test-domain rows must never be
     // overridable via includeUndeliverable or includeUndeliverableEmails — a
     // provider rejects them regardless of caller intent, which is exactly the
@@ -849,6 +897,54 @@ describe('CRM Group Email Endpoints', () => {
         expect(new Set(recipients).size).toBe(300);
         expect(record).toBeNull();
         expect(resendService.sendEmail).not.toHaveBeenCalled();
+        providerSend.mockRestore();
+        (getPendingBatch as jest.Mock).mockResolvedValue(null);
+        (upsertPendingBatch as jest.Mock).mockResolvedValue(undefined);
+        (deletePendingBatch as jest.Mock).mockResolvedValue(undefined);
+      });
+
+      it('ENG-3076: the in-request and background paths build the identical message for the same lead', async () => {
+        mailboxSenderConfig();
+        const providerSend = jest.spyOn(sendAsSenderModule, 'sendAsSender').mockResolvedValue(undefined as any);
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        const target = { leadId: 'lead-x', email: 'ada@test.com', firstName: 'Ada', companyName: 'Acme' };
+        const body = {
+          senderId: 'ol-1', senderEmail: 'hunter@baldwin.com', senderName: 'Hunter',
+          subject: 'Hi {{firstName}}', htmlContent: '<p>Hello {{firstName}}</p>',
+          textContent: 'Hello {{firstName}}', unsubscribeFooterHtml: '<p><a href="{{unsubscribeUrl}}">Stop</a></p>',
+        };
+        const messageFor = () => providerSend.mock.calls.map((c: any[]) => c[2]).find((m: any) => m.to === target.email);
+
+        // Path 1: in-request loop (<= MAILBOX_SYNC_LEAD_LIMIT leads).
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [target], lastEvaluatedKey: undefined });
+        mockReq.body = { ...body };
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+        expect(mockRes.status).not.toHaveBeenCalledWith(202);
+        const inRequest = messageFor();
+        expect(inRequest).toBeDefined();
+        providerSend.mockClear();
+
+        // Path 2: background mailbox run (> MAILBOX_SYNC_LEAD_LIMIT leads).
+        let record: any = null;
+        let tick = 0;
+        (getPendingBatch as jest.Mock).mockImplementation(async () => (record ? { ...record } : null));
+        (upsertPendingBatch as jest.Mock).mockImplementation(async (_u: string, b: any) => { record = { ...b, updatedAt: `t${++tick}` }; });
+        (deletePendingBatch as jest.Mock).mockImplementation(async () => { record = null; });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [target, ...manyLeads(60).map((l) => ({ ...l, firstName: 'F', companyName: 'C' }))], lastEvaluatedKey: undefined });
+        mockReq.body = { ...body };
+        await findHandler('/lists/:listId/group-email/send', 'post')!(mockReq, mockRes);
+        expect(mockRes.status).toHaveBeenCalledWith(202);
+        for (let i = 0; i < 50 && record !== null; i++) await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setTimeout(r, 50));
+        const background = messageFor();
+
+        expect(background).toEqual(inRequest);
+        expect(inRequest.subject).toBe('Hi Ada');
+        expect(inRequest.text).toBe('Hello Ada');
+        expect(inRequest.html).toContain('<p>Hello Ada</p>');
+        expect(inRequest.html).toMatch(/[?&]sig=[0-9a-f]+/);
+        expect(inRequest.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+
         providerSend.mockRestore();
         (getPendingBatch as jest.Mock).mockResolvedValue(null);
         (upsertPendingBatch as jest.Mock).mockResolvedValue(undefined);

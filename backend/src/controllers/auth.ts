@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { isZomaSignup } from '../services/zomaSignupIntent';
+import { hasValidZomaSignupIntent, isZomaSignup, parseGoogleOAuthState } from '../services/zomaSignupIntent';
 import { admitZomaSignup, zomaAdmissionEnabled, waitlistedResponse } from '../services/zomaAdmission';
 import { isConditionalCheckFailed, mapCreateUserError } from "../utils/createUserError";
 import bcrypt from "bcryptjs";
@@ -154,7 +154,9 @@ export const register = async (req: Request, res: Response) => {
     }
     email = email.toLowerCase();
 
-    if (!isCompanyEmail(email)) {
+    // ENG-3124: Emma requires a company email; a signup carrying a valid server-signed Zoma
+    // intent may use a personal one. The unsigned signupProduct marker does not qualify.
+    if (!isCompanyEmail(email) && !hasValidZomaSignupIntent(req.body.signupIntent)) {
       return res.status(400).json({
         message: "Please use a company email address to sign up.",
         code: "personal_email_not_allowed",
@@ -373,7 +375,9 @@ export const login = async (req: Request, res: Response) => {
     }
     email = email.toLowerCase();
 
-    const user = await userDb.getUserByEmail(email);
+    // ENG-3111: email is the table's primary key, so read the row directly
+    // instead of through the email index.
+    const user = await userDb.getUserByEmailConsistent(email);
     if (!user) {
       return res.status(404).json({
         message: "User not found. Please create an account to continue.",
@@ -409,7 +413,8 @@ export const login = async (req: Request, res: Response) => {
     // Update last login time + last-touch attribution (if client sent any)
     try {
       const touch = normalizeAttribution(attribution);
-      await userDb.updateUser(user.userId, {
+      // ENG-3111: one write keyed by the email already in hand (no lookup by id).
+      await userDb.recordLogin(user.email, user.userId, {
         lastLoginTime: new Date().toISOString(),
         ...(touch && { lastTouch: touch }),
       });
@@ -481,11 +486,13 @@ export const googleCallback = async (
     // requests/emails to the org owner each time they log in.
     const isNewUser = !user;
 
-    const portalOrigin = (req.query.state as string) || "partner";
+    // ENG-3124: state is `<portal>` or `customer~<signed Zoma intent>` (Google sign-in started
+    // on the MCP consent page). A Zoma signup returns to the consent/device flow, never Emma.
+    const { portal: portalOrigin, zomaSignup } = parseGoogleOAuthState(req.query.state);
 
-    // Block new registrations from personal email domains on the customer portal.
-    // Existing users are allowed through regardless of domain.
-    if (!user && portalOrigin === "customer" && !isCompanyEmail(email)) {
+    // Block new registrations from personal email domains on the customer portal, unless the
+    // signup carries a valid Zoma intent. Existing users are allowed through regardless of domain.
+    if (!user && portalOrigin === "customer" && !zomaSignup && !isCompanyEmail(email)) {
       return done({
         statusCode: 400,
         message: "Please use a company email address to sign up.",
@@ -493,8 +500,17 @@ export const googleCallback = async (
       }, null);
     }
 
-    // Google registration has no Zoma product intent; these are Emma portal signups.
-    // Zoma setup/MCP registers on the consent page with a product-scoped signup intent.
+    // Same Zoma capacity gate the email signup path applies.
+    if (!user && zomaSignup && zomaAdmissionEnabled()) {
+      try {
+        if (await admitZomaSignup(email) !== 'approved') {
+          return done({ statusCode: 202, ...waitlistedResponse }, null);
+        }
+      } catch (error) {
+        console.error('Zoma admission unavailable', error);
+        return done({ statusCode: 503, code: 'admission_unavailable', message: 'Please try again later.' }, null);
+      }
+    }
 
     if (!user) {
       if (portalOrigin === "genius") {
@@ -598,15 +614,16 @@ export const googleCallback = async (
           );
         }
 
-        // Set Free tier defaults for OAuth registrations
+        // Set Free tier defaults for OAuth registrations. A Zoma signup is stamped like an
+        // MCP-consent email signup so the consent decision attributes it to Zoma (ENG-2906).
         const freeTierConfigOAuth = await getTierConfig("Free");
         await userDb.updateUser(user.userId, {
           subscriptionType: "Free",
           allowedPages: freeTierConfigOAuth?.allowedPages ?? [...DEFAULT_PAGES],
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
-          signupSource: "oauth",
+          signupSource: zomaSignup ? MCP_CONSENT_SIGNUP_SOURCE : "oauth",
         });
-        attributeWebSignup(user.userId, { confidence: "inferred" });
+        if (!zomaSignup) attributeWebSignup(user.userId, { confidence: "inferred" });
 
         // Auto-sync new user to CRM lead list (fire-and-forget)
         syncNewUserToLeadList({

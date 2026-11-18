@@ -57,8 +57,12 @@ export function attachMetaToolkitBackoff<T extends typeof axios | ReturnType<typ
   });
   return client;
 }
-// Installed once on the default client.
-attachMetaToolkitBackoff(axios);
+// Installed once on the default client. Suites that mock axios with a factory expose no
+// interceptor managers; there is nothing to install on, and throwing here fails every
+// importer at load (ENG-3018). Explicit attachMetaToolkitBackoff(client) calls stay strict.
+if (typeof axios?.interceptors?.request?.use === 'function' && typeof axios.interceptors.response?.use === 'function') {
+  attachMetaToolkitBackoff(axios);
+}
 
 /** Toolkit fetch path bypasses the legacy helper's independent retry budget. */
 export async function toolkitMetaFetch(url: string): Promise<Response> {

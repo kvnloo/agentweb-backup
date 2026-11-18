@@ -857,6 +857,23 @@ createTestAccount().then(async () => {
         console.error('[SmartleadPush] Failed to initialize the resumer:', error);
       }
 
+      // ENG-3131: day-3 "your Zoma trial ends soon" email, once per trial. Hourly; a no-op until
+      // ZOMA_BILLING_ENABLED=true. The marker lives on the Stripe subscription (no new table).
+      setTimeout(() => {
+        let running = false;
+        const tick = () => {
+          if (!isCronEnabled() || running) return;
+          running = true;
+          import('./mcp/zomaBilling')
+            .then(({ runZomaTrialReminders }) => cronJobRegistry.track('ZomaTrialReminders', runZomaTrialReminders()))
+            .catch(e => console.error('[ZomaTrialReminders] Error:', e))
+            .finally(() => { running = false; });
+        };
+        tick();
+        setInterval(tick, 60 * 60 * 1000);
+      }, 7 * 60 * 1000);
+      console.log('[ZomaTrialReminders] Initialized — hourly, first pass in 7 minutes (active only when ZOMA_BILLING_ENABLED=true)');
+
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
       // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
       try {

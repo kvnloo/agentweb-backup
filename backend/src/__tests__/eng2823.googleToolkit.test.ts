@@ -286,22 +286,22 @@ const gcall = (deps: MetaToolkitGatewayDeps, toolName: string, args: any) =>
   handleMetaToolkitCall({ authorization: 'Bearer aw_good', toolName, args }, deps);
 
 describe('ENG-2823 gateway', () => {
-  const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
   afterEach(() => {
-    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prev;
     jest.clearAllMocks();
   });
 
   it('flag off: Google tools are not part of the toolkit (Meta-only, as before)', async () => {
-    delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+    delete process.env.ZOMA_GOOGLE_ENABLED;
     const deps = gatewayDeps([metaAccount(), googleAccount()], { execute: jest.fn().mockRejectedValue(new MetaToolkitRefusal('not part')) as any });
     await expect(gcall(deps, 'call_google_ads_reporting_api', { customer_id: CID, mode: 'dashboard' })).rejects.toBeInstanceOf(MetaToolkitRefusal);
     expect(adsCrmApis.handleCallGoogleAdsReportingApi).not.toHaveBeenCalled();
   });
 
   it('flag on: a read runs against the caller\'s own customer and is metered once with platform google_ads', async () => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     const deps = gatewayDeps([googleAccount()]);
     await gcall(deps, 'call_google_ads_reporting_api', { mode: 'dashboard' }); // single account: auto-selected
     expect(adsCrmApis.handleCallGoogleAdsReportingApi).toHaveBeenCalledWith('u1', { customer_id: CID, mode: 'dashboard' }, {});
@@ -311,7 +311,7 @@ describe('ENG-2823 gateway', () => {
   });
 
   it('flag on: a foreign customer is 403 and nothing runs or is metered', async () => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     const deps = gatewayDeps([googleAccount()]);
     await expect(gcall(deps, 'call_google_ads_api', { customer_id: '5555555555', entity_type: 'CAMPAIGN', action: 'LIST' }))
       .rejects.toMatchObject({ status: 403 });
@@ -328,7 +328,7 @@ describe('ENG-2823 gateway', () => {
   });
 
   it('auth errors keep their class for the HTTP layer', async () => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     const deps = gatewayDeps([]);
     await expect(gcall(deps, 'call_google_ads_reporting_api', { mode: 'dashboard' })).rejects.toBeInstanceOf(MetaToolkitAuthError);
   });
@@ -348,7 +348,7 @@ describe('ENG-2823 providers and setup status', () => {
   });
 
   const onboardingDeps = (accounts: any[], googleEnabled: boolean) => ({
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', zomaAdsExperience: 'runs_ads' }),
     listAccounts: jest.fn().mockResolvedValue(accounts),
     findLiveCustomerId: jest.fn(),
     createCustomerForUser: jest.fn(),
@@ -357,7 +357,7 @@ describe('ENG-2823 providers and setup status', () => {
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://facebook.example/connect'),
     buildGoogleAdsConnectUrl: jest.fn().mockResolvedValue('https://accounts.google.example/connect'),
     googleEnabled: () => googleEnabled,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
   }) as any;
