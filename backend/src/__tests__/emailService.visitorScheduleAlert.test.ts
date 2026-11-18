@@ -67,13 +67,20 @@ describe('emailService.sendVisitorScheduleAlertEmail (ENG-3149)', () => {
   });
 
   it('neutralises HTML in the name in the HTML part (escaped, so it cannot add markup), and keeps it readable as text in the plain part', async () => {
-    const hostile = '<img src=x onerror=alert(1)> & "quoted" <a href="https://evil.example">click</a>';
+    const hostile = '<img src=x onerror=alert(1)> & "quoted" <b>bold</b> <script>steal()</script>';
     const { html, text } = await send(hostile);
     expect(html).not.toContain('<img');
-    expect(html).not.toContain('href="https://evil.example"');
-    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt; &amp; &quot;quoted&quot; &lt;a href=&quot;https://evil.example&quot;&gt;click&lt;/a&gt;');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('<b>');
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt; &amp; &quot;quoted&quot; &lt;b&gt;bold&lt;/b&gt; &lt;script&gt;steal()&lt;/script&gt;');
     expect(text).toContain(hostile);
-    // The only links in the HTML are the button's.
+    // The only link in the HTML is the button's.
+    expect((html.match(/<a /g) || []).length).toBe(1);
+  });
+
+  it('a link inside markup in the name is removed before escaping, so not even escaped markup carries an address', async () => {
+    const { html, text } = await send('<a href="https://evil.example/x">click</a>');
+    for (const part of [html, text]) expect(part).not.toContain('evil');
     expect((html.match(/<a /g) || []).length).toBe(1);
   });
 
@@ -132,14 +139,165 @@ describe('emailService.sendVisitorScheduleAlertEmail (ENG-3149)', () => {
 });
 
 describe('shareScheduleAlertName (ENG-3149)', () => {
+  const name = shareScheduleAlertName;
+  const PLACEHOLDER = '[link removed]';
+
   it.each([
     ['plain', 'My schedule', 'My schedule'],
-    ['control characters', 'a\u0000b\u0007c\u007fd', 'a b c d'],
-    ['unicode line separators', 'a b c', 'a b c'],
+    ['a non-printing control character is deleted, not turned into a space (an HTML parser may drop it and rejoin what it split)', 'a\u0000b\u0007c\u007fd', 'abcd'],
+    ['unicode line and paragraph separators separate', 'a\u2028b\u2029c', 'a b c'],
+    ['tabs, newlines, NEL and no-break and ideographic spaces separate and collapse', ' a\t\tb\nc\u0085d\u00A0\u00A0e\u3000f ', 'a b c d e f'],
     ['non-string', undefined, 'Untitled'],
     ['number', 42, 'Untitled'],
+    ['object', { toString: () => 'evil.example' }, 'Untitled'],
     ['blank', '   ', 'Untitled'],
+    ['empty', '', 'Untitled'],
   ])('%s', (_label, input, expected) => {
-    expect(shareScheduleAlertName(input)).toBe(expected);
+    expect(name(input)).toBe(expected);
+  });
+
+  describe('invisible and format characters are deleted (a name cannot hide anything in them)', () => {
+    const invisibles: Array<[string, string]> = [
+      ['U+202A left-to-right embedding', '\u202A'], ['U+202B right-to-left embedding', '\u202B'], ['U+202C pop directional formatting', '\u202C'],
+      ['U+202D left-to-right override', '\u202D'], ['U+202E right-to-left override', '\u202E'],
+      ['U+2066 left-to-right isolate', '\u2066'], ['U+2067 right-to-left isolate', '\u2067'], ['U+2068 first strong isolate', '\u2068'], ['U+2069 pop directional isolate', '\u2069'],
+      ['U+200B zero-width space', '\u200B'], ['U+200C zero-width non-joiner', '\u200C'], ['U+200D zero-width joiner', '\u200D'],
+      ['U+200E left-to-right mark', '\u200E'], ['U+200F right-to-left mark', '\u200F'],
+      ['U+2060 word joiner', '\u2060'], ['U+00AD soft hyphen', '\u00AD'], ['U+061C arabic letter mark', '\u061C'],
+      ['U+115F hangul choseong filler', '\u115F'], ['U+1160 hangul jungseong filler', '\u1160'],
+      ['U+3164 hangul filler', '\u3164'], ['U+FFA0 halfwidth hangul filler', '\uFFA0'],
+      ['U+034F combining grapheme joiner', '\u034F'], ['U+FEFF byte order mark', '\uFEFF'], ['U+2800 braille blank', '\u2800'],
+      ['U+E0000 tag character', '\u{E0000}'], ['U+E0020 tag space', '\u{E0020}'], ['U+E0041 tag latin a', '\u{E0041}'], ['U+E007F cancel tag', '\u{E007F}'],
+    ];
+
+    it.each(invisibles)('%s is deleted', (_label, character) => {
+      expect(name(`ab${character}cd`)).toBe('abcd');
+    });
+
+    it.each(invisibles)('%s cannot hide a dot to get a link past the filter', (_label, character) => {
+      expect(name(`Re-verify your login at evil${character}.example/x`)).toBe(`Re-verify your login at ${PLACEHOLDER}`);
+      expect(name(`Re-verify your login at evil.${character}example`)).toBe(`Re-verify your login at ${PLACEHOLDER}`);
+      expect(name(`see ht${character}tps://evil.example`)).toBe(`see ${PLACEHOLDER}`);
+    });
+
+    it.each(invisibles)('a name made of only %s reads "Untitled"', (_label, character) => {
+      expect(name(character.repeat(5))).toBe('Untitled');
+      expect(name(` ${character} \n${character} `)).toBe('Untitled');
+    });
+
+    it('a name made only of U+3164 is "Untitled"', () => {
+      expect(name('\u3164\u3164\u3164')).toBe('Untitled');
+    });
+
+    it('a right-to-left override cannot reorder what follows it in the shown name', () => {
+      const shown = name('Invoice \u202Etxt.docx');
+      expect(shown).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+      expect(shown).toBe(`Invoice ${PLACEHOLDER}`); // "txt.docx" is host-shaped, and is removed too
+      expect(name('Report \u202E2026 final')).toBe('Report 2026 final');
+    });
+
+    it('a control character cannot split a host to dodge the filter either: it is deleted first', () => {
+      expect(name('log in at evil\u0000.example')).toBe(`log in at ${PLACEHOLDER}`);
+    });
+  });
+
+  describe('link-like and address-like pieces become "[link removed]"', () => {
+    it.each([
+      ['a bare domain', 'Re-verify your login at evil.example', `Re-verify your login at ${PLACEHOLDER}`],
+      ['a bare domain with a path', 'Re-verify your login at evil.example/x', `Re-verify your login at ${PLACEHOLDER}`],
+      ['a bare domain with a port and path', 'go evil.example:8080/login?a=1#b now', `go ${PLACEHOLDER} now`],
+      ['a subdomain chain', 'see login.bank.evil.example today', `see ${PLACEHOLDER} today`],
+      ['a hyphenated domain', 'see my-bank-secure.example', `see ${PLACEHOLDER}`],
+      ['a domain with an upper-case top level', 'see EVIL.COM', `see ${PLACEHOLDER}`],
+      ['a domain whose own name is a number', 'see 163.com', `see ${PLACEHOLDER}`],
+      ['a domain in another script', 'see bücher.example and пример.рф', `see ${PLACEHOLDER} and ${PLACEHOLDER}`],
+      ['a punycode top level', 'see evil.xn--p1ai', `see ${PLACEHOLDER}`],
+      ['a domain written with an ideographic full stop', 'see evil。example', `see ${PLACEHOLDER}`],
+      ['a domain written with a full-width full stop', 'see evil．example', `see ${PLACEHOLDER}`],
+      ['a domain with trailing punctuation', 'see (evil.example), please', `see (${PLACEHOLDER}), please`],
+      ['a url with a scheme', 'visit https://evil.example/a?b=c now', `visit ${PLACEHOLDER} now`],
+      ['a url with an unusual scheme', 'visit ftp://evil.example and ws://x.y/z', `visit ${PLACEHOLDER} and ${PLACEHOLDER}`],
+      ['a scheme-relative payload', 'click javascript:alert(1) or mailto:a@b.co or data:text/html,x', `click ${PLACEHOLDER} or ${PLACEHOLDER} or ${PLACEHOLDER}`],
+      ['a www address', 'visit www.evil now', `visit ${PLACEHOLDER} now`],
+      ['a www address with a one-letter ending (not host-shaped, but www. is enough)', 'visit www.x now', `visit ${PLACEHOLDER} now`],
+      ['a www address with a full domain', 'visit WWW.Evil.Example/x now', `visit ${PLACEHOLDER} now`],
+      ['user@host', 'mail ceo@evil.example now', `mail ${PLACEHOLDER} now`],
+      ['user@host without a dot', 'mail root@localhost now', `mail ${PLACEHOLDER} now`],
+      ['an ip address with a path', 'open 10.0.0.1/login now', `open ${PLACEHOLDER} now`],
+      ['an ip address with a port', 'open 192.168.1.1:8080 now', `open ${PLACEHOLDER} now`],
+    ])('%s', (_label, input, expected) => {
+      expect(name(input)).toBe(expected);
+    });
+
+    it('a name that is only a link, or only links, reads "Untitled" (the placeholder alone says nothing)', () => {
+      expect(name('evil.example')).toBe('Untitled');
+      expect(name('https://evil.example/x')).toBe('Untitled');
+      expect(name('evil.example  evil2.example/x \n ceo@evil.example')).toBe('Untitled');
+      expect(name(' \u3164 evil.example \u200B ')).toBe('Untitled');
+    });
+
+    it('a name with real words around the link keeps them', () => {
+      expect(name('Weekly report evil.example')).toBe(`Weekly report ${PLACEHOLDER}`);
+      expect(name('evil.example weekly report')).toBe(`${PLACEHOLDER} weekly report`);
+    });
+
+    it('an "@" alone, or as a mention with a space, is not an address', () => {
+      expect(name('Standup @ 9am')).toBe('Standup @ 9am');
+      expect(name('Ping @team daily')).toBe('Ping @team daily');
+    });
+  });
+
+  describe('ordinary names are NOT mangled', () => {
+    it.each([
+      ['a version number', 'Weekly report v2.1'],
+      ['a plain version', 'Release 3.0 checklist'],
+      ['a three-part version', 'Build 1.2.3 smoke test'],
+      ['a four-part version without a path', 'Firmware 1.2.3.4 rollout'],
+      ['a version with a word suffix', 'Plan v1.2.final'],
+      ['a version-like with a word', 'Notes 2.5.beta'],
+      ['a decimal', 'Margin 12.5% check'],
+      ['a trailing period', 'Q4 plan.'],
+      ['a trailing period after a word', 'Review the pipeline.'],
+      ['an ellipsis', 'Pipeline review...'],
+      ['an abbreviation with a space', 'Acme Inc. weekly'],
+      ['initials', 'e.g. weekly digest; i.e. each Monday'],
+      ['dotted initials', 'U.S.A weekly'],
+      ['single letters between dots (cannot be a top-level domain)', 'Section a.b.c notes'],
+      ['a currency amount', 'Budget $1,200.50 review'],
+      ['a time', 'Standup 9.30'],
+      ['a date', 'Report 2026.11.18'],
+      ['an emoji and punctuation', 'Daily digest, 9am (UK) - top 5!'],
+      ['a name in another script', '毎週のレポート'],
+    ])('%s: %s stays as written', (_label, input) => {
+      expect(name(input)).toBe(input);
+    });
+
+    it('a name that merely ends in a sentence period with a following word keeps the space rule: "plan. Next" is fine', () => {
+      expect(name('Q4 plan. Next steps')).toBe('Q4 plan. Next steps');
+    });
+
+    it('a name glued together around a dot IS read as a host and replaced (documented trade-off)', () => {
+      expect(name('Sales.Report weekly')).toBe(`${PLACEHOLDER} weekly`);
+    });
+  });
+
+  it('cleans first and cuts last: a link past the limit cannot leave half an address behind', () => {
+    const shown = name(`${'A'.repeat(80)} evil.example/phishing/path`);
+    expect(shown).toBe(`${'A'.repeat(80)} ${PLACEHOLDER}`);
+    expect(Array.from(shown).length).toBeLessThanOrEqual(SHARE_SCHEDULE_ALERT_NAME_MAX);
+    const long = name(`${'A'.repeat(95)} evil.example/phishing/path`);
+    expect(Array.from(long).length).toBeLessThanOrEqual(SHARE_SCHEDULE_ALERT_NAME_MAX);
+    expect(long).not.toContain('evil');
+  });
+
+  it('the full mail shows the cleaned name only', async () => {
+    const sendSpy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue(undefined as any);
+    await emailService.sendVisitorScheduleAlertEmail('owner@example.com', 'Re-verify your login at evil\u200B.example/x', 'sched-1');
+    const [, , text, html] = sendSpy.mock.calls[0] as [string[], string, string, string];
+    for (const part of [text, html]) {
+      expect(part).toContain(`the scheduled chat "Re-verify your login at ${PLACEHOLDER}".`);
+      expect(part).not.toContain('evil');
+    }
+    sendSpy.mockRestore();
   });
 });
