@@ -1352,6 +1352,45 @@ export class UserDB {
   }
 
   /**
+   * ENG-3111: stamp a login on a user row the caller has ALREADY read, in one
+   * write and no read. `updateUser` looks the user up by id first to recover the
+   * email and asks DynamoDB for the whole updated row back; login holds the
+   * email and discards the row, so both were wasted round trips on every login.
+   *
+   * The condition is not optional. An UpdateItem on a missing key creates the
+   * item, so without it a login racing an account deletion would leave a stub
+   * row holding only these fields. `userId = :userId` also proves the row is
+   * still the user that was read. A failed condition throws
+   * ConditionalCheckFailedException; the caller decides what that means.
+   */
+  async recordLogin(
+    email: string,
+    userId: string,
+    fields: { lastLoginTime: string; lastTouch?: unknown }
+  ): Promise<void> {
+    const names: { [key: string]: string } = { "#userId": "userId", "#lastLoginTime": "lastLoginTime" };
+    const values: { [key: string]: any } = { ":userId": userId, ":lastLoginTime": fields.lastLoginTime };
+    let expression = "SET #lastLoginTime = :lastLoginTime";
+    if (fields.lastTouch !== undefined && fields.lastTouch !== null) {
+      names["#lastTouch"] = "lastTouch";
+      values[":lastTouch"] = fields.lastTouch;
+      expression += ", #lastTouch = :lastTouch";
+    }
+    await withTransactionConflictRetry(() =>
+      this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: email.toLowerCase() },
+          UpdateExpression: expression,
+          ConditionExpression: "#userId = :userId",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+        .promise()
+    );
+  }
+
+  /**
    * Remove ONE key from the user's `secrets` map in a single atomic update. Unlike
    * read-modify-write through updateUser, a concurrent write to a DIFFERENT secret
    * is never overwritten. Absent key / absent map is a no-op.

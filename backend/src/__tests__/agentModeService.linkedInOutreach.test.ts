@@ -2598,12 +2598,65 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       },
     ];
 
-    it('discloses the routing decision on the disconnected-session preflight refusal, not just on success (AC3)', async () => {
+    it('does not route onto a candidate whose session is dead: the caller gets the daily-cap refusal for the account it asked for (ENG-3101)', async () => {
+      // Before ENG-3101 this exact setup routed the write onto the dead account and
+      // came back 'LinkedIn account disconnected'. That was the defect: the account
+      // the caller named was never disconnected.
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
       mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
       mockProbeAccountSession.mockImplementation(async (accountId: string) => (
         accountId === 'headroom-account' ? 'disconnected' : 'connected'
       ));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn daily volume limit reached');
+      expect(result.accountRouting).toBeUndefined();
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      // The dead account is still recorded, with the arguments the preflight used
+      // when the write was routed onto it, so its flag and owner alert are unchanged.
+      expect(mockRecordUnipileAccountHealth.mock.calls).toEqual([
+        [{ accountId: 'headroom-account', ownerUserId: 'user-1', state: 'disconnected' }],
+      ]);
+      mockProbeAccountSession.mockResolvedValue('connected');
+    });
+
+    it('skips a dead candidate and sends through the next live one (ENG-3101, the 2026-11-11 run)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        routedAccounts[0],
+        { ...routedAccounts[1], account_id: 'dead-account', userId: 'user-1', sharedWithOrg: undefined },
+        routedAccounts[1],
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+      mockProbeAccountSession.mockImplementation(async (accountId: string) => (
+        accountId === 'dead-account' ? 'disconnected' : 'connected'
+      ));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('headroom-account');
+      expect(result.data.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      mockProbeAccountSession.mockResolvedValue('connected');
+    });
+
+    it('discloses the routing decision on the disconnected-session preflight refusal, not just on success (AC3)', async () => {
+      // Still reachable after ENG-3101: the router does not exclude an indeterminate
+      // probe, and the session can be proven dead by the time the preflight asks.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      let headroomProbes = 0;
+      mockProbeAccountSession.mockImplementation(async (accountId: string) => {
+        if (accountId !== 'headroom-account') return 'connected';
+        headroomProbes += 1;
+        return headroomProbes === 1 ? 'unknown' : 'disconnected';
+      });
 
       const result = await service.linkedinOutreach('user-1', routingInviteArgs);
 
