@@ -297,6 +297,17 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
 }
 
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
+/**
+ * The guarded fetch gives a download ONE total deadline (redirects included). A host that cannot send the file in time surfaces as an
+ * aborted request (axios `ERR_CANCELED`) or a timeout, and is a bad argument for this tool (a slow or huge file), not an account or config fault.
+ */
+function isDownloadTimeout(error: unknown): boolean {
+  const e = error as { code?: unknown; name?: unknown; message?: unknown } | null;
+  if (e?.code === 'ECONNABORTED' || e?.code === 'ETIMEDOUT' || e?.code === 'ERR_CANCELED') return true;
+  if (e?.name === 'CanceledError' || e?.name === 'TimeoutError') return true;
+  return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
+}
+
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
   if (typeof status === 'number') return status;
@@ -481,7 +492,9 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
     // Get file size limit from environment or use default (50MB)
-    const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
+    // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
+    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800', 10);
+    const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
 
     // Prepare file data for analysis.
     // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
@@ -637,6 +650,13 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
             success: false,
             message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
             errorClass: 'invalid_args',
+          };
+        }
+        if (isDownloadTimeout(error)) {
+          return {
+            success: false,
+            message: `Downloading ${fileUrl} did not finish within 30 seconds. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
+            errorClass: 'timeout',
           };
         }
         console.error(`Error processing file ${fileUrl}:`, error);

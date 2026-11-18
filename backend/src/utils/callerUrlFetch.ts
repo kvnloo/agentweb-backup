@@ -7,8 +7,10 @@
  * redirects to one is reachable from the backend host, and the body comes back to the caller (as tool output, a saved template, or an
  * edited file).
  *
- * This is the one place those tools fetch a caller URL. It sits over the existing guarded helpers in `ssrfGuard.ts` (DNS pinned to a
- * public address, every redirect hop checked again, size and total time bounded) and adds three things the tools need:
+ * The tools named above fetch a caller URL only through this file. (Other tools that still fetch a caller URL with a bare client are not
+ * covered by it; they are listed as follow-up work, so do not read "uses this wrapper" as "every URL tool is guarded".) It sits over the
+ * existing guarded helpers in `ssrfGuard.ts` (DNS pinned to a public address, every redirect hop checked again, size and total time
+ * bounded) and adds three things the tools need:
  *   - only http(s) is fetched;
  *   - a blocked URL becomes ONE generic error that carries no address, no DNS answer and no reason, so the answer cannot be used to
  *     map the internal network (a host that does not resolve and a host that resolves to a private address look the same);
@@ -68,6 +70,9 @@ export interface CallerUrlFetchOptions {
 /** Messages the transport and the helper use when a body is over the cap. */
 const TOO_LARGE = /too large|maxContentLength|maxBodyLength/i;
 
+/** The helper's plain error for a redirect to a non-http(s) scheme. A refusal like any other: it gets the same generic answer. */
+const NON_HTTP_REDIRECT = /non-http\(s\) redirect/i;
+
 function refuse(opts: CallerUrlFetchOptions, host: string): never {
   // Host only: a path or query can carry a token, and the rest is chosen by the caller.
   console.warn(JSON.stringify({ event: 'caller_url_blocked', tool: opts.tool, userId: opts.userId ?? null, host: host.slice(0, 100) }));
@@ -100,7 +105,7 @@ export async function fetchCallerUrlBuffer(
       opts.maxBytes,
     );
   } catch (error: any) {
-    if (error instanceof SsrfBlockedError) return refuse(opts, parsed.hostname);
+    if (error instanceof SsrfBlockedError || NON_HTTP_REDIRECT.test(String(error?.message || ''))) return refuse(opts, parsed.hostname);
     if (TOO_LARGE.test(String(error?.message || ''))) throw new CallerUrlTooLargeError(opts.maxBytes);
     throw error;
   }
