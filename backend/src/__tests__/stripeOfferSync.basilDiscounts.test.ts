@@ -111,7 +111,8 @@ function user(overrides: Record<string, unknown> = {}) {
   };
 }
 
-const lastUpdate = () => mockUpdateUser.mock.calls[mockUpdateUser.mock.calls.length - 1][1];
+// ENG-2724: status/offer and tier are written in two updates; assert the merged stored fields.
+const lastUpdate = () => Object.assign({}, ...mockUpdateUser.mock.calls.map((c: unknown[]) => c[1] as object));
 
 beforeEach(() => {
   jest.clearAllMocks();
