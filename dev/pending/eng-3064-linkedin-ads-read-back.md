@@ -1,0 +1,7 @@
+## ENG-3064: LinkedIn Ads updates are read back before they are reported as done (2026-11-16)
+
+Five update paths in `backend/src/services/linkedInAdsService.ts` returned the PARTIAL_UPDATE result as-is: `updateCampaignGroup`, `updateCampaign`, `updateCreativeStatus`, `retagCreativeUtm` (text ad) and `retagPostUtm`. Each now GETs the resource after a successful update and compares the requested fields (`verifyUpdate`). A field that did not land returns `success: false`, `errorType: 'unsupported_field'` and the field list; a failed read returns `errorType: 'read_back_failed'`. `callLinkedInMarketingApi` returns both to the tool as typed failures instead of throwing.
+
+Not verified, with reason: `setConversationAdFirstContent` (LinkedIn documents the first-message field as update-only and its GET example does not return it) and the `targetingCriteria` field of a campaign update (echo shape unconfirmed). Creates and upload steps are exempt as in the Google slice. The list lives in `backend/src/__tests__/eng3064.linkedInAdsReadBack.test.ts`, which fails when a new mutation-shaped export is neither verified nor exempt.
+
+None of this has run against a real LinkedIn ad account; the read endpoints and echo shapes come from LinkedIn's docs and the existing creative/post GETs in the same file. Seen while reading the docs, not changed: `setConversationAdFirstContent` sends `firstContent`, and LinkedIn's current Conversation Ads page names the field `firstMessageContent`.
