@@ -1266,25 +1266,6 @@ export async function handleSubscriptionUpdated(
     updateData.current_period_end = updatedPeriodEndIso;
   }
 
-  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
-  // items.data[0] — a subscription can now also carry a seat-billing extra-
-  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
-  // subscribed item stays first in `items.data` once a second item exists.
-  const basePlanPriceId = subscription.items?.data?.length
-    ? findBasePlanItem(subscription)?.price?.id
-    : undefined;
-  if (basePlanPriceId) {
-    const newType = deriveSubscriptionTypeFromPriceId(basePlanPriceId);
-    if (newType) {
-      updateData.subscriptionType = newType;
-      const tierConfig = await getTierConfig(newType);
-      if (tierConfig) {
-        updateData.allowedPages = tierConfig.allowedPages;
-        updateData.allowedSkills = tierConfig.allowedSkills;
-      }
-    }
-  }
-
   // Always sync activeOffer — set to null when discount is removed. A webhook
   // payload carries Basil `discounts` as ids, so fetch them expanded rather
   // than clear a live offer; if that fetch fails, leave activeOffer as it is
@@ -1302,7 +1283,60 @@ export async function handleSubscriptionUpdated(
     updateData.activeOffer = extractActiveOffer(offerSource);
   }
 
+  // ENG-2724: persist status / renewal / offer BEFORE the tier lookup, which
+  // may need a Stripe product retrieve. A slow or failing lookup must not
+  // delay these facts; if it throws, the webhook still errors so Stripe
+  // retries, and the retry re-applies these idempotent fields.
   await userDb.updateUser(user.userId, updateData);
+
+  const tierUpdate: Record<string, any> = {};
+  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
+  // items.data[0] — a subscription can now also carry a seat-billing extra-
+  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
+  // subscribed item stays first in `items.data` once a second item exists.
+  const basePlanPrice = subscription.items?.data?.length
+    ? findBasePlanItem(subscription)?.price
+    : undefined;
+  if (basePlanPrice?.id) {
+    const newType = await resolveTierForSubscription(basePlanPrice, subscription);
+    if (newType) {
+      tierUpdate.subscriptionType = newType;
+      const tierConfig = await getTierConfig(newType);
+      if (tierConfig) {
+        tierUpdate.allowedPages = tierConfig.allowedPages;
+        tierUpdate.allowedSkills = tierConfig.allowedSkills;
+      }
+    }
+  }
+
+  if (Object.keys(tierUpdate).length) {
+    // ENG-2724: the tier lookup above can wait on Stripe for seconds. If a
+    // cancellation for this customer was handled in that window, its Free
+    // reset is already stored, and writing this event's paid tier now would
+    // leave a canceled customer on that tier. The write is therefore
+    // conditional on the stored status not having ended (checked by DynamoDB
+    // in the same operation as the write), unless this event itself reports
+    // an ended status.
+    const guardEndedStatus = !ENDED_SUBSCRIPTION_STATUSES.has(effectiveStatus);
+    try {
+      await userDb.updateUser(
+        user.userId,
+        tierUpdate,
+        guardEndedStatus
+          ? { condition: STORED_STATUS_NOT_ENDED_CONDITION }
+          : undefined
+      );
+      Object.assign(updateData, tierUpdate);
+    } catch (err: any) {
+      if (!guardEndedStatus || err?.code !== 'ConditionalCheckFailedException') throw err;
+      console.warn(
+        `[STRIPE] Skipping tier sync for user ${user.userId}: subscription ended while ${subscription.id} was being updated`
+      );
+      // Report nothing to the lead list for this event: the cancellation
+      // that won has already synced the final state.
+      delete updateData.subscription_status;
+    }
+  }
   syncUserUpdateToLeadList(user.email, {
     subscriptionType: updateData.subscriptionType,
     subscription_status: updateData.subscription_status,
@@ -1351,6 +1385,28 @@ const LIVE_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['active', 'tria
  * here — paying their invoice is what activates them.
  */
 const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * ENG-2724: `userDb.updateUser` condition for a write that follows a Stripe
+ * lookup. DynamoDB refuses it when a cancellation was stored in the meantime.
+ */
+const STORED_STATUS_NOT_ENDED_CONDITION = {
+  expression: 'attribute_not_exists(#storedStatus) OR NOT (#storedStatus IN (:endedCanceled, :endedExpired))',
+  names: { '#storedStatus': 'subscription_status' },
+  values: { ':endedCanceled': 'canceled', ':endedExpired': 'incomplete_expired' },
+};
+
+/**
+ * ENG-2724: tier for a subscription's base price. A subscription that has
+ * ended keeps the env-only mapping it had before `plan` metadata was read, so
+ * metadata never grants a paid tier from a canceled subscription.
+ */
+async function resolveTierForSubscription(price: any, subscription: any): Promise<string | null> {
+  if (ENDED_SUBSCRIPTION_STATUSES.has(subscription?.status)) {
+    return price?.id ? deriveSubscriptionTypeFromPriceId(price.id) : null;
+  }
+  return resolveSubscriptionTypeForPrice(price, subscription);
+}
 
 /**
  * The customer's live subscription (discounts expanded), or null. Same pick as
@@ -1510,6 +1566,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 
   // Check if the customer still has another active or trialing subscription.
   // This happens during downgrades: old sub is canceled, new (cheaper) sub is created.
+  let survivingSubscriptionFound = false;
   if (customerId) {
     try {
       const s = getStripeOrThrow();
@@ -1521,6 +1578,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
         });
         if (remaining.data.length > 0) {
           const activeSub = remaining.data[0];
+          survivingSubscriptionFound = true;
           console.log(
             `[STRIPE] Subscription ${subscription.id} deleted, but customer ${customerId} still has ${status} subscription ${activeSub.id} — treating as downgrade, not cancellation`
           );
@@ -1531,11 +1589,14 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             stripe_subscription_id: activeSub.id,
           };
 
-          // Derive tier from the remaining subscription's price.
-          //
-          const priceId = findBasePlanItem(activeSub)?.price?.id;
-          if (priceId) {
-            const newType = deriveSubscriptionTypeFromPriceId(priceId);
+          // Derive tier from the remaining subscription's base plan price
+          // (findBasePlanItem: an extra-seat item can sort first, and its
+          // price carries no tier).
+          const activePrice = activeSub.items?.data?.length
+            ? findBasePlanItem(activeSub)?.price
+            : undefined;
+          if (activePrice?.id) {
+            const newType = await resolveSubscriptionTypeForPrice(activePrice, activeSub);
             if (newType) {
               updateData.subscriptionType = newType;
               const tierConfig = await getTierConfig(newType);
@@ -1552,7 +1613,20 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             updateData.current_period_end = activeSubPeriodEndIso;
           }
 
-          await userDb.updateUser(user.userId, updateData);
+          // ENG-2724: the tier lookup above can wait on Stripe. If the survivor
+          // was itself canceled in that window, its Free reset is already
+          // stored and this write would restore paid access. DynamoDB refuses
+          // the write in that case; the error propagates so Stripe redelivers
+          // and the retry re-reads the customer's live subscriptions. A row
+          // that was already stored as ended when this event arrived is not
+          // guarded, so a live survivor still repairs it.
+          await userDb.updateUser(
+            user.userId,
+            updateData,
+            ENDED_SUBSCRIPTION_STATUSES.has(user.subscription_status)
+              ? undefined
+              : { condition: STORED_STATUS_NOT_ENDED_CONDITION }
+          );
           syncUserUpdateToLeadList(user.email, {
             subscriptionType: updateData.subscriptionType,
             subscription_status: updateData.subscription_status,
@@ -1566,6 +1640,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
         }
       }
     } catch (err: any) {
+      // Once Stripe confirmed a survivor, lookup/write failures must retry the
+      // webhook, never fall through and revoke that subscription's paid access.
+      if (survivingSubscriptionFound) throw err;
       console.error(`[STRIPE] Error checking remaining subscriptions for ${customerId}:`, err.message);
       // Fall through to cancel — safer to cancel than to leave in a stale state
     }
@@ -2230,6 +2307,85 @@ export function deriveSubscriptionTypeFromPriceId(priceId: string): string | nul
   return null;
 }
 
+/** Tiers that must never be granted from Stripe metadata: internal-only tiers,
+ * and Free (a billed subscription can never resolve to the unpaid tier). */
+const METADATA_PLAN_DENYLIST: ReadonlySet<string> = new Set(['Super Premium', 'Free', 'Sandbox']);
+
+// Hard wall-clock cap on the product lookup (ENG-2724), above Stripe's 5s idle timeout.
+const PRODUCT_LOOKUP_DEADLINE_MS = 6000;
+
+/**
+ * ENG-2724: resolve the subscription tier for a Stripe price, falling back to
+ * `plan` metadata for prices outside the Starter/Pro env mapping (Max, custom
+ * contract prices). Metadata is read from the price (what is actually billed),
+ * then its product (retrieved when not expanded; lookup errors propagate so
+ * webhooks retry). Subscription metadata is never used. A plan is only accepted when it names a tier defined
+ * in AW-Settings `subscription_types` (via getTierConfig). An unmappable price
+ * returns null with a warning so callers keep the existing tier.
+ */
+export async function resolveSubscriptionTypeForPrice(
+  price: any,
+  subscription?: any,
+): Promise<string | null> {
+  const priceId: string | undefined = typeof price === 'string' ? price : price?.id;
+  if (!priceId) return null;
+  const mapped = deriveSubscriptionTypeFromPriceId(priceId);
+  if (mapped) return mapped;
+
+  const tryPlan = async (raw: unknown): Promise<string | null> => {
+    if (typeof raw !== 'string') return null;
+    const plan = raw.trim();
+    if (!plan || METADATA_PLAN_DENYLIST.has(plan)) return null;
+    try {
+      if (await getTierConfig(plan)) return plan;
+    } catch {
+      console.warn(`[STRIPE] Tier lookup failed for metadata plan (price ${priceId})`);
+    }
+    return null;
+  };
+
+  // Price metadata first; the product is retrieved only when the price plan is
+  // absent or rejected, so a valid price plan never waits on a Stripe call.
+  const fromPrice = await tryPlan(price?.metadata?.plan);
+  if (fromPrice) return fromPrice;
+
+  let product: any = price && typeof price === 'object' && price.product && typeof price.product === 'object'
+    ? price.product
+    : null;
+  if (!product && typeof price?.product === 'string') {
+    // Let lookup errors propagate: swallowing them would answer the webhook 200
+    // (no Stripe retry) and leave the tier stale after a transient Stripe error.
+    // Stripe's `timeout` is a socket-idle timeout, so a slow-trickling response
+    // can exceed it. Enforce a hard wall-clock deadline as well; on expiry the
+    // error propagates (webhook 500 -> Stripe retry), same as any lookup error.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      product = await Promise.race([
+        getStripeOrThrow().products.retrieve(price.product, {}, { timeout: 5000, maxNetworkRetries: 0 }),
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error(`[STRIPE] Product lookup ${price.product} exceeded ${PRODUCT_LOOKUP_DEADLINE_MS}ms`)),
+            PRODUCT_LOOKUP_DEADLINE_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+    }
+  }
+  const fromProduct = await tryPlan(product?.metadata?.plan);
+  if (fromProduct) return fromProduct;
+  // Subscription-level metadata is deliberately NOT a tier source: it is not
+  // what is billed and can be a stale label (e.g. a contract customer moved to
+  // an unlabelled custom price would be downgraded by a leftover plan label).
+
+  console.warn(
+    `[STRIPE] Unmapped price ${priceId} on subscription ${subscription?.id ?? 'unknown'}: ` +
+    'no env mapping and no valid metadata.plan. Tier not synced.'
+  );
+  return null;
+}
+
 function deriveSubscriptionType(session: any, subscription?: any): string | null {
   // Stripe webhook events for checkout.session.completed do NOT expand
   // line_items by default, so session.line_items is typically undefined
@@ -2355,10 +2511,10 @@ export async function reconcileStripeUser(
     hasPaymentMethod = methods.data.length > 0;
   }
 
-  // Derive tier.
-  //
-  const priceId = findBasePlanItem(sub)?.price?.id;
-  const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
+  // Derive tier from the base plan price (findBasePlanItem: an extra-seat
+  // item can sort first, and its price carries no tier).
+  const basePrice = sub.items?.data?.length ? findBasePlanItem(sub)?.price : undefined;
+  const derivedType = basePrice?.id ? await resolveTierForSubscription(basePrice, sub) : null;
 
   // Build updates only for fields that are wrong
   const updates: Record<string, any> = {};
