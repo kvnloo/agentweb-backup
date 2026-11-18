@@ -602,6 +602,15 @@ describe('the email', () => {
     expect(six[0].match(/width="25%"/g)).toHaveLength(8);
   });
 
+  it('each top campaign is a name-and-figures row plus its own full-width bar row, so a phone cannot squeeze the figures', () => {
+    const html = email({ platforms: [META_WEEK], usage: quiet }).html;
+    const block = html.slice(html.indexOf('Top campaigns by spend'));
+    expect(block.match(/<td colspan="2" style="padding:0 0 4px">/g)).toHaveLength(2); // one bar row per campaign
+    expect(block).not.toContain('white-space:nowrap');
+    expect(block).toContain('80.00 USD &middot; 15 conv. &middot; 5.33 USD each');
+    expect(block.match(/height="10" bgcolor="#1877f2"/g)).toHaveLength(2);
+  });
+
   it('a day with no spend is drawn as a flat line, not a bar, and the tallest day gets the full height', () => {
     const html = email({ platforms: [META_WEEK] }).html;
     expect(html.match(/height="110" bgcolor="#1877f2"/g)).toHaveLength(1); // Wed, the 30.00 day
