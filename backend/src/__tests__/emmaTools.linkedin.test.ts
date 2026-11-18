@@ -79,7 +79,7 @@ describe('LinkedIn posting & outreach tool cluster (ENG-2103 F2)', () => {
       );
 
       expect(mockLinkedin.postOnConnectedAccount).toHaveBeenCalledWith(
-        'u1', 'acc-1', 'hello world', ['https://img'], 'linkedin', context
+        'u1', 'acc-1', 'hello world', ['https://img'], 'linkedin', context, { duplicateCaptionGuard: true }
       );
       expect(result).toBe(expected);
     });
@@ -88,7 +88,14 @@ describe('LinkedIn posting & outreach tool cluster (ENG-2103 F2)', () => {
       (mockLinkedin.postOnConnectedAccount as jest.Mock).mockResolvedValue({ success: true, draft: true });
       const context = { userId: 'u1' };
       await emmaToolRegistry.getTool('post_on_connected_account')!.execute({ content: 'x', platform: 'linkedin', save_as_draft: true }, context);
-      expect(mockLinkedin.postOnConnectedAccount).toHaveBeenLastCalledWith('u1', undefined, 'x', undefined, 'linkedin', context, { saveAsDraft: true });
+      expect(mockLinkedin.postOnConnectedAccount).toHaveBeenLastCalledWith('u1', undefined, 'x', undefined, 'linkedin', context, { saveAsDraft: true, duplicateCaptionGuard: true });
+    });
+
+    it('ENG-3015: confirm_duplicate_caption keeps the guard and forwards the confirm for cross-turn validation', async () => {
+      (mockLinkedin.postOnConnectedAccount as jest.Mock).mockResolvedValue({ success: true });
+      const context = { userId: 'u1' };
+      await emmaToolRegistry.getTool('post_on_connected_account')!.execute({ content: 'x', platform: 'linkedin', confirm_duplicate_caption: true }, context);
+      expect(mockLinkedin.postOnConnectedAccount).toHaveBeenLastCalledWith('u1', undefined, 'x', undefined, 'linkedin', context, { duplicateCaptionGuard: true, confirmDuplicateCaption: true });
     });
 
     it('linkedin_outreach calls linkedinImpl.linkedinOutreach with agentModeService.callLLM bound, not agentModeService.linkedinOutreach', async () => {
