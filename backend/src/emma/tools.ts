@@ -4552,7 +4552,8 @@ emmaToolRegistry.register({
     return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, {
       ...(args.save_as_draft === true ? { saveAsDraft: true } : {}),
       ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}),
-      ...(args.confirm_duplicate_caption === true ? {} : { duplicateCaptionGuard: true }),
+      // An unattended run cannot hold a user's confirmation, so the flag is ignored there.
+      ...(args.confirm_duplicate_caption === true && context?.isUnattendedRun !== true ? {} : { duplicateCaptionGuard: true }),
     });
   }
 });

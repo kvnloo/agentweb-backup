@@ -44,6 +44,21 @@ describe('ENG-3015 duplicate-caption guard', () => {
     expect(getPostsByAccount).toHaveBeenCalledWith(PAGE, 50);
   });
 
+  it('interactive refusal halts the turn so the model cannot self-confirm', async () => {
+    (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, {}, { duplicateCaptionGuard: true });
+    expect(r).toMatchObject({ success: false, duplicate_caption: true, awaitingUserConfirmation: true });
+    expect(typeof r.confirmationPrompt).toBe('string');
+  });
+
+  it('unattended refusal reports an explicit outcome without halting', async () => {
+    (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
+    const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, { isUnattendedRun: true }, { duplicateCaptionGuard: true });
+    expect(r).toMatchObject({ success: false, duplicate_caption: true });
+    expect(r.awaitingUserConfirmation).toBeUndefined();
+    expect(createPost).not.toHaveBeenCalled();
+  });
+
   it('proceeds when the user confirmed (guard not requested)', async () => {
     (getPostsByAccount as jest.Mock).mockResolvedValue([{ accountId: PAGE, postId: 'urn:li:share:old', content: CAPTION }]);
     const r = await postOnConnectedAccount('u1', PAGE, CAPTION, [], undefined, undefined, {});

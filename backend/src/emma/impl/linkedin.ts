@@ -555,11 +555,20 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     if (options?.duplicateCaptionGuard === true && account.platform === 'linkedin' && !saveAsDraft) {
       const existing = await findLiveDuplicateCaption(account.account_id, content);
       if (existing) {
+        // Opslane P1 / CodeRabbit: an interactive refusal halts the turn
+        // (awaitingUserConfirmation) so the model cannot self-confirm in the same
+        // reply. An unattended run has nobody to ask: it reports the refusal as its
+        // outcome and never publishes the duplicate (tools.ts ignores the confirm flag there).
+        const unattended = toolContext?.isUnattendedRun === true;
+        const message = unattended
+          ? `Not posted: this caption is already live on this LinkedIn account (${existing}). Scheduled runs never re-publish a live caption.`
+          : `Not posted: this caption is already live on this LinkedIn account (${existing}). Ask the user whether to publish it again; only after they confirm in a new message, re-call with confirm_duplicate_caption=true.`;
         return {
           success: false,
           duplicate_caption: true,
           existing_post_urn: existing,
-          message: `Not posted: this caption is already live on this LinkedIn account (${existing}). Re-call with confirm_duplicate_caption=true only if the user confirms.`,
+          message,
+          ...(unattended ? {} : { awaitingUserConfirmation: true, confirmationPrompt: `This caption is already live on this LinkedIn account (${existing}). Post it again?` }),
         };
       }
     }
