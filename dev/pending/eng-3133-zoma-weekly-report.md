@@ -28,7 +28,7 @@
   is then dropped), the currency with most accounts is shown, and the rest are counted in a "Not
   included here" line. "No delivery" is only said when every account was read and none delivered;
   accounts beyond the limit are "not checked" and never turn a result into "could not read". The Google section appears only while
-  `ZOMA_GOOGLE_ADS_ENABLED` is on (the same flag as the Google toolkit).
+  `ZOMA_GOOGLE_ENABLED` is on (the same flag as the Google toolkit).
 - **Who:** every Zoma user (scoreboard list) who is not an internal/test/admin account or a "pal" lead,
   has not unsubscribed, and made at least one successful call to the Zoma toolkit in the last 7 days
   (Emma's own MCP calls, which share the event type, are filtered out by `product`). Nobody else.
