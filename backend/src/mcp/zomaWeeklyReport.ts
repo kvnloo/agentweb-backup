@@ -348,10 +348,10 @@ function platformText(week: PlatformWeek): string[] {
   const insight = weekInsight(ads);
   const lines = [label, ...(insight ? [insight] : [])];
   for (const c of weekChips(ads)) lines.push(`${c.label}: ${c.value}${c.deltaText ? ` (${c.deltaText})` : ''}`);
-  lines.push(`Spend per day${ads.currency ? ` (${ads.currency})` : ''}: ${ads.daily.map((d) => `${weekdayOf(d.date)} ${d.spend.toFixed(2)}`).join(', ')}`);
+  lines.push(`Spend per day${ads.currency ? ` (${ads.currency})` : ''}: ${ads.daily.map((d) => `${weekdayOf(d.date)} ${money(d.spend)}`).join(', ')}`);
   if (ads.topCampaigns.length) {
     lines.push('Top campaigns by spend:');
-    ads.topCampaigns.forEach((c, i) => lines.push(`${i + 1}. ${cleanName(c.name)}: ${money(c.spend, ads.currency)}, ${count(c.conversions)} conversions`));
+    ads.topCampaigns.forEach((c, i) => lines.push(`${i + 1}. ${cleanName(c.name)}: ${money(c.spend, ads.currency)}, ${count(c.conversions)} conversion${count(c.conversions) === '1' ? '' : 's'}`));
   }
   return lines;
 }
@@ -617,7 +617,7 @@ export function weekFromDaily(
 /** Errors that will not fix themselves by the next tick: the connection or its permissions are the problem. */
 export function isPermanentReadError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
-  return /expired or was revoked|expired or revoked|reconnect|no usable access token|permission|not authori[sz]ed|unauthori[sz]ed|invalid_grant|oauthexception|code 190\b|PERMISSION_DENIED|AUTHENTICATION_ERROR|CUSTOMER_NOT_ENABLED/i.test(msg);
+  return /expired or was revoked|expired or revoked|reconnect|no usable access token|permission|not authori[sz]ed|unauthori[sz]ed|invalid_grant|oauthexception|code 190\b|PERMISSION_DENIED|UNAUTHENTICATED|AUTHENTICATION_ERROR|invalid authentication credentials|CUSTOMER_NOT_ENABLED|HTTP 40[13]\b/i.test(msg);
 }
 
 const topThree = (list: TopCampaign[]): TopCampaign[] =>
