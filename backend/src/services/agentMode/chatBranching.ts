@@ -656,8 +656,8 @@ async function branchInner(deps: BranchDeps, input: BranchInput, ctx: BranchRunC
         // still replay via the in-process record (200, same branch). With the run store ON, a retry
         // that lands on ANOTHER instance finds the claim without a session id and answers 409
         // DUPLICATE_SUBMIT until the claim TTL (IDEM_TTL_INTERACTIVE_S) expires; the branch itself is
-        // intact and visible. The run store is OFF in production today (AGENT_RUN_STORE unset), so
-        // this path is currently not reachable there.
+        // intact and visible. The run store is ON in production (AGENT_RUN_STORE=true, read from the
+        // EB environment 2026-11-15), so this path is reachable there.
         const hadRunStore = runStoreHeld;
         runStoreHeld = false;
         try {
