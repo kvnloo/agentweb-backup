@@ -151,7 +151,7 @@ describe('Stripe subscription downgrade handling', () => {
         subscription_status: 'active',
         stripe_subscription_id: 'sub_new_cheaper',
         subscriptionType: 'Starter',
-      }));
+      }), { condition: expect.objectContaining({ names: { '#storedStatus': 'subscription_status' } }) });
 
       // Should NOT contain 'canceled' or 'Free'
       const updateCall = mockUpdateUser.mock.calls[0][1];
@@ -202,7 +202,7 @@ describe('Stripe subscription downgrade handling', () => {
         subscription_status: 'trialing',
         stripe_subscription_id: 'sub_new_trial',
         subscriptionType: 'Pro',
-      }));
+      }), { condition: expect.objectContaining({ names: { '#storedStatus': 'subscription_status' } }) });
     });
 
     it('should update tier-specific allowedPages when downgrading from Pro to Starter', async () => {
