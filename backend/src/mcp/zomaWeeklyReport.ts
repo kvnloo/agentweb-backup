@@ -386,7 +386,9 @@ function chipsHtml(chips: Chip[]): string {
           return `<td valign="top" width="25%" style="padding:10px 10px;background:#f6f8fa"><div style="font-size:11px;color:#5f6368">${escapeHtml(c.label)}</div><div style="font-size:17px;font-weight:600;color:#111">${escapeHtml(c.value)}</div>${delta}</td><td width="6"></td>`;
         })
         .join('');
-      return `<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0"><tr>${cells}</tr></table>`;
+      // A short last row is padded to four columns so its boxes line up with the row above.
+      const blanks = '<td width="25%" style="padding:10px 10px"></td><td width="6"></td>'.repeat(4 - row.length);
+      return `<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0"><tr>${cells}${blanks}</tr></table>`;
     })
     .join('');
 }
