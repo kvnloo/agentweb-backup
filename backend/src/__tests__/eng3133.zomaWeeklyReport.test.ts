@@ -35,7 +35,10 @@ import { emailService } from '../services/emailService';
 import * as usageService from '../services/mcpUsageEventsService';
 import {
   adsWindows,
+  campaignCostLine,
   claimKey,
+  combinePlatformWeeks,
+  dayInsight,
   defaultZomaWeeklyReportDeps,
   eachDate,
   getZomaWeeklyReportConfig,
@@ -43,12 +46,14 @@ import {
   isPermanentReadError,
   isReportRecipient,
   isoWeekKey,
+  mergeAdsWeeks,
   pctChange,
   recordWeeklyReportOptOut,
   runZomaWeeklyReports,
   signUnsubscribeToken,
   unsubscribeHeaders,
   verifyUnsubscribeToken,
+  watchFlags,
   weekChips,
   weekFromDaily,
   weekInsight,
@@ -134,7 +139,12 @@ describe('config', () => {
     expect(getZomaWeeklyReportConfig({})).toEqual({ enabled: false, weekday: 1, hour: 15, maxPerPass: 200, onlyUserIds: null });
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_WEEKDAY: '9', ZOMA_WEEKLY_REPORT_HOUR: '24', ZOMA_WEEKLY_REPORT_MAX_PER_PASS: '0' } as any))
       .toEqual({ enabled: false, weekday: 1, hour: 15, maxPerPass: 200, onlyUserIds: null });
-    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_WEEKDAY: '5', ZOMA_WEEKLY_REPORT_HOUR: '8' } as any)).toMatchObject({ weekday: 5, hour: 8 });
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_WEEKDAY: '5', ZOMA_WEEKLY_REPORT_HOUR: '13' } as any)).toMatchObject({ weekday: 5, hour: 13 });
+  });
+  it('the send hour is never before 12:00 UTC, so every ad-account time zone has finished the Sunday the report ends on', () => {
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_HOUR: '11' } as any).hour).toBe(15);
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_HOUR: '0' } as any).hour).toBe(15);
+    expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_HOUR: '12' } as any).hour).toBe(12);
   });
   it('a canary list of user ids is parsed from a comma list, blanks ignored', () => {
     expect(getZomaWeeklyReportConfig({ ZOMA_WEEKLY_REPORT_ONLY_USER_IDS: ' u1, u2 ,,' } as any).onlyUserIds).toEqual(['u1', 'u2']);
@@ -194,22 +204,40 @@ describe('pure rules', () => {
   });
 });
 
+const tamper = (t: string) => `${t.slice(0, 20)}${t[20] === 'A' ? 'B' : 'A'}${t.slice(21)}`;
+
 describe('unsubscribe token', () => {
   it('round-trips, and rejects tampering, another secret and junk', () => {
     const t = signUnsubscribeToken('user-1', SECRET);
     expect(verifyUnsubscribeToken(t, SECRET)).toBe('user-1');
     expect(verifyUnsubscribeToken(t, 'other-secret')).toBeNull();
-    const [enc, sig] = t.split('.');
-    expect(verifyUnsubscribeToken(`${Buffer.from('user-2').toString('base64url')}.${sig}`, SECRET)).toBeNull();
-    expect(verifyUnsubscribeToken(`${enc}.${sig.slice(0, -2)}xx`, SECRET)).toBeNull();
-    for (const junk of [undefined, null, 42, '', 'abc', 'a.b.c', `${enc}.`, '.'.repeat(5), 'x'.repeat(400)]) {
+    expect(verifyUnsubscribeToken(tamper(t), SECRET)).toBeNull();
+    expect(verifyUnsubscribeToken(t.slice(0, -4), SECRET)).toBeNull();
+    for (const junk of [undefined, null, 42, '', 'abc', 'a.b.c', 'x'.repeat(500), '!!!!', `${t}=`, 'A'.repeat(40)]) {
       expect(verifyUnsubscribeToken(junk as any, SECRET)).toBeNull();
     }
+  });
+  it('is opaque: the internal user id is not in the link, in any common encoding', () => {
+    const id = '94470467-309f-49a9-930c-0725ce7b3d0a';
+    const t = signUnsubscribeToken(id, SECRET);
+    expect(t).not.toContain(id);
+    expect(t).not.toContain(Buffer.from(id).toString('base64url'));
+    expect(Buffer.from(t, 'base64url').toString('utf8')).not.toContain(id);
+    expect(Buffer.from(t, 'base64url').toString('latin1')).not.toContain('94470467');
+    expect(verifyUnsubscribeToken(t, SECRET)).toBe(id);
+  });
+  it('is random per send but every one of them opts the same user out', () => {
+    const a = signUnsubscribeToken('user-1', SECRET);
+    const b = signUnsubscribeToken('user-1', SECRET);
+    expect(a).not.toBe(b);
+    expect(verifyUnsubscribeToken(a, SECRET)).toBe('user-1');
+    expect(verifyUnsubscribeToken(b, SECRET)).toBe('user-1');
   });
   it('the URL carries a token that verifies back to the user', () => {
     const url = zomaUnsubscribeUrl('user-9', { backendUrl: () => 'https://api.test/', secret: () => SECRET });
     expect(url.startsWith('https://api.test/api/zoma/weekly-report/unsubscribe?t=')).toBe(true);
     expect(verifyUnsubscribeToken(decodeURIComponent(url.split('?t=')[1]), SECRET)).toBe('user-9');
+    expect(url).not.toContain('user-9');
   });
   it('the one-click headers carry the same signed link', () => {
     expect(unsubscribeHeaders('https://api.test/u?t=abc')).toEqual({
@@ -226,12 +254,17 @@ describe('the numbers: week-over-week, chips, one insight sentence', () => {
     expect(chips['Conversions']).toMatchObject({ value: '22 (purchase)', deltaText: 'up 10% vs last week', tone: 'good' });
     expect(chips['Cost per conversion']).toMatchObject({ value: '5.45 USD', deltaText: 'up 9% vs last week', arrow: '▲', tone: 'bad' }); // dearer conversions are bad
     expect(chips['Clicks']).toMatchObject({ value: '310', deltaText: 'up 24% vs last week', tone: 'good' });
+    expect(chips['Click rate']).toMatchObject({ value: '2.21%', deltaText: 'up 6% vs last week', tone: 'good' });
+    expect(chips['Cost per click']).toMatchObject({ value: '0.39 USD', deltaText: 'down 3% vs last week', arrow: '▼', tone: 'good' }); // cheaper clicks are good
     expect(chips['Return on ad spend']).toMatchObject({ value: '2.4x', tone: 'neutral' });
+    expect(weekChips(META_ADS).map((c) => c.label)).toEqual(['Spend', 'Conversions', 'Cost per conversion', 'Clicks', 'Click rate', 'Cost per click', 'Return on ad spend']);
   });
 
   it('a change under 2% is "about the same", and no baseline means no change text at all', () => {
     const same = weekChips(GOOGLE_ADS);
     expect(same.find((c) => c.label === 'Spend')).toMatchObject({ deltaText: 'about the same as last week', tone: 'neutral' });
+    expect(same.find((c) => c.label === 'Click rate')).toMatchObject({ value: '2.31%', deltaText: 'down 4% vs last week', tone: 'bad' }); // a falling click rate is bad
+    expect(same.find((c) => c.label === 'Cost per click')).toMatchObject({ value: '7.92 INR', deltaText: 'about the same as last week' });
     expect(same.map((c) => c.label)).not.toContain('Return on ad spend'); // roas null: no chip
     const noBaseline = weekChips({ ...META_ADS, previous: undefined });
     expect(noBaseline.every((c) => c.deltaText === undefined)).toBe(true);
@@ -249,6 +282,15 @@ describe('the numbers: week-over-week, chips, one insight sentence', () => {
     const c = weekChips({ ...META_ADS, currency: undefined, conversions: 0.4, spend: 5, roas: null, previous: undefined });
     expect(c.find((x) => x.label === 'Spend')!.value).toBe('5.00');
     expect(c.find((x) => x.label === 'Conversions')!.value).toBe('0.4 (purchase)');
+    // Spend over less than one whole conversion is noise, not a price.
+    expect(c.find((x) => x.label === 'Cost per conversion')).toMatchObject({ value: 'none yet', tone: 'neutral' });
+    expect(weekChips({ ...META_ADS, conversions: 0.04 }).find((x) => x.label === 'Conversions')!.value).toBe('<0.1 (purchase)');
+  });
+
+  it('no clicks or impressions means "none yet" for the click numbers, never a division by zero', () => {
+    const c = weekChips({ ...META_ADS, impressions: 0, clicks: 0, previous: undefined });
+    expect(c.find((x) => x.label === 'Click rate')).toMatchObject({ value: 'none yet', tone: 'neutral' });
+    expect(c.find((x) => x.label === 'Cost per click')).toMatchObject({ value: 'none yet', tone: 'neutral' });
   });
 
   it('Meta action types are shown as plain words', () => {
@@ -317,6 +359,127 @@ describe('weekFromDaily', () => {
   });
 });
 
+describe('insights: best day, worth-a-look flags, cost per conversion by campaign', () => {
+  const week = (over: Partial<ZomaAdsWeek>): ZomaAdsWeek => ({ ...META_ADS, ...over });
+
+  it('best day: most conversions, the cheaper one on a tie, and the days with no spend are named', () => {
+    expect(dayInsight(META_ADS)).toBe('Best day: Sun, 5 conversions at 4.00 USD each. No spend on Thu.');
+    expect(dayInsight(week({ daily: days([10, 20, 30, 0, 25, 15, 0], [1, 2, 3, 0, 0, 0, 0]) }))).toBe('Best day: Wed, 3 conversions at 10.00 USD each. No spend on Thu and Sun.');
+    expect(dayInsight(week({ daily: days([10, 20, 30, 0, 25, 0, 0], [1, 2, 3, 0, 0, 0, 0]) }))).toBe('Best day: Wed, 3 conversions at 10.00 USD each. No spend on Thu, Sat and Sun.');
+    expect(dayInsight(week({ daily: days([10, 0, 30, 0, 25, 0, 0], [1, 0, 2, 0, 0, 0, 0]) }))).toBe('Best day: Wed, 2 conversions at 15.00 USD each. No spend on 4 days.');
+  });
+
+  it('without conversions it names the highest-spend and quietest days; equal days and an empty week say nothing', () => {
+    const none = [0, 0, 0, 0, 0, 0, 0];
+    expect(dayInsight(week({ daily: days([10, 20, 30, 40, 25, 15, 20], none) }))).toBe('Highest spend: Thu (40.00 USD). Quietest day: Mon (10.00 USD).');
+    expect(dayInsight(week({ daily: days([10, 10, 10, 10, 10, 10, 10], none) }))).toBeUndefined();
+    expect(dayInsight(week({ daily: days([0, 0, 0, 0, 0, 0, 0], none) }))).toBeUndefined();
+  });
+
+  it('best day on the quietest day is not also called the quietest', () => {
+    expect(dayInsight(week({ daily: days([10, 20, 30, 40, 25, 15, 20], [3, 0, 0, 0, 0, 0, 0]) }))).toBe('Best day: Mon, 3 conversions at 3.33 USD each.');
+  });
+
+  it('flags: nothing to flag on a healthy week', () => {
+    expect(watchFlags(META_ADS)).toEqual([]);
+    expect(watchFlags(GOOGLE_ADS)).toEqual([]);
+  });
+
+  it('flags: spend with no conversions all week points at conversion tracking, and does not also name every campaign', () => {
+    const flags = watchFlags(week({ conversions: 0, topCampaigns: [{ name: 'A', spend: 50, conversions: 0 }] }));
+    expect(flags).toEqual(['No conversions were recorded this week. If you expect some, check that conversion tracking is set up.']);
+  });
+
+  it('flags: spend that stopped for two or more days at the end of the week, but not a single quiet day', () => {
+    expect(watchFlags(week({ daily: days([10, 20, 30, 40, 25, 0, 0], [1, 1, 1, 1, 1, 0, 0]) })))
+      .toEqual(['Spend stopped after Fri. If that is not planned, check your budgets and campaign status.']);
+    expect(watchFlags(week({ daily: days([10, 20, 30, 40, 25, 15, 0], [1, 1, 1, 1, 1, 1, 0]) }))).toEqual([]);
+  });
+
+  it('flags: a top campaign that spent with no conversions (only when the account had some), cleaned, at most three flags', () => {
+    const topCampaigns = [{ name: 'Win', spend: 80, conversions: 15 }, { name: 'Evil\nname', spend: 40, conversions: 0 }, { name: 'C', spend: 20, conversions: 0 }, { name: 'D', spend: 10, conversions: 0 }];
+    expect(watchFlags(week({ topCampaigns }))).toEqual(['Evil name spent 40.00 USD with no conversions.', 'C spent 20.00 USD with no conversions.', 'D spent 10.00 USD with no conversions.']);
+    const stopped = watchFlags(week({ topCampaigns, daily: days([10, 20, 30, 40, 25, 0, 0], [1, 1, 1, 1, 1, 0, 0]) }));
+    expect(stopped).toHaveLength(3);
+    expect(stopped[0]).toMatch(/^Spend stopped after Fri/);
+  });
+
+  it('cost per conversion by campaign: cheapest and dearest, only with two priced campaigns that differ', () => {
+    expect(campaignCostLine(META_ADS)).toBe('Cheapest per conversion: Spring Sale (5.33 USD). Dearest: Retargeting (5.71 USD).');
+    expect(campaignCostLine(GOOGLE_ADS)).toBeUndefined(); // one campaign
+    expect(campaignCostLine(week({ topCampaigns: [{ name: 'A', spend: 10, conversions: 1 }, { name: 'B', spend: 20, conversions: 2 }] }))).toBeUndefined(); // same price
+    expect(campaignCostLine(week({ topCampaigns: [{ name: 'A', spend: 10, conversions: 0.4 }, { name: 'B', spend: 20, conversions: 2 }] }))).toBeUndefined(); // under one conversion is not priced
+  });
+
+  it('the email shows the flags in a "Worth a look" block, escaped, in both parts', () => {
+    const ads = week({ topCampaigns: [{ name: 'Win', spend: 80, conversions: 15 }, { name: '<b>Bad</b>', spend: 40, conversions: 0 }], daily: days([10, 20, 30, 40, 25, 0, 0], [1, 1, 1, 1, 1, 0, 0]) });
+    const e = weeklyReportEmail({ usage: usage(), platforms: [{ platform: 'meta', status: 'delivered', ads }], range: USAGE_RANGE, unsubscribeUrl: 'https://api.test/u?t=abc' });
+    expect(e.text).toContain('Worth a look:\n- Spend stopped after Fri. If that is not planned, check your budgets and campaign status.\n- <b>Bad</b> spent 40.00 USD with no conversions.');
+    expect(e.html).toContain('Worth a look');
+    expect(e.html).toContain('&lt;b&gt;Bad&lt;/b&gt; spent 40.00 USD with no conversions.');
+    expect(e.html).not.toContain('<b>Bad</b>');
+    const healthy = weeklyReportEmail({ usage: usage(), platforms: [META_WEEK], range: USAGE_RANGE, unsubscribeUrl: 'https://api.test/u?t=abc' });
+    expect(healthy.text + healthy.html).not.toContain('Worth a look');
+  });
+});
+
+describe('several ad accounts of one platform', () => {
+  const B: ZomaAdsWeek = {
+    ...META_ADS, spend: 60, impressions: 4000, clicks: 100, conversions: 6, roas: 3,
+    daily: days([5, 5, 5, 5, 15, 15, 10], [1, 1, 1, 1, 1, 0, 1]),
+    previous: { spend: 50, impressions: 3000, clicks: 80, conversions: 4 },
+    topCampaigns: [{ name: 'B camp', spend: 90, conversions: 2 }],
+  };
+
+  it('same-currency accounts are added together: totals, days, previous week, ranking; return on ad spend is dropped', () => {
+    const m = mergeAdsWeeks(META_ADS, B);
+    expect(m).toMatchObject({ currency: 'USD', spend: 180, impressions: 18000, clicks: 410, conversions: 28, roas: null, conversionEvent: 'purchase' });
+    expect(m.previous).toEqual({ spend: 150, impressions: 15000, clicks: 330, conversions: 24 });
+    expect(m.daily.map((d) => d.spend)).toEqual([15, 25, 35, 5, 40, 30, 30]);
+    expect(m.daily.map((d) => d.date)).toEqual(DATES);
+    expect(m.topCampaigns.map((c) => c.name)).toEqual(['B camp', 'Spring Sale', 'Retargeting']);
+  });
+
+  it('different conversion events are not claimed as one; a missing previous week hides the comparison', () => {
+    expect(mergeAdsWeeks(META_ADS, { ...B, conversionEvent: 'lead' }).conversionEvent).toBeNull();
+    expect(mergeAdsWeeks(META_ADS, { ...B, previous: undefined }).previous).toBeUndefined();
+  });
+
+  it('"no delivery" only when every account was read and none delivered', () => {
+    const none: PlatformWeek = { platform: 'meta', status: 'no_delivery' };
+    const bad: PlatformWeek = { platform: 'meta', status: 'unreadable' };
+    expect(combinePlatformWeeks('meta', [none, none])).toEqual({ platform: 'meta', status: 'no_delivery' });
+    expect(combinePlatformWeeks('meta', [none, bad])).toEqual({ platform: 'meta', status: 'unreadable' });
+    expect(combinePlatformWeeks('meta', [none], 1)).toEqual({ platform: 'meta', status: 'unreadable' }); // another account was not read at all
+  });
+
+  it('an account that delivered wins over an idle one, and an unreadable one is counted as not included', () => {
+    const idle: PlatformWeek = { platform: 'meta', status: 'no_delivery' };
+    const delivered = combinePlatformWeeks('meta', [idle, META_WEEK]);
+    expect(delivered).toMatchObject({ status: 'delivered', ads: { spend: 120 } });
+    expect((delivered as any).ads.notIncluded).toBeUndefined();
+    const partly = combinePlatformWeeks('meta', [META_WEEK, { platform: 'meta', status: 'unreadable' }], 1);
+    expect((partly as any).ads.notIncluded).toBe(2);
+  });
+
+  it('different currencies are never added: the currency with most accounts is shown and the rest are counted', () => {
+    const inr: PlatformWeek = { platform: 'meta', status: 'delivered', ads: { ...GOOGLE_ADS } };
+    const usdB: PlatformWeek = { platform: 'meta', status: 'delivered', ads: B };
+    const tie = combinePlatformWeeks('meta', [META_WEEK, inr]) as any;
+    expect(tie.ads).toMatchObject({ currency: 'USD', spend: 120, notIncluded: 1 }); // a tie goes to the first listed
+    expect((combinePlatformWeeks('meta', [inr, META_WEEK]) as any).ads).toMatchObject({ currency: 'INR', spend: 950, notIncluded: 1 });
+    const two = combinePlatformWeeks('meta', [inr, META_WEEK, usdB]) as any;
+    expect(two.ads).toMatchObject({ currency: 'USD', spend: 180, notIncluded: 1 }); // two USD accounts beat one INR account
+  });
+
+  it('the email says what is not included, in both parts', () => {
+    const noted = combinePlatformWeeks('google_ads', [GOOGLE_WEEK, { platform: 'google_ads', status: 'unreadable' }]);
+    const e = weeklyReportEmail({ usage: usage(), platforms: [noted], range: USAGE_RANGE, unsubscribeUrl: 'https://api.test/u?t=abc' });
+    expect(e.text).toContain('Not included here: 1 other Google Ads account (in a different currency, or could not be read).');
+    expect(e.html).toContain('Not included here: 1 other Google Ads account');
+  });
+});
+
 describe('the email', () => {
   const email = (over: Partial<Parameters<typeof weeklyReportEmail>[0]> = {}) =>
     weeklyReportEmail({ usage: usage(), platforms: [META_WEEK, GOOGLE_WEEK], range: USAGE_RANGE, unsubscribeUrl: 'https://api.test/u?t=abc', ...over });
@@ -330,10 +493,16 @@ describe('the email', () => {
     expect(e.text).toContain('Spend: 120.00 USD (up 20% vs last week)');
     expect(e.text).toContain('Conversions: 22 (purchase) (up 10% vs last week)');
     expect(e.text).toContain('Cost per conversion: 5.45 USD (up 9% vs last week)');
+    expect(e.text).toContain('Click rate: 2.21% (up 6% vs last week)');
+    expect(e.text).toContain('Cost per click: 0.39 USD (down 3% vs last week)');
     expect(e.text).toContain('Return on ad spend: 2.4x');
     expect(e.text).toContain('Spend per day (USD): Mon 10.00, Tue 20.00, Wed 30.00, Thu 0.00, Fri 25.00, Sat 15.00, Sun 20.00');
-    expect(e.text).toContain('1. Spring Sale: 80.00 USD, 15 conversions');
-    expect(e.text).toContain('2. Retargeting: 40.00 USD, 7 conversions');
+    expect(e.text).toContain('1. Spring Sale: 80.00 USD, 15 conversions (5.33 USD each)');
+    expect(e.text).toContain('2. Retargeting: 40.00 USD, 7 conversions (5.71 USD each)');
+    expect(e.text).toContain('Cheapest per conversion: Spring Sale (5.33 USD). Dearest: Retargeting (5.71 USD).');
+    expect(e.text).toContain('Best day: Sun, 5 conversions at 4.00 USD each. No spend on Thu.');
+    expect(e.text).toContain('Best day: Sun, 1 conversion at 100.00 INR each. No spend on Thu.');
+    expect(e.text).toContain('Ad platforms often add conversions for a few days after a click, so the newest numbers can still go up.');
     expect(e.text).toContain('Google Ads\nSpend is about the same and conversions are about the same compared with last week.');
     expect(e.text).toContain('Spend per day (INR): Mon 100.00');
     expect(e.text).toContain('Changes made through Zoma: 2 (each one confirmed by reading it back).');
@@ -346,6 +515,10 @@ describe('the email', () => {
   it('the HTML draws the charts with table cells (no images, no scripts), one colour per platform', () => {
     const e = email();
     expect(e.html).not.toMatch(/<img|<script|<svg|<canvas/i);
+    // Bars must survive desktop Outlook (the Word renderer ignores font-size:0): 1px type and an exact line height.
+    expect(e.html).not.toContain('font-size:0');
+    expect(e.html).toContain('font-size:1px;line-height:1px;mso-line-height-rule:exactly');
+    expect(e.html).toContain('background:#ffffff');
     expect(e.html).toContain('border-left:4px solid #1877f2');
     expect(e.html).toContain('border-left:4px solid #34a853');
     expect(e.html).toContain('bgcolor="#1877f2"');
@@ -353,6 +526,10 @@ describe('the email', () => {
     expect(e.html).toContain('Spend per day (USD)');
     expect(e.html).toContain('Spend per day (INR)');
     expect(e.html).toContain('Top campaigns by spend');
+    expect(e.html).toContain('Cheapest per conversion: Spring Sale');
+    expect(e.html).toContain('5.33 USD each');
+    expect(e.html).toContain('Best day: Sun');
+    expect(e.html).toContain('Ad platforms often add conversions');
     for (const d of ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) expect(e.html).toContain(d);
     expect(e.html).toContain('href="https://api.test/u?t=abc"');
     expect(e.html).toContain('support@agentweb.pro');
@@ -411,9 +588,9 @@ describe('the email', () => {
     const ads: ZomaAdsWeek = { ...GOOGLE_ADS, daily: days([1559, 0, 12345.5, 10, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0]), topCampaigns: [{ name: 'One', spend: 6200, conversions: 1 }, { name: 'Many', spend: 100, conversions: 2 }, { name: 'Part', spend: 50, conversions: 0.4 }] };
     const e = email({ platforms: [{ platform: 'google_ads', status: 'delivered', ads }], usage: quiet });
     expect(e.text).toContain('Spend per day (INR): Mon 1,559.00, Tue 0.00, Wed 12,345.50, Thu 10.00');
-    expect(e.text).toContain('1. One: 6,200.00 INR, 1 conversion\n');
-    expect(e.text).toContain('2. Many: 100.00 INR, 2 conversions\n');
-    expect(e.text).toContain('3. Part: 50.00 INR, 0.4 conversions');
+    expect(e.text).toContain('1. One: 6,200.00 INR, 1 conversion (6,200.00 INR each)\n');
+    expect(e.text).toContain('2. Many: 100.00 INR, 2 conversions (50.00 INR each)\n');
+    expect(e.text).toContain('3. Part: 50.00 INR, 0.4 conversions\n'); // under one whole conversion: no price per conversion
   });
 
   it('campaign names are one short printable line; an empty one is "Untitled campaign"', () => {
@@ -422,10 +599,14 @@ describe('the email', () => {
     expect(e.text).toContain('1. Line1 Line2: 3.00 USD');
     expect(e.text).toContain(`2. ${'A'.repeat(39)}…: 2.00 USD`);
     expect(e.text).toContain('3. Untitled campaign: 1.00 USD');
+    // Whole characters only: never half of an emoji.
+    const emoji = email({ platforms: [{ platform: 'meta', status: 'delivered', ads: { ...META_ADS, topCampaigns: [{ name: '😀'.repeat(60), spend: 1, conversions: 0 }] } }], usage: quiet });
+    expect(emoji.text).toContain(`1. ${'😀'.repeat(39)}…: 1.00 USD`);
+    expect(emoji.text + emoji.html).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });
 
   it('says exactly what happened with changes: none, all confirmed, some not confirmed, none confirmed', () => {
-    expect(email({ usage: quiet }).text).toContain('No changes were made through Zoma this week.');
+    expect(email({ usage: quiet }).text).toContain('No changes were recorded through Zoma this week.');
     expect(email({ usage: quiet }).text).not.toContain('Latest changes');
 
     const mixed = email({
@@ -443,7 +624,7 @@ describe('the email', () => {
     // Writes were dispatched but none could be confirmed: never claim "no changes".
     const none = email({ usage: usage({ writes: { total: 3, confirmed: 0, mismatch: 1, unconfirmed: 2 }, recentWrites: [] }) });
     expect(none.text).toContain('Changes sent through Zoma: 3. 0 confirmed by reading them back, 3 could not be confirmed.');
-    expect(none.text).not.toContain('No changes were made');
+    expect(none.text).not.toContain('No changes were recorded');
   });
 });
 
@@ -629,6 +810,35 @@ describe('runZomaWeeklyReports', () => {
     warn.mockRestore();
   });
 
+  it('stops the pass after three sends in a row fail, so a mail outage cannot burn the week for everyone', async () => {
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const ids = ['a', 'b', 'c', 'd', 'e'];
+    const d = makeDeps({
+      listUsers: jest.fn().mockResolvedValue(ids.map((id) => customer(id))),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor(...ids)),
+      sendEmail: jest.fn().mockResolvedValue('failed'),
+    });
+    expect(await runZomaWeeklyReports(d)).toEqual({ checked: 3, sent: 0, failed: 3 });
+    expect(d.sendEmail).toHaveBeenCalledTimes(3);
+    expect(d.claim).toHaveBeenCalledTimes(3); // d and e still hold their week
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('sends in a row failed'));
+  });
+
+  it('a send that works in between resets the count', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const outcomes = ['failed', 'failed', 'sent', 'failed', 'failed'];
+    const ids = ['a', 'b', 'c', 'd', 'e'];
+    const send = jest.fn();
+    outcomes.forEach((o) => send.mockResolvedValueOnce(o));
+    const d = makeDeps({
+      listUsers: jest.fn().mockResolvedValue(ids.map((id) => customer(id))),
+      getUsageByUser: jest.fn().mockResolvedValue(usageFor(...ids)),
+      sendEmail: send,
+    });
+    expect(await runZomaWeeklyReports(d)).toEqual({ checked: 5, sent: 1, failed: 4 });
+    expect(send).toHaveBeenCalledTimes(5);
+  });
+
   it('the unsubscribe link in the sent email verifies back to that user', async () => {
     const d = makeDeps();
     await runZomaWeeklyReports(d);
@@ -719,7 +929,17 @@ describe('the production wiring', () => {
   });
 
   describe('Google Ads', () => {
-    beforeEach(() => accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]));
+    beforeEach(() => {
+      process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([googleAccount]);
+    });
+    afterEach(() => { delete process.env.ZOMA_GOOGLE_ADS_ENABLED; });
+
+    it('there is no Google section while the Google toolkit is dark, so no advice to run a Google flow that does not exist', async () => {
+      delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+      await expect(read()).resolves.toEqual([]);
+      expect(queryReporting).not.toHaveBeenCalled();
+    });
 
     it('reads a daily series for both weeks and a top-3 campaign ranking, cost micros to currency units', async () => {
       queryReporting
@@ -767,11 +987,69 @@ describe('the production wiring', () => {
   });
 
   it('both platforms are read independently: one failing does not hide the other', async () => {
+    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
     accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, googleAccount]);
     mockRunDaily.mockRejectedValue(new Error('The Meta connection expired or was revoked'));
     queryReporting.mockResolvedValueOnce([gRow('2026-11-17', 4_000_000, 100, 5, 1)]).mockResolvedValueOnce([]);
     const weeks = await read();
     expect(weeks.map((w) => `${w.platform}:${w.status}`)).toEqual(['meta:unreadable', 'google_ads:delivered']);
+    delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+  });
+
+  describe('several connected accounts', () => {
+    const second = { ...metaAccount, account_id: '2000', account_name: 'Acme two', config: { ...metaAccount.config, ad_account_id: '2000' } };
+    const third = { ...metaAccount, account_id: '3000', config: { ...metaAccount.config, ad_account_id: '3000' } };
+    const fourth = { ...metaAccount, account_id: '4000', config: { ...metaAccount.config, ad_account_id: '4000' } };
+    const byAccount = (rows: Record<string, any[]>) => mockRunDaily.mockImplementation(async (_a: any, id: string) => metaDaily(rows[id] ?? []));
+
+    it('an idle first account does not hide the one that delivered: it is never reported as "no delivery"', async () => {
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, second]);
+      byAccount({ '1339': [], '2000': [mrow('2026-11-17', 40, 2)] });
+      mockRunReport.mockResolvedValue({ rows: [camp('Only', 40, 2)] });
+      const weeks = await read();
+      expect(weeks).toMatchObject([{ platform: 'meta', status: 'delivered', ads: { spend: 40, conversions: 2 } }]);
+      expect(mockRunDaily.mock.calls.map((c) => c[1])).toEqual(['1339', '2000']);
+      expect(mockRunReport).toHaveBeenCalledTimes(1);
+      expect(mockRunReport.mock.calls[0][1]).toBe('2000'); // the ranking is read only for the account that delivered
+    });
+
+    it('accounts in the same currency are added together', async () => {
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, second]);
+      byAccount({ '1339': [mrow('2026-11-16', 10, 1)], '2000': [mrow('2026-11-16', 20, 2)] });
+      mockRunReport.mockResolvedValue({ rows: [] });
+      const [w] = (await read()) as any[];
+      expect(w.ads).toMatchObject({ spend: 30, conversions: 3 });
+      expect(w.ads.daily[0].spend).toBe(30);
+      expect(w.ads.notIncluded).toBeUndefined();
+    });
+
+    it('only a few accounts per platform are read, and the rest are counted as not included', async () => {
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, second, third, fourth]);
+      byAccount({ '1339': [mrow('2026-11-16', 10)], '2000': [mrow('2026-11-16', 10)], '3000': [mrow('2026-11-16', 10)], '4000': [mrow('2026-11-16', 10)] });
+      mockRunReport.mockResolvedValue({ rows: [] });
+      const [w] = (await read()) as any[];
+      expect(mockRunDaily).toHaveBeenCalledTimes(3);
+      expect(w.ads).toMatchObject({ spend: 30, notIncluded: 1 });
+    });
+
+    it('an idle account next to an expired one cannot be called "no delivery"', async () => {
+      const expired = { ...second, config: { ...second.config, token_expires_at: Date.now() - 1000 } };
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, expired]);
+      byAccount({ '1339': [] });
+      await expect(read()).resolves.toEqual([{ platform: 'meta', status: 'unreadable' }]);
+    });
+
+    it('a permanent failure on one account does not hide another that delivered, and is counted', async () => {
+      accounts.getAccountsByUserIdIncludingOrgShared.mockResolvedValue([metaAccount, second]);
+      mockRunDaily.mockImplementation(async (_a: any, id: string) => {
+        if (id === '1339') throw new Error('The Meta connection expired or was revoked');
+        return metaDaily([mrow('2026-11-17', 40, 2)]);
+      });
+      mockRunReport.mockResolvedValue({ rows: [] });
+      const [w] = (await read()) as any[];
+      expect(w.status).toBe('delivered');
+      expect(w.ads.notIncluded).toBe(1);
+    });
   });
 
   it('no connected ad account at all is an empty list and no report call', async () => {
@@ -784,7 +1062,7 @@ describe('the production wiring', () => {
   it('isPermanentReadError: connection and permission problems are permanent, outages and rate limits are not', () => {
     for (const m of ['The Meta connection expired or was revoked', 'Reconnect Meta', 'Google Ads PERMISSION_DENIED', 'invalid_grant', '... (OAuthException, code 190)', 'no usable access token',
       // The real Google error for a dead credential, seen live on env1.
-      'UNAUTHENTICATED — Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential.', 'Meta did not return the report (HTTP 401)']) {
+      'UNAUTHENTICATED — Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential.', 'Meta did not return the report (HTTP 401)', 'Request failed with status code 400']) {
       expect(isPermanentReadError(new Error(m))).toBe(true);
     }
     for (const m of ['Meta did not return the report (HTTP 503)', 'timeout of 20000ms exceeded', 'Meta did not return the report (rate limit, code 4)', 'UNAVAILABLE', 'fetch failed', 'Meta did not return the report (HTTP 5401)']) {
@@ -981,7 +1259,7 @@ describe('unsubscribe routes', () => {
   });
 
   it('POST with a tampered or missing token is a 400 and writes nothing', async () => {
-    const bad = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({ t: `${token()}x` });
+    const bad = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({ t: tamper(token()) });
     expect(bad.status).toBe(400);
     const none = await request(app()).post('/api/zoma/weekly-report/unsubscribe').type('form').send({});
     expect(none.status).toBe(400);
