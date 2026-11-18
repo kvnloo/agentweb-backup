@@ -96,6 +96,27 @@ async function getAlertEmails(settingKey: string, fallback: string[]): Promise<s
   return settingsService.getJsonArraySetting(settingKey, fallback);
 }
 
+/** ENG-3149: the longest schedule name (in characters, ellipsis included) the visitor-schedule alert will show. */
+export const SHARE_SCHEDULE_ALERT_NAME_MAX = 100;
+
+/**
+ * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner: every run of whitespace
+ * (newlines and tabs too) and every other control character becomes one space, the ends are trimmed, and a name longer than
+ * SHARE_SCHEDULE_ALERT_NAME_MAX is cut (on whole characters, never mid surrogate pair) with an ellipsis at the end so the result
+ * stays within the limit. HTML escaping is the caller's job at the point it writes HTML; the plain-text part uses this as is.
+ */
+export function shareScheduleAlertName(name: unknown): string {
+  const collapsed = (typeof name === 'string' ? name : '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\s\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .trim();
+  const characters = Array.from(collapsed);
+  const shown = characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX
+    ? `${characters.slice(0, SHARE_SCHEDULE_ALERT_NAME_MAX - 1).join('').trimEnd()}\u2026`
+    : collapsed;
+  return shown || 'Untitled';
+}
+
 export const emailService = {
   // Escape HTML content to make it safe for emails
   escapeHtml(html: string): string {
@@ -1874,6 +1895,80 @@ Schedule ID: ${scheduleId}
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat paused-for-input emails to ${emailList.join(', ')}:`, error);
+    }
+  },
+
+  // ENG-3149: a share-link visitor has just made the first mark on one of the owner's scheduled chats (the owner otherwise only
+  // sees the "Visitor-edited" badge). A notification only. The subject is fixed and the schedule NAME is the one piece of
+  // visitor-controlled text in the mail: it is whitespace-collapsed, cut to SHARE_SCHEDULE_ALERT_NAME_MAX characters and escaped
+  // (see shareScheduleAlertName). No prompt text, share token, IP or recipient list goes in. Never throws, like its siblings.
+  async sendVisitorScheduleAlertEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string
+  ) {
+    const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const reviewUrl = `${customerFrontendUrl}/agent-mode?tab=scheduled`;
+      const name = shareScheduleAlertName(scheduleName);
+
+      const header = 'A scheduled chat was set up through your share link';
+      const paragraph1Before = 'Someone using one of your Emma share links created or changed the scheduled chat "';
+      const paragraph1After = '".';
+      const paragraph2 = "Until you review it, it runs with limited access: it can't use account-level tools such as saving memory or changing organization settings, and anything it would publish or post to Slack is kept as a draft.";
+      const paragraph3 = "If it's yours or you trust it, open Scheduled chats, read what it does and press Adopt. If you don't recognise it, delete it, and consider turning off the share link.";
+      const buttonText = 'Review the schedule';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #f9a825; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #f9a825; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">${header}</h2>
+            </div>
+            <div class="content">
+              <p>${paragraph1Before}${this.escapeHtml(name)}${paragraph1After}</p>
+              <p>${paragraph2}</p>
+              <p>${paragraph3}</p>
+              <a class="button" href="${reviewUrl}">${buttonText}</a>
+            </div>
+            <div class="footer" style="color: #6c757d; font-size: 13px;">Schedule ID: ${this.escapeHtml(scheduleId)}</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+${header}
+
+${paragraph1Before}${name}${paragraph1After}
+
+${paragraph2}
+
+${paragraph3}
+
+${buttonText}:
+${reviewUrl}
+
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = 'Someone using your share link set up a scheduled chat';
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`[ENG-3149] visitor schedule alert email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      console.error(`[ENG-3149] error sending visitor schedule alert email to ${emailList.join(', ')}:`, error);
     }
   },
 
