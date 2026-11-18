@@ -14,6 +14,7 @@ import type { TrackingConfig } from "../utils/trackingConfig";
 import { ingestListCache } from "../utils/ingestListCache";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
+import { randomUUID } from "crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
@@ -78,6 +79,9 @@ const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 const s3 = new S3();
 
 // Helper function to handle DynamoDB errors
+/** True when a resubscribe call asked for any condition (so a refused condition is an answer, not an error). */
+const hasResubscribeConditions = (options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) => Boolean(options?.onlyIfOptOutNonce || options?.onlyIfUnsubscribedAt);
+
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
   if (error.code === "CredentialsError") {
@@ -234,6 +238,9 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  /** ENG-3128: answer to the Zoma "How familiar are you with ads?" question (see mcp/zomaAdsExperience.ts). */
+  zomaAdsExperience?: string;
+  zomaAdsExperienceAt?: string;
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
@@ -961,6 +968,18 @@ export interface Organization {
    * member join/leave. Absent/0 = no extra seats purchased.
    */
   purchasedExtraSeats?: number;
+  /**
+   * Hot lead calls add-on (ENG-2783): mirror of the flat $70/month subscription item on the org owner's Stripe
+   * subscription, written only by the billing webhook (hotLeadCallBillingService.mirrorHotLeadCallBilling).
+   * Absent = never subscribed. Read by hotLeadCallEntitlement when HOT_LEAD_CALL_BILLING_REQUIRED=true.
+   */
+  hotLeadCallBilling?: HotLeadCallBilling;
+}
+
+export interface HotLeadCallBilling {
+  itemId: string;
+  status: 'active' | 'past_due' | 'canceled';
+  updatedAt: string;
 }
 
 export interface OrgShareSettings {
@@ -1330,6 +1349,70 @@ export class UserDB {
     const item = result.Item;
     if (item?.userId?.startsWith("deleted_")) return undefined;
     return item;
+  }
+
+  /**
+   * ENG-3111: stamp a login on a user row the caller has ALREADY read, in one
+   * write and no read. `updateUser` looks the user up by id first to recover the
+   * email and asks DynamoDB for the whole updated row back; login holds the
+   * email and discards the row, so both were wasted round trips on every login.
+   *
+   * The condition is not optional. An UpdateItem on a missing key creates the
+   * item, so without it a login racing an account deletion would leave a stub
+   * row holding only these fields. `userId = :userId` also proves the row is
+   * still the user that was read. A failed condition throws
+   * ConditionalCheckFailedException; the caller decides what that means.
+   */
+  async recordLogin(
+    email: string,
+    userId: string,
+    fields: { lastLoginTime: string; lastTouch?: unknown }
+  ): Promise<void> {
+    const names: { [key: string]: string } = { "#userId": "userId", "#lastLoginTime": "lastLoginTime" };
+    const values: { [key: string]: any } = { ":userId": userId, ":lastLoginTime": fields.lastLoginTime };
+    let expression = "SET #lastLoginTime = :lastLoginTime";
+    if (fields.lastTouch !== undefined && fields.lastTouch !== null) {
+      names["#lastTouch"] = "lastTouch";
+      values[":lastTouch"] = fields.lastTouch;
+      expression += ", #lastTouch = :lastTouch";
+    }
+    await withTransactionConflictRetry(() =>
+      this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: email.toLowerCase() },
+          UpdateExpression: expression,
+          ConditionExpression: "#userId = :userId",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+        .promise()
+    );
+  }
+
+  /**
+   * Remove ONE key from the user's `secrets` map in a single atomic update. Unlike
+   * read-modify-write through updateUser, a concurrent write to a DIFFERENT secret
+   * is never overwritten. Absent key / absent map is a no-op.
+   */
+  async removeUserSecret(userId: string, key: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user?.email) throw new Error(`User with ID '${userId}' not found or has no email.`);
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE #secrets.#key SET #updatedAt = :updatedAt",
+          ExpressionAttributeNames: { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" },
+          ExpressionAttributeValues: { ":updatedAt": new Date().toISOString() },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === "ValidationException" && /document path/i.test(error?.message ?? "")) return;
+      handleDynamoDbError(error, "removeUserSecret");
+      throw error;
+    }
   }
 
   /**
@@ -2967,6 +3050,27 @@ export const taskDb = {
       return result.Item;
     } catch (error) {
       handleDynamoDbError(error, "getTaskExecutionById");
+    }
+  },
+
+  /**
+   * Who owns an execution and which task it belongs to, without reading the (large) execution row. Used by the file access policy
+   * (ENG-2988), which asks this for every file under an execution.
+   */
+  async getTaskExecutionOwnerById(executionId: string): Promise<{ executionId: string; userId?: string; taskId?: string } | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: {
+          executionId,
+        },
+        ProjectionExpression: "executionId, userId, taskId",
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskExecutionOwnerById");
     }
   },
 
@@ -4673,9 +4777,18 @@ export const subscriberDb = {
           subscribedAt,
           unsubscribed: false,
         },
+        // Two requests can both pass the check above (a person's click and a mail scanner's, for example): only one may create the row.
+        ConditionExpression: "attribute_not_exists(email)",
       };
 
-      await dynamodb.put(params).promise();
+      try {
+        await dynamodb.put(params).promise();
+      } catch (putError: any) {
+        if (putError?.code === "ConditionalCheckFailedException") {
+          throw new Error(`Email ${email} is already in the subscriber list for this task`);
+        }
+        throw putError;
+      }
       return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
       handleDynamoDbError(error, "addSubscriber");
@@ -4698,15 +4811,22 @@ export const subscriberDb = {
     }
   },
 
-  async softUnsubscribe(taskId: string, email: string, feedback?: string) {
+  /**
+   * Mark an address unsubscribed. With `onlyIfActive` the update happens only if the row exists and is not already unsubscribed, in one
+   * atomic step, and returns null when it did not (ENG-2991: only the caller that really flips the row is handed an undo token).
+   */
+  async softUnsubscribe(taskId: string, email: string, feedback?: string, options?: { onlyIfActive?: boolean }) {
     try {
+      // optOutNonce names this particular opt-out (ENG-2991): the undo token is bound to it, and a repeat unsubscribe of an address that is already
+      // opted out rotates it (refreshOptOut), without touching unsubscribedAt, which stays the record of when the person opted out.
       const updateExpression = feedback
-        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
-        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
+        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce, feedback = :feedback"
+        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce";
 
       const expressionAttributeValues: any = {
         ":unsubscribed": true,
         ":unsubscribedAt": new Date().toISOString(),
+        ":optOutNonce": randomUUID(),
       };
 
       if (feedback) {
@@ -4722,18 +4842,28 @@ export const subscriberDb = {
         UpdateExpression: updateExpression,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
+        ...(options?.onlyIfActive
+          ? { ConditionExpression: "attribute_exists(email) AND (attribute_not_exists(unsubscribed) OR unsubscribed = :stillActive)" }
+          : {}),
       };
+      if (options?.onlyIfActive) (params.ExpressionAttributeValues as any)[":stillActive"] = false;
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (options?.onlyIfActive && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "softUnsubscribe");
     }
   },
 
-  async resubscribe(taskId: string, email: string) {
+  /**
+   * Put an unsubscribed address back. With `onlyIfOptOutNonce` and/or `onlyIfUnsubscribedAt` the update applies only while the row is still
+   * unsubscribed by exactly that opt-out, in one atomic step, and returns null when it did not (ENG-2991: an undo token or a confirmation link
+   * must not undo a newer opt-out).
+   */
+  async resubscribe(taskId: string, email: string, options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
@@ -4747,11 +4877,73 @@ export const subscriberDb = {
         },
         ReturnValues: "ALL_NEW",
       };
+      const conditions: string[] = [];
+      if (options?.onlyIfOptOutNonce) {
+        conditions.push("optOutNonce = :claimedNonce");
+        params.ExpressionAttributeValues[":claimedNonce"] = options.onlyIfOptOutNonce;
+      }
+      if (options?.onlyIfUnsubscribedAt) {
+        conditions.push("unsubscribedAt = :claimedOptOut");
+        params.ExpressionAttributeValues[":claimedOptOut"] = options.onlyIfUnsubscribedAt;
+      }
+      if (conditions.length) {
+        params.ConditionExpression = ["unsubscribed = :wasOptedOut", ...conditions].join(" AND ");
+        params.ExpressionAttributeValues[":wasOptedOut"] = true;
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (hasResubscribeConditions(options) && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "resubscribe");
+    }
+  },
+
+  /**
+   * Give an already unsubscribed address a new opt-out nonce, which voids every undo token issued for the earlier one (ENG-2991). It does not
+   * touch `unsubscribedAt`: that stays the record of when the person opted out, and the rule that refuses a confirmation link sent before the
+   * opt-out depends on it. Returns true when it applied; false if the address is not unsubscribed or does not exist (no row is created).
+   */
+  async refreshOptOut(taskId: string, email: string): Promise<boolean> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET optOutNonce = :nonce",
+        ConditionExpression: "unsubscribed = :isOptedOut",
+        ExpressionAttributeValues: {
+          ":nonce": randomUUID(),
+          ":isOptedOut": true,
+        },
+      };
+
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") return false;
+      handleDynamoDbError(error, "refreshOptOut");
+      return false;
+    }
+  },
+
+  /** Every address of a task with only the three fields needed to match and judge it (not the history and imported fields). */
+  async getTaskSubscriberStates(taskId: string): Promise<Array<{ email: string; unsubscribed?: boolean; unsubscribedAt?: string }> | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        KeyConditionExpression: "taskId = :taskId",
+        ProjectionExpression: "email, unsubscribed, unsubscribedAt",
+        ExpressionAttributeValues: {
+          ":taskId": taskId,
+        },
+      };
+
+      return (await paginatedQuery(dynamodb, params)) as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscriberStates");
     }
   },
 
@@ -4789,7 +4981,7 @@ export const subscriberDb = {
     }
   },
 
-  async getTaskSubscriberByEmail(taskId: string, email: string) {
+  async getTaskSubscriberByEmail(taskId: string, email: string, consistentRead = false) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -4797,6 +4989,7 @@ export const subscriberDb = {
           taskId: taskId,
           email: email,
         },
+        ...(consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
@@ -6666,6 +6859,9 @@ export const crmDb = {
     /** ENG-926 §B: client user-agent at capture (Meta `client_user_agent`). Paired with
      *  clientIp; Meta treats the two together as a match signal. */
     clientUserAgent?: string;
+    /** ENG-2783: CRM-internal sidecar written in the creation put (so it exists before any post-create hook reads the
+     *  row). Used for `system.callConsent`, which the hot-lead call gate must see on the very first pass. */
+    system?: Record<string, unknown>;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -6854,6 +7050,9 @@ export const crmDb = {
       }
       if (leadData.clientUserAgent) {
         item.clientUserAgent = leadData.clientUserAgent;
+      }
+      if (leadData.system && Object.keys(leadData.system).length > 0) {
+        item.system = leadData.system;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;
@@ -12724,6 +12923,43 @@ export const orgDb = {
   },
 
   /**
+   * Write an org secret only if that key is not already set — the check and the
+   * write are one conditional update, so a concurrent writer is never clobbered.
+   * Returns false when the key already exists.
+   */
+  async setOrgSecretIfAbsent(orgId: string, key: string, encryptedValue: string): Promise<boolean> {
+    const names = { "#secrets": "secrets", "#key": key, "#updatedAt": "updatedAt" };
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets.#key = :val, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_exists(#secrets) AND attribute_not_exists(#secrets.#key)",
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: { ":val": encryptedValue, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code !== "ConditionalCheckFailedException") throw err;
+    }
+    // Either the key exists (done) or the secrets map is missing (create it, still conditionally).
+    try {
+      await dynamodb.update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression: "SET #secrets = :secretsMap, #updatedAt = :updatedAt",
+        ConditionExpression: "attribute_not_exists(#secrets)",
+        ExpressionAttributeNames: { "#secrets": "secrets", "#updatedAt": "updatedAt" },
+        ExpressionAttributeValues: { ":secretsMap": { [key]: encryptedValue }, ":updatedAt": new Date().toISOString() },
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === "ConditionalCheckFailedException") return false;
+      throw err;
+    }
+  },
+
+  /**
    * Retrieve a single encrypted secret from the org record.
    * Returns null if the org doesn't exist or the key is absent.
    */
@@ -12734,7 +12970,7 @@ export const orgDb = {
   },
 
   /**
-   * Remove a single secret key from the org record.
+   * Remove a single secret key from the org record. Idempotent; throws on real failures.
    */
   async removeOrgSecret(orgId: string, key: string): Promise<void> {
     try {
@@ -12751,8 +12987,12 @@ export const orgDb = {
           ":updatedAt": new Date().toISOString(),
         },
       }).promise();
-    } catch {
-      // If secrets map or key doesn't exist, that's fine — already absent.
+    } catch (err: any) {
+      // Removing an absent key is a no-op in DynamoDB. The only "already absent" error is the
+      // whole secrets map missing (invalid document path); anything else is a real failure
+      // the caller must see rather than report as a successful disconnect.
+      if (err?.code === "ValidationException" && /document path/i.test(err?.message ?? "")) return;
+      throw err;
     }
   },
 };

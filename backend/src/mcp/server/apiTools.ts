@@ -17,6 +17,8 @@ import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import './readEmailTool';
+// Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
+import './smartleadTools';
 import './conversionSummaryTool';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
@@ -250,7 +252,7 @@ mcpToolRegistry.register({
   name: 'emma_answer_question_deck',
   definition: {
     name: 'emma_answer_question_deck',
-    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI. Cards that need a person\'s approval (adding or releasing contacts in Smartlead, a hot-lead call, activating a CRM sequence, a paused Meta campaign bundle) cannot be approved this way: approving one returns an error with the link where the person approves it in AgentWeb; declining one works.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1075,6 +1077,8 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'list_lead_lists',
+  // A GET only: listing lists changes nothing. Read-only so a key scoped to tools:read (e.g. a Smartlead agent key) can find a listId.
+  readOnly: true,
   definition: {
     name: 'list_lead_lists',
     description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
@@ -1086,6 +1090,11 @@ mcpToolRegistry.register({
   },
   /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
+    // The tool is read-only so a tools:read key can find its own listIds, but reading ANOTHER account's lists (client_id, admin-only)
+    // stays a tools:execute capability, as it was before the tool was marked read-only.
+    if (args?.client_id && context?.externalMcp === true && context?.authMethod === 'api_key' && !(context.apiKeyScopes ?? []).includes('tools:execute')) {
+      throw new Error("client_id needs an API key that holds the 'tools:execute' scope.");
+    }
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/crm/lists',
@@ -4286,6 +4295,50 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
       method: 'GET',
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
       context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'read_client_meta_activity',
+  definition: {
+    name: 'read_client_meta_activity',
+    description: `Read the Meta ad account change history (who changed what, when) for one named client. Admin-only tool, read-only — nothing is written to Meta.
+
+Resolves the client the same way assess_client_health does, with one difference: a name that matches more than one client is refused, so pass the exact email when a name is ambiguous.
+
+Returns:
+- 'ad_account_id' and 'client': the account that was actually read and whose it is. Check these before quoting the history.
+- 'events': one page of Meta activity events (event_time, event_type, object_id, object_name, object_type, actor_name, extra_data). When Meta supplies old and new values (for example a budget change), they are also given as 'before' and 'after'. Fields Meta did not return are absent.
+- 'paging': cursors; pass paging.cursors.after as 'after' to read the next page.
+
+A result with success:false means nothing was read ('reason' says why: ambiguous_client, client_not_found, no_meta_connection, credential_pair_mismatch, invalid_argument, meta_read_failed). Never report a failed read as "no changes".`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: { type: 'string', description: 'ISO date or unix seconds; earliest event.' },
+        until: { type: 'string', description: 'ISO date or unix seconds; latest event.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Events per page (default 50).' },
+        after: { type: 'string', description: 'Paging cursor from a previous result.' }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const queryParams: Record<string, string> = {};
+    for (const key of ['since', 'until', 'limit', 'after']) {
+      if (args[key] !== undefined && args[key] !== null && String(args[key]).trim() !== '') queryParams[key] = String(args[key]);
+    }
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-activity`,
+      context: ctx(context),
+      queryParams
     });
     return jsonResult(data);
   }

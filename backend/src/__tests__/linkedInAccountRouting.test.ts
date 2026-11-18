@@ -19,9 +19,15 @@ import { linkedInOutreachService } from '../services/linkedInOutreachService';
 describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
   const CALLER = 'user-1';
 
+  let probeSpy: jest.SpyInstance;
+
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX = '30';
+    // ENG-3101: the router now asks whether a candidate's session is alive. Default
+    // every account to a live session so the older cases keep testing what they
+    // tested; no case here may reach the real Unipile client.
+    probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('connected');
   });
 
   afterEach(() => {
@@ -293,5 +299,100 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
 
     expect(result!.accountId).toBe('acct-C');
     expect(result!.account.ownerUserId).toBe(CALLER);
+  });
+
+  describe('candidate with a dead session (ENG-3101)', () => {
+    // The 2026-11-11 scheduled run: the requested account was at its daily cap, the
+    // first other account had headroom but a session already known to be dead, and
+    // five send-invite calls were refused as "disconnected" because of it while four
+    // live accounts sat unused.
+    const withHeadroom = (account_id: string, userId: string = CALLER) => ({
+      platform: 'unipile',
+      account_id,
+      userId,
+      config: { daily_invite_cap: 30, daily_volume: { invite: { count: 0, windowStartedAt: Date.now() } } },
+    });
+    const requestedRow = { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 10 } };
+    const probeBy = (states: Record<string, 'connected' | 'disconnected' | 'unknown'>) =>
+      probeSpy.mockImplementation(async (id: string) => states[id] ?? 'connected');
+
+    it('skips a disconnected first candidate and routes to the next live one with headroom', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        requestedRow, withHeadroom('acct-dead'), withHeadroom('acct-live', 'teammate-2'),
+      ]);
+      probeBy({ 'acct-dead': 'disconnected' });
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(result!.accountId).toBe('acct-live');
+      expect(result!.account.ownerUserId).toBe('teammate-2');
+      expect(result!.reason).not.toContain('acct-dead');
+    });
+
+    it('returns null when every other candidate is disconnected, so the caller gets the daily-cap refusal for the account it asked for', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        requestedRow, withHeadroom('acct-dead-1'), withHeadroom('acct-dead-2', 'teammate-2'),
+      ]);
+      probeBy({ 'acct-dead-1': 'disconnected', 'acct-dead-2': 'disconnected' });
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(result).toBeNull();
+    });
+
+    it('does not exclude a candidate whose probe is indeterminate (unknown)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([requestedRow, withHeadroom('acct-unknown')]);
+      probeBy({ 'acct-unknown': 'unknown' });
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(result!.accountId).toBe('acct-unknown');
+    });
+
+    it('does not exclude a candidate when the probe itself throws', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([requestedRow, withHeadroom('acct-B')]);
+      probeSpy.mockRejectedValue(new Error('probe blew up'));
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(result!.accountId).toBe('acct-B');
+    });
+
+    it('reports each skipped disconnected candidate to the caller, and a failing report does not stop routing', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        requestedRow, withHeadroom('acct-dead'), withHeadroom('acct-live'),
+      ]);
+      probeBy({ 'acct-dead': 'disconnected' });
+      const onDisconnectedCandidate = jest.fn().mockRejectedValue(new Error('health write failed'));
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(
+        CALLER, 'send-invite', 'acct-A', cappedAccount, undefined, { onDisconnectedCandidate },
+      );
+
+      expect(onDisconnectedCandidate.mock.calls).toEqual([['acct-dead']]);
+      expect(result!.accountId).toBe('acct-live');
+    });
+
+    it('probes only candidates that would otherwise be chosen: not the requested account, not a capped one, none after the pick', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        requestedRow,
+        { ...withHeadroom('acct-capped'), config: { daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } } },
+        withHeadroom('acct-live'),
+        withHeadroom('acct-never-reached'),
+      ]);
+
+      await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(probeSpy.mock.calls).toEqual([['acct-live']]);
+    });
+
+    it('makes no probe at all when the requested account has headroom', async () => {
+      await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', {
+        ...cappedAccount,
+        dailyVolumeState: { invite: { count: 1, windowStartedAt: Date.now() } },
+      });
+
+      expect(probeSpy).not.toHaveBeenCalled();
+    });
   });
 });

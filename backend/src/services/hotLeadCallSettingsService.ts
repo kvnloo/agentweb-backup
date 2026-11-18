@@ -16,7 +16,9 @@ import {
   ConflictError, ForbiddenError, NotEntitledError, NotFoundError, RevisionRequiredError, StoredStateInvalidError, UnattendedRunError,
   ValidationError, VerificationCodeError,
 } from './hotLeadCallErrors';
-import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
+import {
+  HOT_LEAD_CALL_SUBSCRIBE_MESSAGE, isHotLeadCallBillingActive, isHotLeadCallBillingRequired, isHotLeadCallPlanEntitled,
+} from './voice/hotLeadCallEntitlement';
 import { isConditionalFailure, unchangedSince } from './voice/setupWrites';
 import {
   confirmVerification, startVerification, verificationAfterTeamEdit, verificationStateOf, VERIFICATION_MAX_ATTEMPTS,
@@ -148,9 +150,11 @@ export function storedHotLeadCallConfig(org: Pick<Organization, 'hotLeadCall'>):
 }
 
 /** Plain-English reasons enabling is not possible yet, in the order the person should fix them. */
-function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean): string[] {
+function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean, needsAddon: boolean): string[] {
   const blockers: string[] = [];
   if (!entitled) blockers.push(BLOCKER_NOT_ENTITLED);
+  // The plan includes the feature but the paid add-on is not active: say how to get it (the portal cannot buy it).
+  else if (needsAddon) blockers.push(HOT_LEAD_CALL_SUBSCRIBE_MESSAGE);
   if (!config?.team.length) blockers.push(BLOCKER_NO_VERIFIED_PERSON);
   else if (!config.team.some(m => m.verifiedAt)) blockers.push(BLOCKER_UNVERIFIED);
   if (!config?.callingHours) blockers.push(BLOCKER_NO_HOURS);
@@ -158,8 +162,9 @@ function blockersOf(config: HotLeadCallConfig | undefined, entitled: boolean): s
   return blockers;
 }
 
-function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig | undefined, entitled: boolean): HotLeadCallSettingsDto {
-  const blockers = [...blockersOf(config, entitled), ...effectiveBlockersOf(config)];
+/** `entitled` is the PLAN check; `needsAddon` is true when the plan has the feature but the required paid add-on is not active. */
+function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig | undefined, entitled: boolean, needsAddon = false): HotLeadCallSettingsDto {
+  const blockers = [...blockersOf(config, entitled, needsAddon), ...effectiveBlockersOf(config)];
   return {
     _revision: hotLeadCallRevisionOf(org.hotLeadCall),
     entitled,
@@ -188,7 +193,8 @@ function toDto(org: Pick<Organization, 'hotLeadCall'>, config: HotLeadCallConfig
 
 export async function getHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller): Promise<HotLeadCallSettingsDto> {
   requireConfigure(org, caller);
-  return toDto(org, storedHotLeadCallConfig(org), await isHotLeadCallEntitled(org));
+  const planEntitled = await isHotLeadCallPlanEntitled(org);
+  return toDto(org, storedHotLeadCallConfig(org), planEntitled, planEntitled && !await isHotLeadCallBillingActive(org));
 }
 
 export async function previewHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, at: Date): Promise<HotLeadCallPreviewDto> {
@@ -225,7 +231,7 @@ function configOrNoMember(org: Organization): HotLeadCallConfig {
 
 export async function startMemberVerification(org: Organization, caller: HotLeadCallCaller, memberId: string | undefined) {
   requireConfigure(org, caller);
-  if (!await isHotLeadCallEntitled(org)) throw new NotEntitledError();
+  if (!await isHotLeadCallPlanEntitled(org)) throw new NotEntitledError();
   return startVerification(org, configOrNoMember(org), caller.userId, memberId);
 }
 
@@ -360,13 +366,13 @@ function callingHoursProblems(raw: unknown, errors: Errors): void {
 function scalarProblems(body: Record<string, unknown>, errors: Errors): void {
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') errors.enabled = 'enabled must be true or false';
   if (body.announcedName !== undefined && !announcedNameOf(body.announcedName)) {
-    errors.announcedName = `Use 1 to ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters: letters, digits, spaces and . , & ' - only`;
+    errors.announcedName = `Enter the business's registered (legal) name: it is the name the lead hears as the caller. Use 1 to ${HOT_LEAD_CALL_ANNOUNCED_NAME_MAX} characters: letters, digits, spaces and . , & ' - only`;
   }
   if (body.callingHours !== undefined) callingHoursProblems(body.callingHours, errors);
   for (const field of HOT_LEAD_CALL_LIMIT_FIELDS) {
     const value = body[field];
     const { min, max } = HOT_LEAD_CALL_LIMITS[field];
-    // An operator may store up to the table maximum; the owner routes stop at the default (see the check in applyHotLeadCallSettings).
+    // An operator may store up to the table maximum; the owner routes stop at HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH (see the check in applyHotLeadCallSettings).
     if (field === 'maxCallsPerMonth' && typeof value === 'number' && Number.isInteger(value) && value > HOT_LEAD_CALL_OWNER_MAX_CALLS_PER_MONTH && value <= max) continue;
     if (value !== undefined && !(typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max)) {
       errors[field] = `${field} must be a whole number from ${min} to ${max}`;
@@ -435,7 +441,8 @@ const summary = (errors: Errors) => `Some settings are not valid: ${Object.entri
  *
  * `beforeTurningOn` is for a caller whose request is not a person's click (the Emma tool): it runs after every
  * check above has passed, only for a change that turns calling on, and anything it throws stops the write.
- * The REST route has no such hook, because its caller is the person clicking.
+ * The REST route has no such hook, because its caller is the person clicking; it therefore cannot buy the paid
+ * add-on, and turning calling on there is refused while the add-on is required and not active.
  */
 export async function applyHotLeadCallSettings(
   org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>, beforeTurningOn?: (next: HotLeadCallConfig) => Promise<void>,
@@ -455,7 +462,7 @@ export async function applyHotLeadCallSettings(
   const team = body.team === undefined ? current?.team : buildTeam(body.team, current, errors);
   if (!current) {
     if (body.team === undefined) errors.team = 'Add at least one person';
-    if (body.announcedName === undefined) errors.announcedName = 'Enter the business name callers will hear';
+    if (body.announcedName === undefined) errors.announcedName = 'Enter the business\'s registered (legal) name: it is the name the lead hears as the caller';
   }
   // A value above the owner maximum is refused unless it is the very value already stored (a round trip of the read-out).
   const month = body.maxCallsPerMonth;
@@ -464,7 +471,7 @@ export async function applyHotLeadCallSettings(
   }
   if (Object.keys(errors).length || !team) throw new ValidationError(summary(errors), errors);
 
-  const entitled = await isHotLeadCallEntitled(org);
+  const entitled = await isHotLeadCallPlanEntitled(org);
   const wantsEnabled = (typeof body.enabled === 'boolean' ? body.enabled : undefined) ?? current?.enabled ?? false;
   // Turning calling on is what lets calls spend money; saving while off, or editing while already on, is not gated.
   if (wantsEnabled && !current?.enabled && !entitled) throw new NotEntitledError();
@@ -478,7 +485,7 @@ export async function applyHotLeadCallSettings(
   };
   const draft = hotLeadCallConfigOf(candidate);
   if (!draft) throw new ValidationError('These settings are not valid');
-  const blockers = blockersOf(draft, true);
+  const blockers = blockersOf(draft, true, false);
   // Turning on is also refused when the settings could never place a call (no callable country, hours that never meet the
   // lead window); an org that is already on keeps its setting through an unrelated edit and sees the problem in the read-out.
   const turningOn = wantsEnabled && !current?.enabled;
@@ -496,7 +503,14 @@ export async function applyHotLeadCallSettings(
     const reason = escalationOf(current, next);
     if (reason) throw new UnattendedRunError(`This needs a person to confirm in an interactive chat (${reason})`);
   }
-  if (next.enabled && !current?.enabled) await beforeTurningOn?.(next);
+  let addOnBought = false;
+  if (next.enabled && !current?.enabled) {
+    // The paid add-on (when billing is required) is bought by the chat tool's hook after approval; a caller without
+    // a hook (the portal's REST save) cannot buy it, so it is refused with the way to subscribe.
+    if (!beforeTurningOn && !await isHotLeadCallBillingActive(org)) throw new NotEntitledError(HOT_LEAD_CALL_SUBSCRIBE_MESSAGE);
+    await beforeTurningOn?.(next);
+    addOnBought = isHotLeadCallBillingRequired();
+  }
 
   const verification = verificationAfterTeamEdit(org.hotLeadCallVerification, next.team);
   try {
@@ -504,10 +518,10 @@ export async function applyHotLeadCallSettings(
       condition: unchangedSince({ hotLeadCall: previousRaw, ...(verification ? { hotLeadCallVerification: org.hotLeadCallVerification } : {}) }),
     });
   } catch (err) {
-    if (isConditionalFailure(err)) throw new ConflictError('The settings were changed by someone else. Reload them and try again.');
+    if (isConditionalFailure(err)) throw new ConflictError(`The settings were changed by someone else. Reload them and try again.${addOnBought ? ' The hot lead calls add-on is already active on your subscription and will not be charged again.' : ''}`);
     throw err;
   }
-  return { dto: toDto({ hotLeadCall: next }, next, entitled), config: next };
+  return { dto: toDto({ hotLeadCall: next }, next, entitled, entitled && !(addOnBought || await isHotLeadCallBillingActive(org))), config: next };
 }
 
 export async function updateHotLeadCallSettings(org: Organization, caller: HotLeadCallCaller, body: Record<string, unknown>): Promise<HotLeadCallSettingsDto> {

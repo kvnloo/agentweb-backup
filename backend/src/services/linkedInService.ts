@@ -1,5 +1,19 @@
 import axios from 'axios';
 import { PublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { randomUUID } from 'crypto';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
+import {
+  assertImageDownload,
+  classifyMedia,
+  LinkedInUnsupportedMediaError,
+  LINKEDIN_MAX_VIDEO_BYTES,
+  LINKEDIN_VIDEO_FORMAT_MESSAGE,
+  withMediaUploadSlot,
+} from './linkedInMedia';
 import {
   LinkedInProfile,
   LinkedInPost,
@@ -22,7 +36,7 @@ export class LinkedInService {
       timeout: 15000, // 15 second timeout
       headers: {
         'X-Restli-Protocol-Version': '2.0.0',
-        'LinkedIn-Version': '202511',
+        'LinkedIn-Version': '202610', // 202511 sunsets 2026-11-16; 202610 is supported until 2027-10-15
         'Content-Type': 'application/json',
       },
     });
@@ -946,6 +960,7 @@ export class LinkedInService {
       });
 
       const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+      assertImageDownload(imageResponse.headers['content-type'], imageBuffer);
       const contentType = imageResponse.headers['content-type'] || 'image/png';
 
       // Step 1: Initialize upload
@@ -959,6 +974,162 @@ export class LinkedInService {
     });
   }
 
+
+  // How long a finalized video may stay PROCESSING before the post is refused (nothing is posted).
+  videoProcessingPollMs = 3000;
+  videoProcessingTimeoutMs = 120_000;
+  private static readonly MEDIA_DOWNLOAD_DEADLINE_MS = 5 * 60_000;
+
+  // /tmp is tmpfs (RAM) on Amazon Linux 2023; /var/tmp is disk-backed.
+  private static spoolDir(): string {
+    try {
+      fs.accessSync('/var/tmp', fs.constants.W_OK);
+      return '/var/tmp';
+    } catch {
+      return os.tmpdir();
+    }
+  }
+
+  /** Streams a media_url to a temp file, aborting as soon as it exceeds the size cap. */
+  private async downloadToTempFile(url: string): Promise<{ file: string; bytes: number; contentType: string | undefined }> {
+    const tooLarge = () => new LinkedInUnsupportedMediaError(
+      `The media file is larger than the ${LINKEDIN_MAX_VIDEO_BYTES / 1024 / 1024} MB limit for LinkedIn uploads. Nothing was posted.`,
+    );
+    const response: any = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 30000,
+      signal: AbortSignal.timeout(LinkedInService.MEDIA_DOWNLOAD_DEADLINE_MS),
+      validateStatus: () => true,
+    } as any);
+    if (response.status < 200 || response.status >= 300) {
+      response.data.destroy();
+      throw new Error(`Could not download the media_url (HTTP ${response.status}).`);
+    }
+    const declared = Number(response.headers?.['content-length']);
+    if (declared > LINKEDIN_MAX_VIDEO_BYTES) {
+      response.data.destroy();
+      throw tooLarge();
+    }
+    const file = path.join(LinkedInService.spoolDir(), `li-media-${randomUUID()}`);
+    let bytes = 0;
+    const counter = new Transform({
+      transform(chunk, _enc, cb) {
+        bytes += chunk.length;
+        if (bytes > LINKEDIN_MAX_VIDEO_BYTES) cb(tooLarge());
+        else cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(response.data, counter, fs.createWriteStream(file, { mode: 0o600 }));
+    } catch (err) {
+      await fs.promises.rm(file, { force: true });
+      throw err;
+    }
+    return { file, bytes, contentType: response.headers?.['content-type'] };
+  }
+
+  /**
+   * Download a media_url and upload it to LinkedIn through the pipeline its bytes call for:
+   * an image through the Images API, an MP4 through the multi-part Videos API. Returns the
+   * image or video URN; the caller tells them apart by prefix.
+   */
+  async uploadMediaFromUrl(accessToken: string, ownerUrn: string, mediaUrl: string): Promise<string> {
+    return withMediaUploadSlot(async () => {
+      // Set once the bytes say this is a video, so a failure after that point can be told apart from
+      // an image failure even when the URL gave no hint. The error object is tagged, not rewrapped,
+      // because callers match on its message (fresh-token 401 retry).
+      let isVideo = false;
+      try {
+        return await this.safeRequest(async () => {
+          const download = await this.downloadToTempFile(mediaUrl);
+          try {
+            const head = Buffer.alloc(16);
+            const handle = await fs.promises.open(download.file, 'r');
+            let headBytes: number;
+            try { headBytes = (await handle.read(head, 0, 16, 0)).bytesRead; } finally { await handle.close(); }
+
+            const cls = classifyMedia(download.contentType, head.subarray(0, headBytes));
+            if (cls.kind === 'unsupported') throw new LinkedInUnsupportedMediaError(cls.message);
+
+            if (cls.kind === 'image') {
+              const imageBuffer = await fs.promises.readFile(download.file);
+              const { uploadUrl, imageUrn } = await this.initializeImageUpload(accessToken, ownerUrn);
+              await this.uploadImageBinary(uploadUrl, imageBuffer, download.contentType || 'image/png');
+              console.log(`[LinkedIn] Image uploaded successfully: ${imageUrn}`);
+              return imageUrn;
+            }
+
+            isVideo = true;
+            return await this.uploadVideoFile(accessToken, ownerUrn, download.file, download.bytes);
+          } finally {
+            await fs.promises.rm(download.file, { force: true });
+          }
+        });
+      } catch (error: any) {
+        if (isVideo && error && typeof error === 'object') { try { error.isVideoUpload = true; } catch { /* frozen error: the adapter still refuses */ } }
+        throw error;
+      }
+    });
+  }
+
+  /** Videos API: initializeUpload, one PUT per 4 MB part, finalizeUpload, then wait until AVAILABLE. */
+  private async uploadVideoFile(accessToken: string, ownerUrn: string, file: string, size: number): Promise<string> {
+    const headers = { Authorization: `Bearer ${accessToken}` };
+    const init = await this.client.post('/rest/videos?action=initializeUpload', {
+      initializeUploadRequest: { owner: ownerUrn, fileSizeBytes: size, uploadCaptions: false, uploadThumbnail: false },
+    }, { headers });
+    const { video, uploadToken, uploadInstructions } = (init.data as any).value;
+
+    const etags: string[] = [];
+    const handle = await fs.promises.open(file, 'r');
+    try {
+      for (const part of uploadInstructions as Array<{ firstByte: number; lastByte: number; uploadUrl: string }>) {
+        const length = Math.min(part.lastByte, size - 1) - part.firstByte + 1;
+        const body = Buffer.alloc(length);
+        await handle.read(body, 0, length, part.firstByte);
+        const response = await axios.put(part.uploadUrl, body, {
+          headers: { 'Content-Type': 'application/octet-stream' },
+          timeout: 120000,
+          maxBodyLength: Infinity,
+        } as any);
+        const etag = (response as any).headers?.etag;
+        if (!etag) throw new Error('LinkedIn did not return an ETag for an uploaded video part');
+        etags.push(String(etag).replace(/^"|"$/g, ''));
+      }
+    } finally {
+      await handle.close();
+    }
+
+    await this.client.post('/rest/videos?action=finalizeUpload', {
+      finalizeUploadRequest: { video, uploadToken: uploadToken ?? '', uploadedPartIds: etags },
+    }, { headers });
+
+    await this.waitForVideoAvailable(accessToken, video);
+    console.log(`[LinkedIn] Video uploaded successfully: ${video}`);
+    return video;
+  }
+
+  private async waitForVideoAvailable(accessToken: string, videoUrn: string): Promise<void> {
+    const deadline = Date.now() + this.videoProcessingTimeoutMs;
+    for (;;) {
+      const response = await this.client.get(`/rest/videos/${encodeURIComponent(videoUrn)}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const { status, processingFailureReason } = response.data as any;
+      if (status === 'AVAILABLE') return;
+      if (status === 'PROCESSING_FAILED') {
+        throw new LinkedInUnsupportedMediaError(
+          `LinkedIn could not process the video${processingFailureReason ? ` (${processingFailureReason})` : ''}. ${LINKEDIN_VIDEO_FORMAT_MESSAGE}`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new LinkedInUnsupportedMediaError(
+          'LinkedIn is still processing the video, so it was not attached. Nothing was posted - try again in a few minutes.',
+        );
+      }
+      await new Promise(resolve => setTimeout(resolve, this.videoProcessingPollMs));
+    }
+  }
 
   /**
    * Aggregated Analytics: Get follower, page, and share statistics for an organization

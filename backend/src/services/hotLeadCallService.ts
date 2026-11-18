@@ -9,6 +9,7 @@ import { isInsideLeadCallWindow } from './voice/leadLocalHours';
 import { getVoiceProvider } from './voice/voiceProvider';
 import { isWebhookSafeId } from './voice/voiceUrls';
 import { isHotLeadCallEnabled } from './voice/hotLeadCallMode';
+import { hasCallConsent } from './voice/callConsent';
 import { isLeadDoNotCall } from './voice/hotLeadCallDnc';
 import { isHotLeadCallEntitled } from './voice/hotLeadCallEntitlement';
 import { resolveHotLeadCallContext, type HotLeadCallContext } from './voice/hotLeadCallContext';
@@ -56,7 +57,7 @@ type LeadRow = NonNullable<Awaited<ReturnType<typeof crmDb.getLeadById>>>;
 interface GateInput { config: HotLeadCallConfig; lead: LeadRow; job: HotLeadCallJob }
 
 // Gates that record `call.skipped` when they refuse, cheapest first. Each returns a skip reason or null.
-// Order: ids, phone, org calling hours, lead-local hours, team availability, age. The async gates (do_not_call, plan) follow in review().
+// Order: ids, phone, call consent, org calling hours, lead-local hours, team availability, age. The async gates (do_not_call, plan) follow in review().
 const SKIP_GATES: Array<(g: GateInput) => string | null> = [
   // The webhooks reject ids outside their strict shape; Twilio would ring the member and every callback would fail.
   ({ job }) => (isWebhookSafeId(job.listId) && isWebhookSafeId(job.leadId) ? null : 'unsafe_id'),
@@ -64,6 +65,10 @@ const SKIP_GATES: Array<(g: GateInput) => string | null> = [
     const callable = callableLeadPhone(lead.phone, config);
     return 'reason' in callable ? callable.reason : null;
   },
+  // ENG-2783: an automated call to a mobile needs the person's recorded prior express consent. A lead without
+  // `system.callConsent` (a form with no call-consent notice, or an old lead) is never dialed. Stateless and one field
+  // read, so it runs in every pass including the retry; PERMANENT_REFUSALS spends the retry for it.
+  ({ lead }) => (hasCallConsent(lead) ? null : 'no_call_consent'),
   // Stateless, so it runs in every pass; the limits that count calls run once, just before create. A skip leaves
   // the lead's call slot unused, and the Slack alert goes out regardless.
   ({ config }) => (isWithinCallWindow(config.callingHours, new Date()) ? null : 'outside_calling_hours'),
@@ -140,7 +145,7 @@ async function reviewWhy(input: JobInput, expectedOrgId?: string): Promise<Revie
     }
   }
   // After the stateless gates: it reads the org owner's plan. An org that lost its plan stops dialing here.
-  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId })) {
+  if (!await isHotLeadCallEntitled({ ownerUserId: ctx.orgOwnerUserId, orgId: ctx.orgId })) {
     await recordSkip(lead, 'not_entitled');
     return refusal('not_entitled');
   }
@@ -320,7 +325,7 @@ type RetryOutcome =
  */
 const PERMANENT_REFUSALS = new Set([
   'lead_missing', 'ctx_missing', 'lead_phone_changed', 'do_not_call', 'not_entitled', 'duplicate_phone',
-  'smoke_test', 'draft_lead', 'invalid_phone', 'country_not_allowed', 'unsafe_id', 'not_form_fill', 'has_record', 'retry_expired',
+  'smoke_test', 'draft_lead', 'invalid_phone', 'no_call_consent', 'country_not_allowed', 'unsafe_id', 'not_form_fill', 'has_record', 'retry_expired',
 ]);
 
 const retryLog = (what: 'dropped' | 'rescheduled', reason: string, orgId: string): void =>

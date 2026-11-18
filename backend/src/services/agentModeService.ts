@@ -1,4 +1,5 @@
 import { addCompanionTools } from './agentMode/companionTools';
+import { personOnlyApprovalsIn } from './personOnlyApprovals';
 import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { normalizeSkillIdArg } from './agentMode/skillIdArg';
 import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareProviderPolicy';
@@ -375,7 +376,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -1254,6 +1255,22 @@ export function titleFromUserMessage(message: string): string {
   const cut = flat.slice(0, 60);
   const lastSpace = cut.lastIndexOf(' ');
   return (lastSpace > 24 ? cut.slice(0, lastSpace) : cut).trim();
+}
+
+/**
+ * The closing sentence of an ad-set read-back mismatch, worded from the status
+ * Meta actually reported. A PAUSED ad set is not delivering, so telling the user
+ * it "is live" was false; an ACTIVE or unknown status still says to pause it.
+ */
+export function describeMismatchedAdSetState(status: unknown): string {
+  const s = typeof status === 'string' ? status.toUpperCase() : '';
+  if (s === 'PAUSED' || s === 'ARCHIVED' || s === 'DELETED') {
+    return `It exists with status ${s} and is not delivering — review these settings in Ads Manager before activating it.`;
+  }
+  if (s === 'ACTIVE') {
+    return 'It is ACTIVE with settings that differ from the request — review or pause it in Ads Manager.';
+  }
+  return 'Its delivery status could not be confirmed — review it in Ads Manager and pause it if it is delivering.';
 }
 
 export class AgentModeService {
@@ -2600,25 +2617,7 @@ export class AgentModeService {
     params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
-      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
-      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
-      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
-      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
-      // Studio" slot, and default routing lands on the degraded one. Skip it
-      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
-      // uptime recovers — remove this then, since it forfeits the BYOK cost
-      // discount in exchange for reliability.
-      //
-      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
-      // are the slugs OpenRouter's separate BYOK-credential-creation API
-      // uses, not what `provider.ignore` matches on here. This param matches
-      // against the `provider_name` string from GET /v1/models/{id}/endpoints
-      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
-      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
-      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
-      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
-      // proposed the slug form once already and was reverted for this reason
-      // — verify empirically against live traffic before changing this line.
+      // No default exclusions today; see openRouterIgnoredProviders.
       params.provider.ignore = ignoredProviders;
     }
     if (providerIgnore?.length) {
@@ -3117,9 +3116,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3153,7 +3151,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two
@@ -4406,8 +4404,8 @@ export class AgentModeService {
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
 
-        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
-        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
+        // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
@@ -12882,6 +12880,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // Meta returns monetary fields as strings; compare stringified so
       // 1000 and "1000" are the same value and not a fake mismatch.
       const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      // Schedule fields are instants, not strings: Meta echoes them back in the
+      // ad account's timezone at whole-second precision (requested
+      // 16:44:56.157+00:00 is stored as 08:44:56-0800). Compare the instant at
+      // second resolution so an equivalent time is never reported as overridden.
+      const sameInstant = (requested: string | null, applied: string | null) => {
+        if (requested === null || applied === null) return false;
+        const r = Date.parse(requested);
+        const a = Date.parse(applied);
+        return Number.isFinite(r) && Number.isFinite(a) && Math.floor(r / 1000) === Math.floor(a / 1000);
+      };
+      const isScheduleField = (parameter: string) => parameter === 'start_time' || parameter === 'end_time';
       const readBackMismatches = expected
         .filter(([, requested]) => requested !== undefined)
         .map(([parameter, requested]) => ({
@@ -12889,7 +12898,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           requested: asComparable(requested),
           applied: asComparable(readBack?.[parameter])
         }))
-        .filter(m => m.requested !== m.applied);
+        .filter(m => m.requested !== m.applied &&
+          !(isScheduleField(m.parameter) && sameInstant(m.requested, m.applied)));
 
       if (readBackMismatches.length > 0) {
         const detail = readBackMismatches
@@ -12905,7 +12915,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} ${describeMismatchedAdSetState(readBack?.status ?? adSet?.status)}`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
@@ -15877,6 +15887,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-3033: create the ad creative that points at an existing Instagram post, on the caller's
+   * own ad account. metaToolkitBoost proves the Instagram account, Page and post belong to the
+   * account before calling. A creative cannot spend. `outcomeUnknown` marks a failure without a
+   * definite Meta answer.
+   */
+  public async toolkitMetaBoostCreative(
+    userId: string, account_id: string, spec: { name: string; page_id: string; ig_account_id: string; ig_media_id: string },
+  ): Promise<{ id?: string }> {
+    for (const k of ['page_id', 'ig_account_id', 'ig_media_id'] as const) {
+      if (!/^\d+$/.test(String(spec?.[k] ?? ''))) throw new Error(`Invalid ${k}.`);
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.post(
+        `https://graph.facebook.com/${apiVersion}/act_${String(accountId).replace(/^act_/, '')}/adcreatives`,
+        new URLSearchParams({
+          name: String(spec.name).slice(0, 200),
+          object_id: spec.page_id,
+          instagram_user_id: spec.ig_account_id,
+          source_instagram_media_id: spec.ig_media_id,
+        }).toString(),
+        { params: { access_token: accessToken }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30_000, maxContentLength: 5_000_000 },
+      );
+      return { id: data?.id ? String(data.id) : undefined };
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -16031,7 +16078,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
-      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // ENG-1636: an AD (or AD_SET) status flip usually arrives with only its own id, but the gate needs
       // the parent campaign to scope its tracking checks — and blocked such calls with
       // "no campaign was identified" even though Meta carries campaign_id on the ad
       // object. Resolve the parent instead of refusing a call whose campaign is one
@@ -16042,6 +16089,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         entityType: entity_type,
         campaignId: campaign_id,
         adId: ad_id,
+        adSetId: ad_set_id,
         accessToken: gateCreds.accessToken,
         accountId: gateCreds.accountId,
         resolver: metaService,
@@ -16779,8 +16827,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
+    /**
+     * ENG-2962: set when the answer came from an MCP tool acting on someone's behalf (a self-call). It may not approve a card only a
+     * person may approve; decided here, on the very deck the answers are applied to (the write below is conditional on that deck
+     * still awaiting), not on an earlier read in the route.
+     */
+    options?: { refusePersonOnlyApprovals?: boolean },
   ): Promise<
     | { outcome: 'invalid'; reason: string }
+    | { outcome: 'needs_person'; actions: string[] }
     | { outcome: 'conflict' }
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
@@ -16801,6 +16856,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outcome: 'invalid',
         reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
       };
+    }
+
+    if (options?.refusePersonOnlyApprovals) {
+      const blocked = personOnlyApprovalsIn(deck, inboundAnswers);
+      if (blocked.length > 0) return { outcome: 'needs_person', actions: blocked.map(b => b.action) };
     }
 
     let answered: PendingApprovalDeck;

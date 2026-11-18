@@ -10,11 +10,11 @@ const ON = { SESSION_BREAKER_SHADOW: 'true', SESSION_BREAKER_SHADOW_MAX_TURNS: '
 describe('sessionBreakerShadow (ENG-2953)', () => {
   beforeEach(() => __resetSessionBreakerShadowForTests());
 
-  it('flag off: evaluator never invoked, cost never computed, nothing logged', () => {
+  it('flag explicitly off: evaluator never invoked, cost never computed, nothing logged', () => {
     const evaluate = jest.fn(evaluateSessionSpendBreaker);
     const log = jest.fn();
     const costUsd = jest.fn(() => 100);
-    for (const env of [{}, { SESSION_BREAKER_SHADOW: 'false' }, { SESSION_BREAKER_SHADOW: '1' }]) {
+    for (const env of [{ SESSION_BREAKER_SHADOW: 'false' }, { SESSION_BREAKER_SHADOW: ' FALSE ' }, { SESSION_BREAKER_SHADOW: '0' }, { SESSION_BREAKER_SHADOW: 'off' }]) {
       for (let i = 0; i < 100; i++) {
         recordSessionBreakerShadowTurn({ sessionId: 's', isScheduled: false, costUsd }, { env, log, evaluate });
       }
@@ -22,7 +22,22 @@ describe('sessionBreakerShadow (ENG-2953)', () => {
     expect(evaluate).not.toHaveBeenCalled();
     expect(costUsd).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
-    expect(readSessionBreakerShadowConfig({})).toBeNull();
+    expect(readSessionBreakerShadowConfig({ SESSION_BREAKER_SHADOW: 'false' })).toBeNull();
+  });
+
+  it('flag unset (the prod default): on with the default caps, and logs the would-pause line', () => {
+    expect(readSessionBreakerShadowConfig({})).toEqual({ caps: { maxTurns: 40, maxSpendUsd: 5 } });
+    const lines: Array<Record<string, unknown>> = [];
+    const returned: unknown[] = [];
+    for (let t = 1; t <= 41; t++) {
+      returned.push(recordSessionBreakerShadowTurn(
+        { sessionId: 'unset', isScheduled: false, costUsd: () => 0 },
+        { env: {}, log: l => lines.push(JSON.parse(l)) },
+      ));
+    }
+    expect(returned.every(r => r === undefined)).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ event: 'session_breaker_would_pause', sessionId: 'unset', turns: 40, multiple: 1, reason: 'turn_cap' });
   });
 
   it('replays the Opiner aea6a0ee shape (549 turns, ~$47): first would-pause at turn 40, one log per multiple', () => {

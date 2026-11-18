@@ -991,6 +991,43 @@ router.post('/search-leads', async (req: Request, res: Response) => {
   }
 });
 
+// ─── CRM (lead readback, ENG-3021) ──────────────────────────────────────────
+// Read-only. The same handlers Emma's get_leads / get_lead_details tools call, reachable
+// without a model run so a verifier can read stored fields (contactStatus and the
+// unsubscribe evidence) back. The caller is always the authenticated user; the
+// handlers enforce list access, so nothing here trusts an identity from the body.
+
+const isId = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+router.post('/leads', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id)) return res.status(400).json({ message: 'list_id is required' });
+  try {
+    const svc = await getAgentModeService();
+    const options = {
+      ...(typeof body.limit === 'number' ? { limit: body.limit } : {}),
+      ...(typeof body.cursor === 'string' ? { cursor: body.cursor } : {}),
+      ...(typeof body.status === 'string' ? { status: body.status } : {}),
+      ...(typeof body.search === 'string' ? { search: body.search } : {}),
+      ...(body.include_all_fields === true ? { includeAllFields: true } : {}),
+    };
+    res.json(await svc.getLeads(body.list_id, userId(req), options));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/lead-details', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  if (!isId(body.list_id) || !isId(body.lead_id)) return res.status(400).json({ message: 'list_id and lead_id are required' });
+  try {
+    const svc = await getAgentModeService();
+    res.json(await svc.getLeadDetails(body.list_id, body.lead_id, userId(req)));
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ─── Emma Autonomous Actions Log (G5) ───────────────────────────────────────
 // Read-only feed of events Emma initiated on behalf of the user. Reuses
 // AW-ContactEvents as the source of truth; filters by source='emma_session'.

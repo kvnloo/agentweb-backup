@@ -218,7 +218,7 @@ describe('the lead decides, and the lead is never chased through the team', () =
     await submitLead('lead-a');
     const call = nthCall(1);
     await call.memberAnswers();
-    world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199'; // a repeat submission overwrote it
+    world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199'); // a repeat submission overwrote it
     const reply = await call.memberPresses('1');
     expect(reply.body).not.toContain('<Dial');
     await call.memberLegEnds('completed', '20');
@@ -234,7 +234,7 @@ describe('the lead decides, and the lead is never chased through the team', () =
     setClock(chicago('16:00'));
     await submitLead('lead-a');
     await noAnswer(1);
-    world.crm.lead(LIST, 'lead-a').phone = '(212) 555-0199';
+    world.crm.rePhone(LIST, 'lead-a', '(212) 555-0199');
     const call = nthCall(2);
     await call.memberAnswers();
     expect((await call.memberPresses('1')).body).not.toContain('<Dial');

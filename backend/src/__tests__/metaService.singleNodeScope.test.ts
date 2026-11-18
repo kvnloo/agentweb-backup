@@ -320,3 +320,39 @@ describe('single-entity Meta node reads are bounded by the selected ad account',
     });
   });
 });
+
+// ENG-01 live run: an AD_SET activation sent with only ad_set_id must resolve its parent
+// campaign for the tracking gate, and that lookup must not cross the selected ad account.
+describe('getAdSetCampaignIdForAccount — ad set parent campaign, scoped to the selected account', () => {
+  const SELECTED = '1234567890';
+  const token = 'mock_token';
+  let service: MetaService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = MetaService.getInstance();
+  });
+
+  function adSetReturns(data: Record<string, any>) {
+    const get = jest.fn().mockResolvedValue({ _data: data });
+    (AdSet as unknown as jest.Mock).mockImplementation(() => ({ get }));
+    return get;
+  }
+
+  it('returns the parent campaign of an ad set owned by the selected account', async () => {
+    const get = adSetReturns({ id: 'as1', campaign_id: 'c1', account_id: SELECTED });
+    await expect(service.getAdSetCampaignIdForAccount(token, `act_${SELECTED}`, 'as1')).resolves.toBe('c1');
+    expect(AdSet).toHaveBeenCalledWith('as1');
+    expect(get).toHaveBeenCalledWith(['id', 'campaign_id', 'account_id']);
+  });
+
+  it('returns nothing for an ad set in another ad account, so the gate still blocks', async () => {
+    adSetReturns({ id: 'as1', campaign_id: 'c-foreign', account_id: '9998887776' });
+    await expect(service.getAdSetCampaignIdForAccount(token, SELECTED, 'as1')).resolves.toBeUndefined();
+  });
+
+  it('returns nothing when the provider omits the owning account', async () => {
+    adSetReturns({ id: 'as1', campaign_id: 'c1' });
+    await expect(service.getAdSetCampaignIdForAccount(token, SELECTED, 'as1')).resolves.toBeUndefined();
+  });
+});
