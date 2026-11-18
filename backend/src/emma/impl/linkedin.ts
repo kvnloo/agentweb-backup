@@ -529,7 +529,6 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
       return { success: false, message: withdrawnMidFlight.error };
     }
 
-    console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
     // ENG-827 (Greptile): the check above is the last moment before ENTERING the
     // adapter, not before the post becomes real. LinkedIn uploads images and YouTube
     // downloads then uploads an entire video INSIDE createPost — minutes, on a
@@ -564,6 +563,7 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
         };
       }
     }
+    console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
     const result = inReplyToPostId
       ? await (adapter as any).createPost(
         account, content, mediaUrls, ownerUserId,
