@@ -33,7 +33,17 @@ jest.mock('axios', () => ({ get: jest.fn() }));
 // same pattern for why (agentModeController.ts's uuid.v4() call needs
 // crypto.randomFillSync at module load).
 jest.mock('crypto', () => ({ ...jest.requireActual('crypto'), createHash: jest.fn() }));
+// Who may write which S3 key (the ENG-2988 rule) is a boundary here, covered with the real policy in updateHtmlFile.storageAccess.test.ts.
+// These tests are about what the tool does with the file once it may write it.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
+}));
+
 jest.mock('../utils/s3Utils', () => ({
+  // the file name the upload would write (the write check authorises that exact key)
+  sanitizeS3Filename: (name: string) => name,
+  extractS3KeyFromUrl: (url: string) => jest.requireActual('../utils/s3Utils').extractS3KeyFromUrl(url),
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
     success: true,
     url: 'https://s3.amazonaws.com/bucket/updated_file_v2.html',
