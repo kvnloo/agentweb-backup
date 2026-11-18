@@ -265,7 +265,9 @@ export function classifySessionForPublishGate(
  */
 const DISPATCHER_PUBLISHING_ACTIONS: Record<string, ReadonlySet<string>> = {
   twitter_manage_post: new Set(['reply', 'post_thread', 'quote_tweet', 'retweet']),
-  linkedin_manage_post: new Set(['comment', 'repost']),
+  // ENG-3014: delete_post is not a publication, but it is irreversible and its
+  // contract is explicit user approval, so an approval-required schedule holds it too.
+  linkedin_manage_post: new Set(['comment', 'repost', 'delete_post']),
 };
 
 /**
