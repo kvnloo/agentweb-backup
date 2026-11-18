@@ -46,7 +46,16 @@ jest.mock('crypto', () => ({
 }));
 
 // Mock s3Utils
+// Who may write which S3 key (the ENG-2988 rule) is a boundary here, covered with the real policy in updateHtmlFile.storageAccess.test.ts.
+// These tests are about what the tool does with the file once it may write it.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
+}));
+
 jest.mock('../utils/s3Utils', () => ({
+  // the file name the upload would write (the write check authorises that exact key)
+  sanitizeS3Filename: (name: string) => name,
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
     success: true,
     url: 'https://s3.amazonaws.com/bucket/updated_file_v2.html',

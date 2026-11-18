@@ -94,8 +94,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
-// Mock global fetch
-global.fetch = jest.fn();
+// A URL given as html_source is fetched through utils/callerUrlFetch (guarded DNS, redirects re-checked, size cap; covered in
+// callerUrlFetch.test.ts). The real error classes stay real; only the fetch itself is mocked.
+jest.mock('../utils/callerUrlFetch', () => ({
+  ...jest.requireActual('../utils/callerUrlFetch'),
+  fetchCallerUrlText: jest.fn(),
+}));
+import { fetchCallerUrlText } from '../utils/callerUrlFetch';
 
 describe('AgentModeService - createHtmlTemplate', () => {
   let agentModeService: AgentModeService;
@@ -201,10 +206,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
     it('should create HTML template from S3 URL', async () => {
       // Setup mocks
-      (global.fetch as jest.Mock).mockResolvedValue({
-        ok: true,
-        text: jest.fn().mockResolvedValue(mockInputHtml)
-      });
+      (fetchCallerUrlText as jest.Mock).mockResolvedValue(mockInputHtml);
       mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
       mockGetSetting.mockResolvedValue(null);
       mockSetSetting.mockResolvedValue(undefined);
@@ -222,7 +224,10 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       // Verify
       expect(result.success).toBe(true);
-      expect(global.fetch).toHaveBeenCalledWith('https://s3.amazonaws.com/bucket/test.html');
+      expect(fetchCallerUrlText).toHaveBeenCalledWith(
+        'https://s3.amazonaws.com/bucket/test.html',
+        expect.objectContaining({ tool: 'create_html_template', userId: 'test-user-123' })
+      );
     });
 
     it('should update existing template', async () => {
@@ -267,10 +272,7 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
     it('should handle fetch errors', async () => {
       // Setup mocks
-      (global.fetch as jest.Mock).mockResolvedValue({
-        ok: false,
-        statusText: 'Not Found'
-      });
+      (fetchCallerUrlText as jest.Mock).mockRejectedValue(new Error('Request failed with status code 404'));
 
       // Execute
       const result = await agentModeService.createHtmlTemplate(
@@ -285,7 +287,8 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       // Verify
       expect(result.success).toBe(false);
-      expect(result.error).toContain('Not Found');
+      expect(result.error).toContain('Failed to fetch HTML from URL');
+      expect(result.error).toContain('404');
     });
 
     it('should return a clean error when html_source is undefined (no startsWith crash)', async () => {
