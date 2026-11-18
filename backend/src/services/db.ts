@@ -350,6 +350,12 @@ export interface User {
    * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
    */
   dripUnsubscribed?: boolean;
+  /**
+   * ENG-3133. ISO time the user unsubscribed from the weekly Zoma ad-performance email. When set, the weekly
+   * report job MUST NOT email this user. Scoped to that one email: it changes nothing else (no other mail, no
+   * Zoma access). Absent = subscribed.
+   */
+  zomaWeeklyReportOptOutAt?: string;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   /**
