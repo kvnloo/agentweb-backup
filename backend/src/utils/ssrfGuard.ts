@@ -188,7 +188,10 @@ export async function resolvePinnedPublicAddress(rawUrl: string): Promise<{ host
     throw new SsrfBlockedError('Invalid URL');
   }
 
-  // URL.hostname strips IPv6 brackets, so this is the bare hostname or IP.
+  // NOTE: URL.hostname KEEPS the brackets of an IPv6 literal (`[::1]`) and net.isIP('[::1]') is 0, so an IPv6 literal does not reach the
+  // range checks below: it falls through to a DNS lookup of the bracketed name, which fails, and is refused. That fails closed, which is why it
+  // has gone unnoticed, but literals are not judged by range. Do NOT just strip the brackets: isPrivateIPv6 has gaps (site-local fec0::/10,
+  // ::ffff:0:a.b.c.d, 64:ff9b:1::/48, Teredo, 2001:db8::/32, 100::/64) that would then become reachable by literal.
   const hostname = parsed.hostname.toLowerCase();
   if (!hostname) {
     throw new SsrfBlockedError('Invalid URL');

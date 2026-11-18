@@ -18,6 +18,8 @@ import { AgentModeService } from '../services/agentModeService';
 // a clean cache each time, so it must reset the module's cache itself now).
 import { __resetDataAnalysisConsistencyCacheForTests } from '../emma/impl/searchResearch';
 
+// The download goes through utils/callerUrlFetch (guarded, covered in callerUrlFetch.test.ts); here it is handed to the axios mock below.
+jest.mock('../utils/callerUrlFetch', () => require('./helpers/callerUrlFetchAxiosBridge').callerUrlFetchViaAxiosMock());
 jest.mock('axios', () => ({
   get: jest.fn(),
   post: jest.fn()
