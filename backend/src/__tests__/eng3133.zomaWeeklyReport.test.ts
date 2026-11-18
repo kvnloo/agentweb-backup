@@ -603,6 +603,27 @@ describe('the email', () => {
     expect(six[0]!.match(/width="25%"/g)).toHaveLength(8);
   });
 
+  it('every bar carries its width in CSS plus a spacer, so a client that drops width attributes (Gmail on Android) still draws it', () => {
+    const html = email({ platforms: [META_WEEK, GOOGLE_WEEK], usage: quiet }).html;
+    // Simulate the client: remove every width attribute. Each bar cell must still define its own width.
+    const stripped = html.replace(/ width="[^"]*"/g, '');
+    const bars = stripped.match(/<td height="\d+" bgcolor="#(?:1877f2|34a853|dadce0)" style="[^"]*">.*?<\/td>/g)!;
+    expect(bars).toHaveLength(17); // 7 days x 2 platforms + 3 campaigns
+    for (const b of bars) {
+      expect(b).toMatch(/style="width:\d+px;height:\d+px;/);
+      expect(b).toMatch(/<div style="width:\d+px;height:1px;/); // the spacer holds the width open
+    }
+    expect(html).not.toMatch(/<td width="\d+%" height=/); // no percentage-width bars
+  });
+
+  it('the bars fit a phone: seven day columns of 40px, campaign bars up to 250px', () => {
+    const html = email({ platforms: [META_WEEK], usage: quiet }).html;
+    expect(html.match(/style="padding:0 2px;width:40px"/g)).toHaveLength(7); // 7 x 40px = 280px
+    const campaignWidths = [...html.matchAll(/style="width:(\d+)px;height:10px;/g)].map((m) => Number(m[1]));
+    expect(campaignWidths).toEqual([250, 125]); // 80 and 40 against a 250px maximum
+    for (const w of [...html.matchAll(/style="width:(\d+)px;height:\d+px;/g)].map((m) => Number(m[1]))) expect(w).toBeLessThanOrEqual(250);
+  });
+
   it('each top campaign is a name-and-figures row plus its own full-width bar row, so a phone cannot squeeze the figures', () => {
     const html = email({ platforms: [META_WEEK], usage: quiet }).html;
     const block = html.slice(html.indexOf('Top campaigns by spend'));
