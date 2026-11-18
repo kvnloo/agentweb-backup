@@ -2346,6 +2346,34 @@ export const createZomaReferralCodesTable = async () => {
   }
 };
 
+export const createZomaReferralLedgerTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ZomaReferralLedger`,
+    AttributeDefinitions: [
+      { AttributeName: 'referredUserId', AttributeType: 'S' },
+      { AttributeName: 'entry', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'referredUserId', KeyType: 'HASH' },
+      { AttributeName: 'entry', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  try {
+    await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+    await dynamodb.updateContinuousBackups({
+      TableName: params.TableName,
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+    }).promise();
+    console.log(`Enabled point-in-time recovery on ${params.TableName}`);
+  } catch (error: any) {
+    console.warn(`[create-tables] Could not enable point-in-time recovery on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-continuous-backups --table-name ${params.TableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`);
+  }
+};
+
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -2983,6 +3011,7 @@ const main = async () => {
     await createModelChangeAuditTable();
     await createZomaDeviceAuthTable();
     await createZomaReferralCodesTable();
+    await createZomaReferralLedgerTable();
     await createLlmConnectionsTable();
     await createAttemptUsageTable();
     await createSmartleadPushRunsTable();
