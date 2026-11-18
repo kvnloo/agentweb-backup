@@ -14,6 +14,7 @@ import type { TrackingConfig } from "../utils/trackingConfig";
 import { ingestListCache } from "../utils/ingestListCache";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
+import { randomUUID } from "crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
@@ -30,6 +31,7 @@ import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
 import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
+import { readScheduleProvenance } from "../utils/scheduleProvenance";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -78,6 +80,9 @@ const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 const s3 = new S3();
 
 // Helper function to handle DynamoDB errors
+/** True when a resubscribe call asked for any condition (so a refused condition is an answer, not an error). */
+const hasResubscribeConditions = (options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) => Boolean(options?.onlyIfOptOutNonce || options?.onlyIfUnsubscribedAt);
+
 const handleDynamoDbError = (error: any, operation: string) => {
   console.error(`DynamoDB ${operation} error:`, error);
   if (error.code === "CredentialsError") {
@@ -234,6 +239,9 @@ export interface User {
   createdAt: string;
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
+  /** ENG-3128: answer to the Zoma "How familiar are you with ads?" question (see mcp/zomaAdsExperience.ts). */
+  zomaAdsExperience?: string;
+  zomaAdsExperienceAt?: string;
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
@@ -342,6 +350,12 @@ export interface User {
    * the per-user unsubscribe flow (future: `POST /api/drip/unsubscribe`).
    */
   dripUnsubscribed?: boolean;
+  /**
+   * ENG-3133. ISO time the user unsubscribed from the weekly Zoma ad-performance email. When set, the weekly
+   * report job MUST NOT email this user. Scoped to that one email: it changes nothing else (no other mail, no
+   * Zoma access). Absent = subscribed.
+   */
+  zomaWeeklyReportOptOutAt?: string;
   onboardingProgress?: Record<string, boolean>; // Checklist step completion state (stepId → true)
   onboardingDismissed?: boolean; // Whether the user has dismissed the onboarding checklist
   /**
@@ -1342,6 +1356,45 @@ export class UserDB {
     const item = result.Item;
     if (item?.userId?.startsWith("deleted_")) return undefined;
     return item;
+  }
+
+  /**
+   * ENG-3111: stamp a login on a user row the caller has ALREADY read, in one
+   * write and no read. `updateUser` looks the user up by id first to recover the
+   * email and asks DynamoDB for the whole updated row back; login holds the
+   * email and discards the row, so both were wasted round trips on every login.
+   *
+   * The condition is not optional. An UpdateItem on a missing key creates the
+   * item, so without it a login racing an account deletion would leave a stub
+   * row holding only these fields. `userId = :userId` also proves the row is
+   * still the user that was read. A failed condition throws
+   * ConditionalCheckFailedException; the caller decides what that means.
+   */
+  async recordLogin(
+    email: string,
+    userId: string,
+    fields: { lastLoginTime: string; lastTouch?: unknown }
+  ): Promise<void> {
+    const names: { [key: string]: string } = { "#userId": "userId", "#lastLoginTime": "lastLoginTime" };
+    const values: { [key: string]: any } = { ":userId": userId, ":lastLoginTime": fields.lastLoginTime };
+    let expression = "SET #lastLoginTime = :lastLoginTime";
+    if (fields.lastTouch !== undefined && fields.lastTouch !== null) {
+      names["#lastTouch"] = "lastTouch";
+      values[":lastTouch"] = fields.lastTouch;
+      expression += ", #lastTouch = :lastTouch";
+    }
+    await withTransactionConflictRetry(() =>
+      this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: email.toLowerCase() },
+          UpdateExpression: expression,
+          ConditionExpression: "#userId = :userId",
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        })
+        .promise()
+    );
   }
 
   /**
@@ -3007,6 +3060,27 @@ export const taskDb = {
     }
   },
 
+  /**
+   * Who owns an execution and which task it belongs to, without reading the (large) execution row. Used by the file access policy
+   * (ENG-2988), which asks this for every file under an execution.
+   */
+  async getTaskExecutionOwnerById(executionId: string): Promise<{ executionId: string; userId?: string; taskId?: string } | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+        Key: {
+          executionId,
+        },
+        ProjectionExpression: "executionId, userId, taskId",
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskExecutionOwnerById");
+    }
+  },
+
   async updateTaskExecution(
     executionId: string,
     updates: Partial<{
@@ -3738,6 +3812,32 @@ const writeShedRunResults = async (
  */
 export const EXPECT_UNSET = Symbol.for("agentweb.schedule.expectUnset");
 
+/**
+ * ENG-2816 (step 3): the one tolerant reader of a schedule's `provenance` (the String Set naming the content fields a share-link
+ * visitor wrote). Lives in utils/scheduleProvenance.ts so the pure publish resolver can use it without importing this module;
+ * exported here because the db layer is where the attribute's three shapes (a DynamoDBSet off the wire, an array in memory and in
+ * API responses, absent) meet.
+ */
+export { readScheduleProvenance };
+
+/**
+ * A schedule item as the rest of the app should see it: `provenance`, when present, is a sorted array, never the DocumentClient's
+ * `DynamoDBSet` wrapper (which would otherwise leak into API responses and be spread, compared and cloned as an object). An item
+ * with no `provenance` attribute (every schedule that predates this change) comes back as the SAME object, untouched.
+ */
+const withReadableProvenance = <T>(item: T): T => {
+  if (!item || typeof item !== "object") return item;
+  const raw = (item as any).provenance;
+  if (raw === undefined) return item;
+  return { ...(item as any), provenance: readScheduleProvenance(raw) };
+};
+
+/** `withReadableProvenance` over a list; the same array comes back when no item carries the attribute. */
+const withReadableProvenanceAll = <T>(items: T[]): T[] =>
+  Array.isArray(items) && items.some((item) => item && typeof item === "object" && (item as any).provenance !== undefined)
+    ? items.map(withReadableProvenance)
+    : items;
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3786,11 +3886,17 @@ export const scheduleDb = {
     variableRequestAccessTokenHash?: string;
     variableRequestAccessTokenExpiresAt?: string;
     variableRequestAccessTokenConsumedAt?: string;
+    // ENG-2816 (step 3): the content fields a share-link visitor wrote (see utils/scheduleProvenance.ts). Stored as a DynamoDB
+    // String Set; an empty or absent list writes NO attribute (a Set cannot be empty, and an unmarked schedule carries nothing).
+    provenance?: string[];
   }) {
     try {
+      const { provenance, ...rest } = schedule;
+      const marks = readScheduleProvenance(provenance);
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Item: schedule,
+        // A schedule that never carried the key is written exactly as before (the same object).
+        Item: marks.length > 0 ? { ...rest, provenance: dynamodb.createSet(marks) } : ('provenance' in schedule ? rest : schedule),
       };
 
       await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
@@ -3811,23 +3917,28 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByTaskId");
     }
   },
 
-  async getScheduleById(scheduleId: string) {
+  /**
+   * `consistent` asks for a strongly consistent read. Only a security decision needs it (ENG-2816: is this schedule marked as
+   * visitor-written, right now); every other caller keeps the default eventually consistent read and its cost.
+   */
+  async getScheduleById(scheduleId: string, options?: { consistent?: boolean }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
+        ...(options?.consistent ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
-      return result.Item;
+      return withReadableProvenance(result.Item);
     } catch (error) {
       handleDynamoDbError(error, "getScheduleById");
     }
@@ -3841,7 +3952,7 @@ export const scheduleDb = {
    */
   async getAllSchedules(): Promise<any[]> {
     try {
-      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+      return withReadableProvenanceAll(await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`));
     } catch (error) {
       // Rethrows. A scan that dies halfway must not read as "no schedules" — that
       // would turn a transient failure into a migration that silently grants nothing.
@@ -3915,6 +4026,11 @@ export const scheduleDb = {
       pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
+      // ENG-2816 (step 3): NOT a stored attribute. Members to ADD to the schedule's `provenance` String Set (see
+      // utils/scheduleProvenance.ts), carried in the SAME UpdateExpression as the content change they describe, so a visitor's content
+      // and its mark land together or not at all. Marks are only ever added here; the whole attribute comes off through
+      // `removeAttributes: ['provenance']` (the adopt route), which works on whatever shape the stored value has.
+      provenanceAdd: string[];
     }>,
     /**
      * ENG-827: attributes that must STILL hold for this write to land, as read a
@@ -3943,6 +4059,18 @@ export const scheduleDb = {
      */
     removeAttributes?: string[]
   ) {
+    // ENG-2816 (step 3): split the non-stored provenance key off BEFORE the SET loop below, which would otherwise turn it into
+    // `SET #provenanceAdd = ...` on an attribute that does not exist.
+    const { provenanceAdd, ...storedUpdates } = updates as Record<string, any>;
+    const provenanceToAdd = readScheduleProvenance(provenanceAdd);
+    if (storedUpdates.provenance !== undefined) {
+      // A direct SET would store a List, and the next ADD on it would fail. The set is only ever touched through ADD, and removed
+      // whole through removeAttributes.
+      throw new Error('updateSchedule: set provenance through provenanceAdd, not as an attribute.');
+    }
+    if (provenanceToAdd.length > 0 && (removeAttributes || []).includes('provenance')) {
+      throw new Error('updateSchedule: provenance cannot be added to and removed in one write.');
+    }
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
@@ -3955,7 +4083,7 @@ export const scheduleDb = {
       // ValidationException. Skipping makes a stray undefined a no-op rather than
       // a crash. Deliberate removal goes through `removeAttributes` instead, so
       // it can never be triggered by an accidentally-undefined field.
-      Object.entries(updates).forEach(([key, value]) => {
+      Object.entries(storedUpdates).forEach(([key, value]) => {
         if (value === undefined) return;
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
@@ -4033,6 +4161,13 @@ export const scheduleDb = {
       const clauses: string[] = [];
       if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
       if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
+      // ENG-2816 (step 3): the provenance mark rides the SAME expression as the content change it describes. A write that carries
+      // only a mark is a real write and must not fall into the "nothing to do" return below.
+      if (provenanceToAdd.length > 0) {
+        expressionAttributeNames['#provenance'] = 'provenance';
+        expressionAttributeValues[':provenanceAdd'] = dynamodb.createSet(provenanceToAdd);
+        clauses.push('ADD #provenance :provenanceAdd');
+      }
       if (clauses.length === 0) {
         // Nothing to do. Returning beats sending an empty expression, which
         // DynamoDB rejects, and beats pretending a write happened.
@@ -4058,7 +4193,7 @@ export const scheduleDb = {
       }
 
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       handleDynamoDbError(error, "updateSchedule");
     }
@@ -4085,7 +4220,7 @@ export const scheduleDb = {
 
     try {
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
       if (isDynamoItemSizeError(error)) {
@@ -4095,7 +4230,7 @@ export const scheduleDb = {
             if (plan === null) break;
             const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
             if (written.raced) continue;
-            return written.attributes;
+            return withReadableProvenance(written.attributes);
           }
         } catch (recoveryError) {
           // Recovery failed too — report the condition that actually stopped the write.
@@ -4232,7 +4367,7 @@ export const scheduleDb = {
         }));
       }
 
-      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
+      return withReadableProvenanceAll(dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat'));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -4418,7 +4553,7 @@ export const scheduleDb = {
           ExpressionAttributeValues: { ':status': status, ':type': 'scheduled_chat' },
         })
       ));
-      return results.flat();
+      return withReadableProvenanceAll(results.flat());
     } catch (error) {
       // Best-effort reconciler input: a transient list failure just skips this
       // sweep (the next one retries), so log and return empty rather than throw.
@@ -4593,7 +4728,7 @@ export const scheduleDb = {
       };
 
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       handleDynamoDbError(error, "updateScheduleAfterRun");
       throw error;
@@ -4621,7 +4756,7 @@ export const scheduleDb = {
 
         const result = await dynamodb.scan(params).promise();
         if (result.Items && result.Items.length > 0) {
-          return result.Items[0];
+          return withReadableProvenance(result.Items[0]);
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
@@ -4665,7 +4800,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getPendingSchedules");
     }
@@ -4682,7 +4817,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByUserId");
     }
@@ -4710,9 +4845,18 @@ export const subscriberDb = {
           subscribedAt,
           unsubscribed: false,
         },
+        // Two requests can both pass the check above (a person's click and a mail scanner's, for example): only one may create the row.
+        ConditionExpression: "attribute_not_exists(email)",
       };
 
-      await dynamodb.put(params).promise();
+      try {
+        await dynamodb.put(params).promise();
+      } catch (putError: any) {
+        if (putError?.code === "ConditionalCheckFailedException") {
+          throw new Error(`Email ${email} is already in the subscriber list for this task`);
+        }
+        throw putError;
+      }
       return { taskId, email, subscribedAt, unsubscribed: false };
     } catch (error: any) {
       handleDynamoDbError(error, "addSubscriber");
@@ -4735,15 +4879,22 @@ export const subscriberDb = {
     }
   },
 
-  async softUnsubscribe(taskId: string, email: string, feedback?: string) {
+  /**
+   * Mark an address unsubscribed. With `onlyIfActive` the update happens only if the row exists and is not already unsubscribed, in one
+   * atomic step, and returns null when it did not (ENG-2991: only the caller that really flips the row is handed an undo token).
+   */
+  async softUnsubscribe(taskId: string, email: string, feedback?: string, options?: { onlyIfActive?: boolean }) {
     try {
+      // optOutNonce names this particular opt-out (ENG-2991): the undo token is bound to it, and a repeat unsubscribe of an address that is already
+      // opted out rotates it (refreshOptOut), without touching unsubscribedAt, which stays the record of when the person opted out.
       const updateExpression = feedback
-        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
-        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
+        ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce, feedback = :feedback"
+        : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, optOutNonce = :optOutNonce";
 
       const expressionAttributeValues: any = {
         ":unsubscribed": true,
         ":unsubscribedAt": new Date().toISOString(),
+        ":optOutNonce": randomUUID(),
       };
 
       if (feedback) {
@@ -4759,18 +4910,28 @@ export const subscriberDb = {
         UpdateExpression: updateExpression,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
+        ...(options?.onlyIfActive
+          ? { ConditionExpression: "attribute_exists(email) AND (attribute_not_exists(unsubscribed) OR unsubscribed = :stillActive)" }
+          : {}),
       };
+      if (options?.onlyIfActive) (params.ExpressionAttributeValues as any)[":stillActive"] = false;
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (options?.onlyIfActive && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "softUnsubscribe");
     }
   },
 
-  async resubscribe(taskId: string, email: string) {
+  /**
+   * Put an unsubscribed address back. With `onlyIfOptOutNonce` and/or `onlyIfUnsubscribedAt` the update applies only while the row is still
+   * unsubscribed by exactly that opt-out, in one atomic step, and returns null when it did not (ENG-2991: an undo token or a confirmation link
+   * must not undo a newer opt-out).
+   */
+  async resubscribe(taskId: string, email: string, options?: { onlyIfOptOutNonce?: string; onlyIfUnsubscribedAt?: string }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
         Key: {
           taskId,
@@ -4784,11 +4945,73 @@ export const subscriberDb = {
         },
         ReturnValues: "ALL_NEW",
       };
+      const conditions: string[] = [];
+      if (options?.onlyIfOptOutNonce) {
+        conditions.push("optOutNonce = :claimedNonce");
+        params.ExpressionAttributeValues[":claimedNonce"] = options.onlyIfOptOutNonce;
+      }
+      if (options?.onlyIfUnsubscribedAt) {
+        conditions.push("unsubscribedAt = :claimedOptOut");
+        params.ExpressionAttributeValues[":claimedOptOut"] = options.onlyIfUnsubscribedAt;
+      }
+      if (conditions.length) {
+        params.ConditionExpression = ["unsubscribed = :wasOptedOut", ...conditions].join(" AND ");
+        params.ExpressionAttributeValues[":wasOptedOut"] = true;
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      if (hasResubscribeConditions(options) && error?.code === "ConditionalCheckFailedException") return null;
       handleDynamoDbError(error, "resubscribe");
+    }
+  },
+
+  /**
+   * Give an already unsubscribed address a new opt-out nonce, which voids every undo token issued for the earlier one (ENG-2991). It does not
+   * touch `unsubscribedAt`: that stays the record of when the person opted out, and the rule that refuses a confirmation link sent before the
+   * opt-out depends on it. Returns true when it applied; false if the address is not unsubscribed or does not exist (no row is created).
+   */
+  async refreshOptOut(taskId: string, email: string): Promise<boolean> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        Key: {
+          taskId,
+          email,
+        },
+        UpdateExpression: "SET optOutNonce = :nonce",
+        ConditionExpression: "unsubscribed = :isOptedOut",
+        ExpressionAttributeValues: {
+          ":nonce": randomUUID(),
+          ":isOptedOut": true,
+        },
+      };
+
+      await dynamodb.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") return false;
+      handleDynamoDbError(error, "refreshOptOut");
+      return false;
+    }
+  },
+
+  /** Every address of a task with only the three fields needed to match and judge it (not the history and imported fields). */
+  async getTaskSubscriberStates(taskId: string): Promise<Array<{ email: string; unsubscribed?: boolean; unsubscribedAt?: string }> | undefined> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Subscribers`,
+        KeyConditionExpression: "taskId = :taskId",
+        ProjectionExpression: "email, unsubscribed, unsubscribedAt",
+        ExpressionAttributeValues: {
+          ":taskId": taskId,
+        },
+      };
+
+      return (await paginatedQuery(dynamodb, params)) as any;
+    } catch (error) {
+      handleDynamoDbError(error, "getTaskSubscriberStates");
     }
   },
 
@@ -4826,7 +5049,7 @@ export const subscriberDb = {
     }
   },
 
-  async getTaskSubscriberByEmail(taskId: string, email: string) {
+  async getTaskSubscriberByEmail(taskId: string, email: string, consistentRead = false) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Subscribers`,
@@ -4834,6 +5057,7 @@ export const subscriberDb = {
           taskId: taskId,
           email: email,
         },
+        ...(consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();

@@ -12,7 +12,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -42,7 +43,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
-import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
+import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -106,7 +107,7 @@ import { boundToolsForModel } from '../utils/boundToolsForModel';
 // (orgProfileResolver.ts is a transitive-AWS-SDK-construction trap module)
 // — so the top-level import origin/main reintroduced here is dead in this
 // class and deliberately dropped, not missed.
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, resolveSlackSendAuthorized } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, describeSlackSendState, type SlackSendState } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
@@ -2993,7 +2994,8 @@ export class AgentModeService {
     try {
       // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
       // schedule too, so a vanished record withholds rather than publishes.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       const live = resolveSchedulePublishAuthorization(schedule);
       const resolved = narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
       // ENG-1245: attach WHY, read straight off the live schedule record, so the
@@ -3033,19 +3035,21 @@ export class AgentModeService {
    * this function cannot verify (no session, no parseable schedule, a read error)
    * withholds rather than authorizes.
    */
-  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<SlackSendState> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
-    if (!scheduleId) return false;
+    if (!scheduleId) return { authorized: false };
     try {
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
-      return resolveSlackSendAuthorized(schedule);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      // ENG-2816 (step 3): also WITHHELD for a schedule a share-link visitor wrote into, and says so (see describeSlackSendState).
+      return describeSlackSendState(schedule);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding the ENG-2204 unattended Slack-send override rather than authorizing it unverified:`,
         error
       );
-      return false;
+      return { authorized: false };
     }
   }
   // ENG-2103 (F2): estimateVideoGenerationCost (main's unchanged pre-existing
@@ -3116,9 +3120,8 @@ export class AgentModeService {
     // tokenUsageService pulls in the db -> aws config graph, and a static import
     // here would drag it into every suite that mocks this module.
     //
-    // Everything is swallowed to the acting user. Several legacy suites replace
-    // this module with a partial mock that defines only `incrementUserTokenUsage`,
-    // so the export can genuinely be missing — and beyond that, a descriptive
+    // Everything is swallowed to the acting user. Some suites replace this module
+    // with a partial mock, so the export can genuinely be missing — and beyond that, a descriptive
     // ledger attribute must never be the reason a customer's response fails.
     // `userId` is the value the row carried before this existed, so the
     // degraded path is the old behaviour exactly.
@@ -3152,7 +3155,7 @@ export class AgentModeService {
       // stamped on every ledger row it writes. The ledger has always carried a
       // `billingUserId` attribute and this path has never filled it, so an org
       // member's rows claimed they paid for themselves while
-      // `incrementUserTokenUsage` was charging the org root — the two stores
+      // the (since retired) legacy counter was charging the org root — the two stores
       // disagreed, and a reader had nothing but today's membership to go on.
       //
       // Resolved here rather than inside `recordUsage` because it costs two
@@ -3409,13 +3412,14 @@ export class AgentModeService {
       // ENG-2204: owner opt-out for the Slack-send override — resolved independently
       // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
       // for why this isn't threaded through publishAuthorizationOverride instead.
-      const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
+      const slackSend = await this.resolveScheduledSlackSendAuthorized(currentSession);
       const publishDirective = getUnattendedExecutionDirective(
         'scheduled',
         isAdmin,
         publishAuthorization.authorized ? 'authorized' : 'withheld',
         publishAuthorization.tools,
-        slackSendAuthorized
+        slackSend.authorized,
+        slackSend.reason
       );
       if (publishDirective) messages.push({ role: 'system', content: publishDirective });
     }
@@ -4395,8 +4399,8 @@ export class AgentModeService {
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
 
-        // ENG-2953: DARK shadow of the ENG-2820 session turn/spend breaker. No-op unless
-        // SESSION_BREAKER_SHADOW=true; log-only, never alters this turn.
+        // ENG-2953: shadow of the ENG-2820 session turn/spend breaker. On by default (ENG-2812),
+        // off with SESSION_BREAKER_SHADOW=false; log-only, never alters this turn.
         recordSessionBreakerShadowTurn({
           sessionId,
           userId,
@@ -4405,8 +4409,14 @@ export class AgentModeService {
           costUsd: () => {
             const usage: any = (response as any)?.usage;
             if (!usage) return 0;
-            if (typeof usage.cost === 'number') return usage.cost;
-            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+            return shadowTurnCostUsd(usage, this.estimateCost(
+              llmModel,
+              Number(usage.prompt_tokens) || 0,
+              Number(usage.completion_tokens) || 0,
+              Number(usage.cache_read_input_tokens) || 0,
+              Number(usage.cache_creation_input_tokens) || 0,
+              usage.cache_creation_by_ttl,
+            ));
           },
         });
 
@@ -9923,6 +9933,8 @@ export class AgentModeService {
         ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
         : reason === 'not_granted'
         ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
+        : reason === 'visitor_edited'
+        ? `this schedule was set up or edited through a share link, so ${toolName} cannot publish on the owner's behalf in an unattended run until the owner adopts the schedule.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
     const unblockInstruction =
       reason === 'require_publish_approval'
@@ -9931,6 +9943,8 @@ export class AgentModeService {
         ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
         : reason === 'not_granted'
         ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything. The owner can grant this themselves: open this schedule, confirm the publish tool (e.g. ${toolName}) is selected under Required Actions and saved, then use the "Publish without my review" control (Standing publish authorization) so future runs can post unattended.`
+        : reason === 'visitor_edited'
+        ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF or to use "Publish without my review" — neither lifts this. The owner can adopt the schedule in the portal; a publish grant only takes effect after that.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
@@ -9988,7 +10002,8 @@ export class AgentModeService {
 
     try {
       // resolvePublishAuthorized also returns false for a missing/deleted schedule.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent, so a mark a visitor just wrote cannot be missed by a stale replica.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       if (resolvePublishAuthorized(schedule)) return null;
       console.warn(
         `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} is not authorized to publish.`
@@ -10006,6 +10021,98 @@ export class AgentModeService {
 
 
 
+  /**
+   * ENG-2816 (step 3): is this tool call part of a scheduled run whose schedule a share-link visitor set up or edited?
+   *
+   * A visitor acts under the owner's userId, so a schedule they write is stored as the owner's own and its later runs would carry
+   * the owner's full tool set. The schedule's `provenance` (utils/scheduleProvenance.ts) says which content a visitor wrote; this
+   * is the one place every run entry ends up (cron, manual, test, variables submit, resume, retry loop, self-improvement,
+   * approval resume, continuations), so enforcing it here covers them all without carrying a flag through each.
+   *
+   * Two outcomes, both read LIVE (a consistent read of the schedule, not a stamp taken at run start):
+   *  - the profile refuses this tool name and the schedule is marked: refuse, for EVERYONE (attended or not);
+   *  - this tool's self-call reaches a schedule write route (SCHEDULE_WRITE_TOOL_NAMES) and the schedule is marked: hand back the
+   *    profile, so the call carries the claim and the write it makes is itself a visitor write (it adds marks and never takes one
+   *    off: a marked run, such as its own reflection turn, cannot launder the mark).
+   *
+   * UNVERIFIABLE is judged by who is calling. The purpose of failing closed is to stop an UNATTENDED run (nobody is watching it) from
+   * running as the owner when its schedule cannot be shown to be unmarked, so an unverifiable answer refuses only a caller that says
+   * it is unattended (`isUnattendedRun === true`: every scheduled, test, retry and self-improvement turn does). A person typing in a
+   * chat (attended, or a caller that did not say) is never refused merely because something could not be checked: an owner who
+   * reopens an old "Scheduled: X" session after deleting the schedule keeps save_memory, connect_account, manage_scheduled_chat and
+   * their admin tools. The one exception is a failed SCHEDULE read in a session that is known to be a scheduled run: that refuses
+   * everyone (rare, and a transient blip is cheaper than running a visitor's schedule as the owner).
+   *
+   * Only a tool in one of those two sets pays for the reads, and the session is read as a record only (no transcript, no message
+   * migration). Every other tool, every call outside a scheduled session, and every schedule with no `provenance` (every schedule
+   * that predates this change) is untouched.
+   */
+  private async scheduledRunRestriction(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    const unrestricted = { refusal: null };
+    if (!sessionId) return unrestricted;
+    // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
+    if (extraContext?.restrictionProfile) return unrestricted;
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (!refusedByProfile && !carriesClaim) return unrestricted;
+
+    const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
+    // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSessionRecord(sessionId, true);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we give up (same as the publish gate below).
+      try {
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      } catch (retryError) {
+        console.error(`AgentMode ENG-2816: could not read session ${sessionId} to check schedule provenance for ${toolName}:`, retryError);
+        return whenUnverifiable;
+      }
+    }
+
+    // No session record: for an unattended run that is the deleted-mid-run case (deleting a scheduled session does not cancel its
+    // worker); for anyone else it is just a session id with nothing scheduled behind it.
+    if (!session) return whenUnverifiable;
+    if (classifySessionForPublishGate(session) !== 'scheduled') return unrestricted;
+
+    const scheduleId = extractScheduleId(session.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(`AgentMode ENG-2816: scheduled session ${sessionId} has no parseable scheduleId; cannot check provenance for ${toolName}.`);
+      return whenUnverifiable;
+    }
+
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (firstScheduleError) {
+      // One retry absorbs a single throttled read, as the session read above does, before a throw counts as unverifiable.
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (scheduleError) {
+        // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
+        console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
+        return unverifiable;
+      }
+    }
+    // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
+    if (!schedule) return whenUnverifiable;
+
+    if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
+
+    if (refusedByProfile) {
+      console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+    }
+    return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
@@ -10013,6 +10120,11 @@ export class AgentModeService {
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
     const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
+    // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
+    if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -15878,6 +15990,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-3033: create the ad creative that points at an existing Instagram post, on the caller's
+   * own ad account. metaToolkitBoost proves the Instagram account, Page and post belong to the
+   * account before calling. A creative cannot spend. `outcomeUnknown` marks a failure without a
+   * definite Meta answer.
+   */
+  public async toolkitMetaBoostCreative(
+    userId: string, account_id: string, spec: { name: string; page_id: string; ig_account_id: string; ig_media_id: string },
+  ): Promise<{ id?: string }> {
+    for (const k of ['page_id', 'ig_account_id', 'ig_media_id'] as const) {
+      if (!/^\d+$/.test(String(spec?.[k] ?? ''))) throw new Error(`Invalid ${k}.`);
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.post(
+        `https://graph.facebook.com/${apiVersion}/act_${String(accountId).replace(/^act_/, '')}/adcreatives`,
+        new URLSearchParams({
+          name: String(spec.name).slice(0, 200),
+          object_id: spec.page_id,
+          instagram_user_id: spec.ig_account_id,
+          source_instagram_media_id: spec.ig_media_id,
+        }).toString(),
+        { params: { access_token: accessToken }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30_000, maxContentLength: 5_000_000 },
+      );
+      return { id: data?.id ? String(data.id) : undefined };
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -18877,7 +19026,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * this wrapper's class-bound sibling references.
    */
   async linkedinManagePost(userId: string, args: {
-    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics' | 'delete_post';
     account_id: string;
     post_urn?: string;
     commentary?: string;
@@ -18892,7 +19041,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       listLinkedInComments: this.listLinkedInComments.bind(this),
       reactToLinkedInPost: this.reactToLinkedInPost.bind(this),
       getPostAnalytics: this.getPostAnalytics.bind(this),
+      linkedinDeletePost: this.linkedinDeletePost.bind(this),
     });
+  }
+
+  // ENG-3014: delegating wrapper, injected above so it stays spy-observable like its siblings.
+  async linkedinDeletePost(userId: string, accountId: string, postUrn: string, toolContext?: any): Promise<any> {
+    return linkedinImpl.linkedinDeletePost(userId, accountId, postUrn, toolContext);
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/linkedin.ts. Kept as a

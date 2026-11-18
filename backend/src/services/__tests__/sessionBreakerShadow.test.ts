@@ -2,6 +2,7 @@ import {
   __resetSessionBreakerShadowForTests,
   readSessionBreakerShadowConfig,
   recordSessionBreakerShadowTurn,
+  shadowTurnCostUsd,
 } from '../sessionBreakerShadow';
 import { evaluateSessionSpendBreaker } from '../sessionSpendBreaker';
 
@@ -10,11 +11,11 @@ const ON = { SESSION_BREAKER_SHADOW: 'true', SESSION_BREAKER_SHADOW_MAX_TURNS: '
 describe('sessionBreakerShadow (ENG-2953)', () => {
   beforeEach(() => __resetSessionBreakerShadowForTests());
 
-  it('flag off: evaluator never invoked, cost never computed, nothing logged', () => {
+  it('flag explicitly off: evaluator never invoked, cost never computed, nothing logged', () => {
     const evaluate = jest.fn(evaluateSessionSpendBreaker);
     const log = jest.fn();
     const costUsd = jest.fn(() => 100);
-    for (const env of [{}, { SESSION_BREAKER_SHADOW: 'false' }, { SESSION_BREAKER_SHADOW: '1' }]) {
+    for (const env of [{ SESSION_BREAKER_SHADOW: 'false' }, { SESSION_BREAKER_SHADOW: ' FALSE ' }, { SESSION_BREAKER_SHADOW: '0' }, { SESSION_BREAKER_SHADOW: 'off' }]) {
       for (let i = 0; i < 100; i++) {
         recordSessionBreakerShadowTurn({ sessionId: 's', isScheduled: false, costUsd }, { env, log, evaluate });
       }
@@ -22,7 +23,22 @@ describe('sessionBreakerShadow (ENG-2953)', () => {
     expect(evaluate).not.toHaveBeenCalled();
     expect(costUsd).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
-    expect(readSessionBreakerShadowConfig({})).toBeNull();
+    expect(readSessionBreakerShadowConfig({ SESSION_BREAKER_SHADOW: 'false' })).toBeNull();
+  });
+
+  it('flag unset (the prod default): on with the default caps, and logs the would-pause line', () => {
+    expect(readSessionBreakerShadowConfig({})).toEqual({ caps: { maxTurns: 40, maxSpendUsd: 5 } });
+    const lines: Array<Record<string, unknown>> = [];
+    const returned: unknown[] = [];
+    for (let t = 1; t <= 41; t++) {
+      returned.push(recordSessionBreakerShadowTurn(
+        { sessionId: 'unset', isScheduled: false, costUsd: () => 0 },
+        { env: {}, log: l => lines.push(JSON.parse(l)) },
+      ));
+    }
+    expect(returned.every(r => r === undefined)).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ event: 'session_breaker_would_pause', sessionId: 'unset', turns: 40, multiple: 1, reason: 'turn_cap' });
   });
 
   it('replays the Opiner aea6a0ee shape (549 turns, ~$47): first would-pause at turn 40, one log per multiple', () => {
@@ -84,5 +100,53 @@ describe('sessionBreakerShadow (ENG-2953)', () => {
       }
     }
     expect(lines).toHaveLength(0);
+  });
+});
+
+describe('shadowTurnCostUsd: spend per turn by the ledger rule (BYOK reports usage.cost 0)', () => {
+  const TOKENS = 0.01;
+
+  it('plain BYOK call: the upstream bill, not the 0 in usage.cost', () => {
+    expect(shadowTurnCostUsd({ is_byok: true, cost: 0, cost_details: { upstream_inference_cost: 0.02 } }, TOKENS)).toBeCloseTo(0.02, 10);
+  });
+
+  it('BYOK call with a search fee: upstream bill plus the OpenRouter fee', () => {
+    const usage = { is_byok: true, cost: 0.007, cost_details: { upstream_inference_cost: 0.0006 }, server_tool_use_details: { web_search_requests: 1 } };
+    expect(shadowTurnCostUsd(usage, TOKENS)).toBeCloseTo(0.0076, 10);
+  });
+
+  it('BYOK with no cost reported at all: the price-book token cost, not 0', () => {
+    expect(shadowTurnCostUsd({ is_byok: true, cost: 0 }, TOKENS)).toBe(TOKENS);
+    expect(shadowTurnCostUsd({ is_byok: true }, TOKENS)).toBe(TOKENS);
+  });
+
+  it('BYOK fee with no upstream bill: price-book tokens plus the fee', () => {
+    expect(shadowTurnCostUsd({ is_byok: true, cost: 0.005 }, TOKENS)).toBeCloseTo(0.015, 10);
+  });
+
+  it('not BYOK: usage.cost when positive, else the price-book token cost', () => {
+    expect(shadowTurnCostUsd({ cost: 0.05 }, TOKENS)).toBe(0.05);
+    expect(shadowTurnCostUsd({ cost: 0 }, TOKENS)).toBe(TOKENS);
+    expect(shadowTurnCostUsd({}, TOKENS)).toBe(TOKENS);
+    expect(shadowTurnCostUsd({ cost: -1 }, TOKENS)).toBe(TOKENS);
+  });
+
+  it('no usage block: 0; a bad token cost never yields NaN', () => {
+    expect(shadowTurnCostUsd(undefined, TOKENS)).toBe(0);
+    expect(shadowTurnCostUsd(null, TOKENS)).toBe(0);
+    expect(shadowTurnCostUsd({ is_byok: true, cost: 0 }, NaN)).toBe(0);
+  });
+
+  it('BYOK session now reaches the spend cap (it stayed at $0 before, so only the turn cap could fire)', () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const usage = { is_byok: true, cost: 0, cost_details: { upstream_inference_cost: 0.03 } };
+    for (let t = 1; t <= 3; t++) {
+      recordSessionBreakerShadowTurn(
+        { sessionId: 'byok', isScheduled: false, costUsd: () => shadowTurnCostUsd(usage, 0) },
+        { env: { SESSION_BREAKER_SHADOW_MAX_SPEND_USD: '0.05' }, log: l => lines.push(JSON.parse(l)) },
+      );
+    }
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ event: 'session_breaker_would_pause', turns: 2, spendUsd: 0.06, reason: 'spend_cap', multiple: 1 });
   });
 });

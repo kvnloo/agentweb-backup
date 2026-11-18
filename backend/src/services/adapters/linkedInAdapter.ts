@@ -1,4 +1,5 @@
 import { linkedInService } from '../linkedInService';
+import { isVideoUrl, isVideoUrn, LinkedInUnsupportedMediaError, LINKEDIN_VIDEO_ALONE_MESSAGE } from '../linkedInMedia';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { isPublishConsentWithdrawn, PublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
@@ -170,29 +171,40 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
-
+    // A LinkedIn post carries one video or images, never both. Refuse an obvious mix before uploading anything.
+    if ((mediaUrls || []).length > 1 && (mediaUrls || []).some(isVideoUrl)) {
+      return { success: false, message: LINKEDIN_VIDEO_ALONE_MESSAGE };
+    }
 
     try {
       // Get valid token (refreshes if expired)
       const { token, isFresh } = await this.getValidToken(account, userId);
 
-      // Upload images if provided - track failures for transparency
+      // Every attachment must upload: a post published without the media the caller approved cannot be taken back.
       let imageUrns: string[] = [];
-      let failedImageUploads: { url: string; error: string }[] = [];
-      
+
       if (mediaUrls && mediaUrls.length > 0) {
         for (const url of mediaUrls) {
           try {
-            const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadImageFromUrl(token, authorUrn, url));
+            const imageUrn = await retryIfFreshToken401(isFresh, () => linkedInService.uploadMediaFromUrl(token, authorUrn, url));
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
-            // The same token will be refused for the post itself; do not publish it without the image.
             if (uploadError instanceof FreshTokenRejectedError) throw uploadError;
+            if (uploadError instanceof LinkedInUnsupportedMediaError) return { success: false, message: uploadError.message };
+            // Auth and rate-limit failures keep their class (reconnect / retry-later) via the outer catch; the post is not created either way.
+            if (isLinkedIn401(uploadError) || uploadError?.response?.status === 429 || /rate limit exceeded/i.test(uploadError?.message || '')) throw uploadError;
             const errorMsg = uploadError?.message || 'Unknown upload error';
-            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
-            failedImageUploads.push({ url, error: errorMsg });
+            console.error(`[LinkedInAdapter] Failed to upload media ${url}:`, errorMsg);
+            const what = uploadError?.isVideoUpload || isVideoUrl(url) ? 'video' : 'image';
+            return { success: false, message: `The ${what} failed to upload to LinkedIn (${errorMsg}). Nothing was posted.` };
           }
         }
+      }
+
+      // The mix check above only sees file extensions; an extensionless video is known by now.
+      const hasVideo = imageUrns.some(isVideoUrn);
+      if (hasVideo && (mediaUrls || []).length > 1) {
+        return { success: false, message: LINKEDIN_VIDEO_ALONE_MESSAGE };
       }
 
       // ENG-827: the image uploads above are network round-trips that can take a
@@ -240,18 +252,14 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Build result with optional warning for failed uploads
       const result: PostResult = {
         success: true,
-        message: imageUrns.length > 0
-          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
-          : 'Posted successfully on LinkedIn',
+        message: hasVideo
+          ? 'Posted successfully on LinkedIn with 1 video'
+          : imageUrns.length > 0
+            ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
+            : 'Posted successfully on LinkedIn',
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };
-      
-      // Add warning if some images failed to upload
-      if (failedImageUploads.length > 0) {
-        result.warning = `${failedImageUploads.length} image(s) failed to upload: ${failedImageUploads.map(f => f.url).join(', ')}`;
-        result.failedUploads = failedImageUploads;
-      }
       
       return result;
     } catch (error: any) {
@@ -263,7 +271,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         return { success: false, message: error.message };
       }
       // Rate limit handling
-      if (error.response?.status === 429) {
+      if (error.response?.status === 429 || /rate limit exceeded/i.test(error?.message || '')) {
         rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (isLinkedIn401(error)) {
@@ -376,6 +384,75 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * ENG-3014: delete a post this connected account authored, then prove it is gone.
+   *
+   * Authorship is settled BEFORE any write. A stored row naming a different author
+   * refuses with no LinkedIn call at all; with no stored row the post is read and its
+   * `author` must equal this account's URN. Success is reported only after a readback
+   * returns not-found — LinkedIn's 2xx on the delete is not treated as proof.
+   * The access token never leaves this method.
+   */
+  async deletePost(account: ConnectedAccount, postUrn: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
+    const authorUrn = account.account_id;
+    if (!/^urn:li:(share|ugcPost):[A-Za-z0-9_-]+$/.test(postUrn)) {
+      return { success: false, message: 'post_urn must be a urn:li:share: or urn:li:ugcPost: URN to delete a post' };
+    }
+    const refused = 'This post was not authored by the selected LinkedIn account, so it cannot be deleted with it.';
+
+    const { getPostById } = await import('../linkedInPostsDb');
+    const ownerIds = Array.from(new Set([userId, (account as any).userId].filter((id): id is string => !!id)));
+    let storedAuthor: string | undefined;
+    for (const id of ownerIds) {
+      const stored = await getPostById(id, postUrn).catch(() => null);
+      if (stored?.accountId) { storedAuthor = stored.accountId; break; }
+    }
+    if (storedAuthor && storedAuthor !== authorUrn) return { success: false, message: refused };
+
+    const { token, isFresh } = await this.getValidToken(account, userId);
+
+    if (!storedAuthor) {
+      let live: { exists: boolean; author?: string };
+      try {
+        live = await retryIfFreshToken401(isFresh, () => linkedInService.getPostAuthor(token, postUrn));
+      } catch (error: any) {
+        return { success: false, message: `Could not confirm this account authored the post (LinkedIn returned ${error?.response?.status ?? 'an error'}), so it was not deleted.` };
+      }
+      if (!live.exists) return { success: false, message: 'LinkedIn has no post with that URN (it may already be deleted). Nothing was deleted.' };
+      if (live.author !== authorUrn) return { success: false, message: refused };
+    }
+
+    // The token refresh and authorship read above are network round-trips taken on a
+    // consent decision read before them. Re-read it right before the DELETE, and
+    // again before any fresh-token retry, since the delete cannot be undone.
+    const withdrawn = await assertStillAuthorized?.();
+    if (withdrawn) return { success: false, message: withdrawn.error };
+
+    try {
+      await retryIfFreshToken401(
+        isFresh,
+        () => linkedInService.deletePost(token, postUrn),
+        undefined,
+        recheckConsentBeforeRetry(assertStillAuthorized),
+      );
+    } catch (error: any) {
+      if (isPublishConsentWithdrawn(error)) return { success: false, message: error.message };
+      const status = error?.response?.status;
+      return { success: false, message: `LinkedIn refused the delete${status ? ` (HTTP ${status})` : ''}. The post was not deleted.` };
+    }
+
+    let readback: { exists: boolean };
+    try {
+      readback = await linkedInService.getPostAuthor(token, postUrn);
+    } catch (error: any) {
+      return { success: false, message: `The delete was sent but could not be verified (readback returned ${error?.response?.status ?? 'an error'}). Do not assume the post is gone — check it on LinkedIn.` };
+    }
+    if (readback.exists) {
+      return { success: false, message: 'LinkedIn accepted the delete but the post is still readable. It is NOT confirmed deleted — check it on LinkedIn.' };
+    }
+    return { success: true, message: 'Post deleted from LinkedIn (verified: LinkedIn no longer returns it).', postId: postUrn };
   }
 
   async createReaction(account: ConnectedAccount, postUrn: string, reactionType: string, userId?: string): Promise<PostResult> {

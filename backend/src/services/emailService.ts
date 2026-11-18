@@ -114,7 +114,7 @@ export const emailService = {
    * that records delivery (ENG-1552) can tell a real send from a swallowed failure or
    * a non-prod suppression. `void` only ever comes from a test stub; treat it as unknown.
    */
-  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]): Promise<EmailSendOutcome | void> {
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[], headers?: Record<string, string>): Promise<EmailSendOutcome | void> {
     try {
       const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
@@ -123,7 +123,8 @@ export const emailService = {
         subject,
         text,
         html,
-        replyTo: SUPPORT_REPLY_TO
+        replyTo: SUPPORT_REPLY_TO,
+        ...(headers ? { headers } : {})
       });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
@@ -528,6 +529,96 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
     } catch (error) {
       console.error("Error sending subscriber welcome email:", error);
       // Don't throw - just log the error so subscription still succeeds
+    }
+  },
+
+  /**
+   * ENG-2991: double opt-in. Sent when someone asks (through the public join form) to receive a task's updates; nobody is subscribed until
+   * the link is opened, so a stranger cannot make AgentWeb email an address on a task owner's behalf by typing it into a form.
+   */
+  async sendSubscriberConfirmationEmail(email: string, taskId: string, confirmUrl: string) {
+    try {
+      const { taskDb, userDb } = require('../services/db');
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+      const user = await userDb.getUserById(task.userId);
+      if (!user) throw new Error(`User not found: ${task.userId}`);
+      const taskName = task.name || 'this task';
+      // The task name is chosen by the task's owner and this goes to an address the owner does not control: keep the subject short and on one line.
+      const subjectName = String(taskName).replace(/[\r\n]+/g, ' ').trim().slice(0, 80) || 'this task';
+
+      let emailSender = task.emailSender;
+      let fromName = task.fromName;
+      if (!emailSender || !fromName) {
+        if (user.emailDomain && user.defaultSenderUsername && user.fromName) {
+          emailSender = `${user.defaultSenderUsername}@${user.emailDomain}`;
+          fromName = user.fromName;
+        }
+      }
+      const hasCustomSender = Boolean(emailSender && fromName);
+      const from = hasCustomSender ? `${fromName} <${emailSender}>` : SYSTEM_FROM;
+      // The owner's task name is shown only when the mail goes out from the owner's own sender. From the system address it would be text written
+      // by an account owner, sent to strangers under AgentWeb's name.
+      const forTask = hasCustomSender;
+
+      // Both bodies come from one function so the fallback below can be built without the task name by calling it again, not by editing text.
+      const render = (withTaskName: boolean) => {
+        const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1B2549; margin-top: 0;">Please confirm your subscription</h2>
+            <p style="color: #333; line-height: 1.6;">
+              Someone asked to receive email updates${withTaskName ? ` for <strong>${this.escapeHtml(subjectName)}</strong>` : ''} at this address. If that was you, confirm below.
+            </p>
+            <p style="margin: 24px 0;">
+              <a href="${confirmUrl}" style="background: #3b82f6; color: #fff; padding: 12px 20px; border-radius: 6px; text-decoration: none; font-weight: 600;">Confirm my subscription</a>
+            </p>
+            <p style="color: #666; line-height: 1.6; font-size: 0.9em;">
+              If it wasn't you, ignore this email: you won't be subscribed and you won't receive anything else. The link expires in 48 hours.
+            </p>
+          </div>
+        </div>
+      `;
+        const text = `Please confirm your subscription
+
+Someone asked to receive email updates${withTaskName ? ` for ${subjectName}` : ''} at this address. If that was you, confirm here:
+${confirmUrl}
+
+If it wasn't you, ignore this email: you won't be subscribed and you won't receive anything else. The link expires in 48 hours.`;
+        return { html, text };
+      };
+
+      let result;
+      try {
+        result = await resendService.sendEmail({
+          from,
+          to: email,
+          // From the owner's own sender the task name is part of the subject; from the system address the subject is fixed, so a task name written
+          // by an account owner is not sent to strangers under AgentWeb's name.
+          subject: hasCustomSender ? `Confirm your subscription to ${subjectName}` : 'Please confirm your subscription',
+          ...render(forTask),
+          ...(hasCustomSender ? {} : { replyTo: SUPPORT_REPLY_TO })
+        });
+      } catch (customSenderError: any) {
+        if (!hasCustomSender) throw customSenderError;
+        // The owner's own sender was refused (an unverified domain, a revoked key): the form tells the person to check their email, so send
+        // the plain system confirmation instead of losing the sign-up. It names no task, as for any task without a sender of its own.
+        console.error('Subscriber confirmation from the task sender failed, using the system address:', customSenderError?.statusCode || customSenderError?.name || 'error');
+        result = await resendService.sendEmail({
+          from: SYSTEM_FROM,
+          to: email,
+          subject: 'Please confirm your subscription',
+          ...render(false),
+          replyTo: SUPPORT_REPLY_TO
+        });
+      }
+      console.log('Subscriber confirmation email sent', result?.id ? `(ID: ${result.id})` : '');
+      return true;
+    } catch (error: any) {
+      // The recipient is not logged: an error object from the mail service can carry it.
+      console.error('Error sending subscriber confirmation email:', error?.statusCode || error?.name || 'error');
+      return false;
     }
   },
 

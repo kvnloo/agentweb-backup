@@ -15,6 +15,8 @@ export const EVT_MCP_TOOL_USED = 'mcp_tool_used';
 export const EVT_MCP_FIRST_TOOL_USED = 'mcp_first_tool_used';
 /** ENG-2303 P4: a Meta Toolkit write that was dispatched to Meta (the billable unit). */
 export const EVT_MCP_WRITE_EXECUTED = 'mcp_write_executed';
+/** ENG-3130: a call that failed in-band. Audit only: never counted as a tool call and never billed. */
+export const EVT_MCP_TOOL_FAILED = 'mcp_tool_failed';
 
 export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'zoma_token' | 'unknown';
 export type McpClientType =
@@ -33,6 +35,10 @@ export interface McpUsageEventStore {
   queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]>;
   /** Range read on the existing (loopId, tsSession) key; ts-prefixed sort keys only. */
   queryByLoopIdTsRange?(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]>;
+  /** Range read for every subject (ts-prefixed sort keys only), so a report over many users needs ONE query. */
+  queryByLoopIdTsRangeAll?(loopId: string, startIso: string, endIso: string): Promise<DynamoAttributeMap[]>;
+  /** Exact-key read (one GetItem). Used for rows written with a dedupeKey, whose sort key carries no timestamp. */
+  get?(loopId: string, tsSession: string): Promise<DynamoAttributeMap | undefined>;
 }
 
 export interface McpConnectionAttemptInput {
@@ -196,6 +202,30 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
     return items;
   }
 
+  async queryByLoopIdTsRangeAll(loopId: string, startIso: string, endIso: string): Promise<DynamoAttributeMap[]> {
+    const items: DynamoAttributeMap[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.doc
+        .query({
+          TableName: LOOP_EVENTS_TABLE,
+          KeyConditionExpression: 'loopId = :loopId AND tsSession BETWEEN :start AND :end',
+          ExpressionAttributeValues: { ':loopId': loopId, ':start': startIso, ':end': endIso },
+          ExclusiveStartKey: lastKey,
+        })
+        .promise();
+      items.push(...((result.Items ?? []) as DynamoAttributeMap[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return items;
+  }
+
+  async get(loopId: string, tsSession: string): Promise<DynamoAttributeMap | undefined> {
+    // Consistent: an opt-out or a week claim written a moment ago must be visible, or a user who just unsubscribed could still be mailed.
+    const result = await this.doc.get({ TableName: LOOP_EVENTS_TABLE, Key: { loopId, tsSession }, ConsistentRead: true }).promise();
+    return result.Item as DynamoAttributeMap | undefined;
+  }
+
   async queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]> {
     const items: DynamoAttributeMap[] = [];
     let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -325,6 +355,43 @@ export async function recordMcpToolUse(
 }
 
 /**
+ * ENG-3130: audit row for a call that finished but reported failure in-band (`success:false`).
+ * Same table and key shape as tool use, but a different event type: it is not in
+ * MCP_USAGE_EVENT_TYPES and `getMcpUserUsage` counts only `mcp_tool_used`, so a failed call is
+ * never counted as usage and never billed. Tool name, platform and client only, no arguments or
+ * error text (they can hold ad copy and ids).
+ */
+export async function recordMcpToolFailed(
+  input: McpToolUseInput,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!input.userId) return false;
+
+  const ts = (input.now ?? new Date()).toISOString();
+  const item = eventItem({
+    eventType: EVT_MCP_TOOL_FAILED,
+    subjectId: input.userId,
+    ts,
+    tsSession: `${ts}#${input.userId}#${EVT_MCP_TOOL_FAILED}#${Math.random().toString(36).slice(2, 10)}`,
+    dimensions: {
+      product: normalizeProduct(input.product),
+      outcome: 'failed',
+      authMethod: input.authMethod ?? 'unknown',
+      apiKeyId: cleanString(input.apiKeyId),
+      clientId: cleanString(input.clientId),
+      clientType: input.clientType ?? classifyMcpClient(input),
+      sessionId: cleanString(input.sessionId),
+      toolName: input.toolName,
+      userAgent: cleanString(input.userAgent),
+      platform: cleanString(input.platform),
+    },
+  });
+
+  await store.put(item);
+  return true;
+}
+
+/**
  * ENG-2303 P4: one event per Meta Toolkit write dispatched to Meta, distinct from
  * `mcp_tool_used` (which still counts every call, previews included). Recorded only —
  * no Stripe charge is made (price undecided). Same table and key shape as tool use.
@@ -361,20 +428,80 @@ export async function recordMcpWriteExecuted(
   return true;
 }
 
-/** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
-export async function getMcpUserUsage(
-  userId: string,
-  params: { start: string; end: string },
+/** ENG-3131: Zoma plan funnel (paywall → checkout → paid → trial converted/canceled). */
+export const EVT_ZOMA_BILLING_FUNNEL = 'zoma_billing_funnel';
+export type ZomaBillingFunnelStep =
+  | 'paywall_shown'
+  | 'checkout_started'
+  | 'paid'
+  | 'checkout_canceled'
+  | 'checkout_expired'
+  | 'trial_reminder_claimed'
+  | 'trial_reminder_sent'
+  | 'trial_converted'
+  | 'trial_canceled'
+  | 'subscription_canceled'
+  /** ENG-3133: weekly ad-performance email (claim = one send per user per ISO week). The opt-out lives on the user record. */
+  | 'weekly_report_claimed';
+
+export interface ZomaBillingFunnelInput {
+  userId: string;
+  step: ZomaBillingFunnelStep;
+  /** Stable id (Stripe event / session id). With it the row is written once, so webhook retries never double count. */
+  dedupeKey?: string;
+  dimensions?: Record<string, unknown>;
+  now?: Date;
+}
+
+/** Same table and key shape as tool use; no new persistence. Returns false for a deduped repeat. */
+export async function recordZomaBillingFunnel(
+  input: ZomaBillingFunnelInput,
   store: McpUsageEventStore = defaultStore,
-): Promise<McpUserUsage> {
-  const rows = store.queryByLoopIdTsRange
-    ? await store.queryByLoopIdTsRange(EMMA_MCP_LOOP_ID, params.start, params.end, userId)
-    : await store.queryByLoopId(EMMA_MCP_LOOP_ID);
-  const startMs = Date.parse(params.start);
-  const endMs = Date.parse(params.end);
-  const events = rows
-    .map(parseEventRow)
-    .filter((e): e is ParsedMcpEvent => !!e && e.subjectId === userId && e.ts.getTime() >= startMs && e.ts.getTime() < endMs);
+): Promise<boolean> {
+  if (!input.userId) return false;
+  const ts = (input.now ?? new Date()).toISOString();
+  // With a dedupeKey the sort key carries no timestamp: a key that embeds `ts` is different on every
+  // call, so the conditional put below could never see a repeat.
+  const tsSession = input.dedupeKey
+    ? zomaFunnelDedupeSortKey(input.userId, input.step, input.dedupeKey)
+    : `${ts}#${input.userId}#${EVT_ZOMA_BILLING_FUNNEL}#${input.step}#${Math.random().toString(36).slice(2, 10)}`;
+  const item = eventItem({
+    eventType: EVT_ZOMA_BILLING_FUNNEL,
+    subjectId: input.userId,
+    ts,
+    tsSession,
+    dimensions: { product: 'zoma', step: input.step, ...(input.dimensions ?? {}) },
+  });
+  if (!input.dedupeKey) {
+    await store.put(item);
+    return true;
+  }
+  try {
+    await store.put(item, { condition: 'attribute_not_exists' });
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return false;
+    throw error;
+  }
+}
+
+/** The sort key `recordZomaBillingFunnel` writes for a row that has a dedupeKey (no timestamp in it). */
+export const zomaFunnelDedupeSortKey = (userId: string, step: ZomaBillingFunnelStep, dedupeKey: string) =>
+  `${EVT_ZOMA_BILLING_FUNNEL}#${userId}#${step}#${dedupeKey}`;
+
+/** True when the funnel row (userId, step, dedupeKey) exists. One GetItem; a store without `get` answers false. */
+export async function hasZomaFunnelRow(
+  userId: string,
+  step: ZomaBillingFunnelStep,
+  dedupeKey: string,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!userId || !store.get) return false;
+  return !!(await store.get(EMMA_MCP_LOOP_ID, zomaFunnelDedupeSortKey(userId, step, dedupeKey)));
+}
+
+/** Tool calls and dispatched writes by read-back verdict, from already-parsed events in the window. */
+function summarizeUsageEvents(events: ParsedMcpEvent[], params: { start: string; end: string }): McpUserUsage {
   const writes = events.filter((e) => e.eventType === EVT_MCP_WRITE_EXECUTED).sort((a, b) => a.ts.getTime() - b.ts.getTime());
   const count = (v: string) => writes.filter((w) => w.dimensions.verification === v).length;
   return {
@@ -391,6 +518,52 @@ export async function getMcpUserUsage(
       objectId: w.dimensions.objectId,
     })),
   };
+}
+
+/** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
+export async function getMcpUserUsage(
+  userId: string,
+  params: { start: string; end: string },
+  store: McpUsageEventStore = defaultStore,
+): Promise<McpUserUsage> {
+  const rows = store.queryByLoopIdTsRange
+    ? await store.queryByLoopIdTsRange(EMMA_MCP_LOOP_ID, params.start, params.end, userId)
+    : await store.queryByLoopId(EMMA_MCP_LOOP_ID);
+  const startMs = Date.parse(params.start);
+  const endMs = Date.parse(params.end);
+  const events = rows
+    .map(parseEventRow)
+    .filter((e): e is ParsedMcpEvent => !!e && e.subjectId === userId && e.ts.getTime() >= startMs && e.ts.getTime() < endMs);
+  return summarizeUsageEvents(events, params);
+}
+
+/**
+ * ENG-3133: usage for EVERY user in [start, end) from ONE range query, grouped in memory (the single-user read
+ * above scans the whole window once per user). `filter.product` keeps only rows written by that product
+ * ('zoma' for the Meta/Google toolkit; Emma's own MCP writes 'emma_mcp'), so another product's calls are not
+ * counted. A user with no matching event is absent from the map.
+ */
+export async function getMcpUsageByUser(
+  params: { start: string; end: string },
+  filter: { product?: string } = {},
+  store: McpUsageEventStore = defaultStore,
+): Promise<Map<string, McpUserUsage>> {
+  const rows = store.queryByLoopIdTsRangeAll
+    ? await store.queryByLoopIdTsRangeAll(EMMA_MCP_LOOP_ID, params.start, params.end)
+    : await store.queryByLoopId(EMMA_MCP_LOOP_ID);
+  const startMs = Date.parse(params.start);
+  const endMs = Date.parse(params.end);
+  const byUser = new Map<string, ParsedMcpEvent[]>();
+  for (const row of rows) {
+    const e = parseEventRow(row);
+    if (!e || e.ts.getTime() < startMs || e.ts.getTime() >= endMs) continue;
+    if (e.eventType !== EVT_MCP_TOOL_USED && e.eventType !== EVT_MCP_WRITE_EXECUTED) continue;
+    if (filter.product && e.dimensions.product !== filter.product) continue;
+    const list = byUser.get(e.subjectId);
+    if (list) list.push(e);
+    else byUser.set(e.subjectId, [e]);
+  }
+  return new Map([...byUser].map(([userId, events]) => [userId, summarizeUsageEvents(events, params)]));
 }
 
 export async function recordMcpFirstToolUse(

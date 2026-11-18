@@ -1,7 +1,9 @@
 /**
  * ENG-2953 (ENG-2812.3): SHADOW wiring of the ENG-2820 session turn/spend breaker.
  *
- * DARK — off unless SESSION_BREAKER_SHADOW=true. When on, every agent-loop LLM turn is
+ * ON BY DEFAULT (log-only) since ENG-2812: prod's Elastic Beanstalk environment-variable block
+ * is at CloudFormation's 4096-character cap, so a new env property cannot be added there. Set
+ * SESSION_BREAKER_SHADOW=false (or 0 / off) to turn it off. Every agent-loop LLM turn is
  * counted against a process-local per-session accumulator and the pure evaluator is run.
  * A non-`continue` decision emits ONE structured `session_breaker_would_pause` log line per
  * cap multiple crossed. It never pauses, never alters the response, never writes to any
@@ -11,6 +13,7 @@
  * evidence, and deliberately not persisted (persistence stays on ENG-2812, Requires: Me).
  */
 import { evaluateSessionSpendBreaker, SessionSpendCaps } from './sessionSpendBreaker';
+import { openRouterByokCostUsd } from './funding/recordLlmUsage';
 
 export interface SessionBreakerShadowConfig {
   caps: SessionSpendCaps;
@@ -23,15 +26,41 @@ function positiveNumber(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/** Returns null (no-op) unless SESSION_BREAKER_SHADOW is exactly "true". */
+/** Returns null (no-op) only when SESSION_BREAKER_SHADOW is "false", "0" or "off"; on otherwise. */
 export function readSessionBreakerShadowConfig(env: Env = process.env): SessionBreakerShadowConfig | null {
-  if (env.SESSION_BREAKER_SHADOW !== 'true') return null;
+  const flag = (env.SESSION_BREAKER_SHADOW ?? '').trim().toLowerCase();
+  if (flag === 'false' || flag === '0' || flag === 'off') return null;
   return {
     caps: {
       maxTurns: positiveNumber(env.SESSION_BREAKER_SHADOW_MAX_TURNS, 40),
       maxSpendUsd: positiveNumber(env.SESSION_BREAKER_SHADOW_MAX_SPEND_USD, 5),
     },
   };
+}
+
+/** The parts of an OpenRouter `usage` block that say what a turn cost AgentWeb. */
+export interface ShadowTurnUsage {
+  cost?: unknown;
+  is_byok?: boolean;
+  cost_details?: { upstream_inference_cost?: unknown } | null;
+  server_tool_use_details?: unknown;
+}
+
+/**
+ * What one agent-loop LLM turn cost AgentWeb, by the ledger's rule (ENG-2720), except that a
+ * non-BYOK response with no positive cost is priced from the price book instead of booked as $0.
+ * On our own provider key (BYOK, the default route) `usage.cost` is 0 for a plain call: the real
+ * bill is `cost_details.upstream_inference_cost` plus any OpenRouter fee. Reading `usage.cost`
+ * alone counted every BYOK turn as $0, so the spend cap never fired. `tokenCostUsd` is the
+ * price-book cost, used when the response reports no usable cost.
+ */
+export function shadowTurnCostUsd(usage: ShadowTurnUsage | null | undefined, tokenCostUsd: number): number {
+  if (!usage) return 0;
+  const token = Number.isFinite(tokenCostUsd) && tokenCostUsd > 0 ? tokenCostUsd : 0;
+  const reported = usage.is_byok === true
+    ? openRouterByokCostUsd(usage, token)
+    : typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : undefined;
+  return typeof reported === 'number' && Number.isFinite(reported) && reported > 0 ? reported : token;
 }
 
 interface SessionAccumulator {

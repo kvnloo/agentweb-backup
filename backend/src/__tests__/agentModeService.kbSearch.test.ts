@@ -12,7 +12,6 @@ jest.mock('../services/settingsService');
 jest.mock('../services/db');
 jest.mock('../utils/secretsManager');
 jest.mock('../services/tokenUsageService', () => ({
-  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockSearchPlatformKnowledgeBase = jest.fn();
