@@ -289,7 +289,7 @@ export function createZomaRouter(
   router.get('/weekly-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), (req: Request, res: Response) => {
     const token = typeof req.query.t === 'string' ? req.query.t : '';
     if (!verifyUnsubscribeToken(token)) {
-      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Reply to the email and we will stop it for you.</p>');
+      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the weekly email for you.</p>');
     }
     return page(
       res,
@@ -300,15 +300,16 @@ export function createZomaRouter(
   });
 
   router.post('/weekly-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
-    const userId = verifyUnsubscribeToken(req.body?.t);
+    const userId = verifyUnsubscribeToken(req.body?.t ?? req.query?.t);
     if (!userId) {
-      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Reply to the email and we will stop it for you.</p>');
+      return page(res, 400, 'Weekly Zoma email', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the weekly email for you.</p>');
     }
     try {
       await recordWeeklyReportOptOut(userId);
       return page(res, 200, 'Unsubscribed', '<p>You will not get the weekly Zoma ad report any more. Zoma itself keeps working as before.</p>');
     } catch (error) {
-      return failPage(res, 'weekly_report_opt_out', error);
+      logZomaSetup({ step: 'weekly_report_opt_out', outcome: 'error', reason: error });
+      return page(res, 500, 'Weekly Zoma email', '<p>We could not record that just now. Open the link again in a moment, or write to support@agentweb.pro and we will stop the weekly email for you.</p>');
     }
   });
 
