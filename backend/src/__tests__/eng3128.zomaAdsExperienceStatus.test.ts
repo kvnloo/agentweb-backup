@@ -18,7 +18,7 @@ jest.mock('../services/metaConnectUrl', () => ({ buildMetaConnectUrl: jest.fn() 
 jest.mock('../services/connectedAccountsDb', () => ({ getAccountsByUserIdIncludingOrgShared: jest.fn() }));
 
 import { getZomaReadiness, runZomaTool, ZomaNotReadyError, type ZomaOnboardingDeps } from '../mcp/zomaOnboarding';
-import { ZOMA_NEW_TO_ADS_STEPS, ZOMA_NOT_INTERESTED_MESSAGE } from '../mcp/zomaAdsExperience';
+import { zomaNewToAdsSteps, ZOMA_NOT_INTERESTED_MESSAGE } from '../mcp/zomaAdsExperience';
 import { buildZomaScoreboard, type ScoreboardDeps, type ZomaUserRecord, type ZomaWriteEvent } from '../services/zomaScoreboard';
 import { activeUserCount, buildTracker, dailyFollowUpList, helpAlert, type ZomaTrackedUser } from '../services/zomaActivationQueue';
 
@@ -101,7 +101,7 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
     const d = deps({});
     const r = await status(d, { ads_experience: 'new_to_ads' });
     expect(d.saveAdsExperience).toHaveBeenCalledWith('u1', 'new_to_ads');
-    for (const step of ZOMA_NEW_TO_ADS_STEPS) expect(r.next_step).toContain(step);
+    for (const step of zomaNewToAdsSteps()) expect(r.next_step).toContain(step);
     expect(r.next_step).toMatch(/Business portfolio/);
     expect(r.next_step).toMatch(/Facebook Page/);
     expect(r.next_step).toMatch(/ad account/);
@@ -114,7 +114,7 @@ describe('ENG-3128 zoma_status asks "How familiar are you with ads?"', () => {
   });
 
   it('new_to_ads guide carries the Google no-campaign and user-chosen country/currency/time zone guidance', () => {
-    const guide = ZOMA_NEW_TO_ADS_STEPS.join(' ');
+    const guide = zomaNewToAdsSteps(true).join(' ');
     expect(guide).toContain('Create an account without a campaign');
     expect(guide).toContain('choose them yourself');
   });

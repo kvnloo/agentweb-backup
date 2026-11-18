@@ -39,6 +39,10 @@ export interface SweepSummary {
   errors: number;
   reconciled: number;
   reconcileErrors: number;
+  /** ENG-3095: deployed pages whose stored agentwebforms.com host has no domain row. */
+  rowlessManagedHosts: number;
+  /** ENG-3095: how many of those failed the probe twice in this run. */
+  rowlessManagedFailing: number;
 }
 
 async function scanAll(table: string): Promise<any[]> {
@@ -268,6 +272,91 @@ export async function reconcileUnregisteredDomains(
   return summary;
 }
 
+export interface RowlessManagedHost {
+  pageId: string;
+  host: string;
+}
+
+export interface RowlessManagedHostResult extends RowlessManagedHost {
+  failing: boolean;
+  /** Compact probe outcome for the log line, e.g. `ok(200)` or `FAILED(suspect CERT_HAS_EXPIRED)`. */
+  result: string;
+}
+
+/**
+ * ENG-3095: deployed pages whose stored `agentwebforms.com` host has NO domain row.
+ *
+ * `selectDomainsToProbe` starts from domain rows, so these hosts are never probed, and
+ * `reconcileUnregisteredDomains` deliberately refuses to create a row for them (see its comment:
+ * a missing row for a managed subdomain is a different bug and must be surfaced, not papered
+ * over). Until now nothing surfaced it: two such pages served an expired certificate from
+ * August to November 2026 and nobody was told.
+ *
+ * This only FINDS them. The caller probes and reports; nothing is written for these hosts.
+ *
+ * Pure and exported so the scoping rule is testable without AWS.
+ */
+export function selectRowlessManagedHosts(
+  domains: Array<{ domain?: string }>,
+  pages: Array<{ id?: unknown; status?: string; userId?: string; customDomainUrl?: string }>
+): RowlessManagedHost[] {
+  const registeredHosts = new Set(domains.map((d) => d.domain).filter(Boolean));
+  const managedSuffix = `.${SUBDOMAIN_BASE}`;
+  const out: RowlessManagedHost[] = [];
+  for (const p of pages) {
+    if (p.status !== "deployed" || !p.customDomainUrl) continue;
+    // ENG-1907: a sandbox principal's pages never bring a host into monitoring scope.
+    if (isEvaluationUser(p.userId)) continue;
+    let host: string;
+    try {
+      host = new URL(p.customDomainUrl).host;
+    } catch {
+      continue;
+    }
+    if (!host.endsWith(managedSuffix) || registeredHosts.has(host)) continue;
+    out.push({ pageId: String(p.id), host });
+  }
+  return out;
+}
+
+function describeVerdict(verdict: Awaited<ReturnType<typeof probeDomain>>): string {
+  return verdict.state === "reachable"
+    ? `ok(${verdict.httpStatus})`
+    : `FAILED(${verdict.state} ${verdict.code})`;
+}
+
+/**
+ * Probe each row-less managed host with the monitor's own probe. Read-only.
+ *
+ * A host with a domain row gets its failures confirmed across daily runs through the stored
+ * `consecutiveFailures`. These hosts have no row and this path may not add stored state, so a
+ * failing host is probed a second time in the same run instead; only two failures in a row
+ * count as failing. That filters a single dropped connection, not a day-long outage.
+ */
+export async function probeRowlessManagedHosts(
+  hosts: RowlessManagedHost[]
+): Promise<RowlessManagedHostResult[]> {
+  const byHost = new Map<string, Promise<{ failing: boolean; result: string }>>();
+  const probeHost = async (host: string) => {
+    try {
+      let verdict = await probeDomain(host);
+      if (verdict.state !== "reachable") verdict = await probeDomain(host);
+      return { failing: verdict.state !== "reachable", result: describeVerdict(verdict) };
+    } catch (err: unknown) {
+      return { failing: true, result: `FAILED(probe-error ${(err as Error)?.message ?? "unknown"})` };
+    }
+  };
+  return mapLimit(hosts, SWEEP_CONCURRENCY, async (h) => {
+    // Two pages can store the same host; probe it once.
+    let pending = byHost.get(h.host);
+    if (!pending) {
+      pending = probeHost(h.host);
+      byHost.set(h.host, pending);
+    }
+    return { ...h, ...(await pending) };
+  });
+}
+
 /** Run `worker` over `items` with at most `limit` in flight. */
 async function mapLimit<T, R>(
   items: T[],
@@ -324,6 +413,8 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
     errors: 0,
     reconciled: 0,
     reconcileErrors: 0,
+    rowlessManagedHosts: 0,
+    rowlessManagedFailing: 0,
   };
 
   const [domains, pages] = await Promise.all([scanAll(DOMAINS_TABLE), scanAll(PAGES_TABLE)]);
@@ -404,5 +495,34 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
       `suspect-not-yet-believed=${summary.stillSuspect} errors=${summary.errors} ` +
       `reconciled=${summary.reconciled} reconcile-errors=${summary.reconcileErrors}`
   );
+
+  // ENG-3095: managed hosts with no domain row. Reported, never written.
+  try {
+    const rowless = await probeRowlessManagedHosts(selectRowlessManagedHosts(domains, pages));
+    const failing = rowless.filter((r) => r.failing);
+    summary.rowlessManagedHosts = rowless.length;
+    summary.rowlessManagedFailing = failing.length;
+    const describe = (r: RowlessManagedHostResult) => `page=${r.pageId} host=${r.host} result=${r.result}`;
+    console.log(
+      `[DomainReachability] rowless-managed-hosts=${rowless.length} failing=${failing.length}` +
+        (rowless.length > 0 ? ` :: ${rowless.map(describe).join(" ; ")}` : "")
+    );
+    if (failing.length > 0) {
+      // One internal message per run, listing every failing host. Never per host, never to a
+      // customer. sendOncallAlert is the same oncall path the other backend monitors use.
+      const { emailService } = await import("../services/emailService");
+      await emailService.sendOncallAlert(
+        `Domain monitor: ${failing.length} landing-page host(s) with no domain record failed the probe`,
+        "These deployed pages store an agentwebforms.com host that has no AW-CustomDomains row, " +
+          "so the daily monitor keeps no state for them, and the host failed two probes in a row " +
+          "in this run:\n\n" +
+          failing.map(describe).join("\n"),
+        { "Alert Class": "domain-reachability-rowless-managed-host", "Failing Hosts": failing.length }
+      );
+    }
+  } catch (err: unknown) {
+    summary.errors++;
+    console.warn(`[DomainReachability] rowless managed host check failed: ${(err as Error)?.message}`);
+  }
   return summary;
 }
