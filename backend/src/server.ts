@@ -874,6 +874,24 @@ createTestAccount().then(async () => {
       }, 7 * 60 * 1000);
       console.log('[ZomaTrialReminders] Initialized — hourly, first pass in 7 minutes (active only when ZOMA_BILLING_ENABLED=true)');
 
+      // ENG-3133: weekly Zoma ad-performance email. Hourly tick; a no-op until
+      // ZOMA_WEEKLY_REPORT_ENABLED=true and only inside the configured send window. Exactly one email per
+      // user per ISO week (a conditional write claims the week before the send), safe across instances.
+      setTimeout(() => {
+        let running = false;
+        const tick = () => {
+          if (!isCronEnabled() || running) return;
+          running = true;
+          import('./mcp/zomaWeeklyReport')
+            .then(({ runZomaWeeklyReports }) => cronJobRegistry.track('ZomaWeeklyReport', runZomaWeeklyReports()))
+            .catch(e => console.error('[ZomaWeeklyReport] Error:', e))
+            .finally(() => { running = false; });
+        };
+        tick();
+        setInterval(tick, 60 * 60 * 1000);
+      }, 11 * 60 * 1000);
+      console.log('[ZomaWeeklyReport] Initialized — hourly, first pass in 11 minutes (active only when ZOMA_WEEKLY_REPORT_ENABLED=true)');
+
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
       // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
       try {
