@@ -648,6 +648,62 @@ export async function linkedinRepost(userId: string, accountId: string, postUrn:
   }
 }
 
+/**
+ * ENG-3014: delete a LinkedIn post the connected account authored.
+ * Same account access check as repost; the adapter owns authorship, the delete,
+ * and the not-found readback. The stored post row is removed only once LinkedIn
+ * has confirmed the post is gone.
+ */
+export async function linkedinDeletePost(userId: string, accountId: string, postUrn: string, toolContext?: any): Promise<any> {
+  console.log('[AgentMode] linkedinDeletePost called:', { userId, accountId, postUrn });
+
+  try {
+    const { getAccountByIdConsistent } = await import('../../services/connectedAccountsDb');
+    const { socialPlatformService } = await import('../../services/socialPlatformService');
+
+    const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+    if (!account || account.platform !== 'linkedin') {
+      return { success: false, message: 'Account not found or access denied' };
+    }
+
+    const adapter = socialPlatformService.getAdapter(account.platform) as any;
+    if (!adapter.deletePost) {
+      return { success: false, message: 'Delete is not supported for this platform' };
+    }
+
+    // Irreversible, so the same last-moment consent re-check a repost gets.
+    const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawnNow) return withdrawnNow;
+
+    const result = await adapter.deletePost(account, postUrn, userId, toolContext?.assertPublishStillAuthorized);
+    if (result.success !== true) return { success: false, message: result.message };
+
+    const { deletePost: removeStoredPost } = await import('../../services/linkedInPostsDb');
+    const ownerIds = Array.from(new Set([userId, (account as any).userId].filter(Boolean))) as string[];
+    let recordRemoved = true;
+    for (const id of ownerIds) {
+      try {
+        await removeStoredPost(id, postUrn);
+      } catch (dbError) {
+        recordRemoved = false;
+        console.error('[AgentMode] linkedinDeletePost: failed to remove stored post row:', dbError);
+      }
+    }
+
+    return {
+      success: true,
+      message: recordRemoved ? result.message : `${result.message} The stored copy could not be removed and may still appear in post lists until the next refresh.`,
+      post_id: postUrn,
+    };
+  } catch (error: any) {
+    let message = error?.message || 'Unknown error';
+    if (message.includes('access token expired')) {
+      message = 'Account token expired. Please reconnect the account in Settings.';
+    }
+    return { success: false, message: `Failed to delete post: ${message}`, code: error?.code, ...declaredErrorClass(error) };
+  }
+}
+
 export async function commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string, toolContext?: any): Promise<any> {
   console.log('[AgentMode] commentOnLinkedInPost called:', {
     userId,
@@ -967,6 +1023,7 @@ export type LinkedinManagePostDeps = {
   listLinkedInComments: (userId: string, accountId: string, postUrn: string) => Promise<any>;
   reactToLinkedInPost: (userId: string, accountId: string, postUrn: string, reactionType?: string) => Promise<any>;
   getPostAnalytics: (userId: string, accountId: string, postIds: string[]) => Promise<any>;
+  linkedinDeletePost: (userId: string, accountId: string, postUrn: string, toolContext?: any) => Promise<any>;
 };
 
 /**
@@ -981,7 +1038,7 @@ export type LinkedinManagePostDeps = {
 export async function linkedinManagePost(
   userId: string,
   args: {
-    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics' | 'delete_post';
     account_id: string;
     post_urn?: string;
     commentary?: string;
@@ -1023,6 +1080,8 @@ export async function linkedinManagePost(
       return requirePostUrn('list_comments') ?? deps.listLinkedInComments(userId, account_id, args.post_urn!);
     case 'react':
       return requirePostUrn('react') ?? deps.reactToLinkedInPost(userId, account_id, args.post_urn!, args.reaction_type || 'LIKE');
+    case 'delete_post':
+      return requirePostUrn('delete_post') ?? deps.linkedinDeletePost(userId, account_id, args.post_urn!, toolContext);
     case 'get_analytics':
       return requirePostIds() ?? deps.getPostAnalytics(userId, account_id, args.post_ids!);
     default:
