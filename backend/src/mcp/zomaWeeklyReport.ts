@@ -417,6 +417,13 @@ function chipsHtml(chips: Chip[]): string {
 }
 
 const BAR_AREA_PX = 110;
+/** Gmail's Android app ignores width attributes on these tables, so every bar carries its width in CSS and a spacer. */
+const DAY_BAR_PX = 36;
+const CAMPAIGN_BAR_MAX_PX = 250;
+
+/** One solid bar: a table cell with a colour, an exact size in CSS (and attributes for Outlook), and a spacer that holds the width open. */
+const barCell = (widthPx: number, heightPx: number, color: string) =>
+  `<td width="${widthPx}" height="${heightPx}" bgcolor="${color}" style="width:${widthPx}px;height:${heightPx}px;${BAR_CELL}"><div style="width:${widthPx}px;height:1px;${BAR_CELL}">&nbsp;</div></td>`;
 
 /** Seven bars drawn with table cells (no images, no scripts), so they render in every mail client. */
 function dailyBarsHtml(daily: DailyPoint[], color: string, currency?: string): string {
@@ -424,10 +431,8 @@ function dailyBarsHtml(daily: DailyPoint[], color: string, currency?: string): s
   const cols = daily
     .map((d) => {
       const h = max > 0 && d.spend > 0 ? Math.max(2, Math.round((d.spend / max) * BAR_AREA_PX)) : 0;
-      const bar = h > 0
-        ? `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="${h}" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td></tr></table>`
-        : `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="1" bgcolor="#dadce0" style="${BAR_CELL}">&nbsp;</td></tr></table>`;
-      return `<td align="center" valign="bottom" style="padding:0 3px"><div style="font-size:11px;color:#5f6368;padding-bottom:3px">${escapeHtml(d.spend >= 100 ? int(d.spend) : d.spend === 0 ? '0' : d.spend.toFixed(d.spend >= 10 ? 0 : 1))}</div>${bar}<div style="font-size:11px;color:#5f6368;padding-top:4px">${escapeHtml(weekdayOf(d.date))}</div></td>`;
+      const bar = `<table cellpadding="0" cellspacing="0" align="center" style="width:${DAY_BAR_PX}px"><tr>${h > 0 ? barCell(DAY_BAR_PX, h, color) : barCell(DAY_BAR_PX, 1, '#dadce0')}</tr></table>`;
+      return `<td align="center" valign="bottom" style="padding:0 2px;width:${DAY_BAR_PX + 4}px"><div style="font-size:11px;color:#5f6368;padding-bottom:3px">${escapeHtml(d.spend >= 100 ? int(d.spend) : d.spend === 0 ? '0' : d.spend.toFixed(d.spend >= 10 ? 0 : 1))}</div>${bar}<div style="font-size:11px;color:#5f6368;padding-top:4px">${escapeHtml(weekdayOf(d.date))}</div></td>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:12px 0 4px">Spend per day${currency ? ` (${escapeHtml(currency)})` : ''}</div><table cellpadding="0" cellspacing="0" style="margin:0 auto"><tr>${cols}</tr></table>`;
@@ -438,10 +443,10 @@ function campaignBarsHtml(top: TopCampaign[], color: string, currency?: string):
   // Each campaign is two rows: its name and figures (either may wrap on a phone), then a bar across the full width.
   const rows = top
     .map((c) => {
-      const w = max > 0 ? Math.max(2, Math.round((c.spend / max) * 100)) : 0;
+      const px = max > 0 ? Math.max(4, Math.round((c.spend / max) * CAMPAIGN_BAR_MAX_PX)) : 0;
       const cost = campaignCost(c);
       const each = cost === undefined ? '' : ` &middot; ${escapeHtml(money(cost, currency))} each`;
-      return `<tr><td valign="bottom" style="padding:8px 10px 2px 0;font-size:13px;color:#202124">${escapeHtml(cleanName(c.name))}</td><td valign="bottom" align="right" style="padding:8px 0 2px;font-size:12px;color:#202124">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.${each}</td></tr><tr><td colspan="2" style="padding:0 0 4px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="10" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td><td></td></tr></table></td></tr>`;
+      return `<tr><td valign="bottom" style="padding:8px 10px 2px 0;font-size:13px;color:#202124">${escapeHtml(cleanName(c.name))}</td><td valign="bottom" align="right" style="padding:8px 0 2px;font-size:12px;color:#202124">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.${each}</td></tr><tr><td colspan="2" style="padding:0 0 4px"><table cellpadding="0" cellspacing="0"><tr>${barCell(px, 10, color)}</tr></table></td></tr>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:14px 0 2px">Top campaigns by spend</div><table width="100%" cellpadding="0" cellspacing="0">${rows}</table>`;
