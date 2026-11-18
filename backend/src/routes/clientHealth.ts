@@ -72,7 +72,8 @@ router.get("/:clientEmail/meta-budgets", async (req: Request, res: Response) => 
     if (!userId) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
-    const clientEmail = decodeURIComponent(req.params.clientEmail);
+    // Express has already decoded route params; decoding again breaks a literal "%" (ENG-3084).
+    const clientEmail = req.params.clientEmail;
     const since = typeof req.query.since === "string" ? req.query.since : "";
     const until = typeof req.query.until === "string" ? req.query.until : "";
     const result = await readClientMetaBudgets(userId, clientEmail, since, until, authReq.user.isAdmin);

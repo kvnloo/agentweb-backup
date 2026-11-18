@@ -143,6 +143,19 @@ describe('ENG-3069 readClientMetaBudgets', () => {
     expect(r).not.toHaveProperty('campaigns');
   });
 
+  it('reports a refused campaigns read that arrives as a non-2xx body with no error field as a failure', async () => {
+    admin();
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue(client);
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([ownAccount]);
+    const refused: any = { data: [] };
+    Object.defineProperty(refused, '__httpStatus', { value: 400, enumerable: false });
+    graphRouter({ '/act_111/campaigns': refused });
+    const r = await readClientMetaBudgets('admin', 'owner@haven.com', '2026-11-01', '2026-11-15');
+    expect(r.success).toBe(false);
+    expect(r.reason).toBe('meta_read_failed');
+    expect(r).not.toHaveProperty('account_spend');
+  });
+
   it('reports a thrown Meta fetch as a failure', async () => {
     admin();
     (userDb.getUserByEmail as jest.Mock).mockResolvedValue(client);

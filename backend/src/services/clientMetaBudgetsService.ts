@@ -33,6 +33,12 @@ async function readRows(url: string, what: string): Promise<any[]> {
   }
   if (!body || typeof body !== 'object') throw new MetaReadError(`${what}: empty response`);
   if (body.error) throw new MetaReadError(`${what}: ${body.error.message || 'Graph API error'}`);
+  // A refused read can arrive as a non-2xx response whose body has no `error` field; the
+  // fetch helper exposes the real status as a non-enumerable `__httpStatus` (ENG-1300).
+  const status = (body as any).__httpStatus;
+  if (typeof status === 'number' && (status < 200 || status >= 300)) {
+    throw new MetaReadError(`${what}: Graph API returned HTTP ${status}`);
+  }
   if (body.pagingTruncated) throw new MetaReadError(`${what}: paging stopped before the last page`);
   if (!Array.isArray(body.data)) throw new MetaReadError(`${what}: response had no data array`);
   return body.data;
