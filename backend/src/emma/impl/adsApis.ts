@@ -3370,6 +3370,16 @@ async function getLinkedInAdsCredentials(userId: string, accountId?: string): Pr
 /**
  * Master method for LinkedIn Ads entity management (campaigns, creatives, targeting, etc.)
  */
+/**
+ * ENG-3064: a LinkedIn update that was accepted but did not read back is returned to the tool
+ * as a typed failure (same shape as the Google path), never thrown into a generic error and
+ * never relayed as success.
+ */
+function linkedInReadBackFailure(result: linkedInAdsService.LinkedInAdsApiResult) {
+  if (result.success || !result.errorType) return null;
+  return { success: false, errorType: result.errorType, errorCode: result.errorType, fields: result.fields, error: result.error };
+}
+
 export async function callLinkedInMarketingApi(
   userId: string,
   entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA' | 'INMAIL' | 'CONVERSATION_AD',
@@ -3405,6 +3415,8 @@ export async function callLinkedInMarketingApi(
       if (action === 'UPDATE') {
         if (!params.campaign_group_id) throw new Error('UPDATE requires campaign_group_id');
         const result = await linkedInAdsService.updateCampaignGroup(accessToken, accountId, params.campaign_group_id, params);
+        const readBackFailure = linkedInReadBackFailure(result);
+        if (readBackFailure) return readBackFailure;
         if (!result.success) throw new Error(result.error || 'Failed to update campaign group');
         return { success: true, message: 'Campaign group updated', result: result.data };
       }
@@ -3425,6 +3437,8 @@ export async function callLinkedInMarketingApi(
       if (action === 'UPDATE') {
         if (!params.campaign_id) throw new Error('UPDATE requires campaign_id');
         const result = await linkedInAdsService.updateCampaign(accessToken, accountId, params.campaign_id, params);
+        const readBackFailure = linkedInReadBackFailure(result);
+        if (readBackFailure) return readBackFailure;
         if (!result.success) throw new Error(result.error || 'Failed to update campaign');
         return { success: true, message: 'Campaign updated', result: result.data };
       }
@@ -3483,6 +3497,8 @@ export async function callLinkedInMarketingApi(
         if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
         if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
         const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
+        const readBackFailure = linkedInReadBackFailure(result);
+        if (readBackFailure) return readBackFailure;
         if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
         if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
         return { success: true, message: 'Creative retagged with UTMs' };
@@ -3496,6 +3512,8 @@ export async function callLinkedInMarketingApi(
           throw new Error(`CREATIVE UPDATE requires params.status, one of: ${allowed.join(', ')}`);
         }
         const result = await linkedInAdsService.updateCreativeStatus(accessToken, accountId, String(params.creative_id), status);
+        const readBackFailure = linkedInReadBackFailure(result);
+        if (readBackFailure) return readBackFailure;
         if (!result.success) throw new Error(result.error || 'Failed to update creative');
         return { success: true, message: `Ad status set to ${status}`, result: result.data };
       }
