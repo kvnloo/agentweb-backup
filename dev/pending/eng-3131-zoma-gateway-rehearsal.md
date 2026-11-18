@@ -1,0 +1,3 @@
+## ENG-3131: rehearsal now drives the real gateway and the returning-user path (2026-11-18)
+
+`backend/src/scripts/zomaBillingRehearsal.ts` (test-mode Stripe + test clock, no staging, no Dev-table writes) now also calls `handleMetaToolkitCall` with an `UPDATE status=ACTIVE` write: refused with the pay link before payment (nothing sent to Meta, nothing metered), allowed after, edits and reads metered, an in-band Meta rejection not metered and audited. A last pass cancels the plan and checks the returning-user Checkout (plan + metered price only, $50 due today, USD-only). Meta itself is a fake; journey milestones are stubbed. Run result: 40/40.
