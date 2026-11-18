@@ -798,6 +798,30 @@ export class LinkedInService {
   }
 
   /**
+   * ENG-3014: read a post's author, or report that the post does not exist.
+   * A 404 is an answer here, not an error: it is how a delete is verified.
+   */
+  async getPostAuthor(accessToken: string, postUrn: string): Promise<{ exists: boolean; author?: string }> {
+    try {
+      const response = await this.client.get(`/rest/posts/${encodeURIComponent(postUrn)}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const author = (response.data as any)?.author;
+      return { exists: true, author: typeof author === 'string' ? author : undefined };
+    } catch (error: any) {
+      if (error.response?.status === 404) return { exists: false };
+      throw error;
+    }
+  }
+
+  /** ENG-3014: delete a post (share or ugcPost URN) the token's member/org authored. */
+  async deletePost(accessToken: string, postUrn: string): Promise<void> {
+    await this.client.delete(`/rest/posts/${encodeURIComponent(postUrn)}`, {
+      headers: { Authorization: `Bearer ${accessToken}`, 'X-RestLi-Method': 'DELETE' },
+    });
+  }
+
+  /**
    * Create a comment on a LinkedIn post
    * @param accessToken - OAuth access token
    * @param postUrn - URN of the post to comment on (e.g., "urn:li:ugcPost:123" or "urn:li:share:456")
