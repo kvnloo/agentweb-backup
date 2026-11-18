@@ -120,7 +120,7 @@ class MemoryStore implements ZomaDeviceStore {
   }
 }
 
-const READY = { payment: { ready: true }, meta: { ready: true, accounts: [] }, writes_enabled: true, next_step: null };
+const READY = { payment: { ready: true }, meta: { ready: true, accounts: [] }, writes_enabled: true, ads_experience: 'runs_ads', next_step: null };
 const ACCT = (id: string) => ({ id: `act_${id}`, account_id: id, name: `Acct ${id}`, currency: 'USD', account_status: 1 });
 /** The real Meta connect state format (signed with JWT_SECRET), carrying the Zoma marker. */
 const metaState = (userId: string, extra: Record<string, string> = {}) => generateMetaOAuthState(userId, { flow: 'marketing', ...extra });
@@ -143,6 +143,7 @@ function harness(over: Partial<ZomaDeviceFlowDeps> = {}) {
     finalizeMeta: jest.fn().mockResolvedValue({ flow: 'marketing', adAccounts: [ACCT('111')], tokenSessionId: 'tsid-secret', preconnectInstructions: '' }),
     connectAdAccounts: jest.fn().mockResolvedValue(undefined),
     getCheckoutSession: jest.fn().mockResolvedValue({ status: 'complete', userId: 'user-1' }),
+    saveAdsExperience: jest.fn().mockResolvedValue(undefined),
     ...over,
   };
   return { deps, store, advance: (ms: number) => (now += ms) };
@@ -166,6 +167,7 @@ function liveReadiness() {
     payment: { ready: live.payment },
     meta: { ready: live.meta, accounts: [] },
     writes_enabled: live.meta && live.payment,
+    ads_experience: 'runs_ads',
     next_step: null,
   }));
   return { live, readiness: readiness as any };
@@ -197,7 +199,7 @@ describe('ENG-2496 Zoma device flow — security invariants', () => {
 
   it('a bound user who is not finished onboarding gets next_step, not a token', async () => {
     const h = harness({
-      readiness: jest.fn(async () => ({ payment: { ready: false }, meta: { ready: true, accounts: [] }, writes_enabled: false, next_step: 'x' })) as any,
+      readiness: jest.fn(async () => ({ payment: { ready: false }, meta: { ready: true, accounts: [] }, writes_enabled: false, ads_experience: 'runs_ads', next_step: 'x' })) as any,
       mintPaymentLink: jest.fn().mockResolvedValue('https://checkout.stripe.test/setup'),
     });
     const deviceCode = await startAndApprove(h);

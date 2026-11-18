@@ -134,9 +134,9 @@ const call = async (name: string, args: any) => {
 };
 
 describe('ENG-2928 Google Ads writes over MCP JSON-RPC (Google faked at HTTP)', () => {
-  const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
   beforeEach(() => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     keywords = [];
     assetGroupStatus = 'PAUSED';
     assets = {};
@@ -148,8 +148,8 @@ describe('ENG-2928 Google Ads writes over MCP JSON-RPC (Google faked at HTTP)', 
     mockGet.mockRejectedValue(new Error('no GET expected'));
   });
   afterAll(() => {
-    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prev;
   });
 
   it('KEYWORD ADD: preview sends no mutate; confirm sends one PAUSED create; GAQL read-back CONFIRMED; metered once', async () => {

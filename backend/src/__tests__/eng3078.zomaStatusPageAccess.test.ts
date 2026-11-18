@@ -6,6 +6,8 @@
  *  3. granted  -> output identical to today.
  *  4. the message is getMetaAdsNoPagesMessage verbatim.
  *  5. reads still work, nothing is stored, the write gate is untouched.
+ * ENG-3125 extended next_step: the same message, verbatim and once, followed by numbered fix
+ * steps (see eng3125.zomaMetaPageBlocker.test.ts), and a fresh Meta reconnect link is minted.
  */
 jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock('../services/stripeService', () => ({ stripeService: {} }));
@@ -16,11 +18,17 @@ import { assertZomaWriteReady, getZomaReadiness, runZomaTool, type ZomaOnboardin
 import { buildMetaAdsWrongPageMessage, META_ADS_NO_PAGES_MESSAGE } from '../utils/metaAdsScope';
 
 const NOW = 1_800_000_000_000;
-const ALL_SET = 'All set. Ask me about your Meta ads, e.g. "how are my campaigns doing this week?"';
+// ENG-3134: "All set" now links Zoma's docs and gives a concrete first prompt (zoma_ads_report).
+const ALL_SET = [
+  'All set. Your ad account is connected to Zoma.',
+  'Docs: https://api.agentweb.pro/api/meta-toolkit/skill.md',
+  'Try asking: "Show my Meta ad spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for the last 7 days." (runs zoma_ads_report).',
+].join('\n');
 // The exact text a fully set-up user gets on main today (Google Ads provider off).
 const TODAY_SUMMARY = [
   'Zoma setup:',
   '  [x] AgentWeb login (a@b.co)',
+  '  [x] How familiar you are with ads (runs_ads)',
   '  [x] Payment method on file',
   '  [x] Meta ad account connected (111, TWD)',
   '',
@@ -42,7 +50,7 @@ const googleAccount = () => ({
 
 function deps(accounts: any[], over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Record<string, jest.Mock> {
   return {
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue(accounts),
     findLiveCustomerId: jest.fn(),
     createCustomerForUser: jest.fn(),
@@ -51,20 +59,28 @@ function deps(accounts: any[], over: Partial<ZomaOnboardingDeps> = {}): ZomaOnbo
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://facebook.example/connect'),
     buildGoogleAdsConnectUrl: jest.fn().mockResolvedValue('https://accounts.google.example/connect'),
     googleEnabled: () => false,
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     getUsage: jest.fn(),
     ...over,
   } as any;
 }
 const status = (d: ZomaOnboardingDeps): Promise<any> => runZomaTool('zoma_status', {}, { userId: 'u1' }, d);
+// ENG-3127: the Page step leads with the fact that reads still work.
+const READS_OK = 'Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:\n';
+/** ENG-3125: the ENG-3127 lead, the canonical message verbatim and exactly once, then the guided fix steps. */
+const expectPageStep = (nextStep: string | null, message: string) => {
+  expect(typeof nextStep).toBe('string');
+  expect(nextStep!.startsWith(`${READS_OK}${message}\n\nTo fix it:\n1. `)).toBe(true);
+  expect(nextStep!.split(message).length).toBe(2);
+};
 
 describe('ENG-3078 zoma_status and Facebook Page access', () => {
   it('missing: the Page problem is the next step instead of "All set"', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false })]));
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
-    expect(r.summary.endsWith(`\n\n${META_ADS_NO_PAGES_MESSAGE}`)).toBe(true);
+    expectPageStep(r.next_step, META_ADS_NO_PAGES_MESSAGE);
+    expect(r.summary).toContain(`\n\n${READS_OK}${META_ADS_NO_PAGES_MESSAGE}\n`);
     expect(r.meta.accounts).toEqual([
       { account_id: '111', name: 'Phoenix', currency: 'TWD', ads_management: 'granted', page_access: 'missing' },
     ]);
@@ -76,39 +92,40 @@ describe('ENG-3078 zoma_status and Facebook Page access', () => {
     expect(r.summary).toContain('  [x] Meta ad account connected (111, TWD)');
     expect(r.meta.ready).toBe(true);
     expect(r.writes_enabled).toBe(true);
-    expect(d.buildMetaConnectUrl).not.toHaveBeenCalled();
+    // ENG-3125: one fresh reconnect link for the guided fix; Meta stays connected.
+    expect(d.buildMetaConnectUrl).toHaveBeenCalledTimes(1);
     await expect(assertZomaWriteReady('u1', d)).resolves.toBeUndefined();
   });
 
   it('missing because existing ads run under an inaccessible Page: names that Page', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false, existing_ads_page_id: '9001' })]));
-    expect(r.next_step).toBe(buildMetaAdsWrongPageMessage('9001'));
+    expectPageStep(r.next_step, buildMetaAdsWrongPageMessage('9001'));
     expect(r.summary).not.toContain('All set');
   });
 
   it('one account granted, one missing: only the missing one is flagged and the step is shown', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: true }), metaAccount({ has_meta_pages: false }, '222')]));
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expectPageStep(r.next_step, META_ADS_NO_PAGES_MESSAGE);
     expect(r.meta.accounts.map((a: any) => [a.account_id, a.page_access])).toEqual([['111', undefined], ['222', 'missing']]);
   });
 
   it('two accounts with the same Page problem: the message is shown once', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false }), metaAccount({ has_meta_pages: false }, '222')]));
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expectPageStep(r.next_step, META_ADS_NO_PAGES_MESSAGE);
   });
 
   it('Google Ads ready but Meta Page missing: still not "All set"', async () => {
     const r = await status(deps([metaAccount({ has_meta_pages: false }), googleAccount()], { googleEnabled: () => true }));
     expect(r.google_ads.ready).toBe(true);
     expect(r.summary).not.toContain('All set');
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expectPageStep(r.next_step, META_ADS_NO_PAGES_MESSAGE);
   });
 
   it('missing with mintLinks off (device-flow poll): step shown, no link minted', async () => {
     const d = deps([metaAccount({ has_meta_pages: false })]);
     const r = await getZomaReadiness('u1', d, { mintLinks: false });
-    expect(r.next_step).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expectPageStep(r.next_step, META_ADS_NO_PAGES_MESSAGE);
     expect(d.buildMetaConnectUrl).not.toHaveBeenCalled();
   });
 

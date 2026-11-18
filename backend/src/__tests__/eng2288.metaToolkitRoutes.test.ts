@@ -86,7 +86,7 @@ describe('ENG-2288 Meta Toolkit HTTP routes', () => {
       .set('User-Agent', 'claude-agent/1.0')
       .send({ args: { account_id: '123', toolName: 'evil' }, session_id: 's-1' })
       .expect(200);
-    expect(res.body).toEqual({ result: { rows: [1] } });
+    expect(res.body).toEqual({ result: { rows: [1] }, next_step: expect.stringMatching(/\S/) }); // ENG-3134
     expect(mockHandle).toHaveBeenCalledWith({
       authorization: 'Bearer aw_key',
       toolName: 'meta_get_insights',

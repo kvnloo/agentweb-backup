@@ -1,136 +1,64 @@
 import { Request, Response } from "express";
-import http from "http"; // Import Node.js http module
-import https from "https"; // Import Node.js https module
-import axios from "axios";
-import path from "path";
 import {
   uploadFileToS3WithPath,
+  sanitizeS3Filename,
   extractS3KeyFromUrl,
-  presignS3Url,
+  generatePresignedUrl,
   getS3ObjectStream,
   getS3ObjectMetadata,
 } from "../utils/s3Utils";
 import { ChatbotDB } from "../services/chatbotService";
-import { AuthenticatedRequest } from "../middleware/auth";
+import { AuthenticatedRequest, isRealAdmin } from "../middleware/auth";
+import {
+  canonicalStorageKey,
+  decideStorageAccess,
+  StorageAccess,
+  StorageAccessLookups,
+  StorageCaller,
+  StorageDecision,
+} from "../services/storageAccessPolicy";
 import { renderHtmlToPdf } from "../services/pdfRenderService";
 
 const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || "agentweb-user-files";
 
-export const viewExternalFile = async (req: Request, res: Response) => {
-  const { url } = req.query;
+/**
+ * ENG-2988: who is asking. A delegated session is its target user and has no admin power (isRealAdmin), and neither does an in-process tool
+ * call (a self-call token can carry isAdmin for a delegated session).
+ */
+function storageCallerOf(req: Request): StorageCaller | null {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.user?.userId;
+  return userId ? { userId, isRealAdmin: isRealAdmin(req) && !authReq.isSelfCall } : null;
+}
 
-  if (!url || typeof url !== "string") {
-    return res.status(400).json({
-      message: "URL query parameter is required and must be a string.",
-    });
+/**
+ * The one check every file route here runs, on the exact key it will sign, read or write. `canonical` is null when the reference is not a
+ * single well-formed key. Denials are logged by kind and reason (never the key) so a legitimate flow that was missed shows up in the logs.
+ */
+async function authorizeStorageKey(
+  route: string,
+  caller: StorageCaller,
+  canonical: string | null,
+  access: StorageAccess,
+  lookups: StorageAccessLookups,
+): Promise<StorageDecision> {
+  if (!canonical) return { allow: false, reason: 'invalid_key', shape: 'invalid' };
+  const decision = await decideStorageAccess(caller, canonical, access, lookups);
+  if (!decision.allow) {
+    console.warn(JSON.stringify({ event: 'storage_access_denied', route, access, shape: decision.shape, reason: decision.reason, userId: caller.userId }));
   }
+  return decision;
+}
 
-  try {
-    if (!url.startsWith("http://") && !url.startsWith("https://")) {
-      return res
-        .status(400)
-        .json({ message: "Invalid URL format. Must be HTTP or HTTPS." });
-    }
+const FILE_NOT_FOUND = { success: false, message: "File not found." };
+const FILE_LOOKUP_FAILED = { success: false, message: "Could not check access to this file right now. Please try again." };
+const FILE_READ_ONLY = { success: false, message: "You can view this file, but only its owner can change it." };
 
-    // If it's an S3 URL for our bucket, stream directly via SDK (no public access needed)
-    const s3Key = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
-    if (s3Key) {
-      try {
-        const metadata = await getS3ObjectMetadata(s3Key, DEFAULT_BUCKET);
-        const contentType = metadata.ContentType || "text/html; charset=utf-8";
-        res.setHeader("Content-Type", contentType);
-        if (metadata.ContentLength) {
-          res.setHeader("Content-Length", metadata.ContentLength);
-        }
-        const stream = getS3ObjectStream(s3Key, DEFAULT_BUCKET);
-        stream.on("error", (err) => {
-          console.error(`Error streaming S3 object ${s3Key}:`, err.message);
-          if (!res.headersSent) {
-            res.status(500).send("Error streaming file content.");
-          }
-        });
-        stream.pipe(res);
-        return;
-      } catch (s3Error: any) {
-        const isNotFound = s3Error.code === "NoSuchKey" || s3Error.statusCode === 404;
-        if (!res.headersSent) {
-          return res.status(isNotFound ? 404 : 500).json({
-            message: isNotFound ? "File not found" : "Failed to retrieve file.",
-          });
-        }
-        return;
-      }
-    }
-
-    // Not an S3 URL — proxy via HTTP (for backward compatibility with non-S3 external files)
-    const protocol = url.startsWith("https://") ? https : http;
-    const requestOptions = { timeout: 10000 };
-
-    const clientRequest = protocol.get(url, requestOptions, (proxyResponse) => {
-      if (proxyResponse.statusCode !== 200) {
-        console.error(
-          `Error fetching external file from URL: ${url}. Status: ${proxyResponse.statusCode}`
-        );
-        proxyResponse.resume();
-        if (proxyResponse.statusCode) {
-          res.status(proxyResponse.statusCode);
-        }
-        proxyResponse.pipe(res).on("error", (pipeError) => {
-          console.error("Error piping error response:", pipeError);
-          if (!res.headersSent) {
-            res
-              .status(proxyResponse.statusCode || 500)
-              .send("Failed to retrieve file from external URL.");
-          }
-        });
-        return;
-      }
-
-      const contentType =
-        proxyResponse.headers["content-type"] || "text/html; charset=utf-8";
-      res.setHeader("Content-Type", contentType);
-
-      proxyResponse.pipe(res).on("error", (pipeError) => {
-        console.error(`Error piping data from URL ${url}:`, pipeError);
-        if (!res.headersSent) {
-          res.status(500).send("Error streaming file content.");
-        }
-      });
-    });
-
-    clientRequest.on("timeout", () => {
-      clientRequest.destroy();
-      console.error(`Timeout fetching external file from URL: ${url}`);
-      if (!res.headersSent) {
-        res.status(504).json({
-          message:
-            "Error fetching file: Gateway timeout while connecting to external URL.",
-        });
-      }
-    });
-
-    clientRequest.on("error", (e: Error) => {
-      console.error(`Error making request to external URL ${url}:`, e.message);
-      if (!res.headersSent) {
-        res.status(502).json({
-          message: "Error connecting to external file URL (Bad Gateway).",
-        });
-      }
-    });
-  } catch (error: any) {
-    console.error(
-      `Unexpected error in viewExternalFile for URL: ${url}`,
-      error.message
-    );
-    if (!res.headersSent) {
-      res.status(500).json({
-        message:
-          "Internal server error while attempting to fetch external file.",
-        error: error.message,
-      });
-    }
-  }
-};
+/** The answer for a refused file request: "try again" when the check itself could not run, otherwise the same as a missing file. */
+function sendFileRefusal(res: Response, decision: StorageDecision) {
+  if (!decision.allow && decision.reason === "lookup_failed") return res.status(503).json(FILE_LOOKUP_FAILED);
+  return res.status(404).json(FILE_NOT_FOUND);
+}
 
 /**
  * Sanitize a caller-supplied download filename for use inside an HTTP
@@ -172,25 +100,35 @@ export const getPresignedFileUrl = async (req: Request, res: Response) => {
   }
 
   try {
-    let s3Key: string | null = null;
+    const caller = storageCallerOf(req);
+    if (!caller) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    let canonical: string | null = null;
 
     if (key && typeof key === "string") {
-      s3Key = key;
+      canonical = canonicalStorageKey(key, "key");
     } else if (url && typeof url === "string") {
-      s3Key = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
-      if (!s3Key) {
+      const fromUrl = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
+      if (!fromUrl) {
         return res.status(400).json({
           success: false,
           message: "URL does not reference a file in the configured S3 bucket.",
         });
       }
-    }
-
-    if (!s3Key) {
+      canonical = canonicalStorageKey(fromUrl, "url-path");
+    } else {
       return res.status(400).json({
         success: false,
         message: "Could not determine S3 key.",
       });
+    }
+
+    // ENG-2988: this used to sign any key for any signed-in user. The check runs on the exact string that is signed below.
+    const decision = await authorizeStorageKey("presign", caller, canonical, "read", new StorageAccessLookups());
+    if (!decision.allow || !canonical) {
+      return sendFileRefusal(res, decision);
     }
 
     const wantsDownload = download === "true" || download === "1";
@@ -198,8 +136,8 @@ export const getPresignedFileUrl = async (req: Request, res: Response) => {
       ? `attachment; filename="${sanitizeDownloadFilename(filename)}"`
       : undefined;
 
-    const presignedUrl = presignS3Url(
-      `https://${DEFAULT_BUCKET}.s3.amazonaws.com/${s3Key}`,
+    const presignedUrl = generatePresignedUrl(
+      canonical,
       DEFAULT_BUCKET,
       undefined,
       responseContentDisposition
@@ -250,13 +188,22 @@ export const batchPresignUrls = async (req: Request, res: Response) => {
   }
 
   try {
+    const caller = storageCallerOf(req);
+    if (!caller) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    // ENG-2988: same check as the single presign, per entry; an entry the caller may not read is left out, like a URL outside the bucket.
+    const lookups = new StorageAccessLookups();
     const result: Record<string, string> = {};
     for (const originalUrl of urls) {
       if (typeof originalUrl !== "string") continue;
-      const presigned = presignS3Url(originalUrl, DEFAULT_BUCKET);
-      if (presigned) {
-        result[originalUrl] = presigned;
-      }
+      const fromUrl = extractS3KeyFromUrl(originalUrl, DEFAULT_BUCKET);
+      if (!fromUrl) continue;
+      const canonical = canonicalStorageKey(fromUrl, "url-path");
+      const decision = await authorizeStorageKey("presign-batch", caller, canonical, "read", lookups);
+      if (!decision.allow || !canonical) continue;
+      result[originalUrl] = generatePresignedUrl(canonical, DEFAULT_BUCKET);
     }
 
     return res.json({
@@ -291,9 +238,19 @@ export const getFileContent = async (req: Request, res: Response) => {
     }
 
     // Try to extract S3 key — if it's our bucket, read directly via SDK (no public access needed)
-    const s3Key = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
+    const fromUrl = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
 
-    if (s3Key) {
+    if (fromUrl) {
+      const caller = storageCallerOf(req);
+      if (!caller) {
+        return res.status(401).json({ success: false, message: "Unauthorized" });
+      }
+      // ENG-2988: this used to return any object of the bucket to any signed-in user.
+      const s3Key = canonicalStorageKey(fromUrl, "url-path");
+      const decision = await authorizeStorageKey("content", caller, s3Key, "read", new StorageAccessLookups());
+      if (!decision.allow || !s3Key) {
+        return sendFileRefusal(res, decision);
+      }
       // Use S3 SDK directly — works even when public access is blocked
       const stream = getS3ObjectStream(s3Key, DEFAULT_BUCKET);
       const chunks: Buffer[] = [];
@@ -324,10 +281,8 @@ export const getFileContent = async (req: Request, res: Response) => {
       message: "Access denied: URL must reference a file in the configured S3 bucket.",
     });
   } catch (error: any) {
-    console.error(
-      `Error fetching file content from URL: ${url}`,
-      error.message
-    );
+    // (the address is not logged: it carries the file's key, and may carry a signature)
+    console.error("Error fetching file content:", error.message);
 
     const isNotFound = error.code === "NoSuchKey" || error.statusCode === 404;
     return res.status(isNotFound ? 404 : 500).json({
@@ -362,20 +317,43 @@ export const saveHtmlContent = async (req: Request, res: Response) => {
     });
   }
 
-  const key = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
-  if (!key) {
+  const fromUrl = extractS3KeyFromUrl(url, DEFAULT_BUCKET);
+  if (!fromUrl) {
     return res.status(400).json({
       success: false,
       message: "URL must reference a file in the configured S3 bucket.",
     });
   }
 
-  const lastSlashIndex = key.lastIndexOf("/");
-  const filename =
-    lastSlashIndex === -1 ? key : key.substring(lastSlashIndex + 1);
-  const path = lastSlashIndex === -1 ? "" : key.substring(0, lastSlashIndex);
-
   try {
+    const caller = storageCallerOf(req);
+    if (!caller) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const requestedKey = canonicalStorageKey(fromUrl, "url-path");
+    if (!requestedKey) {
+      return res.status(404).json(FILE_NOT_FOUND);
+    }
+
+    const lastSlashIndex = requestedKey.lastIndexOf("/");
+    const filename =
+      lastSlashIndex === -1 ? requestedKey : requestedKey.substring(lastSlashIndex + 1);
+    const path = lastSlashIndex === -1 ? "" : requestedKey.substring(0, lastSlashIndex);
+
+    // ENG-2988: this used to overwrite any object of the bucket for any signed-in user. Only the owner (or a real admin) may write.
+    // The upload rewrites the file name (non-ASCII and other characters become `_`), so the key that is authorised is the one it will
+    // actually write: the directory as given plus the sanitised name.
+    const writeKey = canonicalStorageKey(path ? `${path}/${sanitizeS3Filename(filename)}` : sanitizeS3Filename(filename), "decoded");
+    const lookups = new StorageAccessLookups();
+    const decision = await authorizeStorageKey("html", caller, writeKey, "write", lookups);
+    if (!decision.allow || !writeKey) {
+      // A teammate who may open the file but not change it is told so; anyone else gets the same answer as for a file that does not exist.
+      if (!decision.allow && decision.reason !== "lookup_failed" && writeKey && (await decideStorageAccess(caller, writeKey, "read", lookups)).allow) {
+        return res.status(403).json(FILE_READ_ONLY);
+      }
+      return sendFileRefusal(res, decision);
+    }
+
     const uploadResult = await uploadFileToS3WithPath(
       content,
       filename,
