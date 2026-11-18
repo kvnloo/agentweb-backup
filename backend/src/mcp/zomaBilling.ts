@@ -657,8 +657,8 @@ export async function handleZomaBillingWebhookEvent(
   const obj = event.data.object;
   // A credit note carries no plan metadata, so it is matched to a Zoma invoice inside the handler
   // (ENG-3132, dark behind ZOMA_REFERRAL_ENABLED). It still falls through to the Emma path, which ignores it.
-  if (event.type === 'credit_note.created') {
-    await referral.onCreditNoteCreated(obj);
+  if (event.type === 'credit_note.created' || event.type === 'credit_note.voided') {
+    await (event.type === 'credit_note.created' ? referral.onCreditNoteCreated(obj) : referral.onCreditNoteVoided(obj));
     return false;
   }
   if (!isZomaPlanObject(obj)) return false;

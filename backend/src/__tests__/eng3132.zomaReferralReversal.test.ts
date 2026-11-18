@@ -1,5 +1,5 @@
 /** ENG-3132 slice B4. Refund invariants: only commissionable money reverses, never beyond the accrual, idempotent. */
-import { reverseReferralCommission, type CreditNoteLike, type ReversalDeps, type ReversalInvoice } from '../services/zomaReferralReversal';
+import { reverseReferralCommission, voidReferralReversal, type CreditNoteLike, type ReversalDeps, type ReversalInvoice } from '../services/zomaReferralReversal';
 import { buildAccrualEntry, type ZomaLedgerEntry, type ZomaReferralLedgerStore } from '../services/zomaReferralLedger';
 
 class MemoryLedger implements ZomaReferralLedgerStore {
@@ -108,5 +108,59 @@ describe('reverseReferralCommission', () => {
     };
     await expect(reverseReferralCommission(note(), deps)).rejects.toThrow('dynamo down');
     await expect(reverseReferralCommission(note(), { ...deps, getInvoice: async () => { throw new Error('stripe down'); } })).rejects.toThrow('stripe down');
+  });
+});
+
+describe('cumulative rounding', () => {
+  const partial = (id: string, cents: number) => note({ id, total_excluding_tax: cents, lines: { data: [{ invoice_line_item: 'il_plan', amount: cents, discount_amount: 0 }] } });
+
+  it('two 3c credits on a 6c accrual (1c commission) return exactly 1c, never 2c', async () => {
+    const { ledger, deps } = setup(6);
+    await reverseReferralCommission(partial('cn_1', 3), deps);
+    await reverseReferralCommission(partial('cn_2', 3), deps);
+    expect(net(ledger)).toBe(0);
+  });
+
+  it('three 1c credits cannot leave the referrer ahead: the final credit returns the remainder', async () => {
+    const { ledger, deps } = setup(3);
+    for (const id of ['cn_1', 'cn_2', 'cn_3']) await reverseReferralCommission(partial(id, 1), deps);
+    expect(net(ledger)).toBe(0);
+  });
+});
+
+describe('payout month of a reversal', () => {
+  it('is the month the credit note was issued, so a clawback after payout hits the open month', async () => {
+    const { ledger, deps } = setup();
+    await reverseReferralCommission(note({ created: Date.parse('2027-01-05T10:00:00Z') / 1000 }), deps);
+    expect(ledger.rows.find((r) => r.kind === 'reversal')).toMatchObject({ payoutMonth: '2027-01', paidAt: '2026-12-10T00:00:00.000Z' });
+  });
+});
+
+describe('voidReferralReversal', () => {
+  const voided = (over: Partial<CreditNoteLike> = {}) => note({ status: 'void', ...over });
+
+  it('puts back exactly what the credit note took, once', async () => {
+    const { ledger, deps } = setup();
+    await reverseReferralCommission(note(), deps);
+    expect(net(ledger)).toBe(0);
+    expect(await voidReferralReversal(voided(), deps)).toMatchObject({ status: 'voided' });
+    expect(net(ledger)).toBe(1000);
+    expect(await voidReferralReversal(voided(), deps)).toEqual({ status: 'duplicate' });
+    expect(net(ledger)).toBe(1000);
+  });
+
+  it('a void frees the cap, so a later credit note can reverse again', async () => {
+    const { ledger, deps } = setup();
+    await reverseReferralCommission(note(), deps);
+    await voidReferralReversal(voided(), deps);
+    await reverseReferralCommission(note({ id: 'cn_2' }), deps);
+    expect(net(ledger)).toBe(0);
+  });
+
+  it('is a no-op for a note that never reversed anything, and ignores a note that is not void', async () => {
+    const { ledger, deps } = setup();
+    expect(await voidReferralReversal(voided(), deps)).toEqual({ status: 'no_reversal' });
+    expect(await voidReferralReversal(note(), deps)).toEqual({ status: 'ignored', reason: 'not_void' });
+    expect(net(ledger)).toBe(1000);
   });
 });

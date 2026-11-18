@@ -20,13 +20,13 @@ export type LedgerKind = 'accrual' | 'reversal';
 
 export interface ZomaLedgerEntry {
   referredUserId: string;
-  /** `<invoiceId>#accrual` or `<invoiceId>#reversal#<creditNoteId>`. */
+  /** `<invoiceId>#accrual`, `<invoiceId>#reversal#<creditNoteId>` or `<invoiceId>#void#<creditNoteId>`. */
   entry: string;
   kind: LedgerKind;
   invoiceId: string;
   referrerId: string;
   code: string;
-  /** UTC `YYYY-MM` of the invoice's paid time; a reversal stays in the month of the invoice it reverses. */
+  /** UTC `YYYY-MM`: the invoice's paid month for an accrual, the credit note's (or void's) month for a reversal. */
   payoutMonth: string;
   paidAt: string;
   baseCents: number;
@@ -40,6 +40,7 @@ export interface ZomaLedgerEntry {
 
 export const accrualKey = (invoiceId: string) => `${invoiceId}#accrual`;
 export const reversalKey = (invoiceId: string, creditNoteId: string) => `${invoiceId}#reversal#${creditNoteId}`;
+export const voidKey = (invoiceId: string, creditNoteId: string) => `${invoiceId}#void#${creditNoteId}`;
 
 export interface ZomaReferralLedgerStore {
   /** True when written, false when this entry already exists. Throws on any other failure. */
@@ -76,8 +77,14 @@ export function buildAccrualEntry(a: Attribution & { baseCents: number }): ZomaL
   };
 }
 
-/** `creditedBaseCents` is the ex-tax amount handed back (positive); the row stores it negated. */
-export function buildReversalEntry(a: Attribution & { creditNoteId: string; creditedBaseCents: number }): ZomaLedgerEntry {
+/**
+ * A refund row. `creditedBaseCents` is the ex-tax amount handed back (positive) and `commissionCentsToReverse`
+ * the commission it takes back (positive); both are stored negated. The row sits in the month the credit note
+ * was issued, so a clawback after a payout nets against the open month instead of a closed one.
+ */
+export function buildReversalEntry(
+  a: Attribution & { creditNoteId: string; creditedBaseCents: number; commissionCentsToReverse: number; creditedAt: string },
+): ZomaLedgerEntry {
   return {
     referredUserId: a.referredUserId,
     entry: reversalKey(a.invoiceId, a.creditNoteId),
@@ -85,14 +92,27 @@ export function buildReversalEntry(a: Attribution & { creditNoteId: string; cred
     invoiceId: a.invoiceId,
     referrerId: a.referrerId,
     code: a.code,
-    payoutMonth: payoutMonth(a.paidAt),
+    payoutMonth: payoutMonth(a.creditedAt),
     paidAt: a.paidAt,
     baseCents: -a.creditedBaseCents,
     percentBps: a.percentBps,
-    commissionCents: -commissionCents(a.creditedBaseCents, a.percentBps),
+    commissionCents: -a.commissionCentsToReverse,
     currency: 'usd',
     createdAt: a.now.toISOString(),
     creditNoteId: a.creditNoteId,
+  };
+}
+
+/** A voided credit note: a positive row that cancels the reversal it made, in the month of the void. */
+export function buildVoidEntry(reversal: ZomaLedgerEntry, voidedAt: string, now: Date): ZomaLedgerEntry {
+  const creditNoteId = reversal.creditNoteId as string;
+  return {
+    ...reversal,
+    entry: voidKey(reversal.invoiceId, creditNoteId),
+    payoutMonth: payoutMonth(voidedAt),
+    baseCents: -reversal.baseCents,
+    commissionCents: -reversal.commissionCents,
+    createdAt: now.toISOString(),
   };
 }
 

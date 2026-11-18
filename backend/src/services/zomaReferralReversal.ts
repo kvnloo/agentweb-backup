@@ -3,18 +3,23 @@
  *
  * The rate and attribution come from the invoice's accrual row, never from current config. Only the
  * commissionable part of a credit note reverses: the $1 trial-fee line never earned, so crediting it
- * reverses nothing. Total reversals for an invoice never exceed what it accrued on.
+ * reverses nothing. Reversals are cumulative (commission of the total credited base minus what was already
+ * reversed), so rounding never drifts and a full refund returns exactly the accrued commission. The clamp
+ * to the accrued base is safe because Stripe itself caps total credit at the invoice amount.
  *
  * Outages throw (the webhook must 5xx so Stripe retries). A shape we cannot read safely returns
  * `unsafe` with a reason for the caller to alert on; it never guesses.
  *
- * Not covered: a refund issued without a credit note (charge refund) and `credit_note.voided`.
+ * Not covered: a refund issued without a credit note (a charge refund); the reconcile script flags those.
  */
-import { buildReversalEntry, reversalKey, accrualKey, type ZomaLedgerEntry, type ZomaReferralLedgerStore } from './zomaReferralLedger';
+import { commissionCents } from './zomaReferralCommission';
+import { accrualKey, buildReversalEntry, buildVoidEntry, reversalKey, voidKey, type ZomaLedgerEntry, type ZomaReferralLedgerStore } from './zomaReferralLedger';
 
 export interface CreditNoteLike {
   id: string;
   status?: string | null;
+  /** Unix seconds; the reversal is stamped in this month. */
+  created?: number;
   invoice: string | { id: string };
   total_excluding_tax?: number | null;
   lines?: { data?: Array<{ invoice_line_item?: string | null; amount: number; discount_amount: number }>; has_more?: boolean } | null;
@@ -41,7 +46,7 @@ export type ReversalResult =
   | { status: 'duplicate' }
   | { status: 'no_accrual' }
   | { status: 'nothing_to_reverse'; reason: 'fee_only' | 'fully_reversed' }
-  | { status: 'ignored'; reason: 'not_issued' }
+  | { status: 'ignored'; reason: 'not_issued' | 'not_void' }
   | { status: 'unsafe'; reason: 'no_fee_price_configured' | 'no_user' | 'missing_totals' | 'lines_truncated' | 'unmapped_line' };
 
 export async function reverseReferralCommission(creditNote: CreditNoteLike, deps: ReversalDeps): Promise<ReversalResult> {
@@ -73,11 +78,16 @@ export async function reverseReferralCommission(creditNote: CreditNoteLike, deps
   const credited = creditNote.total_excluding_tax - feeNet;
   if (credited <= 0) return { status: 'nothing_to_reverse', reason: 'fee_only' };
 
-  const alreadyReversed = rows.filter((r) => r.invoiceId === invoiceId && r.kind === 'reversal').reduce((s, r) => s - r.baseCents, 0);
-  const remaining = accrual.baseCents - alreadyReversed;
+  const reversalRows = rows.filter((r) => r.invoiceId === invoiceId && r.kind === 'reversal');
+  const reversedBase = reversalRows.reduce((sum, r) => sum - r.baseCents, 0);
+  const reversedCommission = reversalRows.reduce((sum, r) => sum - r.commissionCents, 0);
+  const remaining = accrual.baseCents - reversedBase;
   if (remaining <= 0) return { status: 'nothing_to_reverse', reason: 'fully_reversed' };
 
   const creditedBaseCents = Math.min(credited, remaining);
+  const totalBase = reversedBase + creditedBaseCents;
+  const targetCommission = totalBase >= accrual.baseCents ? accrual.commissionCents : commissionCents(totalBase, accrual.percentBps);
+  const now = (deps.now ?? (() => new Date()))();
   const entry = buildReversalEntry({
     referredUserId: accrual.referredUserId,
     referrerId: accrual.referrerId,
@@ -85,9 +95,38 @@ export async function reverseReferralCommission(creditNote: CreditNoteLike, deps
     percentBps: accrual.percentBps,
     invoiceId,
     paidAt: accrual.paidAt,
-    now: (deps.now ?? (() => new Date()))(),
+    now,
     creditNoteId: creditNote.id,
     creditedBaseCents,
+    commissionCentsToReverse: Math.max(0, targetCommission - reversedCommission),
+    creditedAt: (creditNote.created ? new Date(creditNote.created * 1000) : now).toISOString(),
   });
   return (await deps.ledger.append(entry)) ? { status: 'reversed', entry, clamped: creditedBaseCents < credited } : { status: 'duplicate' };
+}
+
+export type VoidResult =
+  | { status: 'voided'; entry: ZomaLedgerEntry }
+  | { status: 'duplicate' }
+  | { status: 'no_reversal' }
+  | { status: 'ignored'; reason: 'not_void' }
+  | { status: 'unsafe'; reason: 'no_user' };
+
+/**
+ * `credit_note.voided`: cancel the reversal that credit note made, so the referrer keeps the commission on
+ * money Stripe did not actually hand back. A note that never reversed anything (fee-only, no accrual) is a no-op.
+ */
+export async function voidReferralReversal(creditNote: CreditNoteLike, deps: Pick<ReversalDeps, 'ledger' | 'getInvoice' | 'now'>): Promise<VoidResult> {
+  if (creditNote.status !== 'void') return { status: 'ignored', reason: 'not_void' };
+  const invoiceId = typeof creditNote.invoice === 'string' ? creditNote.invoice : creditNote.invoice.id;
+  const { userId } = await deps.getInvoice(invoiceId);
+  if (!userId) return { status: 'unsafe', reason: 'no_user' };
+
+  const rows = await deps.ledger.listForReferredUser(userId);
+  const reversal = rows.find((r) => r.entry === reversalKey(invoiceId, creditNote.id));
+  if (!reversal) return { status: 'no_reversal' };
+  if (rows.some((r) => r.entry === voidKey(invoiceId, creditNote.id))) return { status: 'duplicate' };
+
+  const now = (deps.now ?? (() => new Date()))();
+  const entry = buildVoidEntry(reversal, now.toISOString(), now);
+  return (await deps.ledger.append(entry)) ? { status: 'voided', entry } : { status: 'duplicate' };
 }

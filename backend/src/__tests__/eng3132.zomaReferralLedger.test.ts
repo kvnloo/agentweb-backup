@@ -4,6 +4,7 @@ import {
   accrualKey,
   buildAccrualEntry,
   buildReversalEntry,
+  buildVoidEntry,
   reversalKey,
 } from '../services/zomaReferralLedger';
 
@@ -13,13 +14,15 @@ describe('ledger entries', () => {
   it('an accrual is 20% of the base, keyed by invoice, in the UTC month the invoice was paid', () => {
     expect(buildAccrualEntry({ ...base, baseCents: 5000 })).toMatchObject({ entry: 'in_1#accrual', kind: 'accrual', commissionCents: 1000, baseCents: 5000, payoutMonth: '2026-12', currency: 'usd' });
   });
-  it('a reversal is negative, keyed by credit note, and stays in the invoice month', () => {
-    expect(buildReversalEntry({ ...base, creditNoteId: 'cn_1', creditedBaseCents: 2500 })).toMatchObject({ entry: 'in_1#reversal#cn_1', kind: 'reversal', commissionCents: -500, baseCents: -2500, payoutMonth: '2026-12', creditNoteId: 'cn_1' });
+  const refund = { creditNoteId: 'cn_1', creditedBaseCents: 2500, commissionCentsToReverse: 500, creditedAt: '2027-01-05T10:00:00.000Z' };
+  it('a reversal is negative, keyed by credit note, and sits in the month the credit note was issued', () => {
+    expect(buildReversalEntry({ ...base, ...refund })).toMatchObject({ entry: 'in_1#reversal#cn_1', kind: 'reversal', commissionCents: -500, baseCents: -2500, payoutMonth: '2027-01', paidAt: base.paidAt, creditNoteId: 'cn_1' });
   });
-  it('a full refund nets the accrual to exactly zero', () => {
-    const a = buildAccrualEntry({ ...base, baseCents: 5005 });
-    const r = buildReversalEntry({ ...base, creditNoteId: 'cn_1', creditedBaseCents: 5005 });
-    expect(a.commissionCents + r.commissionCents).toBe(0);
+  it('a void cancels exactly the reversal it undoes, in the month of the void', () => {
+    const reversal = buildReversalEntry({ ...base, ...refund });
+    const voided = buildVoidEntry(reversal, '2027-02-02T00:00:00.000Z', base.now);
+    expect(voided).toMatchObject({ entry: 'in_1#void#cn_1', commissionCents: 500, baseCents: 2500, payoutMonth: '2027-02' });
+    expect(reversal.commissionCents + voided.commissionCents).toBe(0);
   });
   it('keys are distinct for accrual and each credit note', () => {
     expect(new Set([accrualKey('in_1'), reversalKey('in_1', 'cn_1'), reversalKey('in_1', 'cn_2')]).size).toBe(3);
