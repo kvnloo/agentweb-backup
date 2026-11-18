@@ -347,6 +347,28 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
   try {
     const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
+    // The SDK reads below use the SERVER's credentials, which can read every bucket in the account. So each key a caller
+    // names is checked against the caller with the same rule as the REST file routes (ENG-2988). One lookup cache per call.
+    // Loaded here, not with the static imports: the access policy reaches the database layer and chatbotService, which this
+    // module must not load when it is merely required (see the header note and searchResearch.moduleIsolation.test.ts).
+    const { TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE, createToolFileAccess } = await import('./toolStorageAccess');
+    const fileAccess = createToolFileAccess('perform_data_analysis', userId);
+    // `invalid_args`, not `not_found`: the model named a file the caller may not read, a bad argument. `not_found` is bucketed as a
+    // config/account fault ("resolve the account, not the code"), the phantom cluster ENG-2993 removed for dead caller URLs.
+    const refuseFile = () => ({
+      success: false,
+      message: TOOL_FILE_REFUSAL_MESSAGE,
+      error: 'File not accessible',
+      errorClass: 'invalid_args',
+    });
+    // The check itself could not run (a lookup failed): tell the model to retry, not that the file is gone.
+    const fileCheckUnavailable = () => ({
+      success: false,
+      message: TOOL_FILE_UNAVAILABLE_MESSAGE,
+      error: 'File access check unavailable',
+      errorClass: 'upstream_5xx',
+    });
+
     if (!analysisInstruction) {
       return {
         success: false,
@@ -378,6 +400,12 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       let resolved = analysisInstruction;
       const resolvedKeys: string[] = [];
       const failedKeys: string[] = [];
+      // Check EVERY key before reading any: a call that names a file the caller may not read is refused whole, with the same
+      // answers as the other two read sites (a refusal is `invalid_args`; a check that could not run says "try again").
+      const keyDecisions: string[] = [];
+      for (const key of uniqueKeys) keyDecisions.push(await fileAccess.check(key));
+      if (keyDecisions.includes('refuse')) return refuseFile();
+      if (keyDecisions.includes('unavailable')) return fileCheckUnavailable();
       for (const key of uniqueKeys) {
         try {
           const content = await getS3ObjectAsString(key);
@@ -481,6 +509,10 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
               message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
             };
           }
+          // Only our own bucket, and only a key this caller may read: the bucket here is whatever the caller wrote.
+          if (!fileAccess.isOurBucket(s3Bucket)) return refuseFile();
+          const s3Decision = await fileAccess.check(s3Key);
+          if (s3Decision !== 'allow') return s3Decision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
           let s3Content: string;
           try {
             s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
@@ -515,6 +547,8 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
         const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
         if (bareS3KeyPattern.test(fileUrl)) {
+          const bareDecision = await fileAccess.check(fileUrl);
+          if (bareDecision !== 'allow') return bareDecision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
           let s3Content: string;
           try {
             s3Content = await getS3ObjectAsString(fileUrl);
