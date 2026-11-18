@@ -141,6 +141,12 @@ import axios from 'axios';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getSecret } from '../../utils/secretsManager';
 import { getS3ObjectAsString } from '../../utils/s3Utils';
+import {
+  CALLER_URL_BLOCKED_MESSAGE,
+  CallerUrlBlockedError,
+  CallerUrlTooLargeError,
+  fetchCallerUrlBuffer,
+} from '../../utils/callerUrlFetch';
 import { meterUsageFromResponse } from '../../utils/llmClients';
 import {
   parseCsvProvenance,
@@ -584,15 +590,17 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           continue;
         }
 
-        // Download the file
-        const response = await axios.get(fileUrl, {
-          responseType: 'arraybuffer',
-          timeout: 30000
+        // Download the file. A URL the caller chose is fetched only through the guarded fetch (public addresses only, every redirect
+        // checked again), and the body is capped at what is left of the total budget, so one URL cannot stream an unbounded body into memory.
+        const { buffer: fileBuffer } = await fetchCallerUrlBuffer(fileUrl, {
+          tool: 'perform_data_analysis',
+          userId,
+          maxBytes: Math.max(maxTotalSize - totalSize, 0),
+          timeoutMs: 30000,
         });
 
         // Check file size
-        const fileData = response.data as ArrayBuffer;
-        totalSize += fileData.byteLength;
+        totalSize += fileBuffer.byteLength;
         if (totalSize > maxTotalSize) {
           return {
             success: false,
@@ -603,7 +611,6 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // Send to Gemini as text/csv so the file materializes on the sandbox
         // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
         // be CSV, JSON, or plain text — the model is told this in the prompt.
-        const fileBuffer = Buffer.from(fileData);
         const base64Content = fileBuffer.toString('base64');
 
         fileParts.push({
@@ -616,6 +623,22 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         fileRawContents.push(fileBuffer.toString('utf-8'));
 
       } catch (error) {
+        // A URL the guard refuses: one generic answer, nothing about why (no address, no DNS text) and no `error` echo, so the
+        // answer cannot be used to map the internal network. A bad argument, not a tool fault.
+        if (error instanceof CallerUrlBlockedError) {
+          return {
+            success: false,
+            message: `Cannot fetch file_urls entry ${fileUrl}: ${CALLER_URL_BLOCKED_MESSAGE} Put the data inline in analysis_instruction, or pass an s3:// key from save_file or a tool-responses key.`,
+            errorClass: 'invalid_args',
+          };
+        }
+        if (error instanceof CallerUrlTooLargeError) {
+          return {
+            success: false,
+            message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+            errorClass: 'invalid_args',
+          };
+        }
         console.error(`Error processing file ${fileUrl}:`, error);
         // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
         // the model passed a dead, expired, or non-public link. There is no
