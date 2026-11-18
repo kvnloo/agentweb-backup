@@ -15877,6 +15877,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-3033: create the ad creative that points at an existing Instagram post, on the caller's
+   * own ad account. metaToolkitBoost proves the Instagram account, Page and post belong to the
+   * account before calling. A creative cannot spend. `outcomeUnknown` marks a failure without a
+   * definite Meta answer.
+   */
+  public async toolkitMetaBoostCreative(
+    userId: string, account_id: string, spec: { name: string; page_id: string; ig_account_id: string; ig_media_id: string },
+  ): Promise<{ id?: string }> {
+    for (const k of ['page_id', 'ig_account_id', 'ig_media_id'] as const) {
+      if (!/^\d+$/.test(String(spec?.[k] ?? ''))) throw new Error(`Invalid ${k}.`);
+    }
+    const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const { data } = await axios.post(
+        `https://graph.facebook.com/${apiVersion}/act_${String(accountId).replace(/^act_/, '')}/adcreatives`,
+        new URLSearchParams({
+          name: String(spec.name).slice(0, 200),
+          object_id: spec.page_id,
+          instagram_user_id: spec.ig_account_id,
+          source_instagram_media_id: spec.ig_media_id,
+        }).toString(),
+        { params: { access_token: accessToken }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30_000, maxContentLength: 5_000_000 },
+      );
+      return { id: data?.id ? String(data.id) : undefined };
+    } catch (error: any) {
+      // The axios error carries the access token in its config/URL; re-throw Meta's fields only.
+      const meta = error?.response?.data?.error;
+      const status = Number(error?.response?.status);
+      const wrapped: any = new Error(String(meta?.error_user_msg || meta?.message || 'Meta request failed.'));
+      wrapped.metaError = meta ? { code: meta.code, error_subcode: meta.error_subcode, message: meta.message } : null;
+      wrapped.outcomeUnknown = !error?.response || status >= 500 || status === 408;
+      throw wrapped;
+    }
+  }
+
   /** ENG-2913: a creative swapped into an ad must belong to the selected ad account (creative ids are global). */
   public async assertToolkitMetaCreativeOwned(userId: string, account_id: string, creativeId: string): Promise<void> {
     const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -18876,7 +18913,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * this wrapper's class-bound sibling references.
    */
   async linkedinManagePost(userId: string, args: {
-    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics' | 'delete_post';
     account_id: string;
     post_urn?: string;
     commentary?: string;
@@ -18891,7 +18928,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       listLinkedInComments: this.listLinkedInComments.bind(this),
       reactToLinkedInPost: this.reactToLinkedInPost.bind(this),
       getPostAnalytics: this.getPostAnalytics.bind(this),
+      linkedinDeletePost: this.linkedinDeletePost.bind(this),
     });
+  }
+
+  // ENG-3014: delegating wrapper, injected above so it stays spy-observable like its siblings.
+  async linkedinDeletePost(userId: string, accountId: string, postUrn: string, toolContext?: any): Promise<any> {
+    return linkedinImpl.linkedinDeletePost(userId, accountId, postUrn, toolContext);
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/linkedin.ts. Kept as a
