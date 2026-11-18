@@ -435,12 +435,13 @@ function dailyBarsHtml(daily: DailyPoint[], color: string, currency?: string): s
 
 function campaignBarsHtml(top: TopCampaign[], color: string, currency?: string): string {
   const max = Math.max(...top.map((c) => c.spend), 0);
+  // Each campaign is two rows: its name and figures (either may wrap on a phone), then a bar across the full width.
   const rows = top
     .map((c) => {
       const w = max > 0 ? Math.max(2, Math.round((c.spend / max) * 100)) : 0;
       const cost = campaignCost(c);
       const each = cost === undefined ? '' : ` &middot; ${escapeHtml(money(cost, currency))} each`;
-      return `<tr><td width="130" style="padding:5px 8px 5px 0;font-size:13px;color:#202124;width:130px">${escapeHtml(cleanName(c.name))}</td><td width="100%" style="padding:5px 8px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="12" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td><td></td></tr></table></td><td align="right" style="padding:5px 0;font-size:12px;color:#202124">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.${each}</td></tr>`;
+      return `<tr><td valign="bottom" style="padding:8px 10px 2px 0;font-size:13px;color:#202124">${escapeHtml(cleanName(c.name))}</td><td valign="bottom" align="right" style="padding:8px 0 2px;font-size:12px;color:#202124">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.${each}</td></tr><tr><td colspan="2" style="padding:0 0 4px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="10" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td><td></td></tr></table></td></tr>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:14px 0 2px">Top campaigns by spend</div><table width="100%" cellpadding="0" cellspacing="0">${rows}</table>`;
