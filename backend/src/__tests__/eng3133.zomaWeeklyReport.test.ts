@@ -535,6 +535,15 @@ describe('the email', () => {
     expect(e.html).toContain('support@agentweb.pro');
   });
 
+  it('the headline numbers sit in rows of four columns, a short last row padded so the boxes line up', () => {
+    const html = email({ platforms: [META_WEEK], usage: quiet }).html; // 7 chips: a row of four and a row of three
+    const tables = html.match(/<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0">.*?<\/table>/g)!;
+    expect(tables).toHaveLength(2);
+    for (const t of tables) expect(t.match(/width="25%"/g)).toHaveLength(4);
+    const noRoas = email({ platforms: [GOOGLE_WEEK], usage: quiet }).html; // 6 chips: four and two
+    expect(noRoas.match(/<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0">.*?<\/table>/g)!.every((t) => (t.match(/width="25%"/g) ?? []).length === 4)).toBe(true);
+  });
+
   it('a day with no spend is drawn as a flat line, not a bar, and the tallest day gets the full height', () => {
     const html = email({ platforms: [META_WEEK] }).html;
     expect(html.match(/height="110" bgcolor="#1877f2"/g)).toHaveLength(1); // Wed, the 30.00 day
