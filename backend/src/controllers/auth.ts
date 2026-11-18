@@ -375,7 +375,9 @@ export const login = async (req: Request, res: Response) => {
     }
     email = email.toLowerCase();
 
-    const user = await userDb.getUserByEmail(email);
+    // ENG-3111: email is the table's primary key, so read the row directly
+    // instead of through the email index.
+    const user = await userDb.getUserByEmailConsistent(email);
     if (!user) {
       return res.status(404).json({
         message: "User not found. Please create an account to continue.",
@@ -411,7 +413,8 @@ export const login = async (req: Request, res: Response) => {
     // Update last login time + last-touch attribution (if client sent any)
     try {
       const touch = normalizeAttribution(attribution);
-      await userDb.updateUser(user.userId, {
+      // ENG-3111: one write keyed by the email already in hand (no lookup by id).
+      await userDb.recordLogin(user.email, user.userId, {
         lastLoginTime: new Date().toISOString(),
         ...(touch && { lastTouch: touch }),
       });

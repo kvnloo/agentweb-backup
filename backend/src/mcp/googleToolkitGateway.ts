@@ -1,6 +1,6 @@
 /**
  * ENG-2823 — Google Ads branch of the Zoma toolkit gateway (provider #2). Reached from
- * handleMetaToolkitCall after authentication, only while ZOMA_GOOGLE_ADS_ENABLED=true.
+ * handleMetaToolkitCall after authentication, only while ZOMA_GOOGLE_ENABLED=true.
  *
  *   1. resolve the caller's Google Ads customer (own or org-shared connection, the same
  *      visibility googleAdsService.getAccountCredentials uses) and refuse a foreign or

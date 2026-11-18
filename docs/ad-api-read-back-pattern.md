@@ -22,5 +22,6 @@ Tool boundary: the tool handler maps the read-back error to `success: false` wit
 
 Coverage guard: `backend/src/__tests__/eng2398.mutationReadBack.test.ts` enumerates every
 public mutation-shaped method on `GoogleAdsService` and fails when a new one is neither
-verified nor exempt. LinkedIn/Meta slices should add the same enumeration test for their
-service classes. Tests use stubbed `mutate`/`search` fixtures only; no live network in CI.
+verified nor exempt. LinkedIn has the same guard in
+`backend/src/__tests__/eng3064.linkedInAdsReadBack.test.ts` (ENG-3064; that service returns
+`success: false` with `errorType` instead of throwing). The Meta slice should add its own. Tests use stubbed `mutate`/`search` fixtures only; no live network in CI.

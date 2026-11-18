@@ -45,11 +45,11 @@ import { logZomaSetup } from './zomaSetupLog';
 import {
   defaultAdsExperienceStore,
   parseZomaAdsExperience,
-  ZOMA_ADS_EXPERIENCE_OPTIONS,
+  zomaAdsExperienceOptions,
   ZOMA_ADS_EXPERIENCE_QUESTION,
   ZOMA_ADS_EXPERIENCE_VALUES,
   ZOMA_META_LOGIN_NOTE,
-  ZOMA_NEW_TO_ADS_STEPS,
+  zomaNewToAdsSteps,
   ZOMA_NOT_INTERESTED_MESSAGE,
   ZOMA_WELCOME,
   type ZomaAdsExperience,
@@ -492,7 +492,7 @@ function askAdsExperience(deps: ZomaDeviceFlowDeps, deviceId: string, message?: 
     action: ZOMA_ADS_EXPERIENCE_PATH,
     token: deps.links.sign({ purpose: 'continue', zoma: deviceId }, ZOMA_ONBOARDING_WINDOW_SEC),
     question: ZOMA_ADS_EXPERIENCE_QUESTION,
-    options: ZOMA_ADS_EXPERIENCE_OPTIONS,
+    options: zomaAdsExperienceOptions(),
     ...(message ? { message } : {}),
   };
 }
@@ -615,7 +615,7 @@ function noAdAccountPage(reason: 'no_ad_accounts' | 'ad_accounts_unavailable', r
     status: 400,
     title: 'No ad account found',
     message: `Meta did not share any ad accounts. If you already have one, reconnect with a Facebook login that has access to it and select it. If you have never run ads, set one up first (a few minutes), then reconnect. ${ZOMA_META_LOGIN_NOTE}`,
-    steps: ZOMA_NEW_TO_ADS_STEPS.slice(0, -1),
+    steps: zomaNewToAdsSteps().slice(0, -1),
     retryUrl,
     retryLabel: 'Reconnect Meta',
   };
@@ -927,7 +927,7 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps, an
       body: {
         next_step: 'ads_experience',
         question: ZOMA_ADS_EXPERIENCE_QUESTION,
-        options: ZOMA_ADS_EXPERIENCE_OPTIONS,
+        options: zomaAdsExperienceOptions(),
         message: `Say "${ZOMA_WELCOME}" to the user, then ask "${ZOMA_ADS_EXPERIENCE_QUESTION}" and poll again with ads_experience set to the value of their answer.`,
         interval: device.intervalSec,
       },
@@ -971,7 +971,7 @@ async function pollDevice(device: ZomaDeviceRecord, deps: ZomaDeviceFlowDeps, an
     // The new-advertiser guide already ends with the login note; everyone else gets it on its own.
     const guide = step !== 'connect_meta'
       ? {}
-      : state.ads_experience === 'new_to_ads' ? { guide: ZOMA_NEW_TO_ADS_STEPS } : { note: ZOMA_META_LOGIN_NOTE };
+      : state.ads_experience === 'new_to_ads' ? { guide: zomaNewToAdsSteps() } : { note: ZOMA_META_LOGIN_NOTE };
     let link: string | undefined;
     try {
       // Meta links are cheap signed URLs (state expires in 10 min), so mint fresh per poll;
