@@ -168,6 +168,9 @@ describe('shareScheduleAlertName (ENG-3149): a bounded allow-list', () => {
     expect(out).not.toMatch(FORBIDDEN_IN_OUTPUT);
     expect(Array.from(out).length).toBeGreaterThan(0);
     expect(Array.from(out).length).toBeLessThanOrEqual(SHARE_SCHEDULE_ALERT_NAME_MAX);
+    expect(out).not.toMatch(/\p{M}{4}/u);                         // at most 3 combining marks in a row
+    expect(out).not.toMatch(/(?<![\p{L}\p{N}\p{M}])\p{M}/u);     // and only after a letter or digit
+    expect(out).toMatch(/[\p{L}\p{N}]/u);                         // a name has a letter or a digit, or it is "Untitled"
     expect(name(out)).toBe(out); // cleaning twice changes nothing
     return out;
   };
@@ -289,6 +292,21 @@ describe('shareScheduleAlertName (ENG-3149): a bounded allow-list', () => {
       expect(name('a' + ch(0x33c2) + 'b')).toBe('aa m b');        // "a.m."
     });
 
+    it('each of the six invisible characters that are listed by code point is deleted outright (never a space)', () => {
+      for (const codePoint of [0x115f, 0x1160, 0x3164, 0xffa0, 0x034f, 0x2800]) {
+        expect(name(`ab${ch(codePoint)}cd`)).toBe('abcd');
+        expect(name(`ab${ch(codePoint)}${ch(codePoint)}.${ch(codePoint)}com`)).toBe('ab com');
+      }
+    });
+
+    it('a lone surrogate and a private-use character are deleted, not turned into a space', () => {
+      for (const codePoint of [0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xf8ff, 0xf0000, 0x10fffd]) {
+        expect(name(`ab${ch(codePoint)}cd`)).toBe('abcd');
+      }
+      expect(name('evil' + ch(0xd800) + '.com')).toBe('evil com');
+      expect(name('evil' + ch(0xe000) + '.com')).toBe('evil com');
+    });
+
     it('control and format characters are DELETED, not turned into spaces (nothing can be split by one, or hidden in one)', () => {
       for (const codePoint of [0x0000, 0x0001, 0x007f, 0x009f, 0x0600, 0x06dd, 0x070f, 0xfff9, 0x1d173]) {
         expect(name(`ab${ch(codePoint)}cd`)).toBe('abcd');
@@ -320,6 +338,89 @@ describe('shareScheduleAlertName (ENG-3149): a bounded allow-list', () => {
       }
       const cut = name('x'.repeat(95) + ' evil.com-tail');
       expect(cut).toBe(`${'x'.repeat(95)} evi${ELLIPSIS}`);
+    });
+  });
+
+  describe('the two input cuts are pinned exactly (300 code points as sent, 400 after NFKC)', () => {
+    it('what lies beyond the first 300 code points is never read: 300 spaces then a word is "Untitled"', () => {
+      expect(name(' '.repeat(300) + 'Hello')).toBe('Untitled');
+      expect(name(ch(0x200b).repeat(300) + 'Hello')).toBe('Untitled');
+    });
+
+    it('...and the 300th code point is the last one read: 299 spaces then a word keeps its first letter', () => {
+      expect(name(' '.repeat(299) + 'Hello')).toBe('H');
+      expect(name(ch(0x200b).repeat(299) + 'Hello')).toBe('H');
+    });
+
+    it('code points are counted, not UTF-16 units: an astral letter counts once', () => {
+      const astral = String.fromCodePoint(0x20bb7);
+      expect(name(' '.repeat(299) + astral + 'x')).toBe(astral);
+      expect(name(' '.repeat(300) + astral + 'x')).toBe('Untitled');
+    });
+
+    it('the cut is not fooled by what comes after it either way: bound-sized and huge inputs agree', () => {
+      expect(name(' '.repeat(299) + 'Hello' + 'x'.repeat(1_000_000))).toBe('H');
+    });
+
+    it('after NFKC the string is cut to exactly 400 code points before anything else looks at it', () => {
+      const firstLengths: number[] = [];
+      const original = String.prototype.replace;
+      let recorded = false;
+      const spy = jest.spyOn(String.prototype, 'replace').mockImplementation(function (this: string, ...args: unknown[]) {
+        if (!recorded) { firstLengths.push(this.length); recorded = true; } // the first replace is the whitespace pass
+        return (original as (...a: unknown[]) => string).apply(this, args);
+      } as typeof String.prototype.replace);
+      try {
+        name(ch(0xfdfa).repeat(300)); // 300 code points that each grow to 18 under NFKC (5,400 in all)
+      } finally {
+        spy.mockRestore();
+      }
+      expect(firstLengths).toEqual([400]);
+    });
+  });
+
+  describe('combining marks: at most 3 per letter or digit, and only where there is something to combine with', () => {
+    const MARK = ch(0x0338);
+    it('a letter with 50 marks keeps 3', () => {
+      expect(clean('a' + MARK.repeat(50))).toBe('a' + MARK.repeat(3));
+      expect(name('a' + MARK.repeat(3) + 'b' + MARK.repeat(5))).toBe('a' + MARK.repeat(3) + 'b' + MARK.repeat(3));
+    });
+
+    it('the cap is per base character, and a digit is a base too', () => {
+      expect(name('1' + ch(0x0301).repeat(9) + '2' + ch(0x0301).repeat(2))).toBe('1' + ch(0x0301).repeat(3) + '2' + ch(0x0301).repeat(2));
+    });
+
+    it('marks with no letter or digit before them are dropped: at the start, after a space, after punctuation', () => {
+      expect(name(ch(0x0301).repeat(5) + 'x')).toBe('x');
+      expect(name('a ' + ch(0x0301) + 'b')).toBe('a b');
+      expect(name('a-' + ch(0x0301).repeat(4) + 'b')).toBe('a-b');
+    });
+
+    it('a name made only of marks (or marks and punctuation) reads "Untitled"', () => {
+      expect(name(ch(0x0301).repeat(5))).toBe('Untitled');
+      expect(name(ch(0x0301, 0x0302) + ' ' + ch(0x0303))).toBe('Untitled');
+      expect(name(`${ch(0x0301).repeat(3)}x`)).toBe('x');
+    });
+
+    it('a name with NO letter or digit at all is "Untitled" (nothing but punctuation and spaces)', () => {
+      for (const input of ['!!!', '---', '( )', "' ' '", '_', '# & + % ? ,', '...', ELLIPSIS, '.'.repeat(500), '-'.repeat(500)]) {
+        expect(name(input)).toBe('Untitled');
+      }
+      expect(name('!!! done')).toBe('!!! done');
+      expect(name('(1)')).toBe('(1)');
+    });
+
+    it('ordinary accented and Indic names keep their marks (within 3 per base)', () => {
+      expect(name('Cafe' + ch(0x0301))).toBe('Caf\u00e9');
+      expect(name('\u0915\u094d\u0937\u093f')).toBe('\u0915\u094d\u0937\u093f'); // consonants, virama, vowel sign
+      expect(name('\u0e01\u0e49\u0e32\u0e27')).toBe('\u0e01\u0e49\u0e32\u0e27'); // Thai: tone mark and vowel signs
+    });
+
+    it('the cap holds in a 5,000,000 character stack of marks and costs nothing', () => {
+      const started = performance.now();
+      const out = name('a' + MARK.repeat(5_000_000));
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(out).toBe('a' + MARK.repeat(3));
     });
   });
 
@@ -357,19 +458,37 @@ describe('shareScheduleAlertName (ENG-3149): a bounded allow-list', () => {
       ['a ligature that grows under NFKC', ch(0xfdfa)],
     ];
     const SIZES = [1_000_000, 5_000_000];
+    // The work is bounded, so this takes a millisecond or two. The bound is deliberately generous (a loaded CI box must not flake
+    // it) and still separates the two worlds: a quadratic implementation took 4 s on 20,000 characters, i.e. minutes on these.
+    const ABSOLUTE_BOUND_MS = 2000;
 
-    it.each(patterns.flatMap(([label, unit]) => SIZES.map((size) => [label, size, unit] as const)))(
-      '%s x %i characters finishes in well under a second',
-      (_label, size, unit) => {
-        const input = unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
-        const started = performance.now();
-        const out = name(input);
-        const elapsed = performance.now() - started;
-        expect(elapsed).toBeLessThan(200);
-        expect(out).toMatch(ALLOWED_OUTPUT);
-        expect(Array.from(out).length).toBeLessThanOrEqual(SHARE_SCHEDULE_ALERT_NAME_MAX);
-      },
-    );
+    const timeOf = (input: string) => {
+      const started = performance.now();
+      const out = name(input);
+      return { elapsed: performance.now() - started, out };
+    };
+    const inputOf = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
+
+    it.each(patterns)('%s: 1,000,000 and 5,000,000 characters are both fast, and 5x the input does not cost 5x the time', (_label, unit) => {
+      name('warm up the regular expressions'); // the first call compiles them
+      const small = timeOf(inputOf(unit, SIZES[0]));
+      const large = timeOf(inputOf(unit, SIZES[1]));
+      for (const run of [small, large]) {
+        expect(run.elapsed).toBeLessThan(ABSOLUTE_BOUND_MS);
+        expect(run.out).toMatch(ALLOWED_OUTPUT);
+        expect(Array.from(run.out).length).toBeLessThanOrEqual(SHARE_SCHEDULE_ALERT_NAME_MAX);
+      }
+      // Linear work would cost 5x; bounded work costs about 1x. Fail only on clearly worse than linear (with a floor, so that two
+      // timings of a millisecond cannot trip it on noise).
+      expect(large.elapsed).toBeLessThan(Math.max(5 * small.elapsed * 2, 250));
+      expect(large.out).toBe(small.out);
+    });
+
+    it('a 20,000 character name (4 s in the quadratic version) takes a fraction of the bound, for the shapes that hurt it', () => {
+      for (const unit of ['a', 'a.', '.', '@', ':/', 'http://', 'x@', '0.', ' ']) {
+        expect(timeOf(inputOf(unit, 20_000)).elapsed).toBeLessThan(ABSOLUTE_BOUND_MS / 4);
+      }
+    });
 
     it('the work does not depend on how much was sent: only the first 300 code points count', () => {
       const head = 'Weekly report ';

@@ -117,6 +117,9 @@ function firstCodePoints(text: string, max: number): string {
   return text.slice(0, end);
 }
 
+/** The most combining marks kept after any one base character (a name must not be able to stack or strike through a letter). */
+const NAME_MAX_MARKS_PER_BASE = 3;
+
 // Every regex below is ONE character class (or a one-character lookaround around it), applied globally: nothing in them can
 // backtrack, so the cost is linear in the (bounded) input.
 
@@ -128,13 +131,42 @@ const NAME_WHITESPACE = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]/gu;
 // control, format, surrogate and private-use character, and the invisible ones that are none of those but are listed by name
 // (U+115F, U+1160, U+3164, U+FFA0 fillers, U+034F combining grapheme joiner, U+2800 blank braille, the tag characters).
 const NAME_INVISIBLE =
-  /[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Co}ᅟᅠㅤﾠ͏⠀\u{E0000}-\u{E007F}]/gu;
+  /[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Co}\u115F\u1160\u3164\uFFA0\u034F\u2800\u{E0000}-\u{E007F}]/gu;
 // A "." is kept only between two digits ("v2.1", "Release 3.0", "1.2.3"); every other dot becomes a space.
 const NAME_DOT_NOT_BETWEEN_DIGITS = /(?<!\d)\.|\.(?!\d)/g;
+// One character at a time: a letter or digit (the only things a combining mark may belong to), and a combining mark.
+const NAME_BASE_CHARACTER = /^[\p{L}\p{N}]$/u;
+const NAME_MARK = /^\p{M}$/u;
+// A name needs at least one letter or digit to be a name at all.
+const NAME_HAS_LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
 // ALLOW-LIST: letters, combining marks (so Devanagari, Thai, Arabic and accented text keep their signs), digits, space, the dots
 // kept above, and a small set of punctuation: _ - ' (U+2019) & , ( ) + # ! ? %. Everything else becomes a space. In particular
 // : / \ @ < > " ; = [ ] { } | ~ ^ * $ and every look-alike of a dot, and emoji and other symbols.
 const NAME_NOT_ALLOWED = /[^\p{L}\p{M}\p{N} _\-'’&,()+#!?%.]/gu;
+
+/**
+ * Keeps at most NAME_MAX_MARKS_PER_BASE combining marks after a letter or digit and drops every other mark (one after a space or
+ * punctuation, or at the start, has nothing to combine with). One pass over the code points, no backtracking, so it is linear in a
+ * string that is already bounded.
+ */
+function capCombiningMarks(text: string): string {
+  let kept = '';
+  let marksAfterBase = 0;
+  let afterBase = false;
+  for (const character of text) {
+    if (NAME_MARK.test(character)) {
+      if (afterBase && marksAfterBase < NAME_MAX_MARKS_PER_BASE) {
+        kept += character;
+        marksAfterBase++;
+      }
+    } else {
+      kept += character;
+      afterBase = NAME_BASE_CHARACTER.test(character);
+      marksAfterBase = 0;
+    }
+  }
+  return kept;
+}
 
 /**
  * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. It is the one piece of
@@ -145,9 +177,10 @@ const NAME_NOT_ALLOWED = /[^\p{L}\p{M}\p{N} _\-'’&,()+#!?%.]/gu;
  *  2. whitespace of any kind becomes a space, then invisible characters are deleted;
  *  3. a "." not between two digits becomes a space, then everything but letters, marks, digits, spaces and a few punctuation marks
  *     becomes a space (so "evil.example/x" can only ever read "evil example x");
- *  4. runs of spaces collapse and the ends are trimmed;
+ *  4. combining marks are capped at 3 per letter or digit (and dropped where there is nothing to combine with), runs of spaces
+ *     collapse and the ends are trimmed;
  *  5. a name over SHARE_SCHEDULE_ALERT_NAME_MAX characters is cut on whole characters to fit WITH its ellipsis;
- *  6. nothing left -> "Untitled".
+ *  6. no letter or digit left (nothing, or only punctuation) -> "Untitled".
  * Cleaning an already clean name returns it unchanged (a single trailing ellipsis is carried over rather than cleaned away). HTML
  * escaping is the caller's job where it writes HTML; the plain-text part uses this as is. Costs and consequences are in
  * dev/pending/eng-3149-owner-alert-for-visitor-schedules.md.
@@ -159,17 +192,16 @@ export function shareScheduleAlertName(name: unknown): string {
   const hadTrailingEllipsis = raw.endsWith('…');
   if (hadTrailingEllipsis) raw = raw.slice(0, -1);
 
-  const cleaned = firstCodePoints(raw.normalize('NFKC'), NAME_MAX_NORMALIZED_CODE_POINTS)
+  const allowed = firstCodePoints(raw.normalize('NFKC'), NAME_MAX_NORMALIZED_CODE_POINTS)
     .replace(NAME_WHITESPACE, ' ')
     .replace(NAME_INVISIBLE, '')
     .replace(NAME_DOT_NOT_BETWEEN_DIGITS, ' ')
     .replace(NAME_NOT_ALLOWED, ' ')
     // Deleting a character can put a base and a mark next to each other that were not: compose them again, so that cleaning is
     // stable. (Letters stay letters; this cannot bring back anything the steps above removed.)
-    .normalize('NFKC')
-    .replace(/ +/g, ' ')
-    .trim();
-  if (!cleaned) return 'Untitled';
+    .normalize('NFKC');
+  const cleaned = capCombiningMarks(allowed).replace(/ +/g, ' ').trim();
+  if (!NAME_HAS_LETTER_OR_DIGIT.test(cleaned)) return 'Untitled';
 
   const characters = Array.from(cleaned);
   const addEllipsis = hadTrailingEllipsis || characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX;
