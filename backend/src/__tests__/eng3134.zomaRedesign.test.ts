@@ -18,7 +18,7 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'eng-3134-test-secret';
 process.env.BACKEND_URL = 'https://api.agentweb.pro';
 process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
 delete process.env.ZOMA_REQUIRE_PAYMENT_METHOD;
-delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+delete process.env.ZOMA_GOOGLE_ENABLED;
 
 const users = new Map<string, Record<string, any>>();
 let accounts: any[] = [];

@@ -246,9 +246,9 @@ describe('ENG-3130 only successful calls are billable', () => {
       args: { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_resource_name: 'customers/1/campaigns/2', status },
     }, d);
 
-    describe('Google Ads (dark behind ZOMA_GOOGLE_ADS_ENABLED)', () => {
-      beforeAll(() => { process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true'; });
-      afterAll(() => { delete process.env.ZOMA_GOOGLE_ADS_ENABLED; });
+    describe('Google Ads (dark behind ZOMA_GOOGLE_ENABLED)', () => {
+      beforeAll(() => { process.env.ZOMA_GOOGLE_ENABLED = 'true'; });
+      afterAll(() => { delete process.env.ZOMA_GOOGLE_ENABLED; });
     it('a Google Ads go-live (status ENABLED) is refused with the pay link before anything is sent', async () => {
       const d = gatewayDeps({ assertPublishAllowed: paywalled() });
       await expect(googleWrite(d, 'ENABLED')).rejects.toThrow(/Going live needs the Zoma plan → https:\/\/pay/);

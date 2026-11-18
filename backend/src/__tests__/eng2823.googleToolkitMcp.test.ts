@@ -108,17 +108,17 @@ const call = async (name: string, args: any, key = 'aw_u1') => {
 };
 
 describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)', () => {
-  const prev = process.env.ZOMA_GOOGLE_ADS_ENABLED;
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
   beforeEach(() => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = 'true';
+    process.env.ZOMA_GOOGLE_ENABLED = 'true';
     budgets = { [BUDGET]: { name: 'Daily', amountMicros: '20000000', explicitlyShared: false, referenceCount: '1', status: 'ENABLED' } };
     mockAccounts.mockResolvedValue([googleAccount()]);
     mockPost.mockImplementation(async (url: string, body: any) => fakeGoogle(url, body));
     mockGet.mockRejectedValue(new Error('no GET expected'));
   });
   afterAll(() => {
-    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prev;
+    if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prev;
   });
 
   it('initialize answers for an authenticated caller', async () => {
@@ -134,7 +134,7 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
     expect(api.inputSchema.properties.client_id).toBeUndefined();
     expect(api.inputSchema.properties.amount_micros).toBeUndefined();
 
-    delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+    delete process.env.ZOMA_GOOGLE_ENABLED;
     const off = await rpc('tools/list').expect(200);
     const offNames = off.body.result.tools.map((t: any) => t.name);
     expect(offNames.filter((n: string) => n.includes('google'))).toEqual([]);
@@ -243,7 +243,7 @@ describe('ENG-2823 Google Ads toolkit over MCP JSON-RPC (Google faked at HTTP)',
   });
 
   it('flag off: a Google tool call never reaches Google', async () => {
-    delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
+    delete process.env.ZOMA_GOOGLE_ENABLED;
     await rpc('tools/call', { name: 'call_google_ads_api', arguments: { customer_id: CID, entity_type: 'BUDGET', action: 'LIST' } });
     expect(mockPost).not.toHaveBeenCalled();
   });
