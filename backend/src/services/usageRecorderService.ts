@@ -32,7 +32,7 @@ import {
   recordDroppedWrite,
   retryTransientWrite,
 } from "./usageWriteFailureMonitor";
-// tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
+// tokenUsageService is lazy-required inside the billing-owner resolver (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
 // module-load, breaking suites that mock aws-sdk without a `config` (e.g. blog.test.ts)
@@ -55,7 +55,7 @@ export interface RecordUsageContext {
   taskId?: string;
   /**
    * ENG-1251: stable identity for THIS charge, used to dedupe a retried usage
-   * report against the per-user monthly cap (see llmChargeAuditDb.recordLlmChargeEvent).
+   * report against the monthly charge-event record (see llmChargeAuditDb.recordLlmChargeEvent).
    * Omit only when the caller genuinely has no natural per-call id — a retry
    * will then be double-charged, since a fresh one is minted each time.
    */
@@ -505,9 +505,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
  * the same way or the §8 reconciliation measures the difference between two
  * error policies instead of the difference between two ledgers:
  *  - "duplicate": this call was already recorded on BOTH rails; nothing to do.
- *    This is also what makes a retried `recordUsage` add its cost once, which
- *    matches the enforced cap (`incrementUserTokenUsage` already dedupes on the
- *    same eventId).
+ *    This is also what makes a retried `recordUsage` add its cost once.
  *  - a transient conflict is retried; the retry is safe because the event is
  *    conditional.
  *  - anything else falls back to the plain aggregate write, so a spend-ledger
@@ -809,80 +807,29 @@ async function recordVendorUsageLegacy(
 }
 
 /**
- * Meter one LLM call BOTH ways for a direct-provider call site that spends a real
- * user's tokens but bypasses callLLM (crm enrichment, growth-genius, workflow-gen,
- * report-revision, invite-note shortening, …):
- *   1. recordUsage()          — the shadow analytics table.
- *   2. incrementUserTokenUsage — the enforced per-user monthly cap.
+ * Meter one LLM call for a direct-provider call site that spends a real user's
+ * tokens but bypasses callLLM (crm enrichment, growth-genius, workflow-gen,
+ * report-revision, invite-note shortening, ...): records it to the spend ledger via
+ * recordUsage(), which is the record admission and the usage views read.
  *
- * Fire-and-forget + fail-open on both — metering must never fail or slow an LLM
- * response. The cap charge is skipped when no user is attributable (a bare
- * recordUsage under "system" still captures the platform overhead).
- *
- * Note: tokens feed the always-on token cap; cost feeds the cap in dollars but
- * only blocks when ENFORCE_COST_CAP is enabled (observe-only by default).
+ * Fire-and-forget + fail-open: metering must never fail or slow an LLM response.
+ * (The legacy per-user `AW-Users.tokenUsage` counter charge that used to ride along
+ * was retired in ENG-2286.)
  */
 export function meterUserUsage(ctx: RecordUsageContext): void {
   void meterUserUsageAsync(ctx);
 }
 
 /**
- * `meterUserUsage`, awaitable: resolves once BOTH writes — the usage row and the
- * cap charge — have settled (ENG-1858). Never rejects; each write keeps its own
- * fail-open handling. Use it where something must wait for the metering to be
- * durable, such as registering it with the graceful-shutdown drain; hot paths
- * keep calling `meterUserUsage` and never wait.
+ * `meterUserUsage`, awaitable: resolves once the usage write has settled
+ * (ENG-1858). Never rejects; the write keeps its own fail-open handling. Use it
+ * where something must wait for the metering to be durable, such as registering
+ * it with the graceful-shutdown drain; hot paths keep calling `meterUserUsage`
+ * and never wait.
  */
 export async function meterUserUsageAsync(ctx: RecordUsageContext): Promise<void> {
-  // Shadow analytics — records under "system" when userId is absent.
-  const recorded = recordUsage(ctx);
-
-  // Enforced per-user cap — only when a real user is attributable.
-  if (!ctx.userId) {
-    await recorded;
-    return;
-  }
-
-  const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
-  const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
-  const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
-  const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
-  const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
-  // Honor an explicit dollar cost for calls that are NOT token-priced (image is
-  // billed per generation, video per clip). Without this, image/video would deduct
-  // $0 from the cap even though they're the largest costs — mirrors recordUsage.
-  const costUsd =
-    ctx.costUsdOverride != null
-      ? Math.max(0, ctx.costUsdOverride)
-      : computeCostMicroUsd(
-          ctx.model,
-          inputTokens,
-          outputTokens,
-          cacheReadTokens,
-          cacheWriteTokens,
-          ctx.cacheWriteByTtl
-        ) / 1e6;
-
-  if (totalTokens <= 0 && costUsd <= 0) {
-    await recorded;
-    return;
-  }
-
-  // Lazy-required (see import-site note) to keep this module's static load graph light.
-  const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
-  const charged = incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
-    eventId: ctx.eventId,
-    model: ctx.model,
-    provider: ctx.provider,
-    feature: ctx.feature,
-    sessionId: ctx.sessionId,
-  }).catch((err: unknown) =>
-    console.error(
-      "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
-      err instanceof Error ? err.message : err
-    )
-  );
-  await Promise.all([recorded, charged]);
+  // Records under "system" when userId is absent.
+  await recordUsage(ctx);
 }
 
 /** Test hook: reset the error-log throttle. */

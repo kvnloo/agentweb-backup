@@ -289,6 +289,56 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.knowledge_base_files).toEqual([{ name: 'positioning.md' }]);
   });
 
+  it('emma_get_brand_profile exports every stored brand and market-strategy field by name (ENG-3122)', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({
+        exists: true,
+        brandData: {
+          brandName: 'Acme', tagline: 'Ship it', valueProposition: 'Faster launches',
+          primaryColor: '#112233', secondaryColor: '#445566', fontFamily: 'Inter',
+          toneOfVoice: 'direct', brandPersonality: 'bold', brandValues: ['speed'],
+          keyMessages: ['one'], targetAudience: 'founders',
+          founders: [{ name: 'Ada' }], logoUrl: 'https://cdn/logo.png',
+        },
+        attachments: [
+          { type: 'logo', url: 'https://cdn/logo.png' },
+          { type: 'secondaryLogo', url: 'https://cdn/logo2.png' },
+          { type: 'brandGuide', url: 'https://cdn/guide.pdf' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        data: { businessOverview: 'B2B SaaS', competitors: [{ name: 'Rival' }], icp: [{ name: 'CTO' }] },
+      })
+      .mockResolvedValueOnce([]);
+
+    const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
+    const x = JSON.parse(res.content[0].text).structured_export;
+
+    expect(x).toMatchObject({
+      brand_name: 'Acme', tagline: 'Ship it', value_proposition: 'Faster launches',
+      primary_color: '#112233', secondary_color: '#445566', font_family: 'Inter',
+      tone_of_voice: 'direct', personality: 'bold', values: ['speed'], key_messages: ['one'],
+      target_audience: 'founders', founders: [{ name: 'Ada' }],
+      logo_urls: ['https://cdn/logo.png', 'https://cdn/logo2.png'],
+      business_overview: 'B2B SaaS', competitors: [{ name: 'Rival' }], icps: [{ name: 'CTO' }],
+    });
+  });
+
+  it('emma_get_brand_profile export of a failed section is null AND reported unavailable, not silently empty', async () => {
+    mockMcpFetch
+      .mockRejectedValueOnce(new Error('API error (500): boom'))
+      .mockResolvedValueOnce({ success: true, data: { businessOverview: 'B2B', competitors: [], icp: [] } })
+      .mockResolvedValueOnce([]);
+
+    const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.unavailable).toEqual([expect.stringContaining('brand_guidelines')]);
+    expect(body.structured_export.brand_name).toBeNull();
+    expect(body.structured_export.business_overview).toBe('B2B');
+  });
+
   it('emma_get_brand_profile treats an unfilled section as unconfigured only when the read SUCCEEDS', async () => {
     // routes/brand.ts returns 200 when a section is simply not filled in — it
     // reserves 404 for "User not found". So "unconfigured" is an empty 200

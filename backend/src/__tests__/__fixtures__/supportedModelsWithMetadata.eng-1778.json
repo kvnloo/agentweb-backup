@@ -29,7 +29,7 @@
       "name": "Claude Sonnet 5.5",
       "tier": "pro",
       "qualityTier": "ultra_premium",
-      "description": "Auto-added from OpenRouter; benchmark score shown when available.",
+      "description": "Anthropic's Sonnet-class model for everyday work",
       "provider": "anthropic",
       "qualityScore": 56,
       "qualityScoreSource": "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5-5 (https://artificialanalysis.ai/)",

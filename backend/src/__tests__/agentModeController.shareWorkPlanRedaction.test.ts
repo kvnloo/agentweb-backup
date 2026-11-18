@@ -18,7 +18,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 jest.mock('../services/llmUsagePolicyResolverService', () => ({ getEffectiveLlmUsagePolicy: jest.fn() }));
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({ generateMarketingResponseWorkerService: { runInWorker: jest.fn() } }));
-jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true }), incrementUserTokenUsage: jest.fn() }));
+jest.mock('../services/tokenUsageService', () => ({ checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true }) }));
 jest.mock('../utils/sseProgress', () => ({
   progressStore: { delete: jest.fn() }, getLatestProgress: jest.fn(), requestCancel: jest.fn(), clearCancel: jest.fn(),
   isCancelled: jest.fn().mockReturnValue(false), emitProgress: jest.fn(), hasActiveProgress: jest.fn().mockReturnValue(false),
