@@ -103,11 +103,10 @@ export interface CodingAgentResult {
   latestCommitSha?: string;
   editedFiles?: string[];
   /**
-   * Summed token usage across this run's self-contained LLM loop, so the caller
-   * can charge it to the per-user token/cost cap (ENG-200). The coding agent's
-   * turns are invisible to the parent agent-mode meter, so without this its spend
-   * never counts. Omitted when the run made no priced LLM call. costUsd is priced
-   * via the same source as the shadow meter (llmPricing), in USD.
+   * Summed token usage across this run's self-contained LLM loop (ENG-200).
+   * Informational: each turn is already recorded to the spend ledger through
+   * recordUsage, and no caller charges this total any more. Omitted when the run
+   * made no priced LLM call. costUsd is priced via llmPricing, in USD.
    */
   usageTotals?: {
     inputTokens: number;
@@ -2013,7 +2012,7 @@ async function runCodingAgentInternal(
       }
 
       // A customer-funded turn goes to the attempt journal only. It is NOT added to
-      // `usageAcc` (the callers charge that total to the per-user cap) and does not touch
+      // `usageAcc` (the returned usageTotals) and does not touch
       // the usage rails, so the customer is never billed twice for their own key.
       if (turnFunding) {
         try {
@@ -2052,8 +2051,8 @@ async function runCodingAgentInternal(
           const servedModel = typeof response.model === 'string' && response.model
             ? response.model
             : model;
-          // Accumulate for the per-user cap (charged once by the caller from
-          // result.usageTotals). Same numbers the shadow meter records below.
+          // Accumulate the turn totals returned as result.usageTotals. Same
+          // numbers the usage recorder writes to the ledger below.
           usageAcc.inputTokens += inputTokens;
           usageAcc.outputTokens += outputTokens;
           usageAcc.cacheReadTokens += cacheReadTokens;
