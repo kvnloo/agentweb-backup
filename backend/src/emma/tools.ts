@@ -9438,7 +9438,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
-For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts, CONTACTS + SEARCH (created_after/created_before) for contacts with source/UTM attribution fields, and DEALS (read-only) for pipeline data.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9500,6 +9500,14 @@ ASSET METRICS (CAMPAIGN LIST_ASSETS):
   WORKFLOW → enrolled, active, completed counts
   SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
 
+  CONTACTS     → LIST (cursor?) | SEARCH (created_after?, created_before?, properties[]?, limit?, cursor?)
+               SEARCH returns source/UTM attribution fields (hs_analytics_source*, hs_latest_source*, utm_*, first/recent conversion).
+  DEALS        → (read-only; scope crm.objects.deals.read)
+               LIST_PIPELINES → pipelines with stage ids + labels
+               SEARCH (deal_stage? [stage label like "New Business Meetings" or stage id], pipeline?, created_after?, created_before?, properties[]?, limit?, cursor?)
+               GET_CONTACTS (deal_id) → associated contacts with source/UTM attribution fields
+               Attribution rule: only report a deal as campaign-attributed when an associated contact's UTM/source value
+               actually names the campaign. Never estimate unmatched deals.
   CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
                → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
                → DELETE (list_id)
@@ -9516,7 +9524,14 @@ TYPICAL WORKFLOW:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST).' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS', 'DEALS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST/SEARCH; DEALS supports LIST_PIPELINES/SEARCH/GET_CONTACTS, read-only).' },
+        deal_stage:       { type: 'string', description: 'DEALS SEARCH: stage label (e.g. "New Business Meetings") or internal stage id.' },
+        pipeline:         { type: 'string', description: 'DEALS SEARCH: pipeline id (from LIST_PIPELINES).' },
+        deal_id:          { type: 'string', description: 'DEALS GET_CONTACTS: deal id.' },
+        created_after:    { type: 'string', description: 'CONTACTS/DEALS SEARCH: inclusive lower bound on createdate (ISO date or epoch ms).' },
+        created_before:   { type: 'string', description: 'CONTACTS/DEALS SEARCH: exclusive upper bound on createdate (ISO date or epoch ms).' },
+        properties:       { type: 'array', items: { type: 'string' }, description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return.' },
+        limit:            { type: 'number', description: 'CONTACTS/DEALS SEARCH page size (max 100).' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
         guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },

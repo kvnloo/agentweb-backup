@@ -62,6 +62,7 @@ export function normalizeHubSpotArgs(raw: any): any {
 
 const HUBSPOT_ENDPOINT_ENTITIES: Array<[RegExp, string]> = [
   [/(^|\/)contacts?$/, 'CONTACTS'],
+  [/(^|\/)deals?$/, 'DEALS'],
   [/(^|\/)campaigns?$/, 'CAMPAIGN'],
   [/(^|\/)(lists?|contact_lists?)$/, 'CONTACT_LIST'],
   [/(^|\/)emails?$/, 'EMAIL'],

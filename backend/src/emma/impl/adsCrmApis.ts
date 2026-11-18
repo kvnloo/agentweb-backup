@@ -1609,6 +1609,40 @@ async function hubspotMarketingPreflight(
 
 import { normalizeHubSpotArgs } from '../../services/agentMode/crmToolArgs';
 
+/** Deal fields returned by DEALS SEARCH (callers may add more via `properties`). */
+const HUBSPOT_DEAL_PROPS = [
+  'dealname', 'amount', 'dealstage', 'pipeline', 'createdate', 'closedate',
+  'hs_lastmodifieddate', 'hubspot_owner_id', 'hs_analytics_source', 'hs_analytics_source_data_1', 'hs_analytics_source_data_2',
+];
+
+/** Contact source/UTM fields used for campaign-to-pipeline attribution. */
+const HUBSPOT_CONTACT_ATTRIBUTION_PROPS = [
+  'email', 'firstname', 'lastname', 'company', 'jobtitle', 'createdate', 'lifecyclestage',
+  'hs_analytics_source', 'hs_analytics_source_data_1', 'hs_analytics_source_data_2',
+  'hs_latest_source', 'hs_latest_source_data_1', 'hs_latest_source_data_2',
+  'hs_analytics_first_url', 'hs_analytics_first_referrer', 'recent_conversion_event_name', 'first_conversion_event_name',
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+];
+
+function mergeProps(base: string[], extra: unknown): string[] {
+  const add = Array.isArray(extra) ? extra.map(String) : typeof extra === 'string' ? extra.split(',') : [];
+  return [...new Set([...base, ...add.map((s) => s.trim()).filter(Boolean)])];
+}
+
+/** created_after / created_before (ISO date or epoch ms) → HubSpot createdate filters. */
+export function hubspotDateFilters(args: any):
+  { filters: Array<{ propertyName: string; operator: string; value?: string; values?: string[] }> } | { error: string } {
+  const filters: Array<{ propertyName: string; operator: string; value?: string }> = [];
+  for (const [key, op] of [['created_after', 'GTE'], ['created_before', 'LT']] as const) {
+    const raw = args?.[key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const ms = /^\d{10,}$/.test(String(raw)) ? Number(raw) : Date.parse(String(raw));
+    if (!Number.isFinite(ms)) return { error: `${key} must be an ISO date (e.g. 2026-11-01) or epoch milliseconds.` };
+    filters.push({ propertyName: 'createdate', operator: op, value: String(ms) });
+  }
+  return { filters };
+}
+
 export async function handleHubspotApi(userId: string, args: any): Promise<any> {
   args = normalizeHubSpotArgs(args);
   const entityType: string = (args?.entity_type ?? '').toUpperCase();
@@ -1638,8 +1672,70 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
     if (preflight) return preflight;
 
     if (entityType === 'CONTACTS') {
-      if (action !== 'LIST') return { success: false, error: 'Valid CONTACTS action: LIST (cursor optional).' };
-      return { success: true, ...await svc.listContacts(args?.cursor) };
+      if (action === 'LIST') return { success: true, ...await svc.listContacts(args?.cursor) };
+      if (action === 'SEARCH') {
+        const filters = hubspotDateFilters(args);
+        if ('error' in filters) return { success: false, error: filters.error };
+        const properties = mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties);
+        const page = await svc.searchCrmObjects('contacts', {
+          filters: filters.filters, properties, cursor: args?.cursor, limit: args?.limit,
+          sortBy: 'createdate', sortDirection: 'DESCENDING',
+        });
+        return { success: true, entity_type: 'CONTACTS', total: page.total, contacts: page.results, nextCursor: page.nextCursor };
+      }
+      return { success: false, error: 'Valid CONTACTS actions: LIST (cursor?), SEARCH (created_after?, created_before?, properties?, limit?, cursor?).' };
+    }
+
+    // ─── DEALS (read-only) ─────────────────────────────────────────────────
+    if (entityType === 'DEALS') {
+      switch (action) {
+        case 'LIST_PIPELINES':
+          return { success: true, pipelines: await svc.listDealPipelines() };
+        case 'SEARCH': {
+          const filters = hubspotDateFilters(args);
+          if ('error' in filters) return { success: false, error: filters.error };
+          const f = [...filters.filters];
+          if (args?.pipeline) f.push({ propertyName: 'pipeline', operator: 'EQ', value: String(args.pipeline) });
+          let stageIds: string[] = [];
+          const stageArg = args?.deal_stage ?? args?.dealstage;
+          if (stageArg) {
+            // Accept either an internal stage id or a human label ("New Business Meetings").
+            const wanted = String(stageArg).trim().toLowerCase();
+            const pipelines = await svc.listDealPipelines();
+            for (const p of pipelines) {
+              if (args?.pipeline && p.id !== String(args.pipeline)) continue;
+              for (const s of p.stages) if (s.id.toLowerCase() === wanted || s.label.trim().toLowerCase() === wanted) stageIds.push(s.id);
+            }
+            if (!stageIds.length) {
+              return {
+                success: false,
+                error: `No deal stage matches "${stageArg}". Use DEALS LIST_PIPELINES to see stage ids and labels.`,
+              };
+            }
+            stageIds = [...new Set(stageIds)];
+            f.push(stageIds.length === 1
+              ? { propertyName: 'dealstage', operator: 'EQ', value: stageIds[0] }
+              : { propertyName: 'dealstage', operator: 'IN', values: stageIds });
+          }
+          const properties = mergeProps(HUBSPOT_DEAL_PROPS, args?.properties);
+          const page = await svc.searchCrmObjects('deals', {
+            filters: f, properties, cursor: args?.cursor, limit: args?.limit,
+            sortBy: 'createdate', sortDirection: 'DESCENDING',
+          });
+          return { success: true, entity_type: 'DEALS', matched_stage_ids: stageIds, total: page.total, deals: page.results, nextCursor: page.nextCursor };
+        }
+        case 'GET_CONTACTS': {
+          const dealId = args?.deal_id ?? args?.id;
+          if (!dealId) return { success: false, error: 'deal_id is required for DEALS GET_CONTACTS.' };
+          const ids = await svc.getDealContactAssociations(String(dealId));
+          const contacts = ids.length
+            ? await svc.batchReadContacts(ids, mergeProps(HUBSPOT_CONTACT_ATTRIBUTION_PROPS, args?.properties))
+            : [];
+          return { success: true, deal_id: String(dealId), contacts };
+        }
+        default:
+          return { success: false, error: `Unknown action "${action}" for DEALS. Valid (read-only): LIST_PIPELINES, SEARCH, GET_CONTACTS.` };
+      }
     }
 
     // ─── CONTACT_LIST ──────────────────────────────────────────────────────
@@ -2051,7 +2147,7 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
       }
     }
 
-    return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
+    return { success: false, error: `Unknown entity_type "${entityType}". Valid: CONTACTS, DEALS, CONTACT_LIST, CAMPAIGN, EMAIL, FORM, LANDING_PAGE, BLOG_POST, WORKFLOW, SOCIAL.` };
   } catch (err: any) {
     if (err?.response?.status === 403) {
       // HubSpot returns 403 both for tier/scope limits and for tokens granted
