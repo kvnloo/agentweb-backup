@@ -596,11 +596,11 @@ describe('the email', () => {
     const chipTables = (html: string) => html.match(/<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0">.*?<\/table>/g) ?? [];
     const seven = chipTables(email({ platforms: [META_WEEK], usage: quiet }).html); // a row of four and a row of three
     expect(seven).toHaveLength(1);
-    expect(seven[0].match(/width="25%"/g)).toHaveLength(8);
-    expect(seven[0].match(/<tr>/g)).toHaveLength(3); // two rows and the spacer between them
+    expect(seven[0]!.match(/width="25%"/g)).toHaveLength(8);
+    expect(seven[0]!.match(/<tr>/g)).toHaveLength(3); // two rows and the spacer between them
     expect(seven[0]).toContain('colspan="8" height="6"'); // desktop Outlook ignores margins
     const six = chipTables(email({ platforms: [GOOGLE_WEEK], usage: quiet }).html); // four and two
-    expect(six[0].match(/width="25%"/g)).toHaveLength(8);
+    expect(six[0]!.match(/width="25%"/g)).toHaveLength(8);
   });
 
   it('every bar carries its width in CSS plus a spacer, so a client that drops width attributes (Gmail on Android) still draws it', () => {
