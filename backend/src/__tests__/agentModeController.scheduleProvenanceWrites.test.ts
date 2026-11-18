@@ -31,6 +31,10 @@ jest.mock('../services/agentModeService', () => ({
     isModelSelectableBy: jest.fn(() => true),
   },
 }));
+// ENG-3149: a visitor's first mark emails the owner; these tests are about what is written, so the mail goes nowhere.
+jest.mock('../services/emailService', () => ({
+  emailService: { sendVisitorScheduleAlertEmail: jest.fn(async () => undefined) },
+}));
 jest.mock('../services/db', () => ({
   scheduleDb: { getScheduleById: jest.fn(), createSchedule: jest.fn(), updateSchedule: jest.fn(), getSchedulesByUserId: jest.fn() },
   userDb: { getUserById: jest.fn() },
