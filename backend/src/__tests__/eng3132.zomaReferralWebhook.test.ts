@@ -41,7 +41,7 @@ describe('enabled', () => {
   it('logs an unsafe invoice for an operator instead of dropping it silently', async () => {
     const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
-      const d = deps({ registry: { create: jest.fn(), revoke: jest.fn(), get: jest.fn(async () => ({ code: 'sandra', referrerId: 's', payeeName: 'S', status: 'active', createdAt: '2026-11-01T00:00:00Z', createdBy: 'a' })) } });
+      const d = deps({ registry: { create: jest.fn(), revoke: jest.fn(), get: jest.fn(async () => ({ code: 'sandra', referrerId: 's', payeeName: 'S', status: 'active' as const, createdAt: '2026-11-01T00:00:00Z', createdBy: 'a' })) } });
       const h = createZomaReferralWebhookHandler({ isZomaPlanObject: () => true, accrualDeps: () => d });
       await h.onInvoicePaid({ ...(invoice as object), status: 'paid', currency: 'usd', amount_paid: 5000 } as never); // no totals/lines: cannot be computed safely
       expect(error).toHaveBeenCalledWith(expect.stringContaining('commission NOT recorded'));
@@ -70,7 +70,7 @@ describe('handleZomaBillingWebhookEvent wiring', () => {
   const recordFunnel = jest.fn(async () => true);
   const zomaInvoice = { id: 'in_1', parent: { subscription_details: { metadata: { product: 'zoma_plan', userId: 'u1' } } } };
 
-  it.each(['invoice.paid', 'invoice.payment_succeeded'])('routes a Zoma %s to accrual and still claims the event from Emma', async (type) => {
+  it.each(['invoice.paid', 'invoice.payment_succeeded'] as const)('routes a Zoma %s to accrual and still claims the event from Emma', async (type) => {
     const referral = handler();
     expect(await handleZomaBillingWebhookEvent({ id: 'evt_1', type, created: 1, data: { object: zomaInvoice } }, { recordFunnel }, referral)).toBe(true);
     expect(referral.onInvoicePaid).toHaveBeenCalledWith(zomaInvoice);
