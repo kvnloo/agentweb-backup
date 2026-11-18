@@ -368,9 +368,13 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     mockGet({ content: { reference: 'urn:li:share:999' } }); // creative read
     mockGet({ contentLandingPage: 'https://example.com/' }); // post read
     mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // post write
+    // ENG-3064: the write is read back; echo the URL that was written.
+    mockAxiosFn.mockImplementationOnce(async () => ({
+      data: { contentLandingPage: mockAxiosFn.mock.calls[2][0].data.patch.$set.contentLandingPage }, headers: {}, status: 200,
+    }));
     const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
     expect(result.success).toBe(true);
-    expect(mockAxiosFn).toHaveBeenCalledTimes(3);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(4);
     expect(mockAxiosFn.mock.calls[1][0].url).toContain(encodeURIComponent('urn:li:share:999'));
   });
 
@@ -422,11 +426,15 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
   it('retags an untagged text-ad creative (happy path)', async () => {
     mockGet({ content: { textAd: { headline: 'H', description: 'D', landingPage: 'https://example.com/' } } });
     mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // the PARTIAL_UPDATE write
+    // ENG-3064: the write is read back; echo the textAd that was written.
+    mockAxiosFn.mockImplementationOnce(async () => ({
+      data: { content: mockAxiosFn.mock.calls[1][0].data.patch.$set.content }, headers: {}, status: 200,
+    }));
 
     const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
 
     expect(result.success).toBe(true);
-    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(3);
     const writeCall = mockAxiosFn.mock.calls[1][0];
     expect(writeCall.method).toBe('POST');
     expect(writeCall.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
@@ -526,6 +534,10 @@ describe('retagPostUtm — sponsored-content post retrofit', () => {
   it('retags an untagged post (happy path) -- top-level $set, no sibling fields to preserve', async () => {
     mockGet({ contentLandingPage: 'https://example.com/' });
     mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 });
+    // ENG-3064: the write is read back; echo the URL that was written.
+    mockAxiosFn.mockImplementationOnce(async () => ({
+      data: { contentLandingPage: mockAxiosFn.mock.calls[1][0].data.patch.$set.contentLandingPage }, headers: {}, status: 200,
+    }));
 
     const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
 

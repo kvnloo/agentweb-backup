@@ -15,6 +15,8 @@
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
+ *   GET  /api/zoma/billing/checkout/:id  ENG-3131 pay link: records checkout_started, then -> Stripe Checkout
+ *   GET  /api/zoma/billing/done       Stripe Checkout return for the $1 trial -> plain result page
  *
  * None of these read the browser's AgentWeb session: the setup's user always comes from the
  * device item (bound at approval), named by a signed state/link.
@@ -39,6 +41,7 @@ import {
 } from '../mcp/zomaDeviceFlow';
 import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
+import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
 export const ZOMA_POLL_MAX_PER_MINUTE = 60;
@@ -148,7 +151,11 @@ function failPage(res: Response, step: string, error: unknown) {
   return page(res, 500, 'Zoma setup', '<p>Something went wrong. Try again in a moment, or ask your agent to start Zoma setup again.</p>');
 }
 
-export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps, googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps): Router {
+export function createZomaRouter(
+  deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
+  googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps,
+  billingDeps?: Parameters<typeof openZomaCheckout>[1],
+): Router {
   const router = Router();
 
   router.post('/setup', throttle('setup', ZOMA_SETUP_MAX_PER_MINUTE), async (req: Request, res: Response) => {
@@ -252,6 +259,28 @@ export function createZomaRouter(deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlo
     } catch (error) {
       return failPage(res, 'checkout_completed', error);
     }
+  });
+
+  router.get('/billing/checkout/:id', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const opened = await openZomaCheckout(String(req.params.id ?? ''), billingDeps);
+      if (opened.kind === 'redirect') return res.redirect(302, opened.url);
+      if (opened.kind === 'gone') {
+        return page(res, 410, 'Zoma plan', '<p>This payment link has expired or was already used. Ask your agent for a new one.</p>');
+      }
+      return page(res, 404, 'Zoma plan', '<p>This payment link is not valid. Ask your agent for a new one.</p>');
+    } catch (error) {
+      return failPage(res, 'billing_checkout', error);
+    }
+  });
+
+  router.get('/billing/done', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    if (req.query.result === 'paid') {
+      return page(res, 200, "You're on the Zoma plan", '<p>Your trial has started: $1 was charged today. After 7 days your card is charged $50/month automatically unless you cancel before then. Go back to your agent and ask it to try the launch again.</p>');
+    }
+    // Funnel only (ENG-3131 R5): a failed write must never change what the user sees.
+    await recordZomaCheckoutCanceled(req.query, billingDeps).catch((e) => console.error('[zoma-billing] cancel record failed:', e));
+    return page(res, 200, 'Zoma plan', '<p>Checkout was canceled and nothing was charged. Reads and drafts still work. Ask your agent for the link again whenever you want to go live.</p>');
   });
 
   router.post('/token/revoke', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {

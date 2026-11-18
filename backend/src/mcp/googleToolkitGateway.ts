@@ -1,6 +1,6 @@
 /**
  * ENG-2823 — Google Ads branch of the Zoma toolkit gateway (provider #2). Reached from
- * handleMetaToolkitCall after authentication, only while ZOMA_GOOGLE_ADS_ENABLED=true.
+ * handleMetaToolkitCall after authentication, only while ZOMA_GOOGLE_ENABLED=true.
  *
  *   1. resolve the caller's Google Ads customer (own or org-shared connection, the same
  *      visibility googleAdsService.getAccountCredentials uses) and refuse a foreign or
@@ -33,8 +33,8 @@ export interface GoogleToolkitCaller {
 export interface GoogleToolkitGatewayDeps {
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   now: () => number;
-  /** Records the single mcp_tool_used event (platform google_ads) for this call. */
-  meter: () => Promise<unknown>;
+  /** Records the single mcp_tool_used event (platform google_ads) once the call finishes; skips (ENG-3130) a result that reports failure. */
+  meter: (result?: unknown) => Promise<unknown>;
   recordWrite: typeof recordMcpWriteExecuted;
   executeRead?: typeof executeGoogleToolkitRead;
   executeWrite?: (userId: string, args: any, currency: string) => Promise<any>;
@@ -87,6 +87,6 @@ export async function handleGoogleToolkitCall(
     });
   }
 
-  await deps.meter();
+  await deps.meter(result);
   return result;
 }

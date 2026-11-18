@@ -21,6 +21,9 @@ jest.mock('../services/linkedInAdsService', () => ({
   listCampaigns: jest.fn(),
   createCampaign: jest.fn(),
   updateCampaign: jest.fn(),
+  updateCreativeStatus: jest.fn(),
+  retagCreativeUtm: jest.fn(),
+  CREATIVE_INTENDED_STATUSES: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'CANCELED', 'DRAFT'],
   createCreative: jest.fn(),
   createCreativeInline: jest.fn(),
   createDynamicCreative: jest.fn(),
@@ -906,5 +909,34 @@ describe('callLinkedInMarketingApi — CONVERSATION_AD', () => {
     await expect(
       (service as any).callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'UNKNOWN', ACCOUNT_ID, {})
     ).rejects.toThrow('CONVERSATION_AD');
+  });
+});
+
+// ENG-3064: an update LinkedIn accepted but that did not read back reaches the tool as a
+// typed failure with the field list, not as success and not as a generic thrown error.
+describe('ENG-3064 read-back failures at the tool boundary', () => {
+  const unsupported = { success: false, errorType: 'unsupported_field', fields: ['status'], error: 'unsupported_field: ...' };
+
+  it.each([
+    ['CAMPAIGN_GROUP', 'UPDATE', 'updateCampaignGroup', { campaign_group_id: 'cg-1', status: 'PAUSED' }],
+    ['CAMPAIGN', 'UPDATE', 'updateCampaign', { campaign_id: 'c-1', status: 'PAUSED' }],
+    ['CREATIVE', 'UPDATE', 'updateCreativeStatus', { creative_id: '42', status: 'PAUSED' }],
+    ['CREATIVE', 'RETAG_UTM', 'retagCreativeUtm', { creative_id: '42', campaign_id: 'c-1' }],
+  ] as const)('%s %s: unsupported_field is returned with its fields', async (entity, action, fn, params) => {
+    ((linkedInAdsService as any)[fn] as jest.Mock).mockResolvedValue(unsupported);
+    const result = await service.callLinkedInMarketingApi(USER_ID, entity as any, action, ACCOUNT_ID, params);
+    expect(result).toEqual({ success: false, errorType: 'unsupported_field', errorCode: 'unsupported_field', fields: ['status'], error: 'unsupported_field: ...' });
+  });
+
+  it('a failed read-back is returned as read_back_failed, not success', async () => {
+    (linkedInAdsService.updateCampaign as jest.Mock).mockResolvedValue({ success: false, errorType: 'read_back_failed', error: 'read_back_failed: ...' });
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CAMPAIGN', 'UPDATE', ACCOUNT_ID, { campaign_id: 'c-1', status: 'PAUSED' });
+    expect(result).toMatchObject({ success: false, errorType: 'read_back_failed' });
+  });
+
+  it('an ordinary update failure still throws, as before', async () => {
+    (linkedInAdsService.updateCampaign as jest.Mock).mockResolvedValue({ success: false, error: 'LinkedIn said no' });
+    await expect(service.callLinkedInMarketingApi(USER_ID, 'CAMPAIGN', 'UPDATE', ACCOUNT_ID, { campaign_id: 'c-1', status: 'PAUSED' }))
+      .rejects.toThrow('LinkedIn said no');
   });
 });

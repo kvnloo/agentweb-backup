@@ -54,10 +54,10 @@ function allAdvertised(): Advertised[] {
 }
 
 describe('ENG-2747 Zoma toolkit tool annotations', () => {
-  const prevGoogle = process.env.ZOMA_GOOGLE_ADS_ENABLED;
+  const prevGoogle = process.env.ZOMA_GOOGLE_ENABLED;
   afterAll(() => {
-    if (prevGoogle === undefined) delete process.env.ZOMA_GOOGLE_ADS_ENABLED;
-    else process.env.ZOMA_GOOGLE_ADS_ENABLED = prevGoogle;
+    if (prevGoogle === undefined) delete process.env.ZOMA_GOOGLE_ENABLED;
+    else process.env.ZOMA_GOOGLE_ENABLED = prevGoogle;
   });
 
   it('gives every advertised tool all four boolean hints', () => {
@@ -127,7 +127,7 @@ describe('ENG-2747 Zoma toolkit tool annotations', () => {
     ['without Google', 'false'],
     ['with Google', 'true'],
   ])('GET /tools and MCP tools/list both advertise annotations (%s)', async (_label, google) => {
-    process.env.ZOMA_GOOGLE_ADS_ENABLED = google;
+    process.env.ZOMA_GOOGLE_ENABLED = google;
     mockAuthenticate.mockResolvedValue({ userId: 'u1', authMethod: 'api_key' });
     const app = express();
     app.use(express.json());
