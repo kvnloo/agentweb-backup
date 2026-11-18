@@ -353,7 +353,7 @@ describe('Security Tests', () => {
       const req: any = { body: { email: 'nobody@example.com', password: 'pass123' } };
       const res = createRes();
 
-      mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
+      mockUserDb.getUserByEmailConsistent.mockResolvedValue(undefined as any);
 
       await login(req, res);
 
@@ -365,7 +365,7 @@ describe('Security Tests', () => {
       const req: any = { body: { email: 'deactivated@example.com', password: 'pass123' } };
       const res = createRes();
 
-      mockUserDb.getUserByEmail.mockResolvedValue({
+      mockUserDb.getUserByEmailConsistent.mockResolvedValue({
         userId: 'user-1',
         email: 'deactivated@example.com',
         isActive: false,
@@ -382,7 +382,7 @@ describe('Security Tests', () => {
       const req: any = { body: { email: 'user@example.com', password: 'wrong' } };
       const res = createRes();
 
-      mockUserDb.getUserByEmail.mockResolvedValue({
+      mockUserDb.getUserByEmailConsistent.mockResolvedValue({
         userId: 'user-1',
         email: 'user@example.com',
         isActive: true,
@@ -400,7 +400,7 @@ describe('Security Tests', () => {
       const req: any = { body: { email: 'user@example.com', password: 'correct' } };
       const res = createRes();
 
-      mockUserDb.getUserByEmail.mockResolvedValue({
+      mockUserDb.getUserByEmailConsistent.mockResolvedValue({
         userId: 'user-1',
         email: 'user@example.com',
         isActive: true,
@@ -408,7 +408,7 @@ describe('Security Tests', () => {
         roles: ['customer'],
         isAdmin: false,
       } as any);
-      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).recordLogin.mockResolvedValue(undefined);
       (mockBcryptCompare as unknown as jest.Mock).mockResolvedValue(true);
       (mockJwt.sign as jest.Mock).mockReturnValue('jwt-token-123');
 
@@ -429,7 +429,7 @@ describe('Security Tests', () => {
       const req: any = { body: { email: 'USER@EXAMPLE.COM', password: 'correct' } };
       const res = createRes();
 
-      mockUserDb.getUserByEmail.mockResolvedValue({
+      mockUserDb.getUserByEmailConsistent.mockResolvedValue({
         userId: 'user-1',
         email: 'user@example.com',
         isActive: true,
@@ -437,14 +437,14 @@ describe('Security Tests', () => {
         roles: ['customer'],
         isAdmin: false,
       } as any);
-      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      (mockUserDb as any).recordLogin.mockResolvedValue(undefined);
       (mockBcryptCompare as unknown as jest.Mock).mockResolvedValue(true);
       (mockJwt.sign as jest.Mock).mockReturnValue('jwt-token-123');
 
       await login(req, res);
 
       // Verify email was lowercased before DB lookup
-      expect(mockUserDb.getUserByEmail).toHaveBeenCalledWith('user@example.com');
+      expect(mockUserDb.getUserByEmailConsistent).toHaveBeenCalledWith('user@example.com');
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ token: 'jwt-token-123' }));
     });
   });
