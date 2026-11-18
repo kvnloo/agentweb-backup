@@ -29,6 +29,7 @@ jest.mock('../utils/sseProgress', () => ({
 }));
 
 import agentModeRoutes from '../routes/agentMode';
+import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
 const app = express();
 app.use(express.json());
@@ -48,6 +49,7 @@ beforeEach(() => {
   mockFake.conditionalFailures = 0;
   mockRequestCancel.mockReset();
   mockFake.seedSession(SEEDED_SESSION);
+  clearShareVisitorTurn(SESSION_ID);
   jest.spyOn(console, 'error').mockImplementation(() => undefined);
   jest.spyOn(console, 'log').mockImplementation(() => undefined);
 });
@@ -57,7 +59,11 @@ describe('POST /api/agent-mode/ishare/:shareId/stop (public, conversable token)'
   const stop = (id: string, token?: string) =>
     request(app).post(`/api/agent-mode/ishare/${id}/stop${token === undefined ? '' : `?conversable=${token}`}`);
 
+  // ENG-2816 (step 3): a share-token stop cancels a turn only when a VISITOR's turn is the one running (the marker a share route sets
+  // where it claims the lock). This file is about the link checks, so the cases that expect a cancel run with one in progress; who
+  // may stop what is in agentModeRoutes.ishareStop.visitorTurn.test.ts.
   it('stops the run for a holder of the share token', async () => {
+    markShareVisitorTurn(SESSION_ID);
     const res = await stop(SESSION_ID, 'TOK');
     expect(res.status).toBe(200);
     expect(mockRequestCancel).toHaveBeenCalledWith(SESSION_ID);
@@ -99,6 +105,7 @@ describe('POST /api/agent-mode/ishare/:shareId/stop (public, conversable token)'
     // owner re-creates the share (new token, live expiry): the old token is refused, the new one stops the run
     mockFake.seedSession({ ...SEEDED_SESSION, interactiveShareMetadata: { ...SEEDED_SESSION.interactiveShareMetadata, token: 'NEW' } });
     expect((await stop(SESSION_ID, 'TOK')).status).toBe(401);
+    markShareVisitorTurn(SESSION_ID);
     expect((await stop(SESSION_ID, 'NEW')).status).toBe(200);
     expect(mockRequestCancel).toHaveBeenCalledTimes(1);
   });
