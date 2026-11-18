@@ -307,9 +307,9 @@ function dailyBarsHtml(daily: DailyPoint[], color: string, currency?: string): s
     .map((d) => {
       const h = max > 0 && d.spend > 0 ? Math.max(2, Math.round((d.spend / max) * BAR_AREA_PX)) : 0;
       const bar = h > 0
-        ? `<table cellpadding="0" cellspacing="0" width="28"><tr><td height="${h}" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`
-        : `<table cellpadding="0" cellspacing="0" width="28"><tr><td height="1" bgcolor="#dadce0" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`;
-      return `<td align="center" valign="bottom" style="padding:0 3px"><div style="font-size:11px;color:#5f6368;padding-bottom:3px">${escapeHtml(d.spend >= 100 ? int(d.spend) : d.spend.toFixed(d.spend >= 10 ? 0 : 1))}</div>${bar}<div style="font-size:11px;color:#5f6368;padding-top:4px">${escapeHtml(weekdayOf(d.date))}</div></td>`;
+        ? `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="${h}" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`
+        : `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="1" bgcolor="#dadce0" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`;
+      return `<td align="center" valign="bottom" style="padding:0 3px"><div style="font-size:11px;color:#5f6368;padding-bottom:3px">${escapeHtml(d.spend >= 100 ? int(d.spend) : d.spend === 0 ? '0' : d.spend.toFixed(d.spend >= 10 ? 0 : 1))}</div>${bar}<div style="font-size:11px;color:#5f6368;padding-top:4px">${escapeHtml(weekdayOf(d.date))}</div></td>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:12px 0 4px">Spend per day${currency ? ` (${escapeHtml(currency)})` : ''}</div><table cellpadding="0" cellspacing="0" style="margin:0 auto"><tr>${cols}</tr></table>`;
@@ -320,7 +320,7 @@ function campaignBarsHtml(top: TopCampaign[], color: string, currency?: string):
   const rows = top
     .map((c) => {
       const w = max > 0 ? Math.max(2, Math.round((c.spend / max) * 100)) : 0;
-      return `<tr><td style="padding:5px 0;font-size:13px;color:#202124;width:190px">${escapeHtml(cleanName(c.name))}</td><td style="padding:5px 8px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="12" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td><td></td></tr></table></td><td align="right" style="padding:5px 0;font-size:12px;color:#202124;white-space:nowrap">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.</td></tr>`;
+      return `<tr><td width="170" style="padding:5px 8px 5px 0;font-size:13px;color:#202124;width:170px">${escapeHtml(cleanName(c.name))}</td><td width="100%" style="padding:5px 8px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="12" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td><td></td></tr></table></td><td align="right" style="padding:5px 0;font-size:12px;color:#202124;white-space:nowrap">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.</td></tr>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:14px 0 2px">Top campaigns by spend</div><table width="100%" cellpadding="0" cellspacing="0">${rows}</table>`;
