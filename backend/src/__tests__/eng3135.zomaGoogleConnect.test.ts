@@ -97,7 +97,7 @@ describe('GET /api/oauth/google-ads/callback', () => {
     const expired = jwt.sign({ userId: 'u1', zoma: ZOMA_MCP_SETUP, nonce: 'n' }, getJwtSecret(), { expiresIn: -60 });
     const res = await request(app).get('/callback').query({ code: 'c0de', state: expired });
     expect(res.headers.location).toMatch(/^\/api\/zoma\/google\/callback\?/);
-    expect(await completeGoogleConnect({ code: 'c0de', state: expired }, defaultZomaGoogleDeps)).toMatchObject({ kind: 'page', status: 400 });
+    expect(await completeGoogleConnect({ code: 'c0de', state: expired }, { ...defaultZomaGoogleDeps, enabled: () => true })).toMatchObject({ kind: 'page', status: 400 });
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
   it('a forged (wrongly signed) state is not treated as Zoma', async () => {
@@ -117,6 +117,7 @@ describe('completeGoogleConnect', () => {
   const deps = (over: Partial<ZomaGoogleDeps> = {}): ZomaGoogleDeps => ({
     ...defaultZomaGoogleDeps,
     mintLink: jest.fn().mockResolvedValue('https://accounts.google.com/o/oauth2/v2/auth?state=fresh'),
+    enabled: () => true,
     ...over,
   });
 
@@ -202,6 +203,31 @@ describe('completeGoogleConnect', () => {
     expect(createAccount).not.toHaveBeenCalled();
   });
 
+  it('Google 401 NOT_ADS_USER (login never used Google Ads) is the no-account page, not a failure', async () => {
+    const notAdsUser = Object.assign(new Error('Request failed with status code 401'), {
+      response: { status: 401, data: { error: { code: 401, status: 'UNAUTHENTICATED', details: [
+        { errors: [{ errorCode: { authenticationError: 'NOT_ADS_USER' }, message: 'User in the cookie is not a valid Ads user.' }] },
+      ] } } },
+    });
+    tree.mockRejectedValueOnce(notAdsUser);
+    const step: any = await completeGoogleConnect({ code: 'c', state: zomaState() }, deps());
+    expect(step).toMatchObject({ kind: 'page', status: 400, title: 'No Google Ads account found', retryLabel: 'Connect Google Ads again' });
+    expect(step.steps.join(' ')).toContain('Create an account without a campaign');
+    expect(createAccount).not.toHaveBeenCalled();
+  });
+
+  it('any other 401 stays a generic failure and logs the status and Google error code', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const other = Object.assign(new Error('Request failed with status code 401'), {
+      response: { status: 401, data: { error: { details: [{ errors: [{ errorCode: { authenticationError: 'OAUTH_TOKEN_INVALID' } }] }] } } },
+    });
+    tree.mockRejectedValueOnce(other);
+    const step: any = await completeGoogleConnect({ code: 'c', state: zomaState() }, deps());
+    expect(step).toMatchObject({ status: 502, title: 'Google Ads not connected' });
+    expect(logSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain('status code 401 [OAUTH_TOKEN_INVALID]');
+    logSpy.mockRestore();
+  });
+
   it('a usable account still connects when another one is not enabled', async () => {
     tree.mockImplementation(async (_token: string, diag?: { notEnabledCustomerIds?: string[] }) => {
       if (diag) diag.notEnabledCustomerIds = ['9990001111'];
@@ -231,6 +257,9 @@ describe('completeGoogleConnect', () => {
 });
 
 describe('POST /api/zoma/google/select + GET /api/zoma/google/callback routes', () => {
+  const prev = process.env.ZOMA_GOOGLE_ENABLED;
+  beforeAll(() => { process.env.ZOMA_GOOGLE_ENABLED = 'true'; });
+  afterAll(() => { if (prev === undefined) delete process.env.ZOMA_GOOGLE_ENABLED; else process.env.ZOMA_GOOGLE_ENABLED = prev; });
   const app = express().use(express.urlencoded({ extended: false })).use('/api/zoma', createZomaRouter());
   it('renders the connected page on Zoma (not a redirect to the portal)', async () => {
     const res = await request(app).get('/api/zoma/google/callback').query({ code: 'c', state: zomaState() });
