@@ -416,7 +416,45 @@ function declaredErrorClass(error: any): { errorClass?: string } {
 }
 
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+export function normalizeCaption(text: string | undefined | null): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** ENG-3015: URN of a stored live post on this account whose caption matches exactly after whitespace normalisation. */
+export async function findLiveDuplicateCaption(accountId: string, content: string): Promise<string | null> {
+  const target = normalizeCaption(content);
+  if (!target) return null;
+  try {
+    const { getPostsByAccount } = await import('../../services/linkedInPostsDb');
+    const posts = await getPostsByAccount(accountId, 50);
+    const match = (posts || []).find((p: any) => p?.accountId === accountId && normalizeCaption(p?.content) === target);
+    return match ? String((match as any).postId) : null;
+  } catch (err) {
+    console.warn('[AgentMode] ENG-3015 duplicate-caption check skipped (non-fatal):', err);
+    return null;
+  }
+}
+
+/**
+ * ENG-3015 (Opslane P1 on c944dd2): the model could self-confirm a duplicate caption
+ * in the same turn. A confirm is honoured only when THIS session was refused for the
+ * same account+caption in an EARLIER run (the user answered in a new message). Same
+ * run, no run id, or no recorded refusal (e.g. after a restart) fails closed and
+ * re-asks. Process-local; a lost record only costs one extra confirmation.
+ */
+const duplicateCaptionRefusals = new Map<string, { runId: string; at: number }>();
+const DUPLICATE_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function duplicateRefusalKey(toolContext: any, accountId: string, content: string): string | null {
+  const sessionId = typeof toolContext?.sessionId === 'string' ? toolContext.sessionId : '';
+  return sessionId ? `${sessionId}|${accountId}|${normalizeCaption(content)}` : null;
+}
+
+export function __resetDuplicateCaptionRefusalsForTest(): void {
+  duplicateCaptionRefusals.clear();
+}
+
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean; confirmDuplicateCaption?: boolean }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -510,7 +548,6 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
       return { success: false, message: withdrawnMidFlight.error };
     }
 
-    console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
     // ENG-827 (Greptile): the check above is the last moment before ENTERING the
     // adapter, not before the post becomes real. LinkedIn uploads images and YouTube
     // downloads then uploads an entire video INSIDE createPost — minutes, on a
@@ -530,6 +567,41 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     if (inReplyToPostId && account.platform !== 'twitter') {
       return { success: false, message: `in_reply_to_post_id is only supported for X (Twitter) accounts, not ${account.platform}. Nothing was posted.` };
     }
+    // ENG-3015: an interactive LinkedIn publish whose caption is already live on the
+    // same page/profile stops and asks for an explicit confirm (the tool re-calls with
+    // confirm_duplicate_caption=true). Read-only against the stored posts cache; a
+    // read failure never blocks the publish.
+    if (options?.duplicateCaptionGuard === true && account.platform === 'linkedin' && !saveAsDraft) {
+      const existing = await findLiveDuplicateCaption(account.account_id, content);
+      if (existing) {
+        const unattended = toolContext?.isUnattendedRun === true;
+        const runId = typeof toolContext?.currentRunId === 'string' ? toolContext.currentRunId : '';
+        const key = duplicateRefusalKey(toolContext, account.account_id, content);
+        const prior = key ? duplicateCaptionRefusals.get(key) : undefined;
+        const confirmed = options?.confirmDuplicateCaption === true && !unattended && !!runId && !!prior
+          && prior.runId !== runId && Date.now() - prior.at < DUPLICATE_REFUSAL_TTL_MS;
+        if (confirmed && key) {
+          duplicateCaptionRefusals.delete(key);
+        } else {
+          // Refusal halts an interactive turn (awaitingUserConfirmation); an unattended
+          // run has nobody to ask, so it reports the refusal and never re-publishes.
+          if (key && !unattended && runId && (!prior || prior.runId !== runId)) {
+            duplicateCaptionRefusals.set(key, { runId, at: Date.now() });
+          }
+          const message = unattended
+            ? `Not posted: this caption is already live on this LinkedIn account (${existing}). Scheduled runs never re-publish a live caption.`
+            : `Not posted: this caption is already live on this LinkedIn account (${existing}). Ask the user whether to publish it again and stop; a re-publish works only after the user confirms in a new message.`;
+          return {
+            success: false,
+            duplicate_caption: true,
+            existing_post_urn: existing,
+            message,
+            ...(unattended ? {} : { awaitingUserConfirmation: true, confirmationPrompt: `This caption is already live on this LinkedIn account (${existing}). Post it again?` }),
+          };
+        }
+      }
+    }
+    console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
     const result = inReplyToPostId
       ? await (adapter as any).createPost(
         account, content, mediaUrls, ownerUserId,
