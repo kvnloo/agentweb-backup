@@ -8,6 +8,7 @@
  */
 import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 import { fetchCallerUrlText, CALLER_URL_BLOCKED_MESSAGE, CallerUrlBlockedError } from '../utils/callerUrlFetch';
+import { ANONYMOUS_TOOLS, anonymousUserIdForSession } from '../mcp/server/anonymousTransport';
 import { uploadFileToS3WithPath } from '../utils/s3Utils';
 
 jest.mock('../utils/callerUrlFetch', () => ({
@@ -264,6 +265,17 @@ describe('update_html_file: who may write the edited copy', () => {
         const r2 = await edit(mode, url('users/anon_abc1234/files/1700/abc/page.html'), 'anon_abc123');
         expect(r2.success).toBe(false);
         nothingTouched();
+      });
+    });
+
+    describe('what the anonymous-owner shortcut rests on', () => {
+      // The id of an anonymous MCP caller is `anon_<Mcp-Session-Id header>`: chosen by the client. Letting a caller write inside the
+      // `users/anon_<its own id>/` folder is safe only because such a caller can run nothing but a read-only tool. If a tool that writes
+      // to the bucket is ever added to the anonymous list, an attacker could name a victim's anonymous id in that header and write into
+      // the victim's folder. This pin makes that change fail here, with the reason, instead of silently opening the hole.
+      it('anonymous MCP callers can execute exactly one tool, emma_review_site, and nothing that writes files', () => {
+        expect([...ANONYMOUS_TOOLS]).toEqual(['emma_review_site']);
+        expect(anonymousUserIdForSession('abc-from-a-header')).toBe('anon_abc-from-a-header');
       });
     });
 

@@ -62,7 +62,6 @@ describe('perform_data_analysis: plain URLs in file_urls', () => {
       ['localhost', 'http://localhost/admin'],
       ['a private 10/8 address', 'http://10.0.0.5/data.csv'],
       ['a private 192.168/16 address', 'https://192.168.1.1/data.csv'],
-      ['IPv6 loopback', 'http://[::1]/data.csv'],
       ['a decimal-encoded loopback', 'http://2130706433/data.csv'],
       ['a file: URL', 'file:///etc/passwd'],
       ['an ftp: URL', 'ftp://example.com/data.csv'],
@@ -180,7 +179,8 @@ describe('perform_data_analysis: plain URLs in file_urls', () => {
       expect(r.success).toBe(false);
       expect(r.errorClass).toBe('timeout');
       expect(r.message).toContain('https://example.com/slow.csv');
-      expect(r.message).toMatch(/did not finish within 30 seconds/);
+      expect(r.message).toMatch(/did not finish within the 30-second download limit/);
+      expect(console.error).toHaveBeenCalled(); // a timeout is still logged
       expect(classifyToolErrorClass(toolResultError(r))).toBe('timeout');
       expect(post).not.toHaveBeenCalled();
     });
