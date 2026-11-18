@@ -99,22 +99,81 @@ async function getAlertEmails(settingKey: string, fallback: string[]): Promise<s
 /** ENG-3149: the longest schedule name (in characters, ellipsis included) the visitor-schedule alert will show. */
 export const SHARE_SCHEDULE_ALERT_NAME_MAX = 100;
 
+/** What replaces a link-like piece of a visitor-written name. */
+export const SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER = '[link removed]';
+
+// Whitespace of every kind (tabs, newlines, no-break and other Unicode spaces, line and paragraph separators) is a SEPARATOR.
+const NAME_SEPARATORS = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]+/gu;
+// Characters that draw nothing (or draw something other than what is there) are DELETED, not turned into a space: a name must not
+// be able to hide a dot, a slash or a word inside an invisible character, nor flip the reading order of what follows. That is every
+// format character (\p{Cf}: zero-width and joiner characters U+200B-200F, U+2060 and friends, soft hyphen U+00AD, the Arabic letter
+// mark U+061C, the left-to-right / right-to-left embeddings, overrides and isolates U+202A-202E and U+2066-2069, the BOM, ...), the
+// remaining control characters, the invisible "filler" letters (U+115F, U+1160, U+3164, U+FFA0), the combining grapheme joiner
+// (U+034F), the blank braille pattern (U+2800) and the tag characters (U+E0000-E007F).
+const NAME_INVISIBLES = /[\p{Cc}\p{Cf}\u034F\u115F\u1160\u2800\u3164\uFFA0\u{E0000}-\u{E007F}]/gu;
+
+// Anything a mail client could turn into a link, or that reads as an address to contact:
+//  - scheme://anything, and the schemes that carry their payload without slashes (mailto:, tel:, javascript:, data: ...);
+//  - www.anything;
+//  - user@host (an "@" with something on both sides, no spaces);
+//  - a numeric IPv4 address with a port or a path.
+const DOT = '[.\\u3002\\uFF0E\\uFF61]';
+const NAME_LINK_LIKE = new RegExp([
+  '[\\p{L}][\\p{L}\\p{N}+.-]*:\\/\\/\\S*',
+  '(?:mailto|tel|sms|data|javascript|vbscript)\\s*:\\S+',
+  `www${DOT}\\S*`,
+  '[^\\s@]+@[^\\s@]+',
+  '(?<![\\d.])\\d{1,3}(?:\\.\\d{1,3}){3}(?:[:/]\\S*)',
+].join('|'), 'giu');
+// A bare host name, optionally followed by a port, path, query or fragment: dot-separated labels (letters, digits, "_" and "-", in
+// any script) ending in a TOP-LEVEL part of 2 or more letters (or an "xn--" punycode one), with no space inside, not glued to more
+// word characters on either side. "evil.example/x", "login.bank.example", "evil.example:8080" match.
+// Deliberately NOT a host, so ordinary names stay as written: "Weekly report v2.1", "Release 3.0", "1.2.3", "10.0" (the last part is
+// not letters), "Q4 plan." and "Acme Inc." (nothing after the dot), "e.g." and "U.S.A" (a one-letter last part cannot be a top-level
+// domain), and "v1.2.final" or "2.5.beta" (every part before the last is a bare version number: at least two of them, so a domain
+// like "163.com" is still a host). A name like "Mr.Smith" or "Sales.Report" IS read as a host and replaced: the cost of that is a
+// placeholder in a notification, the cost of the opposite mistake is a clickable address in a real AgentWeb mail.
+const NAME_HOST_LIKE = new RegExp(
+  `(?<![\\p{L}\\p{N}_-])(?:[\\p{L}\\p{N}_-]+${DOT})+(?:\\p{L}{2,}|xn--[a-z0-9-]{2,})(?![\\p{L}\\p{N}_-])(?:[/:?#]\\S*)?`,
+  'giu',
+);
+const isVersionLikeHost = (match: string): boolean => {
+  const host = match.split(/[/:?#]/u)[0];
+  if (host.length !== match.length) return false; // has a path, port, query or fragment: that is a link
+  const labels = host.split(new RegExp(DOT, 'u'));
+  const beforeTld = labels.slice(0, -1);
+  return beforeTld.length >= 2 && beforeTld.every((label) => /^v?\d+$/iu.test(label));
+};
+
 /**
- * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner: every run of whitespace
- * (newlines and tabs too) and every other control character becomes one space, the ends are trimmed, and a name longer than
- * SHARE_SCHEDULE_ALERT_NAME_MAX is cut (on whole characters, never mid surrogate pair) with an ellipsis at the end so the result
- * stays within the limit. HTML escaping is the caller's job at the point it writes HTML; the plain-text part uses this as is.
+ * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. The name is the one piece
+ * of visitor text in a real AgentWeb mail, so it must not be able to carry a link, an address, hidden characters or extra lines.
+ * In this order (the order matters):
+ *  1. whitespace of any kind becomes a single separator;
+ *  2. invisible and format characters are deleted (so a dot cannot be hidden inside one to get past step 3);
+ *  3. link-like and address-like pieces (see NAME_LINK_LIKE, NAME_HOST_LIKE) become SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER;
+ *  4. runs of spaces collapse and the ends are trimmed;
+ *  5. a name longer than SHARE_SCHEDULE_ALERT_NAME_MAX is cut (on whole characters, never mid surrogate pair) with an ellipsis at
+ *     the end so the result stays within the limit.
+ * Nothing left to show (nothing, only invisible characters, or only link placeholders) reads "Untitled". HTML escaping is the
+ * caller's job where it writes HTML; the plain-text part uses this as is.
  */
 export function shareScheduleAlertName(name: unknown): string {
-  const collapsed = (typeof name === 'string' ? name : '')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\s\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+  const text = typeof name === 'string' ? name : '';
+  let linkRemoved = false;
+  const hide = () => { linkRemoved = true; return SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER; };
+  const cleaned = text
+    .replace(NAME_SEPARATORS, ' ')
+    .replace(NAME_INVISIBLES, '')
+    .replace(NAME_LINK_LIKE, hide)
+    .replace(NAME_HOST_LIKE, (match) => (isVersionLikeHost(match) ? match : hide()))
+    .replace(/ {2,}/g, ' ')
     .trim();
-  const characters = Array.from(collapsed);
-  const shown = characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX
-    ? `${characters.slice(0, SHARE_SCHEDULE_ALERT_NAME_MAX - 1).join('').trimEnd()}\u2026`
-    : collapsed;
-  return shown || 'Untitled';
+  if (!cleaned) return 'Untitled';
+  if (linkRemoved && !/[\p{L}\p{N}]/u.test(cleaned.split(SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER).join(''))) return 'Untitled';
+  const characters = Array.from(cleaned);
+  if (characters.length <= SHARE_SCHEDULE_ALERT_NAME_MAX) return cleaned;
+  return `${characters.slice(0, SHARE_SCHEDULE_ALERT_NAME_MAX - 1).join('').trimEnd()}…`;
 }
 
 export const emailService = {
