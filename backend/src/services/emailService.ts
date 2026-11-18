@@ -99,81 +99,86 @@ async function getAlertEmails(settingKey: string, fallback: string[]): Promise<s
 /** ENG-3149: the longest schedule name (in characters, ellipsis included) the visitor-schedule alert will show. */
 export const SHARE_SCHEDULE_ALERT_NAME_MAX = 100;
 
-/** What replaces a link-like piece of a visitor-written name. */
-export const SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER = '[link removed]';
+// A visitor chooses the name and nothing else limits its length (the request body limit is megabytes), and it is cleaned inside the
+// visitor's own request. So the work is bounded FIRST: only the first 300 code points of what was sent are ever looked at, and NFKC
+// (which can lengthen a string) is followed by a second cut to 400. Every step after that runs over at most 400 code points.
+const NAME_MAX_RAW_CODE_POINTS = 300;
+const NAME_MAX_NORMALIZED_CODE_POINTS = 400;
 
-// Whitespace of every kind (tabs, newlines, no-break and other Unicode spaces, line and paragraph separators) is a SEPARATOR.
-const NAME_SEPARATORS = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]+/gu;
-// Characters that draw nothing (or draw something other than what is there) are DELETED, not turned into a space: a name must not
-// be able to hide a dot, a slash or a word inside an invisible character, nor flip the reading order of what follows. That is every
-// format character (\p{Cf}: zero-width and joiner characters U+200B-200F, U+2060 and friends, soft hyphen U+00AD, the Arabic letter
-// mark U+061C, the left-to-right / right-to-left embeddings, overrides and isolates U+202A-202E and U+2066-2069, the BOM, ...), the
-// remaining control characters, the invisible "filler" letters (U+115F, U+1160, U+3164, U+FFA0), the combining grapheme joiner
-// (U+034F), the blank braille pattern (U+2800) and the tag characters (U+E0000-E007F).
-const NAME_INVISIBLES = /[\p{Cc}\p{Cf}\u034F\u115F\u1160\u2800\u3164\uFFA0\u{E0000}-\u{E007F}]/gu;
+/** The first `max` code points of `text`, found by looking at no more than `max` of them (a surrogate pair counts once). */
+function firstCodePoints(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = 0;
+  for (let counted = 0; counted < max && end < text.length; counted++) {
+    const unit = text.charCodeAt(end);
+    const next = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+    end += unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? 2 : 1;
+  }
+  return text.slice(0, end);
+}
 
-// Anything a mail client could turn into a link, or that reads as an address to contact:
-//  - scheme://anything, and the schemes that carry their payload without slashes (mailto:, tel:, javascript:, data: ...);
-//  - www.anything;
-//  - user@host (an "@" with something on both sides, no spaces);
-//  - a numeric IPv4 address with a port or a path.
-const DOT = '[.\\u3002\\uFF0E\\uFF61]';
-const NAME_LINK_LIKE = new RegExp([
-  '[\\p{L}][\\p{L}\\p{N}+.-]*:\\/\\/\\S*',
-  '(?:mailto|tel|sms|data|javascript|vbscript)\\s*:\\S+',
-  `www${DOT}\\S*`,
-  '[^\\s@]+@[^\\s@]+',
-  '(?<![\\d.])\\d{1,3}(?:\\.\\d{1,3}){3}(?:[:/]\\S*)',
-].join('|'), 'giu');
-// A bare host name, optionally followed by a port, path, query or fragment: dot-separated labels (letters, digits, "_" and "-", in
-// any script) ending in a TOP-LEVEL part of 2 or more letters (or an "xn--" punycode one), with no space inside, not glued to more
-// word characters on either side. "evil.example/x", "login.bank.example", "evil.example:8080" match.
-// Deliberately NOT a host, so ordinary names stay as written: "Weekly report v2.1", "Release 3.0", "1.2.3", "10.0" (the last part is
-// not letters), "Q4 plan." and "Acme Inc." (nothing after the dot), "e.g." and "U.S.A" (a one-letter last part cannot be a top-level
-// domain), and "v1.2.final" or "2.5.beta" (every part before the last is a bare version number: at least two of them, so a domain
-// like "163.com" is still a host). A name like "Mr.Smith" or "Sales.Report" IS read as a host and replaced: the cost of that is a
-// placeholder in a notification, the cost of the opposite mistake is a clickable address in a real AgentWeb mail.
-const NAME_HOST_LIKE = new RegExp(
-  `(?<![\\p{L}\\p{N}_-])(?:[\\p{L}\\p{N}_-]+${DOT})+(?:\\p{L}{2,}|xn--[a-z0-9-]{2,})(?![\\p{L}\\p{N}_-])(?:[/:?#]\\S*)?`,
-  'giu',
-);
-const isVersionLikeHost = (match: string): boolean => {
-  const host = match.split(/[/:?#]/u)[0];
-  if (host.length !== match.length) return false; // has a path, port, query or fragment: that is a link
-  const labels = host.split(new RegExp(DOT, 'u'));
-  const beforeTld = labels.slice(0, -1);
-  return beforeTld.length >= 2 && beforeTld.every((label) => /^v?\d+$/iu.test(label));
-};
+// Every regex below is ONE character class (or a one-character lookaround around it), applied globally: nothing in them can
+// backtrack, so the cost is linear in the (bounded) input.
+
+// Whitespace of any kind becomes a separator.
+const NAME_WHITESPACE = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]/gu;
+// Characters that draw nothing, or draw something other than what is there, are DELETED (not turned into a space), so a name cannot
+// hide a dot, a slash or a word inside one and then have the rest read as separate words: every default-ignorable code point
+// (soft hyphen, zero-width and joiner characters, bidi controls, variation selectors, the filler letters, the tag range ...), every
+// control, format, surrogate and private-use character, and the invisible ones that are none of those but are listed by name
+// (U+115F, U+1160, U+3164, U+FFA0 fillers, U+034F combining grapheme joiner, U+2800 blank braille, the tag characters).
+const NAME_INVISIBLE =
+  /[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Co}ᅟᅠㅤﾠ͏⠀\u{E0000}-\u{E007F}]/gu;
+// A "." is kept only between two digits ("v2.1", "Release 3.0", "1.2.3"); every other dot becomes a space.
+const NAME_DOT_NOT_BETWEEN_DIGITS = /(?<!\d)\.|\.(?!\d)/g;
+// ALLOW-LIST: letters, combining marks (so Devanagari, Thai, Arabic and accented text keep their signs), digits, space, the dots
+// kept above, and a small set of punctuation: _ - ' (U+2019) & , ( ) + # ! ? %. Everything else becomes a space. In particular
+// : / \ @ < > " ; = [ ] { } | ~ ^ * $ and every look-alike of a dot, and emoji and other symbols.
+const NAME_NOT_ALLOWED = /[^\p{L}\p{M}\p{N} _\-'’&,()+#!?%.]/gu;
 
 /**
- * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. The name is the one piece
- * of visitor text in a real AgentWeb mail, so it must not be able to carry a link, an address, hidden characters or extra lines.
- * In this order (the order matters):
- *  1. whitespace of any kind becomes a single separator;
- *  2. invisible and format characters are deleted (so a dot cannot be hidden inside one to get past step 3);
- *  3. link-like and address-like pieces (see NAME_LINK_LIKE, NAME_HOST_LIKE) become SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER;
+ * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. It is the one piece of
+ * visitor text in a real AgentWeb mail, so nothing in it may be clickable, look like an address, hide anything or reorder text. An
+ * ALLOW-LIST does that (a list of what may stay, not of what may not), in this order:
+ *  0. not a string -> "Untitled"; only the first 300 code points are used, before any other work;
+ *  1. NFKC (folds full-width and compatibility characters, including look-alike dots, to their plain form), then cut to 400;
+ *  2. whitespace of any kind becomes a space, then invisible characters are deleted;
+ *  3. a "." not between two digits becomes a space, then everything but letters, marks, digits, spaces and a few punctuation marks
+ *     becomes a space (so "evil.example/x" can only ever read "evil example x");
  *  4. runs of spaces collapse and the ends are trimmed;
- *  5. a name longer than SHARE_SCHEDULE_ALERT_NAME_MAX is cut (on whole characters, never mid surrogate pair) with an ellipsis at
- *     the end so the result stays within the limit.
- * Nothing left to show (nothing, only invisible characters, or only link placeholders) reads "Untitled". HTML escaping is the
- * caller's job where it writes HTML; the plain-text part uses this as is.
+ *  5. a name over SHARE_SCHEDULE_ALERT_NAME_MAX characters is cut on whole characters to fit WITH its ellipsis;
+ *  6. nothing left -> "Untitled".
+ * Cleaning an already clean name returns it unchanged (a single trailing ellipsis is carried over rather than cleaned away). HTML
+ * escaping is the caller's job where it writes HTML; the plain-text part uses this as is. Costs and consequences are in
+ * dev/pending/eng-3149-owner-alert-for-visitor-schedules.md.
  */
 export function shareScheduleAlertName(name: unknown): string {
-  const text = typeof name === 'string' ? name : '';
-  let linkRemoved = false;
-  const hide = () => { linkRemoved = true; return SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER; };
-  const cleaned = text
-    .replace(NAME_SEPARATORS, ' ')
-    .replace(NAME_INVISIBLES, '')
-    .replace(NAME_LINK_LIKE, hide)
-    .replace(NAME_HOST_LIKE, (match) => (isVersionLikeHost(match) ? match : hide()))
-    .replace(/ {2,}/g, ' ')
+  if (typeof name !== 'string') return 'Untitled';
+  let raw = firstCodePoints(name, NAME_MAX_RAW_CODE_POINTS);
+  // The ellipsis this function adds when it cuts a name must survive being cleaned again, so a single trailing one is set aside.
+  const hadTrailingEllipsis = raw.endsWith('…');
+  if (hadTrailingEllipsis) raw = raw.slice(0, -1);
+
+  const cleaned = firstCodePoints(raw.normalize('NFKC'), NAME_MAX_NORMALIZED_CODE_POINTS)
+    .replace(NAME_WHITESPACE, ' ')
+    .replace(NAME_INVISIBLE, '')
+    .replace(NAME_DOT_NOT_BETWEEN_DIGITS, ' ')
+    .replace(NAME_NOT_ALLOWED, ' ')
+    // Deleting a character can put a base and a mark next to each other that were not: compose them again, so that cleaning is
+    // stable. (Letters stay letters; this cannot bring back anything the steps above removed.)
+    .normalize('NFKC')
+    .replace(/ +/g, ' ')
     .trim();
   if (!cleaned) return 'Untitled';
-  if (linkRemoved && !/[\p{L}\p{N}]/u.test(cleaned.split(SHARE_SCHEDULE_ALERT_LINK_PLACEHOLDER).join(''))) return 'Untitled';
+
   const characters = Array.from(cleaned);
-  if (characters.length <= SHARE_SCHEDULE_ALERT_NAME_MAX) return cleaned;
-  return `${characters.slice(0, SHARE_SCHEDULE_ALERT_NAME_MAX - 1).join('').trimEnd()}…`;
+  const addEllipsis = hadTrailingEllipsis || characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const room = addEllipsis ? SHARE_SCHEDULE_ALERT_NAME_MAX - 1 : SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const shown = characters.length > room
+    // A cut must not leave a dot dangling (it would not survive cleaning again), nor spaces before the ellipsis.
+    ? characters.slice(0, room).join('').replace(/[ .]+$/, '')
+    : cleaned;
+  return addEllipsis ? `${shown}…` : shown;
 }
 
 export const emailService = {
@@ -1959,8 +1964,9 @@ Schedule ID: ${scheduleId}
 
   // ENG-3149: a share-link visitor has just made the first mark on one of the owner's scheduled chats (the owner otherwise only
   // sees the "Visitor-edited" badge). A notification only. The subject is fixed and the schedule NAME is the one piece of
-  // visitor-controlled text in the mail: it is whitespace-collapsed, cut to SHARE_SCHEDULE_ALERT_NAME_MAX characters and escaped
-  // (see shareScheduleAlertName). No prompt text, share token, IP or recipient list goes in. Never throws, like its siblings.
+  // visitor-controlled text in the mail: it is reduced to letters, marks, digits and a little punctuation, cut to
+  // SHARE_SCHEDULE_ALERT_NAME_MAX characters and escaped (see shareScheduleAlertName). No prompt text, share token, IP or recipient
+  // list goes in. Never throws, like its siblings.
   async sendVisitorScheduleAlertEmail(
     toEmails: string | string[],
     scheduleName: string,
