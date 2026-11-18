@@ -62,6 +62,43 @@ async function section(name: string, path: string, identity: any) {
   }
 }
 
+/**
+ * Flattens the raw /api/brand/guidelines and /api/market-strategy bodies into one
+ * named, machine-readable export (ENG-3122). Read-only mapping of fields those
+ * routes already store; nothing is derived or invented. A section that could not
+ * be read yields null fields here, and the caller reports it under `unavailable`.
+ */
+export function buildBrandExport(brandBody: any, strategyBody: any) {
+  const b = brandBody?.brandData ?? {};
+  const s = strategyBody?.data ?? {};
+  const attachments: any[] = Array.isArray(brandBody?.attachments) ? brandBody.attachments : [];
+  const val = (v: any) => (v === undefined || v === '' ? null : v);
+  const logoUrls = [
+    b.logoUrl,
+    ...attachments.filter(a => a?.type === 'logo' || a?.type === 'secondaryLogo').map(a => a?.url),
+  ].filter((u): u is string => typeof u === 'string' && u.length > 0);
+  return {
+    brand_name: val(b.brandName),
+    tagline: val(b.tagline),
+    value_proposition: val(b.valueProposition),
+    domain: val(b.domain),
+    primary_color: val(b.primaryColor),
+    primary_color_end: val(b.primaryColorEnd),
+    secondary_color: val(b.secondaryColor),
+    font_family: val(b.fontFamily),
+    tone_of_voice: val(b.toneOfVoice),
+    personality: val(b.brandPersonality),
+    values: val(b.brandValues),
+    key_messages: val(b.keyMessages),
+    target_audience: val(b.targetAudience),
+    founders: val(b.founders),
+    logo_urls: Array.from(new Set(logoUrls)),
+    business_overview: val(s.businessOverview),
+    competitors: val(s.competitors),
+    icps: val(s.icp),
+  };
+}
+
 // ─── 1. Delegate a goal to Emma ─────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -312,6 +349,9 @@ mcpToolRegistry.register({
       brand_guidelines: brand.data,
       market_strategy: strategy.data,
       knowledge_base_files: knowledge.data,
+      // Named fields across both sections (ENG-3122). Raw sections above stay
+      // unchanged for existing callers.
+      structured_export: buildBrandExport(brand.data, strategy.data),
       // "Not configured" and "we could not reach the service" are different
       // facts. Collapsing both to null tells the agent this company has no
       // brand, and it will then invent one.

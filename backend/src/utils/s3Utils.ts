@@ -316,6 +316,24 @@ export async function uploadFileToS3(
   }
 }
 
+/** Normalize a file name: decompose accents and drop the combining marks (reduces signature issues from non-ASCII chars). */
+function normalizeS3Filename(filename: string): string {
+  return (filename || "")
+    .normalize("NFKD")
+    // remove combining diacritical marks
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+/**
+ * The last key segment `uploadFileToS3WithPath` actually writes for a given file name (ASCII-only, safe chars). Exported so a caller that
+ * authorises a key before writing it (ENG-2988, POST /api/files/html) checks the key that will really be written, not the name it was given.
+ */
+export function sanitizeS3Filename(filename: string): string {
+  return normalizeS3Filename(filename)
+    .replace(/[^a-zA-Z0-9.-]/g, '_')
+    .replace(/\s+/g, '_');
+}
+
 /**
  * Upload file to S3 with a specific path structure
  * @param content - File content (Buffer or string)
@@ -332,15 +350,10 @@ export async function uploadFileToS3WithPath(
 ): Promise<S3UploadResult> {
   try {
     // Normalize and sanitize filename to reduce risk of signature issues from non-ASCII chars
-    const normalizedFilename = (filename || "")
-      .normalize("NFKD")
-      // remove combining diacritical marks
-      .replace(/[\u0300-\u036f]/g, "");
+    const normalizedFilename = normalizeS3Filename(filename);
 
     // Sanitize filename for S3 key (ASCII-only, safe chars)
-    const sanitizedFilename = normalizedFilename
-      .replace(/[^a-zA-Z0-9.-]/g, '_')
-      .replace(/\s+/g, '_');
+    const sanitizedFilename = sanitizeS3Filename(filename);
 
     // S3 object metadata values must be US-ASCII. Prepare a safe metadata value.
     const asciiMetadataFilename = normalizedFilename

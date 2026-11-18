@@ -12,6 +12,10 @@ export interface LinkedInAdsApiResult {
   data?: any;
   error?: string;
   status?: number;
+  /** ENG-3064: set when an update was accepted but could not be confirmed by reading the resource back. */
+  errorType?: 'unsupported_field' | 'read_back_failed';
+  /** ENG-3064: with `unsupported_field`, the LinkedIn field paths that did not land. */
+  fields?: string[];
 }
 
 // ─── UTM tagging (ENG-239) ─────────────────────────────────────────────────────
@@ -156,6 +160,70 @@ async function makeRequest(
 
     return { success: false, error: fullError, status };
   }
+}
+
+// ─── Update read-back (ENG-3064, docs/ad-api-read-back-pattern.md) ────────────
+
+/**
+ * A 2xx on a PARTIAL_UPDATE is not evidence the change landed. Read the resource back and
+ * compare each requested field (`expected`: LinkedIn field path -> requested value).
+ *
+ * Returns the update result untouched when it failed (no read is made) or when every field
+ * matches. Otherwise `success: false` with `errorType: 'unsupported_field'` and the paths that
+ * did not land, or `errorType: 'read_back_failed'` when the read itself failed. A resource
+ * that reads back empty fails every field.
+ *
+ * Money amounts compare as numbers (LinkedIn echoes "1500.00" for 1500); everything else as
+ * strings. Not live-verified: no test ad account exists, so the echo shapes are from
+ * LinkedIn's docs, and a read that lags the write would show up as a false failure.
+ */
+async function verifyUpdate(
+  update: LinkedInAdsApiResult,
+  accessToken: string,
+  readPath: string,
+  expected: Record<string, unknown>,
+): Promise<LinkedInAdsApiResult> {
+  const paths = Object.keys(expected);
+  if (!update.success || paths.length === 0) return update;
+
+  const read = await makeRequest('GET', readPath, accessToken);
+  if (!read.success) {
+    return {
+      success: false,
+      errorType: 'read_back_failed',
+      status: read.status,
+      error: `read_back_failed: LinkedIn accepted the update for ${readPath} but the read-back request failed (${read.error}). The change is NOT confirmed; do not report it as done.`,
+    };
+  }
+
+  const fields = paths.filter((path) => {
+    const actual = path.split('.').reduce((node: any, key) => node?.[key], read.data);
+    if (actual === undefined || actual === null) return true;
+    return path.endsWith('.amount')
+      ? Number(actual) !== Number(expected[path])
+      : String(actual) !== String(expected[path]);
+  });
+  if (fields.length === 0) return update;
+  return {
+    success: false,
+    errorType: 'unsupported_field',
+    fields,
+    error: `unsupported_field: LinkedIn accepted the update for ${readPath} but read-back shows these field(s) did not change: ${fields.join(', ')}. Those field(s) were NOT applied; do not report them as done.`,
+  };
+}
+
+/** Flatten a `$set` body into the field paths `verifyUpdate` compares, one level deep. */
+function expectedFromSet(setFields: Record<string, any>, skip: string[] = []): Record<string, unknown> {
+  const expected: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(setFields)) {
+    if (skip.includes(key)) continue;
+    if (value && typeof value === 'object') {
+      for (const [sub, subValue] of Object.entries(value)) expected[`${key}.${sub}`] = subValue;
+    } else {
+      expected[key] = value;
+    }
+  }
+  return expected;
 }
 
 // ─── Token management ─────────────────────────────────────────────────────────
@@ -304,13 +372,9 @@ export async function updateCampaignGroup(
     setFields.runSchedule = { end: params.run_schedule_end };
   }
 
-  return makeRequest(
-    'POST',
-    `/rest/adAccounts/${adAccountId}/adCampaignGroups/${campaignGroupId}`,
-    accessToken,
-    { patch: { $set: setFields } },
-    { 'X-RestLi-Method': 'PARTIAL_UPDATE' }
-  );
+  const path = `/rest/adAccounts/${adAccountId}/adCampaignGroups/${campaignGroupId}`;
+  const update = await makeRequest('POST', path, accessToken, { patch: { $set: setFields } }, { 'X-RestLi-Method': 'PARTIAL_UPDATE' });
+  return verifyUpdate(update, accessToken, path, expectedFromSet(setFields));
 }
 
 // ─── Campaign ─────────────────────────────────────────────────────────────────
@@ -569,13 +633,11 @@ export async function updateCampaign(
     if (scheduleEnd !== undefined) setFields.runSchedule.end = scheduleEnd;
   }
 
-  return makeRequest(
-    'POST',
-    `/rest/adAccounts/${adAccountId}/adCampaigns/${campaignId}`,
-    accessToken,
-    { patch: { $set: setFields } },
-    { 'X-RestLi-Method': 'PARTIAL_UPDATE' }
-  );
+  const path = `/rest/adAccounts/${adAccountId}/adCampaigns/${campaignId}`;
+  const update = await makeRequest('POST', path, accessToken, { patch: { $set: setFields } }, { 'X-RestLi-Method': 'PARTIAL_UPDATE' });
+  // targetingCriteria is sent but not compared: LinkedIn's echo shape for it is unconfirmed
+  // (no test ad account), and a rewritten-but-equivalent echo would fail a change that landed.
+  return verifyUpdate(update, accessToken, path, expectedFromSet(setFields, ['targetingCriteria']));
 }
 
 // ─── Post (sponsored dark post) ───────────────────────────────────────────────
@@ -994,13 +1056,9 @@ export async function updateCreativeStatus(
   status: string,
 ): Promise<LinkedInAdsApiResult> {
   const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
-  return makeRequest(
-    'POST',
-    `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`,
-    accessToken,
-    { patch: { $set: { intendedStatus: status } } },
-    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
-  );
+  const path = `/rest/adAccounts/${adAccountId}/creatives/${encodeURIComponent(creativeUrn)}`;
+  const update = await makeRequest('POST', path, accessToken, { patch: { $set: { intendedStatus: status } } }, { 'X-RestLi-Method': 'PARTIAL_UPDATE' });
+  return verifyUpdate(update, accessToken, path, { intendedStatus: status });
 }
 
 /**
@@ -1073,13 +1131,15 @@ export async function retagCreativeUtm(
   // merge -- it replaces the whole textAd object. Sending only landingPage
   // fails with "field is required but not found and has no default value" on
   // headline/description. Every existing field must be echoed back verbatim.
-  return makeRequest(
+  const path = `/rest/adAccounts/${adAccountId}/creatives/${encoded}`;
+  const update = await makeRequest(
     'POST',
-    `/rest/adAccounts/${adAccountId}/creatives/${encoded}`,
+    path,
     accessToken,
     { patch: { $set: { content: { textAd: { ...content.textAd, landingPage: newUrl } } } } },
     { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
   );
+  return verifyUpdate(update, accessToken, path, { 'content.textAd.landingPage': newUrl });
 }
 
 /**
@@ -1148,13 +1208,9 @@ export async function retagPostUtm(
     return { success: true, alreadyTagged: true };
   }
 
-  return makeRequest(
-    'POST',
-    `/rest/posts/${encoded}`,
-    accessToken,
-    { patch: { $set: { contentLandingPage: newUrl } } },
-    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
-  );
+  const path = `/rest/posts/${encoded}`;
+  const update = await makeRequest('POST', path, accessToken, { patch: { $set: { contentLandingPage: newUrl } } }, { 'X-RestLi-Method': 'PARTIAL_UPDATE' });
+  return verifyUpdate(update, accessToken, path, { contentLandingPage: newUrl });
 }
 
 // ─── Image upload ─────────────────────────────────────────────────────────────
@@ -1610,6 +1666,9 @@ export async function createConversationAdContent(
 /**
  * Set the first message node in a Conversation Ad (required before launching).
  * PATCH /rest/conversationAds/{conversationAdUrn}
+ *
+ * ENG-3064: not verified by read-back. LinkedIn documents the first-message field as
+ * update-only and its GET example does not return it, so there is nothing to compare.
  */
 export async function setConversationAdFirstContent(
   accessToken: string,
