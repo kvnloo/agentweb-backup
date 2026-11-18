@@ -157,7 +157,6 @@ describe('createScheduledChat', () => {
   it.each([
     ['a visitor by claim', visitorByClaim],
     ['a visitor by the turn marker only', visitorByMarkerOnly],
-    ['a marked run by claim', markedRunByClaim],
   ])('%s: its schedule is born marked, so the owner is emailed ONCE, at the owner\'s login address, with the new schedule\'s name and id', async (_name, caller) => {
     const res = await create(caller);
     expect(res.status).toHaveBeenCalledWith(201);
@@ -359,6 +358,53 @@ describe('submitScheduledChatVariables (a signed-in visitor\'s variable write)',
   });
 });
 
+describe('a MARKED RUN\'s own write never alerts (it would drip an email per run, for a schedule that already alerted)', () => {
+  it('createScheduledChat by a marked run: the schedule is still born marked, and nobody is emailed', async () => {
+    const res = await create(markedRunByClaim);
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(createdSchedule().provenance?.length).toBeGreaterThan(0);
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('createScheduleFromTemplate by a marked run: the same', async () => {
+    const res = await useTemplate(markedRunByClaim);
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(createdSchedule().provenance?.length).toBeGreaterThan(0);
+    expect(sendAlert).not.toHaveBeenCalled();
+  });
+
+  it('updateScheduledChat by a marked run, on an unmarked schedule of the owner\'s: the mark is made, nobody is emailed', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    await update(markedRunByClaim, { startingMessage: 'the run wrote this' });
+    expect(mockScheduleDb.updateSchedule.mock.calls[0][1]).toHaveProperty('provenanceAdd', ['startingMessage']);
+    expect(sendAlert).not.toHaveBeenCalled();
+  });
+
+  it('submitScheduledChatVariables by a marked run: the same', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(
+      stored({ startingMessage: 'Hello {{who}}', variables: [{ name: 'who' }], variableValues: { who: 'Alice' } }) as any);
+    await submit(markedRunByClaim, { who: 'Mallory' });
+    expect(mockScheduleDb.updateSchedule.mock.calls[0][1]).toHaveProperty('provenanceAdd', ['variableValues']);
+    expect(sendAlert).not.toHaveBeenCalled();
+  });
+
+  it('a marked run\'s writes spend no slot, so a real visitor turn right after is still told (the cap is not eaten by runs)', async () => {
+    for (let i = 0; i < 10; i++) await create(markedRunByClaim);
+    expect(sendAlert).not.toHaveBeenCalled();
+    for (let i = 0; i < 5; i++) await create(visitorByClaim);
+    expect(sendAlert).toHaveBeenCalledTimes(5);
+  });
+
+  it('a REAL visitor turn still alerts, by claim (share_visitor) and by the turn marker alone', async () => {
+    await create(visitorByClaim);
+    await create(visitorByMarkerOnly);
+    mockScheduleDb.getScheduleById.mockResolvedValue(stored() as any);
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(sendAlert).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe('defence in depth: the alert asks "is this a visitor write?" itself, not only the provenance plan', () => {
   // The plan only ever adds marks for a visitor write today. If that ever regressed, an owner's own save must still not email the owner.
   it('an owner update never alerts even if the plan claimed it added a mark', async () => {
@@ -461,6 +507,34 @@ describe('it is only a notification: it never delays, changes or fails the visit
   });
 });
 
+describe('only a real string is passed on as the schedule name', () => {
+  const nameSent = () => sendAlert.mock.calls[0]?.[1];
+
+  it('a name with its own toString is not coerced (it would run visitor code in the handler, or print "[object Object]")', async () => {
+    const boom = { toString: () => { throw new Error('toString ran'); }, valueOf: () => { throw new Error('valueOf ran'); } };
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...stored(), scheduleName: boom } as any);
+    const res = await update(visitorByClaim, { keywords: ['z'] });
+    expect(res.status).not.toHaveBeenCalledWith(500);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(nameSent()).toBe('');
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an object', { a: 1 }], ['an array', ['x']], ['a number', 7],
+  ])('%s becomes the empty name (the mail then says "Untitled")', async (_label, odd) => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...stored(), scheduleName: odd } as any);
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(nameSent()).toBe('');
+  });
+
+  it('a real string name goes through unchanged (cleaning is the email builder\'s job)', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...stored(), scheduleName: 'Plain name' } as any);
+    await update(visitorByClaim, { keywords: ['z'] });
+    expect(nameSent()).toBe('Plain name');
+  });
+});
+
 describe('the recipient is the account owner\'s login email', () => {
   it('uses the email the request carries', async () => {
     await create({ ...visitorByClaim, email: 'carried@example.com' });
@@ -527,5 +601,25 @@ describe('at most 5 alerts per owner per hour', () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: USER, email: 'looked-up@example.com' } as any);
     for (let i = 0; i < 5; i++) await create(visitorByClaim);
     expect(sendAlert).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe('at most 15 alerts per owner per 24 hours as well', () => {
+  it('a drip that stays under the hourly cap still stops at 15 a day, is logged once as the DAILY cap, and never refuses the visitor', async () => {
+    let clock = 1_800_000_000_000;
+    jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    for (let i = 0; i < 17; i++) {
+      const res = await create(visitorByClaim);
+      expect(res.status).toHaveBeenCalledWith(201);
+      clock += 61 * 60 * 1000; // an hour (and a minute) apart: the hourly cap never bites
+    }
+    expect(sendAlert).toHaveBeenCalledTimes(15);
+    const capLogs = (console.warn as jest.Mock).mock.calls.filter((call) => String(call[0]).includes('[ENG-3149]'));
+    expect(capLogs).toHaveLength(1);
+    expect(String(capLogs[0][0])).toContain('daily cap');
+
+    clock += 25 * 60 * 60 * 1000; // a day later it has room again
+    await create(visitorByClaim);
+    expect(sendAlert).toHaveBeenCalledTimes(16);
   });
 });
