@@ -11,10 +11,17 @@
  * To restrict a new kind of principal (for example inbound email or Slack senders), add an entry to PROFILES and pass its id
  * as `restrictionProfile` in the tool context. Nothing else about tool execution needs to change.
  *
+ * `share_visitor_schedule` (ENG-2816 step 3) is the same restriction for a scheduled run whose schedule a visitor set up or
+ * edited through a share link: same block list, but its own refusal wording, because "shared sessions" would mislead the owner
+ * reading a scheduled run's result. `executeTool` applies it live, from the schedule's provenance (`utils/scheduleProvenance`).
+ *
  * This module imports nothing, so it can be used from anywhere without creating an import cycle.
  */
 
-export type RestrictionProfileId = 'share_visitor';
+export type RestrictionProfileId = 'share_visitor' | 'share_visitor_schedule';
+
+/** The profile a marked schedule's runs (and its own tool calls) carry. */
+export const SHARE_VISITOR_SCHEDULE_PROFILE: RestrictionProfileId = 'share_visitor_schedule';
 
 /**
  * Tools that act on the owner's own account, settings or memory. A share-link visitor runs under the owner's userId, so these
@@ -53,6 +60,14 @@ interface RestrictionProfile {
   refusal(toolName: string, adminToolNames: readonly string[]): string | null;
 }
 
+/** Which kind of tool a restricted principal is refused, so two profiles can share a block list and differ only in their wording. */
+function classifyRestrictedTool(toolName: string, adminToolNames: readonly string[]): 'admin' | 'owner_settings' | 'connect_account' | null {
+  if (adminToolNames.includes(toolName)) return 'admin';
+  if (SHARE_VISITOR_BLOCKED_TOOLS.has(toolName)) return 'owner_settings';
+  if (toolName === 'connect_account') return 'connect_account';
+  return null;
+}
+
 const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
   share_visitor: {
     // The wording is relied on: the share-session refusal eval keys on "is not available in shared sessions".
@@ -69,7 +84,50 @@ const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
       return null;
     },
   },
+  // ENG-2816 step 3: the same block list for a scheduled run of a schedule a share-link visitor set up or edited. The wording
+  // names the reason (the schedule, not the chat) and the way out (the owner adopts it), because the person reading this is
+  // the owner looking at a scheduled run's result, not a visitor in a shared chat.
+  share_visitor_schedule: {
+    refusal(toolName, adminToolNames) {
+      const reason = 'because this schedule was set up or edited through a share link';
+      const way = 'The owner can adopt the schedule in the portal to lift this limit.';
+      switch (classifyRestrictedTool(toolName, adminToolNames)) {
+        case 'admin':
+          return `Tool "${toolName}" is not available in this scheduled run ${reason}. ${way}`;
+        case 'owner_settings':
+          return `Tool "${toolName}" acts on the owner's organization settings or memory and is not available in this scheduled run ${reason}. ${way}`;
+        case 'connect_account':
+          return `Account connections are not available in this scheduled run ${reason}. ${way} Or the owner can connect the account in their own session.`;
+        default:
+          return null;
+      }
+    },
+  },
 };
+
+/** True for an id this module defines. Own keys only: "constructor" must not read as a profile. */
+export function isKnownRestrictionProfile(value: unknown): value is RestrictionProfileId {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(PROFILES, value);
+}
+
+/**
+ * The profile a restriction CLAIM names, where a claim is a value that travels with a self-call (the `_rp` claim of a self-call
+ * token, or the `restrictionProfile` of a tool context on its way into one). Absent means no claim. A known id is itself. A claim
+ * that is PRESENT but not a known id is read as the strictest known profile, not as no claim: whoever put it there meant to
+ * restrict, and a stale or mistyped id must never loosen anything (the same rule `restrictionRefusal` applies).
+ */
+export function normalizeRestrictionClaim(value: unknown): RestrictionProfileId | undefined {
+  if (value === undefined || value === null || value === false || value === '') return undefined;
+  return isKnownRestrictionProfile(value) ? value : 'share_visitor';
+}
+
+/**
+ * The refusal when a tool call could not be checked against its schedule's provenance (the session or schedule could not be read,
+ * or the schedule is gone). Unverifiable is treated as marked: refusing costs one retry, running as the owner costs the hole.
+ */
+export function scheduleProvenanceUnverifiableRefusal(toolName: string): string {
+  return `Tool "${toolName}" was not run: whether this schedule was set up or edited through a share link could not be verified just now, so it was refused rather than assumed safe. Nothing was done. It will work again on the next run once the schedule can be read.`;
+}
 
 /**
  * Thrown by `agentModeService.executeTool` when a restricted principal calls a tool its profile forbids. It is thrown, not
