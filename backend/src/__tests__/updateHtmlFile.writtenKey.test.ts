@@ -92,6 +92,17 @@ describe('update_html_file: the key that is authorised is the key S3 receives', 
       expect(written.split('/')).not.toContain('');
     });
 
+    it.each([
+      ['regional path-style', 'https://s3.us-west-2.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+      ['global path-style', 'https://s3.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+    ])('a %s link is written to the same key as the virtual-hosted one, never to a folder named after the bucket', async (_label, fileUrl) => {
+      const r = await htmlUpdateImpl.updateHtmlFile(fileUrl, mode[0], mode[1], 'me', 's1');
+      expect(r.success).toBe(true);
+      const written = s3Upload.mock.calls[0][0].Key as string;
+      expect(written).toBe('users/me/files/1700/abc/page_v2.html');
+      expect(writeKeysAsked()).toEqual([written]);
+    });
+
     it('a refused file reaches neither the rule\'s success path nor S3', async () => {
       const r = await htmlUpdateImpl.updateHtmlFile(`${HOST}/users/other/files/1700/abc/page.html`, mode[0], mode[1] as any, 'me', 's1');
       expect(r.success).toBe(false);

@@ -78,6 +78,24 @@ describe('perform_data_analysis: plain URLs in file_urls', () => {
       expect(post).not.toHaveBeenCalled();
     });
 
+    // A model's typo (a bare file name, a path) is not a refused address: it is told so plainly, and it is not logged as a blocked URL.
+    it.each([
+      ['a plain file name', 'sales.csv'],
+      ['an absolute local path', '/tmp/sales.csv'],
+      ['a relative path', './data/sales.csv'],
+      ['an empty-looking name', 'my sales data'],
+    ])('%s is "not a URL": a clear answer, a bad argument, nothing fetched, no blocked-URL log', async (_label, entry) => {
+      const r = await performDataAnalysis([entry], 'summarise', 'user-1');
+      expect(r.success).toBe(false);
+      expect(r.errorClass).toBe('invalid_args');
+      expect(r.message).toContain(`file_urls entry "${entry}" is not a URL`);
+      expect(r.message).not.toContain(callerUrlFetch.CALLER_URL_BLOCKED_MESSAGE);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+      const lines = (console.warn as jest.Mock).mock.calls.map((c) => String(c[0])).join('\n');
+      expect(lines).not.toContain('caller_url_blocked');
+    });
+
     it('is classified as a bad argument by telemetry, never as a config fault', async () => {
       const r = await performDataAnalysis(['http://169.254.169.254/'], 'summarise', 'user-1');
       expect(classifyToolErrorClass(toolResultError(r))).toBe('invalid_args');

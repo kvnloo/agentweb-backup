@@ -43,6 +43,7 @@ jest.mock('../services/storageAccessPolicy', () => ({
 jest.mock('../utils/s3Utils', () => ({
   // the file name the upload would write (the write check authorises that exact key)
   sanitizeS3Filename: (name: string) => name,
+  extractS3KeyFromUrl: (url: string) => jest.requireActual('../utils/s3Utils').extractS3KeyFromUrl(url),
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
     success: true,
     url: 'https://s3.amazonaws.com/bucket/updated_file_v2.html',

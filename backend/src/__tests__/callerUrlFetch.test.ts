@@ -261,8 +261,14 @@ describe('fetchCallerUrlBuffer / fetchCallerUrlText', () => {
     it('a missing caller is logged as null, and an unparsable URL logs a fixed host label (nothing from the input)', async () => {
       await fetchCallerUrlBuffer('::::not a url SECRET', { tool: 't', maxBytes: 10, deps: { request: jest.fn() } }).catch(() => undefined);
       const line = JSON.parse(warn.mock.calls[0][0]);
-      expect(line).toEqual({ event: 'caller_url_blocked', tool: 't', userId: null, host: 'invalid' });
+      // not a URL at all = a caller's mistake (a file name), logged under its own event so it is not counted as a refused address
+      expect(line).toEqual({ event: 'caller_url_invalid', tool: 't', userId: null, host: 'invalid' });
       expect(warn.mock.calls[0][0]).not.toMatch(/SECRET/);
+    });
+
+    it('a URL with a refused scheme is still a blocked URL in the log (host label only)', async () => {
+      await fetchCallerUrlBuffer('ftp://example.com/x', { tool: 't', userId: 'u', maxBytes: 10, deps: { request: jest.fn() } }).catch(() => undefined);
+      expect(JSON.parse(warn.mock.calls[0][0])).toEqual({ event: 'caller_url_blocked', tool: 't', userId: 'u', host: 'not-http' });
     });
   });
 

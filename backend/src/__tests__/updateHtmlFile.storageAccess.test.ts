@@ -121,6 +121,19 @@ describe('update_html_file: who may write the edited copy', () => {
         );
       });
 
+      // The file lookup accepts both S3 link styles, so a page is the same object whichever link names it. Judging the path-style link by its raw
+      // path would treat the bucket name as a folder (and, before the write check, silently write the edited copy into a junk folder of that name).
+      it.each([
+        ['us-west-2 regional path-style', 'https://s3.us-west-2.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+        ['global path-style', 'https://s3.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+        ['virtual-hosted, global', 'https://agentweb-user-files.s3.amazonaws.com/users/me/files/1700/abc/page.html'],
+        ['virtual-hosted, regional', 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/me/files/1700/abc/page.html'],
+      ])('the caller\'s own page named by a %s link is edited and written beside the original', async (_label, fileUrl) => {
+        const r = await edit(mode, fileUrl);
+        expect(r.success).toBe(true);
+        expect(upload).toHaveBeenCalledWith(expect.any(String), 'page_v2.html', 'text/html', 'users/me/files/1700/abc');
+      });
+
       it('a task file the caller owns is editable (the task owner writes)', async () => {
         const r = await edit(mode, url('tasks/t-mine/attachments/page.html'));
         expect(r.success).toBe(true);
@@ -194,7 +207,8 @@ describe('update_html_file: who may write the edited copy', () => {
         ['a `..` that climbs into another user\'s folder (the URL parser resolves it first)', 'https://x.example/users/me/files/../../other/files/1700/abc/page.html'],
         ['a `..` written with percent-encoding', 'https://x.example/users/me/files/%2e%2e/%2e%2e/other/files/1700/abc/page.html'],
         ['the owner\'s name written with percent-encoding (a different key from the one the rule would place)', url('users/%6de/files/1700/abc/page.html')],
-        ['a path-style bucket URL (the bucket name becomes the first folder, which is no key of the caller\'s)', 'https://s3.us-west-2.amazonaws.com/agentweb-user-files/users/me/files/1700/abc/page.html'],
+        ['a path-style bucket URL of another user\'s page', 'https://s3.us-west-2.amazonaws.com/agentweb-user-files/users/other/files/1700/abc/page.html'],
+        ['a path-style URL of a bucket that is not ours (the whole path is judged as the key, and it is not the caller\'s)', 'https://s3.us-west-2.amazonaws.com/some-other-bucket/users/me/files/1700/abc/page.html'],
         ['a task of someone else', url('tasks/t-other/attachments/page.html')],
       ])('%s', async (_label, fileUrl) => {
         refused(await edit(mode, fileUrl));
