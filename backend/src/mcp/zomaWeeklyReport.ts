@@ -31,6 +31,10 @@ import { ZOMA_PAL, zomaLeadClassification } from './zomaAdsExperience';
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** The usage window (calls and changes): the 7 x 24 hours before the send. */
 const USAGE_DAYS = 7;
+/** A pass stops after this many sends in a row fail, so a mail outage cannot burn the week for everyone. */
+const MAX_CONSECUTIVE_FAILURES = 3;
+/** At most this many ad accounts per platform are read for one user. */
+const MAX_ACCOUNTS_PER_PLATFORM = 3;
 const UNSUBSCRIBE_CONTEXT = 'zoma-weekly-report-unsubscribe';
 const DOCS_URL = 'https://docs.agentweb.pro/zoma';
 const SUPPORT_EMAIL = 'support@agentweb.pro';
@@ -61,7 +65,8 @@ export function getZomaWeeklyReportConfig(env: NodeJS.ProcessEnv = process.env):
   return {
     enabled: env.ZOMA_WEEKLY_REPORT_ENABLED === 'true',
     weekday: boundedInt(env.ZOMA_WEEKLY_REPORT_WEEKDAY, 1, 0, 6),
-    hour: boundedInt(env.ZOMA_WEEKLY_REPORT_HOUR, 15, 0, 23),
+    // Never before 12:00 UTC: by then every ad-account time zone (UTC-12 and east) has finished the Sunday the report ends on.
+    hour: boundedInt(env.ZOMA_WEEKLY_REPORT_HOUR, 15, 12, 23),
     maxPerPass: boundedInt(env.ZOMA_WEEKLY_REPORT_MAX_PER_PASS, 200, 1, 1000),
     onlyUserIds: only.length ? only : null,
   };
@@ -134,6 +139,8 @@ export interface ZomaAdsWeek extends WeekTotals {
   previous?: WeekTotals;
   /** Up to 3 campaigns by spend; empty when there was nothing to rank or the read failed. */
   topCampaigns: TopCampaign[];
+  /** Other ad accounts of this platform that are not in these numbers (another currency, or could not be read). */
+  notIncluded?: number;
 }
 
 /** What the report can say about one connected ad platform. */
@@ -175,7 +182,7 @@ const int = (n: number) => Math.round(n).toLocaleString('en-US');
 const money = (n: number, currency?: string) =>
   `${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${currency ? ` ${currency}` : ''}`;
 /** A count that may be fractional (Meta attributes partial conversions): 12, or 0.4. */
-const count = (n: number) => (Math.abs(n - Math.round(n)) < 0.05 ? int(n) : n.toFixed(1));
+const count = (n: number) => (n > 0 && n < 0.1 ? '<0.1' : Math.abs(n - Math.round(n)) < 0.05 ? int(n) : n.toFixed(1));
 /** "onsite_conversion.lead_grouped" -> "lead grouped": never show Meta's raw action type. */
 const eventLabel = (e: string) => e.replace(/^(offsite_conversion\.fb_pixel_|onsite_conversion\.|omni_)/, '').replace(/[._]+/g, ' ').trim();
 
@@ -185,7 +192,11 @@ export function pctChange(cur: number, prev: number | undefined): number | undef
   return Math.round(((cur - prev) / prev) * 100);
 }
 
-const costPerConversion = (t: Pick<WeekTotals, 'spend' | 'conversions'>) => (t.conversions > 0 ? t.spend / t.conversions : undefined);
+/** A cost per conversion needs at least one whole conversion: spend over 0.4 of a conversion is noise. */
+const costPerConversion = (t: Pick<WeekTotals, 'spend' | 'conversions'>) => (t.conversions >= 1 ? t.spend / t.conversions : undefined);
+const clickRate = (t: Pick<WeekTotals, 'clicks' | 'impressions'>) => (t.impressions > 0 ? t.clicks / t.impressions : undefined);
+const costPerClick = (t: Pick<WeekTotals, 'spend' | 'clicks'>) => (t.clicks > 0 ? t.spend / t.clicks : undefined);
+const percent = (r: number) => `${(r * 100).toFixed(r >= 0.1 ? 1 : 2)}%`;
 
 export interface Chip {
   label: string;
@@ -204,16 +215,22 @@ function deltaOf(pct: number | undefined, higherIsGood: boolean | null): Pick<Ch
   return { deltaText: `${up ? 'up' : 'down'} ${Math.abs(pct)}% vs last week`, arrow: up ? '▲' : '▼', tone };
 }
 
+/** A headline number that may not exist yet ("none yet"), with its change against last week when both weeks have it. */
+function ratioChip(label: string, cur: number | undefined, prev: number | undefined, show: (n: number) => string, higherIsGood: boolean): Chip {
+  if (cur === undefined) return { label, value: 'none yet', tone: 'neutral' };
+  return { label, value: show(cur), ...deltaOf(pctChange(cur, prev), higherIsGood) };
+}
+
 /** The headline numbers for one platform, each with its change against last week where there is one. */
 export function weekChips(ads: ZomaAdsWeek): Chip[] {
   const prev = ads.previous;
-  const cpc = costPerConversion(ads);
-  const prevCpc = prev ? costPerConversion(prev) : undefined;
   const chips: Chip[] = [
     { label: 'Spend', value: money(ads.spend, ads.currency), ...deltaOf(pctChange(ads.spend, prev?.spend), null) },
     { label: 'Conversions', value: count(ads.conversions) + (ads.conversionEvent ? ` (${eventLabel(ads.conversionEvent)})` : ''), ...deltaOf(pctChange(ads.conversions, prev?.conversions), true) },
-    { label: 'Cost per conversion', value: cpc === undefined ? 'none yet' : money(cpc, ads.currency), ...(cpc !== undefined ? deltaOf(pctChange(cpc, prevCpc), false) : { tone: 'neutral' as const }) },
+    ratioChip('Cost per conversion', costPerConversion(ads), prev ? costPerConversion(prev) : undefined, (n) => money(n, ads.currency), false),
     { label: 'Clicks', value: int(ads.clicks), ...deltaOf(pctChange(ads.clicks, prev?.clicks), true) },
+    ratioChip('Click rate', clickRate(ads), prev ? clickRate(prev) : undefined, percent, true),
+    ratioChip('Cost per click', costPerClick(ads), prev ? costPerClick(prev) : undefined, (n) => money(n, ads.currency), false),
   ];
   if (ads.roas !== null && ads.roas > 0) chips.push({ label: 'Return on ad spend', value: `${ads.roas}x`, tone: 'neutral' });
   return chips;
@@ -231,7 +248,9 @@ export function weekInsight(ads: ZomaAdsWeek): string | undefined {
   const move = (pct: number) => (Math.abs(pct) < 2 ? 'about the same' : `${pct > 0 ? 'up' : 'down'} ${Math.abs(pct)}%`);
   const convPct = pctChange(ads.conversions, prev.conversions);
   if (convPct !== undefined && ads.conversions > 0) {
-    const cpcPct = pctChange(costPerConversion(ads)!, costPerConversion(prev));
+    const cur = costPerConversion(ads);
+    const before = costPerConversion(prev);
+    const cpcPct = cur !== undefined && before !== undefined ? pctChange(cur, before) : undefined;
     const tail = cpcPct === undefined || Math.abs(cpcPct) < 5 ? '' : `, so each conversion cost ${Math.abs(cpcPct)}% ${cpcPct < 0 ? 'less' : 'more'}`;
     return `Spend is ${move(spendPct)} and conversions are ${move(convPct)} compared with last week${tail}.`;
   }
@@ -240,36 +259,40 @@ export function weekInsight(ads: ZomaAdsWeek): string | undefined {
 
 // ---- escaping, signing -----------------------------------------------------------------------
 
-const b64url = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
+/** A key derived from the JWT secret, only for these links. */
+const tokenKey = (secret: string): Buffer => Buffer.from(crypto.hkdfSync('sha256', secret, UNSUBSCRIBE_CONTEXT, 'user-id-token', 32));
 
-function signature(userId: string, secret: string): string {
-  return crypto.createHmac('sha256', secret).update(`${UNSUBSCRIBE_CONTEXT}:${userId}`).digest('base64url');
-}
-
-/** `<base64url user id>.<hmac>`. Signed with the JWT secret, like the CRM unsubscribe links. */
+/**
+ * An opaque, authenticated token for the user id (AES-256-GCM, key derived from the JWT secret): the link shows no
+ * internal id, and any change to it is rejected. Random per send; opting out is idempotent, so reuse is harmless.
+ */
 export function signUnsubscribeToken(userId: string, secret: string = getJwtSecret()): string {
-  return `${b64url(userId)}.${signature(userId, secret)}`;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', tokenKey(secret), iv);
+  const ciphertext = Buffer.concat([cipher.update(userId, 'utf8'), cipher.final()]);
+  return Buffer.concat([iv, ciphertext, cipher.getAuthTag()]).toString('base64url');
 }
 
-/** The user id inside a valid token, else null. Constant-time comparison. */
+/** The user id inside a valid token, else null. */
 export function verifyUnsubscribeToken(token: unknown, secret: string = getJwtSecret()): string | null {
-  if (typeof token !== 'string' || token.length > 300) return null;
-  const [encoded, sig, ...rest] = token.split('.');
-  if (!encoded || !sig || rest.length) return null;
-  let userId: string;
+  if (typeof token !== 'string' || token.length > 400 || !/^[A-Za-z0-9_-]+$/.test(token)) return null;
+  const raw = Buffer.from(token, 'base64url');
+  if (raw.length < 12 + 1 + 16 || raw.length > 12 + 120 + 16) return null;
   try {
-    userId = Buffer.from(encoded, 'base64url').toString('utf8');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', tokenKey(secret), raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(raw.length - 16));
+    const userId = Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]).toString('utf8');
+    return userId && userId.length <= 120 ? userId : null;
   } catch {
     return null;
   }
-  if (!userId || userId.length > 120) return null;
-  const expected = Buffer.from(signature(userId, secret));
-  const given = Buffer.from(sig);
-  return given.length === expected.length && crypto.timingSafeEqual(given, expected) ? userId : null;
 }
 
 const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+const truncate = (s: string, n: number) => {
+  const chars = Array.from(s);
+  return chars.length > n ? `${chars.slice(0, n - 1).join('')}…` : s;
+};
 /** A campaign name is user-typed text: keep it to one short line of printable characters. */
 const cleanName = (s: unknown) => truncate(String(s ?? '').replace(/[\r\n\t]+/g, ' ').replace(/[^\P{C}]/gu, '').trim() || 'Untitled campaign', 40);
 
@@ -285,17 +308,87 @@ function describeWrite(w: McpUserUsage['recentWrites'][number]): string {
 
 const TONE_COLOR: Record<Chip['tone'], string> = { good: '#188038', bad: '#c5221f', neutral: '#5f6368' };
 const NO_ACCOUNT_LINE = 'No ad account is connected to Zoma yet. Ask your agent to run zoma_status for the connect link.';
+const LAG_NOTE = 'Ad platforms often add conversions for a few days after a click, so the newest numbers can still go up.';
+/** Cells that draw a bar hold a non-breaking space: 1px type keeps desktop Outlook (Word) from inflating them. */
+const BAR_CELL = 'font-size:1px;line-height:1px;mso-line-height-rule:exactly';
+
+const dayList = (days: string[]) =>
+  days.length <= 1 ? (days[0] ?? '') : days.length <= 3 ? `${days.slice(0, -1).join(', ')} and ${days[days.length - 1]}` : `${days.length} days`;
+const plural = (n: string, word: string) => `${n} ${word}${n === '1' ? '' : 's'}`;
+
+/** Best and quietest day of the week, from the daily series only. */
+export function dayInsight(ads: ZomaAdsWeek): string | undefined {
+  const spending = ads.daily.filter((d) => d.spend > 0);
+  if (!spending.length) return undefined;
+  const converting = spending.filter((d) => d.conversions > 0);
+  let best: string;
+  let bestDate: string;
+  if (converting.length) {
+    const top = [...converting].sort((a, b) => b.conversions - a.conversions || a.spend / a.conversions - b.spend / b.conversions)[0];
+    const each = top.conversions >= 1 ? ` at ${money(top.spend / top.conversions, ads.currency)} each` : '';
+    best = `Best day: ${weekdayOf(top.date)}, ${plural(count(top.conversions), 'conversion')}${each}.`;
+    bestDate = top.date;
+  } else {
+    // Every day spending the same is not a "highest".
+    if (Math.max(...ads.daily.map((d) => d.spend)) === Math.min(...ads.daily.map((d) => d.spend))) return undefined;
+    const top = [...spending].sort((a, b) => b.spend - a.spend)[0];
+    best = `Highest spend: ${weekdayOf(top.date)} (${money(top.spend, ads.currency)}).`;
+    bestDate = top.date;
+  }
+  const idle = ads.daily.filter((d) => d.spend === 0).map((d) => weekdayOf(d.date));
+  if (idle.length) return `${best} No spend on ${dayList(idle)}.`;
+  const quiet = [...ads.daily].sort((a, b) => a.spend - b.spend)[0];
+  if (quiet.date === bestDate || quiet.spend === Math.max(...ads.daily.map((d) => d.spend))) return best;
+  return `${best} Quietest day: ${weekdayOf(quiet.date)} (${money(quiet.spend, ads.currency)}).`;
+}
+
+/** Up to three plain "worth a look" flags. Only facts the numbers support, never a guess at the cause. */
+export function watchFlags(ads: ZomaAdsWeek): string[] {
+  const flags: string[] = [];
+  if (ads.spend > 0 && ads.conversions === 0) flags.push('No conversions were recorded this week. If you expect some, check that conversion tracking is set up.');
+  let trailing = 0;
+  for (let i = ads.daily.length - 1; i >= 0 && ads.daily[i].spend === 0; i--) trailing += 1;
+  if (trailing >= 2 && trailing < ads.daily.length) {
+    flags.push(`Spend stopped after ${weekdayOf(ads.daily[ads.daily.length - 1 - trailing].date)}. If that is not planned, check your budgets and campaign status.`);
+  }
+  if (ads.conversions > 0) {
+    for (const c of ads.topCampaigns) if (c.spend > 0 && c.conversions === 0) flags.push(`${cleanName(c.name)} spent ${money(c.spend, ads.currency)} with no conversions.`);
+  }
+  return flags.slice(0, 3);
+}
+
+const campaignCost = (c: TopCampaign) => (c.conversions >= 1 ? c.spend / c.conversions : undefined);
+
+/** Which of the top campaigns cost least and most per conversion (needs two with at least one conversion each). */
+export function campaignCostLine(ads: ZomaAdsWeek): string | undefined {
+  const priced = ads.topCampaigns.flatMap((c) => { const cost = campaignCost(c); return cost === undefined ? [] : [{ name: cleanName(c.name), cost }]; });
+  if (priced.length < 2) return undefined;
+  priced.sort((a, b) => a.cost - b.cost);
+  const lo = priced[0];
+  const hi = priced[priced.length - 1];
+  if (Math.round(lo.cost * 100) === Math.round(hi.cost * 100)) return undefined;
+  return `Cheapest per conversion: ${lo.name} (${money(lo.cost, ads.currency)}). Dearest: ${hi.name} (${money(hi.cost, ads.currency)}).`;
+}
+
+const notIncludedLine = (platform: AdPlatform, n: number) =>
+  `Not included here: ${n} other ${PLATFORM_LABEL[platform]} account${n === 1 ? '' : 's'} (in a different currency, or could not be read).`;
 
 function chipsHtml(chips: Chip[]): string {
-  const cells = chips
-    .map((c) => {
-      const delta = c.deltaText
-        ? `<div style="font-size:12px;color:${TONE_COLOR[c.tone]}">${c.arrow ? `${c.arrow} ` : ''}${escapeHtml(c.deltaText)}</div>`
-        : '';
-      return `<td valign="top" width="${Math.floor(100 / chips.length)}%" style="padding:10px 10px;background:#f6f8fa"><div style="font-size:11px;color:#5f6368">${escapeHtml(c.label)}</div><div style="font-size:17px;font-weight:600;color:#111">${escapeHtml(c.value)}</div>${delta}</td><td width="6"></td>`;
+  const rows: Chip[][] = [];
+  for (let i = 0; i < chips.length; i += 4) rows.push(chips.slice(i, i + 4));
+  return rows
+    .map((row) => {
+      const cells = row
+        .map((c) => {
+          const delta = c.deltaText
+            ? `<div style="font-size:12px;color:${TONE_COLOR[c.tone]}">${c.arrow ? `${c.arrow} ` : ''}${escapeHtml(c.deltaText)}</div>`
+            : '';
+          return `<td valign="top" width="25%" style="padding:10px 10px;background:#f6f8fa"><div style="font-size:11px;color:#5f6368">${escapeHtml(c.label)}</div><div style="font-size:17px;font-weight:600;color:#111">${escapeHtml(c.value)}</div>${delta}</td><td width="6"></td>`;
+        })
+        .join('');
+      return `<table width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0"><tr>${cells}</tr></table>`;
     })
     .join('');
-  return `<table width="100%" cellpadding="0" cellspacing="0" style="margin:10px 0"><tr>${cells}</tr></table>`;
 }
 
 const BAR_AREA_PX = 110;
@@ -307,8 +400,8 @@ function dailyBarsHtml(daily: DailyPoint[], color: string, currency?: string): s
     .map((d) => {
       const h = max > 0 && d.spend > 0 ? Math.max(2, Math.round((d.spend / max) * BAR_AREA_PX)) : 0;
       const bar = h > 0
-        ? `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="${h}" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`
-        : `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="1" bgcolor="#dadce0" style="font-size:0;line-height:0">&nbsp;</td></tr></table>`;
+        ? `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="${h}" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td></tr></table>`
+        : `<table cellpadding="0" cellspacing="0" width="44"><tr><td height="1" bgcolor="#dadce0" style="${BAR_CELL}">&nbsp;</td></tr></table>`;
       return `<td align="center" valign="bottom" style="padding:0 3px"><div style="font-size:11px;color:#5f6368;padding-bottom:3px">${escapeHtml(d.spend >= 100 ? int(d.spend) : d.spend === 0 ? '0' : d.spend.toFixed(d.spend >= 10 ? 0 : 1))}</div>${bar}<div style="font-size:11px;color:#5f6368;padding-top:4px">${escapeHtml(weekdayOf(d.date))}</div></td>`;
     })
     .join('');
@@ -320,24 +413,41 @@ function campaignBarsHtml(top: TopCampaign[], color: string, currency?: string):
   const rows = top
     .map((c) => {
       const w = max > 0 ? Math.max(2, Math.round((c.spend / max) * 100)) : 0;
-      return `<tr><td width="170" style="padding:5px 8px 5px 0;font-size:13px;color:#202124;width:170px">${escapeHtml(cleanName(c.name))}</td><td width="100%" style="padding:5px 8px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="12" bgcolor="${color}" style="font-size:0;line-height:0">&nbsp;</td><td></td></tr></table></td><td align="right" style="padding:5px 0;font-size:12px;color:#202124;white-space:nowrap">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.</td></tr>`;
+      const cost = campaignCost(c);
+      const each = cost === undefined ? '' : ` &middot; ${escapeHtml(money(cost, currency))} each`;
+      return `<tr><td width="170" style="padding:5px 8px 5px 0;font-size:13px;color:#202124;width:170px">${escapeHtml(cleanName(c.name))}</td><td width="100%" style="padding:5px 8px"><table cellpadding="0" cellspacing="0" width="100%"><tr><td width="${w}%" height="12" bgcolor="${color}" style="${BAR_CELL}">&nbsp;</td><td></td></tr></table></td><td align="right" style="padding:5px 0;font-size:12px;color:#202124;white-space:nowrap">${escapeHtml(money(c.spend, currency))} &middot; ${escapeHtml(count(c.conversions))} conv.${each}</td></tr>`;
     })
     .join('');
   return `<div style="font-size:12px;color:#5f6368;margin:14px 0 2px">Top campaigns by spend</div><table width="100%" cellpadding="0" cellspacing="0">${rows}</table>`;
 }
 
+const smallNote = (text: string, margin = '6px 0 0') => `<div style="font-size:12px;color:#5f6368;margin:${margin}">${escapeHtml(text)}</div>`;
+
 function platformHtml(week: PlatformWeek): string {
   const label = escapeHtml(PLATFORM_LABEL[week.platform]);
-  const head = `<h3 style="margin:22px 0 2px;color:#111;border-left:4px solid ${PLATFORM_COLOR[week.platform]};padding-left:8px">${label}</h3>`;
+  const color = PLATFORM_COLOR[week.platform];
+  const head = `<h3 style="margin:22px 0 2px;color:#111;border-left:4px solid ${color};padding-left:8px">${label}</h3>`;
   if (week.status === 'no_delivery') return `${head}<p style="margin:6px 0;color:#202124">No ad delivery was recorded on your ${label} account this week.</p>`;
   if (week.status === 'unreadable') return `${head}<p style="margin:6px 0;color:#202124">We could not read your ${label} account this week. It may need to be reconnected: ask your agent to run zoma_status.</p>`;
   const { ads } = week;
   const insight = weekInsight(ads);
-  const top = ads.topCampaigns.length
-    ? campaignBarsHtml(ads.topCampaigns, PLATFORM_COLOR[week.platform], ads.currency)
-    : '';
+  const flags = watchFlags(ads);
+  const dayLine = dayInsight(ads);
+  const costLine = campaignCostLine(ads);
   const topShare = ads.topCampaigns[0] && ads.spend > 0 ? ` Top campaign: ${escapeHtml(cleanName(ads.topCampaigns[0].name))} (${Math.round((ads.topCampaigns[0].spend / ads.spend) * 100)}% of spend).` : '';
-  return `${head}${insight || topShare ? `<p style="margin:6px 0;color:#202124"><b>${escapeHtml(insight ?? '')}</b>${topShare}</p>` : ''}${chipsHtml(weekChips(ads))}${dailyBarsHtml(ads.daily, PLATFORM_COLOR[week.platform], ads.currency)}${top}`;
+  const intro = insight || topShare ? `<p style="margin:6px 0;color:#202124"><b>${escapeHtml(insight ?? '')}</b>${topShare}</p>` : '';
+  const flagsHtml = flags.length
+    ? `<div style="margin:8px 0;padding:8px 12px;background:#fff8e1;border-left:3px solid #f9ab00"><div style="font-size:12px;font-weight:600;color:#5b4a00;margin-bottom:2px">Worth a look</div><ul style="margin:0;padding-left:18px;font-size:13px;color:#202124">${flags.map((f) => `<li>${escapeHtml(f)}</li>`).join('')}</ul></div>`
+    : '';
+  const top = ads.topCampaigns.length ? campaignBarsHtml(ads.topCampaigns, color, ads.currency) : '';
+  return [
+    head, intro, flagsHtml, chipsHtml(weekChips(ads)),
+    ads.notIncluded ? smallNote(notIncludedLine(week.platform, ads.notIncluded), '2px 0 6px') : '',
+    dailyBarsHtml(ads.daily, color, ads.currency),
+    dayLine ? `<div style="font-size:12px;color:#5f6368;margin:6px 0 0;text-align:center">${escapeHtml(dayLine)}</div>` : '',
+    top,
+    costLine ? smallNote(costLine) : '',
+  ].join('');
 }
 
 function platformText(week: PlatformWeek): string[] {
@@ -346,13 +456,23 @@ function platformText(week: PlatformWeek): string[] {
   if (week.status === 'unreadable') return [label, `We could not read your ${label} account this week. It may need to be reconnected: ask your agent to run zoma_status.`];
   const { ads } = week;
   const insight = weekInsight(ads);
+  const flags = watchFlags(ads);
+  const dayLine = dayInsight(ads);
+  const costLine = campaignCostLine(ads);
   const lines = [label, ...(insight ? [insight] : [])];
+  if (flags.length) lines.push('Worth a look:', ...flags.map((f) => `- ${f}`));
   for (const c of weekChips(ads)) lines.push(`${c.label}: ${c.value}${c.deltaText ? ` (${c.deltaText})` : ''}`);
+  if (ads.notIncluded) lines.push(notIncludedLine(week.platform, ads.notIncluded));
   lines.push(`Spend per day${ads.currency ? ` (${ads.currency})` : ''}: ${ads.daily.map((d) => `${weekdayOf(d.date)} ${money(d.spend)}`).join(', ')}`);
+  if (dayLine) lines.push(dayLine);
   if (ads.topCampaigns.length) {
     lines.push('Top campaigns by spend:');
-    ads.topCampaigns.forEach((c, i) => lines.push(`${i + 1}. ${cleanName(c.name)}: ${money(c.spend, ads.currency)}, ${count(c.conversions)} conversion${count(c.conversions) === '1' ? '' : 's'}`));
+    ads.topCampaigns.forEach((c, i) => {
+      const cost = campaignCost(c);
+      lines.push(`${i + 1}. ${cleanName(c.name)}: ${money(c.spend, ads.currency)}, ${plural(count(c.conversions), 'conversion')}${cost === undefined ? '' : ` (${money(cost, ads.currency)} each)`}`);
+    });
   }
+  if (costLine) lines.push(costLine);
   return lines;
 }
 
@@ -371,8 +491,9 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
   const period = `${longDate(win.since)} to ${longDate(win.until)}`;
   const { total, confirmed } = usage.writes;
   const unconfirmed = total - confirmed;
+  // "recorded": a write whose own bookkeeping failed is not in the count, so never say "none were made".
   const changes = total === 0
-    ? 'No changes were made through Zoma this week.'
+    ? 'No changes were recorded through Zoma this week.'
     : unconfirmed === 0
       ? `Changes made through Zoma: ${confirmed} (each one confirmed by reading it back).`
       : `Changes sent through Zoma: ${total}. ${confirmed} confirmed by reading them back, ${unconfirmed} could not be confirmed.`;
@@ -382,12 +503,14 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
   const recentLines = recent.length ? ['Latest changes:', ...recent.map((w) => `- ${recentLine(w)}`)] : [];
   const callLine = `Your agent made ${usage.toolCalls.toLocaleString('en-US')} successful Zoma call${usage.toolCalls === 1 ? '' : 's'} in the past 7 days.`;
   const subject = 'Your Zoma week in ads';
+  const anyDelivered = platforms.some((p) => p.status === 'delivered');
 
   const perfText = platforms.length ? platforms.flatMap((p, i) => [...(i ? [''] : []), ...platformText(p)]) : [NO_ACCOUNT_LINE];
   const text = [
     `Your Zoma week in ads, ${period}.`,
     '',
     ...perfText,
+    ...(anyDelivered ? ['', LAG_NOTE] : []),
     '',
     'What happened in Zoma',
     changes,
@@ -401,10 +524,11 @@ export function weeklyReportEmail(input: WeeklyReportEmailInput): { subject: str
 
   const perfHtml = platforms.length ? platforms.map(platformHtml).join('') : `<p style="color:#202124">${escapeHtml(NO_ACCOUNT_LINE)}</p>`;
   const html = [
-    `<div style="max-width:600px;margin:0 auto;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#202124">`,
+    `<div style="max-width:600px;margin:0 auto;background:#ffffff;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#202124">`,
     `<h2 style="margin:0 0 2px;color:#111">Your Zoma week in ads</h2>`,
     `<div style="color:#5f6368;font-size:13px">${escapeHtml(period)}</div>`,
     perfHtml,
+    anyDelivered ? smallNote(LAG_NOTE, '14px 0 0') : '',
     `<h3 style="margin:26px 0 4px;color:#111">What happened in Zoma</h3>`,
     `<p style="margin:6px 0">${escapeHtml(changes)}</p>`,
     recent.length ? `<div style="font-size:12px;color:#5f6368;margin-top:8px">Latest changes</div><ul style="margin:4px 0;padding-left:18px">${recent.map((w) => `<li>${escapeHtml(recentLine(w))}</li>`).join('')}</ul>` : '',
@@ -477,6 +601,7 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
   // ONE range query for every user, instead of one per user per tick.
   const usageByUser = await deps.getUsageByUser(range);
   let claimedThisPass = 0;
+  let failedInARow = 0;
   for (const user of users) {
     if (claimedThisPass >= cfg.maxPerPass) {
       console.warn(`[zoma-weekly-report] cap of ${cfg.maxPerPass} emails reached for ${week}; the rest wait for the next pass`);
@@ -507,9 +632,16 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
       const outcome = await deps.sendEmail(fresh.email, email.subject, email.text, email.html, unsubscribeHeaders(unsubscribeUrl));
       if (outcome === 'failed') {
         result.failed += 1;
+        failedInARow += 1;
         console.error(`[zoma-weekly-report] not delivered for ${user.userId} (${week}); not retried this week`);
+        // A mail outage must not burn the week for everyone: stop after a few failures in a row.
+        if (failedInARow >= MAX_CONSECUTIVE_FAILURES) {
+          console.error(`[zoma-weekly-report] ${failedInARow} sends in a row failed for ${week}: stopping this pass so the other users keep their week`);
+          break;
+        }
         continue;
       }
+      failedInARow = 0;
       // 'suppressed' is the non-prod mail guard: nothing left the box, so it is done but not counted.
       if (outcome === 'sent') result.sent += 1;
     } catch (error) {
@@ -614,10 +746,51 @@ export function weekFromDaily(
   };
 }
 
+const sumTotals = (x: WeekTotals, y: WeekTotals): WeekTotals => ({
+  spend: x.spend + y.spend, impressions: x.impressions + y.impressions, clicks: x.clicks + y.clicks, conversions: x.conversions + y.conversions,
+});
+
+/** Two accounts of one platform in the SAME currency, added together. Return on ad spend is dropped (no common value). */
+export function mergeAdsWeeks(a: ZomaAdsWeek, b: ZomaAdsWeek): ZomaAdsWeek {
+  const days = new Map<string, DailyPoint>();
+  for (const d of [...a.daily, ...b.daily]) {
+    const seen = days.get(d.date);
+    days.set(d.date, seen ? { date: d.date, spend: seen.spend + d.spend, conversions: seen.conversions + d.conversions } : { ...d });
+  }
+  return {
+    ...(a.currency ? { currency: a.currency } : {}),
+    ...sumTotals(a, b),
+    roas: null,
+    conversionEvent: a.conversionEvent === b.conversionEvent ? a.conversionEvent : null,
+    daily: [...days.values()].sort((x, y) => (x.date < y.date ? -1 : 1)),
+    ...(a.previous && b.previous ? { previous: sumTotals(a.previous, b.previous) } : {}),
+    topCampaigns: topThree([...a.topCampaigns, ...b.topCampaigns]),
+  };
+}
+
+/**
+ * One platform's answer from all of its ad accounts that were read. "No delivery" only when every account was read and
+ * none delivered; accounts in the same currency are added together (the currency with most accounts is shown); accounts
+ * that are not in the numbers are counted.
+ * `unread` = accounts of this platform that were not read at all (expired, or beyond the per-platform limit).
+ */
+export function combinePlatformWeeks(platform: AdPlatform, results: PlatformWeek[], unread = 0): PlatformWeek {
+  const delivered = results.flatMap((r) => (r.status === 'delivered' ? [r.ads] : []));
+  const unreadable = results.filter((r) => r.status === 'unreadable').length + unread;
+  if (!delivered.length) return unreadable > 0 ? { platform, status: 'unreadable' } : { platform, status: 'no_delivery' };
+  const groups = new Map<string, ZomaAdsWeek[]>();
+  for (const ads of delivered) groups.set(ads.currency ?? '', [...(groups.get(ads.currency ?? '') ?? []), ads]);
+  // Currencies cannot be compared, so the group with the most accounts wins (a tie goes to the one listed first).
+  const biggest = [...groups.values()].sort((x, y) => y.length - x.length)[0];
+  const merged = biggest.reduce((acc, w) => mergeAdsWeeks(acc, w));
+  const notIncluded = delivered.length - biggest.length + unreadable;
+  return { platform, status: 'delivered', ads: notIncluded > 0 ? { ...merged, notIncluded } : merged };
+}
+
 /** Errors that will not fix themselves by the next tick: the connection or its permissions are the problem. */
 export function isPermanentReadError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
-  return /expired or was revoked|expired or revoked|reconnect|no usable access token|permission|not authori[sz]ed|unauthori[sz]ed|invalid_grant|oauthexception|code 190\b|PERMISSION_DENIED|UNAUTHENTICATED|AUTHENTICATION_ERROR|invalid authentication credentials|CUSTOMER_NOT_ENABLED|HTTP 40[13]\b/i.test(msg);
+  return /expired or was revoked|expired or revoked|reconnect|no usable access token|permission|not authori[sz]ed|unauthori[sz]ed|invalid_grant|oauthexception|code 190\b|PERMISSION_DENIED|UNAUTHENTICATED|AUTHENTICATION_ERROR|invalid authentication credentials|CUSTOMER_NOT_ENABLED|HTTP 40[13]\b|status code 40[013]\b/i.test(msg);
 }
 
 const topThree = (list: TopCampaign[]): TopCampaign[] =>
@@ -698,34 +871,43 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
   // Only the Zoma toolkit's rows: Emma's own MCP writes the same event type with product 'emma_mcp'.
   getUsageByUser: (range) => getMcpUsageByUser(range, { product: 'zoma' }),
   async getAdsWeeks(userId, win, opts) {
-    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER, GOOGLE_ADS_PROVIDER }] = await Promise.all([
+    const [{ getAccountsByUserIdIncludingOrgShared }, { META_PROVIDER, GOOGLE_ADS_PROVIDER, googleToolkitEnabled }] = await Promise.all([
       import('../services/connectedAccountsDb'), import('./zomaProviders'),
     ]);
     const now = Date.now();
     const accounts = await getAccountsByUserIdIncludingOrgShared(userId);
     const weeks: PlatformWeek[] = [];
-    // Reports the account Zoma itself works on (the first usable one, as zomaProviders resolves it).
+    // Every usable account of the platform (up to a few) is read: Zoma picks one by spend (Meta) or refuses as ambiguous
+    // (Google), so "the first one" would be wrong. Same-currency accounts are added together.
     const read = async (platform: AdPlatform, provider: typeof META_PROVIDER, run: (account: any, id: string) => Promise<PlatformWeek>) => {
       const connected = accounts.filter((a) => provider.isAdAccount(a));
       if (!connected.length) return;
-      const usable = connected.find((a) => provider.isUsable(a, now));
-      const id = usable && provider.accountIds(usable)[0];
+      const targets = connected
+        .filter((a) => provider.isUsable(a, now))
+        .map((account) => ({ account, id: provider.accountIds(account)[0] }))
+        .filter((t): t is { account: typeof t.account; id: string } => !!t.id)
+        .slice(0, MAX_ACCOUNTS_PER_PLATFORM);
       // Connected but expired/revoked: say so, rather than claiming nothing is connected.
-      if (!usable || !id) {
+      if (!targets.length) {
         weeks.push({ platform, status: 'unreadable' });
         return;
       }
-      try {
-        weeks.push(await run(usable, id));
-      } catch (error) {
-        // Transient: let the next hourly tick try again, until the window's last tick.
-        if (!opts.final && !isPermanentReadError(error)) throw error;
-        console.error(`[zoma-weekly-report] ${platform} read failed:`, error instanceof Error ? error.message : error);
-        weeks.push({ platform, status: 'unreadable' });
+      const results: PlatformWeek[] = [];
+      for (const t of targets) {
+        try {
+          results.push(await run(t.account, t.id));
+        } catch (error) {
+          // Transient: let the next hourly tick try again, until the window's last tick.
+          if (!opts.final && !isPermanentReadError(error)) throw error;
+          console.error(`[zoma-weekly-report] ${platform} read failed:`, error instanceof Error ? error.message : error);
+          results.push({ platform, status: 'unreadable' });
+        }
       }
+      weeks.push(combinePlatformWeeks(platform, results, connected.length - targets.length));
     };
     await read('meta', META_PROVIDER, (a, id) => metaWeek(a, id, win));
-    await read('google_ads', GOOGLE_ADS_PROVIDER as typeof META_PROVIDER, (_a, id) => googleWeek(userId, id, win));
+    // The Google toolkit is dark until its flag is on: no Google section (and no "run zoma_status" advice) before then.
+    if (googleToolkitEnabled()) await read('google_ads', GOOGLE_ADS_PROVIDER as typeof META_PROVIDER, (_a, id) => googleWeek(userId, id, win));
     return weeks;
   },
   async sendEmail(to, subject, text, html, headers) {
