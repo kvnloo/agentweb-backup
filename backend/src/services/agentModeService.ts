@@ -42,7 +42,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
-import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
+import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -4404,8 +4404,14 @@ export class AgentModeService {
           costUsd: () => {
             const usage: any = (response as any)?.usage;
             if (!usage) return 0;
-            if (typeof usage.cost === 'number') return usage.cost;
-            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+            return shadowTurnCostUsd(usage, this.estimateCost(
+              llmModel,
+              Number(usage.prompt_tokens) || 0,
+              Number(usage.completion_tokens) || 0,
+              Number(usage.cache_read_input_tokens) || 0,
+              Number(usage.cache_creation_input_tokens) || 0,
+              usage.cache_creation_by_ttl,
+            ));
           },
         });
 
