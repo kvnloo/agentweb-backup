@@ -101,11 +101,13 @@ export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
 export function shouldSanitizePublicResponse(
   toolName: string,
   toolArgs: Record<string, unknown> | undefined,
-  context: { externalMcp?: boolean },
+  context: { externalMcp?: boolean; callerIsAdmin?: boolean },
 ): boolean {
   if (!context.externalMcp) return false;
   if (ADMIN_TOOL_NAMES.has(toolName)) return false;
-  if (toolArgs && (toolArgs.client_id || toolArgs.clientId)) return false;
+  // `client_id` marks an admin acting for a client, whose answers keep their internal ids. The argument alone proves nothing: any caller can
+  // add it to any tool (most tools ignore it), so it switches sanitising off only when the caller really is an admin.
+  if (toolArgs && (toolArgs.client_id || toolArgs.clientId) && context.callerIsAdmin === true) return false;
   return true;
 }
 

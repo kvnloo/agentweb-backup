@@ -41,6 +41,16 @@ import { getListedToolDefinitions } from './toolDiscovery';
 import { API_KEY_SCOPE_EMAIL_READ } from './apiKeyScopes';
 import { sanitizePublicToolResult, shouldSanitizePublicResponse } from './publicResponseSanitizer';
 
+/** True only when the account is a real admin. Any failure answers false, so the response is sanitised (the safe side). */
+async function isAdminUser(userId: string): Promise<boolean> {
+  try {
+    const { userDb } = await import('../../services/db');
+    return (await userDb.getUserById(userId))?.isAdmin === true;
+  } catch {
+    return false;
+  }
+}
+
 export interface McpSessionContext {
   agentUserId?: string;
   sessionId?: string;               // MCP session ID
@@ -141,8 +151,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
 
     try {
       const rawResult = await mcpToolRegistry.execute(name, toolArgs, context);
-      // ENG-2335: public (external, non-admin) responses never carry internal IDs.
-      const result = shouldSanitizePublicResponse(name, toolArgs, context)
+      // ENG-2335: public (external, non-admin) responses never carry internal IDs. A client_id argument only exempts a caller who really is an
+      // admin (checked here, and only when the argument is present): it must not let anyone switch the sanitiser off by adding it to any tool.
+      const clientScopeClaimed = !!(toolArgs.client_id || toolArgs.clientId);
+      const callerIsAdmin = clientScopeClaimed && context.externalMcp && effectiveUserId ? await isAdminUser(effectiveUserId) : false;
+      const result = shouldSanitizePublicResponse(name, toolArgs, { ...context, callerIsAdmin })
         ? sanitizePublicToolResult(rawResult, name)
         : rawResult;
       if (context.externalMcp && effectiveUserId) {
