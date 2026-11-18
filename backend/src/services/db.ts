@@ -31,6 +31,7 @@ import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { isConditionalFailure } from "./voice/setupWrites";
 import { LEAD_SUBMISSION_CLAIM_PARTITION } from "./leadSubmissionIdempotency";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
+import { readScheduleProvenance } from "../utils/scheduleProvenance";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3805,6 +3806,32 @@ const writeShedRunResults = async (
  */
 export const EXPECT_UNSET = Symbol.for("agentweb.schedule.expectUnset");
 
+/**
+ * ENG-2816 (step 3): the one tolerant reader of a schedule's `provenance` (the String Set naming the content fields a share-link
+ * visitor wrote). Lives in utils/scheduleProvenance.ts so the pure publish resolver can use it without importing this module;
+ * exported here because the db layer is where the attribute's three shapes (a DynamoDBSet off the wire, an array in memory and in
+ * API responses, absent) meet.
+ */
+export { readScheduleProvenance };
+
+/**
+ * A schedule item as the rest of the app should see it: `provenance`, when present, is a sorted array, never the DocumentClient's
+ * `DynamoDBSet` wrapper (which would otherwise leak into API responses and be spread, compared and cloned as an object). An item
+ * with no `provenance` attribute (every schedule that predates this change) comes back as the SAME object, untouched.
+ */
+const withReadableProvenance = <T>(item: T): T => {
+  if (!item || typeof item !== "object") return item;
+  const raw = (item as any).provenance;
+  if (raw === undefined) return item;
+  return { ...(item as any), provenance: readScheduleProvenance(raw) };
+};
+
+/** `withReadableProvenance` over a list; the same array comes back when no item carries the attribute. */
+const withReadableProvenanceAll = <T>(items: T[]): T[] =>
+  Array.isArray(items) && items.some((item) => item && typeof item === "object" && (item as any).provenance !== undefined)
+    ? items.map(withReadableProvenance)
+    : items;
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3853,11 +3880,17 @@ export const scheduleDb = {
     variableRequestAccessTokenHash?: string;
     variableRequestAccessTokenExpiresAt?: string;
     variableRequestAccessTokenConsumedAt?: string;
+    // ENG-2816 (step 3): the content fields a share-link visitor wrote (see utils/scheduleProvenance.ts). Stored as a DynamoDB
+    // String Set; an empty or absent list writes NO attribute (a Set cannot be empty, and an unmarked schedule carries nothing).
+    provenance?: string[];
   }) {
     try {
+      const { provenance, ...rest } = schedule;
+      const marks = readScheduleProvenance(provenance);
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Item: schedule,
+        // A schedule that never carried the key is written exactly as before (the same object).
+        Item: marks.length > 0 ? { ...rest, provenance: dynamodb.createSet(marks) } : ('provenance' in schedule ? rest : schedule),
       };
 
       await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
@@ -3878,23 +3911,28 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByTaskId");
     }
   },
 
-  async getScheduleById(scheduleId: string) {
+  /**
+   * `consistent` asks for a strongly consistent read. Only a security decision needs it (ENG-2816: is this schedule marked as
+   * visitor-written, right now); every other caller keeps the default eventually consistent read and its cost.
+   */
+  async getScheduleById(scheduleId: string, options?: { consistent?: boolean }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
+        ...(options?.consistent ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
-      return result.Item;
+      return withReadableProvenance(result.Item);
     } catch (error) {
       handleDynamoDbError(error, "getScheduleById");
     }
@@ -3908,7 +3946,7 @@ export const scheduleDb = {
    */
   async getAllSchedules(): Promise<any[]> {
     try {
-      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+      return withReadableProvenanceAll(await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`));
     } catch (error) {
       // Rethrows. A scan that dies halfway must not read as "no schedules" — that
       // would turn a transient failure into a migration that silently grants nothing.
@@ -3982,6 +4020,11 @@ export const scheduleDb = {
       pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
+      // ENG-2816 (step 3): NOT a stored attribute. Members to ADD to the schedule's `provenance` String Set (see
+      // utils/scheduleProvenance.ts), carried in the SAME UpdateExpression as the content change they describe, so a visitor's content
+      // and its mark land together or not at all. Marks are only ever added here; the whole attribute comes off through
+      // `removeAttributes: ['provenance']` (the adopt route), which works on whatever shape the stored value has.
+      provenanceAdd: string[];
     }>,
     /**
      * ENG-827: attributes that must STILL hold for this write to land, as read a
@@ -4010,6 +4053,18 @@ export const scheduleDb = {
      */
     removeAttributes?: string[]
   ) {
+    // ENG-2816 (step 3): split the non-stored provenance key off BEFORE the SET loop below, which would otherwise turn it into
+    // `SET #provenanceAdd = ...` on an attribute that does not exist.
+    const { provenanceAdd, ...storedUpdates } = updates as Record<string, any>;
+    const provenanceToAdd = readScheduleProvenance(provenanceAdd);
+    if (storedUpdates.provenance !== undefined) {
+      // A direct SET would store a List, and the next ADD on it would fail. The set is only ever touched through ADD, and removed
+      // whole through removeAttributes.
+      throw new Error('updateSchedule: set provenance through provenanceAdd, not as an attribute.');
+    }
+    if (provenanceToAdd.length > 0 && (removeAttributes || []).includes('provenance')) {
+      throw new Error('updateSchedule: provenance cannot be added to and removed in one write.');
+    }
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
@@ -4022,7 +4077,7 @@ export const scheduleDb = {
       // ValidationException. Skipping makes a stray undefined a no-op rather than
       // a crash. Deliberate removal goes through `removeAttributes` instead, so
       // it can never be triggered by an accidentally-undefined field.
-      Object.entries(updates).forEach(([key, value]) => {
+      Object.entries(storedUpdates).forEach(([key, value]) => {
         if (value === undefined) return;
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
@@ -4100,6 +4155,13 @@ export const scheduleDb = {
       const clauses: string[] = [];
       if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
       if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
+      // ENG-2816 (step 3): the provenance mark rides the SAME expression as the content change it describes. A write that carries
+      // only a mark is a real write and must not fall into the "nothing to do" return below.
+      if (provenanceToAdd.length > 0) {
+        expressionAttributeNames['#provenance'] = 'provenance';
+        expressionAttributeValues[':provenanceAdd'] = dynamodb.createSet(provenanceToAdd);
+        clauses.push('ADD #provenance :provenanceAdd');
+      }
       if (clauses.length === 0) {
         // Nothing to do. Returning beats sending an empty expression, which
         // DynamoDB rejects, and beats pretending a write happened.
@@ -4125,7 +4187,7 @@ export const scheduleDb = {
       }
 
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       handleDynamoDbError(error, "updateSchedule");
     }
@@ -4152,7 +4214,7 @@ export const scheduleDb = {
 
     try {
       const result = await dynamodb.update(params).promise();
-      return result.Attributes;
+      return withReadableProvenance(result.Attributes);
     } catch (error) {
       // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
       if (isDynamoItemSizeError(error)) {
@@ -4162,7 +4224,7 @@ export const scheduleDb = {
             if (plan === null) break;
             const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
             if (written.raced) continue;
-            return written.attributes;
+            return withReadableProvenance(written.attributes);
           }
         } catch (recoveryError) {
           // Recovery failed too — report the condition that actually stopped the write.
@@ -4299,7 +4361,7 @@ export const scheduleDb = {
         }));
       }
 
-      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
+      return withReadableProvenanceAll(dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat'));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -4485,7 +4547,7 @@ export const scheduleDb = {
           ExpressionAttributeValues: { ':status': status, ':type': 'scheduled_chat' },
         })
       ));
-      return results.flat();
+      return withReadableProvenanceAll(results.flat());
     } catch (error) {
       // Best-effort reconciler input: a transient list failure just skips this
       // sweep (the next one retries), so log and return empty rather than throw.
@@ -4671,7 +4733,7 @@ export const scheduleDb = {
 
       if (expected === undefined) {
         const result = await dynamodb.update(params).promise();
-        return result.Attributes;
+        return withReadableProvenance(result.Attributes);
       }
 
       const conditions = ['#nextRunTime = :expectedNextRunTime'];
@@ -4684,7 +4746,7 @@ export const scheduleDb = {
       }
       try {
         const result = await dynamodb.update({ ...params, ConditionExpression: conditions.join(' AND ') }).promise();
-        return result.Attributes;
+        return withReadableProvenance(result.Attributes);
       } catch (updateError: any) {
         if (updateError?.code !== 'ConditionalCheckFailedException') throw updateError;
         const lost: any = new Error('Schedule advance precondition failed');
@@ -4719,7 +4781,7 @@ export const scheduleDb = {
 
         const result = await dynamodb.scan(params).promise();
         if (result.Items && result.Items.length > 0) {
-          return result.Items[0];
+          return withReadableProvenance(result.Items[0]);
         }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
@@ -4763,7 +4825,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getPendingSchedules");
     }
@@ -4780,7 +4842,7 @@ export const scheduleDb = {
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      return withReadableProvenanceAll(await paginatedQuery(dynamodb, params));
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByUserId");
     }

@@ -13,6 +13,7 @@
  * evidence, and deliberately not persisted (persistence stays on ENG-2812, Requires: Me).
  */
 import { evaluateSessionSpendBreaker, SessionSpendCaps } from './sessionSpendBreaker';
+import { openRouterByokCostUsd } from './funding/recordLlmUsage';
 
 export interface SessionBreakerShadowConfig {
   caps: SessionSpendCaps;
@@ -35,6 +36,31 @@ export function readSessionBreakerShadowConfig(env: Env = process.env): SessionB
       maxSpendUsd: positiveNumber(env.SESSION_BREAKER_SHADOW_MAX_SPEND_USD, 5),
     },
   };
+}
+
+/** The parts of an OpenRouter `usage` block that say what a turn cost AgentWeb. */
+export interface ShadowTurnUsage {
+  cost?: unknown;
+  is_byok?: boolean;
+  cost_details?: { upstream_inference_cost?: unknown } | null;
+  server_tool_use_details?: unknown;
+}
+
+/**
+ * What one agent-loop LLM turn cost AgentWeb, by the ledger's rule (ENG-2720), except that a
+ * non-BYOK response with no positive cost is priced from the price book instead of booked as $0.
+ * On our own provider key (BYOK, the default route) `usage.cost` is 0 for a plain call: the real
+ * bill is `cost_details.upstream_inference_cost` plus any OpenRouter fee. Reading `usage.cost`
+ * alone counted every BYOK turn as $0, so the spend cap never fired. `tokenCostUsd` is the
+ * price-book cost, used when the response reports no usable cost.
+ */
+export function shadowTurnCostUsd(usage: ShadowTurnUsage | null | undefined, tokenCostUsd: number): number {
+  if (!usage) return 0;
+  const token = Number.isFinite(tokenCostUsd) && tokenCostUsd > 0 ? tokenCostUsd : 0;
+  const reported = usage.is_byok === true
+    ? openRouterByokCostUsd(usage, token)
+    : typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost > 0 ? usage.cost : undefined;
+  return typeof reported === 'number' && Number.isFinite(reported) && reported > 0 ? reported : token;
 }
 
 interface SessionAccumulator {
