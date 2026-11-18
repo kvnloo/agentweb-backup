@@ -276,6 +276,35 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(post).not.toHaveBeenCalled();
     });
 
+    it('refuses the whole call when the refused key comes FIRST and an owned key second (every position is checked)', async () => {
+      const theirs = `tool-responses/${OTHER_SESSION}/b.txt`;
+      const mine = `tool-responses/${MY_SESSION}/a.txt`;
+      const r = await performDataAnalysis([], `Compare ${theirs} with ${mine}.`, 'me');
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
+    it('refuses the whole call when the refused key is in the MIDDLE of three', async () => {
+      const a = `tool-responses/${MY_SESSION}/a.txt`;
+      const theirs = `tool-responses/${OTHER_SESSION}/b.txt`;
+      const c = `tool-responses/${MY_SESSION}/c.txt`;
+      const r = await performDataAnalysis([], `Compare ${a}, ${theirs} and ${c}.`, 'me');
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
+    it('answers "refused", not "try again", when one key is refused outright and another check could not run', async () => {
+      process.env.TEST_LOOKUP_FAILS = '1';
+      // The climbing key is refused without any lookup; the own-session key needs a lookup, which fails here.
+      const r = await performDataAnalysis(
+        [],
+        `Use tool-responses/${MY_SESSION}/../../users/other/files/1/abc/secret.csv and tool-responses/${MY_SESSION}/ok.txt.`,
+        'me',
+      );
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
     it('still inlines several keys when the caller owns them all', async () => {
       const a = `tool-responses/${MY_SESSION}/a.txt`;
       const b = `tool-responses/${MY_SESSION}/b.txt`;
