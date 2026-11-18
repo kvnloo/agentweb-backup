@@ -40,6 +40,13 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn()
 }));
 
+// This suite is about the analysis itself. Who may read which S3 key (ENG-2988 rule) is a boundary here; it is covered with the
+// real policy in performDataAnalysis.storageAccess.test.ts. No assertion of this suite was changed.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
+}));
+
 const mockedAxiosGet = axios.get as jest.Mock;
 const mockedAxiosPost = axios.post as jest.Mock;
 const mockedUploadFileToS3 = uploadFileToS3 as jest.Mock;
