@@ -65,6 +65,8 @@ export interface ZomaUserRecord {
   zomaFirstWriteAt?: string;
   zomaFirstAdLive?: FirstAdLive;
   zomaAdsExperience?: string;
+  /** ENG-3133: set when the user unsubscribed from the weekly Zoma email. */
+  zomaWeeklyReportOptOutAt?: string;
 }
 
 /** ENG-3072: providers a first ad can be verified on. Events without a platform are Meta (pre-Google). */
@@ -388,7 +390,7 @@ async function checkApproval(
 
 let doc: AWS.DynamoDB.DocumentClient | undefined;
 const client = () => (doc ??= new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' }));
-const USER_FIELDS = ['userId', 'email', 'isAdmin', 'createdAt', 'signupProduct', 'signupRef', 'zomaStage', 'zomaStageAt', 'zomaFirstWriteAt', 'zomaFirstAdLive', 'zomaAdsExperience'];
+const USER_FIELDS = ['userId', 'email', 'isAdmin', 'createdAt', 'signupProduct', 'signupRef', 'zomaStage', 'zomaStageAt', 'zomaFirstWriteAt', 'zomaFirstAdLive', 'zomaAdsExperience', 'zomaWeeklyReportOptOutAt'];
 
 function toUserRecord(item: any): ZomaUserRecord | undefined {
   if (!item?.userId || !item?.email) return undefined;
