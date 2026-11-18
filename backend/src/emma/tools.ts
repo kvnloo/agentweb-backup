@@ -4586,13 +4586,13 @@ emmaToolRegistry.register({
   name: 'linkedin_manage_post',
   definition: {
     name: 'linkedin_manage_post',
-    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
+    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, deleting your own posts, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- delete_post: Delete a LinkedIn post that this connected account authored (company page or personal profile). Requires post_urn (urn:li:share:… or urn:li:ugcPost:…). Cannot be undone. CRITICAL: Always get explicit user approval before deleting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics'],
+          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics', 'delete_post'],
           description: 'The operation to perform'
         },
         account_id: {
@@ -4601,7 +4601,7 @@ emmaToolRegistry.register({
         },
         post_urn: {
           type: 'string',
-          description: 'LinkedIn post URN — required for repost, comment, list_comments, react (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+          description: 'LinkedIn post URN — required for repost, comment, list_comments, react, delete_post (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
         },
         commentary: {
           type: 'string',
