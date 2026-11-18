@@ -32,14 +32,14 @@ const metaAccount = (over: any = {}) => ({
 
 function deps(over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Record<string, jest.Mock> {
   return {
-    getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+    getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
     listAccounts: jest.fn().mockResolvedValue([]),
     findLiveCustomerId: jest.fn(async (user: any) => user?.stripe_customer_id ?? null),
     createCustomerForUser: jest.fn().mockResolvedValue('cus_new'),
     resolvePaymentMethod: jest.fn().mockResolvedValue(NO_CARD),
     createPaymentMethodSetupSession: jest.fn().mockResolvedValue({ url: 'https://checkout.stripe.com/c/pay/cs_setup' }),
     buildMetaConnectUrl: jest.fn().mockResolvedValue('https://www.facebook.com/v23.0/dialog/oauth?client_id=x'),
-    frontendUrl: () => 'https://app.agentweb.pro',
+    pagesUrl: () => 'https://api.agentweb.pro',
     now: () => NOW,
     ...over,
   } as any;
@@ -47,7 +47,8 @@ function deps(over: Partial<ZomaOnboardingDeps> = {}): ZomaOnboardingDeps & Reco
 
 describe('ENG-2303 zoma_status onboarding', () => {
   it('no payment method -> next step is a Stripe setup-mode Checkout link; writes disabled', async () => {
-    const d = deps();
+    // ENG-3128: ad accounts come before the card, so Meta is connected here.
+    const d = deps({ listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
     const r = await getZomaReadiness('u1', d);
     expect(r.payment).toEqual({ ready: false, link: 'https://checkout.stripe.com/c/pay/cs_setup' });
     expect(r.writes_enabled).toBe(false);
@@ -56,13 +57,14 @@ describe('ENG-2303 zoma_status onboarding', () => {
     expect(d.createPaymentMethodSetupSession).toHaveBeenCalledWith({
       stripeCustomerId: 'cus_new',
       userId: 'u1',
-      successUrl: 'https://app.agentweb.pro/settings?zoma=payment_method_added',
-      cancelUrl: 'https://app.agentweb.pro/settings?zoma=payment_method_canceled',
+      // ENG-3134: Stripe returns to Zoma's own page on the API, never the AgentWeb (Emma) app.
+      successUrl: 'https://api.agentweb.pro/api/zoma/done?mcp=1',
+      cancelUrl: 'https://api.agentweb.pro/api/zoma/done?mcp=1&canceled=1',
     });
   });
 
   it('reuses the existing Stripe customer instead of creating one', async () => {
-    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1', stripe_customer_id: 'cus_old' }) });
+    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', stripe_customer_id: 'cus_old' }) });
     await getZomaReadiness('u1', d);
     expect(d.createCustomerForUser).not.toHaveBeenCalled();
     expect((d.createPaymentMethodSetupSession as jest.Mock).mock.calls[0][0].stripeCustomerId).toBe('cus_old');
@@ -81,7 +83,7 @@ describe('ENG-2303 zoma_status onboarding', () => {
 
   it('expired or revoked Meta connections are not usable', async () => {
     const d = deps({
-      getUser: jest.fn().mockResolvedValue({ userId: 'u1' }),
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads' }),
       resolvePaymentMethod: paid(),
       listAccounts: jest.fn().mockResolvedValue([
         metaAccount({ token_expires_at: NOW - 1 }),
@@ -94,7 +96,7 @@ describe('ENG-2303 zoma_status onboarding', () => {
 
   it('fully set up -> no next step, writes enabled, no Stripe objects minted', async () => {
     const d = deps({
-      getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co' }),
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co' }),
       resolvePaymentMethod: paid(),
       listAccounts: jest.fn().mockResolvedValue([metaAccount()]),
     });
@@ -138,7 +140,7 @@ describe('ENG-2303 write readiness gate', () => {
 
   it('ENG-2571: a stale has_payment_method flag alone never makes the user ready (checked live)', async () => {
     const d = deps({
-      getUser: jest.fn().mockResolvedValue({ userId: 'u1', email: 'a@b.co', has_payment_method: true }),
+      getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads', email: 'a@b.co', has_payment_method: true }),
       listAccounts: jest.fn().mockResolvedValue([metaAccount()]),
     });
     const r = await getZomaReadiness('u1', d);
@@ -149,7 +151,7 @@ describe('ENG-2303 write readiness gate', () => {
   });
 
   it('passes with payment method + usable Meta and never mints Stripe objects', async () => {
-    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1' }),
+    const d = deps({ getUser: jest.fn().mockResolvedValue({ userId: 'u1', zomaAdsExperience: 'runs_ads' }),
       resolvePaymentMethod: paid(), listAccounts: jest.fn().mockResolvedValue([metaAccount()]) });
     await expect(assertZomaWriteReady('u1', d)).resolves.toBeUndefined();
     expect(d.createCustomerForUser).not.toHaveBeenCalled();
