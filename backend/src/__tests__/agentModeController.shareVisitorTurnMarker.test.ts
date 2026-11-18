@@ -59,6 +59,7 @@ import * as markerModule from '../services/shareVisitorTurnMarker';
 import { getUserFromToken } from '../middleware/auth';
 import {
   agentModeController, tryClaimSessionGeneration, releaseSessionGeneration, preemptAutoContinuationAndWait, autoContinuationSessions,
+  activeSessionGenerations,
 } from '../controllers/agentModeController';
 import { isShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
@@ -422,26 +423,43 @@ describe('a visitor\'s message preempts only a continuation of a VISITOR\'s turn
     });
 
     describe('the continuation finishes DURING the owner check (the lock is free by the time it is looked at again)', () => {
-      /** The owner lookup is where the await happens: the continuation ends (lock released, bookkeeping cleared) while it runs. */
-      const continuationEndsDuring = (auth: any) =>
-        mockGetUserFromToken.mockImplementation(async () => {
-          releaseSessionGeneration(SESSION_ID);
-          autoContinuationSessions.delete(SESSION_ID);
-          return auth;
-        });
+      /**
+       * The owner lookup is where the await happens: the continuation ends (lock released, bookkeeping cleared) while the FIRST lookup
+       * runs, and only then. The lookup is called again later in the turn (marker check, owner-turn decision), and those calls must not
+       * release anything: the lock the second claim took has to stay held for the whole turn, or a dropped or double-held lock could
+       * not be caught by these tests.
+       */
+      const continuationEndsDuringFirstLookup = (auth: any) =>
+        mockGetUserFromToken
+          .mockImplementationOnce(async () => {
+            releaseSessionGeneration(SESSION_ID);
+            autoContinuationSessions.delete(SESSION_ID);
+            return auth;
+          })
+          .mockResolvedValue(auth);
 
       it.each([
         ['the owner (login verifies)', 'Bearer owner.jwt', OWNER_AUTH],
         ['a visitor with a login that does not verify', 'Bearer garbage.jwt', { user: null }],
-      ])('%s is NOT turned away: the second claim wins, nothing is cancelled, and the turn runs', async (_name, authorization, auth) => {
+      ])('%s is NOT turned away: the second claim wins, nothing is cancelled, the turn runs holding the lock, and the lock and marker are gone after', async (_name, authorization, auth) => {
         holdContinuation(false);
-        continuationEndsDuring(auth);
+        continuationEndsDuringFirstLookup(auth);
+        let lockHeldDuringTurn: boolean | undefined;
+        mockWorkerService.runInWorker.mockImplementation(async () => {
+          lockHeldDuringTurn = activeSessionGenerations.has(SESSION_ID);
+          return workerResponse as any;
+        });
         const res = fakeRes();
         await agentModeController.generateSharedResponse(shareRequest({ authorization }), res);
+        expect(mockGetUserFromToken.mock.calls.length).toBeGreaterThanOrEqual(2); // the lookups after the first really ran (and did not release)
         expect(res.status).not.toHaveBeenCalledWith(409);
         expect(cancel).not.toHaveBeenCalled();
         expect(workerCancel()).not.toHaveBeenCalled();
         expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        expect(lockHeldDuringTurn).toBe(true); // the lock the second claim took was held by the turn itself
+        expect(activeSessionGenerations.has(SESSION_ID)).toBe(false); // ...and released by the finally: nothing leaked
+        expect(isShareVisitorTurn(SESSION_ID)).toBe(false); // the marker went with it
+        expect(tryClaimSessionGeneration(SESSION_ID, OWNER_ID)).toBe(true); // a later request finds a free lock
       });
 
       it('and a continuation that is STILL running after the check behaves exactly as before (owner preempts, non-owner gets the unchanged 409)', async () => {
