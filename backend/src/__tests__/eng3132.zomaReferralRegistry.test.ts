@@ -7,9 +7,9 @@ import {
   DEFAULT_REFERRAL_PERCENT_BPS,
   DynamoZomaReferralStore,
   createReferralCode,
-  effectivePercentBps,
   getZomaReferralConfig,
   parsePercentToBps,
+  referralEarns,
   resolveReferrer,
   revokeReferralCode,
   validateReferralCode,
@@ -32,9 +32,6 @@ class MemoryStore implements ZomaReferralStore {
     if (!r) return false;
     this.rows.set(code, { ...r, status: 'revoked', revokedAt: r.revokedAt ?? nowIso });
     return true;
-  }
-  async list() {
-    return [...this.rows.values()];
   }
 }
 
@@ -71,6 +68,7 @@ describe('createReferralCode', () => {
     expect(await createReferralCode(input({ code: 'x1' }), store)).toMatchObject({ status: 'invalid', field: 'code' });
     expect(await createReferralCode(input({ code: 'dan-k', referrerId: 'Bad Id' }), store)).toMatchObject({ status: 'invalid', field: 'referrerId' });
     expect(await createReferralCode(input({ code: 'dan-k', payeeName: '   ' }), store)).toMatchObject({ status: 'invalid', field: 'payeeName' });
+    expect(await createReferralCode(input({ code: 'dan-k', userId: '' }), store)).toMatchObject({ status: 'invalid', field: 'userId' });
     for (const percentBps of [0, 10001, 12.5]) {
       expect(await createReferralCode(input({ code: 'dan-k', percentBps }), store)).toMatchObject({ status: 'invalid', field: 'percentBps' });
     }
@@ -98,6 +96,13 @@ describe('resolveReferrer: only a registered active code earns commission', () =
     await expect(resolveReferrer('sandra', store)).rejects.toThrow('dynamo down');
   });
 
+  it('re-checks the rules on read: a code that later becomes a channel alias stops resolving', async () => {
+    const store = new MemoryStore();
+    // Simulates a row registered before 'partner' became a launch-channel alias.
+    store.rows.set('partner', { code: 'partner', referrerId: 'p', payeeName: 'P', status: 'active', createdAt: '2026-11-01T00:00:00Z', createdBy: 'a' });
+    expect(await resolveReferrer('partner', store)).toEqual({ kind: 'none' });
+  });
+
   it('revoking twice keeps the first revocation time and an unknown code reports false', async () => {
     const store = new MemoryStore();
     await createReferralCode(input(), store);
@@ -105,6 +110,22 @@ describe('resolveReferrer: only a registered active code earns commission', () =
     await revokeReferralCode('sandra', store, () => new Date('2026-12-01T00:00:00Z'));
     expect(store.rows.get('sandra')?.revokedAt).toBe('2026-11-20T00:00:00.000Z');
     expect(await revokeReferralCode('nobody', store)).toBe(false);
+  });
+});
+
+describe('referralEarns', () => {
+  const rec = { createdAt: '2026-11-18T00:00:00Z' } as { createdAt: string; revokedAt?: string };
+  it('does not pay retroactively for signups from before the code was registered', () => {
+    expect(referralEarns(rec, { signupAt: '2026-11-17T23:59:59Z', paidAt: '2026-12-10T00:00:00Z' })).toBe(false);
+    expect(referralEarns(rec, { signupAt: '2026-11-18T00:00:00Z', paidAt: '2026-12-10T00:00:00Z' })).toBe(true);
+  });
+  it('revocation stops invoices paid at or after it, but not ones already paid', () => {
+    const revoked = { ...rec, revokedAt: '2026-12-01T00:00:00Z' };
+    expect(referralEarns(revoked, { signupAt: '2026-11-20T00:00:00Z', paidAt: '2026-11-30T23:59:59Z' })).toBe(true);
+    expect(referralEarns(revoked, { signupAt: '2026-11-20T00:00:00Z', paidAt: '2026-12-01T00:00:00Z' })).toBe(false);
+  });
+  it('pays nothing when a timestamp is unreadable', () => {
+    expect(referralEarns(rec, { signupAt: 'nope', paidAt: '2026-12-10T00:00:00Z' })).toBe(false);
   });
 });
 
@@ -117,19 +138,23 @@ describe('configuration', () => {
     expect(getZomaReferralConfig({ ZOMA_REFERRAL_ENABLED: 'TRUE' }).enabled).toBe(false);
     expect(getZomaReferralConfig({ ZOMA_REFERRAL_ENABLED: 'true' }).enabled).toBe(true);
   });
-  it('reads a configured percent and months, and falls back to defaults for junk', () => {
-    expect(getZomaReferralConfig({ ZOMA_REFERRAL_PERCENT: '12.5', ZOMA_REFERRAL_MONTHS: '6' })).toMatchObject({ percentBps: 1250, months: 6 });
-    for (const bad of ['0', '-5', '101', 'abc', '', '1.234']) {
-      expect(getZomaReferralConfig({ ZOMA_REFERRAL_PERCENT: bad }).percentBps).toBe(DEFAULT_REFERRAL_PERCENT_BPS);
-    }
-    for (const bad of ['0', '13', '2.5', 'x']) {
-      expect(getZomaReferralConfig({ ZOMA_REFERRAL_MONTHS: bad }).months).toBe(DEFAULT_REFERRAL_MONTHS);
-    }
-    expect(parsePercentToBps(20)).toBe(2000);
+  it('reads a configured percent and months', () => {
+    expect(getZomaReferralConfig({ ZOMA_REFERRAL_ENABLED: 'true', ZOMA_REFERRAL_PERCENT: '12.5', ZOMA_REFERRAL_MONTHS: '6' })).toEqual({ enabled: true, percentBps: 1250, months: 6 });
+    expect(parsePercentToBps('20')).toBe(2000);
   });
-  it('a code override wins over the default percent', () => {
-    expect(effectivePercentBps({ percentBps: 1500 }, { percentBps: 2000 })).toBe(1500);
-    expect(effectivePercentBps({}, { percentBps: 2000 })).toBe(2000);
+  it('turns the program OFF when a set value is unusable, never paying a default nobody chose', () => {
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      for (const bad of ['0', '-5', '101', 'abc', '15%', '1,5', '0x14', '1.234']) {
+        expect(getZomaReferralConfig({ ZOMA_REFERRAL_ENABLED: 'true', ZOMA_REFERRAL_PERCENT: bad }).enabled).toBe(false);
+      }
+      for (const bad of ['0', '13', '2.5', 'x']) {
+        expect(getZomaReferralConfig({ ZOMA_REFERRAL_ENABLED: 'true', ZOMA_REFERRAL_MONTHS: bad }).enabled).toBe(false);
+      }
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 
@@ -148,7 +173,7 @@ describe('DynamoZomaReferralStore', () => {
     expect(await store.create(rec)).toBe(true);
     expect(await store.create(rec)).toBe(false);
     await expect(store.create(rec)).rejects.toThrow('throttled');
-    expect(put.mock.calls[0][0]).toMatchObject({ TableName: 'T', ConditionExpression: 'attribute_not_exists(code)' });
+    expect(put.mock.calls[0][0]).toMatchObject({ TableName: 'T', ConditionExpression: 'attribute_not_exists(#code)' });
   });
 
   it('revoke is conditional on existence and keeps the first revokedAt', async () => {
@@ -157,17 +182,16 @@ describe('DynamoZomaReferralStore', () => {
     expect(await store.revoke('sandra', 'now')).toBe(true);
     expect(await store.revoke('ghost', 'now')).toBe(false);
     expect(update.mock.calls[0][0]).toMatchObject({
-      ConditionExpression: 'attribute_exists(code)',
+      ConditionExpression: 'attribute_exists(#code)',
       UpdateExpression: expect.stringContaining('if_not_exists(revokedAt'),
+      ExpressionAttributeValues: expect.objectContaining({ ':revoked': 'revoked' }),
     });
   });
 
-  it('list pages through the scan and sorts by code', async () => {
-    const scan = jest.fn()
-      .mockReturnValueOnce(req(() => ({ Items: [{ code: 'zeta' }], LastEvaluatedKey: { code: 'zeta' } })))
-      .mockReturnValueOnce(req(() => ({ Items: [{ code: 'alpha' }] })));
-    const store = new DynamoZomaReferralStore(dbOf({ scan }), 'T');
-    expect((await store.list()).map((r) => r.code)).toEqual(['alpha', 'zeta']);
-    expect(scan.mock.calls[1][0]).toMatchObject({ ExclusiveStartKey: { code: 'zeta' } });
+  it('get reads consistently, so a revocation is seen at once', async () => {
+    const get = jest.fn().mockReturnValue(req(() => ({ Item: { code: 'sandra' } })));
+    const store = new DynamoZomaReferralStore(dbOf({ get }), 'T');
+    expect(await store.get('sandra')).toEqual({ code: 'sandra' });
+    expect(get.mock.calls[0][0]).toMatchObject({ Key: { code: 'sandra' }, ConsistentRead: true });
   });
 });
