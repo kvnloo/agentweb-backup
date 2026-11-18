@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { getJwtSecret } from '../../config/jwt';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { SCHEDULED_SESSION_HEADER } from '../../utils/scheduledPublishConsentGuard';
+import { normalizeRestrictionClaim, type RestrictionProfileId } from '../../services/toolRestrictionProfiles';
 
 // Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
 // is too short for MCP tools that call slow endpoints (e.g. generate_landing_page
@@ -34,6 +35,11 @@ interface McpFetchOptions {
     agentUserId?: string;
     isDelegatedAccess?: boolean;
     sessionId?: string;
+    /**
+     * ENG-2816 (step 3): the restriction the caller acts under (see ctx() in toolHelpers.ts). Signed into the self-call token as
+     * the `_rp` claim, so the route this call lands on can tell a share-link visitor's write from the owner's own.
+     */
+    restrictionProfile?: string;
     /**
      * A pre-minted JWT to use as the Bearer token instead of self-call token
      * generation (ENG-1596). Set by adminClientScope.ts's
@@ -80,13 +86,24 @@ async function lookupUser(userId: string): Promise<UserRecord> {
 
 const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations like v0 generation
 
-export function generateSelfCallToken(user: UserRecord): string {
+export function generateSelfCallToken(user: UserRecord, restrictionProfile?: RestrictionProfileId): string {
   const secret = getJwtSecret();
   return jwt.sign(
-    { userId: user.userId, email: user.email, isAdmin: user.isAdmin, _svc: true },
+    // `_rp` only when there is a restriction: an unrestricted caller's token is byte-for-byte what it always was.
+    { userId: user.userId, email: user.email, isAdmin: user.isAdmin, _svc: true, ...(restrictionProfile ? { _rp: restrictionProfile } : {}) },
     secret,
     { expiresIn: SELF_CALL_TOKEN_TTL }
   );
+}
+
+/**
+ * ENG-2816 (step 3): a self-call that reaches a schedule or schedule-template WRITE route. Such a call must carry the caller's
+ * restriction claim, because the route decides from it whether the write is a share-link visitor's (and so marks the schedule).
+ */
+function isScheduleWriteCall(method: string, path: string): boolean {
+  if (method === 'GET') return false;
+  const pathname = String(path).split('?')[0];
+  return pathname.startsWith('/api/agent-mode/scheduled-chats') || pathname.startsWith('/api/agent-mode/schedule-templates');
 }
 
 // ─── HTTP self-call helper ──────────────────────────────────────────────────
@@ -177,10 +194,20 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   const { method, path, context, body, queryParams } = options;
   assertSafeSelfCallPath(path);
 
+  // ENG-2816 (step 3): normalised once. A claim that is present but unknown reads as the strictest profile, never as none.
+  const restrictionProfile = normalizeRestrictionClaim(context.restrictionProfile);
+
   let token: string;
   if (context.overrideToken) {
     // ENG-1596: a client-scoped call already carries a fully-formed delegate
     // token for the target client — skip self-call minting entirely.
+    //
+    // ENG-2816 (step 3): that token is not a self-call token, so it cannot carry the restriction claim, and a schedule write that
+    // arrives without it would read as the owner's. Today only read tools mint one (list_scheduled_chats and friends, GET), so
+    // no schedule write travels this way; if a restricted caller ever tries, refuse rather than let the claim be lost.
+    if (restrictionProfile && isScheduleWriteCall(method, path)) {
+      throw new Error('Not allowed: a restricted caller cannot change schedules on another account\'s behalf. Nothing was changed.');
+    }
     token = context.overrideToken;
   } else {
     const userId = context.userId || context.agentUserId;
@@ -192,7 +219,7 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     // When called via admin delegated access, mint the token with isAdmin:true so
     // admin REST routes (requireAdmin middleware) accept the self-call.
     const tokenUser = context.isDelegatedAccess ? { ...user, isAdmin: true } : user;
-    token = generateSelfCallToken(tokenUser);
+    token = generateSelfCallToken(tokenUser, restrictionProfile);
   }
 
   // Build URL with query params

@@ -114,7 +114,7 @@ export const emailService = {
    * that records delivery (ENG-1552) can tell a real send from a swallowed failure or
    * a non-prod suppression. `void` only ever comes from a test stub; treat it as unknown.
    */
-  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]): Promise<EmailSendOutcome | void> {
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[], headers?: Record<string, string>): Promise<EmailSendOutcome | void> {
     try {
       const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
@@ -123,7 +123,8 @@ export const emailService = {
         subject,
         text,
         html,
-        replyTo: SUPPORT_REPLY_TO
+        replyTo: SUPPORT_REPLY_TO,
+        ...(headers ? { headers } : {})
       });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
