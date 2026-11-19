@@ -876,12 +876,28 @@ describe('delete: the same id twice, and a list that holds opted-out leads', () 
 
 describe('list: page and limit are whole numbers', () => {
   it('anything else is refused instead of becoming NaN in the route', async () => {
-    for (const bad of [{ limit: 'x' }, { limit: 0 }, { limit: 1.5 }, { page: -1 }, { page: { n: 1 } }, { limit: { a: 1 } }]) {
+    for (const bad of [{ limit: 'x' }, { limit: '1.5' }, { limit: '-3' }, { limit: 1.5 }, { page: -1 }, { page: '0x10' }, { page: { n: 1 } }, { limit: { a: 1 } }, { engaged_only: 'maybe' }, { engaged_only: 1 }]) {
       const r = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, ...bad });
       expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
     }
     const ok = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, page: 1, limit: 10 });
     expect(ok.isError).toBe(false);
+  });
+
+  // Found by Opslane (run 2309, P2) on head 6f980cf98: the older list call forwarded `limit` as text and skipped a falsy one, so these worked before.
+  it('a number sent as text, and an empty or 0 value, still list (as the older call did); true/false may be text', async () => {
+    const own = leadsOf(TENANT_A.listId).length;
+    for (const good of [{ limit: '50' }, { limit: ' 50 ' }, { limit: '' }, { limit: 0 }, { limit: '0' }, { page: '1' }, { page: 0 }, { page: '' }, { limit: null }, { engaged_only: '' }, { engaged_only: '  ' }, { engaged_only: 'false' }, { engaged_only: 'FALSE' }, { engaged_only: false }]) {
+      const r = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, ...good });
+      expect({ good, isError: r.isError, rows: r.isError ? null : r.json.leads?.length }).toEqual({ good, isError: false, rows: own });
+    }
+  });
+
+  it('the values sent to the route are exactly what was meant (digits become the number; empty and 0 are not sent)', async () => {
+    const { buildLeadListQuery } = await import('../mcp/server/manageLeadsWrites');
+    expect(buildLeadListQuery({ limit: '50', page: ' 2 ', engaged_only: 'TRUE', search: ' x ', status: ' new ' })).toEqual({ limit: '50', page: '2', engagedOnly: 'true', search: 'x', status: 'new' });
+    expect(buildLeadListQuery({ limit: '', page: 0, engaged_only: '', search: '  ' })).toEqual({});
+    expect(buildLeadListQuery({ limit: 25, engaged_only: false })).toEqual({ limit: '25', engagedOnly: 'false' });
   });
 });
 
