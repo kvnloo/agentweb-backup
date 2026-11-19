@@ -739,6 +739,14 @@ describe('runZomaWeeklyReports', () => {
     expect((await runZomaWeeklyReports(tuesday)).sent).toBe(0);
   });
 
+  it('ENG-3155: skips a user who already gets the measurement report (no double email), without claiming the week', async () => {
+    const d = makeDeps({ hasMeasurementSchedule: jest.fn(async () => true) } as any);
+    const r = await runZomaWeeklyReports(d);
+    expect(r).toEqual({ checked: 1, sent: 0, failed: 0 });
+    expect(d.claim).not.toHaveBeenCalled();
+    expect(d.sent).toHaveLength(0);
+  });
+
   it('sends one email to an eligible user, claiming the ISO week first, with the one-click headers', async () => {
     const d = makeDeps();
     const r = await runZomaWeeklyReports(d);
