@@ -29,6 +29,9 @@ export interface LeadImportFollowupResult {
 
 const CONCURRENCY = 8;
 
+/** crmDb.findAllLeadsByEmail's default maxItems (services/db.ts): keep in step with it. */
+const FIND_ALL_BY_EMAIL_CAP = 200;
+
 const normalize = (email: unknown): string => (typeof email === 'string' ? email.trim().toLowerCase() : '');
 
 async function forEachBounded<T>(items: T[], worker: (item: T) => Promise<void>): Promise<void> {
@@ -69,10 +72,14 @@ export async function applyLeadImportFollowups(
   await forEachBounded([...byAddress.entries()], async ([address, leads]) => {
     let source: any;
     try {
-      for (const existing of (await crmDb.findAllLeadsByEmail(address)) as any[]) {
+      const matches = (await crmDb.findAllLeadsByEmail(address)) as any[];
+      for (const existing of matches) {
         if (createdIds.has(existing.leadId) || !isDoNotContact(existing)) continue;
         if ((await ownerOf(existing)) === ownerUserId) { source = existing; break; }
       }
+      // The lookup returns at most this many rows across ALL tenants (newest first). A full page may have pushed this owner's opt-out out of the window, so an
+      // answer of "no opt-out found" is not a complete one: it is reported as a check that could not be completed (the send guard refuses in the same case).
+      if (!source && matches.length >= FIND_ALL_BY_EMAIL_CAP) throw new Error(`the lookup for one address hit its ${FIND_ALL_BY_EMAIL_CAP}-row cap`);
     } catch (err) {
       result.doNotContactCheckFailed++;
       console.error(`[leadImport] do-not-contact lookup failed for an imported address in list ${listId}:`, (err as Error).message);
