@@ -96,6 +96,12 @@ class MemoryStore implements ZomaReportScheduleStore {
     Object.assign(r, patch, { updatedAt: now });
     return true;
   }
+  async setIndustry(u: string, a: string, value: Partial<ZomaReportSchedule>, now: string, opts: { onlyIfUnset?: boolean } = {}) {
+    const r = this.rows.get(this.key(u, a));
+    if (!r || (opts.onlyIfUnset && r.industry !== undefined)) return false;
+    Object.assign(r, value, { updatedAt: now });
+    return true;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -184,6 +190,7 @@ describe('ENG-3155 zoma_measurement_report output', () => {
     // No industry given: exactly N/A, and the user is asked for it.
     expect(r.industryBenchmark.line).toBe('Industry benchmark: N/A');
     expect(r.industryBenchmark.note).toMatch(/^Tell us your industry/);
+    expect(r.industryBenchmark.note).toContain('zoma_report_schedule (action SET_INDUSTRY, industry)');
     expect(r.report_url).toBe('https://agentweb-user-files.s3.amazonaws.com/users/u1/report.html');
 
     expect(r.breakdowns.top_ads?.[0]).toMatchObject({ ad_id: 'a1', label: 'Hero image', spend: 200, conversions: 7 });
@@ -559,7 +566,7 @@ describe('ENG-3155 zoma_report_schedule', () => {
     const store = new MemoryStore();
     await enrollReportSchedule('u1', '111', { store, now: () => NOW, env: ON });
     const opts = { store, now: () => NOW + DAY, env: ON };
-    expect((await runZomaReportScheduleTool('u1', {}, opts)).schedules).toEqual([{ account_id: '111', status: 'active', cadence: 'weekly', next_report_at: iso(NOW + 7 * DAY) }]);
+    expect((await runZomaReportScheduleTool('u1', {}, opts)).schedules).toEqual([{ account_id: '111', status: 'active', cadence: 'weekly', next_report_at: iso(NOW + 7 * DAY), industry: null }]);
     await runZomaReportScheduleTool('u1', { action: 'UPDATE', cadence: 'monthly' }, opts);
     expect((await store.get('u1', '111'))!.cadence).toBe('monthly');
     await runZomaReportScheduleTool('u1', { action: 'PAUSE', account_id: 'act_111' }, opts);
@@ -624,5 +631,132 @@ describe('ENG-3155 flag off = no-op', () => {
     process.env[ZOMA_MEASUREMENT_REPORTS_FLAG] = 'true';
     const names = getMetaToolkitManifest().map((t: any) => t.name);
     expect(names).toEqual(expect.arrayContaining(['zoma_measurement_report', 'zoma_report_schedule']));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
+describe('ENG-3155 industry stored on the report schedule', () => {
+  const now = () => NOW;
+  const ran = () => {
+    const jobs: Promise<void>[] = [];
+    return { jobs, background: (w: Promise<void>) => { jobs.push(w); } };
+  };
+
+  it('SET_INDUSTRY stores a validated industry as user-set; GET shows it; an invalid one is refused', async () => {
+    const store = new MemoryStore();
+    await enrollReportSchedule('u1', '111', { store, now, env: ON });
+    await enrollReportSchedule('u1', '222', { store, now, env: ON });
+    const opts = { store, now, env: ON };
+    const out: any = await runZomaReportScheduleTool('u1', { action: 'SET_INDUSTRY', industry: 'dentists_dental', account_id: '111' }, opts);
+    expect(out.schedules).toEqual([expect.objectContaining({ account_id: '111', industry: 'dentists_dental', industry_source: 'user' })]);
+    expect(await store.get('u1', '111')).toMatchObject({ industry: 'dentists_dental', industrySource: 'user' });
+    expect((await store.get('u1', '222'))!.industry).toBeUndefined();
+    expect((await runZomaReportScheduleTool('u1', {}, opts) as any).summary).toContain('industry dentists_dental');
+    await expect(runZomaReportScheduleTool('u1', { action: 'SET_INDUSTRY', industry: 'space_mining' }, opts)).rejects.toThrow(/industry must be one of/);
+    await expect(runZomaReportScheduleTool('u1', { action: 'SET_INDUSTRY' }, opts)).rejects.toThrow(/industry must be one of/);
+    expect((await store.get('u1', '222'))!.industry).toBeUndefined();
+  });
+
+  it('enrollment with no stored industry classifies once in the background and stores it as classified', async () => {
+    const store = new MemoryStore();
+    const classify = jest.fn(async () => 'dentists_dental' as const);
+    const bg = ran();
+    const notice = await enrollReportSchedule('u1', '111', { store, now, env: ON, classifyIndustry: classify, background: bg.background });
+    // The ship response does not wait for the classification.
+    expect(notice).toMatchObject({ enrollment: 'created', industry: null });
+    expect(scheduleNoticeText(notice!)).toContain('SET_INDUSTRY');
+    await Promise.all(bg.jobs);
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(await store.get('u1', '111')).toMatchObject({ industry: 'dentists_dental', industrySource: 'classified', industryClassifiedAt: iso(NOW) });
+    // A later ship with an industry stored does not classify again, and the notice names it.
+    const again = await enrollReportSchedule('u1', '111', { store, now, env: ON, classifyIndustry: classify, background: bg.background });
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(again).toMatchObject({ industry: 'dentists_dental', industry_source: 'classified' });
+    expect(scheduleNoticeText(again!)).toMatch(/dentists_dental industry benchmark .*SET_INDUSTRY/);
+  });
+
+  it('never overwrites a user-set industry (also when the user sets it while a classification is in flight)', async () => {
+    const store = new MemoryStore();
+    await enrollReportSchedule('u1', '111', { store, now, env: ON });
+    await runZomaReportScheduleTool('u1', { action: 'SET_INDUSTRY', industry: 'attorneys_legal' }, { store, now, env: ON });
+    const classify = jest.fn(async () => 'dentists_dental' as const);
+    await enrollReportSchedule('u1', '111', { store, now, env: ON, classifyIndustry: classify, background: ran().background });
+    expect(classify).not.toHaveBeenCalled();
+
+    const store2 = new MemoryStore();
+    let release!: (v: 'dentists_dental') => void;
+    const slow = jest.fn(() => new Promise<'dentists_dental'>((r) => { release = r; }));
+    const bg = ran();
+    await enrollReportSchedule('u1', '111', { store: store2, now, env: ON, classifyIndustry: slow, background: bg.background });
+    await runZomaReportScheduleTool('u1', { action: 'SET_INDUSTRY', industry: 'attorneys_legal' }, { store: store2, now, env: ON });
+    release('dentists_dental');
+    await Promise.all(bg.jobs);
+    expect(await store2.get('u1', '111')).toMatchObject({ industry: 'attorneys_legal', industrySource: 'user' });
+  });
+
+  it('a failed or empty classification stores nothing and never affects the ship response', async () => {
+    for (const classify of [jest.fn(async () => { throw new Error('Meta down'); }), jest.fn(async () => null), jest.fn(async () => 'not_an_industry' as any)]) {
+      const store = new MemoryStore();
+      const bg = ran();
+      const notice = await enrollReportSchedule('u1', '111', { store, now, env: ON, classifyIndustry: classify, background: bg.background });
+      expect(notice).toMatchObject({ enrollment: 'created', status: 'active' });
+      await Promise.all(bg.jobs);
+      expect(classify).toHaveBeenCalledTimes(1);
+      const row = (await store.get('u1', '111'))!;
+      expect(row.industry).toBeUndefined();
+      expect(row.industrySource).toBeUndefined();
+      expect(row.industryClassifiedAt).toBeUndefined();
+    }
+  });
+
+  it('the DynamoDB store guards the classifier write with attribute_not_exists(industry)', async () => {
+    const update = jest.fn(() => ({ promise: () => Promise.resolve({}) }));
+    const store = new DynamoZomaReportScheduleStore({ update } as any, 'T');
+    await store.setIndustry('u1', '111', { industry: 'attorneys_legal', industrySource: 'classified', industryClassifiedAt: 'c' }, 'n', { onlyIfUnset: true });
+    await store.setIndustry('u1', '111', { industry: 'attorneys_legal', industrySource: 'user' }, 'n');
+    expect((update.mock.calls[0] as any)[0]).toMatchObject({
+      ConditionExpression: 'attribute_exists(userId) AND attribute_not_exists(industry)',
+      UpdateExpression: 'SET industry = :i, industrySource = :s, industryClassifiedAt = :c, updatedAt = :now',
+    });
+    expect((update.mock.calls[1] as any)[0]).toMatchObject({ ConditionExpression: 'attribute_exists(userId)', UpdateExpression: 'SET industry = :i, industrySource = :s, updatedAt = :now' });
+  });
+
+  it('the scheduled runner passes the stored industry into the report', async () => {
+    const store = new MemoryStore();
+    await enrollReportSchedule('u1', '111', { store, now: () => NOW - 8 * DAY, env: ON });
+    await enrollReportSchedule('u1', '222', { store, now: () => NOW - 8 * DAY, env: ON });
+    await store.setIndustry('u1', '111', { industry: 'attorneys_legal', industrySource: 'user' }, iso(NOW));
+    const report = { summary: 's', date_range: { since: 'a', until: 'b' }, report_url: 'https://r' } as unknown as MeasurementReport;
+    const buildReport = jest.fn(async () => report);
+    await runZomaMeasurementReports({
+      enabled: () => true, maxPerPass: () => 10, store: () => store,
+      getUser: async (userId: string) => ({ userId, email: 'owner@shop.com', isAdmin: false }),
+      recentSpend: async () => 10, buildReport, sendEmail: jest.fn(async () => 'sent' as const),
+      backendUrl: () => 'https://api.example', secret: () => 's', now: () => NOW,
+    });
+    expect(buildReport).toHaveBeenCalledWith('u1', '111', 'attorneys_legal');
+    expect(buildReport).toHaveBeenCalledWith('u1', '222', undefined);
+  });
+
+  it('on-demand zoma_measurement_report falls back to the stored industry only when the caller omits it', async () => {
+    process.env[ZOMA_MEASUREMENT_REPORTS_FLAG] = 'true';
+    const runMeasurementReport = jest.fn(async () => ({ summary: 'ok' }));
+    const getStoredIndustry = jest.fn(async () => 'attorneys_legal');
+    await handleMetaToolkitCall({ authorization: 'Bearer oauth-good', toolName: 'zoma_measurement_report', args: {} }, gatewayDeps({ runMeasurementReport, getStoredIndustry }));
+    expect(getStoredIndustry).toHaveBeenCalledWith('u1', '111');
+    expect((runMeasurementReport.mock.calls[0] as any)[3]).toMatchObject({ industry: 'attorneys_legal' });
+    await handleMetaToolkitCall({ authorization: 'Bearer oauth-good', toolName: 'zoma_measurement_report', args: { industry: 'dentists_dental' } }, gatewayDeps({ runMeasurementReport, getStoredIndustry }));
+    expect(getStoredIndustry).toHaveBeenCalledTimes(1);
+    expect((runMeasurementReport.mock.calls[1] as any)[3]).toMatchObject({ industry: 'dentists_dental' });
+    getStoredIndustry.mockResolvedValueOnce(null as any);
+    await handleMetaToolkitCall({ authorization: 'Bearer oauth-good', toolName: 'zoma_measurement_report', args: {} }, gatewayDeps({ runMeasurementReport, getStoredIndustry }));
+    expect((runMeasurementReport.mock.calls[2] as any)[3].industry).toBeUndefined();
+  });
+
+  it('the report N/A note for an industry with no published row tells the agent how to correct it', () => {
+    const b = measurementIndustryBenchmark({ industry: 'other', conversionEvent: 'lead', spend: 10, conversions: 0, currency: 'USD', newAccount: false });
+    expect(b.line).toBe(INDUSTRY_BENCHMARK_NA_LINE);
+    expect(b.note).toContain('SET_INDUSTRY');
   });
 });
