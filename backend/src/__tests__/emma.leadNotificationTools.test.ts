@@ -1,12 +1,14 @@
 const handlers = new Map<string, any>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: any) => handlers.set(tool.name, tool) } }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 import { orgDb, userDb } from '../services/db';
 import '../emma/leadNotificationTools';
 const get = (args: any = {}, context: any = { userId: 'owner' }) => handlers.get('get_lead_notification_settings').execute(args, context);
 const update = (args: any, context: any = { userId: 'owner' }) => handlers.get('update_lead_notification_settings').execute(args, context);
 let org: any;
 beforeEach(() => {
+  // The consistent re-read (ENG-3152) answers what the indexed read answers in these tests.
+  (userDb.getUserByIdConsistent as jest.Mock).mockImplementation((id: string) => (userDb.getUserById as jest.Mock)(id));
   jest.clearAllMocks();
   org = { orgId: 'org-a', ownerUserId: 'owner', leadNotifications: {
     enabled: true, slackChannelId: 'C123', sources: ['inbound'], maskPhone: true, mentions: ['U123'],
