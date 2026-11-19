@@ -26,6 +26,29 @@ export const MAX_LEAD_ROWS_PER_CALL = 100;
 export const ROW_WORK_BUDGET_MS = 90_000;
 
 /**
+ * One call at a time per key, in arrival order, within this process. The opt-out guards are read-then-write (the guard reads the lead, the write comes later), so
+ * two calls from one agent sent in parallel ("mark do-not-contact" and "delete", "mark do-not-contact" and "change the email") could slip a write between a guard's
+ * read and its write; so could an update racing a delete (it re-creates a one-field row), or two deletes of one lead (the list count is lowered twice). An MCP
+ * session lives in ONE server process (sessions are held in memory), so one agent's parallel calls are serialized here. It does NOT serialize calls from different
+ * sessions or different server instances: closing that needs conditional writes in the route and the database layer (stated in the PR; a follow-up).
+ */
+const keyedChains = new Map<string, Promise<unknown>>();
+export async function withLeadLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = keyedChains.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => mine);
+  keyedChains.set(key, tail);
+  try {
+    await previous;
+    return await work();
+  } finally {
+    release();
+    if (keyedChains.get(key) === tail) keyedChains.delete(key);
+  }
+}
+
+/**
  * Fields forwarded as-is. Emma's eleven, plus those the REST routes validate themselves (lifecycle stage, the sender, which must be one the
  * account configured) and two plain profile fields; the review drafts and their format are accepted on update only (see DRAFT_FIELDS).
  */
@@ -46,11 +69,11 @@ const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(['isPrimary']);
 const MAX_POC_EMAILS = 50;
 
 /**
- * An email must be a plain address. The lead stores the text trimmed and lower-cased, and the opt-out is matched on that exact text, so a decorated form
- * of the same mailbox (`Name <a@b.test>`, `"a@b.test"`, `a@b.test.`) would be stored as a different string and NOT be flagged even when the address is
- * opted out. (An empty value is allowed: a lead need not have an email.)
+ * An email must be a plain ASCII address. The lead stores the text trimmed and lower-cased, and the opt-out is matched on that exact text, so a decorated form of
+ * the same mailbox (`Name <a@b.test>`, `"a@b.test"`, `a@b.test.`) or one with invisible or look-alike characters (zero-width space, soft hyphen, full-width letters,
+ * NUL) would be stored as a different string and NOT be flagged even when the address is opted out. (An empty value is allowed: a lead need not have an email.)
  */
-const PLAIN_EMAIL_ADDRESS = /^[^\s<>()[\]\\,;:"@]+@(?:[^\s<>()[\]\\,;:"@.]+\.)+[^\s<>()[\]\\,;:"@.]+$/;
+const PLAIN_EMAIL_ADDRESS = /^[A-Za-z0-9._%+'!#$&*\/=?^`{|}~-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]{2,}$/;
 
 /**
  * A standard field of the wrong type is refused here: the update route records a status change with the value as given BEFORE the write is
@@ -60,7 +83,7 @@ function valueProblem(key: string, value: unknown): string | null {
   if (key === 'status' && (typeof value !== 'string' || !value.trim())) return 'status (must be non-empty text)';
   if (value === null) return null;
   if (key === 'email' && typeof value === 'string' && value.trim() && !PLAIN_EMAIL_ADDRESS.test(value.trim())) {
-    return 'email (must be a plain address such as name@example.com)';
+    return 'email (must be a plain ASCII address such as name@example.com)';
   }
   if (key === 'pocEmails') {
     return Array.isArray(value) && value.length <= MAX_POC_EMAILS && value.every((v) => typeof v === 'string')
@@ -78,8 +101,14 @@ function valueProblem(key: string, value: unknown): string | null {
  */
 const CREATE_ONLY_CRM_FIELDS: ReadonlySet<string> = new Set(['priority', 'role', 'isPrimary', 'expectedClose', 'closedDate', 'heatScore', 'healthScore']);
 
-/** Written by the system's email validation and read by the send-eligibility check: an agent that could write it could mark an undeliverable address deliverable. */
-const SYSTEM_CUSTOM_KEYS: ReadonlySet<string> = new Set(['email_validation']);
+/**
+ * Written by the system and READ as system data: the email validation result (the send-eligibility check reads it: an agent that could write it could mark an
+ * undeliverable address deliverable) and the CRM sync ids the HubSpot and Attio adapters fall back to when syncMetadata has none (an agent that could write them
+ * could point a lead at another record in the account's CRM).
+ */
+const SYSTEM_CUSTOM_KEYS: ReadonlySet<string> = new Set([
+  'email_validation', 'hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id', 'attio_list_entry_id', 'attio_deal_list_id',
+]);
 
 const MAX_DRAFT_CHARS = 200_000;
 
@@ -312,16 +341,21 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
   }
   const { standard, custom, refused } = classifyLeadFields(args.updates);
   if (refused.length > 0) throw refusalError('update', refused);
+  if (Object.keys(standard).length === 0 && Object.keys(custom).length === 0) {
+    throw new Error('manage_leads update: nothing to update: give at least one field (an empty customFields object changes nothing).');
+  }
 
+  return withLeadLock(`${listId}/${args.lead_id}`, async () => {
   const existing = await mcpFetch({ method: 'GET', path: leadPath(listId, args.lead_id), context: c });
   const sameAddress = (a: unknown, b: unknown) => (typeof a === 'string' ? a.trim().toLowerCase() : '') === (typeof b === 'string' ? b.trim().toLowerCase() : '');
   // Custom fields are written KEY BY KEY (db.updateLead's customFieldsKeyMerge: `customFields.<key> = value`, no read, nothing to overwrite), so two updates to one
-  // lead at the same moment cannot drop each other's keys (a read-merge-write of the whole map can, and silently). That needs two things: the stored map must exist (a
-  // key cannot be set inside a map that is not there), and the portal route must not drop the flag, which its write guard does in `enforce` mode (this code runs in the
-  // same process as that route, so the mode is known). Otherwise the whole map is merged from a consistent read and written back, which keeps the older, narrower race.
+  // lead at the same moment cannot drop each other's keys (a read-merge-write of the whole map can, and silently). That needs the portal route not to drop the flag, which its write
+  // guard does in `enforce` mode (this code runs in the same process as that route, so the mode is known); the update layer itself creates a missing map and retries.
+  // In enforce mode the whole map is merged from a consistent read and written back: the same race, narrowed to one process by the per-lead lock around this update.
   const customPatch = Object.keys(custom).length > 0;
-  const keyByKey = customPatch && leadPutGuardMode() !== 'enforce' && isPlainObject(existing?.customFields);
-  const needsStored = standard.email !== undefined || (customPatch && !keyByKey);
+  const keyByKey = customPatch && leadPutGuardMode() !== 'enforce';
+  // The status decision (suppress, or leave an existing opt-out alone) and the address guard also read the STORED lead, consistently: the REST copy can lag a write.
+  const needsStored = standard.email !== undefined || typeof standard.status === 'string' || (customPatch && !keyByKey);
   const stored = needsStored ? await readStoredLead(listId, args.lead_id, 'update') : null;
   // The opt-out lives on the lead and is found by its address. Changing or clearing the address of an opted-out lead would let the old address be
   // added again as a sendable lead (the same reason it is not deleted here), so the address of a lead marked do-not-contact stays as it is. Writing the
@@ -342,7 +376,7 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
   if (typeof standard.status === 'string') {
     // Loaded here, not at the top: emma/impl modules must not be pulled in when the MCP tool registry loads.
     const { suppressionContactStatusUpdates } = await import('../../emma/impl/leads');
-    Object.assign(body, suppressionContactStatusUpdates(standard.status, existing, actingUserOf(c)));
+    Object.assign(body, suppressionContactStatusUpdates(standard.status, stored ?? existing, actingUserOf(c)));
   }
   const data = await mcpFetch({ method: 'PUT', path: leadPath(listId, args.lead_id), context: c, body });
   // Changing a lead's address to one the owner already marked do-not-contact must not make it sendable (the same inheritance as an add). Only when the address
@@ -357,6 +391,7 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
     });
   }
   return jsonResult(data);
+  });
 }
 
 interface RowOutcome {
@@ -482,6 +517,10 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
  * same route, so its access rules apply) and a missing one is a 404, not a success.
  */
 async function deleteExistingLead(listId: string, leadId: string, c: any): Promise<any> {
+  return withLeadLock(`${listId}/${leadId}`, () => deleteExistingLeadLocked(listId, leadId, c));
+}
+
+async function deleteExistingLeadLocked(listId: string, leadId: string, c: any): Promise<any> {
   await mcpFetch({ method: 'GET', path: leadPath(listId, leadId), context: c });
   const lead = await readStoredLead(listId, leadId, 'delete');
   // The opt-out lives on the lead. Deleting it would let the same address be added again as a sendable lead (an add inherits the flag only from
@@ -528,6 +567,10 @@ const MAX_LEADS_CHECKED_BEFORE_LIST_DELETE = 20_000;
  */
 export async function executeLeadListDelete(args: any, c: any): Promise<any> {
   const listId = requireText(args.list_id, 'list_id', 'create_lead_list delete');
+  return withLeadLock(`list:${listId}`, () => deleteListLocked(listId, c));
+}
+
+async function deleteListLocked(listId: string, c: any): Promise<any> {
   const listPath = `/api/crm/lists/${encodeURIComponent(listId)}`;
   await mcpFetch({ method: 'GET', path: listPath, context: c });
   let optedOut = 0;
