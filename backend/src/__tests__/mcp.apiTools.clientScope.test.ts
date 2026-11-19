@@ -349,16 +349,27 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(call.body).toEqual({ email: 'lead@example.com' });
     });
 
-    it('rejects a leads array that is empty or has more than one entry', async () => {
+    // ENG-2840: the self-scoped add now takes up to 100 leads (counted honestly, manageLeadsWrites.ts). Exactly one lead is still required
+    // for a dry_run preview and for the admin client_id path, whose audit trail and flag are written for a single lead.
+    it('rejects an empty leads array, more than 100 leads, and several leads for a preview', async () => {
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [] }, callerContext)
-      ).rejects.toThrow('exactly one lead per call');
+      ).rejects.toThrow('leads must be a non-empty array');
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', {
+          action: 'add',
+          list_id: 'list-1',
+          leads: Array.from({ length: 101 }, (_, i) => ({ email: `l${i}@example.com` })),
+        }, callerContext)
+      ).rejects.toThrow('at most 100 per call');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', {
           action: 'add',
           list_id: 'list-1',
           leads: [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          dry_run: true,
         }, callerContext)
       ).rejects.toThrow('exactly one lead per call');
 
@@ -372,15 +383,15 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
     it('rejects a non-object lead entry (null, string, array) instead of silently sending an empty body', async () => {
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [null] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: ['not-an-object'] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [['nested', 'array']] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });

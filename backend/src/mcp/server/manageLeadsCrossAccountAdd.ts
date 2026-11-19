@@ -23,6 +23,7 @@ import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { resolveClientScopedContext } from './adminClientScope';
 import { recordAdminAudit } from '../../services/adminAuditLog';
+import { buildLeadCreateBody } from './manageLeadsWrites';
 
 const isCrossAccountAddEnabled = (): boolean =>
   process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED === 'true';
@@ -54,7 +55,9 @@ export function normalizeAddLeadPayload(leads: unknown): Record<string, unknown>
       `manage_leads action "add" requires the single lead to be an object with fields (e.g. { email, firstName, ... }); received ${lead === null ? 'null' : Array.isArray(lead) ? 'an array' : typeof lead}.`
     );
   }
-  return lead as Record<string, unknown>;
+  // The same field rules as every other add: standard fields stay, other keys become custom fields, and a key that names the owner, sync or
+  // attribution data, or contact status is refused by name (the REST route stores a body as given).
+  return buildLeadCreateBody(lead);
 }
 
 /**
