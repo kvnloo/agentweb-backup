@@ -93,6 +93,11 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
       expect(ok(m)).toMatchObject({ ok: false, reason: 'result_other_account' });
       const byEmail = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('a', 'monitor_lead_volume', { client: { email: 'other@example.com' } })];
       expect(ok(byEmail)).toMatchObject({ ok: false, reason: 'result_other_account' });
+      // each identity field is checked on its own: a result naming only a different user id, or the right email with a different user id
+      const onlyId = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('a', 'monitor_lead_volume', { client: { userId: 'someone-else' } })];
+      expect(ok(onlyId)).toMatchObject({ ok: false, reason: 'result_other_account' });
+      const sameEmailOtherId = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('a', 'monitor_lead_volume', { client: { userId: 'someone-else', email: 'client@example.com' } })];
+      expect(ok(sameEmailOtherId)).toMatchObject({ ok: false, reason: 'result_other_account' });
     });
 
     it('a Meta or Google Ads call with no client_id (it reads the CALLER\'s own account: the admin\'s), or an empty one', () => {
