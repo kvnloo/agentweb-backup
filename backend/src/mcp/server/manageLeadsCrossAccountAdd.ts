@@ -205,7 +205,7 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
     return jsonResult({
       ...data,
       ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: true } : {}),
-      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
+      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed, doNotContactUnchecked: followups.uncheckedLeadIds } : {}),
     });
   } catch (error: any) {
     recordAdminAudit({ ...auditBase, outcome: 'failed', error: error?.message });

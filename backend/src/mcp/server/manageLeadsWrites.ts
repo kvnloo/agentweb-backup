@@ -12,7 +12,7 @@
 import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
-import { SERVER_OWNED_LEAD_KEYS } from '../../utils/leadWriteGuard';
+import { leadPutGuardMode, SERVER_OWNED_LEAD_KEYS } from '../../utils/leadWriteGuard';
 import { isDoNotContact } from '../../utils/leadContactStatus';
 
 /** Most rows one add or delete call handles (the same cap Emma's bulk tools use). */
@@ -46,12 +46,22 @@ const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(['isPrimary']);
 const MAX_POC_EMAILS = 50;
 
 /**
+ * An email must be a plain address. The lead stores the text trimmed and lower-cased, and the opt-out is matched on that exact text, so a decorated form
+ * of the same mailbox (`Name <a@b.test>`, `"a@b.test"`, `a@b.test.`) would be stored as a different string and NOT be flagged even when the address is
+ * opted out. (An empty value is allowed: a lead need not have an email.)
+ */
+const PLAIN_EMAIL_ADDRESS = /^[^\s<>()[\]\\,;:"@]+@(?:[^\s<>()[\]\\,;:"@.]+\.)+[^\s<>()[\]\\,;:"@.]+$/;
+
+/**
  * A standard field of the wrong type is refused here: the update route records a status change with the value as given BEFORE the write is
  * validated, so an object in `status` would leave a malformed engagement on the lead (and fail the write). null clears a field, except `status`.
  */
 function valueProblem(key: string, value: unknown): string | null {
   if (key === 'status' && (typeof value !== 'string' || !value.trim())) return 'status (must be non-empty text)';
   if (value === null) return null;
+  if (key === 'email' && typeof value === 'string' && value.trim() && !PLAIN_EMAIL_ADDRESS.test(value.trim())) {
+    return 'email (must be a plain address such as name@example.com)';
+  }
   if (key === 'pocEmails') {
     return Array.isArray(value) && value.length <= MAX_POC_EMAILS && value.every((v) => typeof v === 'string')
       ? null : `pocEmails (must be a list of at most ${MAX_POC_EMAILS} email strings)`;
@@ -188,7 +198,7 @@ export function classifyLeadFields(input: unknown, opts: { forAdd?: boolean } = 
         continue;
       }
       for (const [customKey, customValue] of Object.entries(value)) {
-        if (UNSAFE_FIELD_NAMES.has(customKey) || SYSTEM_CUSTOM_KEYS.has(customKey)) out.refused.push(`customFields.${customKey}`);
+        if (UNSAFE_FIELD_NAMES.has(customKey) || SYSTEM_CUSTOM_KEYS.has(customKey) || !customKey.trim()) out.refused.push(`customFields.${customKey || '(empty name)'}`);
         else out.custom[customKey] = customValue;
       }
     } else if (SYSTEM_CUSTOM_KEYS.has(key)) {
@@ -271,24 +281,23 @@ const leadPath = (listId: string, leadId?: string) =>
 const actingUserOf = (c: any): string => c.userId || c.agentUserId;
 
 /**
- * The lead's custom fields as stored, for the merge. The REST read the caller is given has some custom fields removed for viewers who may not
- * see them (card-revenue data), and writing a merged map built from THAT would delete them from the lead for good. Access and existence have
- * already been proved through the REST read; the stored copy only builds the merge and is never returned. If it cannot be read, nothing is
- * written: falling back to the REST copy would reintroduce exactly that loss.
+ * The lead as stored, read CONSISTENTLY. Used where a stale read would be wrong: the merge writes the custom-field map back whole (a stale read deletes the
+ * keys another call just saved), and the opt-out guards decide from it (a suppression written moments ago must be seen). The REST read the caller is given
+ * also has some custom fields removed for viewers who may not see them (card-revenue data), so a merge must not start from THAT copy. Access and existence have
+ * already been proved through the REST read; the stored copy is only used to decide and to merge, and is never returned. If it cannot be read, nothing is
+ * changed: falling back to the REST copy would reintroduce exactly those losses.
  */
-async function storedCustomFields(listId: string, leadId: string): Promise<unknown> {
+async function readStoredLead(listId: string, leadId: string, action: string): Promise<any> {
   let stored: any;
   try {
     const { crmDb } = await import('../../services/db');
-    // Consistent: the merged map is written back whole, so a stale read would silently delete the keys another call just saved (or the email
-    // validation result a just-added lead gets from the background job).
     stored = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
   } catch (err) {
-    console.error('[MCP] manage_leads update: could not read the stored lead:', (err as Error)?.message);
-    throw new Error('manage_leads update: the lead could not be read, so its custom fields were not changed. Nothing was saved; try again.');
+    console.error(`[MCP] manage_leads ${action}: could not read the stored lead:`, (err as Error)?.message);
+    throw new Error(`manage_leads ${action}: the lead could not be read, so nothing was changed. Nothing was saved; try again.`);
   }
-  if (!stored) throw new Error('manage_leads update: the lead could not be found when its custom fields were read. Nothing was saved.');
-  return stored.customFields ?? {};
+  if (!stored) throw new Error(`manage_leads ${action}: the lead could not be found when it was read. Nothing was saved.`);
+  return stored;
 }
 
 /**
@@ -305,18 +314,28 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
   if (refused.length > 0) throw refusalError('update', refused);
 
   const existing = await mcpFetch({ method: 'GET', path: leadPath(listId, args.lead_id), context: c });
+  const sameAddress = (a: unknown, b: unknown) => (typeof a === 'string' ? a.trim().toLowerCase() : '') === (typeof b === 'string' ? b.trim().toLowerCase() : '');
+  // Custom fields are written KEY BY KEY (db.updateLead's customFieldsKeyMerge: `customFields.<key> = value`, no read, nothing to overwrite), so two updates to one
+  // lead at the same moment cannot drop each other's keys (a read-merge-write of the whole map can, and silently). That needs two things: the stored map must exist (a
+  // key cannot be set inside a map that is not there), and the portal route must not drop the flag, which its write guard does in `enforce` mode (this code runs in the
+  // same process as that route, so the mode is known). Otherwise the whole map is merged from a consistent read and written back, which keeps the older, narrower race.
+  const customPatch = Object.keys(custom).length > 0;
+  const keyByKey = customPatch && leadPutGuardMode() !== 'enforce' && isPlainObject(existing?.customFields);
+  const needsStored = standard.email !== undefined || (customPatch && !keyByKey);
+  const stored = needsStored ? await readStoredLead(listId, args.lead_id, 'update') : null;
   // The opt-out lives on the lead and is found by its address. Changing or clearing the address of an opted-out lead would let the old address be
-  // added again as a sendable lead (the same reason it is not deleted here), so the address of a lead marked do-not-contact stays as it is.
-  if (standard.email !== undefined && existing && isDoNotContact(existing)) {
-    const same = (v: unknown) => (typeof v === 'string' ? v.trim().toLowerCase() : '');
-    if (same(standard.email) !== same(existing.email)) {
-      throw new Error('This lead is marked do-not-contact. Its email cannot be changed or cleared here: that would let the address be added again as a sendable lead. Change it in the app if that is really intended.');
-    }
+  // added again as a sendable lead (the same reason it is not deleted here), so the address of a lead marked do-not-contact stays as it is. Writing the
+  // same address is allowed and changes nothing.
+  if (standard.email !== undefined && stored && isDoNotContact(stored) && !sameAddress(standard.email, stored.email)) {
+    throw new Error('This lead is marked do-not-contact. Its email cannot be changed or cleared here: that would let the address be added again as a sendable lead. Change it in the app if that is really intended.');
   }
   const body: Record<string, unknown> = { ...standard };
 
-  if (Object.keys(custom).length > 0) {
-    body.customFields = mergeCustomFields(await storedCustomFields(listId, args.lead_id), custom, {
+  if (keyByKey) {
+    body.customFields = custom;
+    body.customFieldsKeyMerge = true;
+  } else if (customPatch) {
+    body.customFields = mergeCustomFields(stored?.customFields ?? {}, custom, {
       source: 'mcp.manageLeads.update', listId, leadId: args.lead_id,
     });
   }
@@ -326,8 +345,10 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
     Object.assign(body, suppressionContactStatusUpdates(standard.status, existing, actingUserOf(c)));
   }
   const data = await mcpFetch({ method: 'PUT', path: leadPath(listId, args.lead_id), context: c, body });
-  // Changing a lead's address to one the owner already marked do-not-contact must not make it sendable (the same inheritance as an add).
-  if (typeof standard.email === 'string' && standard.email.trim()) {
+  // Changing a lead's address to one the owner already marked do-not-contact must not make it sendable (the same inheritance as an add). Only when the address
+  // really changes, and never on a lead that is already opted out: the inheritance rewrites the contact status, its reason, note and actor, which would
+  // overwrite the original compliance record of an opted-out lead.
+  if (typeof standard.email === 'string' && standard.email.trim() && stored && !sameAddress(standard.email, stored.email) && !isDoNotContact(stored)) {
     const followups = await applyDoNotContactInheritance(listId, [{ leadId: args.lead_id, email: standard.email }], c);
     return jsonResult({
       ...data,
@@ -461,11 +482,12 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
  * same route, so its access rules apply) and a missing one is a 404, not a success.
  */
 async function deleteExistingLead(listId: string, leadId: string, c: any): Promise<any> {
-  const lead = await mcpFetch({ method: 'GET', path: leadPath(listId, leadId), context: c });
+  await mcpFetch({ method: 'GET', path: leadPath(listId, leadId), context: c });
+  const lead = await readStoredLead(listId, leadId, 'delete');
   // The opt-out lives on the lead. Deleting it would let the same address be added again as a sendable lead (an add inherits the flag only from
   // another lead that still exists), so a lead marked do-not-contact is not deleted through this tool.
-  if (lead && isDoNotContact(lead)) {
-    throw new Error('This lead is marked do-not-contact. Deleting it would let the same address be added again as a sendable lead, so it is not deleted here; remove it in the app if that is really intended.');
+  if (isDoNotContact(lead)) {
+    throw new Error('This lead is marked do-not-contact (or unsubscribed). Deleting it would let the same address be added again as a sendable lead, so it is not deleted here; remove it in the app if that is really intended.');
   }
   return mcpFetch({ method: 'DELETE', path: leadPath(listId, leadId), context: c });
 }
