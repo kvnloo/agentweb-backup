@@ -28,6 +28,8 @@
  *    recipients are "no".
  */
 
+import { extractToolResponseS3Ref } from '../utils/toolResponseS3Ref';
+
 /** Argument names that name WHOSE account a tool call is about, per scopable tool. The gateway rewrites aliases before a tool runs (ENG-2610). */
 const CLIENT_NAME_OR_EMAIL_KEYS = ['client_name_or_email', 'client_id', 'client_email', 'client'];
 const CLIENT_ID_KEYS = ['client_id'];
@@ -89,6 +91,8 @@ export interface ToolCallRecord {
   args: Record<string, unknown> | null;
   /** From a tool-result message: the account the tool says it resolved (`client.userId` / `client.email`), when it says. */
   resultSubject?: { userId?: string; email?: string } | null;
+  /** The dispatcher collapsed this call as a same-turn duplicate of an earlier identical one: it did not run, so it read nothing. */
+  suppressed?: boolean;
 }
 
 export interface RunScope {
@@ -100,6 +104,8 @@ export interface RunScope {
   toolNames: string[];
   /** The session's own per-tool success counter, when it is a map (it never exceeds the number of calls that left rows). */
   toolCounts: Record<string, number>;
+  /** Every tool NAME that is a key of the session's counter, zero included (a work plan decrements it per step but keeps the key). */
+  countedNames: string[];
   records: ToolCallRecord[];
 }
 
@@ -157,11 +163,19 @@ function balancedObject(text: string, from: number): string | null {
  * inside a string, or a forged key whose text contains `"client":{` (JSON.stringify escapes the quote but the key text still
  * matches a naive pattern) is never read as the subject. Returns null when there is none.
  */
-function topLevelClientObject(text: string): unknown | null {
-  const start = /(?:^|\n)\{\s*"/.exec(text);
-  if (!start) return null;
-  let i = text.indexOf('{', start.index);
-  const limit = Math.min(text.length, i + 60000);
+function topLevelClientObject(content: string): unknown | null {
+  // The saved content is: [S3 header] [inline-citation block] {top-level JSON, cut off}. Strip exactly those two known
+  // prefixes and require the JSON object to start right there, so a `{"client":...}` forged inside a header, a citation block or
+  // a plain-text error row is never read as the top level.
+  let text = content;
+  const header = extractToolResponseS3Ref(text);
+  if (header) text = text.slice(header.length);
+  const cite = /^\[INLINE CITATIONS[\s\S]*?\n\]\n*/.exec(text);
+  if (cite) text = text.slice(cite[0].length);
+  text = text.replace(/^[\s\uFEFF]+/, '');
+  if (!/^\{\s*"/.test(text)) return null;
+  let i = 0;
+  const limit = Math.min(text.length, 60000);
   let depth = 0;
   let inString = false;
   let strStart = -1;
@@ -238,7 +252,7 @@ export function extractRunScope(
   messages: Array<Record<string, any>> | null | undefined,
   calledFunctions?: Record<string, number> | string[] | null,
 ): RunScope {
-  if (!Array.isArray(messages) || messages.length === 0) return { readOk: false, unrecognized: false, toolNames: [], toolCounts: {}, records: [] };
+  if (!Array.isArray(messages) || messages.length === 0) return { readOk: false, unrecognized: false, toolNames: [], toolCounts: {}, countedNames: [], records: [] };
   const records: ToolCallRecord[] = [];
   const names = new Set<string>();
   let unrecognized = false;
@@ -270,7 +284,7 @@ export function extractRunScope(
             continue;
           }
           names.add(tool);
-          records.push({ tool, source: 'ledger', toolCallId: typeof l?.id === 'string' ? l.id : undefined, args: parseArgs(l?.arguments) });
+          records.push({ tool, source: 'ledger', toolCallId: typeof l?.id === 'string' ? l.id : undefined, args: parseArgs(l?.arguments), suppressed: l?.duplicateOf !== undefined && l?.duplicateOf !== null });
         }
       }
     }
@@ -280,7 +294,16 @@ export function extractRunScope(
         continue;
       }
       names.add(m.name);
-      records.push({ tool: m.name, source: 'result', toolCallId: typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined, args: null, resultSubject: resultSubjectOf(m.content) });
+      // The subject is only needed (and only read, which can be costly for a large result) for the tools this module can scope.
+      const scopable = Object.prototype.hasOwnProperty.call(RECIPIENT_SCOPABLE_TOOLS, m.name);
+      records.push({
+        tool: m.name,
+        source: 'result',
+        toolCallId: typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined,
+        args: null,
+        resultSubject: scopable ? resultSubjectOf(m.content) : null,
+        suppressed: m?.metadata?.duplicateSuppressed === true,
+      });
     }
   }
   const counted = Array.isArray(calledFunctions) ? calledFunctions : calledFunctions && typeof calledFunctions === 'object' ? Object.keys(calledFunctions) : [];
@@ -289,7 +312,7 @@ export function extractRunScope(
   if (calledFunctions && typeof calledFunctions === 'object' && !Array.isArray(calledFunctions)) {
     for (const [k, v] of Object.entries(calledFunctions)) if (typeof v === 'number' && Number.isFinite(v)) toolCounts[k] = v;
   }
-  return { readOk: true, unrecognized, toolNames: [...names], toolCounts, records };
+  return { readOk: true, unrecognized, toolNames: [...names], toolCounts, countedNames: counted.filter((n): n is string => typeof n === 'string' && !!n), records };
 }
 
 const norm = (s: unknown): string => (typeof s === 'string' ? s.trim().toLowerCase() : '');
@@ -300,13 +323,18 @@ const normKey = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '')
 function hasSubjectKeyVariant(args: Record<string, unknown>, rule: ScopableToolRule): boolean {
   const subjectNorms = new Set(rule.keys.map(normKey));
   const exact = new Set(rule.keys);
-  let budget = 500;
+  let budget = 2000;
+  // Fail closed when the arguments are deeper or larger than this walk will read: a subject key could hide there.
   const walk = (value: unknown, depth: number): boolean => {
-    if (!value || typeof value !== 'object' || depth > 4 || budget <= 0) return false;
-    const entries: Array<[string, unknown]> = Array.isArray(value) ? value.map((v, i) => [String(i), v] as [string, unknown]) : Object.entries(value as Record<string, unknown>);
-    for (const [k, v] of entries) {
+    if (!value || typeof value !== 'object') return false;
+    if (depth > 4 || budget <= 0) return true;
+    if (Array.isArray(value)) {
+      for (const v of value) if (v && typeof v === 'object' && walk(v, depth + 1)) return true; // primitives cannot carry a key
+      return false;
+    }
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       budget--;
-      if (!Array.isArray(value) && subjectNorms.has(normKey(k)) && !(depth === 0 && exact.has(k))) return true;
+      if (subjectNorms.has(normKey(k)) && !(depth === 0 && exact.has(k))) return true;
       if (walk(v, depth + 1)) return true;
     }
     return false;
@@ -344,11 +372,16 @@ export function evaluateRunForRecipient(scope: RunScope, recipient: RecipientIde
     (idsByTool[r.tool] ||= new Set()).add(r.toolCallId);
     if (r.source === 'result') (resultIdsByTool[r.tool] ||= new Set()).add(r.toolCallId);
   }
+  const suppressedIds = new Set(scope.records.filter((r) => r.suppressed && r.toolCallId).map((r) => r.toolCallId as string));
   for (const tool of Object.keys(RECIPIENT_SCOPABLE_TOOLS)) {
     const ids = idsByTool[tool]?.size ?? 0;
     if ((scope.toolCounts[tool] ?? 0) > ids) return { ok: false, reason: 'rows_missing' };
+    // A work plan decrements the counter per step (to 0, keeping the key) and resets it on launch, so the count cannot show a
+    // missing call there; but a scopable tool that is a KEY of the counter and left no row at all lost every one of its rows.
+    if (scope.countedNames.includes(tool) && !scope.records.some((r) => r.tool === tool)) return { ok: false, reason: 'rows_missing' };
     if (RECIPIENT_SCOPABLE_TOOLS[tool].emailOnly) {
-      for (const id of idsByTool[tool] ?? []) if (!resultIdsByTool[tool]?.has(id)) return { ok: false, reason: 'result_missing' };
+      // A call the dispatcher collapsed as a same-turn duplicate never ran, so it has no result of its own.
+      for (const id of idsByTool[tool] ?? []) if (!resultIdsByTool[tool]?.has(id) && !suppressedIds.has(id)) return { ok: false, reason: 'result_missing' };
     }
   }
 
@@ -359,6 +392,7 @@ export function evaluateRunForRecipient(scope: RunScope, recipient: RecipientIde
     const rule = RECIPIENT_SCOPABLE_TOOLS[r.tool];
     scopedRecords++;
     if (r.source === 'result') {
+      if (r.suppressed) continue;
       const subj = r.resultSubject;
       if (!subj && rule.emailOnly) return { ok: false, reason: 'result_subject_unreadable' };
       if (subj?.userId && subj.userId !== recipient.userId) return { ok: false, reason: 'result_other_account' };

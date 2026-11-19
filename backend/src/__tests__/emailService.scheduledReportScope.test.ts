@@ -141,6 +141,17 @@ describe('ENG-1904 scoped report recipients: flag ON', () => {
     expect(sentTo()).toEqual([[OWNER.email], ['Client@Customer.Example']]);
   });
 
+  it('an unexpected error adds nobody and the log never carries the error text (it may hold an address)', async () => {
+    setRun(scopedToClient);
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockRejectedValue(Object.assign(new Error(`lookup failed for ${CLIENT.email}`), { code: 'ProvisionedThroughputExceededException' }));
+    await send();
+    expect(sentTo()).toEqual([[OWNER.email]]);
+    const logged = (console.error as jest.Mock).mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    expect(logged).toContain('could not decide scoped recipients');
+    expect(logged).toContain('ProvisionedThroughputExceededException');
+    expect(logged).not.toContain(CLIENT.email);
+  });
+
   it('withholds when the messages cannot be read (an error never adds a recipient)', async () => {
     setRun(scopedToClient);
     (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockRejectedValue(new Error('read failed'));

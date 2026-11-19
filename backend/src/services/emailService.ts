@@ -2528,7 +2528,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       if (!enabled) return [];
       return eligible;
     } catch (error) {
-      console.error(`${tag} could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added:`, error);
+      console.error(`${tag} could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added (${(error as any)?.name || 'Error'}${(error as any)?.code ? ' ' + (error as any).code : ''})`);
       return [];
     }
   },
