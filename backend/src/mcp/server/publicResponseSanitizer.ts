@@ -2,8 +2,9 @@
  * ENG-2335 (ENG-336.3): strip internal identifiers from PUBLIC MCP tool responses.
  *
  * Applied only to external MCP callers (API key / OAuth) on non-admin tools.
- * In-process portal callers, admin lookup tools, and admin client-scoped calls
- * (`client_id`) are returned unchanged.
+ * In-process portal callers, admin lookup tools, and client-scoped calls
+ * (`client_id`) made by a caller who really is an admin are returned unchanged;
+ * a `client_id` argument from anyone else changes nothing.
  *
  * Functional session/run/request handles are retained only by the tool-purpose
  * sets below; unrelated tools cannot inherit those exceptions.

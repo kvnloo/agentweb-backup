@@ -46,7 +46,8 @@ async function isAdminUser(userId: string): Promise<boolean> {
   try {
     const { userDb } = await import('../../services/db');
     return (await userDb.getUserById(userId))?.isAdmin === true;
-  } catch {
+  } catch (err) {
+    console.warn('[MCP] admin check failed; the response stays sanitised:', (err as Error)?.message);
     return false;
   }
 }
