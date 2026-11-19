@@ -32,6 +32,9 @@ import { isMetaExperimentWriteTool, META_EXPERIMENT_WRITE_TOOL_DEFINITIONS } fro
 import { DIAGNOSTICS_READ_DEFINITIONS } from './metaToolkitDiagnostics';
 import { HELP_ARTICLE_DEFINITION } from './metaToolkitHelp';
 import { isZomaAdsReportTool, ZOMA_ADS_REPORT_DEFINITION } from './zomaAdsReport';
+import { isZomaIndustryBenchmarkTool } from './zomaIndustryBenchmark';
+import { measurementReportsEnabled, ZOMA_MEASUREMENT_REPORT_DEFINITION } from './zomaMeasurementReport';
+import { ZOMA_REPORT_SCHEDULE_DEFINITION } from './zomaReportSchedule';
 
 export const CREATIVE_UPLOAD_ACTIONS = ['UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'BULK_CREATE'] as const;
 
@@ -145,12 +148,16 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...zomaToolDefinitions().map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
     JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
+    // ENG-3155: the proactive measurement report and its schedule (dark until ZOMA_MEASUREMENT_REPORTS_ENABLED).
+    ...(measurementReportsEnabled()
+      ? [ZOMA_MEASUREMENT_REPORT_DEFINITION, ZOMA_REPORT_SCHEDULE_DEFINITION].map((d) => JSON.parse(JSON.stringify(d)))
+      : []),
   ];
 }
 
 /** Throws MetaToolkitRefusal when the call is outside the v1 surface. */
 export function assertMetaToolkitV1Call(name: string, args: any): void {
-  if (isZomaTool(name) || isZomaAdsReportTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name) || isMetaAssetLibraryTool(name)) return;
+  if (isZomaTool(name) || isZomaAdsReportTool(name) || isZomaIndustryBenchmarkTool(name) || isMetaHealthTool(name) || isMetaCatalogTool(name) || isMetaCatalogWriteTool(name) || isMetaEventSourceTool(name) || isMetaCatalogFeedTool(name) || isMetaPagesTool(name) || isMetaBoostTool(name) || isMetaExperimentWriteTool(name) || isMetaAssetLibraryTool(name)) return;
   if (!isV1Tool(name)) {
     throw new MetaToolkitRefusal(`Tool ${name} is not part of the Meta Toolkit.`);
   }

@@ -96,6 +96,123 @@ async function getAlertEmails(settingKey: string, fallback: string[]): Promise<s
   return settingsService.getJsonArraySetting(settingKey, fallback);
 }
 
+/** ENG-3149: the longest schedule name (in characters, ellipsis included) the visitor-schedule alert will show. */
+export const SHARE_SCHEDULE_ALERT_NAME_MAX = 100;
+
+// A visitor chooses the name and nothing else limits its length (the request body limit is megabytes), and it is cleaned inside the
+// visitor's own request. So the work is bounded FIRST: only the first 300 code points of what was sent are ever looked at, and NFKC
+// (which can lengthen a string) is followed by a second cut to 400. Every step after that runs over at most 400 code points.
+const NAME_MAX_RAW_CODE_POINTS = 300;
+const NAME_MAX_NORMALIZED_CODE_POINTS = 400;
+
+/** The first `max` code points of `text`, found by looking at no more than `max` of them (a surrogate pair counts once). */
+function firstCodePoints(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = 0;
+  for (let counted = 0; counted < max && end < text.length; counted++) {
+    const unit = text.charCodeAt(end);
+    const next = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+    end += unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? 2 : 1;
+  }
+  return text.slice(0, end);
+}
+
+/** The most combining marks kept after any one base character (a name must not be able to stack or strike through a letter). */
+const NAME_MAX_MARKS_PER_BASE = 3;
+
+// Every regex below is ONE character class (or a one-character lookaround around it), applied globally: nothing in them can
+// backtrack, so the cost is linear in the (bounded) input.
+
+// Whitespace of any kind becomes a separator.
+const NAME_WHITESPACE = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]/gu;
+// Characters that draw nothing, or draw something other than what is there, are DELETED (not turned into a space), so a name cannot
+// hide a dot, a slash or a word inside one and then have the rest read as separate words: every default-ignorable code point
+// (soft hyphen, zero-width and joiner characters, bidi controls, variation selectors, the filler letters, the tag range ...), every
+// control, format, surrogate and private-use character, and the invisible ones that are none of those but are listed by name
+// (U+115F, U+1160, U+3164, U+FFA0 fillers, U+034F combining grapheme joiner, U+2800 blank braille, the tag characters).
+const NAME_INVISIBLE =
+  /[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Co}\u115F\u1160\u3164\uFFA0\u034F\u2800\u{E0000}-\u{E007F}]/gu;
+// A "." is kept only between two digits ("v2.1", "Release 3.0", "1.2.3"); every other dot becomes a space.
+const NAME_DOT_NOT_BETWEEN_DIGITS = /(?<!\d)\.|\.(?!\d)/g;
+// One character at a time: a letter or digit (the only things a combining mark may belong to), and a combining mark.
+const NAME_BASE_CHARACTER = /^[\p{L}\p{N}]$/u;
+const NAME_MARK = /^\p{M}$/u;
+// A name needs at least one letter or digit to be a name at all.
+const NAME_HAS_LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+// ALLOW-LIST: letters, combining marks (so Devanagari, Thai, Arabic and accented text keep their signs), digits, space, the dots
+// kept above, and a small set of punctuation: _ - ' (U+2019) & , ( ) + # ! ? %. Everything else becomes a space. In particular
+// : / \ @ < > " ; = [ ] { } | ~ ^ * $ and every look-alike of a dot, and emoji and other symbols.
+const NAME_NOT_ALLOWED = /[^\p{L}\p{M}\p{N} _\-'’&,()+#!?%.]/gu;
+
+/**
+ * Keeps at most NAME_MAX_MARKS_PER_BASE combining marks after a letter or digit and drops every other mark (one after a space or
+ * punctuation, or at the start, has nothing to combine with). One pass over the code points, no backtracking, so it is linear in a
+ * string that is already bounded.
+ */
+function capCombiningMarks(text: string): string {
+  let kept = '';
+  let marksAfterBase = 0;
+  let afterBase = false;
+  for (const character of text) {
+    if (NAME_MARK.test(character)) {
+      if (afterBase && marksAfterBase < NAME_MAX_MARKS_PER_BASE) {
+        kept += character;
+        marksAfterBase++;
+      }
+    } else {
+      kept += character;
+      afterBase = NAME_BASE_CHARACTER.test(character);
+      marksAfterBase = 0;
+    }
+  }
+  return kept;
+}
+
+/**
+ * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. It is the one piece of
+ * visitor text in a real AgentWeb mail, so nothing in it may be clickable, look like an address, hide anything or reorder text. An
+ * ALLOW-LIST does that (a list of what may stay, not of what may not), in this order:
+ *  0. not a string -> "Untitled"; only the first 300 code points are used, before any other work;
+ *  1. NFKC (folds full-width and compatibility characters, including look-alike dots, to their plain form), then cut to 400;
+ *  2. whitespace of any kind becomes a space, then invisible characters are deleted;
+ *  3. a "." not between two digits becomes a space, then everything but letters, marks, digits, spaces and a few punctuation marks
+ *     becomes a space (so "evil.example/x" can only ever read "evil example x");
+ *  4. combining marks are capped at 3 per letter or digit (and dropped where there is nothing to combine with), runs of spaces
+ *     collapse and the ends are trimmed;
+ *  5. a name over SHARE_SCHEDULE_ALERT_NAME_MAX characters is cut on whole characters to fit WITH its ellipsis;
+ *  6. no letter or digit left (nothing, or only punctuation) -> "Untitled".
+ * Cleaning an already clean name returns it unchanged (a single trailing ellipsis is carried over rather than cleaned away). HTML
+ * escaping is the caller's job where it writes HTML; the plain-text part uses this as is. Costs and consequences are in
+ * dev/pending/eng-3149-owner-alert-for-visitor-schedules.md.
+ */
+export function shareScheduleAlertName(name: unknown): string {
+  if (typeof name !== 'string') return 'Untitled';
+  let raw = firstCodePoints(name, NAME_MAX_RAW_CODE_POINTS);
+  // The ellipsis this function adds when it cuts a name must survive being cleaned again, so a single trailing one is set aside.
+  const hadTrailingEllipsis = raw.endsWith('…');
+  if (hadTrailingEllipsis) raw = raw.slice(0, -1);
+
+  const allowed = firstCodePoints(raw.normalize('NFKC'), NAME_MAX_NORMALIZED_CODE_POINTS)
+    .replace(NAME_WHITESPACE, ' ')
+    .replace(NAME_INVISIBLE, '')
+    .replace(NAME_DOT_NOT_BETWEEN_DIGITS, ' ')
+    .replace(NAME_NOT_ALLOWED, ' ')
+    // Deleting a character can put a base and a mark next to each other that were not: compose them again, so that cleaning is
+    // stable. (Letters stay letters; this cannot bring back anything the steps above removed.)
+    .normalize('NFKC');
+  const cleaned = capCombiningMarks(allowed).replace(/ +/g, ' ').trim();
+  if (!NAME_HAS_LETTER_OR_DIGIT.test(cleaned)) return 'Untitled';
+
+  const characters = Array.from(cleaned);
+  const addEllipsis = hadTrailingEllipsis || characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const room = addEllipsis ? SHARE_SCHEDULE_ALERT_NAME_MAX - 1 : SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const shown = characters.length > room
+    // A cut must not leave a dot dangling (it would not survive cleaning again), nor spaces before the ellipsis.
+    ? characters.slice(0, room).join('').replace(/[ .]+$/, '')
+    : cleaned;
+  return addEllipsis ? `${shown}…` : shown;
+}
+
 export const emailService = {
   // Escape HTML content to make it safe for emails
   escapeHtml(html: string): string {
@@ -114,7 +231,7 @@ export const emailService = {
    * that records delivery (ENG-1552) can tell a real send from a swallowed failure or
    * a non-prod suppression. `void` only ever comes from a test stub; treat it as unknown.
    */
-  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]): Promise<EmailSendOutcome | void> {
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[], headers?: Record<string, string>): Promise<EmailSendOutcome | void> {
     try {
       const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
@@ -123,7 +240,8 @@ export const emailService = {
         subject,
         text,
         html,
-        replyTo: SUPPORT_REPLY_TO
+        replyTo: SUPPORT_REPLY_TO,
+        ...(headers ? { headers } : {})
       });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
@@ -1873,6 +1991,81 @@ Schedule ID: ${scheduleId}
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat paused-for-input emails to ${emailList.join(', ')}:`, error);
+    }
+  },
+
+  // ENG-3149: a share-link visitor has just made the first mark on one of the owner's scheduled chats (the owner otherwise only
+  // sees the "Visitor-edited" badge). A notification only. The subject is fixed and the schedule NAME is the one piece of
+  // visitor-controlled text in the mail: it is reduced to letters, marks, digits and a little punctuation, cut to
+  // SHARE_SCHEDULE_ALERT_NAME_MAX characters and escaped (see shareScheduleAlertName). No prompt text, share token, IP or recipient
+  // list goes in. Never throws, like its siblings.
+  async sendVisitorScheduleAlertEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string
+  ) {
+    const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const reviewUrl = `${customerFrontendUrl}/agent-mode?tab=scheduled`;
+      const name = shareScheduleAlertName(scheduleName);
+
+      const header = 'A scheduled chat was set up through your share link';
+      const paragraph1Before = 'Someone using one of your Emma share links created or changed the scheduled chat "';
+      const paragraph1After = '".';
+      const paragraph2 = "Until you review it, it runs with limited access: it can't use account-level tools such as saving memory or changing organization settings, and anything it would publish or post to Slack is kept as a draft.";
+      const paragraph3 = "If it's yours or you trust it, open Scheduled chats, read what it does and press Adopt. If you don't recognise it, delete it, and consider turning off the share link.";
+      const buttonText = 'Review the schedule';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #f9a825; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #f9a825; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">${header}</h2>
+            </div>
+            <div class="content">
+              <p>${paragraph1Before}${this.escapeHtml(name)}${paragraph1After}</p>
+              <p>${paragraph2}</p>
+              <p>${paragraph3}</p>
+              <a class="button" href="${reviewUrl}">${buttonText}</a>
+            </div>
+            <div class="footer" style="color: #6c757d; font-size: 13px;">Schedule ID: ${this.escapeHtml(scheduleId)}</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+${header}
+
+${paragraph1Before}${name}${paragraph1After}
+
+${paragraph2}
+
+${paragraph3}
+
+${buttonText}:
+${reviewUrl}
+
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = 'Someone using your share link set up a scheduled chat';
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`[ENG-3149] visitor schedule alert email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      console.error(`[ENG-3149] error sending visitor schedule alert email to ${emailList.join(', ')}:`, error);
     }
   },
 
