@@ -6,7 +6,8 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision, recipientScopingEnabled, crossAccountToolsFor } from './scheduledReportAccess';
+import { evaluateRunForRecipient, extractRunScope } from './scheduledReportScope';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
@@ -2189,7 +2190,18 @@ Schedule ID: ${scheduleId}
         minute: '2-digit'
       });
 
-      const html = `
+      // ENG-1904: the "Continue the Conversation" block links to the run's whole session. A recipient authorized only because
+      // every cross-account call was about them (scheduledReportScope) gets the report WITHOUT it: the session is an admin's
+      // and its share view has not been proven safe for a customer. Everyone else gets the email exactly as before.
+      const conversationSectionHtml = `<div class="section">
+                <h3>🔗 Continue the Conversation</h3>
+                <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
+                <a href="${sessionUrl}" class="button">Continue Chatting</a>
+                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
+                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
+                </p>
+              </div>`;
+      const composeHtml = (includeLink: boolean): string => `
         <html>
         <head>
           <style>
@@ -2264,14 +2276,7 @@ Schedule ID: ${scheduleId}
                 <div class="response">${marked(result.actualResponse)}</div>
               </div>
               
-              <div class="section">
-                <h3>🔗 Continue the Conversation</h3>
-                <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
-                <a href="${sessionUrl}" class="button">Continue Chatting</a>
-                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
-                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
-                </p>
-              </div>
+              ${includeLink ? conversationSectionHtml : ''}
             </div>
             
             <div class="footer">
@@ -2284,8 +2289,9 @@ Schedule ID: ${scheduleId}
         </body>
         </html>
       `;
+      const html = composeHtml(true);
 
-      const text = `
+      const composeText = (includeLink: boolean): string => `
 Scheduled Chat Results: ${scheduleName}
 
 Your scheduled chat "${scheduleName}" ${primaryMessage}
@@ -2303,12 +2309,13 @@ ${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
 ` : ''}AI Response:
 ${result.actualResponse}
 
-Continue the conversation: ${sessionUrl}
+${includeLink ? `Continue the conversation: ${sessionUrl}
 
----
+` : ''}---
 This is an automated email from your scheduled chat.
 Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
+      const text = composeText(true);
 
       const subject = `${statusIcon} Scheduled Chat: ${scheduleName}${summary ? ` — ${summary}` : ''}`;
 
@@ -2321,14 +2328,17 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // recipients + the owner, rather than auto-sending to every configured
       // address. No-op for ordinary reports. Fail-closed throughout; see
       // classifyAndResolveScheduledReportRecipients.
-      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList);
+      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList, { allowScopedRecipients: true });
       const recipients = guard.authorized;
-      const notice = this.withheldRecipientsNotice(guard.withheld);
+      // ENG-1904: recipients the guard withheld that the run read ONLY about (scheduledReportScope) get a separate, link-free copy.
+      const scoped = guard.scoped ?? [];
+      const stillWithheld = guard.withheld.filter((e) => !scoped.includes(e));
+      const notice = this.withheldRecipientsNotice(stillWithheld);
       const finalHtml = notice ? `${notice.html}${html}` : html;
       const finalText = notice ? `${notice.text}\n\n${text}` : text;
       const runKey = result.runId || result.sessionId;
 
-      if (recipients.length === 0) {
+      if (recipients.length === 0 && scoped.length === 0) {
         // Fail-closed left no authorized recipient. Do NOT silently drop the
         // completed report: notify the schedule owner that delivery was blocked
         // (a status message ONLY — never the report data) so the report is not
@@ -2353,8 +2363,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         });
       } else {
         // Send ONE email to all authorized recipients
-        await this.deliverScheduledReport(deliveryScheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
+        await this.deliverScheduledReport(
+          deliveryScheduleId, runKey, recipients, stillWithheld, subject, finalText, finalHtml,
+          scoped.length > 0 ? { recipients: scoped, text: composeText(false), html: composeHtml(false) } : undefined,
+        );
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
+        if (scoped.length > 0) {
+          console.log(`[ENG-1904] scheduled report for session ${result.sessionId}: sent a link-free copy to ${scoped.length} recipient(s) because every cross-account call in the run was about them`);
+        }
       }
 
     } catch (error) {
@@ -2378,7 +2394,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   async classifyAndResolveScheduledReportRecipients(
     sessionIds: string[],
     recipients: string[],
-  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string }> {
+    // ENG-1904: only the single-report send asks for scoped recipients; the digest merges runs and keeps today's rule.
+    opts?: { allowScopedRecipients?: boolean },
+  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string; scoped?: string[] }> {
     let ownerEmail: string | undefined;
     let ownerUserId: string | undefined;
     try {
@@ -2429,13 +2447,59 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       if (authz.withheld.length > 0) {
         console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
       }
-      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId };
+      // ENG-1904: of the recipients withheld above, which ones does the run read ONLY about? This can only ADD recipients to
+      // the authorized set (as a separate copy); `authorized` and `withheld` stay exactly what the guard decided.
+      const scoped = opts?.allowScopedRecipients && isSensitive && authz.withheld.length > 0
+        ? await this.resolveScopedReportRecipients(sessionIds, authz.withheld, ownerIsAdmin)
+        : [];
+      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId, ...(scoped.length > 0 ? { scoped } : {}) };
     } catch (guardError) {
       // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
       // than risk distributing possibly-sensitive data to unverified addresses.
       // The caller's empty-recipients branch notifies the owner so it is not silent.
       console.error(`Scheduled report guard errored for session(s) ${sessionIds.join(', ')}; failing closed:`, guardError);
       return { authorized: [], withheld: [...recipients], ownerEmail, ownerUserId };
+    }
+  },
+
+  /**
+   * ENG-1904: the subset of `withheld` (non-admin recipients the ENG-500 guard held back) for whom EVERYTHING the run read was
+   * about them and nothing else (`scheduledReportScope`). Never throws: any failure answers "none". With
+   * SCHEDULED_REPORT_RECIPIENT_SCOPING unset it only logs what it would have done and returns none.
+   */
+  async resolveScopedReportRecipients(sessionIds: string[], withheld: string[], ownerIsAdmin?: boolean): Promise<string[]> {
+    try {
+      const crossAccountTools = crossAccountToolsFor({ ownerIsAdmin });
+      const scopes = [];
+      for (const sessionId of sessionIds) {
+        // The same strongly consistent read the guard uses: this fires right after the run wrote these rows.
+        const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
+        scopes.push(extractRunScope(messages as any));
+      }
+      const eligible: string[] = [];
+      for (const email of withheld) {
+        const normalized = (email || '').trim().toLowerCase();
+        if (!normalized) continue;
+        let user: any;
+        try {
+          user = await userDb.getUserByEmailConsistent(normalized);
+        } catch {
+          user = undefined;
+        }
+        // No account, or a deleted one: nothing to compare the run's subject against.
+        if (!user?.userId || !user?.email) continue;
+        const identity = { userId: String(user.userId), email: String(user.email) };
+        if (scopes.every((scope) => evaluateRunForRecipient(scope, identity, crossAccountTools).ok)) eligible.push(email);
+      }
+      if (eligible.length === 0) return [];
+      if (!recipientScopingEnabled()) {
+        console.warn(`[ENG-1904 shadow] would have sent a link-free copy to ${eligible.length} recipient(s) because every cross-account call in session(s) ${sessionIds.join(', ')} was about them; SCHEDULED_REPORT_RECIPIENT_SCOPING is not enabled`);
+        return [];
+      }
+      return eligible;
+    } catch (error) {
+      console.error(`[ENG-1904] could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added:`, error);
+      return [];
     }
   },
 
@@ -2464,13 +2528,24 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     subject: string,
     text: string,
     html: string,
+    // ENG-1904: a second, link-free copy for recipients authorized by scheduledReportScope. Sent separately so the
+    // authorized recipients' email stays exactly as it was.
+    scopedCopy?: { recipients: string[]; text: string; html: string },
   ): Promise<void> {
     const base = {
       runId,
-      authorizedRecipients: recipients,
+      authorizedRecipients: scopedCopy ? [...recipients, ...scopedCopy.recipients] : recipients,
       ...(withheld.length > 0 ? { withheldRecipients: withheld } : {}),
     };
-    const outcome = await this.sendEmail(recipients, subject, text, html);
+    let outcome: EmailSendOutcome | void;
+    if (!scopedCopy) {
+      outcome = await this.sendEmail(recipients, subject, text, html);
+    } else {
+      const outcomes: Array<EmailSendOutcome | void> = [];
+      if (recipients.length > 0) outcomes.push(await this.sendEmail(recipients, subject, text, html));
+      outcomes.push(await this.sendEmail(scopedCopy.recipients, subject, scopedCopy.text, scopedCopy.html));
+      outcome = outcomes.includes('failed') ? 'failed' : outcomes.includes('suppressed') ? 'suppressed' : outcomes.every((o) => o === 'sent') ? 'sent' : undefined;
+    }
     await recordReportDeliveryState(scheduleId, outcome === 'sent'
       ? { ...base, state: 'delivered' }
       : {
