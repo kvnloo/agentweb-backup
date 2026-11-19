@@ -78,3 +78,20 @@ export function brandMessagingContextFromGuidelines(
   const g = guidelines as { exists?: unknown; brandData?: unknown };
   return g.exists ? buildBrandMessagingContext(g.brandData, maxChars) : '';
 }
+
+/**
+ * ENG-3066: the system message an unattended scheduled run gets so outreach it writes knows what
+ * the sender sells even when the model never calls `read_brand_guidelines`. Returns '' when there
+ * are no usable guidelines or the read fails; a brand read must never fail the run.
+ */
+export async function unattendedBrandContextMessage(readGuidelines: () => Promise<unknown>): Promise<string> {
+  let block = '';
+  try {
+    block = brandMessagingContextFromGuidelines(await readGuidelines());
+  } catch (error) {
+    console.warn('[brandMessagingContext] brand read failed for an unattended run; continuing without the brand block:', error instanceof Error ? error.message : error);
+    return '';
+  }
+  if (!block) return '';
+  return `SENDER BRAND CONTEXT (saved brand guidelines for this account, summarized). Any email, LinkedIn message or invite, DM or sequence step you write in this run must be consistent with it. It is a summary: call read_brand_guidelines when you need the full guidelines.\n${block}`;
+}

@@ -361,3 +361,28 @@ describe('ENG-3134 zoma_ads_report', () => {
     expect(texts(res)[0]).toMatch(/expired or was revoked.*zoma_status/);
   });
 });
+
+describe('ENG-3156 zoma_industry_benchmark through the MCP endpoint', () => {
+  it('is listed read-only and compares the connected account CPA with the sourced benchmark', async () => {
+    const list = await rpc('tools/list').expect(200);
+    const tool = list.body.result.tools.find((t: any) => t.name === 'zoma_industry_benchmark');
+    expect(tool?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+
+    accounts = [metaAccount];
+    fetchMock.mockResolvedValueOnce(graphJson({
+      data: [{ spend: '274.80', impressions: '9000', clicks: '300', account_currency: 'USD', actions: [{ action_type: 'lead', value: '10' }] }],
+    }));
+    const res = await call('zoma_industry_benchmark', { industry: 'real_estate', date_preset: 'last_30d' }).expect(200);
+    const result = JSON.parse(texts(res)[0]);
+    const url = new URL(fetchMock.mock.calls[0][0]);
+    expect(url.pathname).toBe('/v25.0/act_111/insights');
+    expect(url.searchParams.get('level')).toBe('account');
+    expect(result).toMatchObject({
+      kpi: 'lead',
+      customer: { cpa: 27.48, currency: 'USD' },
+      industry_benchmark: { cpa: 13.74, year: 2026, url: 'https://localiq.com/blog/facebook-advertising-benchmarks/' },
+      comparison: { difference_percent: 100, verdict: 'worse' },
+    });
+    expect(JSON.stringify(result)).not.toContain('EAAG-secret-token');
+  });
+});
