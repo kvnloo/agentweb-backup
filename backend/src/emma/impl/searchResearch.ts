@@ -315,6 +315,14 @@ function isDownloadTimeout(error: unknown): boolean {
  * bucket host (agentweb-tool-responses-prod.s3..., aw-team-internal-storage.s3..., bare s3.amazonaws.com). Every guess 404s. When an
  * https URL on an amazonaws.com host carries a tool-responses key as its path, return that key so it is read like a bare key, under the
  * same ownership check. Any other URL, and any path that is not exactly a tool-responses key, returns null (a plain download as before).
+ *
+ * Deliberate choices:
+ *  - The host is ignored for ANY `*.amazonaws.com` host: the invented hosts are exactly what this repairs. Nothing is fetched from the
+ *    host (the key is read from OUR bucket by the server), so userinfo and port are ignored too, and the query string / fragment is dropped.
+ *    Safety comes from the exact key shape plus the caller's ownership check (`fileAccess.check`), not from the host.
+ *  - Path-style URLs (`https://s3.<region>.amazonaws.com/<bucket>/tool-responses/...`) are intentionally NOT repaired: the path then starts
+ *    with the bucket name, so it is not a key and returns null (out of scope; it falls through to the guarded fetch as before).
+ *  - Dot segments are resolved by the WHATWG URL parser before this runs; encoded slashes decode into extra `/`, which the key regex refuses.
  */
 function toolResponseKeyFromAmazonUrl(fileUrl: string): string | null {
   let u: URL;

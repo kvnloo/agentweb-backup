@@ -333,6 +333,8 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       ['agentweb-tool-responses-prod.s3.us-east-1.amazonaws.com'],
       ['aw-team-internal-storage.s3.amazonaws.com'],
       ['s3.amazonaws.com'],
+      ['agentweb-production.s3.us-west-2.amazonaws.com'],
+      ['agentweb-tool-responses.s3.us-west-2.amazonaws.com'],
     ])('reads the caller\'s own key by key, not by the invented host (%s)', async (host) => {
       const r = await performDataAnalysis([wrapped(host, MY_SESSION)], 'summarise', 'me');
       expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`);
@@ -347,10 +349,49 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(get).not.toHaveBeenCalled();
     });
 
-    it('does not rewrite a key that traverses out of the tool-responses folder', async () => {
-      // The URL parser resolves the dots, so the path is no longer a tool-responses key: nothing is read by key (a plain download, as before).
+    it('reads a presigned-style URL (uppercase host, query string) by key and drops the query', async () => {
+      const r = await performDataAnalysis([`https://AgentWeb-Prod.S3.US-WEST-2.AMAZONAWS.COM/tool-responses/${MY_SESSION}/call_1.txt?X-Amz-Signature=abc&X-Amz-Expires=60`], 'summarise', 'me');
+      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`);
+      expect(get).not.toHaveBeenCalled();
+      expect(r.success).not.toBe(false);
+    });
+
+    it('does not rewrite a traversal: relies on WHATWG normalisation of dot segments (the case never reaches the regex)', async () => {
+      // new URL() resolves the dots, so the path is already /users/other/..., not a tool-responses key: a plain (guarded) download.
+      get.mockResolvedValue({ data: Buffer.from('a,b\n1,2'), status: 200, headers: {} });
       await performDataAnalysis([`https://s3.amazonaws.com/tool-responses/${MY_SESSION}/../../users/other/files/1/abc/secret.csv`], 'summarise', 'me');
+      expect(get).toHaveBeenCalledTimes(1);
       expect(readS3).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a host that only starts with an Amazon name', `https://s3.amazonaws.com.evil.com/tool-responses/${MY_SESSION}/f.txt`],
+      ['a host that only ends with amazonaws.com text', `https://evilamazonaws.com/tool-responses/${MY_SESSION}/f.txt`],
+      ['the wrong scheme', `http://s3.amazonaws.com/tool-responses/${MY_SESSION}/f.txt`],
+      ['a path that is not a tool-responses key', 'https://s3.amazonaws.com/users/other/files/1/x.csv'],
+    ])('does not rewrite %s: a plain guarded download', async (_label, url) => {
+      get.mockResolvedValue({ data: Buffer.from('a,b\n1,2'), status: 200, headers: {} });
+      await performDataAnalysis([url], 'summarise', 'me');
+      expect(readS3).not.toHaveBeenCalled();
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['an encoded slash cannot smuggle a traversal', `https://s3.amazonaws.com/tool-responses/${MY_SESSION}%2f..%2f..%2fusers%2fother%2fx`],
+    ])('does not read by key: %s', async (_label, url) => {
+      get.mockResolvedValue({ data: Buffer.from('a,b\n1,2'), status: 200, headers: {} });
+      await performDataAnalysis([url], 'summarise', 'me');
+      // The decoded path has extra slashes, so it is not `tool-responses/<id>/<file>`: nothing is read by key (guarded download).
+      expect(readS3).not.toHaveBeenCalled();
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses an encoded ? in the filename: the key rule rejects "?" in a key, so nothing is read and nothing is fetched', async () => {
+      // %3F stays in the path (not a query delimiter) and decodes to a literal "?", so the helper does produce a key; the storage policy
+      // (storageAccessPolicy: keys may not contain ? # \\ or control characters) then refuses it, even for the caller's own session.
+      refused(await performDataAnalysis([`https://s3.amazonaws.com/tool-responses/${MY_SESSION}/f%3Fx.txt`], 'summarise', 'me'));
+      expect(readS3).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
     });
 
     it('leaves a URL on a non-Amazon host alone (a plain download)', async () => {
