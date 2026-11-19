@@ -156,10 +156,10 @@ async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// A single token (no whitespace) that starts with one of these schemes and a colon is a link the server cannot fetch, not HTML.
-// http(s) is handled by the guarded fetch; text with spaces, and HTML (which starts with "<"), never matches.
+// A single token (no whitespace) that starts with one of these schemes and a colon, with something after it, is a link the server cannot
+// fetch, not HTML. http(s) is handled by the guarded fetch; text with spaces, and HTML (which starts with "<"), never matches.
 const UNFETCHABLE_LINK_SCHEME =
-  /^(data|file|ftps?|sftp|javascript|vbscript|blob|wss?|gopher|s3|gs|about|jar|dict|ldap|smb):\S*$/i;
+  /^(data|file|ftps?|sftp|ssh|git|javascript|vbscript|blob|filesystem|view-source|wss?|gopher|s3a?|gs|gcs|az|hdfs|nfs|mailto|tel|about|jar|dict|ldaps?|smb):\S+$/i;
 
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
@@ -849,13 +849,15 @@ export async function createHtmlTemplate(
       // Read HTML content from source (either S3 URL or direct HTML content)
       let htmlContent = htmlSource;
 
-      // If htmlSource looks like a URL, fetch it
-      if (htmlSource.startsWith('http://') || htmlSource.startsWith('https://')) {
-        console.log('AgentMode: Fetching HTML from URL:', htmlSource);
+      // If htmlSource looks like a URL, fetch it. Padding and upper case (" HTTPS://...") are still a link: the same reading as the refusal
+      // above, so a link is either fetched through the guarded fetch or refused, never saved as the template's body.
+      const linkSource = htmlSource.trim();
+      if (/^https?:\/\//i.test(linkSource)) {
+        console.log('AgentMode: Fetching HTML from URL:', linkSource);
         // A URL the caller chose is fetched only through the guarded fetch (public addresses only, redirects re-checked, size and
         // time bounded): the body becomes a saved template, so the server's own network position must not be reachable through it.
         try {
-          htmlContent = await fetchCallerUrlText(htmlSource, { tool: 'create_html_template', userId, maxBytes: CALLER_URL_MAX_TEXT_BYTES });
+          htmlContent = await fetchCallerUrlText(linkSource, { tool: 'create_html_template', userId, maxBytes: CALLER_URL_MAX_TEXT_BYTES });
         } catch (fetchError) {
           throw new Error(`Failed to fetch HTML from URL: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
         }
