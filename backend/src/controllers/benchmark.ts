@@ -8,6 +8,7 @@ import { AuthenticatedRequest, isRealAdmin } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
 import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+import { isAnonymousShareMessage, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 /**
  * ENG-669 PR-C: a benchmark calls one concrete model directly (no resolver, no router), so the AgentWeb Model, which
@@ -44,18 +45,30 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
     let messages = req.body.conversationHistory?.messages || session.messages || [];
     
     // Process messages to include attachments in user messages (same as generateResponse)
+    // ENG-2227: the replay hands the LAST user message over as the live turn (no stamp is read for it), so only that one is
+    // labelled here; every earlier row is labelled from its own stamp when the history is rebuilt (labelling it here too would
+    // double the label whenever the row also has attachments).
+    const lastUserMessage = [...messages].reverse().find((m: any) => m.role === 'user');
     messages = messages.map((message: any) => {
       if (message.role === 'user') {
+        let content = message.content;
         // Check for attachments in both message.attachments and message.metadata.attachments
         const attachments = message.attachments || message.metadata?.attachments || [];
         if (attachments.length > 0) {
           const attachmentUrls = attachments.map((attachment: any) => {
             return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
           }).join('\n');
-          return {
-            ...message,
-            content: `${message.content}\n\n**Attached Files:**\n${attachmentUrls}`
-          };
+          content = `${content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        }
+        // ENG-2227: this independently duplicates agentModeService's buildMarketingContext
+        // attachment-folding pattern, so it independently needs the same anonymous-sender
+        // marker — otherwise an admin replaying a session containing an ishare message
+        // through this benchmark tool loses the provenance signal the live path now carries.
+        if (isAnonymousShareMessage(message) && message === lastUserMessage) {
+          content = withAnonymousShareMarker(String(content));
+        }
+        if (content !== message.content) {
+          return { ...message, content };
         }
       }
       return message;

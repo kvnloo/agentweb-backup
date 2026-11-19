@@ -216,6 +216,14 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(readS3).not.toHaveBeenCalled();
     });
 
+    // ENG-3151: the "binary file" answer depends on the caller's own string, so it must not replace the uniform refusal for a key
+    // the caller may not read (that would make the two answers differ by key and leak nothing, but the rule stays: one answer).
+    it('gives another user\'s .xlsx / .pdf key the uniform refusal, not the "binary file" answer', async () => {
+      refused(await performDataAnalysis([`tool-responses/${OTHER_SESSION}/report.pdf`], 'summarise', 'me'));
+      refused(await performDataAnalysis([`s3://${OUR_BUCKET}/users/other/files/1/abc/data.xlsx`], 'summarise', 'me'));
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
     it('refuses a tool response of a session that does not exist', async () => {
       const r = await performDataAnalysis([`tool-responses/${UNKNOWN_SESSION}/call1.txt`], 'summarise', 'me');
       refused(r);
