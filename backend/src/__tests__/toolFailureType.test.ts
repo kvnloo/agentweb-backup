@@ -1,4 +1,6 @@
 import { classifyToolFailureType, FAILURE_TYPES } from '../utils/toolFailureType';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { ToolRestrictionDenied, restrictionRefusal, scheduleProvenanceUnverifiableRefusal } from '../services/toolRestrictionProfiles';
 
 /**
  * Decision-layer classification for agent tool failures. Sits on top of the
@@ -320,14 +322,38 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
       'This HubSpot connection was authorised for CRM access only, so it cannot read or write EMAIL (a Marketing Hub object).')).toBe('config');
   });
   // ENG-3152/ENG-3154: authorization refusals are the guard working, not tool bugs.
-  it('classifies a share-visitor tool restriction refusal as by_design (ENG-3152)', () => {
-    const m = 'Tool "get_lead_notification_settings" acts on the owner\'s organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.';
-    expect(classifyToolFailureType('ToolRestrictionDenied', m)).toBe('by_design');
-    expect(classifyToolFailureType('Error', m)).toBe('by_design');
+  describe('restriction-profile refusals (ENG-3152)', () => {
+    const roundTrip = (msg: string) => classifyToolFailureType(classifyToolErrorClass(new ToolRestrictionDenied(msg)), msg);
+    const t = 'get_lead_notification_settings';
+    it.each([
+      ['share-visitor owner settings', restrictionRefusal('share_visitor', t, [])],
+      ['share-visitor admin', restrictionRefusal('share_visitor', 'admin_tool', ['admin_tool'])],
+      ['share-visitor connect_account', restrictionRefusal('share_visitor', 'connect_account', [])],
+      ['scheduled-run owner settings', restrictionRefusal('share_visitor_schedule', t, [])],
+      ['scheduled-run admin', restrictionRefusal('share_visitor_schedule', 'admin_tool', ['admin_tool'])],
+      ['scheduled-run connect_account', restrictionRefusal('share_visitor_schedule', 'connect_account', [])],
+    ])('round-trips the %s refusal to by_design', (_n, msg) => {
+      expect(msg).toBeTruthy();
+      expect(roundTrip(msg as string)).toBe('by_design');
+    });
+    it('keeps the transient provenance-unverifiable refusal as bug (class name alone is not enough)', () => {
+      expect(roundTrip(scheduleProvenanceUnverifiableRefusal(t))).toBe('bug');
+    });
   });
 
-  it('classifies "Organization membership required" as by_design (ENG-3152)', () => {
-    expect(classifyToolFailureType('Error', 'Organization membership required')).toBe('by_design');
+  describe('"Organization membership required" (ENG-3152)', () => {
+    it('is by_design as the whole message, any case, trimmed', () => {
+      expect(classifyToolFailureType('Error', 'Organization membership required')).toBe('by_design');
+      expect(classifyToolFailureType('Error', '  ORGANIZATION MEMBERSHIP REQUIRED \n')).toBe('by_design');
+    });
+    it.each([
+      'Organization membership required: x',
+      'Organization not found',
+      'Authentication required',
+      'Only org owners and admins can update lead notification settings',
+    ])('keeps near-miss %j as bug', (m) => {
+      expect(classifyToolFailureType('Error', m)).toBe('bug');
+    });
   });
 
   it('still treats an unrelated Error as bug', () => {
