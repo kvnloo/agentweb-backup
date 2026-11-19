@@ -899,6 +899,17 @@ describe('list: page and limit are whole numbers', () => {
     expect(buildLeadListQuery({ limit: '', page: 0, engaged_only: '', search: '  ' })).toEqual({});
     expect(buildLeadListQuery({ limit: 25, engaged_only: false })).toEqual({ limit: '25', engagedOnly: 'false' });
   });
+
+  it('search and status are text: a number becomes text, anything else is refused instead of being dropped (a dropped filter returns the whole page and looks like a match)', async () => {
+    const { buildLeadListQuery } = await import('../mcp/server/manageLeadsWrites');
+    expect(buildLeadListQuery({ search: 94107, status: ' new ' })).toEqual({ search: '94107', status: 'new' });
+    expect(buildLeadListQuery({ search: '', status: '   ', limit: undefined })).toEqual({});
+    for (const bad of [{ search: true }, { search: { q: 'x' } }, { search: ['x'] }, { status: false }, { status: { s: 'new' } }, { search: Number.NaN }]) {
+      expect(() => buildLeadListQuery(bad)).toThrow(/must be text/);
+      const r = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, ...bad });
+      expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
+    }
+  });
 });
 
 // ---- Found by the FOURTH review (final head b3ffcf33c: DO NOT SHIP until these two reproduced problems were closed) -----------------------------
@@ -1184,5 +1195,29 @@ describe('system-owned custom keys and empty updates', () => {
       const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
       expect({ updates, isError: r.isError }).toEqual({ updates, isError: true });
     }
+  });
+});
+
+describe('delete: the same id sent twice', () => {
+  it('is one lead, deleted once, and the answer says a repeat was ignored (with one distinct id as well as with several)', async () => {
+    const stamp = '2026-11-18T10:00:00.000Z';
+    for (const id of ['dupdel-1', 'dupdel-2', 'dupdel-3']) fake.seed('AW-Leads', { listId: TENANT_A.listId, leadId: id, userId: TENANT_A.owner, name: id, email: `${id}@alpha.test`, status: 'new', createdAt: stamp, customFields: {} });
+    const countBefore = fake.items('AW-LeadLists').find((l: any) => l.listId === TENANT_A.listId).leadCount;
+    const one = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['dupdel-1', 'dupdel-1', 'dupdel-1'] });
+    expect(one.isError).toBe(false);
+    expect(one.json.duplicateIdsIgnored).toBe(2);
+    expect(leadRow(TENANT_A.listId, 'dupdel-1')).toBeUndefined();
+    const several = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['dupdel-2', 'dupdel-3', 'dupdel-2'] });
+    expect(several.isError).toBe(false);
+    expect(several.json.duplicateIdsIgnored).toBe(1);
+    expect(leadRow(TENANT_A.listId, 'dupdel-2')).toBeUndefined();
+    expect(leadRow(TENANT_A.listId, 'dupdel-3')).toBeUndefined();
+    // Three real leads, each deleted once: the list count dropped by exactly three.
+    expect(countBefore - fake.items('AW-LeadLists').find((l: any) => l.listId === TENANT_A.listId).leadCount).toBe(3);
+    // A plain single delete (no repeat) carries no such note.
+    fake.seed('AW-Leads', { listId: TENANT_A.listId, leadId: 'dupdel-4', userId: TENANT_A.owner, name: 'd4', email: 'dupdel-4@alpha.test', status: 'new', createdAt: stamp, customFields: {} });
+    const plain = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['dupdel-4'] });
+    expect(plain.isError).toBe(false);
+    expect(plain.json.duplicateIdsIgnored).toBeUndefined();
   });
 });
