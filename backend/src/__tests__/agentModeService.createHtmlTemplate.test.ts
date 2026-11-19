@@ -333,6 +333,9 @@ describe('AgentModeService - createHtmlTemplate', () => {
       ['  FTP://example.com/x.html  ', 'ftp'],
       ['javascript:alert(1)', 'javascript'],
       ['s3://bucket/key.html', 's3'],
+      ['ssh://host/index.html', 'ssh'],
+      ['mailto:someone@example.test', 'mailto'],
+      ['hdfs://namenode/a.html', 'hdfs'],
     ])('refuses an unfetchable link %j without fetching, rewriting or saving', async (source, scheme) => {
       const result = await agentModeService.createHtmlTemplate(
         source,
@@ -352,6 +355,29 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(mockSetSetting).not.toHaveBeenCalled();
     });
 
+    it.each(['  https://example.com/a.html  ', 'HTTPS://example.com/a.html', '\nHttp://example.com/a.html'])(
+      'reads %j as an http(s) link: fetched through the guarded fetch, never saved as the body',
+      async (source) => {
+        (fetchCallerUrlText as jest.Mock).mockResolvedValue(mockInputHtml);
+        mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+        mockGetSetting.mockResolvedValue(null);
+        mockSetSetting.mockResolvedValue(undefined);
+
+        const result = await agentModeService.createHtmlTemplate(
+          source,
+          undefined,
+          'welcome_email',
+          'Welcome!',
+          '',
+          'test-user-123',
+          'test-session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(fetchCallerUrlText).toHaveBeenCalledWith(source.trim(), expect.objectContaining({ tool: 'create_html_template' }));
+      }
+    );
+
     it('still accepts text that merely starts with a scheme word but is not a link', async () => {
       mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
       mockGetSetting.mockResolvedValue(null);
@@ -369,6 +395,16 @@ describe('AgentModeService - createHtmlTemplate', () => {
 
       expect(result.success).toBe(true);
       expect(fetchCallerUrlText).not.toHaveBeenCalled();
+    });
+
+    it('a scheme word with nothing after the colon is not a link either', async () => {
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockGetSetting.mockResolvedValue(null);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      const result = await agentModeService.createHtmlTemplate('File:', undefined, 'bare_word', 'Subject', '', 'test-user-123', 'test-session-123');
+
+      expect(result.success).toBe(true);
     });
 
     it('should handle LLM generation errors', async () => {

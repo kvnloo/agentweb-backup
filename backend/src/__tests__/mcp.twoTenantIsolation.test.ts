@@ -57,7 +57,15 @@ interface Attempt {
   refused?: true;
   /** Text the answer must contain (the caller's own data answering, not the other tenant's). */
   shows?: string[];
+  /** A write that must land on the CALLER's own data: the call succeeds and this text is then in the caller's own rows. */
+  ownGains?: string;
 }
+
+/**
+ * What a real refusal looks like through the MCP server: the API's 403 / 404 answer, or the tool's own admin-only refusal. Any other error
+ * (a 5xx, a crash, a ValidationException) is a defect in the path and must not be counted as the isolation holding.
+ */
+const REFUSAL = /^Error: (API error \((403|404)\)|client_id is admin-only)/;
 
 interface ToolSpec {
   tool: TwoTenantCoveredTool;
@@ -93,6 +101,7 @@ const SPECS: ToolSpec[] = [
   {
     tool: 'list_lead_lists',
     ownRead: (t) => ({ args: {}, shows: [t.listName] }),
+    // list_lead_lists takes no list identifier, so there is nothing foreign to name; its isolation is the own-read and override cases.
     foreign: () => [],
     overrides: (atk, vic) => [
       { label: 'client_id (admin-only) from a non-admin', args: { client_id: vic.owner }, refused: true },
@@ -110,27 +119,29 @@ const SPECS: ToolSpec[] = [
     ],
     overrides: (atk, vic) => [
       { label: 'userId override on get still answers as the caller', args: { action: 'get', list_id: atk.listId, userId: vic.owner }, shows: [atk.listName] },
-      { label: 'userId override on create never creates a list for the other tenant', args: { action: 'create', name: 'PLANTED LIST', list_type: 'sales', userId: vic.owner } },
+      { label: 'userId override on create never creates a list for the other tenant', args: { action: 'create', name: 'PLANTED LIST', list_type: 'sales', userId: vic.owner }, ownGains: 'PLANTED LIST' },
     ],
   },
   {
     tool: 'manage_brand',
     ownRead: (t) => ({ args: { action: 'read' }, shows: [t.brandName] }),
+    // manage_brand takes no identifier of another tenant (the brand is the caller's org's); its isolation is the own-read and override cases.
     foreign: () => [],
     overrides: (atk, vic) => [
       { label: 'client_id on read is ignored: the caller\'s own brand answers', args: { action: 'read', client_id: vic.owner }, shows: [atk.brandName] },
-      { label: 'userId override on update never writes the other tenant\'s brand', args: { action: 'update', company_name: 'HIJACKED BRAND', userId: vic.owner } },
-      { label: 'user_id override on update never writes the other tenant\'s brand', args: { action: 'update', company_name: 'HIJACKED BRAND', user_id: vic.owner } },
+      { label: 'userId override on update never writes the other tenant\'s brand', args: { action: 'update', company_name: 'HIJACKED BRAND', userId: vic.owner }, ownGains: 'HIJACKED BRAND' },
+      { label: 'user_id override on update never writes the other tenant\'s brand', args: { action: 'update', company_name: 'HIJACKED BRAND', user_id: vic.owner }, ownGains: 'HIJACKED BRAND' },
     ],
   },
   {
     tool: 'manage_market_strategy',
     ownRead: (t) => ({ args: { action: 'read' }, shows: [t.competitor, t.icp] }),
+    // manage_market_strategy takes no identifier of another tenant (the strategy is the caller's org's); same shape as manage_brand.
     foreign: () => [],
     overrides: (atk, vic) => [
       { label: 'client_id on read is ignored: the caller\'s own strategy answers', args: { action: 'read', client_id: vic.owner }, shows: [atk.competitor] },
-      { label: 'userId override on update never writes the other tenant\'s strategy', args: { action: 'update', competitors: [{ name: 'HIJACKRIVAL' }], userId: vic.owner } },
-      { label: 'user_id override on update never writes the other tenant\'s strategy', args: { action: 'update', competitors: [{ name: 'HIJACKRIVAL' }], user_id: vic.owner } },
+      { label: 'userId override on update never writes the other tenant\'s strategy', args: { action: 'update', competitors: [{ name: 'HIJACKRIVAL' }], userId: vic.owner }, ownGains: 'HIJACKRIVAL' },
+      { label: 'user_id override on update never writes the other tenant\'s strategy', args: { action: 'update', competitors: [{ name: 'HIJACKRIVAL' }], user_id: vic.owner }, ownGains: 'HIJACKRIVAL' },
     ],
   },
 ];
@@ -157,12 +168,16 @@ function expectNoVictimContent(label: string, o: Outcome, vic: Tenant): void {
 async function runAttempt(caller: McpCaller, tool: string, atk: Tenant, vic: Tenant, a: Attempt): Promise<Outcome> {
   const before = snapshotTenant(fake, vic);
   const o = await caller.call(tool, a.args);
-  if (a.refused) expect({ label: a.label, isError: o.isError, text: o.text.slice(0, 200) }).toMatchObject({ label: a.label, isError: true });
+  if (a.refused) expect({ label: a.label, isError: o.isError, refusal: REFUSAL.test(o.text), text: o.text.slice(0, 200) }).toMatchObject({ label: a.label, isError: true, refusal: true });
+  if (a.ownGains) {
+    // The write must have worked, and landed on the caller's own rows: an attempt that errors out before touching data proves nothing.
+    expect({ label: a.label, isError: o.isError, text: o.text.slice(0, 200) }).toMatchObject({ label: a.label, isError: false });
+    expect({ label: a.label, landedOnCaller: snapshotTenant(fake, atk).includes(a.ownGains) }).toEqual({ label: a.label, landedOnCaller: true });
+  }
   expectNoVictimContent(a.label, o, vic);
   for (const marker of a.shows ?? []) expect({ label: a.label, shown: o.text.includes(marker), marker }).toEqual({ label: a.label, shown: true, marker });
   // The victim's rows must be exactly what they were.
   expect({ label: a.label, victimUnchanged: snapshotTenant(fake, vic) === before }).toEqual({ label: a.label, victimUnchanged: true });
-  void atk;
   return o;
 }
 
@@ -183,9 +198,12 @@ describe.each(SPECS)('$tool: two-tenant isolation', (spec) => {
       expect(idMarkers(vic).filter((m) => o.text.includes(m))).toEqual([]);
     });
 
-    it(`3: ${atk.label} aiming at ${vic.label}'s identifiers is refused and ${vic.label}'s rows do not change`, async () => {
-      for (const attempt of spec.foreign(atk, vic)) await runAttempt(owner(), spec.tool, atk, vic, attempt);
-    });
+    // A tool with no foreign identifiers to name registers no test here, rather than one that asserts nothing.
+    if (spec.foreign(atk, vic).length > 0) {
+      it(`3: ${atk.label} aiming at ${vic.label}'s identifiers is refused and ${vic.label}'s rows do not change`, async () => {
+        for (const attempt of spec.foreign(atk, vic)) await runAttempt(owner(), spec.tool, atk, vic, attempt);
+      });
+    }
 
     it(`5: identity overrides from ${atk.label} never change whose data answers or gets written`, async () => {
       for (const attempt of spec.overrides(atk, vic)) await runAttempt(owner(), spec.tool, atk, vic, attempt);
@@ -201,7 +219,7 @@ describe.each(SPECS)('$tool: two-tenant isolation', (spec) => {
     for (const attempt of [...spec.foreign(TENANT_A, TENANT_B), ...spec.overrides(TENANT_A, TENANT_B)]) {
       const r = await member.call(spec.tool, attempt.args);
       expectNoVictimContent(`member: ${attempt.label}`, r, TENANT_B);
-      if (attempt.refused) expect({ label: attempt.label, isError: r.isError }).toEqual({ label: attempt.label, isError: true });
+      if (attempt.refused) expect({ label: attempt.label, isError: r.isError, refusal: REFUSAL.test(r.text) }).toEqual({ label: attempt.label, isError: true, refusal: true });
     }
     expect(snapshotTenant(fake, TENANT_B)).toBe(before);
   });

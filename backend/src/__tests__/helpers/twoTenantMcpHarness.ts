@@ -154,7 +154,9 @@ export function installSelfCallFetch(app: any): () => void {
     for (const [k, v] of Object.entries(init.headers || {})) req = req.set(k, v as string);
     if (init.body) req = req.send(init.body);
     const res = await req;
-    return new Response(res.text, { status: res.status, headers: { 'content-type': res.headers['content-type'] || 'text/plain' } });
+    // A Response with a body cannot carry 204 / 205 / 304 (the constructor throws), so those answer with none.
+    const noBody = [204, 205, 304].includes(res.status);
+    return new Response(noBody ? null : res.text, { status: res.status, headers: { 'content-type': res.headers['content-type'] || 'text/plain' } });
   }) as any;
   return () => {
     global.fetch = realFetch;
