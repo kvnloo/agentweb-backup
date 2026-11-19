@@ -184,6 +184,14 @@ describe('createMcpServer CallTool public vs admin separation', () => {
   };
   const external = { isInternal: false, agentUserId: 'u1', authMethod: 'api_key' };
 
+  // Whether the caller is an admin is read from the account; the tests below that rely on a real admin say so here.
+  const { userDb } = require('../../../services/db');
+  let accountLookup: jest.SpyInstance;
+  beforeEach(() => {
+    accountLookup = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'u1', isAdmin: true } as any);
+  });
+  afterEach(() => accountLookup.mockRestore());
+
   it('external public call: no internal IDs', async () => {
     const text = await call('eng2335_probe', external);
     expect(text).not.toMatch(/cus_123|trace-xyz|"apiKeyId"|"telemetry"/);
@@ -229,5 +237,33 @@ describe('createMcpServer CallTool public vs admin separation', () => {
     expect(await call('get_user_by_id', external)).toMatch(/cus_123/);
     expect(await call('eng2335_probe', external, { client_id: 'a@b.c' })).toMatch(/cus_123/);
     expect(await call('eng2335_probe', { isInternal: true, agentUserId: 'u1' })).toMatch(/cus_123/);
+  });
+
+  describe('a client_id argument only exempts a caller who really is an admin (ENG-2840)', () => {
+    const leaksInternalIds = (text: string) => /cus_123|trace-xyz|"apiKeyId"|"telemetry"/.test(text);
+
+    it.each([['client_id'], ['clientId']])('%s from a non-admin does not switch sanitising off', async (key) => {
+      accountLookup.mockResolvedValue({ userId: 'u1', isAdmin: false } as any);
+      expect(leaksInternalIds(await call('eng2335_probe', external, { [key]: 'a@b.c' }))).toBe(false);
+    });
+
+    it('a caller whose account cannot be read is treated as a non-admin (sanitised)', async () => {
+      accountLookup.mockRejectedValue(new Error('db down'));
+      expect(leaksInternalIds(await call('eng2335_probe', external, { client_id: 'a@b.c' }))).toBe(false);
+    });
+
+    it('an unknown account is treated as a non-admin (sanitised)', async () => {
+      accountLookup.mockResolvedValue(null as any);
+      expect(leaksInternalIds(await call('eng2335_probe', external, { client_id: 'a@b.c' }))).toBe(false);
+    });
+
+    it('the account is looked up only when a client_id is present', async () => {
+      await call('eng2335_probe', external);
+      expect(accountLookup).not.toHaveBeenCalled();
+    });
+
+    it('a real admin with client_id still gets the unsanitised answer', async () => {
+      expect(leaksInternalIds(await call('eng2335_probe', external, { client_id: 'a@b.c' }))).toBe(true);
+    });
   });
 });
