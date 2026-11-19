@@ -27,7 +27,7 @@ import type {
 } from '../../core/types';
 import { asMutationId } from '../../core/types';
 import { redactSensitive } from '../../../mcp/client/mcpToolTelemetry';
-import { EVT_RUN_VERDICT, EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
+import { EVT_RUN_STARTED, EVT_RUN_VERDICT, EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
 
 export interface AgentFailureProposalPayload {
   toolName: string;
@@ -81,6 +81,18 @@ export interface AgentFailureRuleSetOptions {
    * mismatch is reviewed inline by the guard's own visible correction; a
    * second one in the same window is a pattern worth a fix spec. */
   minClaimMismatches?: number;
+  /**
+   * ENG-3152/3154: user ids whose runs are verification traffic (post-merge probes of a new guard, run as a dedicated account).
+   * Those probes deliberately trip refusals, so their runs are left out of every cluster (failures AND the denominator).
+   * Default: the comma-separated `AGENT_LOOP_SYNTHETIC_USER_IDS` env var; unset or empty means nothing is excluded.
+   * Matched on the `userId` dimension of each run's `agent_run_started` event, so it also applies to events already stored
+   * and needs no new field on tool events or users.
+   */
+  syntheticUserIds?: readonly string[];
+}
+
+function syntheticUserIdsFromEnv(): string[] {
+  return (process.env.AGENT_LOOP_SYNTHETIC_USER_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
 }
 
 interface ToolStats {
@@ -184,11 +196,13 @@ export class AgentFailureRuleSet
   private readonly minFailures: number;
   private readonly minFailureRate: number;
   private readonly minClaimMismatches: number;
+  private readonly syntheticUserIds: ReadonlySet<string>;
 
   constructor(options: AgentFailureRuleSetOptions = {}) {
     this.minFailures = options.minFailures ?? 3;
     this.minFailureRate = options.minFailureRate ?? 0.2;
     this.minClaimMismatches = options.minClaimMismatches ?? 2;
+    this.syntheticUserIds = new Set(options.syntheticUserIds ?? syntheticUserIdsFromEnv());
   }
 
   async evaluate(
@@ -197,6 +211,17 @@ export class AgentFailureRuleSet
   ): Promise<MutationProposal<AgentFailureProposalPayload | AgentClaimMismatchProposalPayload>[]> {
     const byTool = new Map<string, ToolStats>();
     const claimMismatchSessions: string[] = [];
+
+    // Runs started by a verification account. Collected first, because a run's started event is not guaranteed to sort
+    // ahead of its tool events.
+    const syntheticRuns = new Set<string>();
+    if (this.syntheticUserIds.size > 0) {
+      for (const e of events) {
+        if (e.eventType !== EVT_RUN_STARTED) continue;
+        const uid = strDim(e.dimensions?.userId);
+        if (uid && this.syntheticUserIds.has(uid)) syntheticRuns.add(String(e.subjectId));
+      }
+    }
 
     for (const e of events) {
       if (e.eventType === EVT_RUN_VERDICT) {
@@ -207,6 +232,7 @@ export class AgentFailureRuleSet
         continue;
       }
       if (e.eventType !== EVT_TOOL_INVOKED && e.eventType !== EVT_TOOL_FAILED) continue;
+      if (syntheticRuns.has(String(e.subjectId))) continue;
       const toolName = strDim(e.dimensions?.toolName);
       if (!toolName) continue; // can't attribute a fix without a tool name
 

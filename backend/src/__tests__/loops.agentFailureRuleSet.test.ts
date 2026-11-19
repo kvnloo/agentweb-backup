@@ -10,6 +10,7 @@
 
 import { AgentFailureRuleSet, isNeverConnectedMessage } from '../loops/instances/agent-mode/failureRuleSet';
 import {
+  EVT_RUN_STARTED,
   EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
@@ -297,5 +298,68 @@ describe('AgentFailureRuleSet — "<X> not connected" precondition wording (ENG-
     const out = await rs.evaluate([...invoked('t', 7), ...fail('t', 5, msg)], WINDOW);
     expect(out).toHaveLength(1);
     expect((out[0].payload as any).failureType).toBe('config');
+  });
+});
+
+// ENG-3152/3154: post-merge verification probes run as a dedicated account and, by design, trip every new guard.
+// Their runs must not count toward (or against) a customer-facing cluster.
+describe('AgentFailureRuleSet: synthetic (verifier) traffic', () => {
+  const QA = 'qa-user-id';
+  const run = (runId: string, userId: string): NormalizedEvent => ({
+    subjectId: asSubjectId(runId),
+    eventType: EVT_RUN_STARTED,
+    ts: new Date('2026-06-04T00:00:00Z'),
+    dimensions: { userId },
+  });
+  const toolEvt = (runId: string, eventType: string, toolName: string, extra: Record<string, string> = {}): NormalizedEvent => ({
+    subjectId: asSubjectId(runId),
+    eventType,
+    ts: new Date('2026-06-04T00:00:00Z'),
+    dimensions: { toolName, ...extra },
+  });
+  const probeEvents = () => [
+    run('run-qa', QA),
+    ...Array.from({ length: 9 }, () => toolEvt('run-qa', EVT_TOOL_INVOKED, 'probe_tool')),
+    ...Array.from({ length: 9 }, () => toolEvt('run-qa', EVT_TOOL_FAILED, 'probe_tool', { errorClass: 'Error', failureType: 'bug', errorMessage: 'boom' })),
+  ];
+
+  it('files the cluster when the verifier account is not configured (default behaviour unchanged)', async () => {
+    const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+    expect((await policy.evaluate(probeEvents(), WINDOW)).length).toBe(1);
+  });
+
+  it('drops a cluster made only of the configured verifier account\'s runs', async () => {
+    const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2, syntheticUserIds: [QA] });
+    expect(await policy.evaluate(probeEvents(), WINDOW)).toEqual([]);
+  });
+
+  it('removes verifier runs from both failures and the denominator, keeping the customers\' own cluster', async () => {
+    const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2, syntheticUserIds: [QA] });
+    const customer = [
+      run('run-c', 'customer-1'),
+      ...Array.from({ length: 10 }, () => toolEvt('run-c', EVT_TOOL_INVOKED, 'probe_tool')),
+      ...Array.from({ length: 4 }, () => toolEvt('run-c', EVT_TOOL_FAILED, 'probe_tool', { errorClass: 'Error', failureType: 'bug', errorMessage: 'boom' })),
+    ];
+    const proposals = await policy.evaluate([...probeEvents(), ...customer], WINDOW);
+    expect(proposals).toHaveLength(1);
+    const stats = (proposals[0] as any).triggeringStats;
+    expect(stats.failures).toBe(4);
+    expect(stats.invocations).toBe(10);
+  });
+
+  it('works when the run_started event arrives after the tool events', async () => {
+    const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2, syntheticUserIds: [QA] });
+    const [started, ...rest] = probeEvents();
+    expect(await policy.evaluate([...rest, started], WINDOW)).toEqual([]);
+  });
+
+  it('reads the account list from AGENT_LOOP_SYNTHETIC_USER_IDS (comma separated, trimmed)', async () => {
+    process.env.AGENT_LOOP_SYNTHETIC_USER_IDS = ` other-id , ${QA} `;
+    try {
+      const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+      expect(await policy.evaluate(probeEvents(), WINDOW)).toEqual([]);
+    } finally {
+      delete process.env.AGENT_LOOP_SYNTHETIC_USER_IDS;
+    }
   });
 });
