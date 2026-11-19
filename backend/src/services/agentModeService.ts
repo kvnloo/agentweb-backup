@@ -256,6 +256,7 @@ import { getCrmSenders as sharedGetCrmSenders } from '../emma/impl/shared/crmSen
 // ENG-2103 (F2): brand guidelines / market strategy tool cluster, same
 // treatment as leadsImpl above.
 import * as brandMarketStrategyImpl from '../emma/impl/brandMarketStrategy';
+import { unattendedBrandContextMessage } from './brandMessagingContext';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same
 // treatment as leadsImpl above.
 import * as mediaVideoImpl from '../emma/impl/mediaVideo';
@@ -3409,6 +3410,11 @@ export class AgentModeService {
     // so undefined must be excluded, not just false — same strict-true discriminator
     // already used at the Meta-write approval-deck gate below.
     if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+      // ENG-3066: nobody is present to notice outreach written without knowing what the sender
+      // sells, so the compact brand block is given up front instead of depending on the model
+      // choosing to call read_brand_guidelines. Pushed before the publish directive, which stays last.
+      const brandContext = await unattendedBrandContextMessage(() => this.readBrandGuidelines(userId));
+      if (brandContext) messages.push({ role: 'system', content: brandContext });
       // ENG-2204: owner opt-out for the Slack-send override — resolved independently
       // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
       // for why this isn't threaded through publishAuthorizationOverride instead.
@@ -18990,7 +18996,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean }): Promise<any> {
     return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
