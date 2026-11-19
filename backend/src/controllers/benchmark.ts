@@ -45,6 +45,10 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
     let messages = req.body.conversationHistory?.messages || session.messages || [];
     
     // Process messages to include attachments in user messages (same as generateResponse)
+    // ENG-2227: the replay hands the LAST user message over as the live turn (no stamp is read for it), so only that one is
+    // labelled here; every earlier row is labelled from its own stamp when the history is rebuilt (labelling it here too would
+    // double the label whenever the row also has attachments).
+    const lastUserMessage = [...messages].reverse().find((m: any) => m.role === 'user');
     messages = messages.map((message: any) => {
       if (message.role === 'user') {
         let content = message.content;
@@ -60,7 +64,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
         // attachment-folding pattern, so it independently needs the same anonymous-sender
         // marker — otherwise an admin replaying a session containing an ishare message
         // through this benchmark tool loses the provenance signal the live path now carries.
-        if (isAnonymousShareMessage(message)) {
+        if (isAnonymousShareMessage(message) && message === lastUserMessage) {
           content = withAnonymousShareMarker(String(content));
         }
         if (content !== message.content) {

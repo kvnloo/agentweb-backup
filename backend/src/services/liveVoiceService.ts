@@ -522,7 +522,10 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
           ? (isAnonymousShareMessage(msg) ? 'User (an anonymous share-link viewer, not a verified account owner)' : 'User')
           : 'Emma';
         // Truncate very long messages to avoid bloating the system prompt
-        const snippet = trimmed.length > 500 ? trimmed.slice(0, 500) + '…' : trimmed;
+        const clipped = trimmed.length > 500 ? trimmed.slice(0, 500) + '…' : trimmed;
+        // ENG-2227: the label sits at the START of the row, so a newline inside a visitor's text could begin a second line
+        // that reads as an unlabelled "User:" row. Keep a visitor's row on one line (other rows keep their line breaks).
+        const snippet = msg.role === 'user' && isAnonymousShareMessage(msg) ? clipped.replace(/[\r\n\u2028\u2029]+/g, ' ') : clipped;
         lines.push(`${label}: ${snippet}`);
       }
     }

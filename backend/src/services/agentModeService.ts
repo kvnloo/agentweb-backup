@@ -621,7 +621,7 @@ import {
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
-import { isAnonymousShareMessage, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
+import { isAnonymousShareMessage, isServerAuthoredContinuation, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 
 /**
@@ -6579,7 +6579,7 @@ export class AgentModeService {
       // anonymous viewer looked identical to one from the verified account owner. Fold the
       // marker into content on every reconstruction (not just the turn it arrived in), the
       // same way attachments are folded in above, so it survives into later turns.
-      if (msg.role === 'user' && isAnonymousShareMessage(msg)) {
+      if (msg.role === 'user' && isAnonymousShareMessage(msg) && !isServerAuthoredContinuation(msg as any)) {
         let contentStr = '';
         if (Array.isArray(content)) {
           contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
@@ -6684,7 +6684,7 @@ export class AgentModeService {
     // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
     // before it's even "history") with zero provenance signal. Apply the same marker here when
     // this turn itself came through the public ishare endpoint.
-    const currentMessageContent = isCurrentTurnAnonymousIshare
+    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(null, messageContent)
       ? withAnonymousShareMarker(messageContent)
       : messageContent;
     if (screenshotUrl) {

@@ -16,7 +16,7 @@ describe('Agent Mode system prompt — anonymous ishare-link input provenance', 
 
   it('explains the provenance marker means no verified identity, not the account owner', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'did NOT come from the account owner — it came from whoever had the share link, with no identity check'
+      'was not verified as coming from the account owner — it came from whoever had the share link, with no identity check'
     );
   });
 

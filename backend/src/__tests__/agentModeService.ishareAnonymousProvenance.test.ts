@@ -256,4 +256,26 @@ describe('AgentModeService - buildMarketingContext with anonymous ishare provena
     );
     expect(merged).toBeDefined();
   });
+  // A visitor's request can chain server-authored continuation turns; they carry the visitor's stamp (the turn is still a
+  // visitor's for tool limits) but no visitor wrote them, so they must not read "sent by an anonymous viewer".
+  it('does not label a stamped server-authored continuation turn, stored or live', () => {
+    const MARK = '[Sent by an anonymous viewer via a shared link — not a verified account owner]';
+    const continuation = '[SYSTEM] This is an automatic continuation, not a message from the user — the previous turn stopped.';
+    const history: ChatMessage[] = [
+      { role: 'system', content: 'sys', timestamp: '2026-11-19T10:00:00.000Z' },
+      { role: 'user', content: 'make me an image', timestamp: '2026-11-19T10:00:01.000Z', metadata: { portalType: 'agent' as const, timestamp: '2026-11-19T10:00:01.000Z', ishareSender: { isAnonymous: true } } as any },
+      { role: 'assistant', content: 'working', timestamp: '2026-11-19T10:00:02.000Z' },
+      { role: 'user', content: continuation, timestamp: '2026-11-19T10:00:03.000Z', metadata: { portalType: 'agent' as const, timestamp: '2026-11-19T10:00:03.000Z', kind: 'auto-continuation', ishareSender: { isAnonymous: true } } as any },
+      { role: 'assistant', content: 'done', timestamp: '2026-11-19T10:00:04.000Z' },
+    ];
+    const rebuilt = (agentModeService as any).buildMarketingContext('next', history, []);
+    const texts = rebuilt.filter((m: any) => m.role === 'user').map((m: any) => String(m.content));
+    expect(texts.find((t: string) => t.includes('make me an image'))).toContain(MARK);
+    expect(texts.find((t: string) => t.includes('automatic continuation'))).not.toContain(MARK);
+
+    const live = (agentModeService as any).buildMarketingContext(continuation, history.slice(0, 3), [], undefined, undefined, undefined, undefined, undefined, true);
+    expect(String(live[live.length - 1].content)).not.toContain(MARK);
+    const liveVisitor = (agentModeService as any).buildMarketingContext('a real visitor message', history.slice(0, 3), [], undefined, undefined, undefined, undefined, undefined, true);
+    expect(String(liveVisitor[liveVisitor.length - 1].content)).toContain(MARK);
+  });
 });
