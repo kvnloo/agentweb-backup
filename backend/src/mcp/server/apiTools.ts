@@ -35,7 +35,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
+import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -1109,7 +1109,7 @@ mcpToolRegistry.register({
   name: 'create_lead_list',
   definition: {
     name: 'create_lead_list',
-    description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete".',
+    description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete". A list that holds leads marked do-not-contact is not deleted here (deleting it would erase those opt-outs); delete it in the app if that is intended.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1154,10 +1154,9 @@ mcpToolRegistry.register({
       case 'update':
         // Emma's eight list fields only (manageLeadsWrites.ts), not everything the REST route accepts.
         return executeLeadListUpdate(args, c);
-      case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
-        return jsonResult(data);
-      }
+      case 'delete':
+        // A list that holds leads marked do-not-contact is not deleted here (manageLeadsWrites.ts).
+        return executeLeadListDelete(args, c);
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
@@ -1663,7 +1662,7 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: `Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". "list" pages with page + limit and filters with search, status and engaged_only. "add" takes up to ${MAX_LEAD_ROWS_PER_CALL} leads (several are created one by one and the answer counts what really happened; an address the account already marked do-not-contact is flagged do-not-contact on the new lead too; a new lead cannot be created with status "do-not-contact", add it and then update its status); "delete" takes up to ${MAX_LEAD_ROWS_PER_CALL} lead_ids and counts the same way (a lead marked do-not-contact is not deleted here, because deleting it would let the address be added again as sendable). A call that runs out of its time budget reports the rows it did not touch. "update" merges any field that is not a standard lead field into the lead's custom fields (it never replaces them); setting status to "do-not-contact" suppresses the lead and cannot be reversed with this tool; changing a lead's email to an address already marked do-not-contact flags it too. Fields that identify the owner, sync or attribution data, and contact status cannot be set. Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.`,
+    description: `Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". "list" pages with page + limit and filters with search, status and engaged_only. "add" takes up to ${MAX_LEAD_ROWS_PER_CALL} leads (several are created one by one and the answer counts what really happened; an address the account already marked do-not-contact is flagged do-not-contact on the new lead too; a new lead cannot be created with status "do-not-contact", add it and then update its status); "delete" takes up to ${MAX_LEAD_ROWS_PER_CALL} lead_ids and counts the same way (a lead marked do-not-contact is not deleted here, because deleting it would let the address be added again as sendable). A call that runs out of its time budget reports the rows it did not touch. A lead added moments ago may briefly be reported as not found by a following update or delete: retry. "update" merges any field that is not a standard lead field into the lead's custom fields (it never replaces them); setting status to "do-not-contact" suppresses the lead and cannot be reversed with this tool; changing a lead's email to an address already marked do-not-contact flags it too. Fields that identify the owner, sync or attribution data, and contact status cannot be set. Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1672,7 +1671,7 @@ mcpToolRegistry.register({
         lead_id: { type: 'string', description: 'Lead ID (for get/update)' },
         leads: { type: 'array', description: `Lead objects to add, 1 to ${MAX_LEAD_ROWS_PER_CALL} (exactly one with client_id or dry_run). Standard fields: email, firstName, lastName, phone, company, title, notes, linkedin, website, companyLinkedin, domain, status, dealValue, dealCurrency, lifecycle, priority (Low, Medium or High), role, isPrimary, expectedClose, closedDate, pocEmails, heatScore, healthScore, selectedSenderId, and attribution: { utm: { source, medium, campaign, content, term } } (source tracking); drafts are saved by an update after the lead exists; any other key becomes a custom field (add action)` },
         lead_ids: { type: 'array', items: { type: 'string' }, description: `Lead IDs to delete, 1 to ${MAX_LEAD_ROWS_PER_CALL} (for delete action)` },
-        updates: { type: 'object', description: 'Fields to update (for update action). Standard lead fields (as for add, plus emailDraft, messageDraft and emailDraftFormat; no attribution) are set; any other key is merged into the lead\'s custom fields. Setting status to "do-not-contact" suppresses the lead.' },
+        updates: { type: 'object', description: 'Fields to update (for update action). Standard lead fields (as for add, plus emailDraft { subject, htmlContent?, textContent? }, messageDraft and emailDraftFormat "text"|"html"; no attribution; priority, role, isPrimary, expectedClose, closedDate, heatScore and healthScore can only be given when adding) are set; the email of a lead marked do-not-contact cannot be changed; any other key is merged into the lead\'s custom fields. Setting status to "do-not-contact" suppresses the lead.' },
         limit: { type: 'number', description: 'Max leads to return per page (list action)' },
         page: { type: 'number', description: 'Page number, starting at 1 (list action)' },
         search: { type: 'string', description: 'Only leads matching this text (list action)' },

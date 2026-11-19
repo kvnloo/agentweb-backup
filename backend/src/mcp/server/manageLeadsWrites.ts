@@ -59,7 +59,40 @@ function valueProblem(key: string, value: unknown): string | null {
   if (TEXT_FIELDS.has(key)) return typeof value === 'string' ? null : `${key} (must be text)`;
   if (NUMBER_FIELDS.has(key)) return typeof value === 'number' && Number.isFinite(value) ? null : `${key} (must be a number)`;
   if (BOOLEAN_FIELDS.has(key)) return typeof value === 'boolean' ? null : `${key} (must be true or false)`;
-  return null; // drafts: checked by the route
+  return null;
+}
+
+/**
+ * The update layer stores only domain and pocEmails of the CRM fields; the others take effect when a lead is created. On an update they would be
+ * accepted and dropped while the call reported success (the same trap as drafts on add), so they are refused there, by name.
+ */
+const CREATE_ONLY_CRM_FIELDS: ReadonlySet<string> = new Set(['priority', 'role', 'isPrimary', 'expectedClose', 'closedDate', 'heatScore', 'healthScore']);
+
+/** Written by the system's email validation and read by the send-eligibility check: an agent that could write it could mark an undeliverable address deliverable. */
+const SYSTEM_CUSTOM_KEYS: ReadonlySet<string> = new Set(['email_validation']);
+
+const MAX_DRAFT_CHARS = 200_000;
+
+/**
+ * A draft as the lead stores it. The route checks a draft only when status is "pending_review", and the update layer stores whatever it is given, so a
+ * string where an object belongs would break the screens that render it: accept only the real shapes and stamp the times here. null clears a draft.
+ */
+function normalizeDraft(key: string, value: unknown): { value?: unknown; problem?: string } {
+  if (value === null) return { value: null };
+  const now = new Date().toISOString();
+  const short = (v: unknown) => typeof v === 'string' && v.length <= MAX_DRAFT_CHARS;
+  if (key === 'emailDraftFormat') return value === 'text' || value === 'html' ? { value } : { problem: 'emailDraftFormat (must be "text" or "html")' };
+  if (key === 'messageDraft') {
+    const content = isPlainObject(value) && Object.keys(value).every((k) => k === 'content') ? value.content : value;
+    return short(content) && (content as string).trim()
+      ? { value: { content, createdAt: now, updatedAt: now } }
+      : { problem: 'messageDraft (must be non-empty text, or { content })' };
+  }
+  if (!isPlainObject(value) || !Object.keys(value).every((k) => k === 'subject' || k === 'htmlContent' || k === 'textContent')
+    || !short(value.subject) || (value.htmlContent !== undefined && !short(value.htmlContent)) || (value.textContent !== undefined && !short(value.textContent))) {
+    return { problem: 'emailDraft (must be { subject, htmlContent?, textContent? } of text)' };
+  }
+  return { value: { ...value, createdAt: now, updatedAt: now } };
 }
 
 /** Saved by an update. The create path never stores them (createLead builds the lead from a fixed field list), so on add they would be dropped while the call reported success. */
@@ -136,8 +169,15 @@ export function classifyLeadFields(input: unknown, opts: { forAdd?: boolean } = 
       out.refused.push(...refused);
       if (utm && refused.length === 0) out.standard.attribution = { utm };
     } else if (DRAFT_FIELDS.has(key)) {
-      if (opts.forAdd) out.refused.push(key);
-      else out.standard[key] = value;
+      if (opts.forAdd) {
+        out.refused.push(key);
+      } else {
+        const draft = normalizeDraft(key, value);
+        if (draft.problem) out.refused.push(draft.problem);
+        else out.standard[key] = draft.value;
+      }
+    } else if (!opts.forAdd && CREATE_ONLY_CRM_FIELDS.has(key)) {
+      out.refused.push(key);
     } else if (MCP_LEAD_STANDARD_FIELDS.has(key)) {
       const problem = valueProblem(key, value);
       if (problem) out.refused.push(problem);
@@ -148,9 +188,11 @@ export function classifyLeadFields(input: unknown, opts: { forAdd?: boolean } = 
         continue;
       }
       for (const [customKey, customValue] of Object.entries(value)) {
-        if (UNSAFE_FIELD_NAMES.has(customKey)) out.refused.push(`customFields.${customKey}`);
+        if (UNSAFE_FIELD_NAMES.has(customKey) || SYSTEM_CUSTOM_KEYS.has(customKey)) out.refused.push(`customFields.${customKey}`);
         else out.custom[customKey] = customValue;
       }
+    } else if (SYSTEM_CUSTOM_KEYS.has(key)) {
+      out.refused.push(key);
     } else {
       out.custom[key] = value;
     }
@@ -165,6 +207,9 @@ function refusalError(action: string, refused: string[]): Error {
   }
   if (refused.some((k) => DRAFT_FIELDS.has(k))) {
     hints.push('Drafts are saved with an update after the lead exists.');
+  }
+  if (refused.some((k) => CREATE_ONLY_CRM_FIELDS.has(k))) {
+    hints.push('priority, role, isPrimary, expectedClose, closedDate, heatScore and healthScore can be given when a lead is added; an update does not store them.');
   }
   return new Error(
     `manage_leads ${action}: these fields cannot be set as given (refused or not valid): ${refused.join(', ')}. ` +
@@ -205,8 +250,12 @@ export function buildLeadCreateBody(lead: unknown): Record<string, unknown> {
 /** Query string for the list action: the parameters the REST route actually reads (it never read `lastKey`, so pagination by key never worked). */
 export function buildLeadListQuery(args: any): Record<string, string> {
   const qp: Record<string, string> = {};
-  if (args.limit !== undefined && args.limit !== null) qp.limit = String(args.limit);
-  if (args.page !== undefined && args.page !== null) qp.page = String(args.page);
+  const wholeNumber = (value: unknown, name: string): string => {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error(`manage_leads list: ${name} must be a whole number of 1 or more.`);
+    return String(value);
+  };
+  if (args.limit !== undefined && args.limit !== null) qp.limit = wholeNumber(args.limit, 'limit');
+  if (args.page !== undefined && args.page !== null) qp.page = wholeNumber(args.page, 'page');
   if (typeof args.search === 'string' && args.search.trim()) qp.search = args.search.trim();
   if (typeof args.status === 'string' && args.status.trim()) qp.status = args.status.trim();
   if (args.engaged_only !== undefined && args.engaged_only !== null) {
@@ -256,6 +305,14 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
   if (refused.length > 0) throw refusalError('update', refused);
 
   const existing = await mcpFetch({ method: 'GET', path: leadPath(listId, args.lead_id), context: c });
+  // The opt-out lives on the lead and is found by its address. Changing or clearing the address of an opted-out lead would let the old address be
+  // added again as a sendable lead (the same reason it is not deleted here), so the address of a lead marked do-not-contact stays as it is.
+  if (standard.email !== undefined && existing && isDoNotContact(existing)) {
+    const same = (v: unknown) => (typeof v === 'string' ? v.trim().toLowerCase() : '');
+    if (same(standard.email) !== same(existing.email)) {
+      throw new Error('This lead is marked do-not-contact. Its email cannot be changed or cleared here: that would let the address be added again as a sendable lead. Change it in the app if that is really intended.');
+    }
+  }
   const body: Record<string, unknown> = { ...standard };
 
   if (Object.keys(custom).length > 0) {
@@ -418,11 +475,13 @@ export async function executeLeadDelete(args: any, c: any, opts: { budgetMs?: nu
   const listId = requireText(args.list_id, 'list_id', 'manage_leads delete');
   const ids = rowList(args.lead_ids, 'lead_ids', 'delete');
   if (ids.some((id) => typeof id !== 'string' || !id)) throw new Error('manage_leads delete: every lead_ids entry must be a lead id string.');
-  if (ids.length === 1) return jsonResult(await deleteExistingLead(listId, ids[0] as string, c));
+  // The same id twice is one lead: the second would otherwise be reported as a failure.
+  const uniqueIds = [...new Set(ids as string[])];
+  if (uniqueIds.length === 1) return jsonResult(await deleteExistingLead(listId, uniqueIds[0], c));
   const started = Date.now();
   const budgetMs = opts.budgetMs ?? ROW_WORK_BUDGET_MS;
   const results: RowOutcome[] = [];
-  for (const leadId of ids as string[]) {
+  for (const leadId of uniqueIds) {
     if (Date.now() - started > budgetMs) {
       results.push({ leadId, status: 'not_attempted' });
       continue;
@@ -434,7 +493,47 @@ export async function executeLeadDelete(args: any, c: any, opts: { budgetMs?: nu
       results.push({ leadId, status: 'failed', error: errorText(err) });
     }
   }
-  return summarise('delete', results, 'deleted');
+  return summarise('delete', results, 'deleted', uniqueIds.length !== ids.length ? { duplicateIdsIgnored: ids.length - uniqueIds.length } : {});
+}
+
+/** Most leads read to look for opted-out ones before a whole list is deleted. */
+const MAX_LEADS_CHECKED_BEFORE_LIST_DELETE = 20_000;
+
+/**
+ * `create_lead_list` action delete. Deleting a list deletes every lead in it, including the ones marked do-not-contact, and an address is flagged
+ * on a later add only from a lead that still exists: so a list that holds opted-out leads is not deleted through this tool (the lead delete refuses
+ * the same way). Access is proved by the REST read; the leads are read in-process to look for opt-outs; if they cannot all be read, nothing is deleted.
+ */
+export async function executeLeadListDelete(args: any, c: any): Promise<any> {
+  const listId = requireText(args.list_id, 'list_id', 'create_lead_list delete');
+  const listPath = `/api/crm/lists/${encodeURIComponent(listId)}`;
+  await mcpFetch({ method: 'GET', path: listPath, context: c });
+  let optedOut = 0;
+  let scanned = 0;
+  let more = false;
+  try {
+    const { crmDb } = await import('../../services/db');
+    let lastKey: any;
+    do {
+      const page: any = await crmDb.getLeadsByListId(listId, 500, lastKey);
+      for (const lead of page?.items ?? []) {
+        scanned++;
+        if (isDoNotContact(lead)) optedOut++;
+      }
+      lastKey = page?.lastEvaluatedKey;
+      more = !!lastKey;
+    } while (more && scanned < MAX_LEADS_CHECKED_BEFORE_LIST_DELETE);
+  } catch (err) {
+    console.error('[MCP] create_lead_list delete: could not read the list\'s leads:', (err as Error)?.message);
+    throw new Error('create_lead_list delete: the leads of this list could not be read to look for opted-out ones, so nothing was deleted. Try again.');
+  }
+  if (optedOut > 0) {
+    throw new Error(`create_lead_list delete: this list holds ${optedOut} lead(s) marked do-not-contact. Deleting the list would erase those opt-outs and let the addresses be added again as sendable leads, so it is not deleted here; delete it in the app if that is really intended.`);
+  }
+  if (more) {
+    throw new Error(`create_lead_list delete: this list has more than ${MAX_LEADS_CHECKED_BEFORE_LIST_DELETE} leads, too many to check for opted-out ones first, so it is not deleted here; delete it in the app.`);
+  }
+  return jsonResult(await mcpFetch({ method: 'DELETE', path: listPath, context: c }));
 }
 
 function summarise(action: 'add' | 'delete', results: RowOutcome[], done: 'created' | 'deleted', extra: Record<string, unknown> = {}): any {
