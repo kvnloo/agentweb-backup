@@ -16,9 +16,13 @@
  * function in zomaBilling.ts. Webhook events are PULLED from Stripe and replayed, signed locally, through the
  * production webhook controller (no public endpoint or Stripe CLI needed).
  *
+ * The agent's path is real too: section 2b and the later gateway checks call `handleMetaToolkitCall` (the same entry the MCP
+ * route uses) with an `UPDATE status=ACTIVE` write, so the paywall, the success-only metering and the failure audit run in
+ * the real gateway against real Stripe. Section 10 cancels the plan and checks the returning-user Checkout (no trial, no $1).
+ *
  * What is not real: the funnel rows go to an in-memory store (same conditional-write semantics as the table), the
- * day-3 email is captured and printed instead of sent, ad performance is a fixed string, and there is no Meta or
- * AgentWeb user. The Meta/Google gateway paywall wiring is covered by the unit tests (eng3130.zomaBilling.test.ts).
+ * day-3 email is captured and printed instead of sent, ad performance is a fixed string, the Meta write itself is a fake
+ * (there is no Meta account here), journey milestones are stubbed, and there is no AgentWeb user.
  *
  * ONE STEP IS MANUAL: hosted Checkout cannot be completed through the API. The script prints the Checkout URL (and
  * writes it to --checkout-url-file); open it and pay with test card 4242 4242 4242 4242, any future expiry, any CVC.
@@ -71,6 +75,7 @@ async function main() {
   log(`Stripe TEST account ${account.id}; pinned API version ${STRIPE_API_VERSION}; run ${RUN}`);
 
   const cleanup: Array<() => Promise<unknown>> = [];
+  const referralOut: { invoices: unknown[]; notes: Record<string, unknown> } = { invoices: [], notes: {} }; // ENG-3132: written to --out under `referral`
   const startedAt = Math.floor(Date.now() / 1000) - 60;
   const userId = `zoma-rh-${RUN}`;
   const email = `zoma-rehearsal+${RUN}@example.invalid`;
@@ -136,15 +141,64 @@ async function main() {
     };
     const clockDeps = () => ({ ...deps, now: () => clockMs });
 
+    // ---- the real toolkit gateway, with a fake Meta write and in-memory usage/failure rows -----------------------
+    const journey: any = await import('../services/journeyMilestones');
+    journey.noteProductUse = async () => undefined; // would write the (non-existent) user row in the Dev tables
+    journey.zomaMilestone = async () => undefined;
+    const { handleMetaToolkitCall } = await import('../mcp/metaToolkitGateway');
+    const counts = { write: 0, usage: 0, failure: 0 };
+    let writeResult: any = { success: true, verification: 'CONFIRMED', id: '5' };
+    const metaAccount = { platform: 'meta', account_id: '111', config: { account_type: 'ad_account', ad_account_id: '111', access_token: 'rehearsal' } } as any;
+    const gwDeps: any = {
+      validateApiKey: async () => ({ userId, keyId: 'rehearsal-key' }),
+      validateOAuthToken: async () => null,
+      listAccounts: async () => [metaAccount],
+      execute: async () => ({ data: [] }),
+      executeWrite: async () => { counts.write += 1; return writeResult; },
+      recordUsage: async () => { counts.usage += 1; return true; },
+      recordFailure: async () => { counts.failure += 1; return true; },
+      recordWrite: async () => true,
+      now: () => Date.now(),
+      reportBillableCall: (uid: string, id: string) => billing.reportZomaBillableCall(uid, id, deps),
+      assertPublishAllowed: (uid: string, ctx: any) => billing.assertZomaPublishAllowed(uid, ctx, deps),
+    };
+    const gw = (params: Record<string, unknown>, action = 'UPDATE') => handleMetaToolkitCall(
+      { authorization: 'Bearer aw_rehearsal', toolName: 'call_meta_marketing_api', args: { entity_type: 'CAMPAIGN', action, campaign_id: '5', params } }, gwDeps);
+
     // ---- customer on a test clock (the code never creates clocks; this is how the acceptance run does it) -----
     const clock = await stripe.testHelpers.testClocks.create({ frozen_time: Math.floor(Date.now() / 1000), name: `zoma-rehearsal-${RUN}` });
     cleanup.push(() => stripe.testHelpers.testClocks.del(clock.id));
     const customer = await stripe.customers.create({ test_clock: clock.id, metadata: { zomaBillingUserId: userId, product: 'zoma_plan' } });
+    // ENG-3132: read-only snapshot of every invoice and EVERY line, so the run records which invoice carries which line.
+    const iso = (sec?: number | null) => (typeof sec === 'number' ? new Date(sec * 1000).toISOString().slice(0, 16) : null);
+    const allLinesOf = async (inv: any): Promise<any[]> =>
+      inv.lines?.has_more ? await stripe.invoices.listLineItems(inv.id, { limit: 100 }).autoPagingToArray({ limit: 1000 }) : (inv.lines?.data ?? []);
+    const dumpInvoices = async (stage: string) => {
+      const invs = (await stripe.invoices.list({ customer: customer.id, limit: 20 })).data.reverse();
+      const snapshot: any[] = [];
+      for (const inv of invs as any[]) {
+        const lines = (await allLinesOf(inv)).map((l: any) => {
+          const price = l.pricing?.price_details?.price ?? l.price?.id ?? null;
+          return {
+            id: l.id, amount: l.amount, discount: (l.discount_amounts ?? []).reduce((a: number, d: any) => a + d.amount, 0), price,
+            kind: price === feePrice.id ? 'FEE' : price === planPrice.id ? 'plan' : price === overagePrice.id ? 'overage' : 'other',
+            period: `${iso(l.period?.start)}..${iso(l.period?.end)}`,
+          };
+        });
+        snapshot.push({ id: inv.id, status: inv.status, created: iso(inv.created), total_excluding_tax: inv.total_excluding_tax, amount_paid: inv.amount_paid, lines });
+      }
+      referralOut.invoices.push({ stage, clock: new Date(clockMs).toISOString(), invoices: snapshot });
+      log(`  invoices ${stage} (clock ${new Date(clockMs).toISOString().slice(0, 16)})`);
+      for (const i of snapshot) {
+        log(`    ${i.id} ${String(i.status).padEnd(6)} ex-tax=${i.total_excluding_tax} paid=${i.amount_paid}`);
+        for (const l of i.lines) log(`       ${l.kind.padEnd(8)} ${String(l.amount).padStart(5)} disc=${l.discount} ${l.period} ${l.id}`);
+      }
+    };
     const advance = async (toEpoch: number) => {
       await stripe.testHelpers.testClocks.advance(clock.id, { frozen_time: Math.floor(toEpoch) });
       for (let i = 0; i < 80; i++) {
         const c = await stripe.testHelpers.testClocks.retrieve(clock.id);
-        if (c.status === 'ready') { clockMs = c.frozen_time * 1000; return; }
+        if (c.status === 'ready') { clockMs = c.frozen_time * 1000; await dumpInvoices(`after advance to ${iso(c.frozen_time)}`).catch((e: any) => note('invoice dump failed', e?.message)); return; }
         await sleep(3000);
       }
       throw new Error('test clock did not become ready');
@@ -184,6 +238,19 @@ async function main() {
     check('our pay link redirects to the hosted Stripe page and records checkout_started', opened.kind === 'redirect' && steps().includes('checkout_started'));
     check('paywall_shown recorded once per surface per hour', steps().filter((s) => s === 'paywall_shown').length === 2, { steps: steps() });
 
+    log('\n=== 2b. The agent path through the real gateway, before paying');
+    const gwRefusal: any = await gw({ status: 'ACTIVE' }).then(() => null, (e: any) => e);
+    check('agent sets the campaign ACTIVE: refused with the same pay link, nothing sent to Meta, nothing metered',
+      Boolean(gwRefusal) && String(gwRefusal.message).includes(refusal.link) && counts.write === 0 && counts.usage === 0, { message: String(gwRefusal?.message).slice(0, 160), counts });
+    await gw({ name: 'draft rename' });
+    check('an edit (not a go-live) goes through and is metered', counts.write === 1 && counts.usage === 1, counts);
+    await handleMetaToolkitCall({ authorization: 'Bearer aw_rehearsal', toolName: 'get_campaigns', args: {} }, gwDeps);
+    check('a read goes through and is metered', counts.usage === 2, counts);
+    writeResult = { success: false, error: 'Meta said no' };
+    await gw({ name: 'rejected edit' });
+    check('a write Meta rejects in-band is not metered but leaves one failure audit row', counts.usage === 2 && counts.failure === 1, counts);
+    writeResult = { success: true, verification: 'CONFIRMED', id: '5' };
+
     log('\n=== 3. MANUAL: pay the $1 trial on the hosted Checkout page');
     const url = (opened as any).url as string;
     if (opt('checkout-url-file')) fs.writeFileSync(opt('checkout-url-file') as string, url);
@@ -209,6 +276,9 @@ async function main() {
     check('trial is 7 days', sub && Math.round((sub.trial_end - sub.trial_start) / DAY_S) === 7, { days: sub && (sub.trial_end - sub.trial_start) / DAY_S });
     check('subscription and session carry metadata.product=zoma_plan and the user id', sub?.metadata?.product === 'zoma_plan' && sub?.metadata?.userId === userId, sub?.metadata);
     check('publishing is now allowed', await billing.assertZomaPublishAllowed(userId, { platform: 'meta' }, deps).then(() => true, () => false));
+    const writesBefore = counts.write;
+    const live: any = await gw({ status: 'ACTIVE' }).then((r: any) => r, (e: any) => e);
+    check('agent retries the ACTIVE write through the gateway: it now goes to Meta and succeeds', counts.write === writesBefore + 1 && live?.success === true, { counts, result: live?.message ?? live?.success });
     check('the old pay link is gone (no second plan can be bought)', (await billing.openZomaCheckout(sessionId, deps)).kind === 'gone');
     const line = billing.formatZomaPlanLine((await billing.getZomaPlanSummary(userId, deps))!, deps.config());
     check('zoma_status shows the trial', /\[x\] Zoma plan: trial until \d{4}-\d{2}-\d{2}, then \$50\/month/.test(line), { line });
@@ -270,6 +340,7 @@ async function main() {
 
     log('\n=== 9. Webhook events pulled from Stripe, replayed through the production controller');
     const { handleWebhook } = await import('../controllers/stripeController');
+    process.env.ZOMA_REFERRAL_ENABLED = 'false'; // replay must never write the real referral ledger (ENG-3132)
     const types = ['checkout.session.completed', 'checkout.session.expired', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'invoice.created', 'invoice.finalized', 'invoice.paid', 'invoice.payment_succeeded'];
     const events = (await stripe.events.list({ types, created: { gte: startedAt }, limit: 100 } as any).autoPagingToArray({ limit: 500 }))
       .filter((e: any) => e.data.object.customer === customer.id).reverse();
@@ -288,6 +359,190 @@ async function main() {
     check('every Zoma plan event (session, subscription, invoice) is claimed before the Emma handlers', unclaimed.length === 0, { unclaimed });
     check('funnel recorded paid and trial_converted', steps().includes('paid') && steps().includes('trial_converted'), { steps: steps() });
     note('api_version of events vs pinned', { seen: [...new Set(events.map((e: any) => e.api_version))], pinned: STRIPE_API_VERSION });
+
+    log('\n=== 9b. ENG-3132 referral commission against the real invoices (in-memory registry and ledger, production modules)');
+    const prevReferralEnv = { enabled: process.env.ZOMA_REFERRAL_ENABLED, percent: process.env.ZOMA_REFERRAL_PERCENT, months: process.env.ZOMA_REFERRAL_MONTHS };
+    try {
+      const { createReferralCode, getZomaReferralConfig } = await import('../services/zomaReferralRegistry');
+      const { createZomaReferralWebhookHandler } = await import('../services/zomaReferralWebhook');
+      const { reconcileReferralLedger } = await import('../services/zomaReferralReconcile');
+      const { invoiceFactsFrom } = await import('./zomaReferralReconcile');
+      Object.assign(process.env, { ZOMA_REFERRAL_ENABLED: 'true', ZOMA_REFERRAL_PERCENT: '20' });
+      delete process.env.ZOMA_REFERRAL_MONTHS;
+
+      const codeRows = new Map<string, any>();
+      const registry: any = {
+        async create(r: any) { if (codeRows.has(r.code)) return false; codeRows.set(r.code, r); return true; },
+        async get(c: string) { return codeRows.get(c) ?? null; },
+        async revoke() { return false; },
+      };
+      const ledgerRows: any[] = [];
+      const ledger: any = {
+        async append(e: any) { if (ledgerRows.some((r) => r.referredUserId === e.referredUserId && r.entry === e.entry)) return false; ledgerRows.push(e); return true; },
+        async listForReferredUser(u: string) { return ledgerRows.filter((r) => r.referredUserId === u); },
+        async listAll() { return ledgerRows; },
+      };
+      const code = `rhref${RUN}`;
+      // Registered "an hour before the run" so the referred user's signup is not before the code existed.
+      const created = await createReferralCode({ code, referrerId: `rh-referrer-${RUN}`, payeeName: 'Rehearsal Referrer', createdBy: 'rehearsal' }, registry, () => new Date((startedAt - 3600) * 1000));
+      check('referral code registers', created.status === 'created', created.status);
+      const subRecord: any = (await stripe.subscriptions.list({ customer: customer.id, status: 'all' })).data[0];
+      const signupAt = new Date((subRecord.created - 60) * 1000).toISOString();
+      const refConfig = getZomaReferralConfig();
+      check('referral config is enabled at 20% / 3 months for this section', refConfig.enabled && refConfig.percentBps === 2000 && refConfig.months === 3, refConfig);
+
+      const accrualDeps = () => ({
+        config: getZomaReferralConfig(), registry, ledger, feePriceIds: [feePrice.id],
+        getReferredUser: async () => ({ signupRef: code, createdAt: signupAt }),
+        listPaidInvoices: async (customerId: string) => (await stripe.invoices.list({ customer: customerId, status: 'paid', limit: 100 }).autoPagingToArray({ limit: 1000 })) as any[],
+        now: () => new Date(),
+      });
+      const referral = createZomaReferralWebhookHandler({
+        isZomaPlanObject: billing.isZomaPlanObject,
+        accrualDeps: accrualDeps as any,
+        retrieveInvoice: (id: string) => stripe.invoices.retrieve(id) as any,
+        listCreditNotes: async (id: string) => (await stripe.creditNotes.list({ invoice: id, limit: 100 }).autoPagingToArray({ limit: 1000 })) as any[],
+      });
+      const replay = async (evs: any[]) => { for (const e of evs) await billing.handleZomaBillingWebhookEvent(e, { recordFunnel: deps.recordFunnel }, referral); };
+
+      // ---- the invoices, and the independent expectation (written here, not taken from the production arithmetic)
+      const paid = ((await stripe.invoices.list({ customer: customer.id, status: 'paid', limit: 100 })).data as any[]).reverse();
+      const full: any[] = [];
+      for (const inv of paid) full.push({ ...inv, _lines: await allLinesOf(inv) });
+      const feeNet = (inv: any) => inv._lines.filter((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === feePrice.id).reduce((a: number, l: any) => a + l.amount - (l.discount_amounts ?? []).reduce((x: number, d: any) => x + d.amount, 0), 0);
+      const expectedBase = (inv: any) => inv.total_excluding_tax - feeNet(inv);
+      const commissionable = full.filter((i) => expectedBase(i) > 0);
+      const expectedAccrued = commissionable.slice(0, refConfig.months);
+      const overageInvoices = full.filter((i) => i._lines.some((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === overagePrice.id && l.amount > 0));
+      note('paid invoices (id: ex-tax, fee-net, base)', full.map((i) => ({ id: i.id, exTax: i.total_excluding_tax, fee: feeNet(i), base: expectedBase(i) })));
+      note('N-INVOICE-SHAPE: which paid invoice carries overage lines', overageInvoices.map((i) => ({
+        invoice: i.id, alsoHasPlanLine: i._lines.some((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === planPrice.id),
+        overage: i._lines.filter((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === overagePrice.id).map((l: any) => ({ amount: l.amount, period: `${iso(l.period?.start)}..${iso(l.period?.end)}` })),
+        plan: i._lines.filter((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === planPrice.id).map((l: any) => `${iso(l.period?.start)}..${iso(l.period?.end)}`),
+      })));
+      referralOut.notes.overageInvoiceIds = overageInvoices.map((i) => i.id);
+
+      // ---- replay the REAL events, twice
+      const payEvents = (events as any[]).filter((e) => e.type === 'invoice.paid' || e.type === 'invoice.payment_succeeded');
+      note('invoice.paid / invoice.payment_succeeded events pulled', { count: payEvents.length, types: [...new Set(payEvents.map((e) => e.type))] });
+      await replay(payEvents);
+      const accrualRows = () => ledgerRows.filter((r) => r.kind === 'accrual');
+      const afterFirst = ledgerRows.length;
+      await replay(payEvents);
+      check('replaying every paid event a second time writes nothing (idempotent per invoice)', ledgerRows.length === afterFirst, { before: afterFirst, after: ledgerRows.length });
+      check('the $1 fee invoice accrues nothing', full.filter((i) => expectedBase(i) <= 0).every((i) => !accrualRows().some((r) => r.invoiceId === i.id)), { feeOnly: full.filter((i) => expectedBase(i) <= 0).map((i) => i.id) });
+      check('exactly the first 3 commissionable invoices accrue, no more', accrualRows().length === expectedAccrued.length && accrualRows().length <= 3 && expectedAccrued.every((i) => accrualRows().some((r) => r.invoiceId === i.id)),
+        { ledger: accrualRows().map((r) => r.invoiceId), expected: expectedAccrued.map((i) => i.id) });
+      check('each accrual is exactly 20% of the invoice ex-tax amount less the fee line',
+        expectedAccrued.every((i) => { const r = accrualRows().find((x) => x.invoiceId === i.id); return r && r.baseCents === expectedBase(i) && r.commissionCents === Math.round(expectedBase(i) * 0.2); }),
+        accrualRows().map((r) => ({ invoice: r.invoiceId, base: r.baseCents, commission: r.commissionCents })));
+      if (overageInvoices.length) {
+        check('an invoice carrying overage lines accrues on the whole ex-tax total, overage included',
+          overageInvoices.filter((i) => expectedAccrued.some((a) => a.id === i.id)).every((i) => accrualRows().find((r) => r.invoiceId === i.id)?.baseCents === i.total_excluding_tax),
+          overageInvoices.map((i) => ({ id: i.id, exTax: i.total_excluding_tax, base: accrualRows().find((r) => r.invoiceId === i.id)?.baseCents ?? null })));
+      } else {
+        note('no paid invoice carried overage lines in this run', { hint: 'overage is billed in arrears; the meter events may not have reached a paid invoice' });
+      }
+
+      // ---- a real credit note with a refund, via the real credit_note.created event
+      const target = expectedAccrued.find((i) => i.amount_paid > 0 && expectedBase(i) >= 5000) ?? expectedAccrued[0];
+      const reconcileDeps = { ledger, getInvoiceFacts: invoiceFactsFrom(stripe) };
+      const netOf = (invoiceId: string) => ledgerRows.filter((r) => r.invoiceId === invoiceId).reduce((a, r) => a + r.commissionCents, 0);
+      if (!target) {
+        note('referral refund checks skipped: no commissionable paid invoice', {});
+      } else {
+        const planLine = target._lines.find((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === planPrice.id) ?? target._lines.find((l: any) => l.amount > 0);
+        const before = netOf(target.id);
+        const cn: any = await stripe.creditNotes.create({
+          invoice: target.id, reason: 'order_change',
+          lines: [{ type: 'invoice_line_item', invoice_line_item: planLine.id, amount: 1000 }], refund_amount: 1000,
+        } as any);
+        note('credit note created (refund_amount path)', { id: cn.id, status: cn.status, total_excluding_tax: cn.total_excluding_tax, refunds: cn.refunds?.length ?? null });
+        const cnLine = (cn.lines?.data ?? [])[0];
+        note('credit-note line to invoice line mapping', { creditNoteLineInvoiceLineItem: cnLine?.invoice_line_item ?? null, invoiceLineId: planLine.id, equal: cnLine?.invoice_line_item === planLine.id });
+        const createdEvent: any = await sleepUntilFound('credit_note.created event in events.list', async () =>
+          ((await stripe.events.list({ types: ['credit_note.created'], created: { gte: startedAt }, limit: 100 } as any)).data as any[]).find((e) => e.data.object.id === cn.id), 90_000);
+        note('credit_note.created retrievable via events.list', { found: Boolean(createdEvent) });
+        await replay([createdEvent ?? { id: `evt_synthetic_${cn.id}`, type: 'credit_note.created', created: Math.floor(Date.now() / 1000), data: { object: cn } }]);
+        const credited = Math.round(1000 * 0.2);
+        check('the credit note reverses exactly its commission on the invoice (1000 of base -> 200 cents)', netOf(target.id) === before - credited, { before, after: netOf(target.id), expectedReversal: credited });
+        const afterOnce = ledgerRows.length;
+        await replay([createdEvent ?? { id: `evt_synthetic_${cn.id}`, type: 'credit_note.created', created: Math.floor(Date.now() / 1000), data: { object: cn } }]);
+        check('replaying the credit note again writes nothing', ledgerRows.length === afterOnce);
+
+        // voided credit note: use a fee-only invoice so the ledger is untouched (the fee never earned)
+        const feeOnly = full.find((i) => expectedBase(i) <= 0 && feeNet(i) > 0);
+        if (feeOnly) {
+          const feeLine = feeOnly._lines.find((l: any) => (l.pricing?.price_details?.price ?? l.price?.id) === feePrice.id);
+          try {
+            const oob: any = await stripe.creditNotes.create({ invoice: feeOnly.id, lines: [{ type: 'invoice_line_item', invoice_line_item: feeLine.id, amount: 50 }], out_of_band_amount: 50 } as any);
+            const voided: any = await stripe.creditNotes.voidCreditNote(oob.id);
+            const voidEvent: any = await sleepUntilFound('credit_note.voided event in events.list', async () =>
+              ((await stripe.events.list({ types: ['credit_note.voided'], created: { gte: startedAt }, limit: 100 } as any)).data as any[]).find((e) => e.data.object.id === oob.id), 90_000);
+            note('credit_note.voided retrievable via events.list', { found: Boolean(voidEvent), status: voided.status });
+            const rowsBefore = ledgerRows.length;
+            await replay([voidEvent ?? { id: `evt_synthetic_${oob.id}`, type: 'credit_note.voided', created: Math.floor(Date.now() / 1000), data: { object: voided } }]);
+            check('a voided credit note on the fee invoice leaves the ledger untouched', ledgerRows.length === rowsBefore, { rowsBefore, rowsAfter: ledgerRows.length });
+          } catch (e: any) {
+            note('could not create/void a fee-invoice credit note on this account', e?.raw?.message ?? e?.message);
+          }
+        } else {
+          note('credit_note.voided not exercised: no fee-only paid invoice found', {});
+        }
+
+        // ---- a raw refund with NO credit note: the webhook cannot see it, the reconcile must
+        const clean = await reconcileReferralLedger(reconcileDeps);
+        check('reconcile does not flag the credit-note refund (ledger already reversed it)', !clean.discrepancies.some((d) => d.invoiceId === target.id), clean.discrepancies.filter((d) => d.invoiceId === target.id));
+        const other = expectedAccrued.find((i) => i.id !== target.id && i.amount_paid > 0);
+        if (!other) {
+          note('raw-refund reconcile check skipped: only one accrued invoice in this run', {});
+        } else {
+          const pay = (await stripe.invoicePayments.list({ invoice: other.id, limit: 10 })).data[0] as any;
+          const pi = pay?.payment?.type === 'payment_intent' ? (typeof pay.payment.payment_intent === 'string' ? pay.payment.payment_intent : pay.payment.payment_intent?.id) : null;
+          note('invoice payment shape', { invoice: other.id, paymentType: pay?.payment?.type ?? null, hasPaymentIntent: Boolean(pi) });
+          if (!pi) {
+            note('raw-refund reconcile check skipped: the invoice payment has no payment_intent', { paymentType: pay?.payment?.type ?? null });
+          } else {
+            await stripe.refunds.create({ payment_intent: pi, amount: 500 });
+            const refundEvents: Record<string, boolean> = {};
+            for (const type of ['charge.refunded', 'refund.created']) {
+              refundEvents[type] = await stripe.events.list({ types: [type], created: { gte: startedAt }, limit: 10 } as any).then((r) => r.data.length > 0, () => false);
+            }
+            note('refund events visible after a raw refund (no credit note)', refundEvents);
+            const netBefore = netOf(other.id);
+            const report = await reconcileReferralLedger(reconcileDeps);
+            const flagged = report.discrepancies.find((d) => d.invoiceId === other.id);
+            check('the webhook path ignores a raw refund (ledger unchanged)', netOf(other.id) === netBefore);
+            check('reconcile flags the raw refund as refund_not_reversed with a positive difference', flagged?.kind === 'refund_not_reversed' && flagged.differenceCents > 0, flagged ?? report.discrepancies);
+            referralOut.notes.reconcile = report.totals;
+          }
+        }
+      }
+      referralOut.notes.ledger = ledgerRows.map((r) => ({ entry: r.entry, kind: r.kind, base: r.baseCents, commission: r.commissionCents, month: r.payoutMonth }));
+    } finally {
+      for (const [k, v] of Object.entries({ ZOMA_REFERRAL_ENABLED: prevReferralEnv.enabled, ZOMA_REFERRAL_PERCENT: prevReferralEnv.percent, ZOMA_REFERRAL_MONTHS: prevReferralEnv.months })) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+
+    log('\n=== 10. Returning user: the plan was cancelled, so the next go-live buys the plan itself (no trial, no $1)');
+    await stripe.subscriptions.cancel(sub.id);
+    let returning: any = null;
+    await sleepUntilFound('cancelled plan state', async () => {
+      const st = await billing.getZomaPlanState(userId, deps);
+      return st.status === 'canceled' && st.hadPlan ? st : null;
+    });
+    const gwReturning: any = await gw({ status: 'ACTIVE' }).then(() => null, (e: any) => e);
+    returning = gwReturning;
+    check('after cancelling, the go-live refusal sells the plan, charged today, with no trial wording',
+      Boolean(returning) && /\$50\/month, charged today/.test(returning.message) && !/trial/i.test(returning.message), { message: String(returning?.message).slice(0, 200) });
+    const retLink = String(returning?.message).match(/https:\/\/\S*\/api\/zoma\/billing\/checkout\/(cs_[A-Za-z0-9_]+)/);
+    const retSession = retLink ? await stripe.checkout.sessions.retrieve(retLink[1], { expand: ['line_items'] }) : null;
+    check('the returning Checkout has the plan and metered price only, no $1 fee line, $50 due today, USD-only',
+      Boolean(retSession) && retSession!.line_items?.data.length === 2 && retSession!.amount_total === 5000 && retSession!.currency === 'usd' && (retSession as any).adaptive_pricing?.enabled === false,
+      { items: retSession?.line_items?.data.length, amount_total: retSession?.amount_total, currency: retSession?.currency });
+    const retLine = billing.formatZomaPlanLine((await billing.getZomaPlanSummary(userId, deps))!, deps.config());
+    check('zoma_status offers the plan, not a trial', /\$50\/month → https:/.test(retLine) && !/trial/i.test(retLine), { line: retLine.slice(0, 120) });
   } finally {
     if (flag('keep')) {
       log('KEPT (--keep): Stripe test clock, meter, product and prices of run', RUN);
@@ -299,7 +554,7 @@ async function main() {
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.filter((r) => r.ok && !r.check.startsWith('NOTE')).length} passed, ${failed.length} failed`);
   failed.forEach((f) => console.log('FAILED:', f.check, JSON.stringify(f.evidence)));
-  if (opt('out')) fs.writeFileSync(opt('out') as string, JSON.stringify({ run: RUN, results }, null, 2));
+  if (opt('out')) fs.writeFileSync(opt('out') as string, JSON.stringify({ run: RUN, referral: referralOut, results }, null, 2));
   process.exit(failed.length ? 1 : 0);
 }
 

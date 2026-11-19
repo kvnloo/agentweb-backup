@@ -58,7 +58,9 @@ async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
   ]);
   return {
     getChatSession: (sessionId: string) => chatbotDb.getChatSession(sessionId),
-    getScheduleById: (scheduleId: string) => scheduleDb.getScheduleById(scheduleId),
+    // ENG-2816 (step 3): a strongly consistent read. Whether a schedule is marked (a visitor wrote part of it) is a security
+    // decision about a public post, and a replica that has not yet seen the mark would read it as the owner's own.
+    getScheduleById: (scheduleId: string) => scheduleDb.getScheduleById(scheduleId, { consistent: true }),
     resolveAccountPlatform: async (accountId: string, userId: string) => {
       const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
       // account_id alone does not identify an account — the same id can sit on two

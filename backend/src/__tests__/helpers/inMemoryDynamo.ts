@@ -67,6 +67,41 @@ function resolveName(token: string, names: Record<string, string>): string {
 }
 
 /**
+ * The value a condition clause's path points at. A dotted path (`brandGuidelines.updatedAt`, `#a.#b`) is a NESTED read, as in DynamoDB;
+ * before this, it was looked up as one attribute literally named "brandGuidelines.updatedAt", so `attribute_not_exists(a.b)` was always
+ * true and `a.b = :v` always false. A path with no dot is read exactly as before.
+ */
+function readConditionPath(item: Record<string, any> | undefined, token: string, names: Record<string, string>): any {
+  if (!token.includes('.')) return item?.[resolveName(token, names)];
+  return token
+    .split('.')
+    .map((segment) => resolveName(segment, names))
+    .reduce<any>((cur, segment) => (cur === undefined || cur === null ? undefined : cur[segment]), item);
+}
+
+/**
+ * The write twin of readConditionPath: `SET a.b = :v` stores `v` INSIDE the map `a`. As in DynamoDB, the parent map must already exist; when
+ * it does not, the update fails with the ValidationException the real service raises (callers such as journeyAttribution.touchProduct
+ * catch it and create the map first). A path with no dot is stored exactly as before.
+ */
+function writeUpdatePath(item: Record<string, any>, token: string, names: Record<string, string>, value: any): void {
+  if (!token.includes('.')) {
+    item[resolveName(token, names)] = value;
+    return;
+  }
+  const segments = token.split('.').map((segment) => resolveName(segment, names));
+  const leaf = segments.pop() as string;
+  const parent = segments.reduce<any>((cur, segment) => (cur !== null && typeof cur === 'object' ? cur[segment] : undefined), item);
+  if (parent === null || typeof parent !== 'object' || Array.isArray(parent)) {
+    throw Object.assign(
+      new Error('ValidationException: The document path provided in the update expression is invalid for update'),
+      { code: 'ValidationException' },
+    );
+  }
+  parent[leaf] = value;
+}
+
+/**
  * `attribute_exists(x) AND attribute_not_exists(y) AND #a = :b AND size(#l) = :n`,
  * plus one parenthesised disjunction: `(attribute_not_exists(#a) OR #a = :a)`.
  *
@@ -115,14 +150,12 @@ function evaluateClause(
 
     let match = clause.match(/^attribute_not_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item === undefined || item[attr] === undefined;
+      return item === undefined || readConditionPath(item, match[1], names) === undefined;
     }
 
     match = clause.match(/^attribute_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item !== undefined && item[attr] !== undefined;
+      return item !== undefined && readConditionPath(item, match[1], names) !== undefined;
     }
 
     match = clause.match(/^size\(\s*([^)]+?)\s*\)\s*=\s*(:[A-Za-z0-9_]+)$/i);
@@ -133,14 +166,12 @@ function evaluateClause(
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*=\s*(:[A-Za-z0-9_]+)$/);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item?.[attr] === values[match[2]];
+      return readConditionPath(item, match[1], names) === values[match[2]];
     }
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*([<>])\s*(:[A-Za-z0-9_]+)$/);
     if (match) {
-      const attr = resolveName(match[1], names);
-      const left = item?.[attr];
+      const left = readConditionPath(item, match[1], names);
       if (typeof left !== 'number') return false;
       return match[2] === '<' ? left < values[match[3]] : left > values[match[3]];
     }
@@ -179,12 +210,44 @@ function splitTopLevelCommas(expression: string): string[] {
  * `if_not_exists(attr, :default) +/- :delta`. Anything else throws loudly rather
  * than silently computing the wrong number.
  */
+/** One operand of list_append: a placeholder, an attribute (nested path allowed) or if_not_exists(attribute, :default). */
+function listOperand(token: string, item: Record<string, any>, names: Record<string, string>, values: Record<string, any>): any {
+  const t = token.trim();
+  const fallback = t.match(/^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)$/i);
+  if (fallback) {
+    const current = readConditionPath(item, fallback[1], names);
+    return current !== undefined ? current : values[fallback[2]];
+  }
+  return /^:[A-Za-z0-9_]+$/.test(t) ? values[t] : readConditionPath(item, t, names);
+}
+
 function evaluateSetValue(
   rawValue: string,
   item: Record<string, any>,
   names: Record<string, string>,
   values: Record<string, any>,
 ): any {
+  // list_append(a, b): both operands must be lists, as in DynamoDB.
+  const append = rawValue.match(/^list_append\(\s*(.+)\s*\)$/is);
+  if (append) {
+    const [first, second] = splitTopLevelCommas(append[1]);
+    const left = listOperand(first ?? '', item, names, values);
+    const right = listOperand(second ?? '', item, names, values);
+    if (!Array.isArray(left) || !Array.isArray(right)) {
+      throw Object.assign(new Error('ValidationException: An operand in the update expression has an incorrect data type (list_append)'), {
+        code: 'ValidationException',
+      });
+    }
+    return [...left, ...right];
+  }
+  // `SET x = if_not_exists(x, :default)` on its own: keep the value that is there, else take the default (how a missing map is created without clobbering one
+  // a concurrent writer just made).
+  const keepOrDefault = rawValue.match(/^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)$/i);
+  if (keepOrDefault) {
+    const current = readConditionPath(item, keepOrDefault[1], names);
+    return current !== undefined ? current : values[keepOrDefault[2]];
+  }
+
   let match = rawValue.match(
     /^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)\s*([+-])\s*(:[A-Za-z0-9_]+)$/i,
   );
@@ -209,16 +272,47 @@ function evaluateSetValue(
   throw new Error(`inMemoryDynamo: unsupported SET value: ${rawValue}`);
 }
 
+/**
+ * The members of a String Set value, whichever way the test holds it: a DocumentClient `DynamoDBSet` (what `createSet` hands the
+ * code under test, and what a read hands it back), or a bare array. Anything else is a malformed ADD / DELETE operand, which real
+ * DynamoDB rejects with a ValidationException, so this throws rather than guessing.
+ */
+function setMembers(value: any, clause: string): string[] {
+  const members = value && typeof value === 'object' && Array.isArray(value.values) ? value.values : Array.isArray(value) ? value : null;
+  if (!members) {
+    throw Object.assign(new Error(`ValidationException: operand of ${clause} is not a set`), { code: 'ValidationException' });
+  }
+  return members;
+}
+
+let realDocumentClient: { createSet(list: string[]): unknown } | undefined;
+
+/**
+ * A new String Set, so a stored set is never mutated in place by a later write. Built by the REAL SDK's `createSet` (the tests that
+ * use this helper mock 'aws-sdk' with the fake client), so it is the same `DynamoDBSet` object the code under test builds and a
+ * real read returns, not a look-alike.
+ */
+function newStringSet(members: string[]) {
+  if (!realDocumentClient) {
+    const actual = jest.requireActual('aws-sdk');
+    realDocumentClient = new actual.DynamoDB.DocumentClient({ region: 'us-west-2' });
+  }
+  return realDocumentClient!.createSet(members) as { values: string[] };
+}
+
 function applyUpdateExpression(
   item: Record<string, any>,
   expression: string,
   names: Record<string, string>,
   values: Record<string, any>,
 ) {
-  const setMatch = expression.match(/SET\s+(.*?)(?=\s+REMOVE\s+|$)/is);
-  const removeMatch = expression.match(/REMOVE\s+(.*)$/is);
+  // Each verb's body runs to the next verb (or the end). ADD is the String Set / number operation real DynamoDB has; it may follow SET
+  // and REMOVE in one expression.
+  const setMatch = expression.match(/SET\s+(.*?)(?=\s+(?:REMOVE|ADD)\s+|$)/is);
+  const removeMatch = expression.match(/REMOVE\s+(.*?)(?=\s+ADD\s+|$)/is);
+  const addMatch = expression.match(/(?:^|\s)ADD\s+(.*)$/is);
 
-  if (!setMatch && !removeMatch) {
+  if (!setMatch && !removeMatch && !addMatch) {
     throw new Error(`inMemoryDynamo: unsupported UpdateExpression: ${expression}`);
   }
   // A bare `SET ` with no assignments is a syntax error in real DynamoDB.
@@ -232,10 +326,7 @@ function applyUpdateExpression(
     for (const assignment of splitTopLevelCommas(setMatch[1])) {
       const [rawTarget, rawValue] = assignment.split('=').map((part) => part.trim());
       if (!rawTarget || !rawValue) continue;
-      if (/list_append/i.test(rawValue)) {
-        throw new Error(`inMemoryDynamo: unsupported SET function: ${rawValue}`);
-      }
-      item[resolveName(rawTarget, names)] = evaluateSetValue(rawValue, item, names, values);
+      writeUpdatePath(item, rawTarget, names, evaluateSetValue(rawValue, item, names, values));
     }
   }
 
@@ -250,6 +341,25 @@ function applyUpdateExpression(
       }
       delete item[resolveName(target, names)];
     }
+  }
+
+  // ADD: a number adds to the attribute (absent counts as 0); a String Set unions into it (absent is an empty set). Adding a
+  // set to an attribute that holds something else (a List, say) is a type mismatch, as it is in DynamoDB.
+  for (const clause of addMatch?.[1] ? splitTopLevelCommas(addMatch[1]) : []) {
+    const [rawTarget, rawValue] = clause.trim().split(/\s+/);
+    const attr = resolveName(rawTarget, names);
+    const operand = values[rawValue];
+    if (typeof operand === 'number') {
+      item[attr] = (item[attr] ?? 0) + operand;
+      continue;
+    }
+    const incoming = setMembers(operand, `ADD ${rawTarget}`);
+    if (item[attr] !== undefined && !(typeof item[attr] === 'object' && Array.isArray(item[attr].values))) {
+      throw Object.assign(new Error(`ValidationException: An operand in the update expression has an incorrect data type (ADD ${attr})`), {
+        code: 'ValidationException',
+      });
+    }
+    item[attr] = newStringSet([...new Set([...(item[attr]?.values ?? []), ...incoming])]);
   }
 }
 
@@ -288,6 +398,11 @@ export class InMemoryDynamo {
   get documentClient() {
     const self = this;
     return class DocumentClient {
+      /** The real DocumentClient's `createSet`: code under test builds its ADD / DELETE operands with it. */
+      createSet(list: any[]) {
+        return newStringSet(list);
+      }
+
       put(params: any) {
         return {
           promise: async () => {
@@ -378,6 +493,18 @@ export class InMemoryDynamo {
             let items = [...self.store(params.TableName).values()].filter(
               (item) => item[schema.hash] === hashValue,
             );
+
+            // A comparison on the RANGE key (`#email = :e`, also < <= > >=): without it a lookup by (hash, range) returned the whole partition.
+            if (schema.range) {
+              for (const m of expression.matchAll(/(#?[A-Za-z0-9_]+)\s*(<=|>=|=|<|>)\s*(:[A-Za-z0-9_]+)/g)) {
+                if (resolveName(m[1], names) !== schema.range) continue;
+                const wanted = values[m[3]];
+                items = items.filter((item) => {
+                  const have = item[schema.range!];
+                  return m[2] === '=' ? have === wanted : m[2] === '<' ? have < wanted : m[2] === '<=' ? have <= wanted : m[2] === '>' ? have > wanted : have >= wanted;
+                });
+              }
+            }
 
             if (between) {
               const attr = resolveName(between[1], names);
