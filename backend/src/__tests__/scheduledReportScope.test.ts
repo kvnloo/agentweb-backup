@@ -6,6 +6,8 @@
  * `tool_calls[].function.arguments` as a JSON string, the tool-result row carries the full result JSON including
  * `client{userId,email}`, and the assistant's `metadata.toolCalls` ledger carries the prepared arguments.
  */
+import { buildToolResponseS3Header } from '../utils/toolResponseS3Ref';
+import { sealTruncatedPayload } from '../services/agentMode/core/truncatedPayload';
 import {
   RECIPIENT_NEUTRAL_REPORT_TOOLS,
   RECIPIENT_SCOPABLE_TOOLS,
@@ -214,6 +216,16 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
       // a preview that never names the account, or a result with no client at all (an error), cannot prove a loosely matched call
       expect(ok([req, result('a', 'monitor_lead_volume', `${header}{"success":true,"daily_rows":[{"day":"2026-1`)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
       expect(ok([req, result('a', 'monitor_lead_volume', { success: false, error: 'No client found' })])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      // the REAL offload path: a large result is cut to 20,000 characters, sealed, and prefixed with the real S3 header
+      const rows = Array.from({ length: 1500 }, (_, i) => ({ day: `2026-01-${i}`, campaign: `Campaign ${i}`, leads: i, note: 'x'.repeat(20) }));
+      const full = JSON.stringify({ success: true, client: { userId: 'user-recipient', email: 'client@example.com', displayName: 'Client Co' }, campaigns: rows });
+      expect(full.length).toBeGreaterThan(20000);
+      const stored = buildToolResponseS3Header('tool-responses/s1/c1.txt', full.length) + sealTruncatedPayload(full.substring(0, 20000));
+      expect(() => JSON.parse(stored)).toThrow();
+      expect(ok([req, result('a', 'monitor_lead_volume', stored)])).toEqual({ ok: true });
+      const otherFull = JSON.stringify({ success: true, client: { userId: 'user-other', email: 'other@example.com' }, campaigns: rows });
+      const otherStored = buildToolResponseS3Header('tool-responses/s1/c1.txt', otherFull.length) + sealTruncatedPayload(otherFull.substring(0, 20000));
+      expect(ok([req, result('a', 'monitor_lead_volume', otherStored)])).toMatchObject({ ok: false, reason: 'result_other_account' });
       // a spoofed `"client":` inside a string is escaped in JSON and is not read as the key
       const spoof = `{"note":"x \\"client\\":{\\"userId\\":\\"user-recipient\\"}","client":{"userId":"user-other","email":"other@example.com"},"rows":[{"a`;
       expect(ok([req, result('a', 'monitor_lead_volume', spoof)])).toMatchObject({ ok: false, reason: 'result_other_account' });
