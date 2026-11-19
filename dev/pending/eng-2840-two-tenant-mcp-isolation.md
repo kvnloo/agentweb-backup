@@ -17,8 +17,10 @@ one answers 404, so existence is distinguishable; this predates the test and is 
 **Fixes.**
 - Any caller could switch off the public-response sanitiser (ENG-2335) by adding a `client_id` argument to any tool. It now applies only when
   the caller's account is really an admin (looked up only when the argument is present; any failure means "not admin", so the answer is stripped).
-- `create_html_template` saved a bare `data:` / `file:` / `ftp:` (and similar) link as the template body. It is now refused with a clear error
-  before any fetch, rewrite or save. Text with spaces and real HTML are unchanged.
+- `create_html_template` saved a bare `data:` / `file:` / `ftp:` / `sms:` / `s3://` (any non-http(s)) link as the template body. A single
+  whitespace-free `scheme:rest` token that is not a real `http(s)://` link is now refused with a clear error before any fetch, rewrite or save
+  (a list of schemes always missed one: Opslane found `sms:` and `vscode://`). A padded or upper-case `https://` link is now fetched like any
+  other. Text with spaces, real HTML and a bare word are unchanged.
 
 **Fake database.** Conditions on nested paths (`brandGuidelines.updatedAt`) were treated as one attribute with dots in its name, so `=` was
 always false and `attribute_not_exists` always true. They now read nested values; the suites that use the fake were re-run.

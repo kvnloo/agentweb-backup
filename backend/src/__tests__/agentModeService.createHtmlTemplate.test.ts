@@ -336,6 +336,12 @@ describe('AgentModeService - createHtmlTemplate', () => {
       ['ssh://host/index.html', 'ssh'],
       ['mailto:someone@example.test', 'mailto'],
       ['hdfs://namenode/a.html', 'hdfs'],
+      // Found by Opslane (run 2294): a fixed list of schemes always misses one, so any scheme that is not a real http(s):// link is refused.
+      ['sms:+14155551234', 'sms'],
+      ['vscode://file/tmp/deck.html', 'vscode'],
+      ['C:\\temp\\deck.html', 'c'],
+      ['http:no-slashes.example', 'http'],
+      ['made-up-scheme+v2.x:anything', 'made-up-scheme+v2.x'],
     ])('refuses an unfetchable link %j without fetching, rewriting or saving', async (source, scheme) => {
       const result = await agentModeService.createHtmlTemplate(
         source,
@@ -353,6 +359,14 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(fetchCallerUrlText).not.toHaveBeenCalled();
       expect(mockGenerateHTML).not.toHaveBeenCalled();
       expect(mockSetSetting).not.toHaveBeenCalled();
+    });
+
+    it('tells the caller what to pass instead for a cloud-storage link', async () => {
+      const result = await agentModeService.createHtmlTemplate('s3://bucket/key.html', undefined, 't', 'S', '', 'test-user-123', 'test-session-123');
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('public or pre-signed https link');
+      const plain = await agentModeService.createHtmlTemplate('sms:+14155551234', undefined, 't', 'S', '', 'test-user-123', 'test-session-123');
+      expect(plain.error).not.toContain('pre-signed');
     });
 
     it.each(['  https://example.com/a.html  ', 'HTTPS://example.com/a.html', '\nHttp://example.com/a.html'])(

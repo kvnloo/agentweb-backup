@@ -156,10 +156,13 @@ async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// A single token (no whitespace) that starts with one of these schemes and a colon, with something after it, is a link the server cannot
-// fetch, not HTML. http(s) is handled by the guarded fetch; text with spaces, and HTML (which starts with "<"), never matches.
-const UNFETCHABLE_LINK_SCHEME =
-  /^(data|file|ftps?|sftp|ssh|git|javascript|vbscript|blob|filesystem|view-source|wss?|gopher|s3a?|gs|gcs|az|hdfs|nfs|mailto|tel|about|jar|dict|ldaps?|smb):\S+$/i;
+// A single token (no whitespace) of the form `scheme:rest` is a link, not HTML and not text. A real http(s):// link is fetched below through the
+// guarded fetch; every other scheme (data:, file:, ftp:, sms:, vscode://, s3://, mailto:, a Windows path such as C:\x ...) cannot be fetched, so
+// it is refused instead of being saved as the template's body. A fixed list of schemes would always miss one. Text with spaces, HTML (which starts
+// with "<") and a bare word are never a token of this form.
+const LINK_LIKE_TOKEN = /^([a-z][a-z0-9+.-]*):\S+$/i;
+const HTTP_LINK = /^https?:\/\//i;
+const CLOUD_STORAGE_SCHEMES: ReadonlySet<string> = new Set(['s3', 's3a', 'gs', 'gcs', 'az', 'hdfs']);
 
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
@@ -815,14 +818,16 @@ export async function createHtmlTemplate(
         };
       }
 
-      // A bare link in a scheme that cannot be fetched (data:, file:, ftp: ...) is refused here, before it is saved as the template's body.
-      // Plain text with spaces and real HTML are not links and still work.
-      const unfetchableScheme = UNFETCHABLE_LINK_SCHEME.exec(htmlSource.trim());
-      if (unfetchableScheme) {
+      // A bare link that cannot be fetched is refused here, before it is saved as the template's body. Plain text with spaces and real HTML still work.
+      const linkSource = htmlSource.trim();
+      const linkLike = LINK_LIKE_TOKEN.exec(linkSource);
+      if (linkLike && !HTTP_LINK.test(linkSource)) {
+        const scheme = linkLike[1].toLowerCase();
         return {
           success: false,
           message: 'Failed to create HTML template',
-          error: `html_source looks like a ${unfetchableScheme[1].toLowerCase()}: link, which cannot be fetched. Pass a public http(s) link or the HTML itself.`
+          error: `html_source looks like a ${scheme}: link, which cannot be fetched. Pass a public http(s) link or the HTML itself.` +
+            (CLOUD_STORAGE_SCHEMES.has(scheme) ? ' For a file in cloud storage, pass a public or pre-signed https link.' : '')
         };
       }
 
@@ -851,8 +856,7 @@ export async function createHtmlTemplate(
 
       // If htmlSource looks like a URL, fetch it. Padding and upper case (" HTTPS://...") are still a link: the same reading as the refusal
       // above, so a link is either fetched through the guarded fetch or refused, never saved as the template's body.
-      const linkSource = htmlSource.trim();
-      if (/^https?:\/\//i.test(linkSource)) {
+      if (HTTP_LINK.test(linkSource)) {
         console.log('AgentMode: Fetching HTML from URL:', linkSource);
         // A URL the caller chose is fetched only through the guarded fetch (public addresses only, redirects re-checked, size and
         // time bounded): the body becomes a saved template, so the server's own network position must not be reachable through it.
