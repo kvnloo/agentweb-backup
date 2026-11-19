@@ -117,7 +117,13 @@ export const AUTONOMOUS_REPORT_WORKPLAN_STEPS: WorkPlanStep[] = [
       "(ad-level, demographics, placement, device) that had no data in step 2, omit that " +
       "section from the report entirely rather than leaving a placeholder or fabricating " +
       "figures. If any campaigns were excluded in step 1, briefly note which ones and why. " +
-      "Provide the report as a clickable link.",
+      "Provide the report as a clickable link." +
+      " CAVEAT (always apply): new ad accounts and new campaigns normally take up to one week " +
+      "to stabilize. For any account or campaign that started delivering within the last 7 days, " +
+      "show this visible note in the report: \"New account/campaign: delivery metrics typically " +
+      "take up to one week to stabilize. Best practice is to treat these results as qualitative " +
+      "signals rather than definitive performance.\" Draw no firm conclusions on them and make no " +
+      "winner/loser calls or pause/scale recommendations for them.",
   },
 ];
 
