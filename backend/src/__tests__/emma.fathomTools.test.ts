@@ -341,7 +341,9 @@ describe('fathom_get_transcript', () => {
     const result = await executeTool('fathom_get_transcript', { recording_id: 810527663 }, { userId: 'user-1' });
     expect(result.success).toBe(false);
     expect(result.message).toContain('fathom_get_meetings');
-    expect(result.message).toContain('fathom.video');
+    expect(result.message).toContain('not found');
+    expect(result.errorClass).toBe('invalid_args');
+    expect(result.status).toBe(404);
     const classified = toolResultError(result);
     expect(classifyToolErrorClass(classified)).toBe('invalid_args');
     expect(classifyToolFailureType(classifyToolErrorClass(classified), classified?.message)).toBe('schema_reject');
