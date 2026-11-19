@@ -27,7 +27,12 @@ export const TWO_TENANT_TABLES: Record<string, TableKeySchema> = {
   'AW-Users': { hash: 'email', indexes: { UserIdIndex: { hash: 'userId' }, OrgIdIndex: { hash: 'orgId' } } },
   'AW-Organizations': { hash: 'orgId' },
   'AW-LeadLists': { hash: 'listId', indexes: { 'userId-index': { hash: 'userId' } } },
-  'AW-Leads': { hash: 'listId', range: 'leadId', indexes: { 'email-index': { hash: 'listId', range: 'email' } } },
+  'AW-Leads': {
+    hash: 'listId',
+    range: 'leadId',
+    // email-index: one (list, email) pair (the duplicate check); EmailLookupIndex: every lead with an address, across lists (do-not-contact inheritance).
+    indexes: { 'email-index': { hash: 'listId', range: 'email' }, EmailLookupIndex: { hash: 'email' } },
+  },
 };
 
 export function makeTwoTenantFake(): InMemoryDynamo {
