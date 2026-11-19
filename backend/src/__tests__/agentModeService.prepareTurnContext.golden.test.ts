@@ -9,6 +9,7 @@
  *
  * Re-record (only when a prompt change is intended, never in a pure refactor): UPDATE_GOLDEN=1 npx jest <this file>
  */
+import { ANONYMOUS_SHARE_MARKER } from '../utils/anonymousShareProvenance';
 import { createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -377,6 +378,16 @@ describe('generateMarketingResponse turn preamble — golden (ENG-2113 PR C0)', 
       const share = await prepare(admin, { isInteractiveShare: true });
       expect(share.isAdmin).toBe(true);
       expect(share.hasAdminAccess).toBe(false);
+    });
+
+    // ENG-2227: the call site of buildMarketingContext passes the share flag; the helper's own tests call it directly, so
+    // only this fixture notices if the argument is dropped from processMessage's turn setup.
+    it('ENG-2227: a share visitor turn ends with the anonymous-viewer label, the owner turn does not', async () => {
+      const lastUser = (ctx: any) => [...ctx.messages].reverse().find((m: any) => m.role === 'user');
+      const visitor = await prepare(admin, { isInteractiveShare: true });
+      const owner = await prepare(admin, { isInteractiveShare: false });
+      expect(String(lastUser(visitor).content).endsWith(ANONYMOUS_SHARE_MARKER)).toBe(true);
+      expect(String(lastUser(owner).content)).not.toContain(ANONYMOUS_SHARE_MARKER);
     });
 
     it('the correction stamp is read from the session decision for THIS turn only', async () => {

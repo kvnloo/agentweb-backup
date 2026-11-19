@@ -8,6 +8,7 @@ import { AuthenticatedRequest, isRealAdmin } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
 import { isAgentWebModelId } from '../services/agentMode/agentWebModelRouter';
+import { isAnonymousShareMessage, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 /**
  * ENG-669 PR-C: a benchmark calls one concrete model directly (no resolver, no router), so the AgentWeb Model, which
@@ -59,8 +60,8 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
         // attachment-folding pattern, so it independently needs the same anonymous-sender
         // marker — otherwise an admin replaying a session containing an ishare message
         // through this benchmark tool loses the provenance signal the live path now carries.
-        if (message.metadata?.ishareSender?.isAnonymous) {
-          content = `${content}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`;
+        if (isAnonymousShareMessage(message)) {
+          content = withAnonymousShareMarker(String(content));
         }
         if (content !== message.content) {
           return { ...message, content };
