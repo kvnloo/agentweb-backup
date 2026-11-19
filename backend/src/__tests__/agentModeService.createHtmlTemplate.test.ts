@@ -326,6 +326,101 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(mockGenerateHTML).not.toHaveBeenCalled();
     });
 
+    // ENG-2840: a link in a scheme the server cannot fetch was saved as the template's body, as if it were HTML.
+    it.each([
+      ['data:text/html;base64,PGgxPmhpPC9oMT4=', 'data'],
+      ['file:///etc/passwd', 'file'],
+      ['  FTP://example.com/x.html  ', 'ftp'],
+      ['javascript:alert(1)', 'javascript'],
+      ['s3://bucket/key.html', 's3'],
+      ['ssh://host/index.html', 'ssh'],
+      ['mailto:someone@example.test', 'mailto'],
+      ['hdfs://namenode/a.html', 'hdfs'],
+      // Found by Opslane (run 2294): a fixed list of schemes always misses one, so any scheme that is not a real http(s):// link is refused.
+      ['sms:+14155551234', 'sms'],
+      ['vscode://file/tmp/deck.html', 'vscode'],
+      ['C:\\temp\\deck.html', 'c'],
+      ['http:no-slashes.example', 'http'],
+      ['made-up-scheme+v2.x:anything', 'made-up-scheme+v2.x'],
+    ])('refuses an unfetchable link %j without fetching, rewriting or saving', async (source, scheme) => {
+      const result = await agentModeService.createHtmlTemplate(
+        source,
+        undefined,
+        'test_template',
+        'Test Subject',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain(`looks like a ${scheme}: link`);
+      expect(result.error).toContain('public http(s) link or the HTML itself');
+      expect(fetchCallerUrlText).not.toHaveBeenCalled();
+      expect(mockGenerateHTML).not.toHaveBeenCalled();
+      expect(mockSetSetting).not.toHaveBeenCalled();
+    });
+
+    it('tells the caller what to pass instead for a cloud-storage link', async () => {
+      const result = await agentModeService.createHtmlTemplate('s3://bucket/key.html', undefined, 't', 'S', '', 'test-user-123', 'test-session-123');
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('public or pre-signed https link');
+      const plain = await agentModeService.createHtmlTemplate('sms:+14155551234', undefined, 't', 'S', '', 'test-user-123', 'test-session-123');
+      expect(plain.error).not.toContain('pre-signed');
+    });
+
+    it.each(['  https://example.com/a.html  ', 'HTTPS://example.com/a.html', '\nHttp://example.com/a.html'])(
+      'reads %j as an http(s) link: fetched through the guarded fetch, never saved as the body',
+      async (source) => {
+        (fetchCallerUrlText as jest.Mock).mockResolvedValue(mockInputHtml);
+        mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+        mockGetSetting.mockResolvedValue(null);
+        mockSetSetting.mockResolvedValue(undefined);
+
+        const result = await agentModeService.createHtmlTemplate(
+          source,
+          undefined,
+          'welcome_email',
+          'Welcome!',
+          '',
+          'test-user-123',
+          'test-session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(fetchCallerUrlText).toHaveBeenCalledWith(source.trim(), expect.objectContaining({ tool: 'create_html_template' }));
+      }
+    );
+
+    it('still accepts text that merely starts with a scheme word but is not a link', async () => {
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockGetSetting.mockResolvedValue(null);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      const result = await agentModeService.createHtmlTemplate(
+        'file: Welcome to {{company_name}} - a short note for new users',
+        undefined,
+        'plain_text_template',
+        'Welcome',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(fetchCallerUrlText).not.toHaveBeenCalled();
+    });
+
+    it('a scheme word with nothing after the colon is not a link either', async () => {
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockGetSetting.mockResolvedValue(null);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      const result = await agentModeService.createHtmlTemplate('File:', undefined, 'bare_word', 'Subject', '', 'test-user-123', 'test-session-123');
+
+      expect(result.success).toBe(true);
+    });
+
     it('should handle LLM generation errors', async () => {
       // Setup mocks
       mockGenerateHTML.mockResolvedValue(''); // Empty response
