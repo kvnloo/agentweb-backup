@@ -24,7 +24,8 @@ jest.mock('../services/journeyMilestones', () => ({ noteProductUse: jest.fn(), n
 
 import {
   buildZomaMeasurementReport,
-  INDUSTRY_BENCHMARK_PLACEHOLDER,
+  INDUSTRY_BENCHMARK_NA_LINE,
+  measurementIndustryBenchmark,
   measurementFindings,
   NEW_DELIVERY_CAVEAT,
   renderMeasurementReportHtml,
@@ -180,8 +181,9 @@ describe('ENG-3155 zoma_measurement_report output', () => {
     expect(r.campaigns[2]).toMatchObject({ crm_leads: null, cost_per_lead: null });
     expect(r.totals).toMatchObject({ spend: 670, conversions: 12, roas: 1.79, crm_leads: 20, cost_per_lead: 33.5 });
     expect(r.unattributed_crm_leads).toBe(3);
-    expect(r.industryBenchmark).toBe(INDUSTRY_BENCHMARK_PLACEHOLDER);
-    expect(r.industryBenchmark).toBe('N/A');
+    // No industry given: exactly N/A, and the user is asked for it.
+    expect(r.industryBenchmark.line).toBe('Industry benchmark: N/A');
+    expect(r.industryBenchmark.note).toMatch(/^Tell us your industry/);
     expect(r.report_url).toBe('https://agentweb-user-files.s3.amazonaws.com/users/u1/report.html');
 
     expect(r.breakdowns.top_ads?.[0]).toMatchObject({ ad_id: 'a1', label: 'Hero image', spend: 200, conversions: 7 });
@@ -222,6 +224,77 @@ describe('ENG-3155 zoma_measurement_report output', () => {
     expect(r.findings).toEqual([]);
     expect(r.breakdowns).toEqual({});
     expect(r.summary).toContain('No campaign spent in this window.');
+  });
+});
+
+describe('ENG-3155 vs. industry line (ENG-3156 benchmark)', () => {
+  const leadReport = (conversions: number) => ({ ...JSON.parse(JSON.stringify(adsReport)), conversion_event: 'lead', totals: { ...adsReport.totals, conversions } });
+
+  it('compares the report\'s own CPA with the benchmark: % diff, worse, source + year + url, with no extra Graph read', async () => {
+    const d = deps({ runAdsReport: jest.fn(async () => leadReport(12)) });
+    const r = await runZomaMeasurementReport('u1', account, '111', { industry: 'education' }, d);
+    const ib = r.industryBenchmark;
+    expect(ib.customer_cpa).toBe(55.83); // 670 / 12, the report's totals
+    expect(ib.benchmark).toMatchObject({ cpa: 26.31, currency: 'USD', year: 2026, url: 'https://localiq.com/blog/facebook-advertising-benchmarks/' });
+    expect(ib.comparison).toEqual({ difference_percent: 112.2, verdict: 'worse' });
+    expect(ib.line).toContain('your CPA 55.83 USD vs 26.31 USD benchmark');
+    expect(ib.line).toContain('112.2% above the benchmark (worse');
+    expect(ib.line).toContain('LocaliQ — Facebook Advertising Benchmarks for 2026, 2026, https://localiq.com/blog/facebook-advertising-benchmarks/');
+    expect(r.summary).toContain(ib.line);
+    const html: string = (d.uploadHtml as jest.Mock).mock.calls[0][0];
+    expect(html).toContain('vs. Industry');
+    expect(html).toContain('href="https://localiq.com/blog/facebook-advertising-benchmarks/"');
+    // Reuses the report's spend/conversions: one ads report, no creatives read, no extra insights read.
+    expect(d.runAdsReport).toHaveBeenCalledTimes(1);
+    const paths = (d.fetch.mock.calls as any[]).map(([u]) => new URL(u).pathname);
+    expect(paths.some((p) => p.includes('adcreatives'))).toBe(false);
+    expect(paths.filter((p) => p.endsWith('/insights'))).toHaveLength(4);
+  });
+
+  it('says better when the CPA is below the benchmark', () => {
+    const ib = measurementIndustryBenchmark({ industry: 'education', conversionEvent: 'lead', spend: 670, conversions: 50, currency: 'USD', newAccount: false });
+    expect(ib.comparison).toEqual({ difference_percent: -49.1, verdict: 'better' });
+    expect(ib.line).toContain('49.1% below the benchmark (better');
+  });
+
+  it('is exactly "Industry benchmark: N/A" when there is no row (purchase KPI, or industry "other")', () => {
+    for (const input of [
+      { industry: 'education' as const, conversionEvent: 'purchase' },
+      { industry: 'other' as const, conversionEvent: 'lead' },
+      { industry: 'education' as const, conversionEvent: null },
+    ]) {
+      const ib = measurementIndustryBenchmark({ ...input, spend: 670, conversions: 12, currency: 'USD', newAccount: false });
+      expect(ib.line).toBe(INDUSTRY_BENCHMARK_NA_LINE);
+      expect(ib.benchmark).toBe('N/A');
+      expect(ib.comparison).toBeNull();
+    }
+  });
+
+  it('does not compare without conversions or across currencies, but still cites the benchmark', () => {
+    const none = measurementIndustryBenchmark({ industry: 'education', conversionEvent: 'lead', spend: 100, conversions: 0, currency: 'USD', newAccount: false });
+    expect(none.comparison).toBeNull();
+    expect(none.note).toMatch(/No lead conversions/);
+    expect(none.line).toContain('https://localiq.com/blog/facebook-advertising-benchmarks/');
+    const eur = measurementIndustryBenchmark({ industry: 'education', conversionEvent: 'lead', spend: 100, conversions: 5, currency: 'EUR', newAccount: false });
+    expect(eur.comparison).toBeNull();
+    expect(eur.note).toMatch(/EUR/);
+  });
+
+  it('skips the comparison for a new-delivery account and shows the caveat instead', async () => {
+    const d = deps({ runAdsReport: jest.fn(async () => leadReport(12)) }, graphFixtures(iso(NOW - 2 * DAY)));
+    const r = await runZomaMeasurementReport('u1', account, '111', { industry: 'education' }, d);
+    expect(r.industryBenchmark.comparison).toBeNull();
+    expect(r.industryBenchmark.benchmark).toBe('N/A');
+    expect(r.industryBenchmark.line).toContain(NEW_DELIVERY_CAVEAT);
+    const html: string = (d.uploadHtml as jest.Mock).mock.calls[0][0];
+    expect(html).not.toContain('above the benchmark');
+  });
+
+  it('refuses an unknown industry before any Graph read', async () => {
+    const d = deps();
+    await expect(buildZomaMeasurementReport('u1', account, '111', { industry: 'crypto' }, d)).rejects.toThrow(/industry must be one of/);
+    expect(d.runAdsReport).not.toHaveBeenCalled();
+    expect(d.fetch).not.toHaveBeenCalled();
   });
 });
 

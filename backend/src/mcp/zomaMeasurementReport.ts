@@ -20,7 +20,15 @@
  */
 import type { ConnectedAccount } from '../services/connectedAccountsDb';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
-import { runZomaAdsReport, type ZomaAdsReport, type ZomaAdsReportDeps } from './zomaAdsReport';
+import { kpiOfConversionEvent, runZomaAdsReport, type ZomaAdsReport, type ZomaAdsReportDeps } from './zomaAdsReport';
+import { BENCHMARK_NA, type BenchmarkFigure, compareCpa } from './zomaIndustryBenchmark';
+import {
+  BENCHMARK_INDUSTRIES,
+  type BenchmarkIndustry,
+  getIndustryBenchmark,
+  INDUSTRY_BENCHMARK_TABLE_VERSION,
+  isBenchmarkIndustry,
+} from './zomaIndustryBenchmarks';
 
 export const ZOMA_MEASUREMENT_REPORTS_FLAG = 'ZOMA_MEASUREMENT_REPORTS_ENABLED';
 export function measurementReportsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -34,8 +42,8 @@ export const isZomaMeasurementReportTool = (name: string) => name === ZOMA_MEASU
 export const NEW_DELIVERY_CAVEAT =
   'New account/campaign: delivery metrics typically take up to one week to stabilize. Best practice is to treat these results as qualitative signals rather than definitive performance.';
 export const NEW_DELIVERY_DAYS = 7;
-/** Filled by ENG-3156; until then the field is present and honest. */
-export const INDUSTRY_BENCHMARK_PLACEHOLDER = 'N/A';
+/** The exact 'vs. industry' line when there is no published benchmark row (ENG-3156 table). */
+export const INDUSTRY_BENCHMARK_NA_LINE = 'Industry benchmark: N/A';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRESET_DAYS = { last_7d: 7, last_14d: 14, last_30d: 30, last_90d: 90 } as const;
@@ -61,6 +69,7 @@ export const ZOMA_MEASUREMENT_REPORT_DEFINITION = {
       since: { type: 'string', description: 'Start date YYYY-MM-DD (inclusive). Needs until.' },
       until: { type: 'string', description: 'End date YYYY-MM-DD (inclusive). Needs since.' },
       account_id: { type: 'string', description: 'Meta ad account id; needed only when more than one is connected.' },
+      industry: { type: 'string', enum: [...BENCHMARK_INDUSTRIES], description: "The user's industry, for the vs. industry CPA line. Omit when unknown: the line is then N/A and asks the user for it." },
     },
     additionalProperties: false,
   },
@@ -125,6 +134,19 @@ export interface AdRow extends BreakdownRow {
   conversions: number;
 }
 
+/** The report's 'vs. industry' comparison (ENG-3156 benchmark table; customer numbers from this report's own totals). */
+export interface MeasurementIndustryBenchmark {
+  /** The rendered line; exactly INDUSTRY_BENCHMARK_NA_LINE when no benchmark row applies. */
+  line: string;
+  industry: BenchmarkIndustry | null;
+  kpi: string | null;
+  customer_cpa: number | null;
+  benchmark: BenchmarkFigure | typeof BENCHMARK_NA;
+  comparison: { difference_percent: number; verdict: 'better' | 'worse' | 'same' } | null;
+  /** Why there is no comparison (unknown industry, no conversions, currency mismatch, new account). */
+  note: string | null;
+}
+
 export interface MeasurementReport {
   account_id: string;
   currency?: string;
@@ -140,7 +162,7 @@ export interface MeasurementReport {
   breakdowns: { top_ads?: AdRow[]; demographics?: BreakdownRow[]; placements?: BreakdownRow[]; devices?: BreakdownRow[] };
   /** CRM leads that landed on the account but on no campaign (never folded into a campaign's count). */
   unattributed_crm_leads?: number;
-  industryBenchmark: string;
+  industryBenchmark: MeasurementIndustryBenchmark;
   report_url?: string;
   summary: string;
 }
@@ -281,6 +303,61 @@ export function measurementFindings(
   return { findings, excluded, caveats };
 }
 
+/** The caller-named industry, or null. Never classified here: no extra Graph read or LLM call. */
+export function measurementIndustry(args: any): BenchmarkIndustry | null {
+  const v = args && typeof args === 'object' ? args.industry : undefined;
+  if (v === undefined) return null;
+  if (!isBenchmarkIndustry(v)) throw new MetaToolkitRefusal(`industry must be one of: ${BENCHMARK_INDUSTRIES.join(', ')}.`);
+  return v;
+}
+
+/**
+ * The vs. industry comparison from the report's own totals (customer CPA = spend / conversions of the
+ * report's conversion event) and getIndustryBenchmark. No row -> exactly INDUSTRY_BENCHMARK_NA_LINE; a
+ * new-delivery account is not compared at all (the caveat is shown instead).
+ */
+export function measurementIndustryBenchmark(input: {
+  industry: BenchmarkIndustry | null;
+  conversionEvent: string | null;
+  spend: number;
+  conversions: number;
+  currency: string | null;
+  newAccount: boolean;
+}): MeasurementIndustryBenchmark {
+  const kpi = kpiOfConversionEvent(input.conversionEvent);
+  const customerCpa = input.conversions > 0 ? round(input.spend / input.conversions) : null;
+  const base = { industry: input.industry, kpi, customer_cpa: customerCpa, benchmark: BENCHMARK_NA as typeof BENCHMARK_NA, comparison: null };
+  if (input.newAccount) {
+    return { ...base, line: `Industry benchmark: not compared. ${NEW_DELIVERY_CAVEAT}`, note: NEW_DELIVERY_CAVEAT };
+  }
+  if (!input.industry) {
+    return { ...base, line: INDUSTRY_BENCHMARK_NA_LINE, note: `Tell us your industry (one of: ${BENCHMARK_INDUSTRIES.join(', ')}) to compare your CPA with an industry benchmark.` };
+  }
+  const row = kpi ? getIndustryBenchmark(input.industry, 'meta', kpi) : null;
+  if (!row) return { ...base, line: INDUSTRY_BENCHMARK_NA_LINE, note: null };
+  const benchmark: BenchmarkFigure = {
+    cpa: row.cpa, currency: row.currency, metric: row.metric, source_name: row.sourceName, year: row.year, url: row.url, table_version: INDUSTRY_BENCHMARK_TABLE_VERSION,
+  };
+  const money = (v: number, c: string | null) => `${v.toFixed(2)}${c ? ` ${c}` : ''}`;
+  const source = `source: ${row.sourceName}, ${row.year}, ${row.url}`;
+  let note: string | null = null;
+  if (customerCpa === null) note = `No ${kpi} conversions in this window, so your CPA is undefined and is not compared.`;
+  else if (input.currency && input.currency !== row.currency) note = `Your account reports in ${input.currency} and the benchmark is in ${row.currency}; they are not compared without an exchange rate.`;
+  if (note || customerCpa === null) {
+    return { ...base, benchmark, note, line: `Industry benchmark (${input.industry}): ${money(row.cpa, row.currency)} ${row.metric}; not compared: ${note} (${source})` };
+  }
+  const comparison = compareCpa(customerCpa, row.cpa);
+  const d = Math.abs(comparison.difference_percent);
+  const diff = comparison.verdict === 'same' ? 'equal to the benchmark' : `${d}% ${comparison.verdict === 'better' ? 'below' : 'above'} the benchmark (${comparison.verdict}; lower CPA is better)`;
+  return {
+    ...base,
+    benchmark,
+    comparison,
+    note: null,
+    line: `vs. industry (${input.industry}): your CPA ${money(customerCpa, input.currency)} vs ${money(row.cpa, row.currency)} benchmark ${row.metric}, ${diff} (${source})`,
+  };
+}
+
 /** A destination is a real http(s) URL off Facebook/Instagram (a link back to the Page is not one). */
 export function creativeDestination(creative: any): string | null {
   const candidates = [
@@ -362,6 +439,7 @@ export async function buildZomaMeasurementReport(
 ): Promise<MeasurementReport> {
   const nowMs = deps.now();
   const range = measurementRange(args, nowMs);
+  const industry = measurementIndustry(args);
   const token = (account.config as any)?.access_token;
   if (typeof token !== 'string' || !token) {
     throw new MetaToolkitRefusal('This Meta connection has no usable access token, so no report was read. Reconnect Meta with a fresh Zoma connect link (call zoma_status).');
@@ -465,7 +543,9 @@ export async function buildZomaMeasurementReport(
     caveats,
     breakdowns,
     ...(leads && leads.unattributed > 0 ? { unattributed_crm_leads: leads.unattributed } : {}),
-    industryBenchmark: INDUSTRY_BENCHMARK_PLACEHOLDER,
+    industryBenchmark: measurementIndustryBenchmark({
+      industry, conversionEvent: ads.conversion_event, spend: totals.spend, conversions: totals.conversions, currency: ads.currency ?? null, newAccount,
+    }),
     summary: '',
   };
   report.summary = measurementSummary(report);
@@ -500,6 +580,11 @@ export function measurementSummary(r: MeasurementReport): string {
   if (r.caveats.length) lines.push(`${r.new_account ? 'This ad account' : `${r.caveats.length} campaign${r.caveats.length === 1 ? '' : 's'}`} started delivering in the last ${NEW_DELIVERY_DAYS} days: ${NEW_DELIVERY_CAVEAT}`);
   for (const f of r.findings) lines.push(`• ${f.text}`);
   for (const e of r.excluded_from_conversion_findings) lines.push(`• Not judged on conversions: ${e.campaign_name} (${e.reason})`);
+  // The new-account caveat is already stated above; repeating it here would say it twice.
+  if (!r.new_account) {
+    lines.push(r.industryBenchmark.line);
+    if (r.industryBenchmark.note && r.industryBenchmark.line === INDUSTRY_BENCHMARK_NA_LINE) lines.push(r.industryBenchmark.note);
+  }
   return lines.join('\n');
 }
 
@@ -550,10 +635,17 @@ export const ZOMA_MEASUREMENT_REPORT_TEMPLATE = `<!DOCTYPE html>
 {{demographics_section}}
 {{placements_section}}
 {{devices_section}}
-  <footer>Industry benchmark: {{industry_benchmark}} &middot; Generated by Zoma {{generated_date}}</footer>
+{{industry_section}}
+  <footer>Generated by Zoma {{generated_date}}</footer>
 </div>
 </body>
 </html>`;
+
+function industrySection(ib: MeasurementIndustryBenchmark): string {
+  const link = ib.benchmark !== BENCHMARK_NA ? ` <a href="${esc(ib.benchmark.url)}">${esc(ib.benchmark.source_name)}, ${esc(ib.benchmark.year)}</a>` : '';
+  const note = ib.note && ib.line === INDUSTRY_BENCHMARK_NA_LINE ? `<p>${esc(ib.note)}</p>` : '';
+  return `  <section><h2>vs. Industry</h2><p>${esc(ib.line)}</p>${link ? `<p>Source:${link}</p>` : ''}${note}</section>`;
+}
 
 const fill = (template: string, slots: Record<string, string>) => template.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => slots[k] ?? '');
 
@@ -593,7 +685,7 @@ export function renderMeasurementReportHtml(r: MeasurementReport): string {
     demographics_section: b.demographics?.length ? table('Demographics', b.demographics) : '',
     placements_section: b.placements?.length ? table('Placement', b.placements) : '',
     devices_section: b.devices?.length ? table('Device', b.devices) : '',
-    industry_benchmark: esc(r.industryBenchmark),
+    industry_section: industrySection(r.industryBenchmark),
     generated_date: esc(r.date_range.until),
   });
 }
