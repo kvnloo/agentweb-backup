@@ -303,8 +303,18 @@ export function buildLeadListQuery(args: any): Record<string, string> {
   if (limit !== undefined) qp.limit = limit;
   const page = wholeNumber(args.page, 'page');
   if (page !== undefined) qp.page = page;
-  if (typeof args.search === 'string' && args.search.trim()) qp.search = args.search.trim();
-  if (typeof args.status === 'string' && args.status.trim()) qp.status = args.status.trim();
+  // search and status are text; a number is turned into text (a zip code, a phone number). Anything else is refused: dropping it silently would return the
+  // whole page and look like a match.
+  const filterText = (value: unknown, name: string): string | undefined => {
+    if (value === undefined || value === null) return undefined;
+    const t = typeof value === 'number' && Number.isFinite(value) ? String(value) : value;
+    if (typeof t !== 'string') throw new Error(`manage_leads list: ${name} must be text.`);
+    return t.trim() || undefined;
+  };
+  const search = filterText(args.search, 'search');
+  if (search) qp.search = search;
+  const status = filterText(args.status, 'status');
+  if (status) qp.status = status;
   if (args.engaged_only !== undefined && args.engaged_only !== null) {
     // true/false, or the text "true"/"false" in any case; an empty value means "not given".
     const flag = typeof args.engaged_only === 'string' ? args.engaged_only.trim().toLowerCase() : args.engaged_only;
@@ -321,11 +331,12 @@ const leadPath = (listId: string, leadId?: string) =>
 const actingUserOf = (c: any): string => c.userId || c.agentUserId;
 
 /**
- * The lead as stored, read CONSISTENTLY. Used where a stale read would be wrong: the merge writes the custom-field map back whole (a stale read deletes the
- * keys another call just saved), and the opt-out guards decide from it (a suppression written moments ago must be seen). The REST read the caller is given
- * also has some custom fields removed for viewers who may not see them (card-revenue data), so a merge must not start from THAT copy. Access and existence have
- * already been proved through the REST read; the stored copy is only used to decide and to merge, and is never returned. If it cannot be read, nothing is
- * changed: falling back to the REST copy would reintroduce exactly those losses.
+ * The lead as stored, read CONSISTENTLY. Used where a stale read would be wrong: the opt-out guards and the status decision (a suppression written moments
+ * ago must be seen) and, only where the key-level custom-field write is not available (the route's `enforce` mode), the read-merge-write of the custom-field map
+ * (a stale read deletes the keys another call just saved). By default a custom-fields-only update writes key by key and does not read the stored lead at all.
+ * The REST read the caller is given also has some custom fields removed for viewers who may not see them (card-revenue data), so a merge must not start from THAT
+ * copy. Access and existence have already been proved through the REST read; the stored copy is only used to decide and to merge, and is never returned. If it
+ * cannot be read, nothing is changed: falling back to the REST copy would reintroduce exactly those losses.
  */
 async function readStoredLead(listId: string, leadId: string, action: string): Promise<any> {
   let stored: any;
@@ -549,7 +560,11 @@ export async function executeLeadDelete(args: any, c: any, opts: { budgetMs?: nu
   if (ids.some((id) => typeof id !== 'string' || !id)) throw new Error('manage_leads delete: every lead_ids entry must be a lead id string.');
   // The same id twice is one lead: the second would otherwise be reported as a failure.
   const uniqueIds = [...new Set(ids as string[])];
-  if (uniqueIds.length === 1) return jsonResult(await deleteExistingLead(listId, uniqueIds[0], c));
+  if (uniqueIds.length === 1) {
+    const answer = await deleteExistingLead(listId, uniqueIds[0], c);
+    const repeated = ids.length - uniqueIds.length;
+    return jsonResult(repeated > 0 && answer && typeof answer === 'object' && !Array.isArray(answer) ? { ...answer, duplicateIdsIgnored: repeated } : answer);
+  }
   const started = Date.now();
   const budgetMs = opts.budgetMs ?? ROW_WORK_BUDGET_MS;
   const results: RowOutcome[] = [];
