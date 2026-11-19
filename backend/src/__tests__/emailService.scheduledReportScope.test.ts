@@ -123,6 +123,24 @@ describe('ENG-1904 scoped report recipients: flag ON', () => {
     }
   });
 
+  it('withholds when the session\'s own tool counter shows a tool the messages do not (the message write can fail after retries)', async () => {
+    setRun(scopedToClient, { monitor_lead_volume: 1, get_meta_ads_metrics: 1, ask_crm: 1 });
+    await send();
+    expect(sentTo()).toEqual([[OWNER.email]]);
+  });
+
+  it('withholds when the recipient\'s account record is incomplete, and finds the account whatever the case of the configured address', async () => {
+    setRun(scopedToClient);
+    (userDb.getUserByEmailConsistent as jest.Mock).mockImplementation(async (email: string) => (email === CLIENT.email ? { email: CLIENT.email } : undefined));
+    await send();
+    expect(sentTo()).toEqual([[OWNER.email]]);
+    sendSpy.mockClear();
+    (userDb.getUserByEmailConsistent as jest.Mock).mockImplementation(async (email: string) => (email === CLIENT.email ? CLIENT : undefined));
+    await send(['Client@Customer.Example']);
+    expect(userDb.getUserByEmailConsistent).toHaveBeenLastCalledWith(CLIENT.email);
+    expect(sentTo()).toEqual([[OWNER.email], ['Client@Customer.Example']]);
+  });
+
   it('withholds when the messages cannot be read (an error never adds a recipient)', async () => {
     setRun(scopedToClient);
     (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockRejectedValue(new Error('read failed'));
@@ -160,13 +178,16 @@ describe('ENG-1904 scoped report recipients: flag OFF (the default)', () => {
     expect(bodyOf(0).html).toContain(LINK);
     expect(bodyOf(0).text).toContain(CLIENT.email); // withheld banner, as today
     expect(logged()[0]).toEqual(expect.objectContaining({ state: 'delivered', authorizedRecipients: [OWNER.email], withheldRecipients: [CLIENT.email] }));
-    expect((console.warn as jest.Mock).mock.calls.some((c) => String(c[0]).includes('[ENG-1904 shadow] would have sent a link-free copy to 1 recipient'))).toBe(true);
+    expect((console.log as jest.Mock).mock.calls.some((c) => String(c[0]).includes('[ENG-1904 shadow] session(s) session-1: 1 of 1 withheld recipient(s) eligible for a link-free copy'))).toBe(true);
   });
 
-  it('logs nothing about scoping when the run was not eligible', async () => {
+  it('logs how many stayed withheld and why (counts and fixed reasons, never an address) so the rollout can be measured', async () => {
     setRun(run({ role: 'assistant', content: '', tool_calls: [call('a', 'list_all_clients', {})] }), { list_all_clients: 1 });
     await send();
     expect(sentTo()).toEqual([[OWNER.email]]);
-    expect((console.warn as jest.Mock).mock.calls.some((c) => String(c[0]).includes('[ENG-1904 shadow]'))).toBe(false);
+    const line = (console.log as jest.Mock).mock.calls.map((c) => String(c[0])).find((l) => l.includes('[ENG-1904 shadow]'));
+    expect(line).toContain('0 of 1 withheld recipient(s) eligible');
+    expect(line).toContain('kept withheld: tool_not_allowed x1');
+    expect(line).not.toContain(CLIENT.email);
   });
 });

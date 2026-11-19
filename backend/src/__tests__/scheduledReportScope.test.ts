@@ -27,7 +27,7 @@ const call = (id: string, name: string, args: unknown) => ({ id, type: 'function
 const assistantCalls = (...calls: any[]) => ({ role: 'assistant', content: '', tool_calls: calls });
 const result = (id: string, name: string, content: unknown) => ({ role: 'tool', tool_call_id: id, name, content: typeof content === 'string' ? content : JSON.stringify(content) });
 const ledger = (...entries: Array<{ id: string; name: string; arguments: unknown; error?: string }>) => ({ role: 'assistant', content: 'report', metadata: { toolCalls: entries } });
-const ok = (messages: any[], recipient = RECIPIENT) => evaluateRunForRecipient(extractRunScope(messages), recipient, CROSS);
+const ok = (messages: any[], recipient = RECIPIENT, calledFunctions?: Record<string, number>) => evaluateRunForRecipient(extractRunScope(messages, calledFunctions), recipient);
 
 describe('ENG-1904 scoped report recipients: the run read only the recipient\'s own account', () => {
   describe('delivers (the ENG-1880 shape: ad numbers, lead counts, report builders)', () => {
@@ -103,13 +103,48 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     it('a Meta or Google Ads call with no client_id (it reads the CALLER\'s own account: the admin\'s), or an empty one', () => {
       for (const tool of ['list_meta_ads_campaigns', 'get_meta_ads_metrics', 'call_meta_ads_insights_api', 'call_google_ads_api', 'call_google_ads_reporting_api']) {
         expect(ok([assistantCalls(call('a', tool, { account_id: '123' }))])).toMatchObject({ ok: false, reason: 'scope_missing' });
-        expect(ok([assistantCalls(call('a', tool, { client_id: '   ' }))])).toMatchObject({ ok: false, reason: 'scope_missing' });
+        expect(ok([assistantCalls(call('a', tool, { client_id: '   ' }))])).toMatchObject({ ok: false, reason: 'scope_blank' });
       }
+    });
+
+    it('a blank, padded or non-string subject key, and ANY subject key that is not the recipient (the gateway only treats "", null and undefined as missing)', () => {
+      const monitor = (args: object) => ok([assistantCalls(call('a', 'monitor_lead_volume', args))]);
+      // the tool would receive the blank one and match a loose name; the other key must not rescue it
+      expect(monitor({ client_name_or_email: ' ', client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_blank' });
+      expect(monitor({ client_name_or_email: '', client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_blank' });
+      expect(monitor({ client_name_or_email: 5, client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_blank' });
+      expect(monitor({ client_name_or_email: ['client@example.com'] })).toMatchObject({ ok: false, reason: 'scope_blank' });
+      expect(monitor({ client_name_or_email: 'other@example.com', client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_other_account' });
+      expect(monitor({ client_name_or_email: 'client@example.com', client: 'Customer' })).toMatchObject({ ok: false, reason: 'scope_not_exact' });
+      // null / undefined are "missing" to the gateway, which repairs them from the alias: the other key decides
+      expect(monitor({ client_name_or_email: null, client_id: 'client@example.com' })).toEqual({ ok: true });
+      expect(monitor({ client_name_or_email: 'client@example.com', client_id: 'client@example.com', client_email: ' Client@Example.com ' })).toEqual({ ok: true });
+      // the same for the client_id tools
+      expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: ' ' }))])).toMatchObject({ ok: false, reason: 'scope_blank' });
+    });
+
+    it('a tool that left no message row but is in the session\'s own calledFunctions counter still counts', () => {
+      const clean = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }))];
+      expect(ok(clean, RECIPIENT, { monitor_lead_volume: 1 })).toEqual({ ok: true });
+      expect(ok(clean, RECIPIENT, { monitor_lead_volume: 1, ask_crm: 1 })).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
+      expect(ok(clean, RECIPIENT, { list_all_clients: 2 } as any)).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
+      expect(extractRunScope(clean, ['ask_crm']).toolNames).toContain('ask_crm');
+    });
+
+    it('a tool name that appears only in a tool-result row counts', () => {
+      const m = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('z', 'ask_crm', '{}')];
+      expect(ok(m)).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
+    });
+
+    it('resolve_skill is not a report builder: for an admin it lists every tenant\'s skills with their owners', () => {
+      expect(RECIPIENT_NEUTRAL_REPORT_TOOLS).not.toContain('resolve_skill');
+      const m = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }), call('b', 'resolve_skill', {}))];
+      expect(ok(m)).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
     });
 
     it('every cross-account tool that is not scopable, for ever (multi-subject, internal data, loose matching)', () => {
       for (const tool of CROSS.filter((t) => !RECIPIENT_SCOPABLE_TOOLS[t])) {
-        expect(ok([assistantCalls(call('a', tool, { client_name_or_email: 'client@example.com' }))])).toMatchObject({ ok: false, reason: 'tool_not_scopable' });
+        expect(ok([assistantCalls(call('a', tool, { client_name_or_email: 'client@example.com' }))])).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
       }
       // sanity: the ones the card names
       for (const tool of ['list_all_clients', 'get_users_by_lifecycle_stage', 'get_chat_history', 'get_session_transcript', 'inspect_client_usage', 'manage_user_notes', 'assess_client_health', 'diagnose_leads_at_zero', 'check_account_tracking_health', 'get_registration_status', 'get_user_by_id']) {
@@ -120,13 +155,13 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     it('any other tool in the run (it may have read the admin\'s own CRM, memory or files)', () => {
       const run = (extra: string) => [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }), call('b', extra, {}))];
       for (const tool of ['ask_crm', 'save_memory', 'search_knowledge_base', 'send_email_from_sender', 'constructor', '__proto__', 'toString']) {
-        expect(ok(run(tool))).toMatchObject({ ok: false, reason: 'tool_not_neutral' });
+        expect(ok(run(tool))).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
       }
     });
 
     it('messages that could not be read, arguments that cannot be parsed, a result row with no arguments, an unresolved recipient', () => {
       expect(ok([])).toMatchObject({ ok: false, reason: 'messages_unreadable' });
-      expect(evaluateRunForRecipient(extractRunScope(undefined), RECIPIENT, CROSS)).toMatchObject({ ok: false, reason: 'messages_unreadable' });
+      expect(evaluateRunForRecipient(extractRunScope(undefined), RECIPIENT)).toMatchObject({ ok: false, reason: 'messages_unreadable' });
       expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '{not json'))])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
       expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '"just a string"'))])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
       expect(ok([result('a', 'monitor_lead_volume', { client: RECIPIENT })])).toMatchObject({ ok: false, reason: 'arguments_missing' });
@@ -143,17 +178,45 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
   });
 
   describe('message extraction', () => {
-    it('reads the three sources of one real run and ignores rows it does not understand', () => {
+    it('reads the three sources of one real run and skips rows that are not tool rows', () => {
       const scope = extractRunScope([
         null as any, 'junk' as any, { role: 'user', content: 'x' },
-        assistantCalls(call('c1', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }), { id: 'bad', function: {} }),
+        assistantCalls(call('c1', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })),
         result('c1', 'monitor_lead_volume', '{not json'),
         ledger({ id: 'c1', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'client@example.com' } }),
       ]);
       expect(scope.readOk).toBe(true);
+      expect(scope.unrecognized).toBe(false);
       expect(scope.toolNames).toEqual(['monitor_lead_volume']);
       expect(scope.records.map((r) => r.source).sort()).toEqual(['ledger', 'request', 'result']);
       expect(scope.records.find((r) => r.source === 'result')?.resultSubject).toBeNull();
+    });
+
+    it('a row shape it does not understand makes the whole run unprovable (fail closed)', () => {
+      const good = call('c1', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' });
+      const shapes: any[][] = [
+        [assistantCalls(good, { id: 'bad', function: {} })], // a tool call with no name
+        [assistantCalls(good), { role: 'assistant', content: '', function_call: { name: 'ask_crm', arguments: '{}' } }], // the legacy single-call shape
+        [assistantCalls(good), { role: 'assistant', content: '', tool_calls: 'not-an-array' }],
+        [assistantCalls(good), { role: 'tool', content: '{}' }], // a tool row with no name
+        [assistantCalls(good), { role: 'assistant', content: '', metadata: { toolCalls: [{ tool: 'ask_crm', arguments: {} }] } }], // a ledger entry keyed differently
+        [assistantCalls(good), { role: 'assistant', content: '', metadata: { toolCalls: 'x' } }],
+      ];
+      for (const messages of shapes) expect(ok(messages)).toMatchObject({ ok: false, reason: 'messages_unrecognized' });
+    });
+
+    it('reads the account from a result that was offloaded to S3 (header plus a truncated preview), not just from complete JSON', () => {
+      const header = '[Full response saved to S3: tool-responses/s1/c1.txt (91234 chars). Use search_tool_response to read the rest.]\n';
+      const preview = (client: object, tail = '"daily_rows":[{"day":"2026-11-01","leads":3},{"day":"2026-1') => `${header}{"success":true,"client":${JSON.stringify(client)},${tail}`;
+      const req = assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }));
+      expect(ok([req, result('a', 'monitor_lead_volume', preview(RECIPIENT))])).toEqual({ ok: true });
+      expect(ok([req, result('a', 'monitor_lead_volume', preview(OTHER))])).toMatchObject({ ok: false, reason: 'result_other_account' });
+      // a preview that never names the account, or a result with no client at all (an error), cannot prove a loosely matched call
+      expect(ok([req, result('a', 'monitor_lead_volume', `${header}{"success":true,"daily_rows":[{"day":"2026-1`)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      expect(ok([req, result('a', 'monitor_lead_volume', { success: false, error: 'No client found' })])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      // a spoofed `"client":` inside a string is escaped in JSON and is not read as the key
+      const spoof = `{"note":"x \\"client\\":{\\"userId\\":\\"user-recipient\\"}","client":{"userId":"user-other","email":"other@example.com"},"rows":[{"a`;
+      expect(ok([req, result('a', 'monitor_lead_volume', spoof)])).toMatchObject({ ok: false, reason: 'result_other_account' });
     });
   });
 

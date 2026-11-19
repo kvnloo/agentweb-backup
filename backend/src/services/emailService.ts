@@ -6,7 +6,7 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision, recipientScopingEnabled, crossAccountToolsFor } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision, recipientScopingEnabled } from './scheduledReportAccess';
 import { evaluateRunForRecipient, extractRunScope } from './scheduledReportScope';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
@@ -2406,6 +2406,8 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // full (safe) classification.
       let ownerIsAdmin: boolean | undefined;
       let ownerResolved = false;
+      // ENG-1904: each session's own tool counter, kept for the scoped-recipient check (a second record of which tools ran).
+      const calledBySession: Record<string, Record<string, number> | string[] | undefined> = {};
       const resolveOwner = async () => {
         if (ownerResolved || !ownerUserId) return;
         ownerResolved = true;
@@ -2420,6 +2422,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         try {
           const session: any = await chatbotDb.getChatSession(sessionId);
           if (session) {
+            calledBySession[sessionId] = session.calledFunctions;
             ownerUserId = ownerUserId || session.userId;
             await resolveOwner();
             if (!reportContainsCrossAccountData(session.calledFunctions, { ownerIsAdmin })) {
@@ -2450,7 +2453,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // ENG-1904: of the recipients withheld above, which ones does the run read ONLY about? This can only ADD recipients to
       // the authorized set (as a separate copy); `authorized` and `withheld` stay exactly what the guard decided.
       const scoped = opts?.allowScopedRecipients && isSensitive && authz.withheld.length > 0
-        ? await this.resolveScopedReportRecipients(sessionIds, authz.withheld, ownerIsAdmin)
+        ? await this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession)
         : [];
       return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId, ...(scoped.length > 0 ? { scoped } : {}) };
     } catch (guardError) {
@@ -2465,18 +2468,26 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   /**
    * ENG-1904: the subset of `withheld` (non-admin recipients the ENG-500 guard held back) for whom EVERYTHING the run read was
    * about them and nothing else (`scheduledReportScope`). Never throws: any failure answers "none". With
-   * SCHEDULED_REPORT_RECIPIENT_SCOPING unset it only logs what it would have done and returns none.
+   * SCHEDULED_REPORT_RECIPIENT_SCOPING unset it only logs what it would have done and returns none. The log carries counts and
+   * fixed reasons, never an address, so the rollout can be measured.
    */
-  async resolveScopedReportRecipients(sessionIds: string[], withheld: string[], ownerIsAdmin?: boolean): Promise<string[]> {
+  async resolveScopedReportRecipients(
+    sessionIds: string[],
+    withheld: string[],
+    calledBySession: Record<string, Record<string, number> | string[] | undefined> = {},
+  ): Promise<string[]> {
+    const enabled = recipientScopingEnabled();
+    const tag = enabled ? '[ENG-1904]' : '[ENG-1904 shadow]';
     try {
-      const crossAccountTools = crossAccountToolsFor({ ownerIsAdmin });
       const scopes = [];
       for (const sessionId of sessionIds) {
         // The same strongly consistent read the guard uses: this fires right after the run wrote these rows.
         const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
-        scopes.push(extractRunScope(messages as any));
+        scopes.push(extractRunScope(messages as any, calledBySession[sessionId]));
       }
       const eligible: string[] = [];
+      const kept: Record<string, number> = {};
+      const keep = (reason: string) => { kept[reason] = (kept[reason] || 0) + 1; };
       for (const email of withheld) {
         const normalized = (email || '').trim().toLowerCase();
         if (!normalized) continue;
@@ -2487,18 +2498,22 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           user = undefined;
         }
         // No account, or a deleted one: nothing to compare the run's subject against.
-        if (!user?.userId || !user?.email) continue;
+        if (!user?.userId || !user?.email) { keep('recipient_unresolved'); continue; }
         const identity = { userId: String(user.userId), email: String(user.email) };
-        if (scopes.every((scope) => evaluateRunForRecipient(scope, identity, crossAccountTools).ok)) eligible.push(email);
+        let reason: string | undefined;
+        for (const scope of scopes) {
+          const decision = evaluateRunForRecipient(scope, identity);
+          if (!decision.ok) { reason = decision.reason || 'not_scoped'; break; }
+        }
+        if (reason) keep(reason); else eligible.push(email);
       }
+      const keptSummary = Object.entries(kept).map(([r, n]) => `${r} x${n}`).join(', ');
+      console.log(`${tag} session(s) ${sessionIds.join(', ')}: ${eligible.length} of ${withheld.length} withheld recipient(s) eligible for a link-free copy${keptSummary ? `; kept withheld: ${keptSummary}` : ''}`);
       if (eligible.length === 0) return [];
-      if (!recipientScopingEnabled()) {
-        console.warn(`[ENG-1904 shadow] would have sent a link-free copy to ${eligible.length} recipient(s) because every cross-account call in session(s) ${sessionIds.join(', ')} was about them; SCHEDULED_REPORT_RECIPIENT_SCOPING is not enabled`);
-        return [];
-      }
+      if (!enabled) return [];
       return eligible;
     } catch (error) {
-      console.error(`[ENG-1904] could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added:`, error);
+      console.error(`${tag} could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added:`, error);
       return [];
     }
   },
