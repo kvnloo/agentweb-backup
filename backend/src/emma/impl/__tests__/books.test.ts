@@ -41,10 +41,18 @@ jest.mock('../../../services/chatbotService', () => ({
   },
 }));
 
+// A research_url is fetched through utils/callerUrlFetch (guarded DNS, redirects re-checked, size cap; covered in callerUrlFetch.test.ts).
+// The real error classes stay real; only the fetch itself is mocked.
+jest.mock('../../../utils/callerUrlFetch', () => ({
+  ...jest.requireActual('../../../utils/callerUrlFetch'),
+  fetchCallerUrlText: jest.fn(),
+}));
+
 import { bookDb } from '../../../services/bookDb';
 import { bookContentDb } from '../../../services/bookContentDb';
 import { createLLMService } from '../../../utils/llmService';
 import { settingsService } from '../../../services/settingsService';
+import { CallerUrlBlockedError, fetchCallerUrlText } from '../../../utils/callerUrlFetch';
 import * as books from '../books';
 
 const mockBookDb = bookDb as jest.Mocked<typeof bookDb>;
@@ -346,21 +354,42 @@ describe('emma/impl/books.ts (ENG-2103 F2 pilot)', () => {
       mockBookContentDb.getContent.mockResolvedValue(null);
       mockBookContentDb.createOrUpdateContent.mockResolvedValue({} as any);
       const generateJSONContent = mockLlmServiceReturning('Body.');
-      const fetchMock = jest.fn().mockResolvedValue({ ok: true, text: async () => 'DEEP RESEARCH TEXT' });
-      const originalFetch = global.fetch;
-      global.fetch = fetchMock as any;
+      (fetchCallerUrlText as jest.Mock).mockResolvedValue('DEEP RESEARCH TEXT');
 
-      try {
-        await books.generateBookContent(
-          'book-1', 'sec-1', 'chap-1', 'desc', 'short', true, 'user-1', 'https://example.com/research.md', 'session-1'
-        );
-      } finally {
-        global.fetch = originalFetch;
-      }
+      await books.generateBookContent(
+        'book-1', 'sec-1', 'chap-1', 'desc', 'short', true, 'user-1', 'https://example.com/research.md', 'session-1'
+      );
 
-      expect(fetchMock).toHaveBeenCalledWith('https://example.com/research.md');
+      expect(fetchCallerUrlText).toHaveBeenCalledWith(
+        'https://example.com/research.md',
+        expect.objectContaining({ tool: 'generate_book_content', userId: 'user-1', maxBytes: 20 * 1024 * 1024 })
+      );
       const userPrompt = generateJSONContent.mock.calls[0][1] as string;
       expect(userPrompt).toContain('DEEP RESEARCH TEXT');
+    });
+
+    // The research text is optional context: any failure leaves it empty and the book content is still written, as before.
+    it.each([
+      ['a URL the guard refuses (private or internal address)', () => new CallerUrlBlockedError()],
+      ['a dead link', () => new Error('Request failed with status code 404')],
+    ])('still generates the content, without research, when the research_url is %s', async (_label, makeError) => {
+      mockBookDb.getBookById.mockResolvedValue(BASE_BOOK as any);
+      mockBookContentDb.getContent.mockResolvedValue(null);
+      mockBookContentDb.createOrUpdateContent.mockResolvedValue({} as any);
+      const generateJSONContent = mockLlmServiceReturning('Body.');
+      (fetchCallerUrlText as jest.Mock).mockRejectedValue(makeError());
+      const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await books.generateBookContent(
+        'book-1', 'sec-1', 'chap-1', 'desc', 'short', true, 'user-1', 'http://169.254.169.254/latest/meta-data/', 'session-1'
+      );
+      err.mockRestore();
+
+      expect(result.success).toBe(true);
+      expect(generateJSONContent).toHaveBeenCalledTimes(1);
+      const userPrompt = generateJSONContent.mock.calls[0][1] as string;
+      expect(userPrompt).not.toContain('169.254');
+      expect(userPrompt).not.toContain('meta-data');
     });
 
     it('returns a failure envelope (not a throw) when the book does not exist', async () => {

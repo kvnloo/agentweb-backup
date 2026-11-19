@@ -141,6 +141,12 @@ import axios from 'axios';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getSecret } from '../../utils/secretsManager';
 import { getS3ObjectAsString } from '../../utils/s3Utils';
+import {
+  CALLER_URL_BLOCKED_MESSAGE,
+  CallerUrlBlockedError,
+  CallerUrlTooLargeError,
+  fetchCallerUrlBuffer,
+} from '../../utils/callerUrlFetch';
 import { meterUsageFromResponse } from '../../utils/llmClients';
 import {
   parseCsvProvenance,
@@ -290,6 +296,20 @@ export function classifyDataAnalysisFailure(result: { message?: unknown; error?:
   return 'upstream_5xx';
 }
 
+/** Total time one plain-URL download may take (redirects included). The guarded fetch enforces it as ONE deadline. */
+const DOWNLOAD_TIMEOUT_MS = 30000;
+
+/**
+ * The guarded fetch gives a download ONE total deadline (redirects included). A host that cannot send the file in time surfaces as an
+ * aborted request (axios `ERR_CANCELED`) or a timeout, and is a bad argument for this tool (a slow or huge file), not an account or config fault.
+ */
+function isDownloadTimeout(error: unknown): boolean {
+  const e = error as { code?: unknown; name?: unknown; message?: unknown } | null;
+  if (e?.code === 'ECONNABORTED' || e?.code === 'ETIMEDOUT' || e?.code === 'ERR_CANCELED') return true;
+  if (e?.name === 'CanceledError' || e?.name === 'TimeoutError') return true;
+  return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
+}
+
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
@@ -347,6 +367,28 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
   try {
     const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
+    // The SDK reads below use the SERVER's credentials, which can read every bucket in the account. So each key a caller
+    // names is checked against the caller with the same rule as the REST file routes (ENG-2988). One lookup cache per call.
+    // Loaded here, not with the static imports: the access policy reaches the database layer and chatbotService, which this
+    // module must not load when it is merely required (see the header note and searchResearch.moduleIsolation.test.ts).
+    const { TOOL_FILE_REFUSAL_MESSAGE, TOOL_FILE_UNAVAILABLE_MESSAGE, createToolFileAccess } = await import('./toolStorageAccess');
+    const fileAccess = createToolFileAccess('perform_data_analysis', userId);
+    // `invalid_args`, not `not_found`: the model named a file the caller may not read, a bad argument. `not_found` is bucketed as a
+    // config/account fault ("resolve the account, not the code"), the phantom cluster ENG-2993 removed for dead caller URLs.
+    const refuseFile = () => ({
+      success: false,
+      message: TOOL_FILE_REFUSAL_MESSAGE,
+      error: 'File not accessible',
+      errorClass: 'invalid_args',
+    });
+    // The check itself could not run (a lookup failed): tell the model to retry, not that the file is gone.
+    const fileCheckUnavailable = () => ({
+      success: false,
+      message: TOOL_FILE_UNAVAILABLE_MESSAGE,
+      error: 'File access check unavailable',
+      errorClass: 'upstream_5xx',
+    });
+
     if (!analysisInstruction) {
       return {
         success: false,
@@ -378,6 +420,12 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
       let resolved = analysisInstruction;
       const resolvedKeys: string[] = [];
       const failedKeys: string[] = [];
+      // Check EVERY key before reading any: a call that names a file the caller may not read is refused whole, with the same
+      // answers as the other two read sites (a refusal is `invalid_args`; a check that could not run says "try again").
+      const keyDecisions: string[] = [];
+      for (const key of uniqueKeys) keyDecisions.push(await fileAccess.check(key));
+      if (keyDecisions.includes('refuse')) return refuseFile();
+      if (keyDecisions.includes('unavailable')) return fileCheckUnavailable();
       for (const key of uniqueKeys) {
         try {
           const content = await getS3ObjectAsString(key);
@@ -447,7 +495,9 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const modelName = process.env.DATA_ANALYSIS_LLM_NAME || 'gemini-3.5-flash';
 
     // Get file size limit from environment or use default (50MB)
-    const maxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800'); // 50MB in bytes
+    // 50MB in bytes. A value that is not a number must not switch the cap off (a NaN limit compares false with everything).
+    const configuredMaxTotalSize = parseInt(process.env.DATA_ANALYSIS_FILE_SIZE || '52428800');
+    const maxTotalSize = Number.isFinite(configuredMaxTotalSize) && configuredMaxTotalSize >= 0 ? configuredMaxTotalSize : 52428800;
 
     // Prepare file data for analysis.
     // IMPORTANT: Gemini code_execution only writes a file part to the sandbox
@@ -481,6 +531,10 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
               message: `Cannot parse S3 URL "${fileUrl}": no object key found. Use the full s3://bucket/key format.`,
             };
           }
+          // Only our own bucket, and only a key this caller may read: the bucket here is whatever the caller wrote.
+          if (!fileAccess.isOurBucket(s3Bucket)) return refuseFile();
+          const s3Decision = await fileAccess.check(s3Key);
+          if (s3Decision !== 'allow') return s3Decision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
           let s3Content: string;
           try {
             s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
@@ -515,6 +569,8 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
         const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
         if (bareS3KeyPattern.test(fileUrl)) {
+          const bareDecision = await fileAccess.check(fileUrl);
+          if (bareDecision !== 'allow') return bareDecision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
           let s3Content: string;
           try {
             s3Content = await getS3ObjectAsString(fileUrl);
@@ -550,15 +606,29 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           continue;
         }
 
-        // Download the file
-        const response = await axios.get(fileUrl, {
-          responseType: 'arraybuffer',
-          timeout: 30000
+        // An entry that is not a URL at all (a plain file name, a local path) is a mistake of the caller, not a blocked address: say so, and do
+        // not log it as a refused URL.
+        let parsesAsUrl = true;
+        try { new URL(fileUrl); } catch { parsesAsUrl = false; }
+        if (!parsesAsUrl) {
+          return {
+            success: false,
+            message: `file_urls entry "${fileUrl}" is not a URL. Pass a public https link, an s3:// key from save_file or a tool-responses key, or put the data inline in analysis_instruction.`,
+            errorClass: 'invalid_args',
+          };
+        }
+
+        // Download the file. A URL the caller chose is fetched only through the guarded fetch (public addresses only, every redirect
+        // checked again), and the body is capped at what is left of the total budget, so one URL cannot stream an unbounded body into memory.
+        const { buffer: fileBuffer } = await fetchCallerUrlBuffer(fileUrl, {
+          tool: 'perform_data_analysis',
+          userId,
+          maxBytes: Math.max(maxTotalSize - totalSize, 0),
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
         });
 
         // Check file size
-        const fileData = response.data as ArrayBuffer;
-        totalSize += fileData.byteLength;
+        totalSize += fileBuffer.byteLength;
         if (totalSize > maxTotalSize) {
           return {
             success: false,
@@ -569,7 +639,6 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // Send to Gemini as text/csv so the file materializes on the sandbox
         // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
         // be CSV, JSON, or plain text — the model is told this in the prompt.
-        const fileBuffer = Buffer.from(fileData);
         const base64Content = fileBuffer.toString('base64');
 
         fileParts.push({
@@ -582,7 +651,30 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         fileRawContents.push(fileBuffer.toString('utf-8'));
 
       } catch (error) {
+        // A URL the guard refuses: one generic answer, nothing about why (no address, no DNS text) and no `error` echo, so the
+        // answer cannot be used to map the internal network. A bad argument, not a tool fault.
+        if (error instanceof CallerUrlBlockedError) {
+          return {
+            success: false,
+            message: `Cannot fetch file_urls entry ${fileUrl}: ${CALLER_URL_BLOCKED_MESSAGE} Put the data inline in analysis_instruction, or pass an s3:// key from save_file or a tool-responses key.`,
+            errorClass: 'invalid_args',
+          };
+        }
+        if (error instanceof CallerUrlTooLargeError) {
+          return {
+            success: false,
+            message: `Total file size exceeds the ${maxTotalSize} bytes limit. Please reduce the number or size of files.`,
+            errorClass: 'invalid_args',
+          };
+        }
         console.error(`Error processing file ${fileUrl}:`, error);
+        if (isDownloadTimeout(error)) {
+          return {
+            success: false,
+            message: `Downloading ${fileUrl} did not finish within the ${DOWNLOAD_TIMEOUT_MS / 1000}-second download limit. The host is too slow or the file too large: use a smaller file or a faster link, or put the data inline in analysis_instruction.`,
+            errorClass: 'timeout',
+          };
+        }
         // ENG-2993: an HTTP 4xx (other than 429) on a caller-supplied URL means
         // the model passed a dead, expired, or non-public link. There is no
         // account to repair, so it must not cluster as not_found -> `config`.
