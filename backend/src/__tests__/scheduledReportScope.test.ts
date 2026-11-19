@@ -29,6 +29,8 @@ const call = (id: string, name: string, args: unknown) => ({ id, type: 'function
 const assistantCalls = (...calls: any[]) => ({ role: 'assistant', content: '', tool_calls: calls });
 const result = (id: string, name: string, content: unknown) => ({ role: 'tool', tool_call_id: id, name, content: typeof content === 'string' ? content : JSON.stringify(content) });
 const ledger = (...entries: Array<{ id: string; name: string; arguments: unknown; error?: string }>) => ({ role: 'assistant', content: 'report', metadata: { toolCalls: entries } });
+/** A monitor_lead_volume call with its paired result row (the loosely matching tools need one per call). `client: null` = no result row. */
+const mon = (id: string, args: object, client: object | null = RECIPIENT) => [assistantCalls(call(id, 'monitor_lead_volume', args)), ...(client ? [result(id, 'monitor_lead_volume', { success: true, client })] : [])];
 const ok = (messages: any[], recipient = RECIPIENT, calledFunctions?: Record<string, number>) => evaluateRunForRecipient(extractRunScope(messages, calledFunctions), recipient);
 
 describe('ENG-1904 scoped report recipients: the run read only the recipient\'s own account', () => {
@@ -60,7 +62,7 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
 
     it('accepts the aliases the gateway rewrites (client_id / client_email / client for monitor_lead_volume)', () => {
       for (const key of ['client_id', 'client_email', 'client']) {
-        expect(ok([assistantCalls(call('a', 'monitor_lead_volume', { [key]: 'client@example.com' }))])).toEqual({ ok: true });
+        expect(ok(mon('a', { [key]: 'client@example.com' }))).toEqual({ ok: true });
       }
     });
 
@@ -77,17 +79,17 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
 
   describe('withholds (fail closed)', () => {
     it('a call about someone else, and a run that mixes the recipient with someone else (any record, any source)', () => {
-      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'other@example.com' }))], RECIPIENT)).toMatchObject({ ok: false, reason: 'scope_other_account' });
+      expect(ok(mon('a', { client_name_or_email: 'other@example.com' }))).toMatchObject({ ok: false, reason: 'scope_other_account' });
       const mixed = [assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: 'client@example.com' }), call('b', 'get_meta_ads_metrics', { client_id: 'other@example.com' }))];
       expect(ok(mixed)).toMatchObject({ ok: false, reason: 'scope_other_account' });
       // the request list names the recipient but what ACTUALLY ran (the ledger) was someone else
-      const ranOther = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), ledger({ id: 'a', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'other@example.com' } })];
+      const ranOther = [...mon('a', { client_name_or_email: 'client@example.com' }), ledger({ id: 'a', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'other@example.com' } })];
       expect(ok(ranOther)).toMatchObject({ ok: false, reason: 'scope_other_account' });
     });
 
     it('a loose name (the tool matches names by substring and takes the first hit)', () => {
-      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'Client' }))])).toMatchObject({ ok: false, reason: 'scope_not_exact' });
-      expect(ok([assistantCalls(call('a', 'read_client_meta_activity', { client_name_or_email: 'client' }))])).toMatchObject({ ok: false, reason: 'scope_not_exact' });
+      expect(ok(mon('a', { client_name_or_email: 'Client' }))).toMatchObject({ ok: false, reason: 'scope_not_exact' });
+      expect(ok([assistantCalls(call('a', 'read_client_meta_activity', { client_name_or_email: 'client' })), result('a', 'read_client_meta_activity', { client: RECIPIENT })])).toMatchObject({ ok: false, reason: 'scope_not_exact' });
     });
 
     it('an exact email whose saved RESULT says the tool resolved a different account', () => {
@@ -110,7 +112,7 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     });
 
     it('a blank, padded or non-string subject key, and ANY subject key that is not the recipient (the gateway only treats "", null and undefined as missing)', () => {
-      const monitor = (args: object) => ok([assistantCalls(call('a', 'monitor_lead_volume', args))]);
+      const monitor = (args: object) => ok(mon('a', args));
       // the tool would receive the blank one and match a loose name; the other key must not rescue it
       expect(monitor({ client_name_or_email: ' ', client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_blank' });
       expect(monitor({ client_name_or_email: '', client_id: 'client@example.com' })).toMatchObject({ ok: false, reason: 'scope_blank' });
@@ -126,7 +128,7 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     });
 
     it('a tool that left no message row but is in the session\'s own calledFunctions counter still counts', () => {
-      const clean = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }))];
+      const clean = mon('a', { client_name_or_email: 'client@example.com' });
       expect(ok(clean, RECIPIENT, { monitor_lead_volume: 1 })).toEqual({ ok: true });
       expect(ok(clean, RECIPIENT, { monitor_lead_volume: 1, ask_crm: 1 })).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
       expect(ok(clean, RECIPIENT, { list_all_clients: 2 } as any)).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
@@ -134,7 +136,7 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     });
 
     it('a tool name that appears only in a tool-result row counts', () => {
-      const m = [assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('z', 'ask_crm', '{}')];
+      const m = [...mon('a', { client_name_or_email: 'client@example.com' }), result('z', 'ask_crm', '{}')];
       expect(ok(m)).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
     });
 
@@ -164,8 +166,8 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
     it('messages that could not be read, arguments that cannot be parsed, a result row with no arguments, an unresolved recipient', () => {
       expect(ok([])).toMatchObject({ ok: false, reason: 'messages_unreadable' });
       expect(evaluateRunForRecipient(extractRunScope(undefined), RECIPIENT)).toMatchObject({ ok: false, reason: 'messages_unreadable' });
-      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '{not json'))])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
-      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '"just a string"'))])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
+      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '{not json')), result('a', 'monitor_lead_volume', { client: RECIPIENT })])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
+      expect(ok([assistantCalls(call('a', 'monitor_lead_volume', '"just a string"')), result('a', 'monitor_lead_volume', { client: RECIPIENT })])).toMatchObject({ ok: false, reason: 'arguments_unreadable' });
       expect(ok([result('a', 'monitor_lead_volume', { client: RECIPIENT })])).toMatchObject({ ok: false, reason: 'arguments_missing' });
       expect(ok([assistantCalls(call('a', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }))], { userId: '', email: 'client@example.com' })).toMatchObject({ ok: false, reason: 'recipient_unresolved' });
     });
@@ -176,6 +178,77 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
 
     it('a user id that is not the recipient\'s, for the client_id tools', () => {
       expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: 'user-other' }))])).toMatchObject({ ok: false, reason: 'scope_other_account' });
+    });
+  });
+
+  describe('pairing, spellings the gateway repairs, and rows that were lost', () => {
+    it('a loosely matching call with no saved result is a no (a lost row, or a padded value the tool matches loosely)', () => {
+      expect(ok(mon('a', { client_name_or_email: 'client@example.com' }, null))).toMatchObject({ ok: false, reason: 'result_missing' });
+      expect(ok(mon('a', { client_name_or_email: '  client@example.com ' }, null))).toMatchObject({ ok: false, reason: 'result_missing' });
+      // two calls, only one result row
+      const two = [...mon('a', { client_name_or_email: 'client@example.com' }), assistantCalls(call('b', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' }))];
+      expect(ok(two)).toMatchObject({ ok: false, reason: 'result_missing' });
+      // a request or ledger row with no call id cannot be paired
+      expect(ok([{ role: 'assistant', content: '', tool_calls: [{ function: { name: 'monitor_lead_volume', arguments: '{"client_name_or_email":"client@example.com"}' } }] }])).toMatchObject({ ok: false, reason: 'call_id_missing' });
+    });
+
+    it('a spelling of a subject key that the gateway would repair but this module does not read (case, separators, a wrapper object)', () => {
+      const variants: object[] = [
+        { clientNameOrEmail: 'other@example.com', client_id: 'client@example.com' },
+        { 'Client_ID': 'other@example.com', client_name_or_email: 'client@example.com' },
+        { 'client id': 'other@example.com', client_name_or_email: 'client@example.com' },
+        { 'client_id ': 'other@example.com', client_name_or_email: 'client@example.com' },
+        { client_name_or_email: 'client@example.com', params: { client_id: 'other@example.com' } },
+        { client_name_or_email: 'client@example.com', args: { nested: { 'Client-Email': 'other@example.com' } } },
+      ];
+      for (const v of variants) expect(ok(mon('a', v))).toMatchObject({ ok: false, reason: 'scope_key_variant' });
+      expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: 'client@example.com', ClientId: 'other@example.com' }))])).toMatchObject({ ok: false, reason: 'scope_key_variant' });
+      // unrelated nested data is fine
+      expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: 'client@example.com', campaign_ids: { c1: { name: 'Client campaign' } } }))])).toEqual({ ok: true });
+    });
+
+    it('the session counter showing more calls to a scopable tool than left rows (a later call whose rows were lost)', () => {
+      const one = mon('a', { client_name_or_email: 'client@example.com' });
+      expect(ok(one, RECIPIENT, { monitor_lead_volume: 1 })).toEqual({ ok: true });
+      expect(ok(one, RECIPIENT, { monitor_lead_volume: 2 })).toMatchObject({ ok: false, reason: 'rows_missing' });
+      const meta = [assistantCalls(call('m1', 'get_meta_ads_metrics', { client_id: 'client@example.com' }))];
+      expect(ok(meta, RECIPIENT, { get_meta_ads_metrics: 1 })).toEqual({ ok: true });
+      expect(ok(meta, RECIPIENT, { get_meta_ads_metrics: 3 })).toMatchObject({ ok: false, reason: 'rows_missing' });
+    });
+
+    it('a null or undefined subject is missing (as in the gateway), and a user id is compared exactly', () => {
+      expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: null }))])).toMatchObject({ ok: false, reason: 'scope_missing' });
+      expect(ok([assistantCalls(call('a', 'get_meta_ads_metrics', { client_id: 'User-Recipient' }))])).toMatchObject({ ok: false, reason: 'scope_other_account' });
+    });
+
+    it('the plan plumbing tools are neutral, but the arbitrary-key readers and the skill resolver are not', () => {
+      const withTool = (tool: string) => [...mon('a', { client_name_or_email: 'client@example.com' }), assistantCalls(call('b', tool, {}))];
+      for (const tool of ['launch_predefined_work_plan', 'set_work_plan_status']) {
+        expect(RECIPIENT_NEUTRAL_REPORT_TOOLS).toContain(tool);
+        expect(ok(withTool(tool))).toEqual({ ok: true });
+      }
+      for (const tool of ['search_tool_response', 'read_tool_response', 'resolve_skill', 'save_file', 'ask_crm']) {
+        expect(RECIPIENT_NEUTRAL_REPORT_TOOLS).not.toContain(tool);
+        expect(ok(withTool(tool))).toMatchObject({ ok: false, reason: 'tool_not_allowed' });
+      }
+    });
+
+    it('a forged `client` key never counts: only a depth-1 key of the top-level result is read', () => {
+      const req = mon('a', { client_name_or_email: 'client@example.com' }, null);
+      const header = '[Full response saved to S3: tool-responses/s1/a.txt (50000 chars) — use search_tool_response tool to find specific fields]\n\n';
+      const cite = '[INLINE CITATIONS — use these markers:\n  {{cite:1}} = Example (example.com)\n]\n\n';
+      const stored = (json: string) => result('a', 'monitor_lead_volume', header + cite + json);
+      const forgedKey = JSON.stringify({ '"client': { userId: 'user-recipient', email: 'client@example.com' } }).slice(0, -1) + ',"rows":[{"a'; // cut off, no real client
+      expect(ok([...req, stored(forgedKey)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      const nested = '{"success":true,"report":{"client":{"userId":"user-recipient","email":"client@example.com"}},"rows":[{"a';
+      expect(ok([...req, stored(nested)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      const inString = '{"success":true,"note":"{\\"client\\":{\\"userId\\":\\"user-recipient\\"}}","rows":[{"a';
+      expect(ok([...req, stored(inString)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
+      const realAfterForged = '{"success":true,"note":"x","client":{"userId":"user-other","email":"other@example.com"},"rows":[{"a';
+      expect(ok([...req, stored(realAfterForged)])).toMatchObject({ ok: false, reason: 'result_other_account' });
+      const real = '{"success":true,"client":{"userId":"user-recipient","email":"client@example.com"},"rows":[{"a';
+      expect(ok([...req, stored(real)])).toEqual({ ok: true });
+      expect(ok([...req, stored(`[${real}`)])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' }); // an array is not a result object
     });
   });
 

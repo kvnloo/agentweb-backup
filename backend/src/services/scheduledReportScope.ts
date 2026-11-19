@@ -15,6 +15,9 @@
  *    padded `client_name_or_email` next to a good `client_id` still reaches the tool as the blank one, and the tool then
  *    matches a loose name), and, for the two tools that match names loosely, the saved tool RESULT must say which account it
  *    resolved and that account must be the recipient's (a missing or unreadable subject is a "no");
+ *  - for those two loosely matching tools EVERY call must be paired, by tool-call id, with a saved result that names the
+ *    recipient: a call whose result row is missing (a lost message row, a padded value) is a "no", and so is a key the gateway
+ *    would repair from another spelling (`clientNameOrEmail`, `Client_ID`, a wrapper object) that this module does not read;
  *  - a call with no scope (the Meta and Google Ads tools read the CALLER's own account when `client_id` is omitted: the admin's)
  *    is not the recipient's;
  *  - any tool in the run that is neither scopable nor on the short list of tools that read no tenant data (the report
@@ -71,6 +74,10 @@ export const RECIPIENT_NEUTRAL_REPORT_TOOLS: ReadonlyArray<string> = [
   'list_html_templates',
   'create_html_from_template',
   'perform_data_analysis',
+  // The scheduled report plan is launched and stepped through these two (copy a plan template into the session; set a step's status).
+  // They read a plan definition and write session state, not tenant data.
+  'launch_predefined_work_plan',
+  'set_work_plan_status',
 ];
 
 export interface ToolCallRecord {
@@ -91,6 +98,8 @@ export interface RunScope {
   unrecognized: boolean;
   /** Every tool name that appears anywhere in the run (request list, executed ledger, tool-result rows, the session's calledFunctions). */
   toolNames: string[];
+  /** The session's own per-tool success counter, when it is a map (it never exceeds the number of calls that left rows). */
+  toolCounts: Record<string, number>;
   records: ToolCallRecord[];
 }
 
@@ -141,29 +150,80 @@ function balancedObject(text: string, from: number): string | null {
 }
 
 /**
- * The account a tool result says it resolved. A result over the offload threshold is replaced in the saved message by an S3
- * header plus the first 20,000 characters of the JSON (toolDispatch.ts), so the whole content no longer parses: the leading
- * `"client":{...}` object is read from that preview instead. A quote inside a string is escaped (`\"`), so the pattern
- * `"client":` only matches a real key. When no subject can be read this returns null and the caller treats it as "no".
+ * The `client` object at the TOP LEVEL of a tool result that no longer parses as a whole. A result over the offload threshold
+ * is replaced in the saved message by an S3 header (and possibly an inline-citation block) plus the first 20,000 characters of
+ * the JSON, so the content has a prefix and a cut-off end. The top-level object starts at the first `{` that begins a line and
+ * is followed by a key; from there a depth-tracking scan accepts a `client` key ONLY at depth 1, so a nested `client`, a `client`
+ * inside a string, or a forged key whose text contains `"client":{` (JSON.stringify escapes the quote but the key text still
+ * matches a naive pattern) is never read as the subject. Returns null when there is none.
+ */
+function topLevelClientObject(text: string): unknown | null {
+  const start = /(?:^|\n)\{\s*"/.exec(text);
+  if (!start) return null;
+  let i = text.indexOf('{', start.index);
+  const limit = Math.min(text.length, i + 60000);
+  let depth = 0;
+  let inString = false;
+  let strStart = -1;
+  let expectKey = false;
+  let lastKey: string | null = null;
+  for (; i < limit; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === '\\') i++;
+      else if (c === '"') {
+        inString = false;
+        if (depth === 1 && expectKey) {
+          try {
+            lastKey = JSON.parse(text.slice(strStart, i + 1));
+          } catch {
+            lastKey = null;
+          }
+          expectKey = false;
+        }
+      }
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      strStart = i;
+    } else if (c === '{' || c === '[') {
+      if (c === '{' && depth === 1 && lastKey === 'client') {
+        const object = balancedObject(text, i);
+        if (!object) return null;
+        try {
+          return JSON.parse(object);
+        } catch {
+          return null;
+        }
+      }
+      depth++;
+      if (depth === 1) expectKey = true;
+    } else if (c === '}' || c === ']') {
+      depth--;
+      if (depth <= 0) return null;
+    } else if (c === ',' && depth === 1) {
+      expectKey = true;
+      lastKey = null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The account a tool result says it resolved. Complete JSON is read as is; an offloaded or prefixed result is read by
+ * `topLevelClientObject`. When no subject can be read this returns null and the caller treats it as "no".
  */
 function resultSubjectOf(content: unknown): { userId?: string; email?: string } | null {
   if (content && typeof content === 'object') return subjectFrom((content as any).client);
   if (typeof content !== 'string') return null;
   try {
     const parsed = JSON.parse(content);
-    return subjectFrom(parsed && typeof parsed === 'object' ? parsed.client : null);
+    return subjectFrom(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed.client : null);
   } catch {
     // fall through to the offloaded / prefixed preview
   }
-  const match = /"client"\s*:\s*\{/.exec(content);
-  if (!match) return null;
-  const object = balancedObject(content, match.index + match[0].length - 1);
-  if (!object) return null;
-  try {
-    return subjectFrom(JSON.parse(object));
-  } catch {
-    return null;
-  }
+  return subjectFrom(topLevelClientObject(content));
 }
 
 /**
@@ -178,7 +238,7 @@ export function extractRunScope(
   messages: Array<Record<string, any>> | null | undefined,
   calledFunctions?: Record<string, number> | string[] | null,
 ): RunScope {
-  if (!Array.isArray(messages) || messages.length === 0) return { readOk: false, unrecognized: false, toolNames: [], records: [] };
+  if (!Array.isArray(messages) || messages.length === 0) return { readOk: false, unrecognized: false, toolNames: [], toolCounts: {}, records: [] };
   const records: ToolCallRecord[] = [];
   const names = new Set<string>();
   let unrecognized = false;
@@ -225,10 +285,34 @@ export function extractRunScope(
   }
   const counted = Array.isArray(calledFunctions) ? calledFunctions : calledFunctions && typeof calledFunctions === 'object' ? Object.keys(calledFunctions) : [];
   for (const n of counted) if (typeof n === 'string' && n) names.add(n);
-  return { readOk: true, unrecognized, toolNames: [...names], records };
+  const toolCounts: Record<string, number> = {};
+  if (calledFunctions && typeof calledFunctions === 'object' && !Array.isArray(calledFunctions)) {
+    for (const [k, v] of Object.entries(calledFunctions)) if (typeof v === 'number' && Number.isFinite(v)) toolCounts[k] = v;
+  }
+  return { readOk: true, unrecognized, toolNames: [...names], toolCounts, records };
 }
 
 const norm = (s: unknown): string => (typeof s === 'string' ? s.trim().toLowerCase() : '');
+/** The gateway matches argument names after this normalisation (agentToolGatewayService normalizeArgName), so a spelling it repairs must be seen here. */
+const normKey = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/** Is any key at any depth (bounded) a spelling of a subject key other than the exact top-level key this module reads? */
+function hasSubjectKeyVariant(args: Record<string, unknown>, rule: ScopableToolRule): boolean {
+  const subjectNorms = new Set(rule.keys.map(normKey));
+  const exact = new Set(rule.keys);
+  let budget = 500;
+  const walk = (value: unknown, depth: number): boolean => {
+    if (!value || typeof value !== 'object' || depth > 4 || budget <= 0) return false;
+    const entries: Array<[string, unknown]> = Array.isArray(value) ? value.map((v, i) => [String(i), v] as [string, unknown]) : Object.entries(value as Record<string, unknown>);
+    for (const [k, v] of entries) {
+      budget--;
+      if (!Array.isArray(value) && subjectNorms.has(normKey(k)) && !(depth === 0 && exact.has(k))) return true;
+      if (walk(v, depth + 1)) return true;
+    }
+    return false;
+  };
+  return walk(args, 0);
+}
 
 /**
  * Is everything in this run about `recipient`, and nothing else?
@@ -245,6 +329,29 @@ export function evaluateRunForRecipient(scope: RunScope, recipient: RecipientIde
     if (!scopable && !RECIPIENT_NEUTRAL_REPORT_TOOLS.includes(tool)) return { ok: false, reason: 'tool_not_allowed' };
   }
 
+  // Pair every call with its result by tool-call id. The message write can lose rows (it only logs after three failed retries),
+  // so a loosely matching tool needs a result that names the account for EACH call it made, and the session's own counter must
+  // not show more calls to a scopable tool than left rows.
+  const idsByTool: Record<string, Set<string>> = {};
+  const resultIdsByTool: Record<string, Set<string>> = {};
+  for (const r of scope.records) {
+    const rule = Object.prototype.hasOwnProperty.call(RECIPIENT_SCOPABLE_TOOLS, r.tool) ? RECIPIENT_SCOPABLE_TOOLS[r.tool] : null;
+    if (!rule) continue;
+    if (!r.toolCallId) {
+      if (r.source !== 'result' && rule.emailOnly) return { ok: false, reason: 'call_id_missing' };
+      continue;
+    }
+    (idsByTool[r.tool] ||= new Set()).add(r.toolCallId);
+    if (r.source === 'result') (resultIdsByTool[r.tool] ||= new Set()).add(r.toolCallId);
+  }
+  for (const tool of Object.keys(RECIPIENT_SCOPABLE_TOOLS)) {
+    const ids = idsByTool[tool]?.size ?? 0;
+    if ((scope.toolCounts[tool] ?? 0) > ids) return { ok: false, reason: 'rows_missing' };
+    if (RECIPIENT_SCOPABLE_TOOLS[tool].emailOnly) {
+      for (const id of idsByTool[tool] ?? []) if (!resultIdsByTool[tool]?.has(id)) return { ok: false, reason: 'result_missing' };
+    }
+  }
+
   // Each scopable call (every record, from every source) must name the recipient, and any resolved account must be theirs.
   let scopedRecords = 0;
   for (const r of scope.records) {
@@ -259,6 +366,7 @@ export function evaluateRunForRecipient(scope: RunScope, recipient: RecipientIde
       continue;
     }
     if (r.args === null) return { ok: false, reason: 'arguments_unreadable' };
+    if (hasSubjectKeyVariant(r.args, rule)) return { ok: false, reason: 'scope_key_variant' };
     // EVERY subject key the call carries must name the recipient: a present key of any type, blank included, is a subject.
     let named = 0;
     for (const key of rule.keys) {
