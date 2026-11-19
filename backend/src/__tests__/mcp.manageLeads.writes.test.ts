@@ -604,12 +604,15 @@ describe('update: consistent merge base and field types', () => {
     for (const [updates, named] of [
       [{ notes: { text: 'x' } }, 'notes (must be text)'],
       [{ dealValue: '1000' }, 'dealValue (must be a number)'],
-      [{ isPrimary: 'yes' }, 'isPrimary (must be true or false)'],
       [{ pocEmails: 'a@b.test' }, 'pocEmails (must be a list'],
     ] as Array<[Record<string, unknown>, string]>) {
       const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
       expect({ updates, isError: r.isError, named: r.text.includes(named) }).toEqual({ updates, isError: true, named: true });
     }
+    // isPrimary is a create-time field: its type is checked on add (an update refuses it by name).
+    const badAdd = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'prim@alpha.test', isPrimary: 'yes' }] });
+    expect(badAdd.isError).toBe(true);
+    expect(badAdd.text).toContain('isPrimary (must be true or false)');
     const cleared = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { company: 'Alpha Inc' } });
     expect(cleared.isError).toBe(false);
     const clear2 = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { company: null } });
@@ -758,5 +761,122 @@ describe('create_lead_list update: duplicate status values', () => {
     expect(r.isError).toBe(true);
     expect(r.text).toContain('duplicate status values: qualified');
     expect(fake.items('AW-LeadLists').find((l: any) => l.listId === TENANT_A.listId).name).toBe(TENANT_A.listName);
+  });
+});
+
+// ---- Found by the THIRD review (final head f838eda7e: DO NOT SHIP until the email-edit hole was closed) -------------------------------------
+
+describe('an opted-out lead keeps its address (editing it was a way to un-suppress)', () => {
+  it('suppress, then change or clear the email: refused; the same address is a no-op; the address still flags a re-add elsewhere', async () => {
+    const X = a1.email;
+    const sup = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { status: 'do-not-contact' } });
+    expect(sup.isError).toBe(false);
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const email of ['moved@alpha.test', null, '', '   ']) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { email } });
+      expect({ email, isError: r.isError, said: r.text.includes('marked do-not-contact') }).toEqual({ email, isError: true, said: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+    // Writing the same address (any case or padding) changes nothing and is allowed.
+    const same = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { email: `  ${X.toUpperCase()} `, notes: 'kept' } });
+    expect(same.isError).toBe(false);
+    // The address still flags a new lead for it in another list of the owner's.
+    fake.seed('AW-LeadLists', { listId: 'list-a9', userId: TENANT_A.owner, name: 'ALPHA ninth', listType: 'sales', createdAt: '2026-11-18T10:00:00.000Z', leadCount: 0 });
+    const readd = await a.call('manage_leads', { action: 'add', list_id: 'list-a9', leads: [{ email: X }] });
+    expect(readd.isError).toBe(false);
+    expect(readd.json).toMatchObject({ inheritedDoNotContact: true });
+    expect(leadsOf('list-a9')[0].contactStatus).toBe('do-not-contact');
+  });
+
+  it('an ordinary lead can still change its email', async () => {
+    const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email: 'arnold2@alpha.test' } });
+    expect(r.isError).toBe(false);
+    expect(leadRow(TENANT_A.listId, a2.leadId).email).toBe('arnold2@alpha.test');
+  });
+});
+
+describe('update: fields the update layer does not store, drafts, system-owned custom keys', () => {
+  it('priority, role, isPrimary, expectedClose, closedDate, heatScore and healthScore are refused by name on update (they would be dropped while the call said success)', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const updates of [{ priority: 'High' }, { role: 'KDM' }, { isPrimary: true }, { expectedClose: '2026-12-31' }, { closedDate: '2027-01-01' }, { heatScore: 50 }, { healthScore: 50 }]) {
+      const key = Object.keys(updates)[0];
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ key, isError: r.isError, named: r.text.includes(key), hint: r.text.includes('when a lead is added') }).toEqual({ key, isError: true, named: true, hint: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+  });
+
+  it('drafts must have the real shape: strings, objects with the right keys, "text" or "html"; they are stored with their times; null clears', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const updates of [
+      { emailDraft: 'just a string' }, { emailDraft: { subject: 1 } }, { emailDraft: { subject: 'S', evil: 'x' } }, { emailDraft: {} },
+      { messageDraft: { content: 1 } }, { messageDraft: '   ' }, { messageDraft: { content: 'x', extra: 1 } }, { emailDraftFormat: 'weird' },
+    ]) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ updates, isError: r.isError }).toEqual({ updates, isError: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+
+    const ok = await a.call('manage_leads', {
+      action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId,
+      updates: { emailDraft: { subject: 'Hi', htmlContent: '<p>Hello</p>' }, emailDraftFormat: 'html', messageDraft: 'Hello on LinkedIn' },
+    });
+    expect(ok.isError).toBe(false);
+    const row = leadRow(TENANT_A.listId, a1.leadId);
+    expect(row.emailDraft).toMatchObject({ subject: 'Hi', htmlContent: '<p>Hello</p>' });
+    expect(typeof row.emailDraft.createdAt).toBe('string');
+    expect(row.messageDraft).toMatchObject({ content: 'Hello on LinkedIn' });
+    expect(row.emailDraftFormat).toBe('html');
+
+    const cleared = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { emailDraft: null, messageDraft: null } });
+    expect(cleared.isError).toBe(false);
+    expect(leadRow(TENANT_A.listId, a1.leadId).emailDraft).toBeUndefined();
+    expect(leadRow(TENANT_A.listId, a1.leadId).messageDraft).toBeUndefined();
+  });
+
+  it('customFields.email_validation (read by the send-eligibility check) cannot be written, at the top level or inside customFields, on update or add', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const updates of [{ email_validation: { status: 'deliverable' } }, { customFields: { email_validation: { status: 'deliverable' } } }]) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ updates, isError: r.isError, named: r.text.includes('email_validation') }).toEqual({ updates, isError: true, named: true });
+    }
+    const add = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'ev@alpha.test', customFields: { email_validation: { status: 'deliverable' } } }] });
+    expect(add.isError).toBe(true);
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+    expect(leadsOf(TENANT_A.listId).find((l: any) => l.email === 'ev@alpha.test')).toBeUndefined();
+  });
+});
+
+describe('delete: the same id twice, and a list that holds opted-out leads', () => {
+  it('a repeated id is one lead (not a failure), and the answer says it was ignored', async () => {
+    const r = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [a1.leadId, a1.leadId, a2.leadId] });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({ requested: 2, deleted: 2, failed: 0, duplicateIdsIgnored: 1 });
+    const same = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['no-such-1', 'no-such-1'] });
+    expect(same.isError).toBe(true); // one id, not found: a 404, not a success
+  });
+
+  it('create_lead_list delete is refused while the list holds a lead marked do-not-contact, and the list and its leads stay', async () => {
+    await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { status: 'do-not-contact' } });
+    const before = snapshotTenant(fake, TENANT_A);
+    const r = await a.call('create_lead_list', { action: 'delete', list_id: TENANT_A.listId });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('1 lead(s) marked do-not-contact');
+    expect(snapshotTenant(fake, TENANT_A)).toBe(before);
+    // The other tenant's list is refused by the route before anything is read.
+    const foreign = await a.call('create_lead_list', { action: 'delete', list_id: TENANT_B.listId });
+    expect(foreign.isError).toBe(true);
+    expect(foreign.text).not.toContain(TENANT_B.leads[0].email);
+  });
+});
+
+describe('list: page and limit are whole numbers', () => {
+  it('anything else is refused instead of becoming NaN in the route', async () => {
+    for (const bad of [{ limit: 'x' }, { limit: 0 }, { limit: 1.5 }, { page: -1 }, { page: { n: 1 } }, { limit: { a: 1 } }]) {
+      const r = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, ...bad });
+      expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
+    }
+    const ok = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, page: 1, limit: 10 });
+    expect(ok.isError).toBe(false);
   });
 });
