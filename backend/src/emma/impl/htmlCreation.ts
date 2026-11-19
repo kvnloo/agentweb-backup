@@ -156,6 +156,11 @@ async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// A single token (no whitespace) that starts with one of these schemes and a colon is a link the server cannot fetch, not HTML.
+// http(s) is handled by the guarded fetch; text with spaces, and HTML (which starts with "<"), never matches.
+const UNFETCHABLE_LINK_SCHEME =
+  /^(data|file|ftps?|sftp|javascript|vbscript|blob|wss?|gopher|s3|gs|about|jar|dict|ldap|smb):\S*$/i;
+
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
 // generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
@@ -807,6 +812,17 @@ export async function createHtmlTemplate(
           success: false,
           message: 'Failed to create HTML template',
           error: 'html_source is required and must be a non-empty string (raw HTML content or an S3/HTTPS URL).'
+        };
+      }
+
+      // A bare link in a scheme that cannot be fetched (data:, file:, ftp: ...) is refused here, before it is saved as the template's body.
+      // Plain text with spaces and real HTML are not links and still work.
+      const unfetchableScheme = UNFETCHABLE_LINK_SCHEME.exec(htmlSource.trim());
+      if (unfetchableScheme) {
+        return {
+          success: false,
+          message: 'Failed to create HTML template',
+          error: `html_source looks like a ${unfetchableScheme[1].toLowerCase()}: link, which cannot be fetched. Pass a public http(s) link or the HTML itself.`
         };
       }
 
