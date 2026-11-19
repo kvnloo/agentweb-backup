@@ -935,11 +935,13 @@ describe('the address must be a plain address (a decorated form of an opted-out 
   it('Name <addr>, "addr", addr. and malformed addresses are refused on add and update, by name; a padded or upper-case plain address is fine', async () => {
     const count = leadsOf(TENANT_A.listId).length;
     const before = JSON.stringify(leadRow(TENANT_A.listId, a2.leadId));
-    for (const email of ['Mallory <victim@alpha.test>', '"victim@alpha.test"', 'victim@alpha.test.', 'victim@alpha', 'a b@alpha.test', 'victim@@alpha.test', '<victim@alpha.test>', 'victim@alpha.test, other@alpha.test']) {
+    for (const email of ['Mallory <victim@alpha.test>', '"victim@alpha.test"', 'victim@alpha.test.', 'victim@alpha', 'a b@alpha.test', 'victim@@alpha.test', '<victim@alpha.test>', 'victim@alpha.test, other@alpha.test',
+      // invisible and look-alike characters would be stored as a different string from the address they imitate
+      'vic\u200Btim@alpha.test', 'vic\u00ADtim@alpha.test', '\uFF56ictim@alpha.test', 'victim\u0000@alpha.test', 'victim@alph\u0430.test']) {
       const add = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email }] });
-      expect({ email, op: 'add', isError: add.isError, named: add.text.includes('email (must be a plain address') }).toEqual({ email, op: 'add', isError: true, named: true });
+      expect({ email, op: 'add', isError: add.isError, named: add.text.includes('email (must be a plain ASCII address') }).toEqual({ email, op: 'add', isError: true, named: true });
       const upd = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email } });
-      expect({ email, op: 'update', isError: upd.isError, named: upd.text.includes('email (must be a plain address') }).toEqual({ email, op: 'update', isError: true, named: true });
+      expect({ email, op: 'update', isError: upd.isError, named: upd.text.includes('email (must be a plain ASCII address') }).toEqual({ email, op: 'update', isError: true, named: true });
     }
     expect(leadsOf(TENANT_A.listId).length).toBe(count);
     expect(JSON.stringify(leadRow(TENANT_A.listId, a2.leadId))).toBe(before);
@@ -1040,7 +1042,7 @@ describe('custom fields are written key by key: overlapping updates to one lead 
     }
   });
 
-  it('a lead with no custom-field map cannot take a key-by-key write, so its map is created whole (nothing to lose)', async () => {
+  it('a lead with no custom-field map gets it created by the key-level write (the update layer creates a missing map and retries); overlapping updates keep every key', async () => {
     const { customFields: _gone, ...bare } = leadRow(TENANT_A.listId, a2.leadId);
     fake.seed('AW-Leads', bare);
     const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { first: 1, second: 2 } });
@@ -1055,5 +1057,116 @@ describe('custom fields are written key by key: overlapping updates to one lead 
       expect({ updates, isError: r.isError, named: r.text.includes('(empty name)') || r.text.includes('customFields.') }).toEqual({ updates, isError: true, named: true });
     }
     expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+  });
+});
+
+// ---- Found by the FIFTH review (final head 6f980cf98: DO NOT SHIP): one agent's PARALLEL calls beat the read-then-write guards -------------------
+
+describe('one agent\'s parallel calls on the same lead are serialized (the guards are read-then-write)', () => {
+  const stamp = '2026-11-18T10:00:00.000Z';
+  const seedLead = (leadId: string, extra: Record<string, unknown> = {}) =>
+    fake.seed('AW-Leads', { listId: TENANT_A.listId, leadId, userId: TENANT_A.owner, name: leadId, email: `${leadId}@alpha.test`, status: 'new', createdAt: stamp, customFields: { region: 'EMEA', tier: 'gold' }, ...extra });
+  const listCount = () => fake.items('AW-LeadLists').find((l: any) => l.listId === TENANT_A.listId).leadCount;
+
+  it('"mark do-not-contact" and "delete" sent together, in either order, never leave a hollow row or a sendable address', async () => {
+    for (const order of ['suppress-first', 'delete-first'] as const) {
+      seedLead(`par-${order}`);
+      const suppress = () => a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: `par-${order}`, updates: { status: 'do-not-contact' } });
+      const del = () => a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [`par-${order}`] });
+      await Promise.all(order === 'suppress-first' ? [suppress(), del()] : [del(), suppress()]);
+      const row = leadRow(TENANT_A.listId, `par-${order}`);
+      if (row) {
+        // The lead survived: it is a real, suppressed lead (never a one-field stub).
+        expect({ order, hollow: !row.email }).toEqual({ order, hollow: false });
+        expect(row.contactStatus).toBe('do-not-contact');
+      } else {
+        // The lead was deleted BEFORE it was suppressed: nothing was re-created.
+        expect(row).toBeUndefined();
+      }
+      // The address is never left on a sendable lead while an opted-out one was deleted: if a lead exists for it, it is opted out.
+      expect(leadsOf(TENANT_A.listId).filter((l: any) => l.email === `par-${order}@alpha.test` && !l.contactStatus)).toEqual([]);
+    }
+  });
+
+  it('an update and a delete of one lead sent together never re-create a hollow row, and the list count drops once', async () => {
+    for (let round = 0; round < 4; round++) {
+      seedLead(`ud-${round}`);
+      const before = listCount();
+      const calls = round % 2 === 0
+        ? [a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: `ud-${round}`, updates: { notes: 'late' } }), a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [`ud-${round}`] })]
+        : [a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [`ud-${round}`] }), a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: `ud-${round}`, updates: { notes: 'late' } })];
+      await Promise.all(calls);
+      expect({ round, row: leadRow(TENANT_A.listId, `ud-${round}`) }).toEqual({ round, row: undefined });
+      expect({ round, dropped: before - listCount() }).toEqual({ round, dropped: 1 });
+    }
+  });
+
+  it('two deletes of one lead sent together: one succeeds, the other is a 404, and the list count drops by exactly one', async () => {
+    seedLead('dd-1');
+    const before = listCount();
+    const [x, y] = await Promise.all([
+      a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['dd-1'] }),
+      a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['dd-1'] }),
+    ]);
+    expect([x.isError, y.isError].sort()).toEqual([false, true]);
+    expect([x, y].find((r) => r.isError)!.text).toContain('(404)');
+    expect(before - listCount()).toBe(1);
+  });
+
+  it('overlapping custom-field updates keep every key in enforce mode (read-merge-write) and on a lead with no map', async () => {
+    process.env.CRM_LEAD_PUT_GUARD = 'enforce';
+    try {
+      for (let round = 0; round < 4; round++) {
+        seedLead('enf-1');
+        await Promise.all(['one', 'two', 'three'].map((k) => a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: 'enf-1', updates: { [k]: `v${round}` } })));
+        expect({ round, custom: leadRow(TENANT_A.listId, 'enf-1').customFields }).toEqual({ round, custom: { region: 'EMEA', tier: 'gold', one: `v${round}`, two: `v${round}`, three: `v${round}` } });
+      }
+    } finally {
+      delete process.env.CRM_LEAD_PUT_GUARD;
+    }
+    for (let round = 0; round < 4; round++) {
+      const { customFields: _none, ...bare } = { ...leadRow(TENANT_A.listId, a2.leadId) } as Record<string, any>;
+      fake.seed('AW-Leads', bare);
+      await Promise.all(['x', 'y', 'z'].map((k) => a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { [k]: round } })));
+      expect({ round, custom: leadRow(TENANT_A.listId, a2.leadId).customFields }).toEqual({ round, custom: { x: round, y: round, z: round } });
+    }
+  });
+});
+
+describe('the status decision reads the stored lead, not a lagging REST copy', () => {
+  it('an existing unsubscribe is not relabelled do-not-contact when the REST read is stale', async () => {
+    const { crmDb } = await import('../services/db');
+    fake.seed('AW-Leads', { listId: TENANT_A.listId, leadId: 'stale-1', userId: TENANT_A.owner, name: 'Stale', email: 'stale-1@alpha.test', status: 'new', contactStatus: 'unsubscribed', contactStatusReason: 'opted-out', contactStatusUpdatedBy: 'recipient', createdAt: '2026-11-18T10:00:00.000Z', customFields: {} });
+    // The REST read (the route's first getLeadById call) shows the lead BEFORE the unsubscribe; the module's own consistent read shows the truth.
+    const original = crmDb.getLeadById.bind(crmDb);
+    const spy = jest.spyOn(crmDb, 'getLeadById');
+    spy.mockImplementationOnce((async (...args: any[]) => ({ ...((await (original as any)(...args)) ?? {}), contactStatus: undefined, contactStatusReason: undefined, contactStatusUpdatedBy: undefined })) as any);
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: 'stale-1', updates: { status: 'do-not-contact' } });
+      expect(r.isError).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(leadRow(TENANT_A.listId, 'stale-1')).toMatchObject({ contactStatus: 'unsubscribed', contactStatusReason: 'opted-out', contactStatusUpdatedBy: 'recipient' });
+  });
+});
+
+describe('system-owned custom keys and empty updates', () => {
+  it('the CRM sync ids the adapters fall back to are refused as custom field names (top level and inside customFields)', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const key of ['hubspot_contact_id', 'hubspot_deal_id', 'attio_record_id', 'attio_list_entry_id', 'attio_deal_list_id']) {
+      for (const updates of [{ [key]: 'rec-of-someone-else' }, { customFields: { [key]: 'rec-of-someone-else' } }]) {
+        const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+        expect({ key, isError: r.isError, named: r.text.includes(key) }).toEqual({ key, isError: true, named: true });
+      }
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+  });
+
+  it('an update that changes nothing is refused (an empty customFields object only touches the update time)', async () => {
+    for (const updates of [{ customFields: {} }, {}]) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ updates, isError: r.isError }).toEqual({ updates, isError: true });
+    }
   });
 });

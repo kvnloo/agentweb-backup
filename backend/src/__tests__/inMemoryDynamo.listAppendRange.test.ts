@@ -45,6 +45,36 @@ describe('InMemoryDynamo list_append', () => {
   });
 });
 
+describe('InMemoryDynamo plain if_not_exists', () => {
+  const makeMap = (fake: InMemoryDynamo, leadId: string) =>
+    clientOf(fake)
+      .update({
+        TableName: 'AW-Leads',
+        Key: { listId: 'l1', leadId },
+        UpdateExpression: 'SET #cfMap = if_not_exists(#cfMap, :emptyMap)',
+        ConditionExpression: 'attribute_exists(#lid)',
+        ExpressionAttributeNames: { '#cfMap': 'customFields', '#lid': 'leadId' },
+        ExpressionAttributeValues: { ':emptyMap': {} },
+      })
+      .promise();
+
+  it('creates the attribute when it is absent and leaves one that is there alone (how a missing custom-field map is created)', async () => {
+    const fake = makeFake();
+    fake.seed('AW-Leads', { listId: 'l1', leadId: '5', email: 'e@x.test', customFields: { keep: 'me' } });
+    await makeMap(fake, '1');
+    await makeMap(fake, '5');
+    const rows = fake.items('AW-Leads');
+    expect(rows.find((r) => r.leadId === '1')!.customFields).toEqual({});
+    expect(rows.find((r) => r.leadId === '5')!.customFields).toEqual({ keep: 'me' });
+  });
+
+  it('refuses for a lead that does not exist (the existence condition), so no stray row is created', async () => {
+    const fake = makeFake();
+    await expect(makeMap(fake, 'ghost')).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    expect(fake.items('AW-Leads').find((r) => r.leadId === 'ghost')).toBeUndefined();
+  });
+});
+
 describe('InMemoryDynamo range-key comparison in a query', () => {
   const byEmail = (fake: InMemoryDynamo, listId: string, email: string) =>
     clientOf(fake)

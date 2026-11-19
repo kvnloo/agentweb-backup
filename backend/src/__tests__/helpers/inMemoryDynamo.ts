@@ -240,6 +240,14 @@ function evaluateSetValue(
     }
     return [...left, ...right];
   }
+  // `SET x = if_not_exists(x, :default)` on its own: keep the value that is there, else take the default (how a missing map is created without clobbering one
+  // a concurrent writer just made).
+  const keepOrDefault = rawValue.match(/^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)$/i);
+  if (keepOrDefault) {
+    const current = readConditionPath(item, keepOrDefault[1], names);
+    return current !== undefined ? current : values[keepOrDefault[2]];
+  }
+
   let match = rawValue.match(
     /^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)\s*([+-])\s*(:[A-Za-z0-9_]+)$/i,
   );
