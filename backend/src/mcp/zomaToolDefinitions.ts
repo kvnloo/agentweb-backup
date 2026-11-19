@@ -9,6 +9,8 @@
  * surface — tool list, routing, zoma_status, setup pages, tool descriptions, MCP instructions,
  * docs — is Meta only. On: the Google Ads implementation is listed, routed and shown again.
  */
+import { ZOMA_INDUSTRY_BENCHMARK_DEFINITION } from './zomaIndustryBenchmark';
+
 export const ZOMA_GOOGLE_FLAG = 'ZOMA_GOOGLE_ENABLED';
 
 export function googleToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -124,5 +126,7 @@ export function zomaToolDefinitions(google: boolean = googleToolkitEnabled()) {
         additionalProperties: false,
       },
     },
+    // ENG-3156: read-only CPA vs a sourced industry benchmark; dispatched by the gateway on the resolved ad account.
+    ZOMA_INDUSTRY_BENCHMARK_DEFINITION,
   ];
 }
