@@ -210,12 +210,36 @@ function splitTopLevelCommas(expression: string): string[] {
  * `if_not_exists(attr, :default) +/- :delta`. Anything else throws loudly rather
  * than silently computing the wrong number.
  */
+/** One operand of list_append: a placeholder, an attribute (nested path allowed) or if_not_exists(attribute, :default). */
+function listOperand(token: string, item: Record<string, any>, names: Record<string, string>, values: Record<string, any>): any {
+  const t = token.trim();
+  const fallback = t.match(/^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)$/i);
+  if (fallback) {
+    const current = readConditionPath(item, fallback[1], names);
+    return current !== undefined ? current : values[fallback[2]];
+  }
+  return /^:[A-Za-z0-9_]+$/.test(t) ? values[t] : readConditionPath(item, t, names);
+}
+
 function evaluateSetValue(
   rawValue: string,
   item: Record<string, any>,
   names: Record<string, string>,
   values: Record<string, any>,
 ): any {
+  // list_append(a, b): both operands must be lists, as in DynamoDB.
+  const append = rawValue.match(/^list_append\(\s*(.+)\s*\)$/is);
+  if (append) {
+    const [first, second] = splitTopLevelCommas(append[1]);
+    const left = listOperand(first ?? '', item, names, values);
+    const right = listOperand(second ?? '', item, names, values);
+    if (!Array.isArray(left) || !Array.isArray(right)) {
+      throw Object.assign(new Error('ValidationException: An operand in the update expression has an incorrect data type (list_append)'), {
+        code: 'ValidationException',
+      });
+    }
+    return [...left, ...right];
+  }
   let match = rawValue.match(
     /^if_not_exists\(\s*([^,]+?)\s*,\s*(:[A-Za-z0-9_]+)\s*\)\s*([+-])\s*(:[A-Za-z0-9_]+)$/i,
   );
@@ -294,9 +318,6 @@ function applyUpdateExpression(
     for (const assignment of splitTopLevelCommas(setMatch[1])) {
       const [rawTarget, rawValue] = assignment.split('=').map((part) => part.trim());
       if (!rawTarget || !rawValue) continue;
-      if (/list_append/i.test(rawValue)) {
-        throw new Error(`inMemoryDynamo: unsupported SET function: ${rawValue}`);
-      }
       writeUpdatePath(item, rawTarget, names, evaluateSetValue(rawValue, item, names, values));
     }
   }
@@ -464,6 +485,18 @@ export class InMemoryDynamo {
             let items = [...self.store(params.TableName).values()].filter(
               (item) => item[schema.hash] === hashValue,
             );
+
+            // A comparison on the RANGE key (`#email = :e`, also < <= > >=): without it a lookup by (hash, range) returned the whole partition.
+            if (schema.range) {
+              for (const m of expression.matchAll(/(#?[A-Za-z0-9_]+)\s*(<=|>=|=|<|>)\s*(:[A-Za-z0-9_]+)/g)) {
+                if (resolveName(m[1], names) !== schema.range) continue;
+                const wanted = values[m[3]];
+                items = items.filter((item) => {
+                  const have = item[schema.range!];
+                  return m[2] === '=' ? have === wanted : m[2] === '<' ? have < wanted : m[2] === '<=' ? have <= wanted : m[2] === '>' ? have > wanted : have >= wanted;
+                });
+              }
+            }
 
             if (between) {
               const attr = resolveName(between[1], names);
