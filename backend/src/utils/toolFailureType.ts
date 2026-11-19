@@ -55,8 +55,10 @@ const UNINSTALLED_RE = /not available\b[\s\S]*install the required skill/i;
 // ENG-2819: "there is nothing to draft" / "remove the do-not-contact flag first" =
 // update_email_draft_for_lead's no-contact-channel skip (ENG-2082) and DNC guard.
 // ENG-2907: read_google_doc refusing a non-Google URL is input validation.
+// ENG-3152: "acts on the owner's organization settings or memory" = the ENG-2816 share-visitor restriction refusing an owner-settings tool;
+// "organization membership required" = a user with no org calling an org-settings tool. Both are authorization outcomes, not handler bugs.
 const BY_DESIGN_RE =
-  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf|the publisher refused this fetch|only the list owner, the org owner, or a listed crm editor|is not a member of the page owner's organization|"state":"(?:unverified|blocked_by_[a-z_]+)"|refused to send: the linkedin profile at \S+ does not appear to belong to this lead|there is nothing to draft|read_google_doc only reads google files|remove the do-not-contact flag first|net::err_(?:empty_response|connection_refused|connection_reset|connection_closed)/i;
+  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf|the publisher refused this fetch|only the list owner, the org owner, or a listed crm editor|is not a member of the page owner's organization|"state":"(?:unverified|blocked_by_[a-z_]+)"|refused to send: the linkedin profile at \S+ does not appear to belong to this lead|there is nothing to draft|read_google_doc only reads google files|remove the do-not-contact flag first|acts on the owner's organization settings or memory|organization membership required|net::err_(?:empty_response|connection_refused|connection_reset|connection_closed)/i;
 
 // "too long (N chars)" = an argument-length constraint (e.g. the LinkedIn 200/300
 // invite-note limit) — an arg validation, not a tool defect.
@@ -146,7 +148,7 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   //    it belongs here rather than 'config'. 'missing_brand_logo' (ENG-1844) = the
   //    generate/duplicate brand-logo gate correctly refused an invented-logo page —
   //    the tool worked exactly as designed. None of these are a tool bug.
-  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused' || cls === 'missing_brand_logo') return 'by_design';
+  if (cls === 'toolrestrictiondenied' || cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused' || cls === 'missing_brand_logo') return 'by_design';
   if (BY_DESIGN_RE.test(msg)) return 'by_design';
 
   // 3. Arguments rejected by schema validation before execution.

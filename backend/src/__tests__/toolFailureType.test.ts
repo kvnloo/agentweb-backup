@@ -319,4 +319,18 @@ describe('ENG-2583 — unconnected integrations / unconfigured resources / CRM r
     expect(classifyToolFailureType('Error',
       'This HubSpot connection was authorised for CRM access only, so it cannot read or write EMAIL (a Marketing Hub object).')).toBe('config');
   });
+  // ENG-3152/ENG-3154: authorization refusals are the guard working, not tool bugs.
+  it('classifies a share-visitor tool restriction refusal as by_design (ENG-3152)', () => {
+    const m = 'Tool "get_lead_notification_settings" acts on the owner\'s organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.';
+    expect(classifyToolFailureType('ToolRestrictionDenied', m)).toBe('by_design');
+    expect(classifyToolFailureType('Error', m)).toBe('by_design');
+  });
+
+  it('classifies "Organization membership required" as by_design (ENG-3152)', () => {
+    expect(classifyToolFailureType('Error', 'Organization membership required')).toBe('by_design');
+  });
+
+  it('still treats an unrelated Error as bug', () => {
+    expect(classifyToolFailureType('Error', 'Stored lead notification settings are invalid')).toBe('bug');
+  });
 });
