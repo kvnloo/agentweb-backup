@@ -9,11 +9,11 @@
  *
  * Re-record (only when a prompt change is intended, never in a pure refactor): UPDATE_GOLDEN=1 npx jest <this file>
  */
-import { ANONYMOUS_SHARE_MARKER } from '../utils/anonymousShareProvenance';
 import { createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { AgentModeService } from '../services/agentModeService';
+import { ANONYMOUS_SHARE_MARKER } from '../utils/anonymousShareProvenance';
 
 jest.mock('openai');
 jest.mock('../services/settingsService');
