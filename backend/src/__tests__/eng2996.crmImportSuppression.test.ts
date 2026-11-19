@@ -119,6 +119,16 @@ describe('applyLeadImportFollowups', () => {
     expect(db.updateLead).not.toHaveBeenCalled();
   });
 
+  it('does NOT inherit from a lead that only CLAIMS this owner: the owner is the owner of the list the lead sits in (a caller can supply userId when creating a lead)', async () => {
+    db.findAllLeadsByEmail.mockResolvedValue([
+      // Planted by another tenant in THEIR list ("other-list" belongs to someone-else) with this owner's id written into the lead.
+      { leadId: 'planted', listId: 'other-list', userId: OWNER, email: 'ann@acme.com', contactStatus: 'do-not-contact', contactStatusReason: 'whatever-the-planter-wrote' },
+    ] as any);
+    const r = await applyLeadImportFollowups('L1', OWNER, [{ leadId: 'a', email: 'ann@acme.com' }], { actingUserId: OWNER });
+    expect(r.inheritedDoNotContact).toEqual([]);
+    expect(db.updateLead).not.toHaveBeenCalled();
+  });
+
   it('a failed do-not-contact lookup is counted, never silently treated as clear, and does not throw', async () => {
     db.findAllLeadsByEmail.mockRejectedValue(new Error('ddb down'));
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
