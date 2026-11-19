@@ -43,6 +43,7 @@ import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, typ
 import { logZomaSetup } from '../mcp/zomaSetupLog';
 import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 import { recordWeeklyReportOptOut, verifyUnsubscribeToken } from '../mcp/zomaWeeklyReport';
+import { MEASUREMENT_UNSUBSCRIBE_CONTEXT, stopAllReportSchedules } from '../mcp/zomaReportSchedule';
 
 export const ZOMA_SETUP_MAX_PER_MINUTE = 10;
 export const ZOMA_POLL_MAX_PER_MINUTE = 60;
@@ -310,6 +311,35 @@ export function createZomaRouter(
     } catch (error) {
       logZomaSetup({ step: 'weekly_report_opt_out', outcome: 'error', reason: error });
       return page(res, 500, 'Weekly Zoma email', '<p>We could not record that just now. Open the link again in a moment, or write to support@agentweb.pro and we will stop the weekly email for you.</p>');
+    }
+  });
+
+  // ENG-3155: the measurement-report email's signed opt-out. GET only shows a button (mail scanners
+  // that open links change nothing); POST stops every measurement-report schedule of the user.
+  router.get('/measurement-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), (req: Request, res: Response) => {
+    const token = typeof req.query.t === 'string' ? req.query.t : '';
+    if (!verifyUnsubscribeToken(token, undefined, MEASUREMENT_UNSUBSCRIBE_CONTEXT)) {
+      return page(res, 400, 'Zoma measurement report', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the measurement report for you.</p>');
+    }
+    return page(
+      res,
+      200,
+      'Zoma measurement report',
+      `<p>Stop the Zoma measurement report emails?</p><form method="post" action="/api/zoma/measurement-report/unsubscribe"><input type="hidden" name="t" value="${escapeHtml(token)}"><button type="submit">Unsubscribe</button></form>`,
+    );
+  });
+
+  router.post('/measurement-report/unsubscribe', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    const userId = verifyUnsubscribeToken(req.body?.t ?? req.query?.t, undefined, MEASUREMENT_UNSUBSCRIBE_CONTEXT);
+    if (!userId) {
+      return page(res, 400, 'Zoma measurement report', '<p>This unsubscribe link is not valid. Write to support@agentweb.pro and we will stop the measurement report for you.</p>');
+    }
+    try {
+      await stopAllReportSchedules(userId);
+      return page(res, 200, 'Unsubscribed', '<p>You will not get the Zoma measurement report any more. Your agent can turn it back on with zoma_report_schedule.</p>');
+    } catch (error) {
+      logZomaSetup({ step: 'measurement_report_opt_out', outcome: 'error', reason: error });
+      return page(res, 500, 'Zoma measurement report', '<p>We could not record that just now. Open the link again in a moment, or write to support@agentweb.pro and we will stop it for you.</p>');
     }
   });
 
