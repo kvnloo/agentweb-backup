@@ -31,6 +31,7 @@ import { createHash } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { performContentReplacements } from './shared/contentReplacements';
 import { makeToolUsageCallback } from './shared/toolUsageMetering';
+import { CALLER_URL_MAX_TEXT_BYTES, fetchCallerUrlText } from '../../utils/callerUrlFetch';
 
 export async function listBooks(userId: string, type?: string, status?: string): Promise<any> {
   try {
@@ -427,13 +428,10 @@ export async function generateBookContent(
     if (researchUrl) {
       try {
         console.log('AgentMode: Fetching research content from S3:', researchUrl);
-        const response = await fetch(researchUrl);
-        if (response.ok) {
-          researchContent = await response.text();
-          console.log(`AgentMode: Fetched ${researchContent.length} characters of research content`);
-        } else {
-          console.warn('AgentMode: Failed to fetch research content from S3:', response.status);
-        }
+        // The URL is the caller's: fetched only through the guarded fetch (public addresses only, redirects re-checked, size and time
+        // bounded). The research text is optional context, so any failure, a refused URL included, leaves it empty as before.
+        researchContent = await fetchCallerUrlText(researchUrl, { tool: 'generate_book_content', userId, maxBytes: CALLER_URL_MAX_TEXT_BYTES });
+        console.log(`AgentMode: Fetched ${researchContent.length} characters of research content`);
       } catch (fetchError) {
         console.error('AgentMode: Error fetching research content:', fetchError);
       }
