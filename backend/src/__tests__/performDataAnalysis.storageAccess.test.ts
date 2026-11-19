@@ -324,4 +324,40 @@ describe('perform_data_analysis: what the server may read for the caller', () =>
       expect(readS3).not.toHaveBeenCalled();
     });
   });
+  // ENG-3151: the model wraps a real tool-responses key in an invented bucket host (agentweb-tool-responses-prod, aw-team-internal-storage,
+  // bare s3.amazonaws.com ...), which 404s. The key is what matters, and it goes through the same ownership rule as a bare key.
+  describe('tool-response keys wrapped in an amazonaws.com URL', () => {
+    const wrapped = (host: string, session: string) => `https://${host}/tool-responses/${session}/call_1.txt`;
+
+    it.each([
+      ['agentweb-tool-responses-prod.s3.us-east-1.amazonaws.com'],
+      ['aw-team-internal-storage.s3.amazonaws.com'],
+      ['s3.amazonaws.com'],
+    ])('reads the caller\'s own key by key, not by the invented host (%s)', async (host) => {
+      const r = await performDataAnalysis([wrapped(host, MY_SESSION)], 'summarise', 'me');
+      expect(readS3).toHaveBeenCalledWith(`tool-responses/${MY_SESSION}/call_1.txt`);
+      expect(get).not.toHaveBeenCalled();
+      expect(r.success).not.toBe(false);
+    });
+
+    it('refuses another user\'s key wrapped the same way, and reads nothing', async () => {
+      const r = await performDataAnalysis([wrapped('s3.amazonaws.com', OTHER_SESSION)], 'summarise', 'me');
+      refused(r);
+      expect(readS3).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    it('does not rewrite a key that traverses out of the tool-responses folder', async () => {
+      // The URL parser resolves the dots, so the path is no longer a tool-responses key: nothing is read by key (a plain download, as before).
+      await performDataAnalysis([`https://s3.amazonaws.com/tool-responses/${MY_SESSION}/../../users/other/files/1/abc/secret.csv`], 'summarise', 'me');
+      expect(readS3).not.toHaveBeenCalled();
+    });
+
+    it('leaves a URL on a non-Amazon host alone (a plain download)', async () => {
+      get.mockResolvedValue({ data: Buffer.from('a,b\n1,2'), status: 200, headers: {} });
+      await performDataAnalysis([wrapped('example.com', MY_SESSION)], 'summarise', 'me');
+      expect(readS3).not.toHaveBeenCalled();
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+  });
 });

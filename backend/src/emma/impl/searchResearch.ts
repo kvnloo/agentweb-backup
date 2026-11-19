@@ -310,6 +310,22 @@ function isDownloadTimeout(error: unknown): boolean {
   return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
 }
 
+/**
+ * ENG-3151: the model often turns a tool-response key it was shown ("tool-responses/<uuid>/call_N.txt") into a URL by guessing the
+ * bucket host (agentweb-tool-responses-prod.s3..., aw-team-internal-storage.s3..., bare s3.amazonaws.com). Every guess 404s. When an
+ * https URL on an amazonaws.com host carries a tool-responses key as its path, return that key so it is read like a bare key, under the
+ * same ownership check. Any other URL, and any path that is not exactly a tool-responses key, returns null (a plain download as before).
+ */
+function toolResponseKeyFromAmazonUrl(fileUrl: string): string | null {
+  let u: URL;
+  try { u = new URL(fileUrl); } catch { return null; }
+  if (u.protocol !== 'https:' || !/(^|\.)amazonaws\.com$/i.test(u.hostname)) return null;
+  let key: string;
+  try { key = decodeURIComponent(u.pathname.replace(/^\/+/, '')); } catch { return null; }
+  if (!/^tool-responses\/[a-z0-9-]{36}\/[^/]+$/i.test(key)) return null;
+  return key;
+}
+
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
@@ -568,23 +584,25 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
         // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
         const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
-        if (bareS3KeyPattern.test(fileUrl)) {
-          const bareDecision = await fileAccess.check(fileUrl);
+        // ENG-3151: also a key the model wrapped in an invented amazonaws.com host.
+        const toolResponseKey = toolResponseKeyFromAmazonUrl(fileUrl) ?? fileUrl;
+        if (bareS3KeyPattern.test(toolResponseKey)) {
+          const bareDecision = await fileAccess.check(toolResponseKey);
           if (bareDecision !== 'allow') return bareDecision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(fileUrl);
+            s3Content = await getS3ObjectAsString(toolResponseKey);
           } catch (s3Err) {
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
-              message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              message: `Cannot read tool-response file "${toolResponseKey}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
             };
           }
           if (!s3Content) {
             return {
               success: false,
-              message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              message: `Tool-response file "${toolResponseKey}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
             };
           }
           const contentBuffer = Buffer.from(s3Content, 'utf-8');
