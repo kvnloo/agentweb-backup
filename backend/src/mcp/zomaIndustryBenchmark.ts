@@ -288,7 +288,7 @@ export async function classifyIndustryWithLlm(
   }
 }
 
-async function classifyFromAdDestinations(account: ConnectedAccount, accountId: string, userId: string): Promise<IndustryClassification> {
+export async function classifyFromAdDestinations(account: ConnectedAccount, accountId: string, userId: string): Promise<IndustryClassification> {
   const token = (account.config as any)?.access_token;
   if (typeof token !== 'string' || !token) return { industry: null, basis: null };
   const params = new URLSearchParams({

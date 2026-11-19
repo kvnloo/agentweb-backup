@@ -44,6 +44,8 @@ export const NEW_DELIVERY_CAVEAT =
 export const NEW_DELIVERY_DAYS = 7;
 /** The exact 'vs. industry' line when there is no published benchmark row (ENG-3156 table). */
 export const INDUSTRY_BENCHMARK_NA_LINE = 'Industry benchmark: N/A';
+/** How the agent sets or corrects the industry (stored on the report schedule, used by scheduled and on-demand reports). */
+const SET_INDUSTRY_HINT = 'Agent: set or correct it with zoma_report_schedule (action SET_INDUSTRY, industry), or pass industry to zoma_measurement_report.';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRESET_DAYS = { last_7d: 7, last_14d: 14, last_30d: 30, last_90d: 90 } as const;
@@ -69,7 +71,7 @@ export const ZOMA_MEASUREMENT_REPORT_DEFINITION = {
       since: { type: 'string', description: 'Start date YYYY-MM-DD (inclusive). Needs until.' },
       until: { type: 'string', description: 'End date YYYY-MM-DD (inclusive). Needs since.' },
       account_id: { type: 'string', description: 'Meta ad account id; needed only when more than one is connected.' },
-      industry: { type: 'string', enum: [...BENCHMARK_INDUSTRIES], description: "The user's industry, for the vs. industry CPA line. Omit when unknown: the line is then N/A and asks the user for it." },
+      industry: { type: 'string', enum: [...BENCHMARK_INDUSTRIES], description: "The user's industry, for the vs. industry CPA line. Omit to use the industry stored on the report schedule (zoma_report_schedule SET_INDUSTRY); with none stored the line is N/A and asks the user for it." },
     },
     additionalProperties: false,
   },
@@ -331,10 +333,16 @@ export function measurementIndustryBenchmark(input: {
     return { ...base, line: `Industry benchmark: not compared. ${NEW_DELIVERY_CAVEAT}`, note: NEW_DELIVERY_CAVEAT };
   }
   if (!input.industry) {
-    return { ...base, line: INDUSTRY_BENCHMARK_NA_LINE, note: `Tell us your industry (one of: ${BENCHMARK_INDUSTRIES.join(', ')}) to compare your CPA with an industry benchmark.` };
+    return {
+      ...base,
+      line: INDUSTRY_BENCHMARK_NA_LINE,
+      note: `Tell us your industry (one of: ${BENCHMARK_INDUSTRIES.join(', ')}) to compare your CPA with an industry benchmark. ${SET_INDUSTRY_HINT}`,
+    };
   }
   const row = kpi ? getIndustryBenchmark(input.industry, 'meta', kpi) : null;
-  if (!row) return { ...base, line: INDUSTRY_BENCHMARK_NA_LINE, note: null };
+  if (!row) {
+    return { ...base, line: INDUSTRY_BENCHMARK_NA_LINE, note: `No published ${kpi ?? 'conversion'} benchmark for the ${input.industry} industry. If that industry is wrong: ${SET_INDUSTRY_HINT}` };
+  }
   const benchmark: BenchmarkFigure = {
     cpa: row.cpa, currency: row.currency, metric: row.metric, source_name: row.sourceName, year: row.year, url: row.url, table_version: INDUSTRY_BENCHMARK_TABLE_VERSION,
   };

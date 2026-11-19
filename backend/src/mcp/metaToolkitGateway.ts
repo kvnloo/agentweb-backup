@@ -50,7 +50,15 @@ import { zomaWriteKindFor } from '../services/zomaWriteKind';
 import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
 import { isZomaIndustryBenchmarkTool, runZomaIndustryBenchmark } from './zomaIndustryBenchmark';
 import { isZomaMeasurementReportTool, measurementReportsEnabled, runZomaMeasurementReport } from './zomaMeasurementReport';
-import { enrollReportSchedule, isReportScheduleWrite, isZomaReportScheduleTool, runZomaReportScheduleTool, type ScheduleNotice } from './zomaReportSchedule';
+import {
+  defaultClassifyIndustry,
+  enrollReportSchedule,
+  isReportScheduleWrite,
+  isZomaReportScheduleTool,
+  runZomaReportScheduleTool,
+  type ScheduleNotice,
+  storedIndustry,
+} from './zomaReportSchedule';
 import crypto from 'crypto';
 import { assertZomaPublishAllowed, isBillableResult, isZomaPublishWrite, reportZomaBillableCall } from './zomaBilling';
 
@@ -152,8 +160,13 @@ export interface MetaToolkitGatewayDeps {
   runMeasurementReport?: (userId: string, account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
   /** ENG-3155 zoma_report_schedule; defaults to runZomaReportScheduleTool. */
   runReportScheduleTool?: (userId: string, args: any) => Promise<any>;
-  /** ENG-3155 auto-enrollment after a confirmed launch; defaults to enrollReportSchedule (null while the flag is off). */
+  /**
+   * ENG-3155 auto-enrollment after a confirmed launch; defaults to enrollReportSchedule (null while the flag is off)
+   * with a one-time background industry classification when none is stored.
+   */
   enrollReportSchedule?: (userId: string, adAccountId: string) => Promise<ScheduleNotice | null>;
+  /** ENG-3155 the industry stored on the account's report schedule (null when none or unreadable); defaults to storedIndustry. */
+  getStoredIndustry?: (userId: string, adAccountId: string) => Promise<string | null>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -609,7 +622,10 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
     );
     if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
-    const report = await (deps.runMeasurementReport ?? runZomaMeasurementReport)(caller.userId, account, accountId, args);
+    // Caller omitted the industry: use the one stored on the report schedule (user-set or classified), if any.
+    const industry = args.industry === undefined ? await (deps.getStoredIndustry ?? storedIndustry)(caller.userId, accountId) : null;
+    const reportArgs = industry ? { ...args, industry } : args;
+    const report = await (deps.runMeasurementReport ?? runZomaMeasurementReport)(caller.userId, account, accountId, reportArgs);
     await meter('meta');
     journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
     return stripCredentials(report);
@@ -729,7 +745,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     // is off). A schedule failure is logged and never makes the executed write look failed.
     if (!audienceTool && !creativeAsset && !lifecycle && isZomaPublishWrite('meta', args) && result?.verification === 'CONFIRMED') {
       try {
-        const notice = await (deps.enrollReportSchedule ?? enrollReportSchedule)(caller.userId, accountId);
+        const notice = await (deps.enrollReportSchedule ?? ((u, a) => enrollReportSchedule(u, a, { classifyIndustry: defaultClassifyIndustry })))(caller.userId, accountId);
         if (notice) result.report_schedule = notice;
       } catch (error) {
         console.error('[meta-toolkit] measurement report enrollment failed:', error instanceof Error ? error.message : error);
