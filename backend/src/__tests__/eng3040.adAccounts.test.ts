@@ -132,12 +132,21 @@ describe('ENG-3040 ads_get_ad_accounts', () => {
   });
 
   describe('through the toolkit gateway', () => {
+    // Each listed connection is read with its own token (like zoma_ads_report), straight from Graph.
+    let fetchSpy: jest.SpyInstance;
+    const graphReads = () => fetchSpy.mock.calls.map((c) => new URL(String(c[0])));
+    beforeEach(() => {
+      fetchSpy = jest.spyOn(global, 'fetch' as any).mockImplementation(async () => ({ ok: true, status: 200, json: async () => GRAPH }) as any);
+    });
+    afterEach(() => fetchSpy.mockRestore());
+
     it('lists both connected accounts when several are connected, and meters once', async () => {
-      readGraph.mockResolvedValue(GRAPH);
       const deps = makeDeps();
       const out: any = await call(deps);
       expect(out.accounts.map((a: any) => a.account_id)).toEqual(['111', '222']);
-      expect(readGraph.mock.calls.map((c) => [c[0], c[1], c[2]])).toEqual([['user-1', '111', 'act_111'], ['user-1', '222', 'act_222']]);
+      expect(graphReads().map((u) => u.pathname.split('/').pop())).toEqual(['act_111', 'act_222']);
+      expect(graphReads()[0].searchParams.get('fields')).toBe(AD_ACCOUNT_LIST_FIELDS);
+      expect(readGraph).not.toHaveBeenCalled();
       expect(deps.recordUsage).toHaveBeenCalledTimes(1);
       expect((deps.recordUsage as jest.Mock).mock.calls[0][0]).toMatchObject({ toolName: 'ads_get_ad_accounts', platform: 'meta', userId: 'user-1' });
       expect(deps.execute).not.toHaveBeenCalled();
@@ -145,7 +154,6 @@ describe('ENG-3040 ads_get_ad_accounts', () => {
     });
 
     it('leaves out a revoked or expired connection and anything that is not a Meta ad account', async () => {
-      readGraph.mockResolvedValue(GRAPH);
       const deps = makeDeps({
         listAccounts: jest.fn().mockResolvedValue([
           metaAccount('111'),
@@ -156,19 +164,18 @@ describe('ENG-3040 ads_get_ad_accounts', () => {
       });
       const out: any = await call(deps);
       expect(out.accounts.map((a: any) => a.account_id)).toEqual(['111']);
-      expect(readGraph).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
 
     it('an aw_ key without tools:read gets 403 before any account list or Graph read, unmetered', async () => {
       const deps = makeDeps({ validateApiKey: jest.fn().mockResolvedValue({ userId: 'user-1', keyId: 'key-1', scopes: ['resources:read'] }) });
       await expect(call(deps)).rejects.toMatchObject({ status: 403 });
       expect(deps.listAccounts).not.toHaveBeenCalled();
-      expect(readGraph).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
       expect(deps.recordUsage).not.toHaveBeenCalled();
     });
 
     it('a read-only aw_ key (tools:read) may call it', async () => {
-      readGraph.mockResolvedValue(GRAPH);
       const deps = makeDeps({ validateApiKey: jest.fn().mockResolvedValue({ userId: 'user-1', keyId: 'key-1', scopes: ['tools:read'] }) });
       await expect(call(deps)).resolves.toMatchObject({ count: 2 });
     });
@@ -176,7 +183,7 @@ describe('ENG-3040 ads_get_ad_accounts', () => {
     it('an account_id argument is refused and not metered: the tool cannot be pointed at another account', async () => {
       const deps = makeDeps();
       await expect(call(deps, { account_id: '999' })).rejects.toThrow(/takes no arguments/);
-      expect(readGraph).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
       expect(deps.recordUsage).not.toHaveBeenCalled();
     });
 

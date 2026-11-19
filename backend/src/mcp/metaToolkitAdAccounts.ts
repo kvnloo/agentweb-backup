@@ -33,15 +33,31 @@ export interface ConnectedAdAccount {
   accountId: string;
   name?: string;
   currency?: string;
+  /** That connection's own access token (never returned to the caller). */
+  accessToken?: string;
 }
 
 export interface MetaAdAccountsDeps {
   /** Read-only Graph GET of the account's own `act_<id>` node with that connection's token. */
-  readAccount: (userId: string, accountId: string, fields: string) => Promise<any>;
+  readAccount: (userId: string, accountId: string, fields: string, accessToken?: string) => Promise<any>;
 }
 
 const defaultDeps: MetaAdAccountsDeps = {
-  readAccount: async (userId, accountId, fields) => {
+  readAccount: async (userId, accountId, fields, accessToken) => {
+    // Read with the listed connection's own token, like zoma_ads_report, so each account is
+    // read with the credential that connected it (not a re-resolved "default" account).
+    if (accessToken) {
+      const base = `https://graph.facebook.com/${process.env.META_API_VERSION || 'v25.0'}`;
+      const params = new URLSearchParams({ fields, access_token: accessToken });
+      const res = await fetch(`${base}/act_${accountId}?${params.toString()}`, { signal: AbortSignal.timeout(20000) });
+      const body: any = await res.json().catch(() => ({}));
+      if (!res.ok || body?.error) {
+        const err: any = new Error(String(body?.error?.message || `HTTP ${res.status}`));
+        err.metaError = body?.error ? { code: body.error.code, message: body.error.message } : null;
+        throw err;
+      }
+      return body;
+    }
     const { agentModeService } = await import('../services/agentModeService');
     return agentModeService.readToolkitMetaPagesGraph(userId, accountId, `act_${accountId}`, { fields });
   },
@@ -68,7 +84,9 @@ export async function runMetaAdAccountsTool(
   let firstError = '';
   const accounts = await Promise.all(listed.map(async (a) => {
     try {
-      const raw = await deps.readAccount(userId, a.accountId, AD_ACCOUNT_LIST_FIELDS);
+      const raw = a.accessToken
+        ? await deps.readAccount(userId, a.accountId, AD_ACCOUNT_LIST_FIELDS, a.accessToken)
+        : await deps.readAccount(userId, a.accountId, AD_ACCOUNT_LIST_FIELDS);
       const code = Number(raw?.account_status);
       return {
         account_id: a.accountId,

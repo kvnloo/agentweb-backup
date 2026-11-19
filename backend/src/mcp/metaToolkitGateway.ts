@@ -604,7 +604,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       const now = deps.now();
       const connected = (await deps.listAccounts(caller.userId))
         .filter((a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, now))
-        .map((a) => ({ accountId: META_PROVIDER.accountIds(a)[0], name: (a as any).account_name, currency: (a.config as any)?.currency }))
+        .map((a) => ({ accountId: META_PROVIDER.accountIds(a)[0], name: (a as any).account_name, currency: (a.config as any)?.currency, accessToken: (a.config as any)?.access_token }))
         .filter((a) => !!a.accountId);
       const result = await (deps.runAdAccountsTool ?? runMetaAdAccountsTool)(caller.userId, connected, args);
       await meter('meta');
