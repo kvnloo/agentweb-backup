@@ -13,6 +13,7 @@ import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { SERVER_OWNED_LEAD_KEYS } from '../../utils/leadWriteGuard';
+import { isDoNotContact } from '../../utils/leadContactStatus';
 
 /** Most rows one add or delete call handles (the same cap Emma's bulk tools use). */
 export const MAX_LEAD_ROWS_PER_CALL = 100;
@@ -31,7 +32,35 @@ export const ROW_WORK_BUDGET_MS = 90_000;
 export const MCP_LEAD_STANDARD_FIELDS: ReadonlySet<string> = new Set([
   'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency',
   'lifecycle', 'selectedSenderId', 'website', 'companyLinkedin',
+  // CRM fields the verbatim forward used to let through and the create/update layer validates itself (priority, role, lifecycle and the scores are
+  // checked by validateLeadCrmExtensions): accepted, so an existing caller that sets them keeps working.
+  'domain', 'pocEmails', 'priority', 'role', 'isPrimary', 'expectedClose', 'closedDate', 'heatScore', 'healthScore',
 ]);
+
+const TEXT_FIELDS: ReadonlySet<string> = new Set([
+  'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealCurrency', 'lifecycle', 'selectedSenderId',
+  'website', 'companyLinkedin', 'domain', 'priority', 'role', 'expectedClose', 'closedDate',
+]);
+const NUMBER_FIELDS: ReadonlySet<string> = new Set(['dealValue', 'heatScore', 'healthScore']);
+const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(['isPrimary']);
+const MAX_POC_EMAILS = 50;
+
+/**
+ * A standard field of the wrong type is refused here: the update route records a status change with the value as given BEFORE the write is
+ * validated, so an object in `status` would leave a malformed engagement on the lead (and fail the write). null clears a field, except `status`.
+ */
+function valueProblem(key: string, value: unknown): string | null {
+  if (key === 'status' && (typeof value !== 'string' || !value.trim())) return 'status (must be non-empty text)';
+  if (value === null) return null;
+  if (key === 'pocEmails') {
+    return Array.isArray(value) && value.length <= MAX_POC_EMAILS && value.every((v) => typeof v === 'string')
+      ? null : `pocEmails (must be a list of at most ${MAX_POC_EMAILS} email strings)`;
+  }
+  if (TEXT_FIELDS.has(key)) return typeof value === 'string' ? null : `${key} (must be text)`;
+  if (NUMBER_FIELDS.has(key)) return typeof value === 'number' && Number.isFinite(value) ? null : `${key} (must be a number)`;
+  if (BOOLEAN_FIELDS.has(key)) return typeof value === 'boolean' ? null : `${key} (must be true or false)`;
+  return null; // drafts: checked by the route
+}
 
 /** Saved by an update. The create path never stores them (createLead builds the lead from a fixed field list), so on add they would be dropped while the call reported success. */
 const DRAFT_FIELDS: ReadonlySet<string> = new Set(['emailDraft', 'messageDraft', 'emailDraftFormat']);
@@ -53,7 +82,10 @@ const CONTACT_STATUS_KEYS = [
 /** Whose lead it is, and where it lives: always taken from the authenticated caller and the list in the request, never from the body. */
 const IDENTITY_KEYS = ['userId', 'user_id', 'tenantId', 'accountOwnerUserId', 'orgId', 'listId', 'leadId', 'client_id', 'clientId'];
 
-const REFUSED_LEAD_KEYS: ReadonlySet<string> = new Set([...SERVER_OWNED_LEAD_KEYS, ...CONTACT_STATUS_KEYS, ...IDENTITY_KEYS]);
+/** Links to other records (a deal id from another account would be stored as given) and enrichment results the system computes. */
+const SYSTEM_OWNED_KEYS = ['dealIds', 'icpMatch', 'enrichmentMetadata'];
+
+const REFUSED_LEAD_KEYS: ReadonlySet<string> = new Set([...SERVER_OWNED_LEAD_KEYS, ...CONTACT_STATUS_KEYS, ...IDENTITY_KEYS, ...SYSTEM_OWNED_KEYS]);
 
 /** A custom field name that could reach the prototype of the object it is merged into. */
 const UNSAFE_FIELD_NAMES: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
@@ -107,7 +139,9 @@ export function classifyLeadFields(input: unknown, opts: { forAdd?: boolean } = 
       if (opts.forAdd) out.refused.push(key);
       else out.standard[key] = value;
     } else if (MCP_LEAD_STANDARD_FIELDS.has(key)) {
-      out.standard[key] = value;
+      const problem = valueProblem(key, value);
+      if (problem) out.refused.push(problem);
+      else out.standard[key] = value;
     } else if (key === 'customFields') {
       if (!isPlainObject(value)) {
         out.refused.push('customFields (must be an object)');
@@ -133,9 +167,9 @@ function refusalError(action: string, refused: string[]): Error {
     hints.push('Drafts are saved with an update after the lead exists.');
   }
   return new Error(
-    `manage_leads ${action}: these fields cannot be set through this tool: ${refused.join(', ')}. ` +
-    'A lead is suppressed by setting status to "do-not-contact" (it cannot be reversed here); who owns a lead, its sync data and its contact status ' +
-    'are set by the system. To store your own data under one of these names, put it inside customFields.' +
+    `manage_leads ${action}: these fields cannot be set as given (refused or not valid): ${refused.join(', ')}. ` +
+    'A lead is suppressed by setting status to "do-not-contact" (it cannot be reversed with this tool); who owns a lead, its sync data, its links to deals, ' +
+    'its enrichment data and its contact status are set by the system. To store your own data under one of these names, put it inside customFields.' +
     (hints.length > 0 ? ` ${hints.join(' ')}` : '')
   );
 }
@@ -157,6 +191,7 @@ export function isDoNotContactStatus(status: unknown): boolean {
 
 /** The body for one lead being created: standard fields plus a customFields object when there are any. Throws, naming the keys, when any is refused. */
 export function buildLeadCreateBody(lead: unknown): Record<string, unknown> {
+  if (!isPlainObject(lead)) throw new Error('manage_leads add: a lead must be an object with fields (e.g. { email, firstName }).');
   const { standard, custom, refused } = classifyLeadFields(lead, { forAdd: true });
   if (refused.length > 0) throw refusalError('add', refused);
   if (isDoNotContactStatus(standard.status)) {
@@ -196,13 +231,15 @@ async function storedCustomFields(listId: string, leadId: string): Promise<unkno
   let stored: any;
   try {
     const { crmDb } = await import('../../services/db');
-    stored = await crmDb.getLeadById(listId, leadId);
+    // Consistent: the merged map is written back whole, so a stale read would silently delete the keys another call just saved (or the email
+    // validation result a just-added lead gets from the background job).
+    stored = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
   } catch (err) {
     console.error('[MCP] manage_leads update: could not read the stored lead:', (err as Error)?.message);
     throw new Error('manage_leads update: the lead could not be read, so its custom fields were not changed. Nothing was saved; try again.');
   }
   if (!stored) throw new Error('manage_leads update: the lead could not be found when its custom fields were read. Nothing was saved.');
-  return stored.customFields;
+  return stored.customFields ?? {};
 }
 
 /**
@@ -232,6 +269,15 @@ export async function executeLeadUpdate(args: any, c: any): Promise<any> {
     Object.assign(body, suppressionContactStatusUpdates(standard.status, existing, actingUserOf(c)));
   }
   const data = await mcpFetch({ method: 'PUT', path: leadPath(listId, args.lead_id), context: c, body });
+  // Changing a lead's address to one the owner already marked do-not-contact must not make it sendable (the same inheritance as an add).
+  if (typeof standard.email === 'string' && standard.email.trim()) {
+    const followups = await applyDoNotContactInheritance(listId, [{ leadId: args.lead_id, email: standard.email }], c);
+    return jsonResult({
+      ...data,
+      ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: true } : {}),
+      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed, doNotContactUnchecked: followups.uncheckedLeadIds } : {}),
+    });
+  }
   return jsonResult(data);
 }
 
@@ -258,6 +304,8 @@ function rowList(value: unknown, what: string, action: string): unknown[] {
 interface Followups {
   inheritedDoNotContact: string[];
   doNotContactCheckFailed: number;
+  /** When any check failed, which leads were not checked (all of them: the service counts failures, it does not say which). */
+  uncheckedLeadIds: string[];
 }
 
 /**
@@ -274,15 +322,19 @@ export async function applyDoNotContactInheritance(
   actingUserId: string = actingUserOf(c),
 ): Promise<Followups> {
   const withLeadId = created.filter((l) => typeof l.leadId === 'string' && l.leadId);
-  if (withLeadId.length === 0) return { inheritedDoNotContact: [], doNotContactCheckFailed: 0 };
+  if (withLeadId.length === 0) return { inheritedDoNotContact: [], doNotContactCheckFailed: 0, uncheckedLeadIds: [] };
   try {
     const list = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}`, context: c });
     const { applyLeadImportFollowups } = await import('../../services/leadImportFollowups');
     const result = await applyLeadImportFollowups(listId, list?.userId ?? actingUserOf(c), withLeadId, { actingUserId, validate: false });
-    return { inheritedDoNotContact: result.inheritedDoNotContact, doNotContactCheckFailed: result.doNotContactCheckFailed };
+    return {
+      inheritedDoNotContact: result.inheritedDoNotContact,
+      doNotContactCheckFailed: result.doNotContactCheckFailed,
+      uncheckedLeadIds: result.doNotContactCheckFailed > 0 ? withLeadId.map((l) => l.leadId) : [],
+    };
   } catch (err) {
     console.error('[MCP] manage_leads add: do-not-contact check failed:', (err as Error)?.message);
-    return { inheritedDoNotContact: [], doNotContactCheckFailed: withLeadId.length };
+    return { inheritedDoNotContact: [], doNotContactCheckFailed: withLeadId.length, uncheckedLeadIds: withLeadId.map((l) => l.leadId) };
   }
 }
 
@@ -296,7 +348,11 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
   const rows = rowList(args.leads, 'leads', 'add');
   const bodies = rows.map((row, i) => {
     if (!isPlainObject(row)) throw new Error(`manage_leads add: row ${i} must be an object with fields (e.g. { email, firstName }).`);
-    return buildLeadCreateBody(row);
+    try {
+      return buildLeadCreateBody(row);
+    } catch (err) {
+      throw new Error(rows.length > 1 ? `${(err as Error).message} (row ${i})` : (err as Error).message);
+    }
   });
   if (bodies.length === 1) {
     const lead = await mcpFetch({ method: 'POST', path: leadPath(listId), context: c, body: bodies[0] });
@@ -304,7 +360,7 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
     return jsonResult({
       ...lead,
       ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: true } : {}),
-      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
+      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed, doNotContactUnchecked: followups.uncheckedLeadIds } : {}),
     });
   }
   const started = Date.now();
@@ -338,6 +394,7 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
   return summarise('add', results, 'created', {
     inheritedDoNotContact: followups.inheritedDoNotContact,
     doNotContactCheckFailed: followups.doNotContactCheckFailed,
+    ...(followups.doNotContactCheckFailed > 0 ? { doNotContactUnchecked: followups.uncheckedLeadIds } : {}),
   });
 }
 
@@ -347,7 +404,12 @@ export async function executeLeadAdd(args: any, c: any, opts: { budgetMs?: numbe
  * same route, so its access rules apply) and a missing one is a 404, not a success.
  */
 async function deleteExistingLead(listId: string, leadId: string, c: any): Promise<any> {
-  await mcpFetch({ method: 'GET', path: leadPath(listId, leadId), context: c });
+  const lead = await mcpFetch({ method: 'GET', path: leadPath(listId, leadId), context: c });
+  // The opt-out lives on the lead. Deleting it would let the same address be added again as a sendable lead (an add inherits the flag only from
+  // another lead that still exists), so a lead marked do-not-contact is not deleted through this tool.
+  if (lead && isDoNotContact(lead)) {
+    throw new Error('This lead is marked do-not-contact. Deleting it would let the same address be added again as a sendable lead, so it is not deleted here; remove it in the app if that is really intended.');
+  }
   return mcpFetch({ method: 'DELETE', path: leadPath(listId, leadId), context: c });
 }
 
@@ -433,6 +495,17 @@ export async function executeLeadListUpdate(args: any, c: any): Promise<any> {
   }
   if (Object.keys(body).length === 0 && instruction === undefined) {
     throw new Error('create_lead_list update: provide at least one field to update.');
+  }
+  if (Array.isArray(args.status_config)) {
+    // Two stages with the same value would be indistinguishable on a lead (Emma's own status tool refuses this too).
+    const seen = new Set<string>();
+    const duplicates: string[] = [];
+    for (const entry of args.status_config) {
+      const value = typeof entry?.value === 'string' ? entry.value.trim().toLowerCase() : '';
+      if (value && seen.has(value)) duplicates.push(value);
+      if (value) seen.add(value);
+    }
+    if (duplicates.length > 0) throw new Error(`create_lead_list update: status_config has duplicate status values: ${[...new Set(duplicates)].join(', ')}. Nothing was changed.`);
   }
 
   // The instruction is saved by the auto-draft route, which needs the on/off switch with it: the one given, else the list's current one.
