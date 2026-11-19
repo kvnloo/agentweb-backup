@@ -1,7 +1,7 @@
 type Tool = { name: string; definition: { description: string; inputSchema: { properties: object } }; execute: (args: unknown, context: unknown) => Promise<Record<string, unknown>> };
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn(), claimMetaWriteManifestDigest: jest.fn() } }));
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -25,6 +25,8 @@ const cfg = (): Record<string, unknown> => {
 const stored = () => storedConfigFixture();
 const team = () => cfg().team as Array<Record<string, unknown>>;
 beforeEach(() => {
+  // The consistent re-read (ENG-3152) answers what the indexed read answers in these tests.
+  (userDb.getUserByIdConsistent as jest.Mock).mockImplementation((id: string) => (userDb.getUserById as jest.Mock)(id));
   jest.clearAllMocks();
   setHotLeadCallEntitledOverride(true);
   org = { orgId: 'org-a', ownerUserId: 'owner', hotLeadCall: stored(), connected_accounts: [{ config: { access_token: 'secret' } }] };
