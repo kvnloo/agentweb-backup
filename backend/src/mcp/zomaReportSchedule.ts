@@ -4,7 +4,8 @@
  *
  * DATA-PLANE: one new table `${prefix}AW-ZomaReportSchedules` (scripts/create-tables.ts), PK `userId`
  * (S) + SK `adAccountId` (S), no GSI. One item per user + Meta ad account. Not in ensureCriticalTables:
- * create it deliberately before turning ZOMA_MEASUREMENT_REPORTS_ENABLED on.
+ * create it deliberately before turning ZOMA_MEASUREMENT_REPORTS_ENABLED on (or listing anyone in
+ * ZOMA_MEASUREMENT_REPORTS_ALLOWLIST).
  *
  * Lifecycle:
  *   ship (a confirmed write that sets a campaign ACTIVE) -> enroll: first report 7 days after launch,
@@ -27,7 +28,13 @@ import { TABLE_PREFIX } from '../config/constants';
 import { getJwtSecret } from '../config/jwt';
 import { getBackendUrl } from './oauth/authChallenge';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
-import { measurementReportsEnabled, type MeasurementReport } from './zomaMeasurementReport';
+import {
+  type LoadMeasurementReportsSubject,
+  type MeasurementReport,
+  measurementReportsEnabledFor,
+  measurementReportsEnabledForUserId,
+  measurementReportsMaybeEnabled,
+} from './zomaMeasurementReport';
 import { isReportRecipient, signUnsubscribeToken, unsubscribeHeaders } from './zomaWeeklyReport';
 import { BENCHMARK_INDUSTRIES, type BenchmarkIndustry, isBenchmarkIndustry } from './zomaIndustryBenchmarks';
 import type { ZomaUserRecord } from '../services/zomaScoreboard';
@@ -270,9 +277,11 @@ export async function enrollReportSchedule(
     classifyIndustry?: ClassifyIndustry;
     /** Receives the background classification; default: let it run (errors are already caught). */
     background?: (work: Promise<void>) => void;
+    /** Resolves email/orgId for the allowlist; default: the user record. */
+    loadUser?: LoadMeasurementReportsSubject;
   } = {},
 ): Promise<ScheduleNotice | null> {
-  if (!measurementReportsEnabled(opts.env)) return null;
+  if (!(await measurementReportsEnabledForUserId(userId, opts.env, opts.loadUser))) return null;
   const store = opts.store ?? getZomaReportScheduleStore();
   const now = opts.now ?? Date.now;
   const nowIso = new Date(now()).toISOString();
@@ -390,9 +399,9 @@ const describe = (s: ZomaReportSchedule) => ({
 export async function runZomaReportScheduleTool(
   userId: string,
   args: any,
-  opts: { store?: ZomaReportScheduleStore; now?: () => number; env?: NodeJS.ProcessEnv } = {},
+  opts: { store?: ZomaReportScheduleStore; now?: () => number; env?: NodeJS.ProcessEnv; loadUser?: LoadMeasurementReportsSubject } = {},
 ) {
-  if (!measurementReportsEnabled(opts.env)) throw new MetaToolkitRefusal('Measurement report schedules are not available yet.');
+  if (!(await measurementReportsEnabledForUserId(userId, opts.env, opts.loadUser))) throw new MetaToolkitRefusal('Measurement report schedules are not available yet.');
   const store = opts.store ?? getZomaReportScheduleStore();
   const nowMs = (opts.now ?? Date.now)();
   const nowIso = new Date(nowMs).toISOString();
@@ -453,11 +462,14 @@ export async function runZomaReportScheduleTool(
 // ---------------------------------------------------------------------------------------------
 
 export interface MeasurementRunnerDeps {
+  /** Pass-level gate: the flag is on or the allowlist is non-empty. */
   enabled: () => boolean;
+  /** Per-schedule gate on the freshly read user (flag or allowlist match). */
+  enabledFor: (user: { userId: string; email?: string; orgId?: string }) => boolean;
   maxPerPass: () => number;
   store: () => ZomaReportScheduleStore;
   /** Fresh user read right before the send; undefined when the account cannot be resolved. */
-  getUser: (userId: string) => Promise<(Pick<ZomaUserRecord, 'email' | 'isAdmin' | 'zomaAdsExperience'> & { userId: string }) | undefined>;
+  getUser: (userId: string) => Promise<(Pick<ZomaUserRecord, 'email' | 'isAdmin' | 'zomaAdsExperience'> & { userId: string; orgId?: string }) | undefined>;
   /** Account spend over the last `days` complete days; throws when the account cannot be read. */
   recentSpend: (userId: string, adAccountId: string, days: number) => Promise<number>;
   /** `industry` is the schedule's stored industry, when there is one. */
@@ -522,7 +534,7 @@ export async function runZomaMeasurementReports(deps: MeasurementRunnerDeps = de
     try {
       if (s.userId.startsWith('deleted_')) continue;
       const user = await deps.getUser(s.userId);
-      if (!user || !isReportRecipient(user)) continue;
+      if (!user || !deps.enabledFor(user) || !isReportRecipient(user)) continue;
       // No spend for 14+ days: go dormant without emailing; the next ship resumes it.
       if ((await deps.recentSpend(s.userId, s.adAccountId, DORMANT_AFTER_DAYS)) <= 0) {
         if (await store.update(s.userId, s.adAccountId, { status: 'dormant' }, nowIso)) result.dormant += 1;
@@ -565,8 +577,13 @@ export async function stopAllReportSchedules(userId: string, store: ZomaReportSc
 }
 
 /** For the weekly email: users with an active measurement schedule get that report instead (no double email). */
-export async function hasActiveReportSchedule(userId: string, store: ZomaReportScheduleStore = getZomaReportScheduleStore(), env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
-  if (!measurementReportsEnabled(env)) return false;
+export async function hasActiveReportSchedule(
+  userId: string,
+  store: ZomaReportScheduleStore = getZomaReportScheduleStore(),
+  env: NodeJS.ProcessEnv = process.env,
+  loadUser?: LoadMeasurementReportsSubject,
+): Promise<boolean> {
+  if (!(await measurementReportsEnabledForUserId(userId, env, loadUser))) return false;
   return (await store.listForUser(userId)).some((s) => s.status === 'active');
 }
 
@@ -585,7 +602,8 @@ async function usableMetaAccount(userId: string, adAccountId: string) {
 }
 
 export const defaultMeasurementRunnerDeps: MeasurementRunnerDeps = {
-  enabled: () => measurementReportsEnabled(),
+  enabled: () => measurementReportsMaybeEnabled(),
+  enabledFor: (user) => measurementReportsEnabledFor(user),
   maxPerPass: () => {
     const n = Number(process.env.ZOMA_MEASUREMENT_REPORTS_MAX_PER_PASS);
     return Number.isInteger(n) && n >= 1 && n <= 1000 ? n : DEFAULT_MAX_PER_PASS;
@@ -594,7 +612,7 @@ export const defaultMeasurementRunnerDeps: MeasurementRunnerDeps = {
   async getUser(userId) {
     const { userDb } = await import('../services/db');
     const user = await userDb.getUserByIdConsistent(userId);
-    return user?.email ? { userId, email: user.email, isAdmin: user.isAdmin, zomaAdsExperience: (user as any).zomaAdsExperience } : undefined;
+    return user?.email ? { userId, email: user.email, isAdmin: user.isAdmin, zomaAdsExperience: (user as any).zomaAdsExperience, orgId: (user as any).orgId } : undefined;
   },
   async recentSpend(userId, adAccountId, days) {
     const { runZomaAdsReport } = await import('./zomaAdsReport');
