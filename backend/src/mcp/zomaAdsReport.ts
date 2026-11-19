@@ -31,6 +31,17 @@ const CONVERSION_PRIORITY: ReadonlyArray<readonly string[]> = [
 ];
 const PURCHASE_TYPES = new Set(CONVERSION_PRIORITY[0]);
 
+/** ENG-3156: the KPI each CONVERSION_PRIORITY group measures, in the same order. */
+export const CONVERSION_KPIS = ['purchase', 'lead', 'registration'] as const;
+export type ConversionKpi = (typeof CONVERSION_KPIS)[number];
+
+/** The KPI a Meta action type counts toward, or null when it is outside the priority groups. */
+export function kpiOfConversionEvent(event: string | null): ConversionKpi | null {
+  if (!event) return null;
+  const i = CONVERSION_PRIORITY.findIndex((group) => group.includes(event));
+  return i < 0 ? null : CONVERSION_KPIS[i];
+}
+
 export const ZOMA_ADS_REPORT_DEFINITION = {
   name: ZOMA_ADS_REPORT_TOOL,
   description:
@@ -144,10 +155,14 @@ const actionValue = (list: unknown, type: string) =>
 const hasAction = (rows: any[], type: string) =>
   rows.some((r) => Array.isArray(r?.actions) && r.actions.some((x: any) => x?.action_type === type));
 
-/** The one conversion action for this report: the caller's, else the first present by priority. */
-export function chooseConversionEvent(rows: any[], requested: string | null): string | null {
+/**
+ * The one conversion action for this report: the caller's, else the first present by priority.
+ * With a kpi, only that KPI's group is searched (ENG-3156).
+ */
+export function chooseConversionEvent(rows: any[], requested: string | null, kpi?: ConversionKpi): string | null {
   if (requested) return requested;
-  for (const group of CONVERSION_PRIORITY) {
+  const groups = kpi ? [CONVERSION_PRIORITY[CONVERSION_KPIS.indexOf(kpi)]] : CONVERSION_PRIORITY;
+  for (const group of groups) {
     const found = group.find((type) => hasAction(rows, type));
     if (found) return found;
   }
@@ -198,6 +213,7 @@ export async function runZomaAdsReport(
   accountId: string,
   args: unknown,
   deps: ZomaAdsReportDeps = defaultDeps(),
+  options: { kpi?: ConversionKpi } = {},
 ): Promise<ZomaAdsReport> {
   const parsed = parseZomaAdsReportArgs(args);
   const token = (account.config as any)?.access_token;
@@ -234,7 +250,7 @@ export async function runZomaAdsReport(
     url = typeof body?.paging?.next === 'string' ? body.paging.next : undefined;
   }
 
-  const conversionEvent = chooseConversionEvent(raw, parsed.conversionEvent);
+  const conversionEvent = chooseConversionEvent(raw, parsed.conversionEvent, options.kpi);
   // ROAS is always purchase value / spend, whatever is counted as a conversion.
   const valueEvent = conversionEvent && PURCHASE_TYPES.has(conversionEvent)
     ? conversionEvent
