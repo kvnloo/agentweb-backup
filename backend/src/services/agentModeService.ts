@@ -3225,7 +3225,7 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
       }
     }
-    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare);
 
     // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
     let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
