@@ -155,6 +155,52 @@ describe('ENG-1904 scoped report recipients: flag ON', () => {
     expect(logged()).toEqual([expect.objectContaining({ state: 'delivery_attempted', reason: 'provider_error' })]);
   });
 
+  it('the client copy also drops the internal "Function Call Details" (tool names); the admin copy keeps them', async () => {
+    setRun(scopedToClient);
+    const withDetails = { ...RESULT, functionCallDetails: { monitor_lead_volume: { actual: 1, required: 1 } } } as any;
+    await emailService.sendScheduledChatResultEmail([CLIENT.email], 'Weekly Ads', withDetails, 'schedule-1');
+    expect(bodyOf(0).html).toContain('Function Call Details'); expect(bodyOf(0).text).toContain('Function Call Details:');
+    expect(bodyOf(1).html).not.toContain('Function Call Details'); expect(bodyOf(1).html).not.toContain('monitor_lead_volume');
+    expect(bodyOf(1).text).not.toContain('Function Call Details'); expect(bodyOf(1).text).not.toContain('monitor_lead_volume');
+  });
+
+  it('a send that THROWS is recorded as a failed delivery (not a lost record) and the log does not claim it was sent', async () => {
+    setRun(scopedToClient);
+    sendSpy.mockResolvedValueOnce('sent').mockRejectedValueOnce(new Error('boom'));
+    await send();
+    expect(logged()).toEqual([expect.objectContaining({ state: 'delivery_attempted', reason: 'provider_error' })]);
+    const line = (console.log as jest.Mock).mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[ENG-1904] scheduled report'));
+    expect(line).toContain('NOT confirmed sent (failed)');
+  });
+
+  it('a successful scoped send says sent', async () => {
+    setRun(scopedToClient);
+    await send();
+    const line = (console.log as jest.Mock).mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[ENG-1904] scheduled report'));
+    expect(line).toMatch(/: sent$/);
+  });
+
+  it('a hung read never holds up the admin email for more than 10 seconds', async () => {
+    jest.useFakeTimers();
+    try {
+      setRun(scopedToClient);
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(() => new Promise(() => {}));
+      const sending = send();
+      await jest.advanceTimersByTimeAsync(10_000);
+      await sending;
+      expect(sentTo()).toEqual([[OWNER.email]]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('an unresolved recipient next to an eligible one: only the eligible one gets the copy', async () => {
+    setRun(scopedToClient);
+    await send(['nobody@customer.example', CLIENT.email]);
+    expect(sentTo()).toEqual([[OWNER.email], [CLIENT.email]]);
+    expect(bodyOf(0).text).toContain('nobody@customer.example'); // still withheld, shown to the admin as today
+  });
+
   it('an admin recipient is unaffected: the same single email as before, nothing scoped', async () => {
     setRun(scopedToClient);
     await send([OWNER.email]);
@@ -179,6 +225,13 @@ describe('ENG-1904 scoped report recipients: flag OFF (the default)', () => {
     expect(bodyOf(0).text).toContain(CLIENT.email); // withheld banner, as today
     expect(logged()[0]).toEqual(expect.objectContaining({ state: 'delivered', authorizedRecipients: [OWNER.email], withheldRecipients: [CLIENT.email] }));
     expect((console.log as jest.Mock).mock.calls.some((c) => String(c[0]).includes('[ENG-1904 shadow] session(s) session-1: 1 of 1 withheld recipient(s) eligible for a link-free copy'))).toBe(true);
+  });
+
+  it('the shadow evaluation is detached: a hung read does not delay the send at all', async () => {
+    setRun(scopedToClient);
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockImplementation(() => new Promise(() => {}));
+    await send(); // resolves without waiting for the read
+    expect(sentTo()).toEqual([[OWNER.email]]);
   });
 
   it('logs how many stayed withheld and why (counts and fixed reasons, never an address) so the rollout can be measured', async () => {

@@ -8,6 +8,14 @@ import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
 import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision, recipientScopingEnabled } from './scheduledReportAccess';
 import { evaluateRunForRecipient, extractRunScope } from './scheduledReportScope';
+
+/** Resolve `fallback` when `p` takes longer than `ms` or rejects; never rejects, never leaves a timer running. */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then((v) => { clearTimeout(timer); resolve(v); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
@@ -2190,9 +2198,10 @@ Schedule ID: ${scheduleId}
         minute: '2-digit'
       });
 
-      // ENG-1904: the "Continue the Conversation" block links to the run's whole session. A recipient authorized only because
-      // every cross-account call was about them (scheduledReportScope) gets the report WITHOUT it: the session is an admin's
-      // and its share view has not been proven safe for a customer. Everyone else gets the email exactly as before.
+      // ENG-1904: the "Continue the Conversation" block links to the run's whole session, and "Function Call Details" lists the
+      // run's internal tool names. A recipient authorized only because every cross-account call was about them
+      // (scheduledReportScope) gets the report WITHOUT either (the session is an admin's and its share view has not been proven safe
+      // for a customer). Everyone else gets the email exactly as before (`adminView`).
       const conversationSectionHtml = `<div class="section">
                 <h3>🔗 Continue the Conversation</h3>
                 <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
@@ -2201,7 +2210,7 @@ Schedule ID: ${scheduleId}
                   Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
                 </p>
               </div>`;
-      const composeHtml = (includeLink: boolean): string => `
+      const composeHtml = (adminView: boolean): string => `
         <html>
         <head>
           <style>
@@ -2252,7 +2261,7 @@ Schedule ID: ${scheduleId}
               </div>
               ` : ''}
 
-              ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+              ${adminView && result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
               <div class="section">
                 <h3>🔧 Function Call Details</h3>
                 <div class="criteria">
@@ -2276,7 +2285,7 @@ Schedule ID: ${scheduleId}
                 <div class="response">${marked(result.actualResponse)}</div>
               </div>
               
-              ${includeLink ? conversationSectionHtml : ''}
+              ${adminView ? conversationSectionHtml : ''}
             </div>
             
             <div class="footer">
@@ -2291,7 +2300,7 @@ Schedule ID: ${scheduleId}
       `;
       const html = composeHtml(true);
 
-      const composeText = (includeLink: boolean): string => `
+      const composeText = (adminView: boolean): string => `
 Scheduled Chat Results: ${scheduleName}
 
 Your scheduled chat "${scheduleName}" ${primaryMessage}
@@ -2300,7 +2309,7 @@ ${isBlockedRun ? `
 ${outageNoteText}
 ` : ''}
 
-${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+${adminView && result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
 ${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
         `- ${funcName}: ${details.actual}/${details.required} calls ${details.actual >= details.required ? '✅' : '❌'}`
@@ -2309,7 +2318,7 @@ ${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
 ` : ''}AI Response:
 ${result.actualResponse}
 
-${includeLink ? `Continue the conversation: ${sessionUrl}
+${adminView ? `Continue the conversation: ${sessionUrl}
 
 ` : ''}---
 This is an automated email from your scheduled chat.
@@ -2363,13 +2372,13 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         });
       } else {
         // Send ONE email to all authorized recipients
-        await this.deliverScheduledReport(
+        const outcome = await this.deliverScheduledReport(
           deliveryScheduleId, runKey, recipients, stillWithheld, subject, finalText, finalHtml,
           scoped.length > 0 ? { recipients: scoped, text: composeText(false), html: composeHtml(false) } : undefined,
         );
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
         if (scoped.length > 0) {
-          console.log(`[ENG-1904] scheduled report for session ${result.sessionId}: sent a link-free copy to ${scoped.length} recipient(s) because every cross-account call in the run was about them`);
+          console.log(`[ENG-1904] scheduled report for session ${result.sessionId}: link-free copy for ${scoped.length} recipient(s) (every cross-account call in the run was about them): ${outcome === 'sent' ? 'sent' : `NOT confirmed sent (${outcome ?? 'unknown'})`}`);
         }
       }
 
@@ -2452,9 +2461,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       }
       // ENG-1904: of the recipients withheld above, which ones does the run read ONLY about? This can only ADD recipients to
       // the authorized set (as a separate copy); `authorized` and `withheld` stay exactly what the guard decided.
-      const scoped = opts?.allowScopedRecipients && isSensitive && authz.withheld.length > 0
-        ? await this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession)
-        : [];
+      let scoped: string[] = [];
+      if (opts?.allowScopedRecipients && isSensitive && authz.withheld.length > 0) {
+        if (recipientScopingEnabled()) {
+          scoped = await withTimeout(this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession), 10_000, []);
+        } else {
+          // Shadow mode: measure only. Detached, so the flag-off send is never delayed or changed by the extra reads.
+          void this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession);
+        }
+      }
       return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId, ...(scoped.length > 0 ? { scoped } : {}) };
     } catch (guardError) {
       // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
@@ -2546,7 +2561,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     // ENG-1904: a second, link-free copy for recipients authorized by scheduledReportScope. Sent separately so the
     // authorized recipients' email stays exactly as it was.
     scopedCopy?: { recipients: string[]; text: string; html: string },
-  ): Promise<void> {
+  ): Promise<EmailSendOutcome | void> {
     const base = {
       runId,
       authorizedRecipients: scopedCopy ? [...recipients, ...scopedCopy.recipients] : recipients,
@@ -2557,8 +2572,12 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       outcome = await this.sendEmail(recipients, subject, text, html);
     } else {
       const outcomes: Array<EmailSendOutcome | void> = [];
-      if (recipients.length > 0) outcomes.push(await this.sendEmail(recipients, subject, text, html));
-      outcomes.push(await this.sendEmail(scopedCopy.recipients, subject, scopedCopy.text, scopedCopy.html));
+      // sendEmail is documented never to throw; if either send did, it is a failed send, not a lost delivery record.
+      const attempt = async (to: string[], t: string, h: string): Promise<EmailSendOutcome | void> => {
+        try { return await this.sendEmail(to, subject, t, h); } catch { return 'failed'; }
+      };
+      if (recipients.length > 0) outcomes.push(await attempt(recipients, text, html));
+      outcomes.push(await attempt(scopedCopy.recipients, scopedCopy.text, scopedCopy.html));
       outcome = outcomes.includes('failed') ? 'failed' : outcomes.includes('suppressed') ? 'suppressed' : outcomes.every((o) => o === 'sent') ? 'sent' : undefined;
     }
     await recordReportDeliveryState(scheduleId, outcome === 'sent'
@@ -2569,6 +2588,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           ...(outcome === 'failed' ? { reason: 'provider_error' as const } : {}),
           ...(outcome === 'suppressed' ? { reason: 'suppressed_nonprod' as const } : {}),
         });
+    return outcome;
   },
 
   /**
