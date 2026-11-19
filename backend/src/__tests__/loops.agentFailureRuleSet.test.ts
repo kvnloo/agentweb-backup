@@ -8,7 +8,7 @@
  * Healthy tools and one-off blips produce nothing.
  */
 
-import { AgentFailureRuleSet, isNeverConnectedMessage } from '../loops/instances/agent-mode/failureRuleSet';
+import { AgentFailureRuleSet, isNeverConnectedMessage, QA_VERIFIER_USER_ID } from '../loops/instances/agent-mode/failureRuleSet';
 import {
   EVT_RUN_STARTED,
   EVT_RUN_VERDICT,
@@ -323,9 +323,15 @@ describe('AgentFailureRuleSet: synthetic (verifier) traffic', () => {
     ...Array.from({ length: 9 }, () => toolEvt('run-qa', EVT_TOOL_FAILED, 'probe_tool', { errorClass: 'Error', failureType: 'bug', errorMessage: 'boom' })),
   ];
 
-  it('files the cluster when the verifier account is not configured (default behaviour unchanged)', async () => {
+  it('files the cluster when the run belongs to an unlisted account (a person\'s own account is never excluded by default)', async () => {
     const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
     expect((await policy.evaluate(probeEvents(), WINDOW)).length).toBe(1);
+  });
+
+  it('leaves the built-in QA account\'s runs out with no configuration at all', async () => {
+    const policy = new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+    const qaRun = probeEvents().map(e => (e.eventType === EVT_RUN_STARTED ? { ...e, dimensions: { userId: QA_VERIFIER_USER_ID } } : e));
+    expect(await policy.evaluate(qaRun, WINDOW)).toEqual([]);
   });
 
   it('drops a cluster made only of the configured verifier account\'s runs', async () => {

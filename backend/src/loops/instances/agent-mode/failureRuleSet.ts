@@ -84,15 +84,23 @@ export interface AgentFailureRuleSetOptions {
   /**
    * ENG-3152/3154: user ids whose runs are verification traffic (post-merge probes of a new guard, run as a dedicated account).
    * Those probes deliberately trip refusals, so their runs are left out of every cluster (failures AND the denominator).
-   * Default: the comma-separated `AGENT_LOOP_SYNTHETIC_USER_IDS` env var; unset or empty means nothing is excluded.
+   * Default: the built-in QA account plus any ids in the comma-separated `AGENT_LOOP_SYNTHETIC_USER_IDS` env var (optional).
    * Matched on the `userId` dimension of each run's `agent_run_started` event, so it also applies to events already stored
    * and needs no new field on tool events or users.
    */
   syntheticUserIds?: readonly string[];
 }
 
+/**
+ * The dedicated QA account (`qa-user@agentweb.pro`), the default login of the verify scripts. Built in because the prod backend
+ * environment is at the Elastic Beanstalk 4096-character variable limit, so a new variable cannot be added there (ENG-3152).
+ * It is an identifier, not a secret. Do NOT add a person's own account here: their real runs would then drop out of every cluster.
+ */
+export const QA_VERIFIER_USER_ID = '1ad42ce1-00a3-4805-bf62-12eac2f7b856';
+
 function syntheticUserIdsFromEnv(): string[] {
-  return (process.env.AGENT_LOOP_SYNTHETIC_USER_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+  const extra = (process.env.AGENT_LOOP_SYNTHETIC_USER_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+  return [QA_VERIFIER_USER_ID, ...extra];
 }
 
 interface ToolStats {
