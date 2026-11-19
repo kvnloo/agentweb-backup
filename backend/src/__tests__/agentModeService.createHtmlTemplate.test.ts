@@ -326,6 +326,51 @@ describe('AgentModeService - createHtmlTemplate', () => {
       expect(mockGenerateHTML).not.toHaveBeenCalled();
     });
 
+    // ENG-2840: a link in a scheme the server cannot fetch was saved as the template's body, as if it were HTML.
+    it.each([
+      ['data:text/html;base64,PGgxPmhpPC9oMT4=', 'data'],
+      ['file:///etc/passwd', 'file'],
+      ['  FTP://example.com/x.html  ', 'ftp'],
+      ['javascript:alert(1)', 'javascript'],
+      ['s3://bucket/key.html', 's3'],
+    ])('refuses an unfetchable link %j without fetching, rewriting or saving', async (source, scheme) => {
+      const result = await agentModeService.createHtmlTemplate(
+        source,
+        undefined,
+        'test_template',
+        'Test Subject',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain(`looks like a ${scheme}: link`);
+      expect(result.error).toContain('public http(s) link or the HTML itself');
+      expect(fetchCallerUrlText).not.toHaveBeenCalled();
+      expect(mockGenerateHTML).not.toHaveBeenCalled();
+      expect(mockSetSetting).not.toHaveBeenCalled();
+    });
+
+    it('still accepts text that merely starts with a scheme word but is not a link', async () => {
+      mockGenerateHTML.mockResolvedValue(mockEnhancedHtml);
+      mockGetSetting.mockResolvedValue(null);
+      mockSetSetting.mockResolvedValue(undefined);
+
+      const result = await agentModeService.createHtmlTemplate(
+        'file: Welcome to {{company_name}} - a short note for new users',
+        undefined,
+        'plain_text_template',
+        'Welcome',
+        '',
+        'test-user-123',
+        'test-session-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(fetchCallerUrlText).not.toHaveBeenCalled();
+    });
+
     it('should handle LLM generation errors', async () => {
       // Setup mocks
       mockGenerateHTML.mockResolvedValue(''); // Empty response
