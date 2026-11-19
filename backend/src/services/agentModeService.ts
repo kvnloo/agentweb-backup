@@ -621,6 +621,7 @@ import {
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
+import { isAnonymousShareMessage, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 
 /**
@@ -6494,8 +6495,7 @@ export class AgentModeService {
     const mergedHistory: ChatMessage[] = [];
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
-      const sameAnonymity = Boolean((last as any)?.metadata?.ishareSender?.isAnonymous)
-        === Boolean((msg as any)?.metadata?.ishareSender?.isAnonymous);
+      const sameAnonymity = isAnonymousShareMessage(last) === isAnonymousShareMessage(msg);
       if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
@@ -6579,7 +6579,7 @@ export class AgentModeService {
       // anonymous viewer looked identical to one from the verified account owner. Fold the
       // marker into content on every reconstruction (not just the turn it arrived in), the
       // same way attachments are folded in above, so it survives into later turns.
-      if (msg.role === 'user' && (msg as any).metadata?.ishareSender?.isAnonymous) {
+      if (msg.role === 'user' && isAnonymousShareMessage(msg)) {
         let contentStr = '';
         if (Array.isArray(content)) {
           contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
@@ -6588,7 +6588,7 @@ export class AgentModeService {
         } else {
           contentStr = String(content);
         }
-        content = `${contentStr}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`;
+        content = withAnonymousShareMarker(contentStr);
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -6685,7 +6685,7 @@ export class AgentModeService {
     // before it's even "history") with zero provenance signal. Apply the same marker here when
     // this turn itself came through the public ishare endpoint.
     const currentMessageContent = isCurrentTurnAnonymousIshare
-      ? `${messageContent}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`
+      ? withAnonymousShareMarker(messageContent)
       : messageContent;
     if (screenshotUrl) {
       messages.push({
