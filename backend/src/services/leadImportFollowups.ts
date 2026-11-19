@@ -54,8 +54,10 @@ export async function applyLeadImportFollowups(
   const result: LeadImportFollowupResult = { inheritedDoNotContact: [], doNotContactCheckFailed: 0 };
   const createdIds = new Set(created.map(l => l.leadId));
   const listOwners = new Map<string, Promise<string | undefined>>();
+  // The owner of a matching lead is the owner of the LIST it sits in, never the lead's own `userId`: that is a field a caller can supply when creating
+  // a lead (the single-lead route stores the body as given), so another tenant could plant a do-not-contact lead that names THIS owner and have it
+  // flag this owner's later adds. (For a lead created normally the two are the same.)
   const ownerOf = async (lead: any): Promise<string | undefined> => {
-    if (lead.userId) return lead.userId;
     if (!lead.listId) return undefined;
     if (!listOwners.has(lead.listId)) {
       listOwners.set(lead.listId, crmDb.getLeadListById(lead.listId).then((l: any) => l?.userId));
