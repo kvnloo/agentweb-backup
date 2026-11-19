@@ -4094,6 +4094,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null,
         missedRuns: expect.any(Number),
       }),
+      // ENG-2816 (step 3): every row carries the COMPUTED (never stored) digest the portal sends back to adopt a visitor-edited
+      // schedule. Its value is pinned in agentModeController.scheduleProvenanceWrites.test.ts.
+      contentVersion: expect.stringMatching(/^[0-9a-f]{32}$/),
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
