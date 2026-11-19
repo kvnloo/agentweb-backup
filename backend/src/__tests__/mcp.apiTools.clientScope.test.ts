@@ -39,12 +39,19 @@ jest.mock('../services/crmAccessControl', () => ({
   CRM_EDITOR_REQUIRED_MESSAGE: 'You need CRM-editor access to this list.',
 }));
 
+// ENG-2840: every add now runs the do-not-contact inheritance the bulk imports run. Its own behaviour is tested in mcp.manageLeads.writes.test.ts;
+// here it is a recorded stub, so what is pinned is WHO it acts for and WITH WHICH token.
+jest.mock('../services/leadImportFollowups', () => ({
+  applyLeadImportFollowups: jest.fn().mockResolvedValue({ inheritedDoNotContact: [], doNotContactCheckFailed: 0 }),
+}));
+
 const mockRecordAdminAudit = jest.fn();
 jest.mock('../services/adminAuditLog', () => ({
   recordAdminAudit: (...a: any[]) => mockRecordAdminAudit(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
 import { userDb, crmDb } from '../services/db';
 import { canDestructiveCrmList } from '../services/crmAccessControl';
 import { mcpToolRegistry } from '../mcp/server/registry';
@@ -290,10 +297,16 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
 
       await mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: false }), callerContext);
 
-      expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+      // The write, then the list read the do-not-contact inheritance needs (the owner of the list). Both travel as the DELEGATED target.
+      expect(mockMcpFetch).toHaveBeenCalledTimes(2);
       const call = mockMcpFetch.mock.calls[0][0];
       expect(call.method).toBe('POST');
       expect(call.path).toBe('/api/crm/lists/list-1/leads');
+      const listRead = mockMcpFetch.mock.calls[1][0];
+      expect({ method: listRead.method, path: listRead.path }).toEqual({ method: 'GET', path: '/api/crm/lists/list-1' });
+      expect(listRead.context.overrideToken).toBe(call.context.overrideToken);
+      // The inheritance flags the new lead on behalf of the ADMIN who acted (the audit identity), not the customer.
+      expect(applyLeadImportFollowups).toHaveBeenCalledWith('list-1', expect.any(String), [{ leadId: 'new-lead-1', email: 'lead@example.com' }], { actingUserId: 'admin-1', validate: false });
       // Regression guard for the {leads:[...]} payload-shape bug — the real
       // route reads req.body as a single lead's fields directly.
       expect(call.body).toEqual({ email: 'lead@example.com' });

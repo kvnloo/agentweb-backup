@@ -23,7 +23,7 @@ import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { resolveClientScopedContext } from './adminClientScope';
 import { recordAdminAudit } from '../../services/adminAuditLog';
-import { buildLeadCreateBody } from './manageLeadsWrites';
+import { applyDoNotContactInheritance, buildLeadCreateBody } from './manageLeadsWrites';
 
 const isCrossAccountAddEnabled = (): boolean =>
   process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED === 'true';
@@ -200,7 +200,13 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
       body: leadPayload,
     });
     recordAdminAudit({ ...auditBase, outcome: 'created', leadId: data?.leadId });
-    return jsonResult(data);
+    // The same do-not-contact inheritance as every other add; the new lead is stamped with the admin who acted, not the customer.
+    const followups = await applyDoNotContactInheritance(listId, [{ leadId: data?.leadId, email: typeof leadPayload.email === 'string' ? leadPayload.email : undefined }], c, scope.caller.userId);
+    return jsonResult({
+      ...data,
+      ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: true } : {}),
+      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed } : {}),
+    });
   } catch (error: any) {
     recordAdminAudit({ ...auditBase, outcome: 'failed', error: error?.message });
     throw error;
