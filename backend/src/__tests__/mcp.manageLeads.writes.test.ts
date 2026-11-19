@@ -91,7 +91,7 @@ describe('update', () => {
     ]) {
       const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
       expect({ updates, isError: r.isError }).toEqual({ updates, isError: true });
-      expect(r.text).toMatch(/cannot be set through this tool/);
+      expect(r.text).toMatch(/cannot be set as given/);
     }
     // Nothing was written, not even the harmless field that travelled with a refused one.
     expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
@@ -560,5 +560,203 @@ describe('add: same address within one call, and the owner of the list', () => {
     expect(r.json).toMatchObject({ created: 2, doNotContactCheckFailed: 0 });
     expect(leadsOf('list-a-member').find((l: any) => l.email === 'member-optout@alpha.test').contactStatus).toBe('do-not-contact');
     expect(leadsOf('list-a-member').find((l: any) => l.email === 'fine@alpha.test').contactStatus).toBeUndefined();
+  });
+});
+
+// ---- Found by the fresh full review of the final head ------------------------------------------------------------------------------------
+
+describe('update: consistent merge base and field types', () => {
+  it('the stored read behind the custom-field merge is a CONSISTENT read (the merged map is written back whole)', async () => {
+    const { crmDb } = await import('../services/db');
+    const spy = jest.spyOn(crmDb, 'getLeadById');
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { tier: 'gold' } });
+      expect(r.isError).toBe(false);
+      expect(spy.mock.calls.some(([, , opts]) => (opts as any)?.consistentRead === true)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a lead with no custom-field map is merged without a false corruption alarm in the log', async () => {
+    const { customFields: _gone, ...bare } = leadRow(TENANT_A.listId, a2.leadId);
+    fake.seed('AW-Leads', bare);
+    const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { tier: 'gold' } });
+      expect(r.isError).toBe(false);
+      expect(err.mock.calls.filter((c) => String(c[0]).includes('customFieldsGuard'))).toEqual([]);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it('a status that is not non-empty text is refused and no engagement is written (the route would record it before validating)', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const status of [{ value: 'won' }, '', '   ', null, 7, ['won']]) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { status } });
+      expect({ status, isError: r.isError, named: r.text.includes('status (must be non-empty text)') }).toEqual({ status, isError: true, named: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+  });
+
+  it('other standard fields of the wrong type are refused by name; null clears a text field', async () => {
+    for (const [updates, named] of [
+      [{ notes: { text: 'x' } }, 'notes (must be text)'],
+      [{ dealValue: '1000' }, 'dealValue (must be a number)'],
+      [{ isPrimary: 'yes' }, 'isPrimary (must be true or false)'],
+      [{ pocEmails: 'a@b.test' }, 'pocEmails (must be a list'],
+    ] as Array<[Record<string, unknown>, string]>) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ updates, isError: r.isError, named: r.text.includes(named) }).toEqual({ updates, isError: true, named: true });
+    }
+    const cleared = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { company: 'Alpha Inc' } });
+    expect(cleared.isError).toBe(false);
+    const clear2 = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { company: null } });
+    expect(clear2.isError).toBe(false);
+  });
+
+  it('CRM fields the verbatim forward used to honour keep working: the update layer stores domain and pocEmails, the create layer stores priority, role, isPrimary, dates and scores; links to deals and enrichment results are refused', async () => {
+    const ok = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { domain: 'alpha.example', pocEmails: ['poc@alpha.test'] } });
+    expect(ok.isError).toBe(false);
+    expect(leadRow(TENANT_A.listId, a1.leadId)).toMatchObject({ domain: 'alpha.example', pocEmails: ['poc@alpha.test'] });
+    expect(leadRow(TENANT_A.listId, a1.leadId).customFields).toEqual({ region: 'EMEA', tier: 'gold' });
+
+    const created = await a.call('manage_leads', {
+      action: 'add', list_id: TENANT_A.listId,
+      leads: [{ email: 'crmfields@alpha.test', priority: 'High', role: 'KDM', isPrimary: true, expectedClose: '2026-12-31', closedDate: '2027-01-15', heatScore: 60, healthScore: 70 }],
+    });
+    expect(created.isError).toBe(false);
+    const row = leadsOf(TENANT_A.listId).find((l: any) => l.email === 'crmfields@alpha.test');
+    expect(row).toMatchObject({ priority: 'High', role: 'KDM', isPrimary: true, expectedClose: '2026-12-31', closedDate: '2027-01-15', heatScore: 60, healthScore: 70 });
+    expect(row.customFields).toEqual({});
+
+    // A value the create layer rejects (it validates priority, role and the score ranges) fails the add and creates nothing.
+    const count = leadsOf(TENANT_A.listId).length;
+    for (const bad of [{ priority: 'Urgent' }, { role: 'Boss' }, { heatScore: 500 }]) {
+      const r = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'badcrm@alpha.test', ...bad }] });
+      expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
+    }
+    expect(leadsOf(TENANT_A.listId).length).toBe(count);
+
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const key of ['dealIds', 'icpMatch', 'enrichmentMetadata']) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { [key]: key === 'dealIds' ? ['deal-of-another-account'] : { x: 1 } } });
+      expect({ key, isError: r.isError, named: r.text.includes(key) }).toEqual({ key, isError: true, named: true });
+      const a2r = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: `x-${key}@alpha.test`, [key]: key === 'dealIds' ? ['deal-of-another-account'] : { x: 1 } }] });
+      expect({ key, isError: a2r.isError, named: a2r.text.includes(key) }).toEqual({ key, isError: true, named: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
+    expect(leadsOf(TENANT_A.listId).length).toBe(count + 0);
+  });
+});
+
+describe('do-not-contact: delete, email change, unchecked leads', () => {
+  const stamp = '2026-11-18T10:00:00.000Z';
+  const OPTOUT = 'optout2@alpha.test';
+  beforeEach(() => {
+    fake.seed('AW-LeadLists', { listId: 'list-a3', userId: TENANT_A.owner, name: 'ALPHA third', listType: 'sales', createdAt: stamp, leadCount: 1 });
+    fake.seed('AW-Leads', { listId: 'list-a3', leadId: '950-optout', userId: TENANT_A.owner, name: 'Opt Out Two', email: OPTOUT, status: 'new', contactStatus: 'do-not-contact', createdAt: stamp });
+  });
+
+  it('a lead marked do-not-contact is not deleted (single id, or counted as failed among several); an ordinary lead is', async () => {
+    const one = await a.call('manage_leads', { action: 'delete', list_id: 'list-a3', lead_ids: ['950-optout'] });
+    expect(one.isError).toBe(true);
+    expect(one.text).toContain('marked do-not-contact');
+    expect(leadsOf('list-a3').length).toBe(1);
+
+    fake.seed('AW-Leads', { listId: 'list-a3', leadId: '951-plain', userId: TENANT_A.owner, name: 'Plain', email: 'plain3@alpha.test', status: 'new', createdAt: stamp });
+    const many = await a.call('manage_leads', { action: 'delete', list_id: 'list-a3', lead_ids: ['950-optout', '951-plain'] });
+    expect(many.isError).toBe(false);
+    expect(many.json).toMatchObject({ requested: 2, deleted: 1, failed: 1 });
+    expect(many.json.results[0].error).toContain('marked do-not-contact');
+    expect(leadRow('list-a3', '950-optout')).toBeDefined();
+    expect(leadRow('list-a3', '951-plain')).toBeUndefined();
+  });
+
+  it('a legacy opt-out (unsubscribedFromGroupEmail, no contactStatus) is protected from deletion too', async () => {
+    fake.seed('AW-Leads', { listId: 'list-a3', leadId: '952-legacy', userId: TENANT_A.owner, name: 'Legacy', email: 'legacy3@alpha.test', status: 'new', unsubscribedFromGroupEmail: true, createdAt: stamp });
+    const r = await a.call('manage_leads', { action: 'delete', list_id: 'list-a3', lead_ids: ['952-legacy'] });
+    expect(r.isError).toBe(true);
+    expect(leadRow('list-a3', '952-legacy')).toBeDefined();
+  });
+
+  it("changing a lead's email to an address the owner marked do-not-contact flags the lead, and says so", async () => {
+    const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email: OPTOUT } });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({ inheritedDoNotContact: true });
+    expect(leadRow(TENANT_A.listId, a2.leadId)).toMatchObject({ email: OPTOUT, contactStatus: 'do-not-contact' });
+    // An ordinary address changes nothing.
+    const plain = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { email: 'fine2@alpha.test' } });
+    expect(plain.isError).toBe(false);
+    expect(plain.json.inheritedDoNotContact).toBeUndefined();
+    expect(leadRow(TENANT_A.listId, a1.leadId).contactStatus).toBeUndefined();
+  });
+
+  it('when the do-not-contact check itself fails, the lead is still created and the answer names the leads that were NOT checked', async () => {
+    const svc = await import('../services/leadImportFollowups');
+    const spy = jest.spyOn(svc, 'applyLeadImportFollowups').mockRejectedValue(new Error('lookup unavailable'));
+    const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const multi = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'u1@alpha.test' }, { email: 'u2@alpha.test' }] });
+      expect(multi.isError).toBe(false);
+      const ids = multi.json.results.map((x: any) => x.leadId);
+      expect(multi.json).toMatchObject({ created: 2, doNotContactCheckFailed: 2 });
+      expect(multi.json.doNotContactUnchecked.sort()).toEqual([...ids].sort());
+      const single = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'u3@alpha.test' }] });
+      expect(single.json).toMatchObject({ email: 'u3@alpha.test', doNotContactCheckFailed: 1 });
+      expect(single.json.doNotContactUnchecked).toEqual([single.json.leadId]);
+    } finally {
+      spy.mockRestore();
+      err.mockRestore();
+    }
+  });
+});
+
+describe('add: a refused row is named, and a non-object lead fails closed', () => {
+  it('the error names the row in a multi-row add', async () => {
+    const r = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'ok1@alpha.test' }, { email: 'ok2@alpha.test' }, { email: 'bad@alpha.test', userId: 'x' }] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('(row 2)');
+    expect(leadsOf(TENANT_A.listId).length).toBe(TENANT_A.leads.length);
+  });
+
+  it('buildLeadCreateBody refuses anything that is not a plain object instead of returning an empty lead', async () => {
+    const { buildLeadCreateBody } = await import('../mcp/server/manageLeadsWrites');
+    for (const bad of [null, undefined, 'x', 7, [], Object.create(null)]) {
+      expect(() => buildLeadCreateBody(bad)).toThrow('must be an object');
+    }
+  });
+});
+
+describe('a member who is not an editor of the list cannot write to it', () => {
+  it('update, add, delete and a list update by a same-org member without editor rights are refused and change nothing', async () => {
+    const member = await connectCaller(TENANT_A.member!);
+    try {
+      const before = snapshotTenant(fake, TENANT_A);
+      for (const [tool, args] of [
+        ['manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { status: 'do-not-contact' } }],
+        ['manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: 'm1@alpha.test' }, { email: 'm2@alpha.test' }] }],
+        ['manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [a1.leadId, a2.leadId] }],
+        ['create_lead_list', { action: 'update', list_id: TENANT_A.listId, name: 'MEMBER RENAME', auto_draft_instruction: 'x' }],
+      ] as Array<[string, Record<string, unknown>]>) {
+        const r = await member.call(tool, args);
+        // Either a clear refusal, or (delete of several) a call whose every row failed: never a success that changed data.
+        expect({ tool, action: args.action, changed: false, isError: r.isError }).toEqual({ tool, action: args.action, changed: false, isError: true });
+      }
+      expect(snapshotTenant(fake, TENANT_A)).toBe(before);
+    } finally {
+      await member.close();
+    }
+  });
+});
+
+describe('create_lead_list update: duplicate status values', () => {
+  it('two stages with the same value are refused before anything is saved', async () => {
+    const dup = [{ value: 'qualified', label: 'Qualified', color: 'blue', type: 'active' }, { value: ' Qualified ', label: 'Again', color: 'red', type: 'lost' }];
+    const r = await a.call('create_lead_list', { action: 'update', list_id: TENANT_A.listId, name: 'SHOULD NOT SAVE', status_config: dup });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('duplicate status values: qualified');
+    expect(fake.items('AW-LeadLists').find((l: any) => l.listId === TENANT_A.listId).name).toBe(TENANT_A.listName);
   });
 });
