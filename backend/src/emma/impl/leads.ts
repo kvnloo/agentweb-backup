@@ -2624,7 +2624,10 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         return {
           success: false,
           message: 'Email draft already sent or changed',
-          error: 'This draft is already being sent (or was changed) by another request, so it was not sent again. Check the lead before retrying.',
+          // ENG-2984 / Opslane run 2213: a refused claim means either a send is in flight or
+          // the draft changed. Say so truthfully and give the recovery path: an orphaned claim
+          // (crashed send) expires after the 5-minute lease, after which a retry succeeds.
+          error: 'Another request is sending this draft right now (or the draft was just changed), so it was not sent twice. Check the lead in a minute: if the draft is gone, it was sent. If the draft is still there after about 5 minutes, retry the send once.',
         };
       }
 
