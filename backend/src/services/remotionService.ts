@@ -162,6 +162,35 @@ export function resolveCompositionDuration(input: {
   };
 }
 
+// The BrandedVideo composition (remotion-lambda/src/compositions/BrandedVideo.tsx) fades each
+// overlay with interpolate() over these keyframes, where d is the overlay's own length:
+//   intro  [0, 10, d - 20, d]   needs d > 30
+//   outro  [0, 12, d - 10, d]   needs d > 22
+// Remotion throws "inputRange must be strictly monotonically increasing" for anything shorter,
+// which failed every branded video under ~6.6s (intro) or ~4.8s with a call to action (outro):
+// a 4s clip is 120 frames, 15% of that is 18, and [0, 10, 18 - 20, 18] = [0, 10, -2, 18] (ENG-2228).
+export const MIN_INTRO_OVERLAY_FRAMES = 31;
+export const MIN_OUTRO_OVERLAY_FRAMES = 23;
+const MAX_OVERLAY_FRAMES = 90;
+
+/**
+ * Intro and outro overlay lengths for a composition: 15% of the video, capped at 90 frames, but never
+ * shorter than the composition's fade keyframes need. An overlay that outlasts a very short video is
+ * simply cut off by the end of the composition, which renders fine.
+ */
+export function resolveOverlayDurations(input: { durationInFrames: number; hasCta: boolean }): {
+  introDurationFrames: number;
+  outroDurationFrames: number;
+} {
+  const share = Math.round(input.durationInFrames * 0.15);
+  const clamp = (min: number) => Math.max(min, Math.min(MAX_OVERLAY_FRAMES, share));
+  return {
+    introDurationFrames: clamp(MIN_INTRO_OVERLAY_FRAMES),
+    // Without a CTA the outro is never rendered (BrandedVideo guards on ctaText); keep the default.
+    outroDurationFrames: input.hasCta ? clamp(MIN_OUTRO_OVERLAY_FRAMES) : MAX_OVERLAY_FRAMES,
+  };
+}
+
 /**
  * Number of poll iterations compose should run before handing off, bounded by the run's
  * remaining media-generation budget. Extracted as a pure function so the timeout handoff
@@ -385,10 +414,10 @@ export class RemotionService {
         filename = `${filename}.mp4`;
       }
 
-      const introDurationFrames = Math.max(1, Math.min(90, Math.round(durationInFrames * 0.15)));
-      const outroDurationFrames = params.ctaText
-        ? Math.max(1, Math.min(90, Math.round(durationInFrames * 0.15)))
-        : 90; // default to 90 even if no CTA; BrandedVideo guards against rendering it
+      const { introDurationFrames, outroDurationFrames } = resolveOverlayDurations({
+        durationInFrames,
+        hasCta: Boolean(params.ctaText),
+      });
 
       const inputPropsWithDuration: Record<string, any> = {
         clipUrl: allClipUrls[0],

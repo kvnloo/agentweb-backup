@@ -27,7 +27,12 @@ export const TWO_TENANT_TABLES: Record<string, TableKeySchema> = {
   'AW-Users': { hash: 'email', indexes: { UserIdIndex: { hash: 'userId' }, OrgIdIndex: { hash: 'orgId' } } },
   'AW-Organizations': { hash: 'orgId' },
   'AW-LeadLists': { hash: 'listId', indexes: { 'userId-index': { hash: 'userId' } } },
-  'AW-Leads': { hash: 'listId', range: 'leadId', indexes: { 'email-index': { hash: 'listId', range: 'email' } } },
+  'AW-Leads': {
+    hash: 'listId',
+    range: 'leadId',
+    // email-index: one (list, email) pair (the duplicate check); EmailLookupIndex: every lead with an address, across lists (do-not-contact inheritance).
+    indexes: { 'email-index': { hash: 'listId', range: 'email' }, EmailLookupIndex: { hash: 'email' } },
+  },
 };
 
 export function makeTwoTenantFake(): InMemoryDynamo {
@@ -154,9 +159,19 @@ export function installSelfCallFetch(app: any): () => void {
     for (const [k, v] of Object.entries(init.headers || {})) req = req.set(k, v as string);
     if (init.body) req = req.send(init.body);
     const res = await req;
-    // A Response with a body cannot carry 204 / 205 / 304 (the constructor throws), so those answer with none.
-    const noBody = [204, 205, 304].includes(res.status);
-    return new Response(noBody ? null : res.text, { status: res.status, headers: { 'content-type': res.headers['content-type'] || 'text/plain' } });
+    // The answer is a plain object, not a `Response`: `Response.json()` builds its objects in the OUTER Node realm, whose Object.prototype is not
+    // the one jest's sandbox sees, so a value read from it fails `Object.getPrototypeOf(v) === Object.prototype` (customFieldsGuard) and is
+    // coerced to {}. In production fetch and the code share one realm; this keeps that true here. It also sidesteps the Response constructor
+    // refusing a body on 204 / 205 / 304.
+    const text: string = [204, 205, 304].includes(res.status) ? '' : res.text;
+    const contentType: string = res.headers['content-type'] || 'text/plain';
+    return {
+      ok: res.status >= 200 && res.status < 300,
+      status: res.status,
+      headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+      json: async () => JSON.parse(text),
+      text: async () => text,
+    };
   }) as any;
   return () => {
     global.fetch = realFetch;
