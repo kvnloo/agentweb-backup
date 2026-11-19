@@ -67,6 +67,41 @@ function resolveName(token: string, names: Record<string, string>): string {
 }
 
 /**
+ * The value a condition clause's path points at. A dotted path (`brandGuidelines.updatedAt`, `#a.#b`) is a NESTED read, as in DynamoDB;
+ * before this, it was looked up as one attribute literally named "brandGuidelines.updatedAt", so `attribute_not_exists(a.b)` was always
+ * true and `a.b = :v` always false. A path with no dot is read exactly as before.
+ */
+function readConditionPath(item: Record<string, any> | undefined, token: string, names: Record<string, string>): any {
+  if (!token.includes('.')) return item?.[resolveName(token, names)];
+  return token
+    .split('.')
+    .map((segment) => resolveName(segment, names))
+    .reduce<any>((cur, segment) => (cur === undefined || cur === null ? undefined : cur[segment]), item);
+}
+
+/**
+ * The write twin of readConditionPath: `SET a.b = :v` stores `v` INSIDE the map `a`. As in DynamoDB, the parent map must already exist; when
+ * it does not, the update fails with the ValidationException the real service raises (callers such as journeyAttribution.touchProduct
+ * catch it and create the map first). A path with no dot is stored exactly as before.
+ */
+function writeUpdatePath(item: Record<string, any>, token: string, names: Record<string, string>, value: any): void {
+  if (!token.includes('.')) {
+    item[resolveName(token, names)] = value;
+    return;
+  }
+  const segments = token.split('.').map((segment) => resolveName(segment, names));
+  const leaf = segments.pop() as string;
+  const parent = segments.reduce<any>((cur, segment) => (cur !== null && typeof cur === 'object' ? cur[segment] : undefined), item);
+  if (parent === null || typeof parent !== 'object' || Array.isArray(parent)) {
+    throw Object.assign(
+      new Error('ValidationException: The document path provided in the update expression is invalid for update'),
+      { code: 'ValidationException' },
+    );
+  }
+  parent[leaf] = value;
+}
+
+/**
  * `attribute_exists(x) AND attribute_not_exists(y) AND #a = :b AND size(#l) = :n`,
  * plus one parenthesised disjunction: `(attribute_not_exists(#a) OR #a = :a)`.
  *
@@ -115,14 +150,12 @@ function evaluateClause(
 
     let match = clause.match(/^attribute_not_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item === undefined || item[attr] === undefined;
+      return item === undefined || readConditionPath(item, match[1], names) === undefined;
     }
 
     match = clause.match(/^attribute_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item !== undefined && item[attr] !== undefined;
+      return item !== undefined && readConditionPath(item, match[1], names) !== undefined;
     }
 
     match = clause.match(/^size\(\s*([^)]+?)\s*\)\s*=\s*(:[A-Za-z0-9_]+)$/i);
@@ -133,14 +166,12 @@ function evaluateClause(
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*=\s*(:[A-Za-z0-9_]+)$/);
     if (match) {
-      const attr = resolveName(match[1], names);
-      return item?.[attr] === values[match[2]];
+      return readConditionPath(item, match[1], names) === values[match[2]];
     }
 
     match = clause.match(/^([#A-Za-z0-9_.[\]]+)\s*([<>])\s*(:[A-Za-z0-9_]+)$/);
     if (match) {
-      const attr = resolveName(match[1], names);
-      const left = item?.[attr];
+      const left = readConditionPath(item, match[1], names);
       if (typeof left !== 'number') return false;
       return match[2] === '<' ? left < values[match[3]] : left > values[match[3]];
     }
@@ -266,7 +297,7 @@ function applyUpdateExpression(
       if (/list_append/i.test(rawValue)) {
         throw new Error(`inMemoryDynamo: unsupported SET function: ${rawValue}`);
       }
-      item[resolveName(rawTarget, names)] = evaluateSetValue(rawValue, item, names, values);
+      writeUpdatePath(item, rawTarget, names, evaluateSetValue(rawValue, item, names, values));
     }
   }
 
