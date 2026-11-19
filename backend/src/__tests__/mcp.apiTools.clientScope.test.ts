@@ -319,6 +319,16 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'created', leadId: 'new-lead-1' }));
     });
 
+    it('when the do-not-contact check fails on the admin add, the answer names the lead that was NOT checked', async () => {
+      process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED = 'true';
+      mockMcpFetch.mockResolvedValue({ leadId: 'new-lead-1' });
+      (applyLeadImportFollowups as jest.Mock).mockResolvedValueOnce({ inheritedDoNotContact: [], doNotContactCheckFailed: 1 });
+
+      const result: any = await mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: false }), callerContext);
+      const body = JSON.parse(result.content[0].text);
+      expect(body).toMatchObject({ leadId: 'new-lead-1', doNotContactCheckFailed: 1, doNotContactUnchecked: ['new-lead-1'] });
+    });
+
     it('records a failed-outcome audit and rethrows when the real write itself fails', async () => {
       process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED = 'true';
       mockMcpFetch.mockRejectedValue(new Error('downstream 500'));

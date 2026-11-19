@@ -509,6 +509,7 @@ describe('update fails closed when the stored lead cannot be read', () => {
     const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
     const { crmDb } = await import('../services/db');
     const original = crmDb.getLeadById.bind(crmDb);
+    process.env.CRM_LEAD_PUT_GUARD = 'enforce'; // the read-merge path (key-by-key writes need no read)
     for (const second of [() => Promise.reject(new Error('throttled')), () => Promise.resolve(undefined)]) {
       const spy = jest.spyOn(crmDb, 'getLeadById');
       // The REST read (first call) is real; the module's own stored read (second call) is the one that fails.
@@ -522,6 +523,7 @@ describe('update fails closed when the stored lead cannot be read', () => {
         spy.mockRestore();
       }
     }
+    delete process.env.CRM_LEAD_PUT_GUARD;
   });
 
   it('a list_id or lead_id that is not a string is refused before anything is read or written', async () => {
@@ -566,14 +568,16 @@ describe('add: same address within one call, and the owner of the list', () => {
 // ---- Found by the fresh full review of the final head ------------------------------------------------------------------------------------
 
 describe('update: consistent merge base and field types', () => {
-  it('the stored read behind the custom-field merge is a CONSISTENT read (the merged map is written back whole)', async () => {
+  it('where the whole map is merged and written back (the portal route is in enforce mode and drops the key-by-key flag), the stored read behind the merge is a CONSISTENT read', async () => {
     const { crmDb } = await import('../services/db');
     const spy = jest.spyOn(crmDb, 'getLeadById');
+    process.env.CRM_LEAD_PUT_GUARD = 'enforce';
     try {
       const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { tier: 'gold' } });
       expect(r.isError).toBe(false);
       expect(spy.mock.calls.some(([, , opts]) => (opts as any)?.consistentRead === true)).toBe(true);
     } finally {
+      delete process.env.CRM_LEAD_PUT_GUARD;
       spy.mockRestore();
     }
   });
@@ -878,5 +882,178 @@ describe('list: page and limit are whole numbers', () => {
     }
     const ok = await a.call('manage_leads', { action: 'list', list_id: TENANT_A.listId, page: 1, limit: 10 });
     expect(ok.isError).toBe(false);
+  });
+});
+
+// ---- Found by the FOURTH review (final head b3ffcf33c: DO NOT SHIP until these two reproduced problems were closed) -----------------------------
+
+describe('an opted-out lead keeps its compliance record', () => {
+  const stamp = '2026-11-18T10:00:00.000Z';
+  const X = 'twin-optout@alpha.test';
+  beforeEach(() => {
+    // An opted-out lead with a human's reason, note and actor, and a twin with the same address in another list (the original plus an inherited copy).
+    fake.seed('AW-LeadLists', { listId: 'list-a5', userId: TENANT_A.owner, name: 'ALPHA fifth', listType: 'sales', createdAt: stamp, leadCount: 1 });
+    fake.seed('AW-Leads', {
+      listId: TENANT_A.listId, leadId: '700-orig', userId: TENANT_A.owner, name: 'Orig', email: X, status: 'new',
+      contactStatus: 'do-not-contact', contactStatusReason: 'complained', contactStatusNote: 'spam complaint 2026-01', contactStatusUpdatedBy: 'human-1', contactStatusUpdatedAt: '2026-01-05T00:00:00.000Z', createdAt: stamp,
+    });
+    fake.seed('AW-Leads', { listId: 'list-a5', leadId: '701-twin', userId: TENANT_A.owner, name: 'Twin', email: X, status: 'new', contactStatus: 'unsubscribed', contactStatusReason: 'opted-out', contactStatusUpdatedBy: 'recipient', createdAt: stamp });
+  });
+
+  it('writing the SAME address on an opted-out lead (with a twin elsewhere) leaves its reason, note, actor and status untouched, and does not claim an inheritance', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, '700-orig'));
+    const twinBefore = JSON.stringify(leadRow('list-a5', '701-twin'));
+    const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: '700-orig', updates: { email: X, notes: 'touch' } });
+    expect(r.isError).toBe(false);
+    expect(r.json.inheritedDoNotContact).toBeUndefined();
+    const row = leadRow(TENANT_A.listId, '700-orig');
+    expect(row).toMatchObject({ contactStatus: 'do-not-contact', contactStatusReason: 'complained', contactStatusNote: 'spam complaint 2026-01', contactStatusUpdatedBy: 'human-1', notes: 'touch' });
+    // Every contact-status field is exactly as it was (the update also derives the lead's domain from the address: that is not part of the record).
+    const contactFields = (r: Record<string, any>) => Object.fromEntries(Object.entries(r).filter(([k]) => k.startsWith('contactStatus') || k.startsWith('unsubscribed')));
+    expect(contactFields(row)).toEqual(contactFields(JSON.parse(before)));
+    // The same for the twin, which is the recipient's own unsubscribe: it must not be relabelled do-not-contact.
+    const t = await a.call('manage_leads', { action: 'update', list_id: 'list-a5', lead_id: '701-twin', updates: { email: `  ${X.toUpperCase()}  `, notes: 'touch' } });
+    expect(t.isError).toBe(false);
+    expect(leadRow('list-a5', '701-twin')).toMatchObject({ contactStatus: 'unsubscribed', contactStatusReason: 'opted-out', contactStatusUpdatedBy: 'recipient' });
+    expect(JSON.parse(twinBefore).contactStatus).toBe('unsubscribed');
+  });
+
+  it('an ordinary lead whose address does not change gets no inheritance run either', async () => {
+    const svc = await import('../services/leadImportFollowups');
+    const spy = jest.spyOn(svc, 'applyLeadImportFollowups');
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email: a2.email.toUpperCase(), notes: 'same address' } });
+      expect(r.isError).toBe(false);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('the address must be a plain address (a decorated form of an opted-out mailbox would not be matched)', () => {
+  it('Name <addr>, "addr", addr. and malformed addresses are refused on add and update, by name; a padded or upper-case plain address is fine', async () => {
+    const count = leadsOf(TENANT_A.listId).length;
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a2.leadId));
+    for (const email of ['Mallory <victim@alpha.test>', '"victim@alpha.test"', 'victim@alpha.test.', 'victim@alpha', 'a b@alpha.test', 'victim@@alpha.test', '<victim@alpha.test>', 'victim@alpha.test, other@alpha.test']) {
+      const add = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email }] });
+      expect({ email, op: 'add', isError: add.isError, named: add.text.includes('email (must be a plain address') }).toEqual({ email, op: 'add', isError: true, named: true });
+      const upd = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email } });
+      expect({ email, op: 'update', isError: upd.isError, named: upd.text.includes('email (must be a plain address') }).toEqual({ email, op: 'update', isError: true, named: true });
+    }
+    expect(leadsOf(TENANT_A.listId).length).toBe(count);
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a2.leadId))).toBe(before);
+    const ok = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ email: '  Fine.Person+tag@Sub.Alpha.TEST ' }] });
+    expect(ok.isError).toBe(false);
+    // No email at all is still fine (a lead need not have one), and null clears an ordinary lead's address.
+    const none = await a.call('manage_leads', { action: 'add', list_id: TENANT_A.listId, leads: [{ firstName: 'No', lastName: 'Email', linkedin: 'https://linkedin.com/in/no-email' }] });
+    expect(none.isError).toBe(false);
+  });
+});
+
+describe('the opt-out guards read the stored lead consistently and fail closed', () => {
+  it('the email guard and the delete guard use a consistent read; if it cannot be read, nothing is changed or deleted', async () => {
+    const { crmDb } = await import('../services/db');
+    // A consistent read is requested by the email guard...
+    const spy = jest.spyOn(crmDb, 'getLeadById');
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { email: 'arnold-new@alpha.test' } });
+      expect(r.isError).toBe(false);
+      expect(spy.mock.calls.some(([, , opts]) => (opts as any)?.consistentRead === true)).toBe(true);
+      spy.mockClear();
+      const d = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: [a1.leadId] });
+      expect(d.isError).toBe(false);
+      expect(spy.mock.calls.some(([, , opts]) => (opts as any)?.consistentRead === true)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    // ...and a stored read that fails (after the REST read succeeded) stops both, with nothing changed.
+    fake.seed('AW-Leads', { listId: TENANT_A.listId, leadId: '010-extra', userId: TENANT_A.owner, name: 'Extra', email: 'extra@alpha.test', status: 'new', createdAt: '2026-11-18T10:00:00.000Z' });
+    const before = JSON.stringify(leadRow(TENANT_A.listId, '010-extra'));
+    const original = crmDb.getLeadById.bind(crmDb);
+    const failing = jest.spyOn(crmDb, 'getLeadById');
+    failing.mockImplementationOnce(original as any).mockRejectedValueOnce(new Error('throttled'));
+    const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const u = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: '010-extra', updates: { email: 'moved-extra@alpha.test' } });
+      expect(u.isError).toBe(true);
+      expect(u.text).toContain('Nothing was saved');
+      failing.mockImplementationOnce(original as any).mockRejectedValueOnce(new Error('throttled'));
+      const d = await a.call('manage_leads', { action: 'delete', list_id: TENANT_A.listId, lead_ids: ['010-extra'] });
+      expect(d.isError).toBe(true);
+      expect(leadRow(TENANT_A.listId, '010-extra')).toBeDefined();
+      expect(JSON.stringify(leadRow(TENANT_A.listId, '010-extra'))).toBe(before);
+    } finally {
+      failing.mockRestore();
+      err.mockRestore();
+    }
+  });
+});
+
+// ---- Found by Opslane (run 2308, P1) on b3ffcf33c: two updates to one lead at the same moment could silently drop a custom field -------------
+
+describe('custom fields are written key by key: overlapping updates to one lead cannot drop each other', () => {
+  const customOf = (leadId: string) => leadRow(TENANT_A.listId, leadId).customFields;
+
+  it('three updates sent at the same moment, one key each, all land (repeated, so a race could not hide)', async () => {
+    for (let round = 0; round < 6; round++) {
+      fake.seed('AW-Leads', { ...leadRow(TENANT_A.listId, a1.leadId), customFields: { region: 'EMEA', tier: 'gold' } });
+      const calls = await Promise.all([
+        a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { region: `EMEA-${round}` } }),
+        a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { tier: `gold-${round}` } }),
+        a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { third: `x-${round}` } }),
+      ]);
+      expect(calls.map((c) => c.isError)).toEqual([false, false, false]);
+      expect({ round, custom: customOf(a1.leadId) }).toEqual({ round, custom: { region: `EMEA-${round}`, tier: `gold-${round}`, third: `x-${round}` } });
+    }
+  });
+
+  it('the portal route receives only the keys being changed, with the key-by-key flag (never the whole map)', async () => {
+    const { crmDb } = await import('../services/db');
+    const spy = jest.spyOn(crmDb, 'updateLead');
+    try {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { tier: 'platinum', customFields: { extra: 1 }, notes: 'n' } });
+      expect(r.isError).toBe(false);
+      const sent = spy.mock.calls.find(([l, id]) => l === TENANT_A.listId && id === a1.leadId)![2] as any;
+      expect(sent.customFieldsKeyMerge).toBe(true);
+      expect(sent.customFields).toEqual({ tier: 'platinum', extra: 1 });
+      expect(sent.notes).toBe('n');
+      expect(customOf(a1.leadId)).toEqual({ region: 'EMEA', tier: 'platinum', extra: 1 });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('when the portal route is in enforce mode (it would drop the flag and replace the map) the whole map is merged from a consistent read: nothing is lost sequentially', async () => {
+    process.env.CRM_LEAD_PUT_GUARD = 'enforce';
+    const { crmDb } = await import('../services/db');
+    const spy = jest.spyOn(crmDb, 'updateLead');
+    try {
+      expect((await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { region: 'APAC' } })).isError).toBe(false);
+      expect((await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates: { tier: 'silver' } })).isError).toBe(false);
+      expect(customOf(a1.leadId)).toEqual({ region: 'APAC', tier: 'silver' });
+      const sent = spy.mock.calls.map(([, , u]) => u as any).filter((u) => u.customFields);
+      expect(sent.every((u) => u.customFieldsKeyMerge === undefined)).toBe(true);
+    } finally {
+      delete process.env.CRM_LEAD_PUT_GUARD;
+      spy.mockRestore();
+    }
+  });
+
+  it('a lead with no custom-field map cannot take a key-by-key write, so its map is created whole (nothing to lose)', async () => {
+    const { customFields: _gone, ...bare } = leadRow(TENANT_A.listId, a2.leadId);
+    fake.seed('AW-Leads', bare);
+    const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a2.leadId, updates: { first: 1, second: 2 } });
+    expect(r.isError).toBe(false);
+    expect(customOf(a2.leadId)).toEqual({ first: 1, second: 2 });
+  });
+
+  it('an empty custom field name is refused (the key-by-key write would drop it silently)', async () => {
+    const before = JSON.stringify(leadRow(TENANT_A.listId, a1.leadId));
+    for (const updates of [{ customFields: { '': 'x' } }, { customFields: { '   ': 'x' } }]) {
+      const r = await a.call('manage_leads', { action: 'update', list_id: TENANT_A.listId, lead_id: a1.leadId, updates });
+      expect({ updates, isError: r.isError, named: r.text.includes('(empty name)') || r.text.includes('customFields.') }).toEqual({ updates, isError: true, named: true });
+    }
+    expect(JSON.stringify(leadRow(TENANT_A.listId, a1.leadId))).toBe(before);
   });
 });

@@ -4,6 +4,7 @@
  * rows that already went through. The clock is controlled here (each call advances it), so no test waits.
  */
 jest.mock('../httpClient', () => ({ mcpFetch: jest.fn() }));
+jest.mock('../../../services/db', () => ({ crmDb: { getLeadById: jest.fn().mockResolvedValue({ leadId: 'stored' }) } }));
 jest.mock('../../../services/leadImportFollowups', () => ({
   applyLeadImportFollowups: jest.fn().mockResolvedValue({ inheritedDoNotContact: [], doNotContactCheckFailed: 0 }),
 }));
