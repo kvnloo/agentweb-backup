@@ -289,17 +289,28 @@ export function buildLeadCreateBody(lead: unknown): Record<string, unknown> {
 /** Query string for the list action: the parameters the REST route actually reads (it never read `lastKey`, so pagination by key never worked). */
 export function buildLeadListQuery(args: any): Record<string, string> {
   const qp: Record<string, string> = {};
-  const wholeNumber = (value: unknown, name: string): string => {
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error(`manage_leads list: ${name} must be a whole number of 1 or more.`);
-    return String(value);
+  // A model may send a number as text ("50") or leave an optional value empty or 0. The older list call accepted all of those (it forwarded `limit` as text and
+  // skipped a falsy one), so they keep working: digits-only text is a number, and empty, blank or 0 means "not given". Anything else (negative, fractional,
+  // words, objects) is refused instead of becoming NaN in the route.
+  const wholeNumber = (value: unknown, name: string): string | undefined => {
+    if (value === undefined || value === null) return undefined;
+    const text = typeof value === 'string' ? value.trim() : undefined;
+    const n = text === undefined ? value : text === '' ? 0 : /^\d+$/.test(text) ? Number(text) : NaN;
+    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) throw new Error(`manage_leads list: ${name} must be a whole number of 1 or more.`);
+    return n === 0 ? undefined : String(n);
   };
-  if (args.limit !== undefined && args.limit !== null) qp.limit = wholeNumber(args.limit, 'limit');
-  if (args.page !== undefined && args.page !== null) qp.page = wholeNumber(args.page, 'page');
+  const limit = wholeNumber(args.limit, 'limit');
+  if (limit !== undefined) qp.limit = limit;
+  const page = wholeNumber(args.page, 'page');
+  if (page !== undefined) qp.page = page;
   if (typeof args.search === 'string' && args.search.trim()) qp.search = args.search.trim();
   if (typeof args.status === 'string' && args.status.trim()) qp.status = args.status.trim();
   if (args.engaged_only !== undefined && args.engaged_only !== null) {
-    if (typeof args.engaged_only !== 'boolean') throw new Error('manage_leads list: engaged_only must be true or false.');
-    qp.engagedOnly = String(args.engaged_only);
+    // true/false, or the text "true"/"false" in any case; an empty value means "not given".
+    const flag = typeof args.engaged_only === 'string' ? args.engaged_only.trim().toLowerCase() : args.engaged_only;
+    if (flag === true || flag === 'true') qp.engagedOnly = 'true';
+    else if (flag === false || flag === 'false') qp.engagedOnly = 'false';
+    else if (flag !== '') throw new Error('manage_leads list: engaged_only must be true or false.');
   }
   return qp;
 }
