@@ -247,6 +247,10 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
         { role: 'tool', tool_call_id: 'd2', name: 'monitor_lead_volume', content: 'This call was collapsed: an identical monitor_lead_volume call ...', metadata: { duplicateSuppressed: true, duplicateOfId: 'd1' } },
         ledger({ id: 'd1', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'client@example.com' } }, { id: 'd2', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'client@example.com' }, duplicateOf: 'd1' } as any)];
       expect(ok(dup, RECIPIENT, { monitor_lead_volume: 1 })).toEqual({ ok: true });
+      // the same duplicate whose collapsed-result row was lost: the ledger's duplicateOf alone shows it never ran
+      const dupNoRow = [...mon('d1', { client_name_or_email: 'client@example.com' }), assistantCalls(call('d2', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })),
+        ledger({ id: 'd1', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'client@example.com' } }, { id: 'd2', name: 'monitor_lead_volume', arguments: { client_name_or_email: 'client@example.com' }, duplicateOf: 'd1' } as any)];
+      expect(ok(dupNoRow, RECIPIENT, { monitor_lead_volume: 1 })).toEqual({ ok: true });
       // a call that ERRORED and was retried stays a no: the error row names no account (a known false positive; measured in shadow mode)
       const retried = [assistantCalls(call('e1', 'monitor_lead_volume', { client_name_or_email: 'client@example.com' })), result('e1', 'monitor_lead_volume', 'Tool Error: timeout'), ...mon('e2', { client_name_or_email: 'client@example.com' })];
       expect(ok(retried)).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
@@ -290,6 +294,11 @@ describe('ENG-1904 scoped report recipients: the run read only the recipient\'s 
       expect(ok([...req, stored('{"success":true}\n{"client":{"userId":"user-recipient","email":"client@example.com"}')])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
       // a string containing an escaped quote must not end the scan early and expose a forged key
       expect(ok([...req, stored('{"note":"say \\"hi\\" then \\"client\\":{","client":{"userId":"user-other","email":"other@example.com"},"rows":[{"a')])).toMatchObject({ ok: false, reason: 'result_other_account' });
+      // the real client AFTER a string with escaped quotes or backslashes is still found in a cut-off result (the scan must not lose its place)
+      for (const note of ['a"b', 'a\\"b', '"', 'q\\"', '{"a":"b\\"c"}']) {
+        const whole = JSON.stringify({ note, client: { userId: 'user-recipient', email: 'client@example.com' }, rows: [1, 2, 3] });
+        expect(ok([...req, result('a', 'monitor_lead_volume', whole.slice(0, whole.length - 5))])).toEqual({ ok: true });
+      }
       // complete JSON whose `client` is not at the top level
       expect(ok([...req, result('a', 'monitor_lead_volume', { data: { client: RECIPIENT } })])).toMatchObject({ ok: false, reason: 'result_subject_unreadable' });
       // a forged top-level object planted in a prefix that is not the real header or citation block, or in a plain-text row
