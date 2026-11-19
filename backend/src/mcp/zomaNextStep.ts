@@ -9,6 +9,7 @@
  */
 import { ZOMA_NOT_INTERESTED_MESSAGE } from './zomaAdsExperience';
 import { googleToolkitEnabled } from './zomaToolDefinitions';
+import { scheduleNoticeText, type ScheduleNotice } from './zomaReportSchedule';
 
 /** Shared Meta refusals (also used by the Emma app) name the Emma settings screen; Zoma users never see it. */
 const EMMA_RECONNECT = /under Settings -> ?Connected accounts/g;
@@ -48,14 +49,20 @@ export function zomaNextStep(toolName: string, args: any, result: unknown): stri
       return 'Show this preview to the user. Only after they approve it, repeat the exact same call with confirm=true and this preview_token.';
     }
     if (typeof result.verification === 'string') {
+      // ENG-3155: a confirmed launch that enrolled the account in measurement reports says so.
+      const schedule = isObject(result.report_schedule) ? ` ${scheduleNoticeText(result.report_schedule as ScheduleNotice)} Tell the user.` : '';
       return result.verification === 'CONFIRMED'
-        ? 'Done and verified. Tell the user what changed; new campaigns, ad sets and ads stay PAUSED until they approve activation (its own preview).'
+        ? `Done and verified. Tell the user what changed; new campaigns, ad sets and ads stay PAUSED until they approve activation (its own preview).${schedule}`
         : `The change was sent but not confirmed (${result.verification}). Re-read the object (GET) before retrying so nothing is duplicated.`;
     }
   }
   if (toolName === 'zoma_ads_report') {
     return 'Ask which campaign to dig into: rerun zoma_ads_report with campaign_ids and a different date range, or ask for a change (every change is previewed before it runs).';
   }
+  if (toolName === 'zoma_measurement_report') {
+    return 'Share report_url with the user and walk through the findings. Campaigns marked new_delivery are qualitative signals only: no winner/loser or pause/scale call on them.';
+  }
+  if (toolName === 'zoma_report_schedule') return 'Tell the user the schedule now in effect; they can change cadence, pause, resume or stop it any time.';
   if (toolName === 'zoma_usage') return 'Ask about results with zoma_ads_report, e.g. spend and ROAS by campaign for the last 7 days.';
   if (toolName === 'zoma_prepare_upload') return 'Run the upload_command with the real file path, then pass file_url to the creative upload call.';
   if (args?.confirm === true) return 'Read the object back (GET) to confirm the change, then tell the user what changed.';

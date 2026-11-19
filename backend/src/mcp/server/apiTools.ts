@@ -35,6 +35,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
+import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -1108,7 +1109,7 @@ mcpToolRegistry.register({
   name: 'create_lead_list',
   definition: {
     name: 'create_lead_list',
-    description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete".',
+    description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete". A list that holds leads marked do-not-contact is not deleted here (deleting it would erase those opt-outs); delete it in the app if that is intended.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1116,7 +1117,25 @@ mcpToolRegistry.register({
         list_id: { type: 'string', description: 'List ID (required for get/update/delete)' },
         name: { type: 'string', description: 'List name (create/update)' },
         description: { type: 'string', description: 'List description (create/update)' },
-        list_type: { type: 'string', description: 'List type: sales | customers | session (create only; validated by the API)' }
+        list_type: { type: 'string', description: 'List type: sales | customers | session (create, or update once: a type that is already set cannot be changed; validated by the API)' },
+        icps_only: { type: 'boolean', description: 'Update: the list shows only leads that match the ICP by default' },
+        engaged_only: { type: 'boolean', description: 'Update: the list shows only engaged leads by default' },
+        auto_draft_enabled: { type: 'boolean', description: 'Update: turn automatic email drafts for new leads on or off' },
+        auto_draft_instruction: { type: 'string', description: 'Update: instructions for the automatic email drafts (2000 characters at most)' },
+        status_config: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              value: { type: 'string', description: 'Machine key (e.g. "qualified")' },
+              label: { type: 'string', description: 'Display name (e.g. "Qualified")' },
+              color: { type: 'string', description: 'Tailwind color name (e.g. "blue")' },
+              type: { type: 'string', enum: ['active', 'won', 'lost', 'churned'], description: 'Status category' },
+            },
+            required: ['value', 'label', 'color', 'type'],
+          },
+          description: 'Update: the status pipeline stages of this list',
+        }
       },
       required: ['action']
     }
@@ -1132,14 +1151,12 @@ mcpToolRegistry.register({
         const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
         return jsonResult(data);
       }
-      case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c, body: { name: args.name, description: args.description } });
-        return jsonResult(data);
-      }
-      case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(args.list_id)}`, context: c });
-        return jsonResult(data);
-      }
+      case 'update':
+        // Emma's eight list fields only (manageLeadsWrites.ts), not everything the REST route accepts.
+        return executeLeadListUpdate(args, c);
+      case 'delete':
+        // A list that holds leads marked do-not-contact is not deleted here (manageLeadsWrites.ts).
+        return executeLeadListDelete(args, c);
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
@@ -1645,18 +1662,21 @@ mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.',
+    description: `Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". "list" pages with page + limit and filters with search, status and engaged_only. "add" takes up to ${MAX_LEAD_ROWS_PER_CALL} leads (several are created one by one and the answer counts what really happened; an address the account already marked do-not-contact is flagged do-not-contact on the new lead too; a new lead cannot be created with status "do-not-contact", add it and then update its status); "delete" takes up to ${MAX_LEAD_ROWS_PER_CALL} lead_ids and counts the same way (a lead marked do-not-contact or unsubscribed is not deleted here, because deleting it would let the address be added again as sendable). A call that runs out of its time budget reports the rows it did not touch. A lead added moments ago may briefly be reported as not found by a following update or delete: retry. "update" merges any field that is not a standard lead field into the lead's custom fields (it never replaces them); setting status to "do-not-contact" suppresses the lead and cannot be reversed with this tool; changing a lead's email to an address already marked do-not-contact flags it too. An email must be a plain ASCII address (name@example.com). Fields that identify the owner, sync or attribution data, and contact status cannot be set. Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.`,
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['list', 'add', 'get', 'update', 'delete'], description: 'Action to perform' },
         list_id: { type: 'string', description: 'The lead list ID' },
         lead_id: { type: 'string', description: 'Lead ID (for get/update)' },
-        leads: { type: 'array', description: 'Exactly one lead object to add, wrapped in an array (for add action)' },
-        lead_ids: { type: 'array', items: { type: 'string' }, description: 'Lead IDs to delete (for delete action)' },
-        updates: { type: 'object', description: 'Fields to update (for update action)' },
-        limit: { type: 'number', description: 'Max leads to return (list action)' },
-        last_key: { type: 'string', description: 'Pagination key (list action)' },
+        leads: { type: 'array', description: `Lead objects to add, 1 to ${MAX_LEAD_ROWS_PER_CALL} (exactly one with client_id or dry_run). Standard fields: email, firstName, lastName, phone, company, title, notes, linkedin, website, companyLinkedin, domain, status, dealValue, dealCurrency, lifecycle, priority (Low, Medium or High), role, isPrimary, expectedClose, closedDate, pocEmails, heatScore, healthScore, selectedSenderId, and attribution: { utm: { source, medium, campaign, content, term } } (source tracking); drafts are saved by an update after the lead exists; any other key becomes a custom field (add action)` },
+        lead_ids: { type: 'array', items: { type: 'string' }, description: `Lead IDs to delete, 1 to ${MAX_LEAD_ROWS_PER_CALL} (for delete action)` },
+        updates: { type: 'object', description: 'Fields to update (for update action). Standard lead fields (as for add, plus emailDraft { subject, htmlContent?, textContent? }, messageDraft and emailDraftFormat "text"|"html"; no attribution; priority, role, isPrimary, expectedClose, closedDate, heatScore and healthScore can only be given when adding) are set; the email of a lead marked do-not-contact cannot be changed; any other key is merged into the lead\'s custom fields. Setting status to "do-not-contact" suppresses the lead.' },
+        limit: { type: 'number', description: 'Max leads to return per page (list action)' },
+        page: { type: 'number', description: 'Page number, starting at 1 (list action)' },
+        search: { type: 'string', description: 'Only leads matching this text (list action)' },
+        status: { type: 'string', description: 'Only leads with this pipeline status (list action)' },
+        engaged_only: { type: 'boolean', description: 'Only leads that have engaged (list action)' },
         client_id: {
           type: 'string',
           description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",
@@ -1695,50 +1715,31 @@ mcpToolRegistry.register({
     const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
     switch (args.action) {
       case 'list': {
-        const qp: Record<string, string> = {};
-        if (args.limit) qp.limit = String(args.limit);
-        if (args.last_key) qp.lastKey = args.last_key;
-        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, queryParams: qp });
+        const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, queryParams: buildLeadListQuery(args) });
         return jsonResult(data);
       }
       case 'add': {
+        // A real write: one to MAX_LEAD_ROWS_PER_CALL leads, counted honestly (manageLeadsWrites.ts). A preview is always exactly one lead.
+        if (!resolveDryRunFlag(args.dry_run)) return executeLeadAdd(args, c);
         const leadPayload = normalizeAddLeadPayload(args.leads);
-        if (resolveDryRunFlag(args.dry_run)) {
-          // Must match httpClient.ts's own acting-identity resolution
-          // (`context.userId || context.agentUserId`) exactly — otherwise an
-          // internal service-to-service caller (userId deliberately distinct
-          // from agentUserId, see mcpServerCore.ts) gets a preview checked
-          // against a different identity than the one that actually performs
-          // the real write a moment later.
-          const actingUserId = c.userId || c.agentUserId;
-          const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
-          return jsonResult({ dryRun: true, ...preview });
-        }
-        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads`, context: c, body: leadPayload });
-        return jsonResult(data);
+        // Must match httpClient.ts's own acting-identity resolution
+        // (`context.userId || context.agentUserId`) exactly — otherwise an
+        // internal service-to-service caller (userId deliberately distinct
+        // from agentUserId, see mcpServerCore.ts) gets a preview checked
+        // against a different identity than the one that actually performs
+        // the real write a moment later.
+        const actingUserId = c.userId || c.agentUserId;
+        const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
+        return jsonResult({ dryRun: true, ...preview });
       }
       case 'get': {
         const data = await mcpFetch({ method: 'GET', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c });
         return jsonResult(data);
       }
-      case 'update': {
-        const data = await mcpFetch({ method: 'PUT', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_id)}`, context: c, body: args.updates });
-        return jsonResult(data);
-      }
-      case 'delete': {
-        // Delete uses the single-lead endpoint if one ID, or we need to call per-lead
-        if (args.lead_ids && args.lead_ids.length === 1) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(args.lead_ids[0])}`, context: c });
-          return jsonResult(data);
-        }
-        // For multiple deletes, call individually
-        const results = [];
-        for (const leadId of (args.lead_ids || [])) {
-          const data = await mcpFetch({ method: 'DELETE', path: `/api/crm/lists/${encodeURIComponent(listId)}/leads/${encodeURIComponent(leadId)}`, context: c });
-          results.push(data);
-        }
-        return jsonResult({ deleted: args.lead_ids?.length || 0, results });
-      }
+      case 'update':
+        return executeLeadUpdate(args, c);
+      case 'delete':
+        return executeLeadDelete(args, c);
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }

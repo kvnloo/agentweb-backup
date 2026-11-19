@@ -29,6 +29,7 @@ import type { ChatMessage } from '../chatbotService';
 import { AGENTWEB_MODEL_ID } from './modelAccess';
 import { classifyToolErrorClass } from '../../utils/toolErrorClassifier';
 import type { UsageBlockPaygInput } from '../../utils/usageBlockCopy';
+import { isAnonymousShareMessage, isServerAuthoredContinuation, withAnonymousShareMarker } from '../../utils/anonymousShareProvenance';
 import {
   MAX_ALTERNATIVE_LATENCY_MS,
   MAX_COMPARE_ALTERNATIVES,
@@ -399,8 +400,13 @@ export function buildCompareMessages(history: readonly ChatMessage[] | undefined
   let budget = MAX_CONTEXT_CHARS;
   const turns = (history ?? []).filter(isReplayableTurn);
   for (let i = turns.length - 1; i >= 0 && picked.length < MAX_CONTEXT_MESSAGES && budget > 0; i--) {
-    const text = (turns[i].content as string).slice(0, Math.min(MAX_CONTEXT_MESSAGE_CHARS, budget));
-    budget -= text.length;
+    const sliced = (turns[i].content as string).slice(0, Math.min(MAX_CONTEXT_MESSAGE_CHARS, budget));
+    budget -= sliced.length;
+    // ENG-2227: a share visitor's row is replayed here without going through buildMarketingContext, so it carries the same
+    // label. It is appended to the row itself, so it stays attached to the visitor's words when same-role turns are merged.
+    const text = turns[i].role === 'user' && isAnonymousShareMessage(turns[i]) && !isServerAuthoredContinuation(turns[i] as any)
+      ? withAnonymousShareMarker(sliced)
+      : sliced;
     picked.push({ role: turns[i].role as 'user' | 'assistant', content: text });
   }
   picked.reverse();
