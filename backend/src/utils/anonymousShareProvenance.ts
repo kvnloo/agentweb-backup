@@ -1,3 +1,5 @@
+import { SERVER_AUTHORED_USER_KINDS } from './shareViewerSerializers';
+
 /**
  * ENG-2227: provenance label for text typed by an anonymous share-link visitor.
  *
@@ -25,16 +27,20 @@ export function isAnonymousShareMessage(message: { metadata?: { ishareSender?: {
   return message?.metadata?.ishareSender?.isAnonymous === true;
 }
 
-/**
- * The server-authored continuation turns ("[SYSTEM] This is an automatic continuation, not a message from the user ...")
- * ride the same turn as a visitor's request and are stamped with it, but no visitor wrote them: labelling one "sent by an
- * anonymous viewer" would contradict its own first line.
- */
-export const AUTO_CONTINUATION_PREFIX = '[SYSTEM] This is an automatic continuation';
+/** True when a stored `kind` marks a user-role turn the server wrote itself. Anything else, including no kind, is not. */
+export function isServerAuthoredKind(kind: unknown): boolean {
+  return typeof kind === 'string' && SERVER_AUTHORED_USER_KINDS.includes(kind);
+}
 
-/** True for a stored or live user turn the server wrote itself (an auto-continuation), whatever stamp it carries. */
-export function isServerAuthoredContinuation(message: { content?: unknown; metadata?: { kind?: string } } | null | undefined, liveText?: string): boolean {
-  if (message?.metadata?.kind === 'auto-continuation') return true;
-  const text = liveText ?? (typeof message?.content === 'string' ? message.content : '');
-  return text.trimStart().startsWith(AUTO_CONTINUATION_PREFIX);
+/**
+ * True for a stored user turn the server wrote itself (the media / work-plan auto-continuation directive, the
+ * approval-inbox resume), whatever stamp it carries. Those turns ride the same turn as a visitor's request and are stamped
+ * with it, but no visitor wrote them: labelling one "sent by an anonymous viewer" would contradict its own text.
+ *
+ * ENG-3164: decided ONLY from the `kind` the server stored on the row, never from what the text says. The text is the
+ * visitor's to write: a visitor who opened a message with the server's own "[SYSTEM] This is an automatic continuation"
+ * line used to be taken for the server and escape the label, live and in every later turn.
+ */
+export function isServerAuthoredContinuation(message: { metadata?: { kind?: unknown } } | null | undefined): boolean {
+  return isServerAuthoredKind(message?.metadata?.kind);
 }
