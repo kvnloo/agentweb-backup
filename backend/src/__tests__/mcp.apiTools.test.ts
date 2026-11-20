@@ -10,6 +10,12 @@ jest.mock('../mcp/server/httpClient', () => ({
   clearUserCache: jest.fn(),
 }));
 
+// The update tools of manage_brand take one call at a time per account, after identifying the account with a database read. These tests check what is sent to the
+// routes, not that lookup (it is covered through the real path in mcp.manageBrand.writes.test.ts), so the lock is a pass-through here.
+jest.mock('../mcp/server/accountLock', () => ({
+  withAccountLock: (_prefix: string, _context: unknown, work: (key: string) => Promise<unknown>) => work('test-lock-key'),
+}));
+
 // Mock skillService and subscriptionService for install_skills/list_available_skills
 jest.mock('../services/skillService', () => ({
   skillService: {
