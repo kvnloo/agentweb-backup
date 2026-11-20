@@ -173,8 +173,10 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
     if (spelled && !exact.has(spelled)) exact.set(spelled, i);
   });
   const added: string[] = [];
-  const updated: string[] = [];
-  const unchanged: string[] = [];
+  /** Positions of the entries this call appended: a later entry for the same name is the same entry, folded into it and reported once, as added. */
+  const addedAt = new Set<number>();
+  /** The stored entries this call touched, in the order it first touched them: a stored entry touched twice is reported once. */
+  const touched = new Map<number, { name: string; changed: boolean }>();
   for (const entry of incoming) {
     const key = identity(entry[keyField]);
     // The entry stored under exactly this spelling wins over a stored entry that differs only in case or spacing.
@@ -183,6 +185,7 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
       merged.push(entry);
       index.set(key, merged.length - 1);
       exact.set(String(entry[keyField]), merged.length - 1);
+      addedAt.add(merged.length - 1);
       added.push(String(entry[keyField]));
       continue;
     }
@@ -198,8 +201,14 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
       }
     }
     if (changed) merged[at] = next;
-    (changed ? updated : unchanged).push(String(current[keyField]));
+    if (addedAt.has(at)) continue;
+    const before = touched.get(at);
+    if (before) before.changed = before.changed || changed;
+    else touched.set(at, { name: String(current[keyField]), changed });
   }
+  const updated: string[] = [];
+  const unchanged: string[] = [];
+  for (const { name, changed } of touched.values()) (changed ? updated : unchanged).push(name);
   return { merged, added, updated, unchanged };
 }
 
