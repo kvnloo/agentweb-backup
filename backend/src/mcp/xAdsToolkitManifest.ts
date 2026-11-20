@@ -129,7 +129,7 @@ export function getXAdsToolkitManifest() {
           daily_budget: { type: 'number', description: 'LINE_ITEM CREATE (required) / UPDATE: daily budget in MAJOR currency units. Not accepted on CAMPAIGN CREATE; on CAMPAIGN UPDATE only for a legacy campaign with its own budget.' },
           total_budget: { type: 'number', description: 'LINE_ITEM CREATE / UPDATE: optional lifetime budget in MAJOR currency units. Not accepted on CAMPAIGN CREATE.' },
           start_time: { type: 'string', description: 'CAMPAIGN / LINE_ITEM CREATE: optional ISO 8601 start (line items default to now).' },
-          end_time: { type: 'string', description: 'CAMPAIGN / LINE_ITEM CREATE: optional ISO 8601 end.' },
+          end_time: { type: 'string', description: 'CAMPAIGN / LINE_ITEM CREATE: optional ISO 8601 end (line items default to 30 days after start).' },
           objective: { type: 'string', enum: [...X_ADS_LINE_ITEM_OBJECTIVES], description: 'LINE_ITEM CREATE.' },
           bid_amount: { type: 'number', description: 'LINE_ITEM: max bid in MAJOR currency units; omit on CREATE for automatic bidding.' },
           placements: { type: 'array', items: { type: 'string', enum: ['ALL_ON_TWITTER', 'PUBLISHER_NETWORK', 'TWITTER_PROFILE', 'TWITTER_SEARCH', 'TWITTER_TIMELINE'] } },
