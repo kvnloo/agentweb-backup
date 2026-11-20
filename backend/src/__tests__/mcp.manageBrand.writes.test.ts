@@ -347,8 +347,9 @@ describe('update: the merge baseline', () => {
   it('a read that is older than what this process just saved and read back is not merged onto', async () => {
     const stale = { exists: true, brandData: JSON.parse(JSON.stringify(brandOf(TENANT_A.orgId).brandData)), attachments: [LOGO], createdAt: STORED_AT, updatedAt: STORED_AT, isOrgLevel: true };
     expect((await update(owner, { founders: [{ name: 'Di Delta' }] })).isError).toBe(false);
-    // Calls so far: baseline read (1) and read-back (2). The second update's baseline read (3) answers with the brand as it was before the first save.
-    await withBrandReadsOverridden((call) => (call === 3 ? stale : undefined), async () => {
+    // The override counts the reads made while it is installed: the second update's baseline read is the first of them, and it answers with the brand as it
+    // was before the first save; its read-back (the second) is left alone.
+    await withBrandReadsOverridden((call) => (call === 1 ? stale : undefined), async () => {
       const second = await update(owner, { founders: [{ name: 'Ed Epsilon' }] });
       expect(second.isError).toBe(false);
     });
