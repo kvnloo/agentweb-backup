@@ -606,6 +606,48 @@ describe('update: stored padding, names and size', () => {
   });
 });
 
+describe('arguments the action does not take', () => {
+  it.each([
+    ['one the tool does not store (an Opslane finding: it answered success and dropped it)', { competitors: [{ name: 'Delta' }], targetAudience: 'SMB founders' }, /"targetAudience" is not an input of update/],
+    ['several, listed together', { competitors: [{ name: 'Delta' }], location: 'EU', audience: 'SMB' }, /"location", "audience" are not inputs of update/],
+    ['an argument of read', { competitors: [{ name: 'Delta' }], competitorOffset: 3 }, /"competitorOffset" is not an input of update/],
+  ])('an update with %s is refused by name and writes nothing', async (_label, args, message) => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, args);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(message);
+    expect(r.text).toMatch(/Update takes businessOverview, competitors, icp\. Nothing was changed\./);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('a read with data arguments is refused by name instead of ignoring them', async () => {
+    const r = await read(owner, { competitors: [{ name: 'Delta' }] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/"competitors" is not an input of read \(it would be dropped, not saved\)\. Read takes competitorOffset, competitorNames\./);
+  });
+
+  it('positioning, differentiators and channels keep their own, more specific refusal', async () => {
+    const r = await update(owner, { competitors: [{ name: 'Delta' }], positioning: 'cheaper' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/"positioning" is not stored by the market strategy/);
+  });
+
+  it('identity-style arguments are ignored (the strategy is always the caller\'s own) and the answer says so', async () => {
+    const before = snapshotTenant(fake, TENANT_B);
+    const w = await update(owner, { competitors: [{ name: 'Delta' }], client_id: TENANT_B.owner, clientId: TENANT_B.owner, user_id: TENANT_B.owner });
+    expect(w.isError).toBe(false);
+    expect(w.json.ignoredArguments).toEqual(['client_id', 'clientId', 'user_id']);
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toContain('Delta');
+    expect(snapshotTenant(fake, TENANT_B)).toBe(before);
+    const r = await read(owner, { client_id: TENANT_B.owner });
+    expect(r.isError).toBe(false);
+    expect(r.json.ignoredArguments).toEqual(['client_id']);
+    expect(r.json.data.competitors.map((e: any) => e.name)).not.toContain('BravoRival');
+    // A call without them says nothing about them.
+    expect((await read(owner)).json.ignoredArguments).toBeUndefined();
+  });
+});
+
 describe('the action', () => {
   it('is matched without regard to case, and anything else is refused (it used to be taken as an update)', async () => {
     expect((await owner.call('manage_market_strategy', { action: ' Read ' })).isError).toBe(false);
