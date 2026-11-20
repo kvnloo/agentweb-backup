@@ -102,6 +102,8 @@ export const READ_ONLY_TOOLKIT_TOOLS: ReadonlySet<string> = new Set([
   'zoma_industry_benchmark',
   // Google Ads
   'call_google_ads_reporting_api',
+  // X Ads (ENG-3142): x_ads_read only issues GETs (lists + synchronous stats). x_ads_write stays on the default.
+  'x_ads_read',
 ]);
 
 /** Tools that are not read-only but whose effect is narrower than the conservative default. */
