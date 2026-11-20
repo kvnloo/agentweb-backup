@@ -164,7 +164,29 @@ describe('update: merge, never replace', () => {
       ['Gamma', 'Enterprise only'],
       ['Delta', 'second'],
     ]);
-    expect(r.json.competitors).toMatchObject({ added: ['Delta'], updated: ['Delta', 'Beta Corp'] });
+    // Two entries for one new name are one added competitor, reported once (Opslane P2 on ef2bc22: it used to be listed as added AND updated).
+    expect(r.json.competitors).toMatchObject({ added: ['Delta'], updated: ['Beta Corp'], unchanged: [] });
+    expect(r.json.competitors.total).toBe(4);
+  });
+
+  it('the same new competitor sent twice in one call (case and padding differ) is added once and listed once, with the later fields winning (Opslane P2 on ef2bc22)', async () => {
+    const r = await update(owner, { competitors: [{ name: 'Golf', description: 'new' }, { name: '  golf  ', description: 'dup' }] });
+    expect(r.isError).toBe(false);
+    expect(r.json.competitors).toMatchObject({ added: ['Golf'], updated: [], unchanged: [], total: 4 });
+    expect(strategyOf(TENANT_A.orgId).competitors.filter((e: any) => /golf/i.test(e.name))).toEqual([{ name: 'Golf', description: 'dup' }]);
+  });
+
+  it('a stored competitor named twice in one call is listed once: updated when either entry changed it, unchanged when neither did', async () => {
+    const changed = await update(owner, { competitors: [{ name: 'Beta Corp', description: 'first rewrite' }, { name: 'beta corp', description: 'second rewrite' }] });
+    expect(changed.json.competitors).toMatchObject({ added: [], updated: ['Beta Corp'], unchanged: [] });
+    expect(strategyOf(TENANT_A.orgId).competitors.find((e: any) => e.name === 'Beta Corp').description).toBe('second rewrite');
+
+    const repeated = await update(owner, { competitors: [{ name: 'Gamma', description: 'one rewrite' }, { name: 'gamma', description: 'one rewrite' }] });
+    expect(repeated.json.competitors).toMatchObject({ added: [], updated: ['Gamma'], unchanged: [] });
+
+    const same = await update(owner, { competitors: [{ name: 'Beta Corp', description: 'second rewrite' }, { name: ' BETA CORP ', description: 'second rewrite' }] });
+    expect(same.json).toMatchObject({ success: true, changed: false });
+    expect(JSON.stringify(same.json)).not.toMatch(/"updated":\["Beta Corp"/);
   });
 
   it('a stored ICP that has no title (older data) is kept and the new profile is added next to it', async () => {
@@ -989,5 +1011,53 @@ describe('pure helpers', () => {
     expect(out.merged).toEqual([{ name: 'A', description: 'a', extra: 1 }, 'legacy text entry', { name: 'B', description: 'new' }, { name: 'C' }]);
     expect({ added: out.added, updated: out.updated, unchanged: out.unchanged }).toEqual({ added: ['C'], updated: ['B'], unchanged: ['A'] });
     expect(mergeStrategyEntries(undefined, [{ name: 'X' }], 'name').merged).toEqual([{ name: 'X' }]);
+  });
+
+  it('mergeStrategyEntries reports one name once however often it appears in a call', () => {
+    const fresh = mergeStrategyEntries([], [{ name: 'Golf', description: 'a' }, { name: 'golf', description: 'b' }, { name: 'GOLF', description: 'b' }], 'name');
+    expect({ added: fresh.added, updated: fresh.updated, unchanged: fresh.unchanged }).toEqual({ added: ['Golf'], updated: [], unchanged: [] });
+    expect(fresh.merged).toEqual([{ name: 'Golf', description: 'b' }]);
+
+    const stored = [{ name: 'A', description: 'a' }, { name: 'B', description: 'b' }];
+    const out = mergeStrategyEntries(stored, [{ name: 'a', description: 'a' }, { name: 'B', description: 'x' }, { name: 'b', description: 'y' }, { name: 'A', description: 'a' }], 'name');
+    expect({ added: out.added, updated: out.updated, unchanged: out.unchanged }).toEqual({ added: [], updated: ['B'], unchanged: ['A'] });
+    expect(out.merged).toEqual([{ name: 'A', description: 'a' }, { name: 'B', description: 'y' }]);
+
+    // Changed by its first mention and repeated, unchanged, by the second: still one update, not an unchanged repeat.
+    const again = mergeStrategyEntries([{ name: 'B', description: 'b' }], [{ name: 'B', description: 'x' }, { name: 'b', description: 'x' }], 'name');
+    expect({ updated: again.updated, unchanged: again.unchanged }).toEqual({ updated: ['B'], unchanged: [] });
+  });
+});
+
+describe('update: a record that would pass the 400 KB item limit (Opslane P1 on ef2bc22)', () => {
+  const ITEM_LIMIT = 409_600;
+
+  afterEach(() => {
+    fake.maxItemBytes = undefined;
+  });
+
+  it('answers with a reason that names the size limit, not a bare server error, and writes nothing', async () => {
+    // A solo account whose record is almost full for a reason outside the strategy (a large saved ICP result), so the strategy stays far below the tool's own 250,000-byte limit.
+    const row = fake.items('AW-Users').find((u: any) => u.userId === SOLO);
+    const withBulk = { ...row, icpResult: '' };
+    const room = ITEM_LIMIT - Buffer.byteLength(JSON.stringify(withBulk), 'utf8') - 400;
+    fake.seed('AW-Users', { ...row, icpResult: 'x'.repeat(room) });
+    fake.maxItemBytes = ITEM_LIMIT;
+    const before = JSON.stringify(fake.items('AW-Users').find((u: any) => u.userId === SOLO));
+
+    const r = await update(solo, { competitors: [{ name: 'NewRival', description: 'y'.repeat(1_500) }] });
+
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/400 KB/);
+    expect(r.text).toMatch(/Nothing was changed/);
+    expect(r.text).not.toMatch(/Internal server error/);
+    expect(JSON.stringify(fake.items('AW-Users').find((u: any) => u.userId === SOLO))).toBe(before);
+  });
+
+  it('still saves when the record has room (the limit only bites when it is reached)', async () => {
+    fake.maxItemBytes = ITEM_LIMIT;
+    const r = await update(solo, { competitors: [{ name: 'Fits', description: 'small' }] });
+    expect(r.isError).toBe(false);
+    expect(names(fake.items('AW-Users').find((u: any) => u.userId === SOLO).marketStrategy.competitors)).toEqual(['SoloRival', 'Fits']);
   });
 });
