@@ -87,7 +87,8 @@ function optionalText(value: unknown, name: string, max: number): string | undef
   if (typeof value !== 'string') return fail(`${name} must be text.`);
   const t = value.trim();
   if (t.length > max) return fail(`${name} must be ${max} characters or fewer.`);
-  return t === '' ? undefined : t;
+  // Nothing visible (empty, spaces, or only invisible characters) is "not given"; other text is kept as sent (a joiner can belong to an emoji).
+  return cleanName(t) === '' ? undefined : t;
 }
 
 /** The founders the caller sent, checked and cleaned (only the five known fields; blank text = not given). Undefined when not sent. */
@@ -263,7 +264,7 @@ export async function executeBrandUpdate(args: any, c: any): Promise<any> {
   if (args.brand_values !== undefined && args.brand_values !== null) {
     const values = args.brand_values;
     if (!Array.isArray(values) || values.some((v: unknown) => typeof v !== 'string')) fail('brand_values must be a list of text.');
-    const kept = (values as string[]).map((v) => v.trim()).filter((v) => v !== '');
+    const kept = (values as string[]).filter((v) => cleanName(v) !== '').map((v) => v.trim());
     if (kept.length > MAX_BRAND_VALUES) fail(`brand_values may hold at most ${MAX_BRAND_VALUES} entries.`);
     if (kept.some((v) => v.length > MAX_BRAND_VALUE_CHARS)) fail(`brand_values entries must be ${MAX_BRAND_VALUE_CHARS} characters or fewer.`);
     // An empty list is "not given", as it is for the founders: it never clears the stored values.

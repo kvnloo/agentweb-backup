@@ -6,8 +6,8 @@ personality and the founder profiles, which Emma's `update_brand_guidelines` wri
 that an argument it does not take is refused by name.
 
 - **new fields:** `tagline` (300 characters), `domain` (253), `brand_personality` (2,000) and `brand_values` (a list of up to 50, 200 characters each,
-  trimmed, blank entries dropped). They replace the stored value, like `key_messages` always did. For these new fields (and for founders) blank text and an
-  empty list mean "not given" and never blank a stored value. The six fields the tool always had (`company_name`, `mission`, `tone_of_voice`,
+  trimmed, blank entries dropped). They replace the stored value, like `key_messages` always did. For these new fields (and for founders) blank text (empty, spaces, or
+  only invisible characters; text that merely contains a joiner, as an emoji does, is kept as sent) and an empty list mean "not given" and never blank a stored value. The six fields the tool always had (`company_name`, `mission`, `tone_of_voice`,
   `target_audience`, `key_messages`, `visual_identity`) keep their mapping and behaviour exactly, including the fact that they are forwarded as sent and are
   not validated: an explicit blank (or `null`, or a very large value) there is stored as sent, as it always was.
 - **founders merge by name (a deliberate difference from Emma).** The route REPLACES the stored founder list (an empty list wipes it). Emma treats a

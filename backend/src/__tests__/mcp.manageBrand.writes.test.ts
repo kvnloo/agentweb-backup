@@ -644,6 +644,16 @@ describe('update: duplicates, names and sizes', () => {
     expect(brandOf(TENANT_A.orgId).brandData.brandValues).toEqual(['Honesty', 'Craft']);
   });
 
+  it('text with nothing visible in it (only invisible characters) is "not given" and never overwrites; text that merely contains a joiner is kept', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, { tagline: '\u200b', domain: ' \u200d ', brand_personality: '\u2060', brand_values: ['\u00ad', ' '], founders: [{ name: 'Ben Beta', jobTitle: 'CTO', styleTone: '\u200b' }] });
+    expect(r.json).toMatchObject({ success: true, changed: false });
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+    const emoji = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467} family';
+    expect((await update(owner, { tagline: emoji })).json.success).toBe(true);
+    expect(brandOf(TENANT_A.orgId).brandData.tagline).toBe(emoji);
+  });
+
   it('the six old fields are still forwarded as sent: an explicit blank still blanks the stored value', async () => {
     expect((await update(owner, { company_name: '' })).json.success).toBe(true);
     expect(brandOf(TENANT_A.orgId).brandData.brandName).toBe('');
