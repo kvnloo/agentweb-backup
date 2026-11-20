@@ -65,7 +65,12 @@ export class RateLimiter {
     }
   }
 
-  constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000) {
+  // `windowMs` defaults to one minute, so every existing caller keeps its
+  // per-minute meaning. A caller that needs a longer window (ENG-3163: sends
+  // per hour) passes it here; the `maxPerMinute` argument of check() is then
+  // the maximum per that window.
+  constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000, windowMs: number = 60000) {
+    if (Number.isFinite(windowMs) && windowMs > 0) this.windowMs = windowMs;
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
     // Only enable bounded storage for a valid positive integer cap; an
     // invalid value (non-finite, non-integer, <= 0) falls back to the
