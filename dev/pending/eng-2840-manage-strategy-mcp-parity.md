@@ -20,8 +20,11 @@ for the lists the tool hands it, because they are already the merged ones.
   both lists past 250,000 bytes together: the strategy sits on the account record, one DynamoDB item of at most 400 KB that also holds everything else of
   the account, so an oversized save is refused here with a reason instead of coming back from the route as an unexplained 500. An account that is already
   over that size can still edit an entry as long as the edit does not make it bigger.
-- **refused by name:** `positioning`, `differentiators` and `channels` (never stored: callers believed they were saved). A call with nothing to send is
-  refused instead of reported as saved. One bad entry refuses the whole call; nothing is half-saved.
+- **refused by name:** `positioning`, `differentiators` and `channels` (never stored: callers believed they were saved), and any other top-level argument
+  the action does not take (for example `targetAudience` on an update, or `competitors` on a read): it would be dropped while the call reported success
+  (found by the Opslane check on the first head). Identity-style arguments (`client_id`, `clientId`, `user_id`, `userId`) are not refused: the strategy is
+  always the caller's own and they are never used (the MCP layer already strips `userId` before a tool sees it), and the answer lists them in
+  `ignoredArguments`. A call with nothing to send is refused instead of reported as saved. One bad entry refuses the whole call; nothing is half-saved.
 - **a call that changes nothing writes nothing.** A write that carries `icp` marks the ICPs as hand-edited, which switches the account off its cached ICP
   search filters (`icpUpdatedAt`), so repeating what is already stored must not do that. Stored text is compared trimmed, so stored padding does not make a
   repeat look like a change. Only the parts that changed are sent to the route.
@@ -44,7 +47,8 @@ for the lists the tool hands it, because they are already the merged ones.
 
 **Behaviour changes for outside callers (stated, not hidden):** a call that sent `competitors` or `icp` used to REPLACE the stored list and now merges;
 sending `[]` used to wipe the list and now changes nothing (to remove entries, use the app, or `regenerate_market_strategy` through Emma); the three
-never-stored arguments and unknown entry fields are refused where they used to be ignored or stored; a very large roster is paged on read. The answer of an
+never-stored arguments, every other argument the action does not take, and unknown entry fields are refused where they used to be ignored or stored; a very
+large roster is paged on read. The answer of an
 update changed shape: it used to be `{success, data: <the whole saved strategy>, message}` and is now `{success, changed, businessOverview?, competitors?,
 icp?}` with added / updated / unchanged names and the saved totals (no `data`, no `message`). A blank `businessOverview` used to clear the overview and is
 now refused as "nothing to send" (the overview can no longer be cleared over MCP). Any `action` other than `read` or `update` (case ignored) used to be taken
