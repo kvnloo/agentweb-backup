@@ -573,6 +573,51 @@ describe('update: duplicates, names and sizes', () => {
     expect(foundersOf(TENANT_A.orgId)[0]).toMatchObject({ name: 'Ada Alpha', jobTitle: 'Chief' });
   });
 
+  it('look-alike names made with other invisible characters or another encoding of an accent are the same founder', async () => {
+    const brand = brandOf(TENANT_A.orgId);
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), brandGuidelines: { ...brand, brandData: { ...brand.brandData, founders: [{ name: 'José Alpha' }, { name: 'Ben Beta' }] } } });
+    // A left-to-right mark, a variation selector, a braille blank, and "e" followed by a combining accent.
+    for (const lookalike of ['Jos\u00e9\u200e Alpha', 'Jos\u00e9\ufe0f Alpha', 'Jos\u00e9\u2800 Alpha', 'Jose\u0301 Alpha']) {
+      const r = await update(owner, { founders: [{ name: lookalike, jobTitle: 'Chief' }] });
+      expect({ lookalike, ok: r.json?.success, total: r.json?.founders?.total }).toEqual({ lookalike, ok: true, total: 2 });
+    }
+    expect(foundersOf(TENANT_A.orgId).map((f: any) => f.name)).toEqual(['José Alpha', 'Ben Beta']);
+  });
+
+  it('the same founder twice in one call is refused, not reported as both added and updated', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, { founders: [{ name: 'Di Delta' }, { name: 'di   delta', jobTitle: 'CFO' }] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/founders\[1\] names the same founder as founders\[0\]/);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it.each([
+    ['an unknown key', { visual_identity: { primaryColor: '#112233', logoUrl: 'https://x.test/l.png' } }, /visual_identity has fields that are not stored: "logoUrl"\. Supported fields: primaryColor, primaryColorEnd, secondaryColor, fontFamily, isGradient/],
+    ['text instead of an object', { visual_identity: 'blue' }, /visual_identity must be an object/],
+    ['a list', { visual_identity: ['#fff'] }, /visual_identity must be an object/],
+  ])('visual_identity with %s is refused by name instead of being dropped while the call reports success', async (_label, args, message) => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, { tagline: 'Should not land', ...args });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(message);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('visual_identity with the supported keys still saves', async () => {
+    const r = await update(owner, { visual_identity: { primaryColor: '#112233', primaryColorEnd: '#445566', secondaryColor: '#778899', fontFamily: 'Inter', isGradient: true } });
+    expect(r.json.success).toBe(true);
+    expect(brandOf(TENANT_A.orgId).brandData).toMatchObject({ primaryColor: '#112233', primaryColorEnd: '#445566', secondaryColor: '#778899', fontFamily: 'Inter', isGradient: true });
+  });
+
+  it('a call that changes nothing is answered without the route\'s editor check (it writes nothing); a change is still refused for a member who is not an editor', async () => {
+    const same = await update(member, { founders: [{ name: 'Ben Beta', jobTitle: 'CTO' }] });
+    expect(same.json).toMatchObject({ success: true, changed: false });
+    const change = await update(member, { founders: [{ name: 'Ben Beta', jobTitle: 'Different' }] });
+    expect(change.isError).toBe(true);
+    expect(change.text).toMatch(/Not authorized to edit brand guidelines/);
+  });
+
   it('remove_founders names are bounded', async () => {
     const r = await update(owner, { remove_founders: ['n'.repeat(201)] });
     expect(r.isError).toBe(true);
