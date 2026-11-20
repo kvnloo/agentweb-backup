@@ -894,6 +894,33 @@ describe('update: solo accounts, the org flag and the memory\'s end', () => {
     expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
   });
 
+  it('an org caller whose read answered with an EMPTY personal strategy (no createdAt, not the org\'s) is refused too, and so is one whose second read is the personal strategy', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const emptyPersonal = { success: true, data: { businessOverview: '', competitors: [], icp: [] }, isOrgLevel: false };
+    await withStrategyReadsOverridden(() => emptyPersonal, async () => {
+      const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/the organisation's market strategy could not be read.*Try again\. Nothing was changed/);
+    });
+    const personal = { success: true, data: { businessOverview: 'Personal', competitors: [{ name: 'PersonalRival' }], icp: [], createdAt: STORED_AT, updatedAt: STORED_AT }, isOrgLevel: false };
+    await withStrategyReadsOverridden((call) => (call === 1 ? emptyPersonal : personal), async () => {
+      const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(r.isError).toBe(true);
+    });
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('text with nothing visible in it (only invisible characters) is "not given" and never overwrites stored text; text that merely contains a joiner is kept', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const same = await update(owner, { businessOverview: '\u200b', competitors: [{ name: 'AlphaRival', description: ' \u200d\u2060 ' }], icp: [{ title: 'Founder', description: '\u00ad', buyerPersonas: ['\u200b'] }] });
+    expect(same.isError).toBe(false);
+    expect(same.json.changed).toBe(false);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+    const emoji = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467} family';
+    expect((await update(owner, { competitors: [{ name: 'AlphaRival', description: emoji }] })).isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors[0].description).toBe(emoji);
+  });
+
   it('after a minute the memory is gone: a read that is older than our last save (a writer with an older stamp) is used, not replaced by the saved copy', async () => {
     const now = Date.now();
     const spy = jest.spyOn(Date, 'now');
@@ -904,11 +931,12 @@ describe('update: solo accounts, the org flag and the memory\'s end', () => {
       const saved = strategyOf(TENANT_A.orgId);
       fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...saved, updatedAt: STORED_AT, competitors: [...saved.competitors, { name: 'Foreign' }] } });
       spy.mockReturnValue(now + 61_000);
-      expect((await update(owner, { businessOverview: 'Later overview' })).isError).toBe(false);
+      // The call changes the competitors, so the merge baseline matters: inside the minute it would be our saved copy (without 'Foreign'); after it, the read.
+      expect((await update(owner, { competitors: [{ name: 'Epsilon' }] })).isError).toBe(false);
     } finally {
       spy.mockRestore();
     }
-    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta', 'Foreign']);
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta', 'Foreign', 'Epsilon']);
   });
 });
 
