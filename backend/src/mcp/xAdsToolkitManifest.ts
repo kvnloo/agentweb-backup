@@ -36,8 +36,12 @@ export const X_ADS_LINE_ITEM_OBJECTIVES = [
 export const X_ADS_STATS_ENTITIES = ['ACCOUNT', 'FUNDING_INSTRUMENT', 'CAMPAIGN', 'LINE_ITEM', 'PROMOTED_TWEET'] as const;
 export const X_ADS_METRIC_GROUPS = ['ENGAGEMENT', 'BILLING', 'VIDEO', 'MEDIA', 'WEB_CONVERSION', 'MOBILE_CONVERSION', 'LIFE_TIME_VALUE_MOBILE_CONVERSION'] as const;
 
-/** X's synchronous stats endpoint accepts at most 7 days per request. */
-export const X_ADS_SYNC_STATS_MAX_DAYS = 7;
+/**
+ * X's synchronous stats endpoint accepts at most 604800s (7 days) per request, measured in
+ * the account's timezone. A 7-calendar-day window that crosses a DST fall-back is 7d+1h
+ * and X rejects it, so windows are 6 days.
+ */
+export const X_ADS_SYNC_STATS_MAX_DAYS = 6;
 /** Longest range one GET_STATS call will chunk (bounds the number of X requests). */
 export const X_ADS_STATS_MAX_RANGE_DAYS = 90;
 /** X accepts at most 20 entity_ids per stats request. */

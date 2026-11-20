@@ -1,6 +1,6 @@
 /**
  * ENG-3142 — X Ads toolkit manifest + reads: curated surface, honest annotations, and
- * synchronous stats split into <=7-day windows and merged. X is faked at the HTTP boundary.
+ * synchronous stats split into <=6-day windows and merged. X is faked at the HTTP boundary.
  */
 import {
   assertXAdsToolkitCall, chunkDateRange, executeXAdsRead, getXAdsToolkitManifest, mergeStatsWindows, X_ADS_TOOL_NAMES,
@@ -36,14 +36,13 @@ describe('ENG-3142 X Ads manifest', () => {
 });
 
 describe('ENG-3142 X Ads stats windows', () => {
-  it('splits a range into <=7-day windows (end exclusive)', () => {
-    expect(chunkDateRange('2026-11-01', '2026-11-08')).toEqual([{ start: '2026-11-01', end: '2026-11-08' }]);
-    expect(chunkDateRange('2026-10-01', '2026-10-31')).toEqual([
-      { start: '2026-10-01', end: '2026-10-08' },
-      { start: '2026-10-08', end: '2026-10-15' },
-      { start: '2026-10-15', end: '2026-10-22' },
-      { start: '2026-10-22', end: '2026-10-29' },
-      { start: '2026-10-29', end: '2026-10-31' },
+  it('splits a range into <=6-day windows (end exclusive) so DST fall-back never exceeds X\'s 7-day cap', () => {
+    expect(chunkDateRange('2026-11-01', '2026-11-07')).toEqual([{ start: '2026-11-01', end: '2026-11-07' }]);
+    expect(chunkDateRange('2026-10-01', '2026-10-20')).toEqual([
+      { start: '2026-10-01', end: '2026-10-07' },
+      { start: '2026-10-07', end: '2026-10-13' },
+      { start: '2026-10-13', end: '2026-10-19' },
+      { start: '2026-10-19', end: '2026-10-20' },
     ]);
   });
 
@@ -62,10 +61,10 @@ describe('ENG-3142 X Ads stats windows', () => {
 });
 
 describe('ENG-3142 executeXAdsRead', () => {
-  it('GET_STATS over 10 days makes two signed, sequential 7-day requests and merges them', async () => {
+  it('GET_STATS over 10 days makes two signed, sequential 6-day requests and merges them', async () => {
     const fetchImpl = jest.fn()
-      .mockResolvedValueOnce(ok({ data: [{ id: 'c1', id_data: [{ metrics: { impressions: Array(7).fill(1) } }] }] }))
-      .mockResolvedValueOnce(ok({ data: [{ id: 'c1', id_data: [{ metrics: { impressions: [2, 2, 2] } }] }] }));
+      .mockResolvedValueOnce(ok({ data: [{ id: 'c1', id_data: [{ metrics: { impressions: Array(6).fill(1) } }] }] }))
+      .mockResolvedValueOnce(ok({ data: [{ id: 'c1', id_data: [{ metrics: { impressions: [2, 2, 2, 2] } }] }] }));
     const result = await executeXAdsRead(
       { action: 'GET_STATS', entity: 'CAMPAIGN', entity_ids: ['c1'], start_date: '2026-11-01', end_date: '2026-11-11', granularity: 'TOTAL' },
       { accountId: 'acc1', credentials, fetchImpl },
@@ -73,11 +72,11 @@ describe('ENG-3142 executeXAdsRead', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     const urls = fetchImpl.mock.calls.map(([u]) => new URL(u));
     expect(urls[0].pathname).toBe('/12/stats/accounts/acc1');
-    expect(urls.map((u) => [u.searchParams.get('start_time'), u.searchParams.get('end_time')])).toEqual([['2026-11-01', '2026-11-08'], ['2026-11-08', '2026-11-11']]);
+    expect(urls.map((u) => [u.searchParams.get('start_time'), u.searchParams.get('end_time')])).toEqual([['2026-11-01', '2026-11-07'], ['2026-11-07', '2026-11-11']]);
     expect(urls[0].searchParams.get('metric_groups')).toBe('ENGAGEMENT,BILLING');
     expect(urls[0].searchParams.get('placement')).toBe('ALL_ON_TWITTER');
     expect(fetchImpl.mock.calls[0][1].headers.Authorization).toMatch(/oauth_token="t"/);
-    expect(result).toMatchObject({ success: true, windows: 2, data: [{ id: 'c1', metrics: { impressions: 13 } }] });
+    expect(result).toMatchObject({ success: true, windows: 2, data: [{ id: 'c1', metrics: { impressions: 14 } }] });
   });
 
   it('GET_STATS refuses more than 20 ids before calling X', async () => {
