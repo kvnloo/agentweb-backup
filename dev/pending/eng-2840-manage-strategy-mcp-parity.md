@@ -11,14 +11,15 @@ for the lists the tool hands it, because they are already the merged ones.
   not-stored lookup ignores case and padding); an entry that is already stored is updated field by field and keeps its own spelling of the name; every other
   stored entry is kept, including fields the tool cannot write (the ICP's cached search filters). Nothing can be removed (Emma has no removal either;
   `regenerate_market_strategy` is the separate destructive tool). The answer lists what was added, updated and unchanged per list, and the totals are the
-  ones the route reports as saved.
+  ones the route reports as saved. A name sent more than once in one call is listed once: two entries for a new name are one added competitor (the later fields win), and a stored entry
+  named twice is listed as updated when either mention changed it (Opslane P2 on `ef2bc22`: it used to be listed as added and updated).
 - **what is accepted:** a competitor holds `name` and `description`; an ICP holds `title`, `description`, `valueProposition` and `buyerPersonas` (a list of
   text that replaces that profile's list). Any other field is refused by name (Emma spreads any extra key onto the stored strategy; over MCP that would let
   an outside agent write arbitrary keys into the account record). Blank text (empty, spaces, or only invisible characters) means "not given" and never blanks a stored value; an empty list changes
   nothing. At most 100 entries per list per call; a name or title of 200 characters, text of 5,000, a persona of 500 (50 per profile), an overview of
   20,000. A merge that would take a list past 500 competitors or 100 ICPs is refused when it adds an entry, and so is one that would take the overview and
   both lists past 250,000 bytes together: the strategy sits on the account record, one DynamoDB item of at most 400 KB that also holds everything else of
-  the account, so an oversized save is refused here with a reason instead of coming back from the route as an unexplained 500. An account that is already
+  the account, so a save past that is refused here with a reason. The 250,000 bytes do not count the rest of the record, so a save that fits them can still push the whole record past 400 KB (an account with a large saved ICP result, for example): the service refuses that write atomically and `POST /api/market-strategy` answers 413 `market_strategy_too_large` with a message that names the 400 KB limit and says nothing was changed (it used to be a bare 500; Opslane P1 on `ef2bc22`). An account that is already
   over that size can still edit an entry as long as the edit does not make it bigger.
 - **refused by name:** `positioning`, `differentiators` and `channels` (never stored: callers believed they were saved), and any other top-level argument
   the action does not take (for example `targetAudience` on an update, or `competitors` on a read): it would be dropped while the call reported success
