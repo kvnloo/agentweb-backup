@@ -24,6 +24,7 @@ import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } 
 import { validateRef } from '../services/journeyAttribution';
 import { toZomaVoice, zomaErrorNextStep, zomaNextStep } from '../mcp/zomaNextStep';
 import { ZOMA_ADS_EXPERIENCE_QUESTION, ZOMA_WELCOME } from '../mcp/zomaAdsExperience';
+import { measurementReportsEnabledForUserId } from '../mcp/zomaMeasurementReport';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -45,17 +46,20 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
  * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
-function toolkitManifest() {
+function toolkitManifest(measurementReports: boolean) {
   // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
-  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
+  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest(undefined, { measurementReports }));
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+  return annotateToolkitTools([...getMetaToolkitManifest(undefined, { measurementReports }), ...getGoogleToolkitManifest()]);
 }
 
-/** ENG-2747 (option B): Databricks-origin callers see only the tools they may call. */
-function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
-  const tools = toolkitManifest();
+/**
+ * ENG-2747 (option B): Databricks-origin callers see only the tools they may call.
+ * ENG-3155: the measurement report tools are listed when the flag is on or this caller is allowlisted.
+ */
+async function toolsFor(caller: { userId: string; databricksOrigin?: boolean }) {
+  const tools = toolkitManifest(await measurementReportsEnabledForUserId(caller.userId));
   return caller?.databricksOrigin ? databricksToolView(tools) : tools;
 }
 
@@ -90,7 +94,7 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 router.get('/tools', async (req: Request, res: Response) => {
   try {
     const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: toolsFor(caller) });
+    return res.json({ tools: await toolsFor(caller) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -203,7 +207,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
         return rpcResult(res, id, {});
       case 'tools/list': {
         const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: toolsFor(caller) });
+        return rpcResult(res, id, { tools: await toolsFor(caller) });
       }
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
