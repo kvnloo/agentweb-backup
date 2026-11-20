@@ -17,6 +17,7 @@ jest.mock('../../../services/funding/runFunding', () => ({
 import { createHash } from 'node:crypto';
 import { mcpToolRegistry, withToolAnnotations } from '../registry';
 import { KB_TEXT_FILE_MAX_BYTES } from '../apiTools';
+import { buildKbListQuery, KB_APPEND_MAX_FILE_BYTES, KB_LIST_TYPES } from '../knowledgeBaseParams';
 import { findScopeDenial } from '../apiKeyScopes';
 import { classifyMcpTool } from '../toolAnnotationPolicy';
 
@@ -52,8 +53,12 @@ function fakeBackend(tasks: Record<string, any>) {
     }
     if (path === '/api/emma/update-knowledge-base-file') {
       const t = tasks[body.task_id];
-      if (body.file_name === 'knowledge-base.txt') t.knowledgeBaseSize = bytes(body.content);
-      else t.knowledgeBaseFiles.find((f: any) => f.filename === body.file_name).size = bytes(body.content);
+      const file = body.file_name === 'knowledge-base.txt' ? null : t.knowledgeBaseFiles.find((f: any) => f.filename === body.file_name);
+      const previous = file ? file.size : t.knowledgeBaseSize;
+      // Emma's append keeps the stored text and puts a blank line before the new text (emma/impl/knowledgeBase.ts).
+      const next = body.mode === 'append' ? previous + 2 + bytes(body.content) : bytes(body.content);
+      if (file) file.size = next;
+      else t.knowledgeBaseSize = next;
       return { success: true };
     }
     const del = path.match(/^\/api\/tasks\/([^/]+)\/knowledge-base\/files\/(.+)$/);
@@ -210,6 +215,136 @@ describe('text only, size cap', () => {
     expect((await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name: 'a.md', content: 'PNG\u0000\u0001' })).error).toContain('binary');
     expect((await run('create_knowledge_base_file', { kb_id: 'kb-own', file_name: 'a.pdf', content: 'x' })).error).toContain('.txt');
     expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('update_knowledge_base_file_content: append mode', () => {
+  const MAIN = 'knowledge-base.txt';
+
+  it('appends to the main file, keeps the stored text, and reports the bytes added (no hash of a file it did not read back)', async () => {
+    const tasks = seed();
+    fakeBackend(tasks);
+    const content = 'New finding.';
+    const res = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: MAIN, content, mode: 'append' });
+    expect(res).toEqual({ success: true, mode: 'append', kb_id: 'kb-own', file_name: MAIN, file_key: 'tasks/kb-own/knowledge-base.txt', size_bytes: 5 + 2 + bytes(content), previous_size_bytes: 5, appended_bytes: bytes(content) });
+    expect(res.sha256).toBeUndefined();
+    expect(writeCalls()[0]).toMatchObject({ path: '/api/emma/update-knowledge-base-file', body: { task_id: 'kb-own', file_name: MAIN, content, mode: 'append' } });
+    expect(tasks['kb-own'].knowledgeBaseSize).toBe(5 + 2 + bytes(content));
+  });
+
+  it('appends to an attached file', async () => {
+    const tasks = seed();
+    fakeBackend(tasks);
+    const res = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: 'notes.md', content: 'more', mode: 'append' });
+    expect(res).toMatchObject({ success: true, mode: 'append', size_bytes: 3 + 2 + 4, previous_size_bytes: 3, appended_bytes: 4 });
+    expect(tasks['kb-own'].knowledgeBaseFiles[0].size).toBe(9);
+  });
+
+  it('the default and an empty mode are still replace (the tool never changed meaning for existing callers)', async () => {
+    fakeBackend(seed());
+    for (const mode of [undefined, '', null]) {
+      const res = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: 'notes.md', content: 'whole new', ...(mode === undefined ? {} : { mode }) });
+      expect(res).toMatchObject({ success: true, size_bytes: bytes('whole new'), sha256: sha('whole new') });
+    }
+    expect(writeCalls().map((c: any) => c.body.mode)).toEqual(['replace', 'replace', 'replace']);
+  });
+
+  it('refuses a mode that is neither replace nor append, before any call', async () => {
+    fakeBackend(seed());
+    for (const mode of ['prepend', 'APPEND', 'merge', 7]) {
+      expect(await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: 'notes.md', content: 'x', mode })).toEqual({ success: false, error: 'mode must be "replace" or "append"' });
+    }
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('an append to a file that does not exist is not-found, not a silent create; a foreign KB answers the same', async () => {
+    fakeBackend(seed());
+    const missing = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: 'new.md', content: 'x', mode: 'append' });
+    const foreign = await run('update_knowledge_base_file_content', { kb_id: 'kb-foreign', file_name: 'secret.md', content: 'x', mode: 'append' });
+    expect(missing).toEqual({ success: false, error: 'Knowledge base or file not found' });
+    expect(foreign).toEqual(missing);
+    expect(writeCalls()).toEqual([]);
+  });
+
+  it('an append that would take the file past 10 MB is refused and nothing is sent', async () => {
+    const tasks = seed();
+    tasks['kb-own'].knowledgeBaseSize = KB_APPEND_MAX_FILE_BYTES - 4;
+    fakeBackend(tasks);
+    const res = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: MAIN, content: 'abcdef', mode: 'append' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/would be \d+ bytes after this append; the maximum is 10485760 bytes\. Nothing was changed\./);
+    expect(writeCalls()).toEqual([]);
+  });
+
+  it('when the route answers success but the stored size shows the text was replaced instead of added, the answer is a failure', async () => {
+    const tasks = seed();
+    fakeBackend(tasks);
+    const normal = mockMcpFetch.getMockImplementation()!;
+    mockMcpFetch.mockImplementation(async (o: any) => (o.path === '/api/emma/update-knowledge-base-file' ? normal({ ...o, body: { ...o.body, mode: 'replace' } }) : normal(o)));
+    const res = await run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: MAIN, content: 'New finding.', mode: 'append' });
+    expect(res).toMatchObject({ success: false, error: 'Write could not be verified on read-back' });
+  });
+
+  it('two appends to one file sent together both land (taken in turn, each on top of the other)', async () => {
+    const tasks: Record<string, any> = seed();
+    const store = tasks['kb-own'];
+    // A route that, like the real one, reads the stored text, waits, then writes: two overlapping appends would otherwise both start from the same text.
+    mockMcpFetch.mockImplementation(async ({ method, path, body }: any) => {
+      const taskGet = path.match(/^\/api\/tasks\/([^/]+)$/);
+      if (method === 'GET' && taskGet) return JSON.parse(JSON.stringify(tasks[taskGet[1]]));
+      if (path === '/api/emma/update-knowledge-base-file') {
+        const read = store.knowledgeBaseSize;
+        await new Promise((r) => setTimeout(r, 15));
+        store.knowledgeBaseSize = read + 2 + bytes(body.content);
+        return { success: true };
+      }
+      throw new Error(`unexpected ${method} ${path}`);
+    });
+    const [a, b] = await Promise.all([
+      run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: MAIN, content: 'AAAA', mode: 'append' }),
+      run('update_knowledge_base_file_content', { kb_id: 'kb-own', file_name: MAIN, content: 'BBBBBB', mode: 'append' }),
+    ]);
+    expect(a.success).toBe(true);
+    expect(b.success).toBe(true);
+    expect(store.knowledgeBaseSize).toBe(5 + 2 + 4 + 2 + 6);
+  });
+});
+
+describe('list_knowledge_bases: the inputs Emma\'s list takes', () => {
+  it('sends no query when called with no arguments (as before)', async () => {
+    mockMcpFetch.mockResolvedValue({ files: [] });
+    await run('list_knowledge_bases', {});
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ method: 'GET', path: '/api/emma/knowledge-bases', queryParams: {} }));
+  });
+
+  it('forwards kb_type, the dates, limit and offset to the route', async () => {
+    mockMcpFetch.mockResolvedValue({ files: [] });
+    await run('list_knowledge_bases', { kb_type: 'google-drive', modified_after: '2026-04-15', modified_before: '2026-04-22T10:00:00Z', limit: 25, offset: '50' });
+    expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ queryParams: { kb_type: 'google-drive', modified_after: '2026-04-15', modified_before: '2026-04-22T10:00:00Z', limit: '25', offset: '50' } }));
+  });
+
+  it('empty, blank and zero values mean "not given"; the kind is matched without regard to case', () => {
+    expect(buildKbListQuery({ kb_type: ' Private ', modified_after: ' ', limit: 0, offset: '', modified_before: null })).toEqual({ kb_type: 'private' });
+    expect(buildKbListQuery({ limit: '0', offset: 0 })).toEqual({});
+    expect(buildKbListQuery(undefined)).toEqual({});
+  });
+
+  it.each([
+    ['a kind that is not one of the sources', { kb_type: 'dropbox' }, /kb_type must be one of google-drive, private, public, clickup, clickup-tasks, foreplay-swipefile, foreplay-board \(got "dropbox"\)/],
+    ['a kind that is not text', { kb_type: 5 }, /kb_type must be one of/],
+    ['a date that is not an ISO date', { modified_after: 'last week' }, /modified_after must be an ISO date/],
+    ['a date with an impossible month', { modified_before: '2026-13-45' }, /modified_before must be an ISO date/],
+    ['a date that is not text', { modified_after: 20260415 }, /modified_after must be text/],
+    ['a negative limit', { limit: -1 }, /limit must be a whole number/],
+    ['a fractional offset', { offset: 1.5 }, /offset must be a whole number/],
+    ['a limit of words', { limit: 'many' }, /limit must be a whole number/],
+  ])('%s is refused by name and nothing is sent', async (_label, args, message) => {
+    await expect(run('list_knowledge_bases', args)).rejects.toThrow(message);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('every kind the schema offers is accepted', () => {
+    for (const kind of KB_LIST_TYPES) expect(buildKbListQuery({ kb_type: kind })).toEqual({ kb_type: kind });
   });
 });
 
