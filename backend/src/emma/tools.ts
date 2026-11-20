@@ -7670,8 +7670,9 @@ const bridgedToolNames = [
 /**
  * Bridged tools that act on one signed-in account's data and must refuse an anonymous (not signed-in) session with the same
  * deferred refusal Emma's own account tools give. The bridge copies a definition and an execute function, not the MCP handler's
- * flags, so a tool that needs this names itself here instead of the loop below carrying every flag (which would change the
- * landing-page and publish tools, whose handlers also set it). ENG-2840.
+ * flags, so a tool that needs this names itself here. (None of the other bridged tools' MCP handlers sets the flag today, so
+ * the loop below carrying every handler's flag would change nothing now; naming the tool keeps the change to this tool, and a
+ * handler that sets the flag later does not silently start refusing anonymous in-app sessions.) ENG-2840.
  */
 const BRIDGED_REQUIRES_USER_ACCOUNT: ReadonlySet<string> = new Set(['manage_market_strategy']);
 

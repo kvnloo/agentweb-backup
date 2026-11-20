@@ -311,7 +311,8 @@ export const SKILL_ONLY_TOOL_NAMES: readonly string[] = ['manage_market_strategy
 
 /**
  * Get tools that are not associated with any published skill.
- * Excludes foundation tools and admin-only tools.
+ * Excludes foundation tools, admin-only tools, the page-context-only get_visual_context and the skill-only tools
+ * (SKILL_ONLY_TOOL_NAMES).
  *
  * `foundationTools`/`getAllTools` are injected — see this module's header
  * comment ("ENG-2103 F2 FOLLOW-UP") for why: `foundationTools` must be a LIVE
@@ -337,11 +338,13 @@ export function getUnassociatedTools(
     skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
   });
 
-  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
+  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools + skill-only tools
   const excludedTools = new Set<string>(foundationTools);
   ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
   // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
   excludedTools.add('get_visual_context');
+  // Skill-only tools (ENG-2840): offered through a skill that lists them, not through this catch-all pool. A work plan or
+  // schedule that names one in requiredFunctionCalls therefore does not get it from the pool either.
   SKILL_ONLY_TOOL_NAMES.forEach(t => excludedTools.add(t));
 
   // Get all registered tools and find those not in any skill
