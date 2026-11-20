@@ -33,6 +33,19 @@ export interface BaseOAuthConfig {
 }
 
 /**
+ * ENG-2264: platform values stored on older connected accounts that name the same
+ * connection as a current `PlatformType`. Meta accounts connected before the platform
+ * name was standardised are stored as 'facebook'; every reader already accepts both
+ * spellings, so the write path has to as well or a reconnect cannot find the old row.
+ * Keys are the legacy spelling, values the current platform.
+ */
+const LEGACY_PLATFORM_ALIASES: Readonly<Record<string, PlatformType>> = { facebook: 'meta' };
+
+/** True when `stored` is a legacy spelling of `platform` (never true for an exact match). */
+const isLegacyPlatformAlias = (stored: string, platform: PlatformType): boolean =>
+  stored !== platform && LEGACY_PLATFORM_ALIASES[stored] === platform;
+
+/**
  * Helper function to normalize connected_accounts to array format
  */
 const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => {
@@ -511,10 +524,20 @@ export const createAccount = async (
   const now = new Date().toISOString();
   const existingAccounts = normalizeAccounts((user as User).connected_accounts);
 
-  // Find existing account for this platform AND account_id (to support multiple accounts per platform)
-  const existingIndex = existingAccounts.findIndex(
+  // Find existing account for this platform AND account_id (to support multiple accounts per platform).
+  // ENG-2264: an exact platform match wins; failing that, a row stored under a legacy
+  // spelling of the same platform ('facebook' for 'meta') is the same connection, so it is
+  // updated in place (and relabelled to the current platform) instead of being left behind
+  // as an orphan next to a brand-new duplicate.
+  const exactIndex = existingAccounts.findIndex(
     acc => acc.platform === platform && acc.account_id === input.account_id
   );
+  const existingIndex =
+    exactIndex >= 0
+      ? exactIndex
+      : existingAccounts.findIndex(
+          acc => isLegacyPlatformAlias(acc.platform, platform) && acc.account_id === input.account_id
+        );
   const existingAccount = existingIndex >= 0 ? existingAccounts[existingIndex] : null;
 
   // On reconnect (existing platform+account_id), spread the existing entry first so
