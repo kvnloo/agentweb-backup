@@ -7659,6 +7659,11 @@ const bridgedToolNames = [
   // had no self-status tool and fell back to assess_client_health (admin lookup
   // by email) — the user-reported "asked me for my email" bug.
   'get_account_status',
+  // ENG-2840: the market strategy tool of the MCP server (competitors merged by name, ICPs by title, nothing removed). Bridged
+  // so a skill that lists it in `toolNames` has a tool to offer in agent mode: it was registered for MCP callers only, so such a
+  // skill silently offered nothing and a call answered "Unknown tool". It is offered only through a skill that lists it (it is
+  // not a foundation tool); Emma's own update_market_strategy is unchanged.
+  'manage_market_strategy',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
