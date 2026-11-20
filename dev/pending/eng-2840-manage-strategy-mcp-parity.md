@@ -33,8 +33,10 @@ for the lists the tool hands it, because they are already the merged ones.
   exact) lands on the last entry rather than an empty page. `competitorNames` (up to 50) answers stored / not stored with the offset, whatever the page
   shows; names past 50 are reported as not checked. A roster that fits one page reads as before, with the extra paging fields. The overview and ICPs are
   returned whole, as before. An answer from the route that is not a success carrying a strategy is an error, not an empty strategy.
-- **who may write:** unchanged and still the route's job: an org member needs the same editor rights as in the app (403 otherwise). Isolation of which
-  strategy is the caller's is the route's (tests: `mcp.twoTenantIsolation.test.ts`, `mcp.manageStrategy.writes.test.ts`).
+- **who may write:** unchanged and still the route's job: an org member needs the same editor rights as in the app (403 otherwise) for a call that changes
+  something. A call that changes nothing makes no write at all, so it is answered (`changed: false`) without the route's editor check; the caller can read
+  everything such an answer tells it. Isolation of which strategy is the caller's is the route's (tests: `mcp.twoTenantIsolation.test.ts`,
+  `mcp.manageStrategy.writes.test.ts`).
 - **parallel calls:** calls on one ACCOUNT are serialized in arrival order within the server process (the same lock as `manage_leads`; the key is the org
   when the caller belongs to one, else the user, because an org's strategy is shared by its members), since the merge is read, merge, write: two calls sent
   together (one agent's parallel calls, or the owner's agent and an editor's) would each merge onto the same stored lists and the second write would drop the
@@ -44,11 +46,21 @@ for the lists the tool hands it, because they are already the merged ones.
   believed, because the route's read can miss the org owner's record for a moment and a write built on that would replace the real lists; and a read whose
   `updatedAt` is older than the strategy this process saved for that account within the last minute is not used (the saved copy is), because the route reads
   through an eventually consistent index and the next call of a serialized pair starts right after the first one's write.
+- **parts the route would fill from its own read:** the tool sends the route only the parts a call changes (so a no-change part does not stamp `icpUpdatedAt`),
+  and for every part it does not send the route fills the value from its OWN read of the account, which can be older than a save made a moment ago and would
+  write that older part back over the saved one (the second independent review reproduced this: a competitors save followed straight away by an
+  overview-only call lost the new competitor). So a part that a save of the last minute changed is sent again by the next call from the checked baseline,
+  whatever that call changes; the parts of saves made within the last minute add up. The cost: a call within a minute of a save that changed `icp` sends `icp`
+  again and stamps `icpUpdatedAt` again, which that earlier save had already done.
 
 **Behaviour changes for outside callers (stated, not hidden):** a call that sent `competitors` or `icp` used to REPLACE the stored list and now merges;
 sending `[]` used to wipe the list and now changes nothing (to remove entries, use the app, or `regenerate_market_strategy` through Emma); the three
 never-stored arguments, every other argument the action does not take, and unknown entry fields are refused where they used to be ignored or stored; a very
-large roster is paged on read. The answer of an
+large roster is paged on read. A competitor or ICP sent as a bare string (the old schema was a bare array, so `["HubSpot"]` was plausible) is refused: an entry
+is an object with a name or title. Overview, names, descriptions and personas are stored trimmed, and a name loses invisible characters (zero-width spaces and
+joiners, word joiner, byte-order mark, soft hyphen), so a look-alike name matches the stored one instead of becoming a second entry; when two stored entries
+differ only by case or spacing, the one with the exact spelling is the one updated. Every update does at least one extra read of the strategy, and one more
+after a 200 ms wait when the read shows no `createdAt` (older strategies). Stored lists that are not lists block only an update of that list. The answer of an
 update changed shape: it used to be `{success, data: <the whole saved strategy>, message}` and is now `{success, changed, businessOverview?, competitors?,
 icp?}` with added / updated / unchanged names and the saved totals (no `data`, no `message`). A blank `businessOverview` used to clear the overview and is
 now refused as "nothing to send" (the overview can no longer be cleared over MCP). Any `action` other than `read` or `update` (case ignored) used to be taken
@@ -60,7 +72,12 @@ route does not, so this tool does not. The route rebuilds the stored strategy fr
 `updatedAt`, `icpUpdatedAt`); Emma's merge keeps any other top-level key the record happens to hold, so for such a stray key the route's replace is not a
 no-op.
 
-**Limits (stated):** (1) The lock and the recent-save memory cover one server process. Calls that reach different instances, or a write by the portal or by
+**Limits (stated):** (0) An admin's `client_id` is ignored (and listed in `ignoredArguments`): the tool has never supported client scoping, so an admin who
+means a client's account gets a write on their own account, with only that note to catch it; other tools refuse `client_id`, but the two-tenant isolation tests
+pin this tool's ignoring it. The lock is held across up to two reads and one write (each may take minutes if the route stalls), so a stalled call holds that
+account's queue; if the caller's record cannot be read the lock key falls back to the user (`strategy:user:<id>`), which then does not serialize with the org's
+members. The recent-save memory keeps at most 100 accounts, each entry the route's whole saved strategy (up to about 250 KB), until a minute passes and a later
+save of any account sweeps it. (1) The lock and the recent-save memory cover one server process. Calls that reach different instances, or a write by the portal or by
 Emma (neither is serialized with this tool) landing between our read and our write, can still be overwritten by the merged lists we send, and a read that is
 older than another writer's save (not ours) cannot be recognised here. The portal's own partial saves have the same read-then-write shape but are
 human-paced; here the same read lag can hit calls made back to back, which is why the recent-save check exists. (2) The merge baseline is the route's own
