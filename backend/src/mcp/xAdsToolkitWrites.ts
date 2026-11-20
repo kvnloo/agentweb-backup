@@ -74,10 +74,12 @@ const requireName = (v: unknown): string => {
 };
 /** X requires an end_time on every line item; used when the caller gives none. */
 export const X_ADS_LINE_ITEM_DEFAULT_DAYS = 30;
+/** X accepts only yyyy-MM-ddTHH:mm:ssZ (no milliseconds, UTC). */
+export const toXTime = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const optionalIso = (v: unknown, field: string): string | undefined => {
   if (v === undefined) return undefined;
   if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) throw new MetaToolkitRefusal(`${field} must be an ISO 8601 date-time.`);
-  return v;
+  return toXTime(Date.parse(v));
 };
 const stringList = (v: unknown, field: string, max: number, re: RegExp): string[] => {
   if (!Array.isArray(v) || v.length === 0 || v.length > max || !v.every((s) => typeof s === 'string' && re.test(s))) {
@@ -399,8 +401,8 @@ export async function executeXAdsWrite(
     } else if (v.op === 'LINE_ITEM CREATE') {
       // X requires both start_time and end_time on line items. Defaults (outside the preview
       // fingerprint): start now, end X_ADS_LINE_ITEM_DEFAULT_DAYS later.
-      const liStartIso = String(v.fields.start_time ?? new Date(now).toISOString());
-      const liEndIso = String(v.fields.end_time ?? new Date(Date.parse(liStartIso) + X_ADS_LINE_ITEM_DEFAULT_DAYS * 86400000).toISOString());
+      const liStartIso = String(v.fields.start_time ?? toXTime(now));
+      const liEndIso = String(v.fields.end_time ?? toXTime(Date.parse(liStartIso) + X_ADS_LINE_ITEM_DEFAULT_DAYS * 86400000));
       const liQuery = { ...v.fields, start_time: liStartIso, end_time: liEndIso };
       createdId = (await call({ method: 'POST', path: `/accounts/${acct}/line_items`, query: liQuery }))?.data?.id;
     } else if (v.op === 'PROMOTED_TWEET CREATE') {

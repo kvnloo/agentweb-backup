@@ -215,7 +215,7 @@ describe('ENG-3142 X Ads guarded writes', () => {
     expect(done).toMatchObject({ success: true, verification: 'CONFIRMED' });
     expect(x.writes[0].query).toMatchObject({ entity_status: 'PAUSED', product_type: 'PROMOTED_TWEETS', bid_strategy: 'AUTO', placements: 'ALL_ON_TWITTER' });
     // X requires start_time on line items; defaulted to "now" at apply time.
-    expect(x.writes[0].query.start_time).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(x.writes[0].query.start_time).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/); // X rejects milliseconds
     // ...and end_time (required by X): 30 days after start by default.
     expect(Date.parse(x.writes[0].query.end_time) - Date.parse(x.writes[0].query.start_time)).toBe(30 * 86400000);
     expect(x.writes[1].json.map((o: any) => o.params.targeting_type)).toEqual(['LOCATION', 'BROAD_KEYWORD', 'SIMILAR_TO_FOLLOWERS_OF_USER']);
