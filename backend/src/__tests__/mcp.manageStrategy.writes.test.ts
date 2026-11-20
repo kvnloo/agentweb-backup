@@ -189,6 +189,16 @@ describe('update: merge, never replace', () => {
     expect(JSON.stringify(same.json)).not.toMatch(/"updated":\["Beta Corp"/);
   });
 
+  it('an entry a call changes and changes back is unchanged by its net effect, and a call that only does that writes nothing', async () => {
+    const posts = await recordStrategyPosts(async () => {
+      const r = await update(owner, { competitors: [{ name: 'Gamma', description: 'temporary' }, { name: 'gamma', description: 'Enterprise only' }] });
+      expect(r.isError).toBe(false);
+      expect(r.json).toMatchObject({ success: true, changed: false });
+    });
+    expect(posts).toEqual([]);
+    expect(strategyOf(TENANT_A.orgId).competitors.find((e: any) => e.name === 'Gamma').description).toBe('Enterprise only');
+  });
+
   it('a stored ICP that has no title (older data) is kept and the new profile is added next to it', async () => {
     fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), icp: [{ name: 'Legacy persona' }] } });
     const r = await update(owner, { icp: [{ title: 'Founder', description: 'Small team' }] });
@@ -1022,6 +1032,11 @@ describe('pure helpers', () => {
     const out = mergeStrategyEntries(stored, [{ name: 'a', description: 'a' }, { name: 'B', description: 'x' }, { name: 'b', description: 'y' }, { name: 'A', description: 'a' }], 'name');
     expect({ added: out.added, updated: out.updated, unchanged: out.unchanged }).toEqual({ added: [], updated: ['B'], unchanged: ['A'] });
     expect(out.merged).toEqual([{ name: 'A', description: 'a' }, { name: 'B', description: 'y' }]);
+
+    // Changed and changed back within one call: unchanged by its net effect.
+    const flip = mergeStrategyEntries([{ name: 'B', description: 'b' }], [{ name: 'B', description: 'x' }, { name: 'b', description: 'b' }], 'name');
+    expect({ updated: flip.updated, unchanged: flip.unchanged }).toEqual({ updated: [], unchanged: ['B'] });
+    expect(flip.merged).toEqual([{ name: 'B', description: 'b' }]);
 
     // Changed by its first mention and repeated, unchanged, by the second: still one update, not an unchanged repeat.
     const again = mergeStrategyEntries([{ name: 'B', description: 'b' }], [{ name: 'B', description: 'x' }, { name: 'b', description: 'x' }], 'name');

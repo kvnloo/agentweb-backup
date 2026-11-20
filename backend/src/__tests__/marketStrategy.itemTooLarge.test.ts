@@ -88,6 +88,7 @@ describe.each([
     expect(res.body).toMatchObject({ success: false, error: 'market_strategy_too_large' });
     expect(res.body.message).toMatch(/400 KB/);
     expect(res.body.message).toMatch(/Nothing was changed/);
+    expect(res.body.message).not.toMatch(/remove/i);
   });
 
   it('any other failure of the write is still a bare 500 (a different ValidationException, a throttle, a plain error)', async () => {
@@ -95,6 +96,7 @@ describe.each([
     for (const error of [
       awsError('ValidationException', 'One or more parameter values were invalid'),
       awsError('ValidationException', 'Item size of a key attribute is invalid'),
+      awsError('InternalServerError', 'Item size has exceeded the maximum allowed size'),
       awsError('ProvisionedThroughputExceededException', 'Item size is fine, the table is throttled'),
       new Error('boom'),
     ]) {
