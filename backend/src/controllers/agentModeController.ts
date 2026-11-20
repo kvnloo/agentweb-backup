@@ -1205,12 +1205,22 @@ export function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | nul
   const inviteCalls = toolCalls.filter(
     (call: any) => call?.name === 'linkedin_outreach' && normalizeLinkedInOutreachAction(call) === 'send-invite',
   );
-  const blockedCall = inviteCalls.find((call: any) => {
+  const inviteAccountId = (call: any): string | undefined => {
+    const args = linkedInOutreachArgs(call);
+    return args && typeof args.account_id === 'string' ? args.account_id : undefined;
+  };
+  const blockedCall = inviteCalls.find((call: any, index: number) => {
     if (toolCallSucceeded(call)) return false;
     const detail = [call?.error, call?.result?.error, call?.result?.message]
       .filter((value) => typeof value === 'string')
       .join('\n');
-    return LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail) || LINKEDIN_ACCOUNT_DISCONNECTED_RE.test(detail);
+    if (!LINKEDIN_INVITE_CAP_BLOCK_RE.test(detail) && !LINKEDIN_ACCOUNT_DISCONNECTED_RE.test(detail)) return false;
+    // ENG-3092: each of these blocks belongs to one sending account. If a later invite went out
+    // on a different account, the run was not blocked by this one, so it is not a run-wide notice.
+    const blockedAccountId = inviteAccountId(call);
+    return !inviteCalls
+      .slice(index + 1)
+      .some((later: any) => toolCallSucceeded(later) && inviteAccountId(later) !== blockedAccountId);
   });
   if (!blockedCall) return null;
 
