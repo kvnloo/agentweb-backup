@@ -28,8 +28,9 @@ jest.mock('aws-sdk', () => ({
 
 const mockGetOrgById = jest.fn();
 const mockUpdateOrg = jest.fn();
+const mockGetUserById = jest.fn();
 jest.mock('../services/db', () => ({
-  userDb: { getUserById: jest.fn(), updateUser: jest.fn() },
+  userDb: { getUserById: (...a: any[]) => mockGetUserById(...a), updateUser: jest.fn() },
   orgDb: {
     getOrgById: (...a: any[]) => mockGetOrgById(...a),
     updateOrg: (...a: any[]) => mockUpdateOrg(...a),
@@ -61,11 +62,11 @@ const strategy = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const appFor = () => {
+const appFor = (userId: string = USER_ID) => {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).user = { userId: USER_ID };
+    (req as any).user = { userId };
     next();
   });
   app.use('/api/market-strategy', marketStrategyRouter);
@@ -130,9 +131,23 @@ describe.each([
     expect(removed.icpUpdatedAt).not.toBe(STORED_AT);
   });
 
-  it('moves the stamp when the form sends the ICPs back without a field the record holds (the portal dropping the cached filters)', async () => {
+  it('moves the stamp when the list sent leaves out a field the record holds (a client that drops the cached filters)', async () => {
     const { extractedFilters: _dropped, ...withoutFilters } = storedIcp[0] as any;
     const written = await save(strategy(), { icp: [withoutFilters, storedIcp[1]] });
+    expect(written.icpUpdatedAt).not.toBe(STORED_AT);
+  });
+
+  it('keeps the stamp when the list sent has its keys in another order (DynamoDB does not promise key order)', async () => {
+    const reorder = (value: any): any =>
+      Array.isArray(value) ? value.map(reorder)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).reverse().map(([k, v]) => [k, reorder(v)]))
+          : value;
+    const written = await save(strategy(), { icp: reorder(storedIcp) });
+    expect(written.icpUpdatedAt).toBe(STORED_AT);
+  });
+
+  it('moves the stamp when a value has another type (a number sent where text is stored), not a loose match', async () => {
+    const written = await save(strategy({ icp: [{ title: 'Founder', score: '1' }] }), { icp: [{ title: 'Founder', score: 1 }] });
     expect(written.icpUpdatedAt).not.toBe(STORED_AT);
   });
 
@@ -151,5 +166,31 @@ describe.each([
     const written = await save(strategy({ icp: [], icpUpdatedAt: undefined }), { icp: [{ title: 'First' }] });
     expect(typeof written.icpUpdatedAt).toBe('string');
     expect(written.icp).toEqual([{ title: 'First' }]);
+  });
+});
+
+describe('org save when the org record holds no strategy yet (the owner\'s strategy is the baseline)', () => {
+  const MEMBER_ID = 'member-stamp';
+  const OWNER_ID = 'owner-other';
+
+  async function memberSaveOnOwnerBaseline(ownerStrategy: any, body: any): Promise<any> {
+    mockDynamoQuery.mockResolvedValue({ Items: [{ userId: MEMBER_ID, email: 'member@stamp.test', orgId: ORG_ID, orgRole: 'member' }] });
+    mockGetOrgById.mockResolvedValue({ orgId: ORG_ID, ownerUserId: OWNER_ID, name: 'Stamp Org', shareSettings: { marketingStrategy: { editors: [MEMBER_ID] } } });
+    mockGetUserById.mockResolvedValue({ userId: OWNER_ID, email: 'owner@stamp.test', marketStrategy: ownerStrategy });
+    const res = await request(appFor(MEMBER_ID)).post('/api/market-strategy').send(body);
+    expect(res.status).toBe(200);
+    return mockUpdateOrg.mock.calls[0][1].marketStrategy;
+  }
+
+  it('keeps the owner\'s stamp for the owner\'s own list, and writes that list and that stamp together', async () => {
+    const written = await memberSaveOnOwnerBaseline(strategy(), { competitors: [{ name: 'Rival' }, { name: 'Newcomer' }], icp: JSON.parse(JSON.stringify(storedIcp)) });
+    expect(written.icpUpdatedAt).toBe(STORED_AT);
+    expect(written.icp).toEqual(storedIcp);
+  });
+
+  it('stamps now when the member changes the list', async () => {
+    const written = await memberSaveOnOwnerBaseline(strategy(), { icp: [{ title: 'Changed' }] });
+    expect(written.icpUpdatedAt).not.toBe(STORED_AT);
+    expect(written.icp).toEqual([{ title: 'Changed' }]);
   });
 });
