@@ -26,6 +26,7 @@ jest.mock('../mcp/metaToolkitGateway', () => ({
 import router from '../routes/metaToolkit';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
+import { getXAdsToolkitManifest } from '../mcp/xAdsToolkitManifest';
 import {
   annotateToolkitTools,
   getToolkitToolAnnotations,
@@ -50,7 +51,7 @@ const NON_DESTRUCTIVE_WRITES = ['zoma_status', 'zoma_prepare_upload'];
 const LOCAL_READS = ['ads_get_errors', 'ads_get_help_article', 'zoma_usage'];
 
 function allAdvertised(): Advertised[] {
-  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]) as Advertised[];
+  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest(), ...getXAdsToolkitManifest()]) as Advertised[];
 }
 
 describe('ENG-2747 Zoma toolkit tool annotations', () => {
