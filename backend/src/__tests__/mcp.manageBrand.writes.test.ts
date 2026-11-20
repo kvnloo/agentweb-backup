@@ -526,7 +526,7 @@ describe('update: the read-back and what is remembered', () => {
 
 describe('update: the lock key', () => {
   it.each([
-    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom'))],
+    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom arn:aws:iam::123456789012:role/internal-role'))],
     ['has no record', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockResolvedValueOnce(undefined)],
   ])('refuses the call when the caller\'s record %s, instead of locking per user', async (_label, arrange) => {
     const spy = arrange();
@@ -535,6 +535,8 @@ describe('update: the lock key', () => {
       const r = await update(owner, { founders: [{ name: 'Di Delta' }] });
       expect(r.isError).toBe(true);
       expect(r.text).toMatch(/brand: the account could not be identified.*nothing was changed/);
+      // The lookup's own message (it can name roles and tables) stays in the log.
+      expect(r.text).not.toMatch(/arn:aws|lookup boom/);
     } finally {
       spy.mockRestore();
     }

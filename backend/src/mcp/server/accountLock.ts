@@ -21,7 +21,9 @@ export async function accountLockKey(prefix: string, c: any): Promise<string> {
     const { userDb } = await import('../../services/db');
     user = await userDb.getUserByIdConsistent(who);
   } catch (err) {
-    throw new Error(`${prefix}: the account could not be identified (${(err as Error)?.message ?? 'lookup failed'}), so nothing was changed. Try again.`);
+    // The lookup's own message can name roles and tables: it goes to the log, not to the caller.
+    console.error(`[MCP] ${prefix}: account lookup failed:`, (err as Error)?.message);
+    throw new Error(`${prefix}: the account could not be identified, so nothing was changed. Try again.`);
   }
   if (!user) throw new Error(`${prefix}: the account could not be identified, so nothing was changed. Try again.`);
   return user.orgId ? `${prefix}:org:${user.orgId}` : `${prefix}:user:${who}`;
