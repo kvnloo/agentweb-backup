@@ -2115,7 +2115,7 @@
   {
     "name": "list_knowledge_bases",
     "listed": false,
-    "description": "List knowledge base files for the authenticated user (private and public knowledge bases, connected Google Drive folders, ClickUp docs and Foreplay boards). With no arguments it returns up to 100 files per source. Use kb_type to narrow to one kind of source, modified_after / modified_before (ISO dates such as 2026-04-15) to find recent files, and limit with offset to page through a large account; limit and offset apply per knowledge base source.",
+    "description": "List knowledge base files for the authenticated user: your private knowledge bases, public ones, and connected Google Drive folders, ClickUp docs and Foreplay boards. With no arguments it returns everything it can. kb_type narrows to one kind of source: \"private\" and \"public\" both mean only the platform knowledge bases (yours and the public ones; the two are not told apart), \"google-drive\", \"clickup\", \"clickup-tasks\", \"foreplay-swipefile\" and \"foreplay-board\" mean only that connected source. modified_after and modified_before (dates as YYYY-MM-DD), limit (default 100) and offset page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay, and limit and offset apply per Drive folder.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2130,23 +2130,23 @@
             "foreplay-swipefile",
             "foreplay-board"
           ],
-          "description": "Only return this kind of knowledge base. Omit to return all kinds."
+          "description": "Only return this kind of source (\"private\" and \"public\" both mean the platform knowledge bases). Omit to return every source."
         },
         "modified_after": {
           "type": "string",
-          "description": "Only files modified on or after this ISO date, e.g. \"2026-04-15\". Applies to Google Drive files."
+          "description": "Google Drive files modified on or after this date, YYYY-MM-DD (e.g. \"2026-04-15\")."
         },
         "modified_before": {
           "type": "string",
-          "description": "Only files modified on or before this ISO date, e.g. \"2026-04-22\". Applies to Google Drive files."
+          "description": "Google Drive files modified on or before this date, YYYY-MM-DD (e.g. \"2026-04-22\")."
         },
         "limit": {
           "type": "number",
-          "description": "Most files to return per knowledge base source (default 100)."
+          "description": "Most Google Drive files to return per folder (default 100)."
         },
         "offset": {
           "type": "number",
-          "description": "Files to skip within each knowledge base source (default 0). Use with limit to page."
+          "description": "Google Drive files to skip per folder (default 0). Use with limit to page."
         }
       },
       "required": []
@@ -4105,7 +4105,7 @@
   {
     "name": "update_knowledge_base_file_content",
     "listed": false,
-    "description": "Change the content of an existing text or markdown file in one of your own knowledge bases (max 1048576 bytes per call, no binary). mode \"replace\" (the default) replaces the whole file; mode \"append\" adds content after the stored text, separated by a blank line, and never loses what is stored (use it to add notes or findings). An append keeps the file under 10 MB. Returns the stored file key and size; a replace also returns the sha256 of the content, an append returns the bytes appended.",
+    "description": "Replace the full content of an existing text or markdown file in one of your own knowledge bases (max 1048576 bytes, no binary). Returns the stored file key, size and sha256.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4119,15 +4119,7 @@
         },
         "content": {
           "type": "string",
-          "description": "File text: the new content for a replace, the text to add for an append"
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "replace",
-            "append"
-          ],
-          "description": "replace (default) overwrites the file; append adds the content after the stored text."
+          "description": "New file text (replaces the old content)"
         }
       },
       "required": [

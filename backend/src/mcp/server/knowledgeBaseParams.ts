@@ -1,21 +1,17 @@
 /**
- * ENG-2840 wave 1 (PR C): the knowledge-base inputs Emma's own tools take and the MCP wrappers used to drop.
+ * ENG-2840 wave 1 (PR C): the knowledge-base list inputs Emma's own tool takes and the MCP wrapper used to drop.
  *
- * `list_knowledge_bases` sent no query at all, although the route behind it (GET /api/emma/knowledge-bases) and Emma's `list_knowledge_base_files`
- * take modified_after, modified_before, limit, offset and kb_type: a caller could not narrow a large account's list or page through it.
- * `update_knowledge_base_file_content` could only replace a file, while Emma's `update_knowledge_base_file` appends by default.
+ * `list_knowledge_bases` sent no query at all, although the route behind it (GET /api/emma/knowledge-bases) and Emma's `list_knowledge_base_files` take
+ * modified_after, modified_before, limit, offset and kb_type. What each one does is decided by the service (emma/impl/knowledgeBase.ts `listKnowledgeBaseFiles`):
+ * kb_type picks the sources ("private" and "public" both mean only the platform knowledge bases, which are not told apart), and the dates, limit and offset
+ * apply to the Google Drive files only.
  */
 
-/** The kinds of knowledge base Emma's list tool can narrow to. */
+/** The kinds of knowledge base source Emma's list tool can narrow to. */
 export const KB_LIST_TYPES = ['google-drive', 'private', 'public', 'clickup', 'clickup-tasks', 'foreplay-swipefile', 'foreplay-board'] as const;
 
-/** Most a file may hold after an append: the per-call limit Emma's own update tool applies. */
-export const KB_APPEND_MAX_FILE_BYTES = 10 * 1024 * 1024;
-
-/** The separator Emma's append puts between the stored text and the new text (emma/impl/knowledgeBase.ts). */
-export const KB_APPEND_SEPARATOR = '\n\n';
-
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+/** The only date form the service accepts (`validateDriveDateFilter`): a real calendar date, YYYY-MM-DD. */
+const CALENDAR_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 const refuse = (message: string): never => { throw new Error(`list_knowledge_bases: ${message}`); };
 
@@ -27,10 +23,12 @@ export function buildKbListQuery(args: any): Record<string, string> {
   const qp: Record<string, string> = {};
   const date = (value: unknown, name: string): void => {
     if (value === undefined || value === null) return;
-    if (typeof value !== 'string') return refuse(`${name} must be text, an ISO date such as 2026-04-15.`);
+    if (typeof value !== 'string') return refuse(`${name} must be text, a date such as 2026-04-15.`);
     const text = value.trim();
     if (text === '') return;
-    if (!ISO_DATE.test(text) || Number.isNaN(Date.parse(text))) return refuse(`${name} must be an ISO date such as 2026-04-15.`);
+    const m = CALENDAR_DATE.exec(text);
+    const real = m && (() => { const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))); return d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() === Number(m[2]) - 1 && d.getUTCDate() === Number(m[3]); })();
+    if (!real) return refuse(`${name} must be a calendar date in YYYY-MM-DD form, such as 2026-04-15.`);
     qp[name] = text;
   };
   date(args?.modified_after, 'modified_after');
