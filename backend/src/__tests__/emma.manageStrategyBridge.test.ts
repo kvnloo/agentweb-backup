@@ -111,6 +111,24 @@ describe('which sessions are offered it (review of f8ca60f: not through the catc
       expect(allowedToolNames.has('manage_market_strategy')).toBe(true);
     }
   });
+
+  it('the tool definitions a skill-filtered session is sent carry it only when its skill lists it', async () => {
+    const offered = async (allowed: Set<string>) =>
+      (await service.getFilteredTools(SOLO, allowed, ['*'])).map((t: any) => t.function?.name ?? t.name);
+
+    const without = await offered(service.buildSkillContext([], ['*'], [], []).allowedToolNames);
+    const withSkill = await offered(service.buildSkillContext([skill(false)], ['*'], [skill(false)], ['strategy-skill']).allowedToolNames);
+
+    expect(without).not.toContain('manage_market_strategy');
+    expect(without).toContain('update_market_strategy');
+    expect(withSkill).toContain('manage_market_strategy');
+    expect(withSkill).toContain('update_market_strategy');
+  });
+
+  it('a tier that does not entitle the skill (or the pool) is not offered its tools', () => {
+    const { allowedToolNames } = service.buildSkillContext([skill(false)], ['some-other-skill'], [skill(false)], ['strategy-skill', '__other_skills__']);
+    expect(allowedToolNames.has('manage_market_strategy')).toBe(false);
+  });
 });
 
 describe('a call made the way a chat turn makes it', () => {
