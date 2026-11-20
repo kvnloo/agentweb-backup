@@ -34,7 +34,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-import { executeBrandUpdate } from './manageBrandWrites';
+import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -2238,7 +2238,7 @@ mcpToolRegistry.register({
     description: 'Read or update brand guidelines. Use action: "read" or "update". '
       + 'Update changes only the fields you send. company_name, mission, tone_of_voice, target_audience, key_messages, tagline, domain, brand_values, brand_personality and visual_identity replace the stored value of that field (a list replaces the whole list). For tagline, domain, brand_personality, brand_values and founders, blank text or an empty list means "not given" and changes nothing. '
       + 'FOUNDERS: founders is merged BY NAME, never replaced: a founder already stored (same name, case and padding ignored) is updated field by field, a new name is added, and every founder you do not mention is kept, so you can send just the founder you are changing. An empty founders list changes nothing. '
-      + 'To remove a founder, name them in remove_founders (at most 20 per call; exact name, case ignored); the answer says which were removed and which were not found. A name may not appear in both. '
+      + 'To remove a founder, name them in remove_founders (at most 20 per call; the name is matched as for founders: case, padding and repeated spaces ignored); the answer says which were removed and which were not found. A name may not appear in both. '
       + 'A founder holds name, jobTitle, styleTone, signaturePosts and voiceExamples (text); other fields are refused. The answer reports the founders that were added, updated, removed and the stored total, read back after the save.',
     inputSchema: {
       type: 'object',
@@ -2278,10 +2278,7 @@ mcpToolRegistry.register({
     const c = ctx(context);
     // Any other action used to be taken as an update, so a mistyped "Read" wrote; now it is refused.
     const action = typeof args?.action === 'string' ? args.action.trim().toLowerCase() : '';
-    if (action === 'read') {
-      const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
-      return jsonResult(data);
-    }
+    if (action === 'read') return executeBrandRead(args, c);
     if (action === 'update') return executeBrandUpdate(args, c);
     throw new Error('manage_brand: action must be "read" or "update".');
   }

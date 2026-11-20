@@ -9,17 +9,22 @@
 
 import { withLeadLock } from './manageLeadsWrites';
 
-/** The lock key for `prefix` and the account the caller acts for. If the caller's record cannot be read the key falls back to the user. */
+/**
+ * The lock key for `prefix` and the account the caller acts for. The caller's record is read consistently (the index read alone can be older than an org
+ * switch). If it cannot be read, or the caller has no record, the call is refused: falling back to a per-user key would let two members of one org run
+ * unserialized, which is the loss the lock exists to prevent.
+ */
 export async function accountLockKey(prefix: string, c: any): Promise<string> {
   const who: string = c?.userId || c?.agentUserId || 'unknown';
+  let user: any;
   try {
     const { userDb } = await import('../../services/db');
-    const user: any = await userDb.getUserById(who);
-    if (user?.orgId) return `${prefix}:org:${user.orgId}`;
-  } catch {
-    // Fall through: a lock per user still serializes one agent's own parallel calls.
+    user = await userDb.getUserByIdConsistent(who);
+  } catch (err) {
+    throw new Error(`${prefix}: the account could not be identified (${(err as Error)?.message ?? 'lookup failed'}), so nothing was changed. Try again.`);
   }
-  return `${prefix}:user:${who}`;
+  if (!user) throw new Error(`${prefix}: the account could not be identified, so nothing was changed. Try again.`);
+  return user.orgId ? `${prefix}:org:${user.orgId}` : `${prefix}:user:${who}`;
 }
 
 /** Run `work` once every earlier call for the same account and `prefix` has finished. */

@@ -10,7 +10,7 @@
  * Emma's rule it would delete the others. So over MCP (the owner's decision, 2026-11-19):
  *  - `founders` MERGES by name: a stored founder with the same name (case and padding ignored) is updated field by field, a new name is added, and a
  *    stored founder that is not mentioned is kept. An empty list changes nothing. Omission never removes anyone.
- *  - removal is deliberate: `remove_founders: [names]` removes exactly those founders (exact name match after trimming and ignoring case, at most 20
+ *  - removal is deliberate: `remove_founders: [names]` removes exactly those founders (the same name match as the merge: case, padding, repeated spaces and invisible characters ignored; at most 20
  *    per call), and the answer says which were removed and which were not found. This is the `removeFounders` shape the ENG-2875 card itself proposes.
  * This differs from Emma on purpose, and the PR says so.
  *
@@ -35,6 +35,8 @@ export const MAX_BRAND_VALUE_CHARS = 200;
 export const MAX_TAGLINE_CHARS = 300;
 export const MAX_DOMAIN_CHARS = 253;
 export const MAX_BRAND_PERSONALITY_CHARS = 2_000;
+/** Most bytes the founder profiles may take together after a call that makes them bigger (the brand sits on one DynamoDB item of at most 400 KB; an oversized save is refused here with a reason). */
+export const MAX_FOUNDERS_BYTES = 250_000;
 
 /** The five fields of a stored founder, and the longest text each may hold. */
 const FOUNDER_TEXT_LIMITS: Record<string, number> = {
@@ -63,7 +65,14 @@ function checkArguments(args: any): string[] {
 }
 
 const fail = (message: string): never => { throw new Error(`manage_brand update: ${message} Nothing was changed.`); };
-const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+/** Characters that show nothing (zero-width spaces and joiners, word joiner, byte-order mark, soft hyphen): a name holding one would look like another and not match it. */
+const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+/** A name as it is stored: no invisible characters, no padding. */
+const cleanName = (value: string): string => value.replace(INVISIBLE, '').trim();
+/** Case, padding, repeated-space and invisible-character insensitive identity of a founder. */
+const identity = (value: unknown): string => cleanName(String(value ?? '')).toLowerCase().replace(/\s+/g, ' ');
+const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
+const bytesOf = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
 const plainObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Plain text field: undefined / null = not given; text is trimmed; blank = not given. */
@@ -83,11 +92,12 @@ export function validateFounders(value: unknown): Founder[] | undefined {
   return value.map((raw, i) => {
     const at = `founders[${i}]`;
     if (!plainObject(raw)) return fail(`${at} must be an object with a name.`);
-    const unknown = Object.keys(raw).filter((k) => k !== 'name' && !(k in FOUNDER_TEXT_LIMITS));
+    const unknown = Object.keys(raw).filter((k) => k !== 'name' && !hasOwn(FOUNDER_TEXT_LIMITS, k));
     if (unknown.length > 0) return fail(`${at} has fields that are not stored: ${unknown.map((k) => `"${k}"`).join(', ')}. Supported fields: name, ${Object.keys(FOUNDER_TEXT_LIMITS).join(', ')}.`);
-    if (typeof raw.name !== 'string' || raw.name.trim() === '') return fail(`${at}.name is required and must be text.`);
-    if (raw.name.trim().length > MAX_FOUNDER_NAME_CHARS) return fail(`${at}.name must be ${MAX_FOUNDER_NAME_CHARS} characters or fewer.`);
-    const clean: Founder = { name: raw.name.trim() };
+    const name = typeof raw.name === 'string' ? cleanName(raw.name) : '';
+    if (name === '') return fail(`${at}.name is required and must be text.`);
+    if (name.length > MAX_FOUNDER_NAME_CHARS) return fail(`${at}.name must be ${MAX_FOUNDER_NAME_CHARS} characters or fewer.`);
+    const clean: Founder = { name };
     for (const [field, max] of Object.entries(FOUNDER_TEXT_LIMITS)) {
       const text = optionalText(raw[field], `${at}.${field}`, max);
       if (text !== undefined) clean[field] = text;
@@ -101,8 +111,10 @@ export function validateRemoveFounders(value: unknown): string[] | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value) || value.some((n) => typeof n !== 'string')) return fail('remove_founders must be a list of founder names (text).');
   if (value.length > MAX_REMOVE_FOUNDERS_PER_CALL) return fail(`remove_founders may hold at most ${MAX_REMOVE_FOUNDERS_PER_CALL} names per call (got ${value.length}).`);
-  if (value.some((n: string) => n.trim() === '')) return fail('remove_founders names must not be blank.');
-  return (value as string[]).map((n) => n.trim());
+  const names = (value as string[]).map(cleanName);
+  if (names.some((n) => n === '')) return fail('remove_founders names must not be blank.');
+  if (names.some((n) => n.length > MAX_FOUNDER_NAME_CHARS)) return fail(`remove_founders names must be ${MAX_FOUNDER_NAME_CHARS} characters or fewer.`);
+  return names;
 }
 
 export interface FounderOutcome {
@@ -121,45 +133,48 @@ export interface FounderOutcome {
  */
 export function mergeFoundersForMcp(stored: unknown, incoming: Founder[], removeNames: string[]): FounderOutcome {
   const founders: Founder[] = Array.isArray(stored) ? stored.map((f) => (plainObject(f) ? { ...f } : (f as Founder))) : [];
-  const index = new Map<string, number>();
+  // Every stored copy of a name (older data can hold the same founder twice): an update lays the sent fields over all of them and a removal drops all of them.
+  const index = new Map<string, number[]>();
   founders.forEach((f, i) => {
     const key = plainObject(f) ? identity(f.name) : '';
-    if (key && !index.has(key)) index.set(key, i);
+    if (key) index.set(key, [...(index.get(key) ?? []), i]);
   });
   const added: string[] = [];
   const updated: string[] = [];
   const unchanged: string[] = [];
   for (const entry of incoming) {
     const key = identity(entry.name);
-    const at = index.get(key);
-    if (at === undefined) {
+    const copies = index.get(key);
+    if (copies === undefined) {
       founders.push({ ...entry });
-      index.set(key, founders.length - 1);
+      index.set(key, [founders.length - 1]);
       added.push(String(entry.name));
       continue;
     }
-    const current = founders[at];
     let changed = false;
-    for (const [field, value] of Object.entries(entry)) {
-      if (field === 'name') continue;
-      if (JSON.stringify(current[field]) !== JSON.stringify(value)) {
-        current[field] = value;
-        changed = true;
+    for (const at of copies) {
+      for (const [field, value] of Object.entries(entry)) {
+        if (field === 'name') continue;
+        if (JSON.stringify(founders[at][field]) !== JSON.stringify(value)) {
+          founders[at][field] = value;
+          changed = true;
+        }
       }
     }
-    (changed ? updated : unchanged).push(String(current.name));
+    (changed ? updated : unchanged).push(String(founders[copies[0]].name));
   }
   const removed: string[] = [];
   const notFound: string[] = [];
   const dropped = new Set<number>();
   for (const name of removeNames) {
-    const at = index.get(identity(name));
-    if (at === undefined || dropped.has(at)) {
-      if (at === undefined) notFound.push(name);
+    const copies = index.get(identity(name))?.filter((at) => !dropped.has(at));
+    if (copies === undefined) {
+      notFound.push(name);
       continue;
     }
-    dropped.add(at);
-    removed.push(String(founders[at].name));
+    if (copies.length === 0) continue;
+    removed.push(String(founders[copies[0]].name));
+    for (const at of copies) dropped.add(at);
   }
   return { founders: founders.filter((_, i) => !dropped.has(i)), added, updated, unchanged, removed, notFound };
 }
@@ -174,24 +189,48 @@ function checkedBrandRead(response: any): any {
   return response;
 }
 
-/** What this process last saved and read back for an account's founders, so a read that is older than that save is not mistaken for the current roster. */
+/**
+ * What this process last saved for an account's founders (the roster it meant to save, stamped just before the save, or the one it read back), so a read that
+ * is older than that save is not mistaken for the current roster. The org read is eventually consistent, so even the read-back can be older than the save: the
+ * intended roster is remembered whether or not the read-back matched it.
+ */
 const RECENT_WRITE_TTL_MS = 60_000;
-const RECENT_WRITE_MAX_ACCOUNTS = 200;
+const RECENT_WRITE_MAX_ACCOUNTS = 100;
 const recentWrites = new Map<string, { at: number; updatedAt: string; founders: unknown[] }>();
 export function clearRecentBrandWrites(): void { recentWrites.clear(); }
-function rememberWrite(key: string, read: any): void {
-  if (typeof read?.updatedAt !== 'string') return;
+export function recentBrandWriteKeys(): string[] { return [...recentWrites.keys()]; }
+const freshWrite = (key: string) => {
+  const mine = recentWrites.get(key);
+  if (mine && Date.now() - mine.at > RECENT_WRITE_TTL_MS) { recentWrites.delete(key); return undefined; }
+  return mine;
+};
+function rememberWrite(key: string, updatedAt: string, founders: unknown[]): void {
   recentWrites.delete(key);
-  recentWrites.set(key, { at: Date.now(), updatedAt: read.updatedAt, founders: storedFoundersOf(read) });
-  const now = Date.now();
-  for (const [k, v] of recentWrites) if (now - v.at > RECENT_WRITE_TTL_MS) recentWrites.delete(k);
+  recentWrites.set(key, { at: Date.now(), updatedAt, founders });
+  for (const k of [...recentWrites.keys()]) freshWrite(k);
   while (recentWrites.size > RECENT_WRITE_MAX_ACCOUNTS) recentWrites.delete(recentWrites.keys().next().value as string);
 }
 /** The founders to merge onto: what the read shows, unless it is older than what this process saved a moment ago. */
 function baselineFounders(key: string, read: any): unknown[] {
-  const mine = recentWrites.get(key);
-  if (!mine || Date.now() - mine.at > RECENT_WRITE_TTL_MS) return storedFoundersOf(read);
+  const mine = freshWrite(key);
+  if (!mine) return storedFoundersOf(read);
   return typeof read?.updatedAt === 'string' && read.updatedAt >= mine.updatedAt ? storedFoundersOf(read) : mine.founders;
+}
+
+/** What a stored founder holds that this tool writes: the read-back compares all of it, not only the names. */
+const fingerprint = (f: any): string => JSON.stringify([f?.name ?? '', f?.jobTitle ?? '', f?.styleTone ?? '', f?.signaturePosts ?? '', f?.voiceExamples ?? '']);
+const sameRoster = (stored: unknown[], intended: Founder[]): boolean => stored.length === intended.length && intended.every((f, i) => fingerprint(stored[i]) === fingerprint(f));
+
+/** `read`: unchanged, except that an argument it does not take is refused by name (it would be ignored while the call looked like a read of what was sent). */
+export async function executeBrandRead(args: any, c: any): Promise<any> {
+  const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined && k !== 'action');
+  const unknown = sent.filter((k) => !IGNORED_ARGUMENTS.includes(k));
+  if (unknown.length > 0) {
+    throw new Error(`manage_brand read: ${unknown.map((k) => `"${k}"`).join(', ')} ${unknown.length > 1 ? 'are not inputs' : 'is not an input'} of read (it takes no arguments; to change the brand use action "update").`);
+  }
+  const data: any = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
+  const ignored = sent.filter((k) => IGNORED_ARGUMENTS.includes(k));
+  return jsonResult(ignored.length > 0 && plainObject(data) ? { ...data, ignoredArguments: ignored } : data);
 }
 
 /** `update`: the six fields the tool always had, plus tagline, domain, brand values, brand personality and founders (merge by name; removal only by name). */
@@ -243,23 +282,40 @@ export async function executeBrandUpdate(args: any, c: any): Promise<any> {
         fail(`the brand would hold ${outcome.founders.length} founders, over the limit of ${MAX_STORED_FOUNDERS}. Update existing founders instead of adding more.`);
       }
       const changed = outcome.added.length + outcome.updated.length + outcome.removed.length > 0;
+      const sizeAfter = bytesOf(outcome.founders);
+      if (changed && sizeAfter > MAX_FOUNDERS_BYTES && sizeAfter > bytesOf(baselineFounders(lockKey, current))) {
+        fail(`the founder profiles would take ${sizeAfter} bytes, over the limit of ${MAX_FOUNDERS_BYTES} (they sit on the brand record, which has a hard size limit). Shorten entries or update existing ones instead of adding more.`);
+      }
       if (changed) body.founders = outcome.founders;
       if (!changed && Object.keys(body).length === 0) {
         return jsonResult({ success: true, changed: false, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}), founders: foundersAnswer(outcome, outcome.founders.length), message: 'Everything sent is already stored exactly as given; nothing was written.' });
       }
     }
+    const savedAt = new Date().toISOString();
     const saved: any = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
     const answer: Record<string, unknown> = { ...(plainObject(saved) ? saved : {}), success: true, changed: true, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}) };
     if (outcome && body.founders !== undefined) {
-      // The route answers with a message only; read the founders back so the answer reports what is stored, not what was intended.
-      const after: any = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
+      const intended = body.founders as Founder[];
+      // The route answers with a message only; read the founders back so the answer reports what is stored, not what was intended. The org read can be older than
+      // the save (it is eventually consistent), so a read that does not match is repeated once before the answer says it could not be verified.
+      let after: any;
+      try {
+        after = checkedBrandRead(await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c }));
+        if (!sameRoster(storedFoundersOf(after), intended)) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          after = checkedBrandRead(await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c }));
+        }
+      } catch (err) {
+        rememberWrite(lockKey, savedAt, intended);
+        return jsonResult({ success: false, error: `The brand was saved, but reading the founders back failed (${(err as Error)?.message ?? 'unknown error'}); check them with manage_brand read.`, founders: foundersAnswer(outcome, intended.length) });
+      }
       const stored = storedFoundersOf(after);
-      const wanted = (body.founders as Founder[]).map((f) => identity(f.name));
-      const got = stored.map((f: any) => identity(f?.name));
-      if (wanted.length !== got.length || wanted.some((n, i) => n !== got[i])) {
+      if (!sameRoster(stored, intended)) {
+        // Whatever the reads showed, the save went through (the route answered): remember the roster it meant, so the next call does not merge onto an older read.
+        rememberWrite(lockKey, savedAt, intended);
         return jsonResult({ success: false, error: 'The founders could not be verified on read-back; check them with manage_brand read before retrying.', founders: foundersAnswer(outcome, stored.length) });
       }
-      rememberWrite(lockKey, after);
+      rememberWrite(lockKey, typeof after.updatedAt === 'string' && after.updatedAt > savedAt ? after.updatedAt : savedAt, stored);
       answer.founders = foundersAnswer(outcome, stored.length);
     } else if (outcome) {
       answer.founders = foundersAnswer(outcome, outcome.founders.length);
