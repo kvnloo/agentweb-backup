@@ -4,6 +4,21 @@ import { DynamoDB } from "aws-sdk";
 import { userDb, orgDb } from "../services/db";
 import { canEditItem } from "../services/orgShareService";
 import { resolveOrgProfileField } from "../services/orgProfileResolver";
+import { isDeepStrictEqual } from "util";
+
+/**
+ * The `icpUpdatedAt` a save stores (ENG-1955 follow-up, ENG-2840). It marks the last time the ICP list actually CHANGED, which
+ * routes/crm.ts compares with the user's `icpCompletedAt` to decide between the cached, richer ICP search filters and the
+ * market-strategy ICPs. A save that does not send `icp` keeps the stamp it has. A save that sends back the very list that is
+ * already stored (a portal save of an unedited form, or a client re-sending the ICPs it just saved) touches nothing, so it keeps
+ * the stamp too: moving it would switch the account off its cached filters for no reason. A first ICP save, a changed list, and a
+ * record that has no stamp yet (saved before the field existed) stamp `now`, as before.
+ */
+function nextIcpUpdatedAt(sentIcp: unknown, existing: any, now: string): string | undefined {
+  if (sentIcp === undefined) return existing?.icpUpdatedAt;
+  if (existing?.icpUpdatedAt && isDeepStrictEqual(sentIcp, existing.icp)) return existing.icpUpdatedAt;
+  return now;
+}
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -185,7 +200,7 @@ router.post("/", authenticateToken, async (req, res) => {
         // member editing an unrelated field silently — and permanently —
         // switches that org off its cached, richer icpResult-derived ICP
         // filters for no reason.
-        icpUpdatedAt: icp !== undefined ? now : (existingMarketStrategyMerged as any).icpUpdatedAt,
+        icpUpdatedAt: nextIcpUpdatedAt(icp, existingMarketStrategyMerged, now),
       };
 
       await orgDb.updateOrg(user.orgId, { marketStrategy });
@@ -213,7 +228,7 @@ router.post("/", authenticateToken, async (req, res) => {
       updatedAt: now,
       // See the org branch above for why this is tracked separately from
       // updatedAt (ENG-1955 follow-up).
-      icpUpdatedAt: icp !== undefined ? now : (existingMarketStrategyMerged as any).icpUpdatedAt,
+      icpUpdatedAt: nextIcpUpdatedAt(icp, existingMarketStrategyMerged, now),
     };
 
     // Update user record with market strategy data
