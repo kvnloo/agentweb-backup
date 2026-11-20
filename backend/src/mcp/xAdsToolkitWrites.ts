@@ -155,6 +155,12 @@ export function validateXAdsWriteShape(args: any, currency: string): ValidatedXW
         fields.bid_strategy = 'MAX';
         fields.bid_amount_local_micro = money(args.bid_amount, 'bid_amount');
       }
+      // X requires start_time on line items. An explicit one is part of the previewed fields;
+      // otherwise "now" is filled in at apply time (outside the preview fingerprint).
+      const liStart = optionalIso(args.start_time, 'start_time');
+      const liEnd = optionalIso(args.end_time, 'end_time');
+      if (liStart) fields.start_time = liStart;
+      if (liEnd) fields.end_time = liEnd;
       fields.entity_status = 'PAUSED';
       const targeting: TargetingCriterion[] = [];
       const t = args.targeting;
@@ -388,7 +394,8 @@ export async function executeXAdsWrite(
     if (v.op === 'CAMPAIGN CREATE') {
       createdId = (await call({ method: 'POST', path: `/accounts/${acct}/campaigns`, query: v.fields }))?.data?.id;
     } else if (v.op === 'LINE_ITEM CREATE') {
-      createdId = (await call({ method: 'POST', path: `/accounts/${acct}/line_items`, query: v.fields }))?.data?.id;
+      const liQuery = v.fields.start_time ? v.fields : { ...v.fields, start_time: new Date(now).toISOString() };
+      createdId = (await call({ method: 'POST', path: `/accounts/${acct}/line_items`, query: liQuery }))?.data?.id;
     } else if (v.op === 'PROMOTED_TWEET CREATE') {
       await call({ method: 'POST', path: `/accounts/${acct}/promoted_tweets`, query: v.fields });
     } else {
