@@ -14,18 +14,35 @@
  *  - blank text means "not given" and never overwrites a stored value; an empty list changes nothing (Emma's spread would blank a description);
  *  - names match without regard to case and padding, as Emma's own stored/not-stored lookup does, so "hubspot" does not become a second "HubSpot";
  *  - a call that changes nothing writes nothing (a write that carries `icp` marks the ICP as hand-edited, which switches the account off its
- *    cached ICP search filters, so a no-op write must not do that).
+ *    cached ICP search filters, so a no-op write must not do that);
+ *  - Emma also fills empty brand fields from the strategy after each write (`populateEmptyBrandGuidelines`); the route does not, so this tool does not;
+ *  - the route rebuilds the stored strategy from its six known keys (businessOverview, competitors, icp, createdAt, updatedAt, icpUpdatedAt), where Emma's
+ *    merge keeps any other top-level key the record happens to hold.
+ *
+ * The merge is read, merge, write through the route. Three things keep its baseline honest: calls on one ACCOUNT (the org, when the caller belongs to one)
+ * are taken in turn in this process; a read that shows nothing stored is read once more before it is believed (a missed read of a long-lived account would
+ * otherwise turn the write into a replace); and a read older than what this process saved a moment ago is not used (the route reads through an eventually
+ * consistent index). Calls that reach different server instances are not covered.
  */
 
 import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
-import { withLeadLock } from './manageLeadsWrites';
+import { withAccountLock } from './accountLock';
 
 /** Most entries one update call may carry, per list. */
 export const MAX_STRATEGY_ENTRIES_PER_CALL = 100;
-/** Most entries a list may hold after a merge that adds to it (the account record is one DynamoDB item; an update that cannot be saved should fail here, clearly). */
+/** Most entries a list may hold after a merge that adds to it. */
 export const MAX_STORED_COMPETITORS = 500;
 export const MAX_STORED_ICPS = 100;
+/**
+ * Most bytes the overview and both lists may take together after a merge that makes them bigger. The strategy sits on the account record, one DynamoDB item
+ * of at most 400 KB that also holds everything else of the account; a save that cannot fit is refused here with a reason instead of coming back from the route
+ * as an unexplained 500. A record that is already over this limit can still be edited, as long as the edit does not make it bigger.
+ */
+export const MAX_STRATEGY_BYTES = 250_000;
+/** How long this process remembers what it last saved for an account, to recognise a read that is older than that save. */
+const RECENT_WRITE_TTL_MS = 60_000;
+const RECENT_WRITE_MAX_ACCOUNTS = 200;
 export const MAX_ENTRY_KEY_CHARS = 200;
 export const MAX_ENTRY_TEXT_CHARS = 5_000;
 export const MAX_BUYER_PERSONAS = 50;
@@ -51,8 +68,8 @@ type KeyField = 'name' | 'title';
 
 const fail = (message: string): never => { throw new Error(`manage_market_strategy update: ${message} Nothing was changed.`); };
 
-/** Case and padding insensitive identity of an entry (what Emma's stored/not-stored lookup compares). */
-const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase();
+/** Case, padding and repeated-space insensitive identity of an entry (Emma's stored / not-stored lookup ignores case and padding; runs of spaces are folded too). */
+const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -72,7 +89,7 @@ export function validateStrategyEntries(kind: 'competitors' | 'icp', value: unkn
     const at = `${kind}[${i}]`;
     if (!plainObject(raw)) return fail(`${at} must be an object with a ${keyField}.`);
     const unknownKeys = Object.keys(raw).filter((k) => !known.includes(k));
-    if (unknownKeys.length > 0) return fail(`${at} has fields that are not stored: ${unknownKeys.map((k) => `"${k}"`).join(', ')}. Supported fields: ${known.join(', ')}.`);
+    if (unknownKeys.length > 0) return fail(`${at} has fields that are not stored: ${unknownKeys.map((k) => `"${k}"`).join(', ')}. Supported fields: ${known.join(', ')}. Other fields shown when you read an entry (such as extractedFilters) are kept for you: leave them out.`);
     const key = raw[keyField];
     if (typeof key !== 'string' || key.trim() === '') return fail(`${at}.${keyField} is required and must be text.`);
     if (key.trim().length > MAX_ENTRY_KEY_CHARS) return fail(`${at}.${keyField} must be ${MAX_ENTRY_KEY_CHARS} characters or fewer.`);
@@ -95,6 +112,13 @@ export function validateStrategyEntries(kind: 'competitors' | 'icp', value: unkn
     }
     return clean;
   });
+}
+
+/** Is `incoming` (already trimmed) what is stored? Stored text and persona lists are compared trimmed too, so stored padding never makes a repeat look like a change. */
+function sameValue(stored: unknown, incoming: unknown): boolean {
+  if (typeof incoming === 'string' && typeof stored === 'string') return stored.trim() === incoming;
+  if (Array.isArray(incoming) && Array.isArray(stored)) return JSON.stringify(stored.map((v) => (typeof v === 'string' ? v.trim() : v))) === JSON.stringify(incoming);
+  return JSON.stringify(stored) === JSON.stringify(incoming);
 }
 
 export interface MergeOutcome {
@@ -134,7 +158,7 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
     let changed = false;
     for (const [field, value] of Object.entries(entry)) {
       if (field === keyField) continue;
-      if (JSON.stringify(current[field]) !== JSON.stringify(value)) {
+      if (!sameValue(current[field], value)) {
         next[field] = value;
         changed = true;
       }
@@ -147,6 +171,32 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
 
 const strategyOf = (response: any): Record<string, any> => (plainObject(response?.data) ? response.data : {});
 const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+const bytesOf = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
+
+/** The route's answer to GET /api/market-strategy, checked: anything that is not a success carrying a strategy object is not a baseline to merge onto. */
+function checkedStrategy(response: any, action: 'read' | 'update'): Record<string, any> {
+  if (!plainObject(response) || response.success !== true || !plainObject(response.data)) {
+    throw new Error(`manage_market_strategy ${action}: the stored market strategy could not be read, so nothing was changed. Try again.`);
+  }
+  return response.data;
+}
+
+/** What this process last saved for an account (the route's own answer), so a read that is older than that save is not mistaken for the current strategy. */
+const recentWrites = new Map<string, { at: number; updatedAt: string; data: Record<string, any> }>();
+export function clearRecentStrategyWrites(): void { recentWrites.clear(); }
+function rememberWrite(key: string, data: Record<string, any>): void {
+  if (typeof data.updatedAt !== 'string') return;
+  recentWrites.delete(key);
+  recentWrites.set(key, { at: Date.now(), updatedAt: data.updatedAt, data });
+  const now = Date.now();
+  for (const [k, v] of recentWrites) if (now - v.at > RECENT_WRITE_TTL_MS) recentWrites.delete(k);
+  while (recentWrites.size > RECENT_WRITE_MAX_ACCOUNTS) recentWrites.delete(recentWrites.keys().next().value as string);
+}
+function newestOf(key: string, read: Record<string, any>): Record<string, any> {
+  const mine = recentWrites.get(key);
+  if (!mine || Date.now() - mine.at > RECENT_WRITE_TTL_MS) return read;
+  return typeof read.updatedAt === 'string' && read.updatedAt >= mine.updatedAt ? read : mine.data;
+}
 
 /** `update`: read the stored strategy, merge, and send the route only the parts that changed. */
 export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
@@ -165,12 +215,23 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     fail('send at least one of businessOverview, competitors or icp with content. Blank text and empty lists change nothing, and this tool cannot remove an entry.');
   }
 
-  // One call at a time per account within this process: the merge below is read, merge, write, so two of one agent's parallel calls would otherwise each merge
-  // onto the same stored lists and the second write would drop the first one's entries. The key is the acting user (org members share one strategy; two members
-  // writing at once, and calls reaching different server instances, are not covered).
-  const who = c?.userId || c?.agentUserId || 'unknown';
-  return withLeadLock(`strategy:${who}`, async () => {
-    const stored = strategyOf(await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c }));
+  // One call at a time per ACCOUNT (the org, for a member of one) within this process: the merge below is read, merge, write, so two calls sent together
+  // (one agent's parallel calls, or two members' agents) would each merge onto the same stored lists and the second write would drop the first one's entries.
+  return withAccountLock('strategy', c, async (lockKey) => {
+    let stored = checkedStrategy(await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c }), 'update');
+    if (typeof stored.createdAt !== 'string') {
+      // The read shows no strategy stored. That is true for an account that never saved one, and also what a missed read of a long-lived account looks like (the
+      // route's read can miss the org owner's record for a moment); a write built on a missed read replaces the real lists. Read once more before believing it.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const again = checkedStrategy(await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c }), 'update');
+      if (typeof again.createdAt === 'string') stored = again;
+    }
+    stored = newestOf(lockKey, stored);
+    for (const kind of ['competitors', 'icp'] as const) {
+      if (stored[kind] !== undefined && stored[kind] !== null && !Array.isArray(stored[kind])) {
+        fail(`the stored ${kind} are not a list, so they cannot be merged safely.`);
+      }
+    }
     const body: Record<string, unknown> = {};
     const answer: Record<string, unknown> = { success: true };
 
@@ -196,7 +257,13 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     if (Object.keys(body).length === 0) {
       return jsonResult({ ...answer, changed: false, message: 'Everything sent is already stored exactly as given; nothing was written.' });
     }
+    const sizeBefore = bytesOf({ businessOverview: stored.businessOverview, competitors: stored.competitors, icp: stored.icp });
+    const sizeAfter = bytesOf({ businessOverview: body.businessOverview ?? stored.businessOverview, competitors: body.competitors ?? stored.competitors, icp: body.icp ?? stored.icp });
+    if (sizeAfter > MAX_STRATEGY_BYTES && sizeAfter > sizeBefore) {
+      fail(`the strategy would take ${sizeAfter} bytes, over the limit of ${MAX_STRATEGY_BYTES} (it sits on the account record, which has a hard size limit). Shorten entries or update existing ones instead of adding more.`);
+    }
     const saved = strategyOf(await mcpFetch({ method: 'POST', path: '/api/market-strategy', context: c, body }));
+    rememberWrite(lockKey, saved);
     // Totals are what the route reports as saved, not what was computed here.
     for (const kind of ['competitors', 'icp'] as const) {
       const section = answer[kind] as Record<string, unknown> | undefined;
@@ -210,8 +277,9 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
 function offsetOf(value: unknown): number {
   if (value === undefined || value === null || value === '') return 0;
   const n = typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : value;
-  if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) throw new Error('manage_market_strategy read: competitorOffset must be a whole number of 0 or more.');
-  return n;
+  // A number too big to be exact is still "past the end": it lands on the last entry like any other offset past the end.
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) throw new Error('manage_market_strategy read: competitorOffset must be a whole number of 0 or more.');
+  return Math.min(n, Number.MAX_SAFE_INTEGER);
 }
 
 /**
@@ -226,7 +294,7 @@ export async function executeStrategyRead(args: any, c: any): Promise<any> {
   }
   const requested = offsetOf(args.competitorOffset);
   const response: any = await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c });
-  const strategy = strategyOf(response);
+  const strategy = checkedStrategy(response, 'read');
   const all = listOf(strategy.competitors);
   // An offset past the end lands on the last entry rather than an empty page: an empty page reads as "no competitors".
   const start = all.length === 0 ? 0 : Math.min(requested, all.length - 1);
