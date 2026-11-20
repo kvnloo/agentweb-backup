@@ -92,6 +92,8 @@ const fail = (message: string): never => { throw new Error(`manage_market_strate
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
 /** A name as it is stored: no invisible characters, no padding. */
 const cleanName = (value: string): string => value.replace(INVISIBLE, '').trim();
+/** Text with nothing visible in it (empty, spaces, or only invisible characters) is "not given"; any other text is kept as sent (a joiner can belong to an emoji). */
+const isBlankText = (value: string): boolean => cleanName(value) === '';
 /** Case, padding, repeated-space and invisible-character insensitive identity of an entry (Emma's stored / not-stored lookup ignores case and padding). */
 const identity = (value: unknown): string => cleanName(String(value ?? '')).toLowerCase().replace(/\s+/g, ' ');
 
@@ -124,7 +126,7 @@ export function validateStrategyEntries(kind: 'competitors' | 'icp', value: unkn
       if (field === 'buyerPersonas') {
         const personas = raw[field];
         if (!Array.isArray(personas) || personas.some((p) => typeof p !== 'string')) return fail(`${at}.buyerPersonas must be a list of text.`);
-        const kept = (personas as string[]).map((p) => p.trim()).filter((p) => p !== '');
+        const kept = (personas as string[]).filter((p) => !isBlankText(p)).map((p) => p.trim());
         if (kept.length > MAX_BUYER_PERSONAS) return fail(`${at}.buyerPersonas may hold at most ${MAX_BUYER_PERSONAS} entries.`);
         if (kept.some((p) => p.length > MAX_BUYER_PERSONA_CHARS)) return fail(`${at}.buyerPersonas entries must be ${MAX_BUYER_PERSONA_CHARS} characters or fewer.`);
         if (kept.length > 0) clean[field] = kept;
@@ -133,7 +135,7 @@ export function validateStrategyEntries(kind: 'competitors' | 'icp', value: unkn
       const text = raw[field];
       if (typeof text !== 'string') return fail(`${at}.${field} must be text.`);
       if (text.trim().length > MAX_ENTRY_TEXT_CHARS) return fail(`${at}.${field} must be ${MAX_ENTRY_TEXT_CHARS} characters or fewer.`);
-      if (text.trim() !== '') clean[field] = text.trim();
+      if (!isBlankText(text)) clean[field] = text.trim();
     }
     return clean;
   });
@@ -255,7 +257,7 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
   if (args.businessOverview !== undefined && args.businessOverview !== null) {
     if (typeof args.businessOverview !== 'string') fail('businessOverview must be text.');
     if (args.businessOverview.trim().length > MAX_BUSINESS_OVERVIEW_CHARS) fail(`businessOverview must be ${MAX_BUSINESS_OVERVIEW_CHARS} characters or fewer.`);
-    if (args.businessOverview.trim() !== '') overview = args.businessOverview.trim();
+    if (!isBlankText(args.businessOverview)) overview = args.businessOverview.trim();
   }
   const competitors = validateStrategyEntries('competitors', args.competitors);
   const icp = validateStrategyEntries('icp', args.icp);
@@ -283,7 +285,7 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     // The caller belongs to an org, so the strategy is the org's. If the route answered with the caller's PERSONAL strategy instead (its read of the org missed),
     // merging onto it and saving would write that personal strategy over the org's.
     if (lockKey.startsWith('strategy:org:') && !isOrgLevel) {
-      fail("the organisation's market strategy could not be read (the answer was the caller's personal one).");
+      fail("the organisation's market strategy could not be read (the answer was the caller's personal one). Try again.");
     }
     stored = newestOf(lockKey, stored);
     const body: Record<string, unknown> = {};
