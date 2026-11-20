@@ -35,6 +35,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -1948,11 +1949,24 @@ mcpToolRegistry.register({
   name: 'list_knowledge_bases',
   definition: {
     name: 'list_knowledge_bases',
-    description: 'List all knowledge base files for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List knowledge base files for the authenticated user: the platform knowledge bases (yours, those your organisation shares with you, and public ones) and your connected Google Drive folders, ClickUp docs and Foreplay boards. '
+      + 'With no arguments it returns everything it can. kb_type narrows the sources: "private" and "public" both mean only the platform knowledge bases (the two are not told apart), "google-drive", "clickup", "clickup-tasks" and "foreplay-swipefile" / "foreplay-board" mean only that connected source (the two Foreplay values are not told apart, and ClickUp folder entries are listed whatever kb_type is). '
+      + 'modified_after and modified_before (dates as YYYY-MM-DD), limit (1 to 1000, default 100) and offset (0 to 100000) page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay (the answer still echoes them), and limit and offset apply per Google Drive source, a source being a registered folder with everything under it. '
+      + 'Blank or 0 for limit and offset means the default, not "none". To page Drive files send the same arguments with a new offset.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_type: { type: 'string', enum: [...KB_LIST_TYPES], description: 'Only return this kind of source ("private" and "public" both mean the platform knowledge bases). Omit to return every source.' },
+        modified_after: { type: 'string', description: 'Google Drive files modified on or after this date, YYYY-MM-DD (e.g. "2026-04-15").' },
+        modified_before: { type: 'string', description: 'Google Drive files modified on or before this date, YYYY-MM-DD (e.g. "2026-04-22"); not earlier than modified_after.' },
+        limit: { type: 'number', minimum: 1, maximum: MAX_KB_LIST_LIMIT, description: 'Most Google Drive files to return per source (default 100).' },
+        offset: { type: 'number', minimum: 0, maximum: MAX_KB_LIST_OFFSET, description: 'Google Drive files to skip per source (default 0). Use with limit to page.' }
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
     return jsonResult(data);
   }
 });
@@ -4340,6 +4354,39 @@ A result with success:false means nothing was read ('reason' says why: ambiguous
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-activity`,
       context: ctx(context),
       queryParams
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'read_client_meta_budgets',
+  definition: {
+    name: 'read_client_meta_budgets',
+    description: `Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.
+
+Resolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window.
+
+Refuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address, or a display name that matches exactly one client.'
+        },
+        since: { type: 'string', description: 'First day of the window, YYYY-MM-DD (inclusive).' },
+        until: { type: 'string', description: 'Last day of the window, YYYY-MM-DD (inclusive).' }
+      },
+      required: ['client_name_or_email', 'since', 'until']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const qs = new URLSearchParams({ since: String(args.since ?? ''), until: String(args.until ?? '') });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-budgets?${qs.toString()}`,
+      context: ctx(context)
     });
     return jsonResult(data);
   }
