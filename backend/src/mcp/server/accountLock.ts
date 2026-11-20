@@ -1,5 +1,5 @@
 /**
- * ENG-2840 wave 1 (PR C): one lock per ACCOUNT for the read, merge, write tools (market strategy and brand).
+ * ENG-2840 wave 1 (PR C): one lock per ACCOUNT for the read, merge, write tools (market strategy, brand).
  *
  * An org's strategy and brand belong to the org, not to the member who happens to call: the owner and a listed editor each run their own agent, and their
  * two updates are a read, merge, write on the same stored lists. A lock keyed by the calling user would let the second write drop the first one's entries.
