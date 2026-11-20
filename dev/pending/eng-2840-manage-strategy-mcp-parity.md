@@ -102,6 +102,8 @@ read. If it degrades (the org owner's record is not yet visible) it returns an e
 the second read 200 ms later makes it unlikely that both reads of one call miss, not impossible, and a write built on two missed reads replaces the lists
 and masks the owner's copy. (3) `emma_send_message` with the same key still reaches Emma's own `update_market_strategy`; this PR does not change that.
 
+**Where the tool is reachable.** `manage_market_strategy` is an MCP-server tool: it is registered in the MCP registry (`mcpToolRegistry`) and reached through `POST /mcp` with an API key. It is not in Emma's registry (`emmaToolRegistry`), which is what the in-app agent mode copies its tools from, so an in-app agent session (including one built on a private skill that lists `manage_market_strategy`) has never been able to call it: it answers `Unknown tool: manage_market_strategy`, on `main` as well as on this branch. The in-app agent's own tool for this data is `update_market_strategy`. This PR does not change that; a check that drives the tool through an agent-mode session tests a path on which the tool does not exist, and the way to exercise it is an MCP client with an `aw_` key.
+
 Proof: `backend/src/__tests__/mcp.manageStrategy.writes.test.ts` runs the real path (MCP client, MCP server, tool, mcpFetch, the real Express app, db.ts,
 in-memory DynamoDB; strongly consistent, so the read-lag cases are simulated by answering one read with an older copy) for an org owner, a member who is not
 an editor, a listed editor, another tenant and a solo user.
