@@ -687,6 +687,26 @@ describe('update: parts the route would fill from its own, possibly older, read'
     expect(s.icp.map((e: any) => e.title)).toEqual(['IT Director', 'Founder', 'Analyst']);
   });
 
+  it('a competitors-only call right after an ICP save sends the ICPs again but leaves icpUpdatedAt where the ICP save put it (Opslane P1 on 440bb19)', async () => {
+    expect((await update(owner, { icp: [{ title: 'Analyst' }] })).isError).toBe(false);
+    const stampOfTheIcpSave = strategyOf(TENANT_A.orgId).icpUpdatedAt;
+    expect(stampOfTheIcpSave).not.toBe(STORED_AT);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const posts = await recordStrategyPosts(async () => {
+      expect((await update(owner, { competitors: [{ name: 'Delta' }] })).isError).toBe(false);
+    });
+
+    // The saved ICP list is carried along (the route would otherwise fill it from its own, possibly older, read) ...
+    expect(Object.keys(posts[0]).sort()).toEqual(['competitors', 'icp']);
+    expect(posts[0].icp.map((e: any) => e.title)).toEqual(['IT Director', 'Founder', 'Analyst']);
+    // ... and, being the list already stored, it does not move the stamp.
+    const s = strategyOf(TENANT_A.orgId);
+    expect(s.icpUpdatedAt).toBe(stampOfTheIcpSave);
+    expect(s.icp.map((e: any) => e.title)).toEqual(['IT Director', 'Founder', 'Analyst']);
+    expect(names(s.competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta']);
+  });
+
   it('a part nobody saved recently is not sent (so an ICP the call did not touch is not marked as edited)', async () => {
     const posts = await recordStrategyPosts(async () => {
       await update(owner, { competitors: [{ name: 'Delta' }] });
