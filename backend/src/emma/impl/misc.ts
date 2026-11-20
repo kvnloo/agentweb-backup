@@ -302,6 +302,14 @@ export function getAdminToolNames(): string[] {
 }
 
 /**
+ * Tools registered for agent mode that a session is offered only through a skill that lists them, never through the
+ * `__other_skills__` catch-all pool (every registered tool that no published skill lists). `manage_market_strategy` (ENG-2840) is the
+ * MCP server's market strategy tool, bridged so a skill can list it; Emma's own `update_market_strategy` is a foundation tool, and a
+ * second strategy writer with different merge rules should not appear in every catch-all session next to it.
+ */
+export const SKILL_ONLY_TOOL_NAMES: readonly string[] = ['manage_market_strategy'];
+
+/**
  * Get tools that are not associated with any published skill.
  * Excludes foundation tools and admin-only tools.
  *
@@ -334,6 +342,7 @@ export function getUnassociatedTools(
   ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
   // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
   excludedTools.add('get_visual_context');
+  SKILL_ONLY_TOOL_NAMES.forEach(t => excludedTools.add(t));
 
   // Get all registered tools and find those not in any skill
   const allTools = getAllTools();

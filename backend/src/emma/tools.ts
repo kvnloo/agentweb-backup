@@ -7661,10 +7661,19 @@ const bridgedToolNames = [
   'get_account_status',
   // ENG-2840: the market strategy tool of the MCP server (competitors merged by name, ICPs by title, nothing removed). Bridged
   // so a skill that lists it in `toolNames` has a tool to offer in agent mode: it was registered for MCP callers only, so such a
-  // skill silently offered nothing and a call answered "Unknown tool". It is offered only through a skill that lists it (it is
-  // not a foundation tool); Emma's own update_market_strategy is unchanged.
+  // skill silently offered nothing and a call answered "Unknown tool". It is not a foundation tool and is kept out of the
+  // __other_skills__ pool (SKILL_ONLY_TOOL_NAMES in emma/impl/misc.ts), so a session is offered it through a skill that lists it;
+  // Emma's own update_market_strategy is unchanged.
   'manage_market_strategy',
 ];
+
+/**
+ * Bridged tools that act on one signed-in account's data and must refuse an anonymous (not signed-in) session with the same
+ * deferred refusal Emma's own account tools give. The bridge copies a definition and an execute function, not the MCP handler's
+ * flags, so a tool that needs this names itself here instead of the loop below carrying every flag (which would change the
+ * landing-page and publish tools, whose handlers also set it). ENG-2840.
+ */
+const BRIDGED_REQUIRES_USER_ACCOUNT: ReadonlySet<string> = new Set(['manage_market_strategy']);
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
@@ -7752,6 +7761,7 @@ for (const toolName of bridgedToolNames) {
         ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
         : handler.definition,
       execute,
+      ...(BRIDGED_REQUIRES_USER_ACCOUNT.has(toolName) ? { requiresUserAccount: true } : {}),
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
