@@ -22,6 +22,7 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 import app from '../app';
+import { userDb } from '../services/db';
 import {
   clearRecentStrategyWrites,
   executeStrategyUpdate,
@@ -774,6 +775,99 @@ describe('update: names, arguments and who may write', () => {
     expect(r.isError).toBe(false);
     expect(strategyOf(TENANT_A.orgId).businessOverview).toBe('Fixed overview');
     expect(strategyOf(TENANT_A.orgId).competitors).toBe('oops');
+  });
+});
+
+describe('update: third round', () => {
+  it('a stored entry that is a bare string is matched by its text, not duplicated, and becomes an entry holding that name', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: ['HubSpot', { name: 'Gamma', description: 'x' }], icp: ['IT Director', { title: 'Founder' }] } });
+    expect((await read(owner, { competitorNames: ['hubspot'] })).json.competitorLookup).toEqual([{ name: 'hubspot', stored: true, offset: 0 }]);
+    const r = await update(owner, { competitors: [{ name: 'hubspot', description: 'CRM' }], icp: [{ title: ' it  director ', description: 'Runs the stack' }] });
+    expect(r.isError).toBe(false);
+    expect(r.json.competitors).toMatchObject({ added: [], updated: ['HubSpot'], total: 2 });
+    expect(r.json.icp).toMatchObject({ added: [], updated: ['IT Director'], total: 2 });
+    expect(strategyOf(TENANT_A.orgId).competitors).toEqual([{ name: 'HubSpot', description: 'CRM' }, { name: 'Gamma', description: 'x' }]);
+    expect(strategyOf(TENANT_A.orgId).icp).toEqual([{ title: 'IT Director', description: 'Runs the stack' }, { title: 'Founder' }]);
+  });
+
+  it('a bare-string entry sent again by name alone is unchanged (it stays as it is)', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: ['HubSpot'] } });
+    const r = await update(owner, { competitors: [{ name: 'HubSpot' }] });
+    expect(r.json.changed).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors).toEqual(['HubSpot']);
+  });
+
+  it('the parts carried along do not chain: a part counts for a minute from the save that changed it, not from later saves that only carried it', async () => {
+    const now = Date.now();
+    const spy = jest.spyOn(Date, 'now');
+    try {
+      const posts: Array<string[]> = [];
+      const at = async (ms: number, args: Record<string, unknown>) => {
+        spy.mockReturnValue(now + ms);
+        const got = await recordStrategyPosts(async () => { expect((await update(owner, args)).isError).toBe(false); });
+        posts.push(Object.keys(got[0]).sort());
+      };
+      await at(0, { icp: [{ title: 'Analyst' }] });
+      await at(40_000, { competitors: [{ name: 'Delta' }] });
+      await at(80_000, { businessOverview: 'Later overview' });
+      await at(130_000, { competitors: [{ name: 'Epsilon' }] });
+      expect(posts).toEqual([
+        ['icp'],
+        ['competitors', 'icp'], // the ICP save is 40 s old
+        ['businessOverview', 'competitors'], // the ICP save is 80 s old and no longer counts; the competitors save is 40 s old
+        ['businessOverview', 'competitors'], // the competitors save is 90 s old; the overview save is 50 s old
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('null is the same as not sent, for refused arguments too', async () => {
+    const r = await update(owner, { competitors: [{ name: 'Delta' }], positioning: null, targetAudience: null });
+    expect(r.isError).toBe(false);
+    expect(r.json.ignoredArguments).toBeUndefined();
+  });
+
+  it('a read of an account whose stored competitors are not a list says so instead of reporting none', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: 'oops' } });
+    const r = await read(owner);
+    expect(r.isError).toBe(false);
+    expect(r.json.warning).toMatch(/stored competitors are not a list/);
+    expect(r.json.data.competitors).toEqual([]);
+  });
+
+  it.each([
+    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom'))],
+    ['has no record', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockResolvedValueOnce(undefined)],
+  ])('refuses the call when the caller\'s record %s, instead of locking per user', async (_label, arrange) => {
+    const spy = arrange();
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    try {
+      const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/strategy: the account could not be identified.*nothing was changed/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('a refusal inside the lock releases it: the next call goes through', async () => {
+    expect((await update(member, { competitors: [{ name: 'AlphaRival', description: 'Different' }] })).isError).toBe(true);
+    expect((await update(owner, { competitors: [{ name: 'Delta' }] })).isError).toBe(false);
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toContain('Delta');
+  });
+
+  it('more than 100 profiles in one call are refused, and an empty competitorNames list adds no lookup', async () => {
+    const r = await update(owner, { icp: Array.from({ length: 101 }, (_, i) => ({ title: `P${i}` })) });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/icp may hold at most 100 entries per call/);
+    expect((await read(owner, { competitorNames: [] })).json.competitorLookup).toBeUndefined();
+  });
+
+  it('identity-style arguments are listed on the answer of a call that changes nothing too', async () => {
+    const r = await update(owner, { competitors: [{ name: 'AlphaRival', description: 'The old incumbent' }], client_id: TENANT_B.owner });
+    expect(r.json).toMatchObject({ changed: false, ignoredArguments: ['client_id'] });
   });
 });
 
