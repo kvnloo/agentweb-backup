@@ -7679,6 +7679,7 @@ const adminToolNames = [
   'monitor_lead_volume',
   'check_account_tracking_health',
   'read_client_meta_activity',
+  'read_client_meta_budgets',
   'diagnose_leads_at_zero',
   'get_pr_digest',
   'freeze_user_account',

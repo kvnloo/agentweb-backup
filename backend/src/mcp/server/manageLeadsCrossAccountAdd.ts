@@ -23,6 +23,7 @@ import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { resolveClientScopedContext } from './adminClientScope';
 import { recordAdminAudit } from '../../services/adminAuditLog';
+import { applyDoNotContactInheritance, buildLeadCreateBody } from './manageLeadsWrites';
 
 const isCrossAccountAddEnabled = (): boolean =>
   process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED === 'true';
@@ -54,7 +55,9 @@ export function normalizeAddLeadPayload(leads: unknown): Record<string, unknown>
       `manage_leads action "add" requires the single lead to be an object with fields (e.g. { email, firstName, ... }); received ${lead === null ? 'null' : Array.isArray(lead) ? 'an array' : typeof lead}.`
     );
   }
-  return lead as Record<string, unknown>;
+  // The same field rules as every other add: standard fields stay, other keys become custom fields, and a key that names the owner, sync or
+  // attribution data, or contact status is refused by name (the REST route stores a body as given).
+  return buildLeadCreateBody(lead);
 }
 
 /**
@@ -197,7 +200,13 @@ export async function executeCrossAccountLeadAdd(args: any, context: any): Promi
       body: leadPayload,
     });
     recordAdminAudit({ ...auditBase, outcome: 'created', leadId: data?.leadId });
-    return jsonResult(data);
+    // The same do-not-contact inheritance as every other add; the new lead is stamped with the admin who acted, not the customer.
+    const followups = await applyDoNotContactInheritance(listId, [{ leadId: data?.leadId, email: typeof leadPayload.email === 'string' ? leadPayload.email : undefined }], c, scope.caller.userId);
+    return jsonResult({
+      ...data,
+      ...(followups.inheritedDoNotContact.length > 0 ? { inheritedDoNotContact: true } : {}),
+      ...(followups.doNotContactCheckFailed > 0 ? { doNotContactCheckFailed: followups.doNotContactCheckFailed, doNotContactUnchecked: followups.uncheckedLeadIds } : {}),
+    });
   } catch (error: any) {
     recordAdminAudit({ ...auditBase, outcome: 'failed', error: error?.message });
     throw error;

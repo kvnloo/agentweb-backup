@@ -310,6 +310,66 @@ function isDownloadTimeout(error: unknown): boolean {
   return typeof e?.message === 'string' && /timed out following redirects|timeout of \d+ms exceeded|aborted due to timeout/i.test(e.message);
 }
 
+/**
+ * ENG-3151: the model often turns a tool-response key it was shown ("tool-responses/<uuid>/call_N.txt") into a URL by guessing the
+ * bucket host (agentweb-tool-responses-prod.s3..., aw-team-internal-storage.s3..., bare s3.amazonaws.com). Every guess 404s. When an
+ * https URL on an amazonaws.com host carries a tool-responses key as its path, return that key so it is read like a bare key, under the
+ * same ownership check. Any other URL, and any path that is not exactly a tool-responses key, returns null (a plain download as before).
+ *
+ * Deliberate choices:
+ *  - The host is ignored for ANY `*.amazonaws.com` host: the invented hosts are exactly what this repairs. Nothing is fetched from the
+ *    host (the key is read from OUR bucket by the server), so userinfo and port are ignored too, and the query string / fragment is dropped.
+ *    Safety comes from the exact key shape plus the caller's ownership check (`fileAccess.check`), not from the host.
+ *  - Path-style URLs (`https://s3.<region>.amazonaws.com/<bucket>/tool-responses/...`) are intentionally NOT repaired: the path then starts
+ *    with the bucket name, so it is not a key and returns null (out of scope; it falls through to the guarded fetch as before).
+ *  - Dot segments are resolved by the WHATWG URL parser before this runs; encoded slashes decode into extra `/`, which the key regex refuses.
+ */
+function toolResponseKeyFromAmazonUrl(fileUrl: string): string | null {
+  let u: URL;
+  try { u = new URL(fileUrl); } catch { return null; }
+  if (u.protocol !== 'https:' || !/(^|\.)amazonaws\.com$/i.test(u.hostname)) return null;
+  let key: string;
+  try { key = decodeURIComponent(u.pathname.replace(/^\/+/, '')); } catch { return null; }
+  if (!/^tool-responses\/[a-z0-9-]{36}\/[^/]+$/i.test(key)) return null;
+  return key;
+}
+
+/**
+ * ENG-3151: every file goes to the Gemini code-execution sandbox labelled `text/csv`, which Google documents as working best with
+ * text and CSV. PDF and Excel files sent that way were answered with HTTP 400 `invalid_argument` after seconds to minutes of
+ * upload. They are refused up front instead: by extension before anything is downloaded or read, and by the file's first bytes
+ * (PDF `%PDF-`, zip container `PK\x03\x04`, legacy Office `D0 CF 11 E0`) before the model call. The cause of the 400 is not proven;
+ * the refusal is safe either way because these files already fail.
+ */
+const BINARY_EXTENSIONS: Record<string, string> = {
+  pdf: 'PDF', xlsx: 'Excel', xlsm: 'Excel', xlsb: 'Excel', xls: 'Excel', docx: 'Word', doc: 'Word', pptx: 'PowerPoint', zip: 'zip archive',
+};
+
+function binaryKindFromName(entry: string): string | null {
+  let path = entry;
+  try { path = entry.includes('://') ? new URL(entry).pathname : entry; } catch { return null; }
+  let last = path.slice(path.lastIndexOf('/') + 1);
+  try { last = decodeURIComponent(last); } catch { /* keep the raw name */ }
+  const dot = last.lastIndexOf('.');
+  return dot < 0 ? null : (BINARY_EXTENSIONS[last.slice(dot + 1).toLowerCase()] ?? null);
+}
+
+function binaryKindFromBytes(buf: Buffer): string | null {
+  if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'PDF';
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return 'Excel/Word/zip';
+  if (buf.length >= 4 && buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0) return 'Office';
+  return null;
+}
+
+function binaryFileRefusal(entry: string, kind: string) {
+  const shown = entry.length > 120 ? `${entry.slice(0, 117)}...` : entry;
+  return {
+    success: false,
+    message: `file_urls entry "${shown}" is a ${kind} file, and perform_data_analysis reads text files only (CSV, TSV, JSON or plain text). Convert the data to CSV and pass that file, or put the data inline in analysis_instruction.`,
+    errorClass: 'invalid_args',
+  };
+}
+
 /** ENG-2993: HTTP status of a failed file download (axios response, else message). */
 function downloadHttpStatus(error: unknown): number | undefined {
   const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
@@ -516,6 +576,14 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
     const fileRawContents: string[] = [];
     let totalSize = 0;
 
+    // ENG-3151: refuse formats the sandbox cannot read before any download. Only plain URLs here: an s3:// or tool-responses key is
+    // judged after its access check below, so a key the caller may not read still gets the one uniform "not found or no access" answer.
+    for (const entry of urlsToProcess) {
+      if (entry.startsWith('s3://') || /^tool-responses\/[a-z0-9-]{36}\//i.test(entry)) continue;
+      const kind = binaryKindFromName(entry);
+      if (kind) return binaryFileRefusal(entry, kind);
+    }
+
     for (const fileUrl of urlsToProcess) {
       try {
         // If the LLM passed an s3:// URI (e.g. "s3://bucket/key"), fetch directly via SDK
@@ -535,6 +603,7 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           if (!fileAccess.isOurBucket(s3Bucket)) return refuseFile();
           const s3Decision = await fileAccess.check(s3Key);
           if (s3Decision !== 'allow') return s3Decision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
+          { const kind = binaryKindFromName(s3Key); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
             s3Content = await getS3ObjectAsString(s3Key, s3Bucket);
@@ -568,23 +637,26 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
         // If the LLM passed a bare S3 tool-response key (e.g. "tool-responses/<uuid>/foo.txt")
         // instead of a proper URL, read it directly from S3 rather than failing with "Invalid URL".
         const bareS3KeyPattern = /^tool-responses\/[a-z0-9-]{36}\//i;
-        if (bareS3KeyPattern.test(fileUrl)) {
-          const bareDecision = await fileAccess.check(fileUrl);
+        // ENG-3151: also a key the model wrapped in an invented amazonaws.com host.
+        const toolResponseKey = toolResponseKeyFromAmazonUrl(fileUrl) ?? fileUrl;
+        if (bareS3KeyPattern.test(toolResponseKey)) {
+          const bareDecision = await fileAccess.check(toolResponseKey);
           if (bareDecision !== 'allow') return bareDecision === 'unavailable' ? fileCheckUnavailable() : refuseFile();
+          { const kind = binaryKindFromName(fileUrl); if (kind) return binaryFileRefusal(fileUrl, kind); }
           let s3Content: string;
           try {
-            s3Content = await getS3ObjectAsString(fileUrl);
+            s3Content = await getS3ObjectAsString(toolResponseKey);
           } catch (s3Err) {
             const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
             return {
               success: false,
-              message: `Cannot read tool-response file "${fileUrl}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
+              message: `Cannot read tool-response file "${toolResponseKey}" from S3: ${s3ErrMsg}. The data is no longer available. Re-run the original tool call to regenerate the data, then pass the new S3 key.`,
             };
           }
           if (!s3Content) {
             return {
               success: false,
-              message: `Tool-response file "${fileUrl}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
+              message: `Tool-response file "${toolResponseKey}" exists in S3 but is empty. Re-run the original tool call to regenerate the data.`,
             };
           }
           const contentBuffer = Buffer.from(s3Content, 'utf-8');
@@ -626,6 +698,10 @@ async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstr
           maxBytes: Math.max(maxTotalSize - totalSize, 0),
           timeoutMs: DOWNLOAD_TIMEOUT_MS,
         });
+
+        // ENG-3151: a binary file behind a URL with no telling extension.
+        const sniffed = binaryKindFromBytes(fileBuffer);
+        if (sniffed) return binaryFileRefusal(fileUrl, sniffed);
 
         // Check file size
         totalSize += fileBuffer.byteLength;

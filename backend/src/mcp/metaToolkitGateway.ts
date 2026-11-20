@@ -49,7 +49,7 @@ import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
 import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
 import { isZomaIndustryBenchmarkTool, runZomaIndustryBenchmark } from './zomaIndustryBenchmark';
-import { isZomaMeasurementReportTool, measurementReportsEnabled, runZomaMeasurementReport } from './zomaMeasurementReport';
+import { isZomaMeasurementReportTool, measurementReportsEnabledForUserId, runZomaMeasurementReport } from './zomaMeasurementReport';
 import {
   defaultClassifyIndustry,
   enrollReportSchedule,
@@ -156,7 +156,9 @@ export interface MetaToolkitGatewayDeps {
   runAdsReport?: (account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
   /** ENG-3156 zoma_industry_benchmark; defaults to runZomaIndustryBenchmark (Graph reads + one classification call). */
   runIndustryBenchmark?: (account: ConnectedAccount, accountId: string, userId: string, args: any) => Promise<any>;
-  /** ENG-3155 zoma_measurement_report (dark until ZOMA_MEASUREMENT_REPORTS_ENABLED); defaults to runZomaMeasurementReport. */
+  /** ENG-3155 per-user gate (flag or allowlist); defaults to measurementReportsEnabledForUserId. */
+  measurementReportsEnabledFor?: (userId: string) => Promise<boolean>;
+  /** ENG-3155 zoma_measurement_report (dark until the flag or the allowlist); defaults to runZomaMeasurementReport. */
   runMeasurementReport?: (userId: string, account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
   /** ENG-3155 zoma_report_schedule; defaults to runZomaReportScheduleTool. */
   runReportScheduleTool?: (userId: string, args: any) => Promise<any>;
@@ -361,7 +363,8 @@ function ambiguousAccountMessage(usable: ConnectedAccount[]): string {
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
 // refused (and not metered) rather than executing without the resolved account binding.
 function toolAcceptsAccountId(name: string): boolean {
-  const def = getMetaToolkitManifest().find((d: any) => d.name === name);
+  // Schema lookup only (listing is gated per caller elsewhere): include every gated definition.
+  const def = getMetaToolkitManifest(undefined, { measurementReports: true }).find((d: any) => d.name === name);
   return !!def?.inputSchema?.properties?.account_id;
 }
 
@@ -523,9 +526,10 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     return result;
   }
 
-  // ENG-3155: the measurement-report schedule is Zoma's own setting (no Meta call). Not routed while the flag
-  // is off, so the call falls through to the v1 refusal like any unknown tool.
-  if (isZomaReportScheduleTool(request.toolName) && measurementReportsEnabled()) {
+  // ENG-3155: the measurement-report schedule is Zoma's own setting (no Meta call). Not routed unless the flag is
+  // on or the caller is allowlisted, so otherwise the call falls through to the v1 refusal like any unknown tool.
+  const reportsEnabled = () => (deps.measurementReportsEnabledFor ?? measurementReportsEnabledForUserId)(caller.userId);
+  if (isZomaReportScheduleTool(request.toolName) && (await reportsEnabled())) {
     assertMetaToolkitScope(caller, request.toolName, isReportScheduleWrite(request.args));
     const result = await (deps.runReportScheduleTool ?? runZomaReportScheduleTool)(caller.userId, request.args ?? {});
     await meter(undefined, result);
@@ -617,7 +621,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   }
 
   // ENG-3155: the full measurement report (campaigns, CRM leads, breakdowns, hosted HTML) on the resolved account.
-  if (isZomaMeasurementReportTool(request.toolName) && measurementReportsEnabled()) {
+  if (isZomaMeasurementReportTool(request.toolName) && (await reportsEnabled())) {
     const account = (await deps.listAccounts(caller.userId)).find(
       (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
     );
@@ -741,8 +745,8 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const entityType = audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type);
     const executedWrites: any[] = Array.isArray((result as any)?.results) ? (result as any).results : [result];
     for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write, args.params);
-    // ENG-3155: a confirmed launch enrolls the account in measurement reports (idempotent; no-op while the flag
-    // is off). A schedule failure is logged and never makes the executed write look failed.
+    // ENG-3155: a confirmed launch enrolls the account in measurement reports (idempotent; no-op unless the flag
+    // is on or the caller is allowlisted). A schedule failure is logged and never makes the executed write look failed.
     if (!audienceTool && !creativeAsset && !lifecycle && isZomaPublishWrite('meta', args) && result?.verification === 'CONFIRMED') {
       try {
         const notice = await (deps.enrollReportSchedule ?? ((u, a) => enrollReportSchedule(u, a, { classifyIndustry: defaultClassifyIndustry })))(caller.userId, accountId);
