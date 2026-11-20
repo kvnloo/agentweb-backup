@@ -621,6 +621,7 @@ import {
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
+import { isAnonymousShareMessage, isServerAuthoredContinuation, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 
 /**
@@ -3225,7 +3226,7 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
       }
     }
-    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare);
 
     // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
     let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
@@ -6465,7 +6466,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6483,10 +6484,19 @@ export class AgentModeService {
 
     // Merge consecutive user messages into one — keeps the 10-message window from dropping
     // the original task when many retry messages ("Please try again...") pile up behind it.
+    // ENG-2227: merging mutates only `.content`, never `.metadata` — if an anonymous ishare
+    // message landed adjacent to a real owner message (the exact retry-pileup shape this merge
+    // exists for), only the FIRST message's metadata survived the merge, silently dropping the
+    // anonymous tag (when it merged INTO an owner message) or mislabeling the owner's own words
+    // as anonymous (when an owner message merged into one). This merge was only ever meant to
+    // collapse retries from the SAME actor, so only merge when both sides share the same
+    // anonymity status — a genuine identity change between two adjacent messages now keeps them
+    // as separate entries, each correctly tagged by the per-message loop below.
     const mergedHistory: ChatMessage[] = [];
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
-      if (last && last.role === 'user' && msg.role === 'user') {
+      const sameAnonymity = isAnonymousShareMessage(last) === isAnonymousShareMessage(msg);
+      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
         mergedHistory.push({ ...msg });
@@ -6561,6 +6571,24 @@ export class AgentModeService {
           contentStr = String(content);
         }
         content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
+      }
+
+      // ENG-2227: a message submitted via an anonymous ishare link carries no verified
+      // identity — metadata.ishareSender is stored on the message (agentModeController.ts)
+      // but was never surfaced into what the model actually reads, so a claim from an
+      // anonymous viewer looked identical to one from the verified account owner. Fold the
+      // marker into content on every reconstruction (not just the turn it arrived in), the
+      // same way attachments are folded in above, so it survives into later turns.
+      if (msg.role === 'user' && isAnonymousShareMessage(msg) && !isServerAuthoredContinuation(msg as any)) {
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = withAnonymousShareMarker(contentStr);
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -6650,16 +6678,25 @@ export class AgentModeService {
     messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
+    // ENG-2227: this turn's own message is deliberately filtered OUT of sessionHistory above
+    // (the dedupe filter at the top of this function) and reconstructed here as a bare string,
+    // bypassing the per-message loop above entirely — including its anonymous-sender marker.
+    // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
+    // before it's even "history") with zero provenance signal. Apply the same marker here when
+    // this turn itself came through the public ishare endpoint.
+    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(null, messageContent)
+      ? withAnonymousShareMarker(messageContent)
+      : messageContent;
     if (screenshotUrl) {
       messages.push({
         role: 'user',
         content: [
-          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'text', text: `${currentMessageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
           { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
         ]
       });
     } else {
-      messages.push({ role: 'user', content: messageContent });
+      messages.push({ role: 'user', content: currentMessageContent });
     }
 
     return messages;

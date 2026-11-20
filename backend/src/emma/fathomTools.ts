@@ -211,7 +211,7 @@ emmaToolRegistry.register({
       properties: {
         recording_id: {
           type: 'number',
-          description: 'The recording ID from the meetings list (required)',
+          description: 'The recording ID from the meetings list (required). Must be a recording_id returned by fathom_get_meetings.',
         },
       },
       required: ['recording_id'],
@@ -269,8 +269,11 @@ emmaToolRegistry.register({
       if (status === 404) {
         return {
           success: false,
-          message: `Recording ${args.recording_id} not found. Use fathom_get_meetings to list available recordings.`,
+          message: `Recording ${args.recording_id} not found for the connected Fathom account. Use a recording_id returned by fathom_get_meetings.`,
           status,
+          // ENG-3153: the connected account is healthy; the model named a recording it does not have.
+          // A bad argument, so it must not cluster as not_found -> config ("reconnect the account").
+          errorClass: 'invalid_args',
         };
       }
       console.error('[fathom_get_transcript] API error:', error?.message);
