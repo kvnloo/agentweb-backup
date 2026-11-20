@@ -19,8 +19,17 @@ const session = { accountId: 'acc1', credentials: { consumerKey: 'ck', consumerS
 function fakeX() {
   const store: Record<string, Record<string, any>> = {
     funding_instruments: { fi1: { id: 'fi1', entity_status: 'ACTIVE', currency: 'USD', funded_amount_local_micro: 1 } },
-    campaigns: { c1: { id: 'c1', name: 'Launch', entity_status: 'PAUSED', funding_instrument_id: 'fi1', daily_budget_amount_local_micro: 50000000 } },
-    line_items: { l1: { id: 'l1', name: 'LI', entity_status: 'PAUSED', campaign_id: 'c1', objective: 'ENGAGEMENTS', bid_strategy: 'AUTO' } },
+    campaigns: {
+      // Legacy campaign-budget campaign (pre-v12 CBO).
+      c1: { id: 'c1', name: 'Launch', entity_status: 'PAUSED', funding_instrument_id: 'fi1', daily_budget_amount_local_micro: 50000000 },
+      // Current shape: budget lives on its line items.
+      c2: { id: 'c2', name: 'Spring', entity_status: 'PAUSED', funding_instrument_id: 'fi1', budget_optimization: 'LINE_ITEM' },
+    },
+    line_items: {
+      l1: { id: 'l1', name: 'LI', entity_status: 'PAUSED', campaign_id: 'c1', objective: 'ENGAGEMENTS', bid_strategy: 'AUTO' },
+      l2: { id: 'l2', name: 'A', entity_status: 'PAUSED', campaign_id: 'c2', objective: 'ENGAGEMENTS', bid_strategy: 'AUTO', daily_budget_amount_local_micro: 20000000 },
+      l3: { id: 'l3', name: 'B', entity_status: 'ACTIVE', campaign_id: 'c2', objective: 'ENGAGEMENTS', bid_strategy: 'AUTO', daily_budget_amount_local_micro: 15000000 },
+    },
   };
   const promoted: any[] = [];
   const criteria: any[] = [];
@@ -53,7 +62,13 @@ function fakeX() {
     }
     throw new Error(`unexpected ${method} ${path}`);
   });
-  const listAll = jest.fn(async ({ path }: any) => (path.endsWith('promoted_tweets') ? promoted : path.endsWith('targeting_criteria') ? criteria : []));
+  const listAll = jest.fn(async ({ path, query }: any) => {
+    if (path.endsWith('promoted_tweets')) return promoted;
+    if (path.endsWith('targeting_criteria')) return criteria;
+    if (path.endsWith('funding_instruments')) return Object.values(store.funding_instruments);
+    if (path.endsWith('line_items')) return Object.values(store.line_items).filter((li) => !query?.campaign_ids || li.campaign_id === query.campaign_ids);
+    return [];
+  });
   return { store, writes, request, listAll };
 }
 
@@ -78,20 +93,86 @@ async function previewThenConfirm(args: any, d: XAdsWriteDeps) {
 }
 
 describe('ENG-3142 X Ads guarded writes', () => {
-  it('CAMPAIGN CREATE: preview sends nothing; confirm creates it PAUSED with micros, verified', async () => {
+  it('CAMPAIGN CREATE: preview sends nothing; confirm creates it PAUSED with budget_optimization=LINE_ITEM and no budget, verified', async () => {
     const { d, x } = deps();
-    const args = { entity_type: 'CAMPAIGN', action: 'CREATE', name: 'Black Friday', funding_instrument_id: 'fi1', daily_budget: 25.5 };
+    const args = { entity_type: 'CAMPAIGN', action: 'CREATE', name: 'Black Friday', funding_instrument_id: 'fi1' };
     const preview: any = await executeXAdsWrite('u1', args, session, 'USD', d);
     expect(preview.status).toBe('PREVIEW');
-    expect(preview.preview).toContain('25.50 USD');
-    expect(preview.preview).toContain('25500000 micros');
+    expect(preview.preview).toMatch(/per line item/);
     expect(preview.preview).toMatch(/created PAUSED/);
     expect(x.writes).toHaveLength(0);
 
     const done: any = await executeXAdsWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, session, 'USD', d);
     expect(done).toMatchObject({ success: true, verification: 'CONFIRMED', entity_status: 'PAUSED' });
     expect(x.writes).toHaveLength(1);
-    expect(x.writes[0].query).toMatchObject({ entity_status: 'PAUSED', daily_budget_amount_local_micro: 25500000, funding_instrument_id: 'fi1' });
+    expect(x.writes[0].query).toMatchObject({ entity_status: 'PAUSED', budget_optimization: 'LINE_ITEM', funding_instrument_id: 'fi1' });
+    expect(x.writes[0].query).not.toHaveProperty('daily_budget_amount_local_micro');
+    expect(x.writes[0].query).not.toHaveProperty('total_budget_amount_local_micro');
+  });
+
+  it('CAMPAIGN CREATE with a budget is refused, pointing at line-item budgets', () => {
+    for (const extra of [{ daily_budget: 25 }, { total_budget: 500 }]) {
+      expect(() => validateXAdsWriteShape({ entity_type: 'CAMPAIGN', action: 'CREATE', name: 'n', funding_instrument_id: 'fi1', ...extra }, 'USD'))
+        .toThrow(/LINE_ITEM CREATE/);
+    }
+  });
+
+  it('CAMPAIGN CREATE without a usable funding instrument tells the user to add a payment method at ads.x.com', async () => {
+    const args = { entity_type: 'CAMPAIGN', action: 'CREATE', name: 'n', funding_instrument_id: 'fi1' };
+    for (const fi of [undefined, { id: 'fi1', entity_status: 'CANCELLED', currency: 'USD' }, { id: 'fi1', entity_status: 'ACTIVE', able_to_fund: false, currency: 'USD' }]) {
+      const x = fakeX();
+      if (fi) x.store.funding_instruments = { fi1: fi }; else x.store.funding_instruments = {};
+      const { d } = deps(x);
+      await expect(executeXAdsWrite('u1', args, session, 'USD', d)).rejects.toThrow(/payment method at ads\.x\.com \(Billing\)/);
+      expect(x.writes).toHaveLength(0);
+    }
+    // A usable instrument exists but a different id was passed: refused, naming the usable one.
+    const x = fakeX();
+    const { d } = deps(x);
+    await expect(executeXAdsWrite('u1', { ...args, funding_instrument_id: 'fi9' }, session, 'USD', d)).rejects.toThrow(/Usable funding instruments: fi1/);
+  });
+
+  it('CAMPAIGN UPDATE budget: allowed on a legacy campaign that has one, refused on a LINE_ITEM-budget campaign', async () => {
+    const { d, x } = deps();
+    const legacy: any = await previewThenConfirm({ entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: 'c1', daily_budget: 60 }, d);
+    expect(legacy).toMatchObject({ success: true, verification: 'CONFIRMED' });
+    await expect(executeXAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: 'c2', daily_budget: 60 }, session, 'USD', d))
+      .rejects.toThrow(/LINE_ITEM UPDATE/);
+    // A rename on the same campaign is still fine.
+    await expect(previewThenConfirm({ entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: 'c2', name: 'Summer' }, d)).resolves.toMatchObject({ verification: 'CONFIRMED' });
+    expect(x.writes).toHaveLength(2);
+  });
+
+  it('LINE_ITEM CREATE requires daily_budget and sends it (and total_budget) as micros; UPDATE can change both', async () => {
+    expect(() => validateXAdsWriteShape({ entity_type: 'LINE_ITEM', action: 'CREATE', campaign_id: 'c2', name: 'n', objective: 'REACH' }, 'USD'))
+      .toThrow(/needs daily_budget/);
+    const { d, x } = deps();
+    const args = { entity_type: 'LINE_ITEM', action: 'CREATE', campaign_id: 'c2', name: 'n', objective: 'REACH', daily_budget: 12.5, total_budget: 300 };
+    const preview: any = await executeXAdsWrite('u1', args, session, 'USD', d);
+    expect(preview.preview).toMatch(/Daily budget: 12\.50 USD/);
+    expect(preview.preview).toMatch(/Total budget: 300\.00 USD/);
+    const done: any = await executeXAdsWrite('u1', { ...args, confirm: true, preview_token: preview.preview_token }, session, 'USD', d);
+    expect(done).toMatchObject({ success: true, verification: 'CONFIRMED' });
+    expect(x.writes[0].query).toMatchObject({ daily_budget_amount_local_micro: 12500000, total_budget_amount_local_micro: 300000000 });
+
+    const upd: any = await previewThenConfirm({ entity_type: 'LINE_ITEM', action: 'UPDATE', line_item_id: 'l2', daily_budget: 30, total_budget: 900 }, d);
+    expect(upd).toMatchObject({ success: true, verification: 'CONFIRMED' });
+    expect(x.store.line_items.l2).toMatchObject({ daily_budget_amount_local_micro: 30000000, total_budget_amount_local_micro: 900000000 });
+  });
+
+  it('ACTIVATE: a campaign shows the sum of its line items\' daily budgets; a line item shows its own', async () => {
+    const { d, x } = deps();
+    const camp: any = await executeXAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: 'c2' }, session, 'USD', d);
+    expect(camp.preview).toMatch(/up to 35\.00 USD .*\/day/);
+    expect(camp.preview).toMatch(/2 line item/);
+    const li: any = await executeXAdsWrite('u1', { entity_type: 'LINE_ITEM', action: 'ACTIVATE', line_item_id: 'l2' }, session, 'USD', d);
+    expect(li.preview).toMatch(/up to 20\.00 USD .*\/day \(its daily budget\)/);
+    expect(x.writes).toHaveLength(0);
+
+    // The ceiling applies to the line-item sum on campaign activation.
+    const capped = deps(undefined, { spendCeilingPolicy: () => ({ maxDailyBudget: 30000000 }) }).d;
+    await expect(executeXAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: 'c2' }, session, 'USD', capped)).rejects.toThrow(/Activating/);
+    await expect(executeXAdsWrite('u1', { entity_type: 'LINE_ITEM', action: 'ACTIVATE', line_item_id: 'l2' }, session, 'USD', capped)).resolves.toMatchObject({ status: 'PREVIEW' });
   });
 
   it('a preview token is single use and bound to the exact arguments', async () => {
@@ -116,7 +197,7 @@ describe('ENG-3142 X Ads guarded writes', () => {
   });
 
   it('a create can never carry a status; activation is its own ACTIVATE preview', async () => {
-    expect(() => validateXAdsWriteShape({ entity_type: 'CAMPAIGN', action: 'CREATE', name: 'n', funding_instrument_id: 'fi1', daily_budget: 5, entity_status: 'ACTIVE' }, 'USD'))
+    expect(() => validateXAdsWriteShape({ entity_type: 'CAMPAIGN', action: 'CREATE', name: 'n', funding_instrument_id: 'fi1', entity_status: 'ACTIVE' }, 'USD'))
       .toThrow(/always PAUSED/);
     const { d, x } = deps();
     const preview: any = await executeXAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: 'c1' }, session, 'USD', d);
@@ -128,7 +209,7 @@ describe('ENG-3142 X Ads guarded writes', () => {
   it('LINE_ITEM CREATE: PAUSED, automatic bid by default, targeting applied in one batch and read back', async () => {
     const { d, x } = deps();
     const done: any = await previewThenConfirm({
-      entity_type: 'LINE_ITEM', action: 'CREATE', campaign_id: 'c1', name: 'US devs', objective: 'WEBSITE_CLICKS',
+      entity_type: 'LINE_ITEM', action: 'CREATE', campaign_id: 'c2', name: 'US devs', objective: 'WEBSITE_CLICKS', daily_budget: 10,
       targeting: { locations: ['96683cc9126741d1'], keywords: ['typescript'], follower_lookalike_user_ids: ['783214'] },
     }, d);
     expect(done).toMatchObject({ success: true, verification: 'CONFIRMED' });

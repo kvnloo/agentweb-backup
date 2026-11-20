@@ -106,12 +106,15 @@ export function getXAdsToolkitManifest() {
       description:
         'X (Twitter) Ads guarded writes. Every write is two calls: first without confirm (returns a PREVIEW and preview_token, nothing changes), ' +
         'show the preview to the user, then after their explicit approval repeat the exact same call with confirm=true and the preview_token. ' +
-        'CAMPAIGN CREATE (name, funding_instrument_id, daily_budget, total_budget?, start_time?, end_time?) / UPDATE (campaign_id, name? daily_budget? total_budget?); ' +
-        'LINE_ITEM CREATE (campaign_id, name, objective, bid_amount? — omit for automatic bidding, placements? default ALL_ON_TWITTER, ' +
-        'targeting? {locations: X location targeting_values, keywords: broad keywords, follower_lookalike_user_ids: X user ids}) / UPDATE (line_item_id, name? bid_amount?); ' +
+        'Budgets live on LINE ITEMS: X no longer accepts campaign budgets, so campaigns are created with budget_optimization=LINE_ITEM and no budget. ' +
+        'CAMPAIGN CREATE (name, funding_instrument_id — the X ad account needs a payment method added at ads.x.com Billing, start_time?, end_time?; no budget) / ' +
+        'UPDATE (campaign_id, name?; daily_budget?/total_budget? only for a legacy campaign that already has a campaign budget); ' +
+        'LINE_ITEM CREATE (campaign_id, name, objective, daily_budget, total_budget?, bid_amount? — omit for automatic bidding, placements? default ALL_ON_TWITTER, ' +
+        'targeting? {locations: X location targeting_values, keywords: broad keywords, follower_lookalike_user_ids: X user ids}) / UPDATE (line_item_id, name? bid_amount? daily_budget? total_budget?); ' +
         'PROMOTED_TWEET CREATE (line_item_id, tweet_ids 1-50 of existing posts); PAUSE / ACTIVATE (CAMPAIGN campaign_id | LINE_ITEM line_item_id). ' +
         'Budgets and bids are MAJOR units of the account currency (daily_budget: 50 = 50.00/day); the preview echoes the micros. ' +
-        'New campaigns and line items are always created PAUSED; activating is its own ACTIVATE preview and approval. ' +
+        'New campaigns and line items are always created PAUSED; activating is its own ACTIVATE preview and approval ' +
+        '(activating a campaign can spend up to the sum of its line items\' daily budgets). ' +
         'A write is done only when the result says verification CONFIRMED.',
       inputSchema: {
         type: 'object',
@@ -121,10 +124,10 @@ export function getXAdsToolkitManifest() {
           account_id: ACCOUNT_ID,
           campaign_id: { type: 'string' },
           line_item_id: { type: 'string' },
-          funding_instrument_id: { type: 'string', description: 'CAMPAIGN CREATE: from LIST_FUNDING_INSTRUMENTS.' },
+          funding_instrument_id: { type: 'string', description: 'CAMPAIGN CREATE: an ACTIVE one from LIST_FUNDING_INSTRUMENTS (none → add a payment method at ads.x.com Billing).' },
           name: { type: 'string' },
-          daily_budget: { type: 'number', description: 'CAMPAIGN: daily budget in MAJOR currency units.' },
-          total_budget: { type: 'number', description: 'CAMPAIGN: optional lifetime budget in MAJOR currency units.' },
+          daily_budget: { type: 'number', description: 'LINE_ITEM CREATE (required) / UPDATE: daily budget in MAJOR currency units. Not accepted on CAMPAIGN CREATE; on CAMPAIGN UPDATE only for a legacy campaign with its own budget.' },
+          total_budget: { type: 'number', description: 'LINE_ITEM CREATE / UPDATE: optional lifetime budget in MAJOR currency units. Not accepted on CAMPAIGN CREATE.' },
           start_time: { type: 'string', description: 'CAMPAIGN CREATE: optional ISO 8601 start.' },
           end_time: { type: 'string', description: 'CAMPAIGN CREATE: optional ISO 8601 end.' },
           objective: { type: 'string', enum: [...X_ADS_LINE_ITEM_OBJECTIVES], description: 'LINE_ITEM CREATE.' },

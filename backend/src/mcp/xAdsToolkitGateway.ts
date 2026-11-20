@@ -4,7 +4,8 @@
  *
  *   1. refuse anything outside the curated surface (xAdsToolkitManifest) before any lookup;
  *   2. resolve the caller's X Ads account (own or org-shared, the provider-neutral
- *      resolveProviderAccount) and refuse a foreign or unusable one;
+ *      resolveProviderAccount): an account_id that is not connected is a tool error listing the
+ *      connected ids; no usable connection is a 403;
  *   3. decrypt that connection's OAuth 1.0a token pair and attach the app consumer key/secret;
  *   4. reads → executeXAdsRead; writes → executeXAdsWrite (preview → confirm → apply → read-back);
  *   5. meter: one tool-use event per call, plus one write event per write that reached X —
@@ -60,9 +61,17 @@ export async function handleXAdsToolkitCall(
   const args = { ...(request.args ?? {}) };
   assertXAdsToolkitCall(request.toolName, args);
 
-  const resolved = resolveProviderAccount(X_ADS_PROVIDER, await deps.listAccounts(caller.userId), args.account_id, deps.now());
+  const accounts = await deps.listAccounts(caller.userId);
+  const resolved = resolveProviderAccount(X_ADS_PROVIDER, accounts, args.account_id, deps.now());
   if (!resolved.ok) {
     if (resolved.kind === 'ambiguous') throw new MetaToolkitRefusal(resolved.message);
+    // A wrong account_id is an argument mistake the model can fix, so it is a tool error naming the
+    // connected ids — not a transport-level 403. No usable connection at all stays the 403.
+    const requested = X_ADS_PROVIDER.normalizeId(args.account_id);
+    const connected = accounts.filter(X_ADS_PROVIDER.isAdAccount).flatMap(X_ADS_PROVIDER.accountIds);
+    if (requested && !connected.includes(requested)) {
+      throw new MetaToolkitRefusal(`X Ads account ${requested} isn't connected; connected: ${connected.length ? connected.join(', ') : 'none'}.`);
+    }
     throw deps.accessError(resolved.message);
   }
   const cfg: any = resolved.account.config;
