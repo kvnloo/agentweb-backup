@@ -103,9 +103,12 @@ describe('ENG-3142 gateway (flag on)', () => {
     expect(deps.recordWrite).not.toHaveBeenCalled();
   });
 
-  it('a foreign or revoked account is 403 and X is never called; an off-surface call is refused', async () => {
+  it('an account_id that is not connected is a tool error naming the connected ids; a revoked one is 403; X is never called', async () => {
     const deps = gatewayDeps([xAccount()]);
-    await expect(call(deps, 'x_ads_read', { action: 'LIST_CAMPAIGNS', account_id: 'someoneelse' })).rejects.toMatchObject({ status: 403 });
+    const wrong = call(deps, 'x_ads_read', { action: 'LIST_CAMPAIGNS', account_id: 'someoneelse' });
+    await expect(wrong).rejects.toBeInstanceOf(MetaToolkitRefusal);
+    await expect(call(deps, 'x_ads_read', { action: 'LIST_CAMPAIGNS', account_id: 'someoneelse' }))
+      .rejects.toThrow("X Ads account someoneelse isn't connected; connected: acc1.");
     await expect(call(gatewayDeps([xAccount('acc1', { needs_reconnect: true })]), 'x_ads_read', { action: 'LIST_CAMPAIGNS' }))
       .rejects.toBeInstanceOf(MetaToolkitAuthError);
     await expect(call(deps, 'x_ads_write', { entity_type: 'CAMPAIGN', action: 'DELETE' })).rejects.toBeInstanceOf(MetaToolkitRefusal);

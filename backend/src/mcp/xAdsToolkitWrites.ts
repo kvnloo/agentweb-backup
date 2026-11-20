@@ -2,17 +2,25 @@
  * ENG-3142 — guarded X (Twitter) Ads writes for external Zoma agents (provider #3 of the
  * ENG-2303 guarded-write flow; Google's is googleToolkitWrites.ts).
  *
- * Allowed: CAMPAIGN CREATE / UPDATE (name, budgets) / PAUSE / ACTIVATE; LINE_ITEM CREATE (with
- * optional basic targeting: locations, broad keywords, follower lookalikes) / UPDATE (name, bid)
- * / PAUSE / ACTIVATE; PROMOTED_TWEET CREATE (promote existing posts on a line item).
+ * Allowed: CAMPAIGN CREATE / UPDATE (name; budgets only on a legacy campaign that has one) /
+ * PAUSE / ACTIVATE; LINE_ITEM CREATE (daily budget required, optional basic targeting: locations,
+ * broad keywords, follower lookalikes) / UPDATE (name, bid, budgets) / PAUSE / ACTIVATE;
+ * PROMOTED_TWEET CREATE (promote existing posts on a line item).
+ *
+ * Budgets live on line items: X v12 rejects new campaigns with campaign budget optimization
+ * ("Create the campaign with budget_optimization=LINE_ITEM and set a daily budget on each line
+ * item instead"), so CAMPAIGN CREATE sends budget_optimization=LINE_ITEM and no budget, and every
+ * LINE_ITEM CREATE carries its own daily budget. A campaign's max daily spend is the sum of its
+ * line items' daily budgets (or its own budget, for a legacy campaign that has one).
  *
  * Flow (shared guard, zomaWriteGuard.ts):
  *   1. Shape validation — pure, before any credential or X call.
- *   2. Payment method + usable X Ads connection (assertZomaWriteReady 'x_ads').
+ *   2. Payment method + usable X Ads connection (assertZomaWriteReady 'x_ads'); CAMPAIGN CREATE
+ *      also needs a usable funding instrument on the X ad account (a card added at ads.x.com).
  *   3. Read the current state the preview describes (stable fields only, so spend counters
  *      moving between preview and confirm do not void the token).
  *   4. X_ADS_TOOLKIT_SPEND_CEILING (micros, same shape as GOOGLE_TOOLKIT_SPEND_CEILING) on
- *      daily budgets, and on activating a campaign at its current daily budget.
+ *      daily budgets, and on activating at the daily spend that activation unlocks.
  *   5. No confirm → PREVIEW + single-use preview_token bound to user, arguments and state.
  *   6. confirm=true + matching token → applied ONCE → independent read-back. Only CONFIRMED is
  *      success. A failure without a definite answer (no response, 5xx, 408) may have applied,
@@ -104,10 +112,15 @@ export function validateXAdsWriteShape(args: any, currency: string): ValidatedXW
 
   switch (op) {
     case 'CAMPAIGN CREATE': {
+      if (args.daily_budget !== undefined || args.total_budget !== undefined) {
+        throw new MetaToolkitRefusal(
+          'X no longer accepts budgets on new campaigns (campaign budget optimization is retired). Create the campaign without '
+          + 'daily_budget/total_budget, then set daily_budget (and optional total_budget) on each LINE_ITEM CREATE.',
+        );
+      }
       fields.name = requireName(args.name);
       fields.funding_instrument_id = requireId(args.funding_instrument_id, 'funding_instrument_id');
-      fields.daily_budget_amount_local_micro = money(args.daily_budget, 'daily_budget');
-      if (args.total_budget !== undefined) fields.total_budget_amount_local_micro = money(args.total_budget, 'total_budget');
+      fields.budget_optimization = 'LINE_ITEM';
       const start = optionalIso(args.start_time, 'start_time');
       const end = optionalIso(args.end_time, 'end_time');
       if (start) fields.start_time = start;
@@ -127,6 +140,9 @@ export function validateXAdsWriteShape(args: any, currency: string): ValidatedXW
       const campaignId = requireId(args.campaign_id, 'campaign_id');
       fields.campaign_id = campaignId;
       fields.name = requireName(args.name);
+      if (args.daily_budget === undefined) throw new MetaToolkitRefusal('LINE_ITEM CREATE needs daily_budget (major currency units): X budgets live on line items.');
+      fields.daily_budget_amount_local_micro = money(args.daily_budget, 'daily_budget');
+      if (args.total_budget !== undefined) fields.total_budget_amount_local_micro = money(args.total_budget, 'total_budget');
       if (!(X_ADS_LINE_ITEM_OBJECTIVES as readonly string[]).includes(args.objective)) {
         throw new MetaToolkitRefusal(`objective must be one of ${X_ADS_LINE_ITEM_OBJECTIVES.join(', ')}.`);
       }
@@ -165,7 +181,9 @@ export function validateXAdsWriteShape(args: any, currency: string): ValidatedXW
         fields.bid_strategy = 'MAX';
         fields.bid_amount_local_micro = money(args.bid_amount, 'bid_amount');
       }
-      if (!Object.keys(fields).length) throw new MetaToolkitRefusal('LINE_ITEM UPDATE needs name or bid_amount.');
+      if (args.daily_budget !== undefined) fields.daily_budget_amount_local_micro = money(args.daily_budget, 'daily_budget');
+      if (args.total_budget !== undefined) fields.total_budget_amount_local_micro = money(args.total_budget, 'total_budget');
+      if (!Object.keys(fields).length) throw new MetaToolkitRefusal('LINE_ITEM UPDATE needs name, bid_amount, daily_budget or total_budget.');
       return { op, target: { kind: 'line_item', id }, fields, targeting: [] };
     }
     case 'CAMPAIGN PAUSE':
@@ -189,11 +207,19 @@ const PATH: Record<'funding_instrument' | 'campaign' | 'line_item', string> = {
 };
 /** Fields the preview token binds to (spend counters are left out: they move on their own). */
 const STABLE: Record<'funding_instrument' | 'campaign' | 'line_item', string[]> = {
-  funding_instrument: ['id', 'entity_status', 'currency', 'deleted'],
-  campaign: ['id', 'name', 'entity_status', 'funding_instrument_id', 'daily_budget_amount_local_micro', 'total_budget_amount_local_micro', 'deleted'],
-  line_item: ['id', 'name', 'entity_status', 'campaign_id', 'objective', 'bid_amount_local_micro', 'bid_strategy', 'deleted'],
+  funding_instrument: ['id', 'entity_status', 'currency', 'able_to_fund', 'deleted'],
+  campaign: ['id', 'name', 'entity_status', 'funding_instrument_id', 'budget_optimization', 'daily_budget_amount_local_micro', 'total_budget_amount_local_micro', 'deleted'],
+  line_item: [
+    'id', 'name', 'entity_status', 'campaign_id', 'objective', 'bid_amount_local_micro', 'bid_strategy',
+    'daily_budget_amount_local_micro', 'total_budget_amount_local_micro', 'deleted',
+  ],
 };
 const pick = (row: any, keys: string[]) => Object.fromEntries(keys.map((k) => [k, row?.[k]]));
+
+/** A funding instrument that can pay for delivery: live, not cancelled, and not flagged unable to fund. */
+const fundingUsable = (fi: any) => !fi?.deleted && fi?.entity_status === 'ACTIVE' && fi?.able_to_fund !== false;
+const NO_FUNDING =
+  'has no usable payment method, so X would not deliver anything. Add a payment method at ads.x.com (Billing) first, then retry. Nothing was sent.';
 
 /** Outcome-unknown transport failures (the write may have applied). */
 const outcomeUnknown = (error: unknown) => error instanceof XAdsApiError && (error.status === 0 || error.status >= 500 || error.status === 408);
@@ -240,18 +266,29 @@ export async function executeXAdsWrite(
   let state: Record<string, unknown> = {};
   let activateBudgetMicros: unknown;
   if (v.op === 'CAMPAIGN CREATE') {
-    const fi = await mustRead('funding_instrument', v.parent!.id);
+    const instruments = await deps.listAll({ credentials: session.credentials, fetchImpl: session.fetchImpl, path: `/accounts/${acct}/funding_instruments` });
+    const usable = instruments.filter(fundingUsable);
+    if (!usable.length) throw new MetaToolkitRefusal(`X Ads account ${session.accountId} ${NO_FUNDING}`);
+    const fi = usable.find((f) => String(f.id) === v.parent!.id);
+    if (!fi) {
+      const known = instruments.some((f) => String(f.id) === v.parent!.id && !f.deleted);
+      throw new MetaToolkitRefusal(
+        `Funding instrument ${v.parent!.id} ${known ? 'is not usable (inactive or unable to fund)' : `was not found on X Ads account ${session.accountId}`}. `
+        + `Usable funding instruments: ${usable.map((f) => f.id).join(', ')}. Nothing was sent.`,
+      );
+    }
     if (fi.currency && fi.currency !== currency) {
       throw new MetaToolkitRefusal(`Funding instrument ${fi.id} is in ${fi.currency}, but this account is ${currency}. Nothing was sent.`);
     }
     state = { parent: pick(fi, STABLE.funding_instrument) };
     lines.push(`Create campaign "${v.fields.name}" on funding instrument ${fi.id}${fi.description ? ` (${fi.description})` : ''}.`);
-    lines.push(`Daily budget: ${money(v.fields.daily_budget_amount_local_micro)}/day.${v.fields.total_budget_amount_local_micro !== undefined ? ` Total budget: ${money(v.fields.total_budget_amount_local_micro)}.` : ''}`);
+    lines.push('Budget: set per line item (budget_optimization=LINE_ITEM); the campaign itself has no budget. Add line items with a daily_budget next.');
     lines.push('It is created PAUSED: nothing delivers or spends until you approve a separate ACTIVATE.');
   } else if (v.op === 'LINE_ITEM CREATE') {
     const campaign = await mustRead('campaign', v.parent!.id);
     state = { parent: pick(campaign, STABLE.campaign) };
-    lines.push(`Create line item "${v.fields.name}" in campaign "${campaign.name}" (campaign is ${campaign.entity_status}, ${money(campaign.daily_budget_amount_local_micro)}/day).`);
+    lines.push(`Create line item "${v.fields.name}" in campaign "${campaign.name}" (campaign is ${campaign.entity_status}).`);
+    lines.push(`Daily budget: ${money(v.fields.daily_budget_amount_local_micro)}/day.${v.fields.total_budget_amount_local_micro !== undefined ? ` Total budget: ${money(v.fields.total_budget_amount_local_micro)}.` : ''}`);
     lines.push(`Objective ${v.fields.objective}, placements ${v.fields.placements}, bid ${v.fields.bid_strategy === 'AUTO' ? 'automatic' : `max ${money(v.fields.bid_amount_local_micro)}`}.`);
     if (v.targeting.length) {
       const by = (t: string) => v.targeting.filter((c) => c.targeting_type === t).map((c) => c.targeting_value);
@@ -279,16 +316,41 @@ export async function executeXAdsWrite(
       lines.push(`${v.fields.entity_status === 'ACTIVE' ? 'Activate' : 'Pause'} ${noun} "${prior.name}": ${prior.entity_status} → ${v.fields.entity_status}.`);
       if (v.fields.entity_status === 'ACTIVE') {
         if (kind === 'campaign') {
-          activateBudgetMicros = prior.daily_budget_amount_local_micro;
-          lines.push(`It will start delivering and can spend up to ${money(prior.daily_budget_amount_local_micro)}/day.`);
+          if (typeof prior.daily_budget_amount_local_micro === 'number') {
+            // Legacy campaign-budget campaign: its own budget caps the whole campaign.
+            activateBudgetMicros = prior.daily_budget_amount_local_micro;
+            lines.push(`It will start delivering and can spend up to ${money(prior.daily_budget_amount_local_micro)}/day (campaign budget).`);
+          } else {
+            const items = (await deps.listAll({
+              credentials: session.credentials, fetchImpl: session.fetchImpl, path: `/accounts/${acct}/line_items`, query: { campaign_ids: prior.id },
+            })).filter((li) => !li.deleted);
+            state = { ...state, line_items: items.map((li) => pick(li, STABLE.line_item)) };
+            const sum = items.reduce((total, li) => total + (typeof li.daily_budget_amount_local_micro === 'number' ? li.daily_budget_amount_local_micro : 0), 0);
+            activateBudgetMicros = sum;
+            const active = items.filter((li) => li.entity_status === 'ACTIVE').length;
+            lines.push(items.length
+              ? `It will start delivering and can spend up to ${money(sum)}/day: the sum of its ${items.length} line item daily budget(s) (${active} ACTIVE now; paused ones spend only after their own ACTIVATE).`
+              : 'It has no line items yet, so nothing delivers until a line item (with its own daily budget) is created and activated.');
+          }
         } else {
           const campaign = await mustRead('campaign', prior.campaign_id);
           state = { ...state, campaign: pick(campaign, STABLE.campaign) };
-          activateBudgetMicros = campaign.daily_budget_amount_local_micro;
-          lines.push(`It delivers only while campaign "${campaign.name}" is ACTIVE (now ${campaign.entity_status}); that campaign's budget is ${money(campaign.daily_budget_amount_local_micro)}/day.`);
+          const own = prior.daily_budget_amount_local_micro;
+          activateBudgetMicros = typeof own === 'number' ? own : campaign.daily_budget_amount_local_micro;
+          lines.push(typeof own === 'number'
+            ? `It can spend up to ${money(own)}/day (its daily budget).`
+            : `It has no daily budget of its own; campaign "${campaign.name}" caps it at ${money(campaign.daily_budget_amount_local_micro)}/day.`);
+          lines.push(`It delivers only while campaign "${campaign.name}" is ACTIVE (now ${campaign.entity_status}).`);
         }
       }
     } else {
+      if (kind === 'campaign' && (v.fields.daily_budget_amount_local_micro !== undefined || v.fields.total_budget_amount_local_micro !== undefined)
+        && typeof prior.daily_budget_amount_local_micro !== 'number' && typeof prior.total_budget_amount_local_micro !== 'number') {
+        throw new MetaToolkitRefusal(
+          `Campaign "${prior.name}" has no campaign budget (budget_optimization=${prior.budget_optimization ?? 'LINE_ITEM'}): its budget lives on its line items. `
+          + 'Change daily_budget/total_budget with LINE_ITEM UPDATE on each line item instead. Nothing was sent.',
+        );
+      }
       if (v.fields.name !== undefined) lines.push(`Rename ${noun} "${prior.name}" → "${v.fields.name}".`);
       if (v.fields.daily_budget_amount_local_micro !== undefined) lines.push(`Daily budget: ${money(prior.daily_budget_amount_local_micro)} → ${money(v.fields.daily_budget_amount_local_micro)}.`);
       if (v.fields.total_budget_amount_local_micro !== undefined) lines.push(`Total budget: ${money(prior.total_budget_amount_local_micro)} → ${money(v.fields.total_budget_amount_local_micro)}.`);
