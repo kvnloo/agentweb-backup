@@ -12,7 +12,7 @@ for the lists the tool hands it, because they are already the merged ones.
   stored entry is kept, including fields the tool cannot write (the ICP's cached search filters). Nothing can be removed (Emma has no removal either;
   `regenerate_market_strategy` is the separate destructive tool). The answer lists what was added, updated and unchanged per list, and the totals are the
   ones the route reports as saved. A name sent more than once in one call is listed once: two entries for a new name are one added competitor (the later fields win), and a stored entry
-  named twice is listed as updated when either mention changed it (Opslane P2 on `ef2bc22`: it used to be listed as added and updated).
+  named twice is listed by what the call did to it in the end (updated, or unchanged when it changes an entry and changes it back, in which case a call that only does that writes nothing) (Opslane P2 on `ef2bc22`: it used to be listed as added and updated).
 - **what is accepted:** a competitor holds `name` and `description`; an ICP holds `title`, `description`, `valueProposition` and `buyerPersonas` (a list of
   text that replaces that profile's list). Any other field is refused by name (Emma spreads any extra key onto the stored strategy; over MCP that would let
   an outside agent write arbitrary keys into the account record). Blank text (empty, spaces, or only invisible characters) means "not given" and never blanks a stored value; an empty list changes
