@@ -35,6 +35,76 @@ export function measurementReportsEnabled(env: NodeJS.ProcessEnv = process.env):
   return env[ZOMA_MEASUREMENT_REPORTS_FLAG] === 'true';
 }
 
+/**
+ * Per-user rollout while the global flag is off: comma-separated userIds, orgIds and/or email domains
+ * ('@slashy.com'). Matching is exact (domains case-insensitive, no subdomain match).
+ */
+export const ZOMA_MEASUREMENT_REPORTS_ALLOWLIST = 'ZOMA_MEASUREMENT_REPORTS_ALLOWLIST';
+
+export interface MeasurementReportsSubject {
+  userId?: string;
+  email?: string;
+  orgId?: string;
+}
+
+function parseAllowlist(env: NodeJS.ProcessEnv): { ids: Set<string>; domains: Set<string> } {
+  const ids = new Set<string>();
+  const domains = new Set<string>();
+  for (const raw of String(env[ZOMA_MEASUREMENT_REPORTS_ALLOWLIST] ?? '').split(',')) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    if (entry.startsWith('@')) {
+      if (entry.length > 1) domains.add(entry.slice(1).toLowerCase());
+    } else ids.add(entry);
+  }
+  return { ids, domains };
+}
+
+/** True when the flag is on or the allowlist names at least one subject (the runner's pass-level gate). */
+export function measurementReportsMaybeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (measurementReportsEnabled(env)) return true;
+  const { ids, domains } = parseAllowlist(env);
+  return ids.size > 0 || domains.size > 0;
+}
+
+/** The one gate: the global flag, or this user (by userId, orgId or email domain) is on the allowlist. */
+export function measurementReportsEnabledFor(user: MeasurementReportsSubject | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (measurementReportsEnabled(env)) return true;
+  if (!user) return false;
+  const { ids, domains } = parseAllowlist(env);
+  if (user.userId && ids.has(user.userId)) return true;
+  if (user.orgId && ids.has(user.orgId)) return true;
+  const at = user.email?.lastIndexOf('@') ?? -1;
+  return at >= 0 && domains.has(user.email!.slice(at + 1).trim().toLowerCase());
+}
+
+export type LoadMeasurementReportsSubject = (userId: string) => Promise<MeasurementReportsSubject | undefined>;
+
+const loadSubjectFromDb: LoadMeasurementReportsSubject = async (userId) => {
+  const { userDb } = await import('../services/db');
+  const user: any = await userDb.getUserByIdConsistent(userId);
+  return user ? { userId, email: user.email, orgId: user.orgId } : undefined;
+};
+
+/**
+ * measurementReportsEnabledFor, resolving the user's email/orgId only when needed: flag on or empty allowlist
+ * decides without a read (so flag-off + empty allowlist is exactly the old flag check). A failed read fails closed.
+ */
+export async function measurementReportsEnabledForUserId(
+  userId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  loadUser: LoadMeasurementReportsSubject = loadSubjectFromDb,
+): Promise<boolean> {
+  if (!measurementReportsMaybeEnabled(env)) return false;
+  if (measurementReportsEnabledFor({ userId }, env)) return true;
+  try {
+    return measurementReportsEnabledFor({ ...(await loadUser(userId)), userId }, env);
+  } catch (error) {
+    console.error('[zoma-measurement-report] allowlist user read failed:', error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
 export const ZOMA_MEASUREMENT_REPORT_TOOL = 'zoma_measurement_report';
 export const isZomaMeasurementReportTool = (name: string) => name === ZOMA_MEASUREMENT_REPORT_TOOL;
 
