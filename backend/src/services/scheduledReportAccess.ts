@@ -38,6 +38,7 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'monitor_lead_volume',
   'check_account_tracking_health',
   'read_client_meta_activity',
+  'read_client_meta_budgets',
   'diagnose_leads_at_zero',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',

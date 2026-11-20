@@ -4346,6 +4346,39 @@ A result with success:false means nothing was read ('reason' says why: ambiguous
 });
 
 mcpToolRegistry.register({
+  name: 'read_client_meta_budgets',
+  definition: {
+    name: 'read_client_meta_budgets',
+    description: `Read one managed client's Meta ad budgets and spend for an exact date window. Admin-only, read-only; never changes a budget.
+
+Resolves the client (exact email, or a name that matches exactly one client) to the same Meta ad account and token assess_client_health reads. Returns the ad account id read, account spend for the window, and per campaign and per ad set: status, current daily or lifetime budget (minor currency units, as Meta returns them), and spend for the window.
+
+Refuses instead of guessing, with a reason: ambiguous_client (several clients match; ask with the email), client_not_found, no_meta_connection, credential_pair_mismatch, invalid_window, and meta_read_failed (a Meta read failed; no numbers are reported, which is not the same as zero spend).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address, or a display name that matches exactly one client.'
+        },
+        since: { type: 'string', description: 'First day of the window, YYYY-MM-DD (inclusive).' },
+        until: { type: 'string', description: 'Last day of the window, YYYY-MM-DD (inclusive).' }
+      },
+      required: ['client_name_or_email', 'since', 'until']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const qs = new URLSearchParams({ since: String(args.since ?? ''), until: String(args.until ?? '') });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}/meta-budgets?${qs.toString()}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'check_account_tracking_health',
   definition: {
     name: 'check_account_tracking_health',
