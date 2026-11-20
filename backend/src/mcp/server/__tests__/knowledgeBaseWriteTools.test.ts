@@ -17,7 +17,7 @@ jest.mock('../../../services/funding/runFunding', () => ({
 import { createHash } from 'node:crypto';
 import { mcpToolRegistry, withToolAnnotations } from '../registry';
 import { KB_TEXT_FILE_MAX_BYTES } from '../apiTools';
-import { buildKbListQuery, KB_LIST_TYPES } from '../knowledgeBaseParams';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from '../knowledgeBaseParams';
 import { findScopeDenial } from '../apiKeyScopes';
 import { classifyMcpTool } from '../toolAnnotationPolicy';
 
@@ -249,6 +249,28 @@ describe('list_knowledge_bases: the inputs Emma\'s list takes (the service decid
     expect(mockMcpFetch).not.toHaveBeenCalled();
   });
 
+  it('limit and offset have an upper bound (the service has none and would walk a whole Drive folder)', async () => {
+    expect(buildKbListQuery({ limit: MAX_KB_LIST_LIMIT, offset: MAX_KB_LIST_OFFSET })).toEqual({ limit: String(MAX_KB_LIST_LIMIT), offset: String(MAX_KB_LIST_OFFSET) });
+    await expect(run('list_knowledge_bases', { limit: MAX_KB_LIST_LIMIT + 1 })).rejects.toThrow(/limit must be 1000 or less/);
+    await expect(run('list_knowledge_bases', { offset: '100001' })).rejects.toThrow(/offset must be 100000 or less/);
+    await expect(run('list_knowledge_bases', { limit: 9007199254740991 })).rejects.toThrow(/limit must be 1000 or less/);
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+  });
+
+  it('modified_after later than modified_before is refused (no file could match); the same day is fine', () => {
+    expect(() => buildKbListQuery({ modified_after: '2026-04-22', modified_before: '2026-04-15' })).toThrow(/modified_after must not be later than modified_before/);
+    expect(buildKbListQuery({ modified_after: '2026-04-15', modified_before: '2026-04-15' })).toEqual({ modified_after: '2026-04-15', modified_before: '2026-04-15' });
+  });
+
+  it('the years 0000 to 0099 are dates too (the service takes them)', () => {
+    expect(buildKbListQuery({ modified_after: '0050-01-01' })).toEqual({ modified_after: '0050-01-01' });
+    expect(() => buildKbListQuery({ modified_after: '0050-02-30' })).toThrow(/calendar date/);
+  });
+
+  it('padded dates and numbers are trimmed and leading zeros dropped', () => {
+    expect(buildKbListQuery({ modified_after: ' 2026-04-15 ', limit: ' 025 ', offset: '007' })).toEqual({ modified_after: '2026-04-15', limit: '25', offset: '7' });
+  });
+
   it('a leap day is a date, a non-leap one is not', () => {
     expect(buildKbListQuery({ modified_after: '2024-02-29' })).toEqual({ modified_after: '2024-02-29' });
     expect(() => buildKbListQuery({ modified_after: '2026-02-29' })).toThrow(/calendar date/);
@@ -260,8 +282,10 @@ describe('list_knowledge_bases: the inputs Emma\'s list takes (the service decid
 
   it('the description says what each input does (the service applies dates, limit and offset to Google Drive only)', () => {
     const description: string = mcpToolRegistry.getTool('list_knowledge_bases')!.definition.description;
-    expect(description).toMatch(/modified_after and modified_before \(dates as YYYY-MM-DD\), limit \(default 100\) and offset page and narrow the Google Drive files only/);
+    expect(description).toMatch(/modified_after and modified_before \(dates as YYYY-MM-DD\), limit \(1 to 1000, default 100\) and offset \(0 to 100000\) page and narrow the Google Drive files only/);
     expect(description).toMatch(/"private" and "public" both mean only the platform knowledge bases/);
+    expect(description).toMatch(/ClickUp folder entries are listed whatever kb_type is/);
+    expect(description).toMatch(/yours, those your organisation shares with you, and public ones/);
   });
 });
 
