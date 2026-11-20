@@ -23,9 +23,12 @@ jest.mock('../utils/secretsManager', () => ({
 
 import app from '../app';
 import {
+  clearRecentStrategyWrites,
   COMPETITOR_LOOKUP_MAX,
   COMPETITOR_PAGE_CHAR_BUDGET,
   MAX_STORED_COMPETITORS,
+  MAX_STORED_ICPS,
+  MAX_STRATEGY_BYTES,
   mergeStrategyEntries,
   validateStrategyEntries,
 } from '../mcp/server/manageStrategyWrites';
@@ -66,6 +69,7 @@ afterAll(async () => {
 
 /** Tenant A's org holds a realistic strategy; a solo user (no org) holds one on the user record. */
 beforeEach(() => {
+  clearRecentStrategyWrites();
   seedTwoTenantWorld(fake);
   fake.seed('AW-Organizations', {
     ...orgRow(TENANT_A.orgId),
@@ -342,7 +346,10 @@ describe('read: paged competitors', () => {
       expect(r.isError).toBe(false);
       expect(r.json.totalCompetitors).toBe(60);
       expect(r.json.competitorOffset).toBe(offset);
-      expect(JSON.stringify(r.json.data.competitors).length).toBeLessThanOrEqual(COMPETITOR_PAGE_CHAR_BUDGET + 1100);
+      // The entries on a page add up to the budget at most (a single oversized entry aside, which a page always returns).
+      const used = r.json.data.competitors.reduce((n: number, e: unknown) => n + JSON.stringify(e).length, 0);
+      expect(used).toBeLessThanOrEqual(COMPETITOR_PAGE_CHAR_BUDGET);
+      if (r.json.nextCompetitorOffset !== null) expect(used).toBeGreaterThan(COMPETITOR_PAGE_CHAR_BUDGET - 1200);
       seen.push(...names(r.json.data.competitors));
       offset = r.json.nextCompetitorOffset;
       pages++;
@@ -357,6 +364,14 @@ describe('read: paged competitors', () => {
     const r = await read(owner, { competitorOffset: 9999 });
     expect(r.json).toMatchObject({ competitorOffset: 59, competitorsReturned: 1, nextCompetitorOffset: null });
     expect(names(r.json.data.competitors)).toEqual(['Rival 059']);
+  });
+
+  it('an offset too big to be exact still lands on the last competitor (number or text)', async () => {
+    seedRoster(60);
+    for (const huge of [1e21, '99999999999999999999']) {
+      const r = await read(owner, { competitorOffset: huge });
+      expect({ huge, isError: r.isError, offset: r.json?.competitorOffset }).toEqual({ huge, isError: false, offset: 59 });
+    }
   });
 
   it('a single entry bigger than the page budget is still returned', async () => {
@@ -392,9 +407,11 @@ describe('read: paged competitors', () => {
       expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
       expect(r.text).toMatch(/competitorOffset must be a whole number/);
     }
-    const r = await read(owner, { competitorNames: 'Delta' });
-    expect(r.isError).toBe(true);
-    expect(r.text).toMatch(/competitorNames must be a list of text/);
+    for (const bad of ['Delta', ['Delta', 7], [null]]) {
+      const r = await read(owner, { competitorNames: bad });
+      expect({ bad, isError: r.isError }).toEqual({ bad, isError: true });
+      expect(r.text).toMatch(/competitorNames must be a list of text/);
+    }
   });
 
   it('an account with no stored strategy reads as empty, with a zero total', async () => {
@@ -404,6 +421,201 @@ describe('read: paged competitors', () => {
     expect(r.isError).toBe(false);
     expect(r.json).toMatchObject({ totalCompetitors: 0, competitorsReturned: 0, nextCompetitorOffset: null });
     expect(r.json.data.competitors).toEqual([]);
+  });
+});
+
+/** Put `member` on the org's marketingStrategy editors list. */
+const makeMemberEditor = () => {
+  const org = orgRow(TENANT_A.orgId);
+  fake.seed('AW-Organizations', { ...org, shareSettings: { ...(org.shareSettings || {}), marketingStrategy: { editors: [TENANT_A.member] } } });
+};
+
+/** Answer GET /api/market-strategy calls with `forced(callNumber)` when it returns a body, and let every other call through to the real app. */
+async function withStrategyReadsOverridden(forced: (call: number) => unknown, run: () => Promise<void>): Promise<void> {
+  const realFetch = global.fetch;
+  let call = 0;
+  global.fetch = (async (url: any, init: any = {}) => {
+    if (String(url).includes('/api/market-strategy') && String(init.method || 'GET').toUpperCase() === 'GET') {
+      const body = forced(++call);
+      if (body !== undefined) {
+        const text = typeof body === 'string' ? body : JSON.stringify(body);
+        return { ok: true, status: 200, headers: { get: () => (typeof body === 'string' ? 'text/plain' : 'application/json') }, json: async () => JSON.parse(text), text: async () => text } as any;
+      }
+    }
+    return realFetch(url, init);
+  }) as any;
+  try {
+    await run();
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+describe('update: the merge baseline', () => {
+  it('the org owner and a listed editor writing at the same moment both land (one lock for the org, not one per member)', async () => {
+    makeMemberEditor();
+    const [x, y] = await Promise.all([update(owner, { competitors: [{ name: 'FromOwner' }] }), update(member, { competitors: [{ name: 'FromMember' }] })]);
+    expect(x.isError).toBe(false);
+    expect(y.isError).toBe(false);
+    expect(names(strategyOf(TENANT_A.orgId).competitors).sort()).toEqual(['AlphaRival', 'Beta Corp', 'FromMember', 'FromOwner', 'Gamma']);
+  });
+
+  it('a read that is older than what this process just saved is not merged onto (an eventually consistent read right after a write)', async () => {
+    const before = JSON.parse(JSON.stringify({ success: true, data: strategyOf(TENANT_A.orgId), isOrgLevel: true }));
+    const first = await update(owner, { competitors: [{ name: 'Delta' }] });
+    expect(first.isError).toBe(false);
+    await withStrategyReadsOverridden(() => before, async () => {
+      const second = await update(owner, { competitors: [{ name: 'Epsilon' }] });
+      expect(second.isError).toBe(false);
+    });
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta', 'Epsilon']);
+  });
+
+  it('a read that wrongly shows nothing stored is read once more before it is believed (a missed read must not turn the write into a replace)', async () => {
+    const empty = { success: true, data: { businessOverview: '', competitors: [], icp: [] }, isOrgLevel: true };
+    await withStrategyReadsOverridden((call) => (call === 1 ? empty : undefined), async () => {
+      const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(r.isError).toBe(false);
+    });
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta']);
+  });
+
+  it('an org whose strategy sits on the owner\'s own record is merged onto that, for a listed editor', async () => {
+    makeMemberEditor();
+    const ownerStrategy = { businessOverview: 'Owner copy', competitors: [{ name: 'OwnerRival', description: 'x' }], icp: [{ title: 'Owner ICP' }], createdAt: STORED_AT, updatedAt: STORED_AT };
+    const org = orgRow(TENANT_A.orgId);
+    const { marketStrategy: _dropped, ...orgWithoutStrategy } = org;
+    fake.seed('AW-Organizations', orgWithoutStrategy);
+    const ownerRow = fake.items('AW-Users').find((u: any) => u.userId === TENANT_A.owner);
+    fake.seed('AW-Users', { ...ownerRow, marketStrategy: ownerStrategy });
+    const r = await update(member, { competitors: [{ name: 'EditorRival' }] });
+    expect(r.isError).toBe(false);
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['OwnerRival', 'EditorRival']);
+    expect(strategyOf(TENANT_A.orgId).icp).toEqual([{ title: 'Owner ICP' }]);
+    expect(strategyOf(TENANT_A.orgId).businessOverview).toBe('Owner copy');
+  });
+
+  it.each([
+    ['text instead of JSON', 'Service Unavailable'],
+    ['a failure body', { success: false, error: 'nope' }],
+    ['a body with no strategy', { success: true }],
+  ])('an answer from the read that is %s is not a baseline: nothing is changed (update and read)', async (_label, bad) => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    await withStrategyReadsOverridden(() => bad, async () => {
+      const u = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(u.isError).toBe(true);
+      expect(u.text).toMatch(/could not be read, so nothing was changed/);
+      const r = await read(owner);
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/could not be read/);
+    });
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('stored lists that are not lists are refused, not treated as empty', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: 'oops' } });
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/the stored competitors are not a list/);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+});
+
+describe('update: stored padding, names and size', () => {
+  it('stored text with trailing padding is not a change when the caller sends the same text trimmed (the ICPs are not marked edited)', async () => {
+    const s = strategyOf(TENANT_A.orgId);
+    fake.seed('AW-Organizations', {
+      ...orgRow(TENANT_A.orgId),
+      marketStrategy: {
+        ...s,
+        businessOverview: 'ALPHA sells widgets\n',
+        competitors: [{ name: 'AlphaRival', description: 'The old incumbent ' }],
+        icp: [{ title: 'Founder', description: 'Runs the stack\n', buyerPersonas: ['CEO ', ' CTO'] }],
+      },
+    });
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, {
+      businessOverview: 'ALPHA sells widgets',
+      competitors: [{ name: 'AlphaRival', description: 'The old incumbent' }],
+      icp: [{ title: 'Founder', description: 'Runs the stack', buyerPersonas: ['CEO', 'CTO'] }],
+    });
+    expect(r.isError).toBe(false);
+    expect(r.json.changed).toBe(false);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('a name with a doubled space is the same competitor, not a second one', async () => {
+    const r = await update(owner, { competitors: [{ name: 'beta   CORP', description: 'Updated' }] });
+    expect(r.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors).toHaveLength(3);
+    expect(strategyOf(TENANT_A.orgId).competitors[1]).toEqual({ name: 'Beta Corp', description: 'Updated' });
+  });
+
+  it('echoing back a field shown on read (extractedFilters) is refused with a hint to leave it out', async () => {
+    const shown = (await read(owner)).json.data.icp[0];
+    expect(shown.extractedFilters).toBeDefined();
+    const r = await update(owner, { icp: [shown] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/"extractedFilters"/);
+    expect(r.text).toMatch(/kept for you: leave them out/);
+  });
+
+  it('a full ICP list takes no new profile, but a stored one can still be updated', async () => {
+    const full = Array.from({ length: MAX_STORED_ICPS }, (_, i) => ({ title: `Profile ${i}`, description: 'x' }));
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), icp: full } });
+    const refused = await update(owner, { icp: [{ title: 'One too many' }] });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/icp would hold 101 entries, over the limit of 100/);
+    expect((await update(owner, { icp: [{ title: 'profile 3', description: 'changed' }] })).isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).icp[3].description).toBe('changed');
+  });
+
+  it('a strategy that would pass the size limit takes no growth, but an account already over it can still shrink an entry', async () => {
+    const big = Array.from({ length: 60 }, (_, i) => ({ name: `Big ${i}`, description: 'd'.repeat(4900) }));
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: big } });
+    expect(JSON.stringify(big).length).toBeGreaterThan(MAX_STRATEGY_BYTES);
+    const grow = await update(owner, { competitors: [{ name: 'One more' }] });
+    expect(grow.isError).toBe(true);
+    expect(grow.text).toMatch(/over the limit of 250000/);
+    const growText = await update(owner, { competitors: [{ name: 'Big 1', description: 'd'.repeat(5000) }] });
+    expect(growText.isError).toBe(true);
+    const shrink = await update(owner, { competitors: [{ name: 'Big 1', description: 'short' }] });
+    expect(shrink.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors[1].description).toBe('short');
+  });
+
+  it.each([
+    ['a persona that is too long', { icp: [{ title: 'X', buyerPersonas: ['p'.repeat(501)] }] }, /buyerPersonas entries must be 500 characters or fewer/],
+    ['personas that are not text', { icp: [{ title: 'X', buyerPersonas: ['ok', 5] }] }, /buyerPersonas must be a list of text/],
+    ['an entry that is a list', { competitors: [['Delta']] }, /competitors\[0\] must be an object/],
+    ['an entry that is null', { competitors: [null] }, /competitors\[0\] must be an object/],
+  ])('%s is refused by name', async (_label, args, message) => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, args);
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(message);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('null field values are "not given"', async () => {
+    const r = await update(owner, { competitors: [{ name: 'Delta', description: null }], icp: [{ title: 'Founder', valueProposition: null, buyerPersonas: null }] });
+    expect(r.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).icp[1]).toMatchObject({ valueProposition: 'Speed', buyerPersonas: ['CEO', 'CTO'] });
+    expect(strategyOf(TENANT_A.orgId).competitors[3]).toEqual({ name: 'Delta' });
+  });
+});
+
+describe('the action', () => {
+  it('is matched without regard to case, and anything else is refused (it used to be taken as an update)', async () => {
+    expect((await owner.call('manage_market_strategy', { action: ' Read ' })).isError).toBe(false);
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    for (const args of [{ action: 'delete', competitors: [{ name: 'Delta' }] }, { competitors: [{ name: 'Delta' }] }, { action: 7 }]) {
+      const r = await owner.call('manage_market_strategy', args);
+      expect({ args, isError: r.isError }).toEqual({ args, isError: true });
+      expect(r.text).toMatch(/action must be "read" or "update"/);
+    }
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
   });
 });
 
