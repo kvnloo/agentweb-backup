@@ -35,6 +35,7 @@ import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGu
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
+import { executeStrategyRead, executeStrategyUpdate } from './manageStrategyWrites';
 import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
@@ -2302,28 +2303,58 @@ mcpToolRegistry.register({
   name: 'manage_market_strategy',
   definition: {
     name: 'manage_market_strategy',
-    description: 'Read or update market strategy. Use action: "read" or "update".',
+    description: 'Read or update the market strategy: the business overview, the competitors and the ideal customer profiles (ICPs). Use action: "read" or "update". '
+      + 'Read: the competitor list comes back one page at a time (about 12,000 characters per page); totalCompetitors is always the true count and nextCompetitorOffset (null on the last page) is where the next page starts. '
+      + 'Before adding a competitor, pass competitorNames (up to 50) to learn which are already stored, whatever the page shows. '
+      + 'Update: send only what changes. Competitors are merged by name and ICPs by title (case and padding ignored): an entry that is already stored is updated field by field and every other stored entry is kept; new ones are added. '
+      + 'An empty list or blank text changes nothing, and nothing can be removed here. businessOverview replaces the stored overview. '
+      + 'A competitor holds name and description; an ICP holds title, description, valueProposition and buyerPersonas (a list of text that replaces that profile\'s persona list). Other fields are refused. '
+      + 'positioning, differentiators and channels are not stored and are refused (put them in businessOverview). At most 100 entries per list per call. The answer lists what was added, updated or unchanged and the true totals. '
+      + 'Changing an org\'s market strategy needs the same editor rights as in the app.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['read', 'update'], description: 'Action' },
-        positioning: { type: 'string', description: 'Market positioning (update)' },
-        competitors: { type: 'array', description: 'Competitor list (update)' },
-        differentiators: { type: 'array', items: { type: 'string' }, description: 'Key differentiators (update)' },
-        channels: { type: 'array', items: { type: 'string' }, description: 'Marketing channels (update)' }
+        competitorOffset: { type: 'number', description: 'Read: 0-based index of the first competitor to return. Use nextCompetitorOffset from the previous answer for the next page.' },
+        competitorNames: { type: 'array', items: { type: 'string' }, description: 'Read: names to check against the stored competitors (up to 50). The answer says stored or not for each, with its offset.' },
+        businessOverview: { type: 'string', description: 'Update: the business overview (mission, vision, value propositions). Replaces the stored overview; blank changes nothing.' },
+        competitors: {
+          type: 'array',
+          description: 'Update: competitors to add or update, merged by name. Never removes a stored competitor.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Competitor name' },
+              description: { type: 'string', description: 'Competitor description or analysis' }
+            },
+            required: ['name']
+          }
+        },
+        icp: {
+          type: 'array',
+          description: 'Update: ideal customer profiles to add or update, merged by title. Never removes a stored profile.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'ICP title or name' },
+              description: { type: 'string', description: 'ICP description or characteristics' },
+              valueProposition: { type: 'string', description: 'Value proposition for this customer type' },
+              buyerPersonas: { type: 'array', items: { type: 'string' }, description: 'Buyer personas for this customer type (replaces this profile\'s list)' }
+            },
+            required: ['title']
+          }
+        }
       },
       required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
-    if (args.action === 'read') {
-      const data = await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c });
-      return jsonResult(data);
-    }
-    const { action, ...body } = args;
-    const data = await mcpFetch({ method: 'POST', path: '/api/market-strategy', context: c, body });
-    return jsonResult(data);
+    // Any other action used to be taken as an update, so a mistyped "Read" wrote; now it is refused.
+    const action = typeof args?.action === 'string' ? args.action.trim().toLowerCase() : '';
+    if (action === 'read') return executeStrategyRead(args, c);
+    if (action === 'update') return executeStrategyUpdate(args, c);
+    throw new Error('manage_market_strategy: action must be "read" or "update".');
   }
 });
 
