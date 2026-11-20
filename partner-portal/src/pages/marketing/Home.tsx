@@ -192,17 +192,6 @@ const Home: React.FC = () => {
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
                   Produce compelling advertising copy, visuals, and video/script assets with AI.
                 </Typography>
-                <Button 
-                  component={Link} 
-                  to="/marketing/creative-generation"
-                  endIcon={<ChevronRightIcon />}
-                  sx={{ 
-                    '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },
-                    '& .MuiSvgIcon-root': { transition: 'transform 0.2s' }
-                  }}
-                >
-                  Learn More
-                </Button>
               </CardContent>
             </Card>
           </Grid>
@@ -238,17 +227,6 @@ const Home: React.FC = () => {
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
                   Monitor and analyze social media trends and conversations in real-time.
                 </Typography>
-                <Button 
-                  component={Link} 
-                  to="/marketing/social-listening"
-                  endIcon={<ChevronRightIcon />}
-                  sx={{ 
-                    '&:hover .MuiSvgIcon-root': { transform: 'translateX(4px)' },
-                    '& .MuiSvgIcon-root': { transition: 'transform 0.2s' }
-                  }}
-                >
-                  Learn More
-                </Button>
               </CardContent>
             </Card>
           </Grid>
