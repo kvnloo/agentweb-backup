@@ -21,10 +21,13 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 import app from '../app';
+import { userDb } from '../services/db';
 import {
   clearRecentBrandWrites,
+  MAX_FOUNDERS_BYTES,
   MAX_STORED_FOUNDERS,
   mergeFoundersForMcp,
+  recentBrandWriteKeys,
   validateFounders,
   validateRemoveFounders,
 } from '../mcp/server/manageBrandWrites';
@@ -287,11 +290,11 @@ describe('update: the answer reports what is stored', () => {
   it('when the read-back does not show the saved founders, the answer is a failure that says so (not a success)', async () => {
     const realFetch = global.fetch;
     let brandReads = 0;
-    // The first read is the merge baseline; the second is the read-back after the save: answer that one with the brand as it was before.
+    // The first read is the merge baseline; the second is the read-back after the save and the third its one repeat: answer both with the brand as it was before.
     const stale = JSON.stringify({ exists: true, brandData: { ...brandOf(TENANT_A.orgId).brandData }, attachments: [LOGO] });
     global.fetch = (async (url: any, init: any = {}) => {
       const isBrandRead = String(url).includes('/api/brand/guidelines') && String(init.method || 'GET').toUpperCase() === 'GET';
-      if (isBrandRead && ++brandReads === 2) {
+      if (isBrandRead && [2, 3].includes(++brandReads)) {
         return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => JSON.parse(stale), text: async () => stale } as any;
       }
       return realFetch(url, init);
@@ -422,6 +425,201 @@ describe('the action', () => {
       expect(r.text).toMatch(/action must be "read" or "update"/);
     }
     expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+});
+
+const PRE_SAVE_READ = () => ({ exists: true, brandData: JSON.parse(JSON.stringify(brandOf(TENANT_A.orgId).brandData)), attachments: [LOGO], createdAt: STORED_AT, updatedAt: STORED_AT, isOrgLevel: true });
+
+describe('update: the read-back and what is remembered', () => {
+  it('a read-back that is older than the save is repeated once, and the answer is a success (no false failure)', async () => {
+    const stale = PRE_SAVE_READ();
+    await withBrandReadsOverridden((call) => (call === 2 ? stale : undefined), async () => {
+      const r = await update(owner, { founders: [{ name: 'Di Delta' }] });
+      expect(r.json).toMatchObject({ success: true, founders: { added: ['Di Delta'], total: 4 } });
+    });
+    expect(names(foundersOf(TENANT_A.orgId))).toContain('Di Delta');
+  });
+
+  it('when both reads after the save are older, the answer says it could not verify, and the roster the save meant is remembered so the next call does not drop it', async () => {
+    const stale = PRE_SAVE_READ();
+    await withBrandReadsOverridden((call) => ([2, 3, 4].includes(call) ? stale : undefined), async () => {
+      const first = await update(owner, { founders: [{ name: 'Di Delta' }] });
+      expect(first.json).toMatchObject({ success: false });
+      expect(first.json.error).toMatch(/could not be verified on read-back/);
+      // The next call's own baseline read (4) is older too; it merges onto what the first call meant to save.
+      const second = await update(owner, { founders: [{ name: 'Ed Epsilon' }] });
+      expect(second.json.success).toBe(true);
+    });
+    expect(names(foundersOf(TENANT_A.orgId))).toEqual(['Ada Alpha', 'Ben Beta', 'Cy Gamma', 'Di Delta', 'Ed Epsilon']);
+  });
+
+  it('two updates sent together on an account whose reads lag both land', async () => {
+    const stale = PRE_SAVE_READ();
+    await withBrandReadsOverridden((call) => ([2, 3, 4].includes(call) ? stale : undefined), async () => {
+      const [x, y] = await Promise.all([update(owner, { founders: [{ name: 'Di Delta' }] }), update(owner, { founders: [{ name: 'Ed Epsilon' }] })]);
+      expect([x.json.success, y.json.success].sort()).toEqual([false, true]);
+    });
+    expect(names(foundersOf(TENANT_A.orgId)).sort()).toEqual(['Ada Alpha', 'Ben Beta', 'Cy Gamma', 'Di Delta', 'Ed Epsilon']);
+  });
+
+  it('a read that is newer than what is remembered wins (a portal save inside the minute is not overwritten by the older remembered roster)', async () => {
+    expect((await update(owner, { founders: [{ name: 'Di Delta' }] })).json.success).toBe(true);
+    const org = orgRow(TENANT_A.orgId);
+    const brand = org.brandGuidelines;
+    fake.seed('AW-Organizations', { ...org, brandGuidelines: { ...brand, updatedAt: new Date(Date.now() + 60_000).toISOString(), brandData: { ...brand.brandData, founders: [...brand.brandData.founders, { name: 'Portal Pat' }] } } });
+    expect((await update(owner, { founders: [{ name: 'Ed Epsilon' }] })).json.success).toBe(true);
+    expect(names(foundersOf(TENANT_A.orgId))).toEqual(['Ada Alpha', 'Ben Beta', 'Cy Gamma', 'Di Delta', 'Portal Pat', 'Ed Epsilon']);
+  });
+
+  it('what is remembered is dropped after a minute (another account\'s save sweeps it)', async () => {
+    const now = Date.now();
+    const spy = jest.spyOn(Date, 'now');
+    try {
+      spy.mockReturnValue(now);
+      expect((await update(owner, { founders: [{ name: 'Di Delta' }] })).json.success).toBe(true);
+      expect(recentBrandWriteKeys()).toEqual(['brand:org:org-a']);
+      spy.mockReturnValue(now + 61_000);
+      expect((await update(solo, { founders: [{ name: 'Una Two' }] })).json.success).toBe(true);
+      expect(recentBrandWriteKeys()).toEqual(['brand:user:user-solo']);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a read-back that fails after the save is answered as saved but not read back, and the save stands', async () => {
+    await withBrandReadsOverridden((call) => ([2, 3].includes(call) ? 'Service Unavailable' : undefined), async () => {
+      const r = await update(owner, { founders: [{ name: 'Di Delta' }] });
+      expect(r.json.success).toBe(false);
+      expect(r.json.error).toMatch(/The brand was saved, but reading the founders back failed/);
+    });
+    expect(names(foundersOf(TENANT_A.orgId))).toContain('Di Delta');
+  });
+
+  it('the read-back compares what was written, not only the names (a lost field-only change is a failure)', async () => {
+    const stale = PRE_SAVE_READ();
+    await withBrandReadsOverridden((call) => ([2, 3].includes(call) ? stale : undefined), async () => {
+      const r = await update(owner, { founders: [{ name: 'Ada Alpha', jobTitle: 'Chief Executive' }] });
+      expect(r.json.success).toBe(false);
+    });
+  });
+
+  it('a 409 from the route (another save landed inside its own read and write) is answered with its message and changes nothing', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const realFetch = global.fetch;
+    global.fetch = (async (url: any, init: any = {}) => {
+      if (String(url).includes('/api/brand/guidelines') && String(init.method || 'GET').toUpperCase() === 'POST') {
+        const text = JSON.stringify({ error: 'Brand guidelines are being updated. Please refresh and try again.' });
+        return { ok: false, status: 409, headers: { get: () => 'application/json' }, json: async () => JSON.parse(text), text: async () => text } as any;
+      }
+      return realFetch(url, init);
+    }) as any;
+    try {
+      const r = await update(owner, { founders: [{ name: 'Di Delta' }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/API error \(409\): Brand guidelines are being updated/);
+    } finally {
+      global.fetch = realFetch;
+    }
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+});
+
+describe('update: the lock key', () => {
+  it.each([
+    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom'))],
+    ['has no record', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockResolvedValueOnce(undefined)],
+  ])('refuses the call when the caller\'s record %s, instead of locking per user', async (_label, arrange) => {
+    const spy = arrange();
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    try {
+      const r = await update(owner, { founders: [{ name: 'Di Delta' }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/brand: the account could not be identified.*nothing was changed/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+});
+
+describe('update: duplicates, names and sizes', () => {
+  const seedDuplicates = () => {
+    const brand = brandOf(TENANT_A.orgId);
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), brandGuidelines: { ...brand, brandData: { ...brand.brandData, founders: [{ name: 'Ada Alpha', jobTitle: 'CEO' }, { name: 'ada alpha ', jobTitle: 'Old copy' }, { name: 'Ben Beta' }] } } });
+  };
+
+  it('a removal drops every stored copy of a name, and an update lays the new fields over every copy', async () => {
+    seedDuplicates();
+    const updated = await update(owner, { founders: [{ name: 'ADA ALPHA', styleTone: 'Warm' }] });
+    expect(updated.json.founders).toMatchObject({ updated: ['Ada Alpha'], total: 3 });
+    expect(foundersOf(TENANT_A.orgId).map((f: any) => f.styleTone)).toEqual(['Warm', 'Warm', undefined]);
+    const removed = await update(owner, { remove_founders: ['ada   alpha'] });
+    expect(removed.json.founders).toMatchObject({ removed: ['Ada Alpha'], notFound: [], total: 1 });
+    expect(names(foundersOf(TENANT_A.orgId))).toEqual(['Ben Beta']);
+  });
+
+  it.each(['constructor', 'toString', 'valueOf', 'hasOwnProperty'])('a founder field named %s is refused by name, not dropped', async (field) => {
+    const r = await update(owner, { founders: [{ name: 'X', [field]: 'y' }] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain(`"${field}"`);
+  });
+
+  it('invisible characters in names are removed, so a look-alike name is the same founder (and a name of only invisible characters is refused)', async () => {
+    expect((await update(owner, { founders: [{ name: '\u200b' }] })).isError).toBe(true);
+    expect((await update(owner, { remove_founders: [' \u200d '] })).isError).toBe(true);
+    const r = await update(owner, { founders: [{ name: 'Ada\u200b Alpha', jobTitle: 'Chief' }] });
+    expect(r.isError).toBe(false);
+    expect(foundersOf(TENANT_A.orgId)).toHaveLength(3);
+    expect(foundersOf(TENANT_A.orgId)[0]).toMatchObject({ name: 'Ada Alpha', jobTitle: 'Chief' });
+  });
+
+  it('remove_founders names are bounded', async () => {
+    const r = await update(owner, { remove_founders: ['n'.repeat(201)] });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/remove_founders names must be 200 characters or fewer/);
+  });
+
+  it('founder profiles that would pass the size limit take no growth, but an oversized roster can still shrink an entry', async () => {
+    const big = Array.from({ length: 30 }, (_, i) => ({ name: `Big ${i}`, voiceExamples: 'v'.repeat(9_000) }));
+    expect(JSON.stringify(big).length).toBeGreaterThan(MAX_FOUNDERS_BYTES);
+    const brand = brandOf(TENANT_A.orgId);
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), brandGuidelines: { ...brand, brandData: { ...brand.brandData, founders: big } } });
+    const grow = await update(owner, { founders: [{ name: 'One more' }] });
+    expect(grow.isError).toBe(true);
+    expect(grow.text).toMatch(/over the limit of 250000/);
+    const shrink = await update(owner, { founders: [{ name: 'Big 1', voiceExamples: 'short' }] });
+    expect(shrink.json.success).toBe(true);
+    expect(foundersOf(TENANT_A.orgId)[1].voiceExamples).toBe('short');
+  });
+
+  it('brand values are trimmed and blank entries dropped', async () => {
+    expect((await update(owner, { brand_values: ['  Honesty ', '', 'Craft  '] })).json.success).toBe(true);
+    expect(brandOf(TENANT_A.orgId).brandData.brandValues).toEqual(['Honesty', 'Craft']);
+  });
+
+  it('the six old fields are still forwarded as sent: an explicit blank still blanks the stored value', async () => {
+    expect((await update(owner, { company_name: '' })).json.success).toBe(true);
+    expect(brandOf(TENANT_A.orgId).brandData.brandName).toBe('');
+  });
+
+  it('a scalar sent unchanged is still saved (the route bumps updatedAt) and `changed` means saved, not different', async () => {
+    const before = brandOf(TENANT_A.orgId).updatedAt;
+    const r = await update(owner, { tagline: 'Widgets for all' });
+    expect(r.json).toMatchObject({ success: true, changed: true });
+    expect(brandOf(TENANT_A.orgId).updatedAt).not.toBe(before);
+  });
+});
+
+describe('read', () => {
+  it('refuses arguments it does not take by name, and ignores identity-style ones (listing them)', async () => {
+    const bad = await owner.call('manage_brand', { action: 'read', tagline: 'x', founders: [{ name: 'Y' }] });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/"tagline", "founders" are not inputs of read/);
+    const ok = await owner.call('manage_brand', { action: 'read', client_id: TENANT_B.owner });
+    expect(ok.isError).toBe(false);
+    expect(ok.json.ignoredArguments).toEqual(['client_id']);
+    expect(ok.json.brandData.brandName).toBe(TENANT_A.brandName);
+    expect((await owner.call('manage_brand', { action: 'read' })).json.ignoredArguments).toBeUndefined();
   });
 });
 
