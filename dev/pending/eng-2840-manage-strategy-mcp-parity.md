@@ -14,7 +14,7 @@ for the lists the tool hands it, because they are already the merged ones.
   ones the route reports as saved.
 - **what is accepted:** a competitor holds `name` and `description`; an ICP holds `title`, `description`, `valueProposition` and `buyerPersonas` (a list of
   text that replaces that profile's list). Any other field is refused by name (Emma spreads any extra key onto the stored strategy; over MCP that would let
-  an outside agent write arbitrary keys into the account record). Blank text means "not given" and never blanks a stored value; an empty list changes
+  an outside agent write arbitrary keys into the account record). Blank text (empty, spaces, or only invisible characters) means "not given" and never blanks a stored value; an empty list changes
   nothing. At most 100 entries per list per call; a name or title of 200 characters, text of 5,000, a persona of 500 (50 per profile), an overview of
   20,000. A merge that would take a list past 500 competitors or 100 ICPs is refused when it adds an entry, and so is one that would take the overview and
   both lists past 250,000 bytes together: the strategy sits on the account record, one DynamoDB item of at most 400 KB that also holds everything else of
@@ -28,8 +28,8 @@ for the lists the tool hands it, because they are already the merged ones.
 - **a call that changes nothing writes nothing.** A write that carries `icp` marks the ICPs as hand-edited, which switches the account off its cached ICP
   search filters (`icpUpdatedAt`), so repeating what is already stored must not do that. Stored text is compared trimmed, so stored padding does not make a
   repeat look like a change. Only the parts that changed are sent to the route.
-- **read:** the competitor list comes back one page at a time (about 12,000 characters of compact JSON of competitors per page, at least one entry; the answer is pretty-printed, so the text a client receives is up to about
-  half as large again); `totalCompetitors` is
+- **read:** the competitor list comes back one page at a time (about 12,000 characters of compact JSON of competitors per page, at least one entry; the answer is pretty-printed, which makes the text a client receives larger: about
+  1.04 times for large entries and up to about 2.7 times for very short ones); `totalCompetitors` is
   the true count and `nextCompetitorOffset` (null on the last page) says where the next page starts; an offset past the end (including one too big to be
   exact) lands on the last entry rather than an empty page. `competitorNames` (up to 50) answers stored / not stored with the offset, whatever the page
   shows; names past 50 are reported as not checked. A roster that fits one page reads as before, with the extra paging fields. The overview and ICPs are
@@ -45,8 +45,9 @@ for the lists the tool hands it, because they are already the merged ones.
 - **the merge baseline is checked, not trusted:** the route's read must be a success carrying a strategy object, else nothing is changed; stored lists that
   are not lists are refused instead of being treated as empty; a read that shows nothing stored (no `createdAt`) is read once more 200 ms later before it is
   believed, because the route's read can miss the org owner's record for a moment and a write built on that would replace the real lists; and a read whose
-  `updatedAt` is older than the strategy this process saved for that account within the last minute is not used (the saved copy is), because the route reads
-  through an eventually consistent index and the next call of a serialized pair starts right after the first one's write.
+  `updatedAt` is older than the strategy this process saved for that account within the last minute is not used (the saved copy is), because the route's read is
+  eventually consistent (solo users through an index, org callers through a plain read of the org record) and the next call of a serialized pair starts right
+  after the first one's write.
 - **an org caller is never merged onto a personal strategy:** the route's read answers with the org's strategy (`isOrgLevel` true) or, when its read of the org
   misses, with the caller's personal one. If the caller belongs to an org and the answer is not the org's, the call is refused ("the organisation's market
   strategy could not be read ... Nothing was changed"). The account lookup's own error text (it can name roles and tables) goes to the log, not to the caller.
@@ -69,8 +70,8 @@ not folded and still make a second entry); when two stored entries
 differ only by case or spacing, the one with the exact spelling is the one updated. Every update does at least one extra read of the strategy, and one more
 after a 200 ms wait when the read shows no `createdAt` (older strategies). Stored lists that are not lists block only an update of that list. The answer of an
 update changed shape: it used to be `{success, data: <the whole saved strategy>, message}` and is now `{success, changed, businessOverview?, competitors?,
-icp?}` with added / updated / unchanged names and the saved totals (no `data`; a call that changes nothing also carries a `message`). A blank `businessOverview` used to clear the overview and is
-now refused as "nothing to send" (the overview can no longer be cleared over MCP). Any `action` other than `read` or `update` (case ignored) used to be taken
+icp?}` with added / updated / unchanged names and the saved totals (no `data`; a call that changes nothing also carries a `message`). A blank `businessOverview` used to clear the overview; it is now "not given": refused as "nothing to send" when it is the only content, and otherwise
+dropped (the answer has no `businessOverview` key), so the overview can no longer be cleared over MCP. Any `action` other than `read` or `update` (case ignored) used to be taken
 as an update, so a mistyped "Read" wrote; it is now refused. A field shown when an entry is read (such as the ICP's `extractedFilters`) cannot be sent back:
 it is refused with a hint to leave it out (it is kept for you).
 
@@ -84,8 +85,12 @@ refuses them; Emma stamps `icpUpdatedAt` on any `icp` argument, including one th
 means a client's account gets a write on their own account, with only that note to catch it; other tools refuse `client_id`, but the two-tenant isolation tests
 pin this tool's ignoring it. The lock is held across up to two reads and one write (each may take minutes if the route stalls), so a stalled call holds that
 account's queue. The caller's record is read consistently to find the org; if that cannot be done the call is refused ("the account could not be
-identified, so nothing was changed") rather than locked per user, which would not serialize the org's members. The recent-save memory keeps at most 100 accounts, each entry the route's whole saved strategy (up to about 250 KB), until a minute passes and a later
-save of any account sweeps it. (1) The lock and the recent-save memory cover one server process. Calls that reach different instances, or a write by the portal or by
+identified, so nothing was changed") rather than locked per user, which would not serialize the org's members. The recent-save memory keeps at most 100 accounts, each entry the route's whole saved strategy (up to the size of the stored strategy: the 250,000-byte limit stops growth, but an account already over it can still
+be edited, up to the 400 KB record), until a minute passes and a later
+save of any account sweeps it. (1a) If the consistent lookup says the caller has no org while the route's own, eventually consistent read still says there is one (a user who just left an org), the
+write lands in the org's strategy under a per-user lock that does not serialize with the org's other members; the reverse (lookup says org, route says
+personal) is refused. A read right after an update can show the older copy: `read` takes no lock and does not use the recent-save memory. (1) The lock and the
+recent-save memory cover one server process. Calls that reach different instances, or a write by the portal or by
 Emma (neither is serialized with this tool) landing between our read and our write, can still be overwritten by the merged lists we send, and a read that is
 older than another writer's save (not ours) cannot be recognised here; a writer that stamps `updatedAt` with an older time than our last save (the onboarding ICP
 mirror stamps its completion time, and instances' clocks can differ) is not recognised either, so such a write made within a minute of our save can be
