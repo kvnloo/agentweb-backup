@@ -219,6 +219,7 @@ describe('ENG-3142 X Ads guarded writes', () => {
     // ...and end_time (required by X): 30 days after start by default.
     expect(Date.parse(x.writes[0].query.end_time) - Date.parse(x.writes[0].query.start_time)).toBe(30 * 86400000);
     expect(x.writes[1].json.map((o: any) => o.params.targeting_type)).toEqual(['LOCATION', 'BROAD_KEYWORD', 'SIMILAR_TO_FOLLOWERS_OF_USER']);
+    expect(x.writes[1].json.every((o: any) => o.params.operator_type === 'EQ')).toBe(true); // X requires operator_type
   });
 
   it('PROMOTED_TWEET CREATE promotes existing posts and confirms each one', async () => {
