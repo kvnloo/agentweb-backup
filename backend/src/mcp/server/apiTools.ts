@@ -1,4 +1,3 @@
-import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { summarizeItemizedUsage, USAGE_MONTH_PATTERN } from './usageBreakdown';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
@@ -35,6 +34,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
+import { executeBrandUpdate } from './manageBrandWrites';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -2235,7 +2235,11 @@ mcpToolRegistry.register({
   name: 'manage_brand',
   definition: {
     name: 'manage_brand',
-    description: 'Read or update brand guidelines. Use action: "read" or "update".',
+    description: 'Read or update brand guidelines. Use action: "read" or "update". '
+      + 'Update changes only the fields you send. company_name, mission, tone_of_voice, target_audience, key_messages, tagline, domain, brand_values, brand_personality and visual_identity replace the stored value of that field (a list replaces the whole list). For tagline, domain, brand_personality, brand_values and founders, blank text or an empty list means "not given" and changes nothing. '
+      + 'FOUNDERS: founders is merged BY NAME, never replaced: a founder already stored (same name, case and padding ignored) is updated field by field, a new name is added, and every founder you do not mention is kept, so you can send just the founder you are changing. An empty founders list changes nothing. '
+      + 'To remove a founder, name them in remove_founders (at most 20 per call; exact name, case ignored); the answer says which were removed and which were not found. A name may not appear in both. '
+      + 'A founder holds name, jobTitle, styleTone, signaturePosts and voiceExamples (text); other fields are refused. The answer reports the founders that were added, updated, removed and the stored total, read back after the save.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2245,7 +2249,27 @@ mcpToolRegistry.register({
         tone_of_voice: { type: 'string', description: 'Tone of voice (update)' },
         target_audience: { type: 'string', description: 'Target audience (update)' },
         key_messages: { type: 'array', items: { type: 'string' }, description: 'Key messages (update)' },
-        visual_identity: { type: 'object', description: 'Visual identity settings (update)' }
+        tagline: { type: 'string', description: 'Brand tagline or slogan (update)' },
+        domain: { type: 'string', description: 'Website domain, e.g. example.com (update)' },
+        brand_values: { type: 'array', items: { type: 'string' }, description: 'Brand values (update; replaces the stored list; at most 50)' },
+        brand_personality: { type: 'string', description: 'Brand personality description (update)' },
+        visual_identity: { type: 'object', description: 'Visual identity settings (update)' },
+        founders: {
+          type: 'array',
+          description: 'Founder profiles to add or update (update). Merged by name; founders you leave out are kept. Use remove_founders to remove one.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Founder name' },
+              jobTitle: { type: 'string', description: 'Founder job title' },
+              styleTone: { type: 'string', description: 'Founder communication style and tone' },
+              signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' },
+              voiceExamples: { type: 'string', description: 'Actual post examples (verbatim) written by or for this founder, used as a style reference for social posts' }
+            },
+            required: ['name']
+          }
+        },
+        remove_founders: { type: 'array', items: { type: 'string' }, description: 'Names of founders to remove (update). Only these are removed.' }
       },
       required: ['action']
     }
@@ -2256,9 +2280,7 @@ mcpToolRegistry.register({
       const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
       return jsonResult(data);
     }
-    const body = mapManageBrandUpdate(args);
-    const data = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
-    return jsonResult(data);
+    return executeBrandUpdate(args, c);
   }
 });
 
