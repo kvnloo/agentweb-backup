@@ -5,6 +5,7 @@ import { userDb, orgDb } from "../services/db";
 import { canEditItem } from "../services/orgShareService";
 import { resolveOrgProfileField } from "../services/orgProfileResolver";
 import { isDeepStrictEqual } from "util";
+import { isDynamoItemSizeError } from "../utils/dynamoItemBudget";
 
 /**
  * The `icpUpdatedAt` a save stores (ENG-1955 follow-up, ENG-2840). It marks the last time the ICP list actually CHANGED, which
@@ -18,11 +19,6 @@ function nextIcpUpdatedAt(sentIcp: unknown, existing: any, now: string): string 
   if (sentIcp === undefined) return existing?.icpUpdatedAt;
   if (existing?.icpUpdatedAt && isDeepStrictEqual(sentIcp, existing.icp)) return existing.icpUpdatedAt;
   return now;
-}
-
-/** DynamoDB's refusal of a write that would make one item larger than 400 KB ("Item size has exceeded the maximum allowed size", or "Item size to update has exceeded ..."). */
-function isItemTooLarge(error: any): boolean {
-  return error?.code === "ValidationException" && /item size .*maximum allowed size/i.test(String(error?.message ?? ""));
 }
 
 const router = Router();
@@ -263,14 +259,14 @@ router.post("/", authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error("[MARKET STRATEGY DEBUG] Error in POST /market-strategy:", error);
-    if (isItemTooLarge(error)) {
+    if (isDynamoItemSizeError(error)) {
       // The strategy sits on a record (the user's, or the organisation's) that DynamoDB caps at 400 KB. A save that would push the whole
       // record past it is refused atomically (nothing is written); say why instead of a bare 500 (Opslane P1 on ef2bc22, ENG-2840).
       return res.status(413).json({
         success: false,
         error: "market_strategy_too_large",
         message:
-          "The market strategy was not saved: the record that holds it would exceed the 400 KB size limit for one stored item, and the rest of that record already takes most of it. Nothing was changed. Shorten or remove entries and try again.",
+          "The market strategy was not saved: the record that holds it would exceed the 400 KB size limit for one stored item. Nothing was changed. Shorten the entries and try again.",
       });
     }
     return res.status(500).json({

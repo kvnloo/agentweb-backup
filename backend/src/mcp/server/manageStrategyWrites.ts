@@ -25,6 +25,7 @@
  * consistent index). Calls that reach different server instances are not covered.
  */
 
+import { isDeepStrictEqual } from 'util';
 import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
 import { withAccountLock } from './accountLock';
@@ -175,8 +176,8 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
   const added: string[] = [];
   /** Positions of the entries this call appended: a later entry for the same name is the same entry, folded into it and reported once, as added. */
   const addedAt = new Set<number>();
-  /** The stored entries this call touched, in the order it first touched them: a stored entry touched twice is reported once. */
-  const touched = new Map<number, { name: string; changed: boolean }>();
+  /** The stored entries this call touched, in the order it first touched them, as they were stored: a stored entry touched twice is reported once, by what the call did to it in the end. */
+  const touched = new Map<number, { name: string; original: unknown }>();
   for (const entry of incoming) {
     const key = identity(entry[keyField]);
     // The entry stored under exactly this spelling wins over a stored entry that differs only in case or spacing.
@@ -191,6 +192,7 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
     }
     // A bare string becomes an entry holding that name, with what the caller sent laid over it.
     const current: Entry = typeof merged[at] === 'string' ? { [keyField]: cleanName(merged[at] as string) } : (merged[at] as Entry);
+    if (!addedAt.has(at) && !touched.has(at)) touched.set(at, { name: String(current[keyField]), original: merged[at] });
     const next: Entry = { ...current };
     let changed = false;
     for (const [field, value] of Object.entries(entry)) {
@@ -201,14 +203,11 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
       }
     }
     if (changed) merged[at] = next;
-    if (addedAt.has(at)) continue;
-    const before = touched.get(at);
-    if (before) before.changed = before.changed || changed;
-    else touched.set(at, { name: String(current[keyField]), changed });
   }
   const updated: string[] = [];
   const unchanged: string[] = [];
-  for (const { name, changed } of touched.values()) (changed ? updated : unchanged).push(name);
+  // By the net effect: an entry a call changes and changes back is unchanged (and, if that is all the call did, nothing is written).
+  for (const [at, { name, original }] of touched) (isDeepStrictEqual(original, merged[at]) ? unchanged : updated).push(name);
   return { merged, added, updated, unchanged };
 }
 
