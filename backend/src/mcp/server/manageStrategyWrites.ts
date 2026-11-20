@@ -266,13 +266,24 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
   // One call at a time per ACCOUNT (the org, for a member of one) within this process: the merge below is read, merge, write, so two calls sent together
   // (one agent's parallel calls, or two members' agents) would each merge onto the same stored lists and the second write would drop the first one's entries.
   return withAccountLock('strategy', c, async (lockKey) => {
-    let stored = checkedStrategy(await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c }), 'update');
+    const firstRead = await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c });
+    let stored = checkedStrategy(firstRead, 'update');
+    let isOrgLevel = (firstRead as any).isOrgLevel === true;
     if (typeof stored.createdAt !== 'string') {
       // The read shows no strategy stored. That is true for an account that never saved one, and also what a missed read of a long-lived account looks like (the
       // route's read can miss the org owner's record for a moment); a write built on a missed read replaces the real lists. Read once more before believing it.
       await new Promise((resolve) => setTimeout(resolve, 200));
-      const again = checkedStrategy(await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c }), 'update');
-      if (typeof again.createdAt === 'string') stored = again;
+      const secondRead = await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c });
+      const again = checkedStrategy(secondRead, 'update');
+      if (typeof again.createdAt === 'string') {
+        stored = again;
+        isOrgLevel = (secondRead as any).isOrgLevel === true;
+      }
+    }
+    // The caller belongs to an org, so the strategy is the org's. If the route answered with the caller's PERSONAL strategy instead (its read of the org missed),
+    // merging onto it and saving would write that personal strategy over the org's.
+    if (lockKey.startsWith('strategy:org:') && !isOrgLevel) {
+      fail("the organisation's market strategy could not be read (the answer was the caller's personal one).");
     }
     stored = newestOf(lockKey, stored);
     const body: Record<string, unknown> = {};
