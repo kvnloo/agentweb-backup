@@ -2115,10 +2115,44 @@
   {
     "name": "list_knowledge_bases",
     "listed": false,
-    "description": "List all knowledge base files for the authenticated user.",
+    "description": "List knowledge base files for the authenticated user: the platform knowledge bases (yours, those your organisation shares with you, and public ones) and your connected Google Drive folders, ClickUp docs and Foreplay boards. With no arguments it returns everything it can. kb_type narrows the sources: \"private\" and \"public\" both mean only the platform knowledge bases (the two are not told apart), \"google-drive\", \"clickup\", \"clickup-tasks\" and \"foreplay-swipefile\" / \"foreplay-board\" mean only that connected source (the two Foreplay values are not told apart, and ClickUp folder entries are listed whatever kb_type is). modified_after and modified_before (dates as YYYY-MM-DD), limit (1 to 1000, default 100) and offset (0 to 100000) page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay (the answer still echoes them), and limit and offset apply per Google Drive source, a source being a registered folder with everything under it. Blank or 0 for limit and offset means the default, not \"none\". To page Drive files send the same arguments with a new offset.",
     "inputSchema": {
       "type": "object",
-      "properties": {},
+      "properties": {
+        "kb_type": {
+          "type": "string",
+          "enum": [
+            "google-drive",
+            "private",
+            "public",
+            "clickup",
+            "clickup-tasks",
+            "foreplay-swipefile",
+            "foreplay-board"
+          ],
+          "description": "Only return this kind of source (\"private\" and \"public\" both mean the platform knowledge bases). Omit to return every source."
+        },
+        "modified_after": {
+          "type": "string",
+          "description": "Google Drive files modified on or after this date, YYYY-MM-DD (e.g. \"2026-04-15\")."
+        },
+        "modified_before": {
+          "type": "string",
+          "description": "Google Drive files modified on or before this date, YYYY-MM-DD (e.g. \"2026-04-22\"); not earlier than modified_after."
+        },
+        "limit": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Most Google Drive files to return per source (default 100)."
+        },
+        "offset": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Google Drive files to skip per source (default 0). Use with limit to page."
+        }
+      },
       "required": []
     },
     "sideEffect": "write",
@@ -2398,7 +2432,7 @@
   {
     "name": "manage_brand",
     "listed": false,
-    "description": "Read or update brand guidelines. Use action: \"read\" or \"update\".",
+    "description": "Read or update brand guidelines. Use action: \"read\" or \"update\". Update changes only the fields you send. company_name, mission, tone_of_voice, target_audience, key_messages, tagline, domain, brand_values, brand_personality and visual_identity replace the stored value of that field (a list replaces the whole list). For tagline, domain, brand_personality, brand_values and founders, blank text or an empty list means \"not given\" and changes nothing. FOUNDERS: founders is merged BY NAME, never replaced: a founder already stored (same name, case and padding ignored) is updated field by field, a new name is added, and every founder you do not mention is kept, so you can send just the founder you are changing. An empty founders list changes nothing. To remove a founder, name them in remove_founders (at most 20 per call; the name is matched as for founders: case, padding and repeated spaces ignored); the answer says which were removed and which were not found. A name may not appear in both. A founder holds name, jobTitle, styleTone, signaturePosts and voiceExamples (text); other fields are refused. The answer reports the founders that were added, updated, removed and the stored total, read back after the save.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2433,9 +2467,67 @@
           },
           "description": "Key messages (update)"
         },
+        "tagline": {
+          "type": "string",
+          "description": "Brand tagline or slogan (update)"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Website domain, e.g. example.com (update)"
+        },
+        "brand_values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Brand values (update; replaces the stored list; at most 50)"
+        },
+        "brand_personality": {
+          "type": "string",
+          "description": "Brand personality description (update)"
+        },
         "visual_identity": {
           "type": "object",
           "description": "Visual identity settings (update)"
+        },
+        "founders": {
+          "type": "array",
+          "description": "Founder profiles to add or update (update). Merged by name; founders you leave out are kept. Use remove_founders to remove one.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Founder name"
+              },
+              "jobTitle": {
+                "type": "string",
+                "description": "Founder job title"
+              },
+              "styleTone": {
+                "type": "string",
+                "description": "Founder communication style and tone"
+              },
+              "signaturePosts": {
+                "type": "string",
+                "description": "Notable posts or content the founder is known for"
+              },
+              "voiceExamples": {
+                "type": "string",
+                "description": "Actual post examples (verbatim) written by or for this founder, used as a style reference for social posts"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        },
+        "remove_founders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of founders to remove (update). Only these are removed."
         }
       },
       "required": [
