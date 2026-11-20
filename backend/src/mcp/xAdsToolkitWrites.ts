@@ -72,6 +72,8 @@ const requireName = (v: unknown): string => {
   if (typeof v !== 'string' || !v.trim() || v.length > 255) throw new MetaToolkitRefusal('name must be 1-255 characters.');
   return v.trim();
 };
+/** X requires an end_time on every line item; used when the caller gives none. */
+export const X_ADS_LINE_ITEM_DEFAULT_DAYS = 30;
 const optionalIso = (v: unknown, field: string): string | undefined => {
   if (v === undefined) return undefined;
   if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) throw new MetaToolkitRefusal(`${field} must be an ISO 8601 date-time.`);
@@ -295,6 +297,7 @@ export async function executeXAdsWrite(
     state = { parent: pick(campaign, STABLE.campaign) };
     lines.push(`Create line item "${v.fields.name}" in campaign "${campaign.name}" (campaign is ${campaign.entity_status}).`);
     lines.push(`Daily budget: ${money(v.fields.daily_budget_amount_local_micro)}/day.${v.fields.total_budget_amount_local_micro !== undefined ? ` Total budget: ${money(v.fields.total_budget_amount_local_micro)}.` : ''}`);
+    lines.push(`Schedule: ${v.fields.start_time ? `starts ${v.fields.start_time}` : 'starts when created'}, ${v.fields.end_time ? `ends ${v.fields.end_time}` : `ends ${X_ADS_LINE_ITEM_DEFAULT_DAYS} days after start (pass end_time to change)`}.`);
     lines.push(`Objective ${v.fields.objective}, placements ${v.fields.placements}, bid ${v.fields.bid_strategy === 'AUTO' ? 'automatic' : `max ${money(v.fields.bid_amount_local_micro)}`}.`);
     if (v.targeting.length) {
       const by = (t: string) => v.targeting.filter((c) => c.targeting_type === t).map((c) => c.targeting_value);
@@ -394,7 +397,11 @@ export async function executeXAdsWrite(
     if (v.op === 'CAMPAIGN CREATE') {
       createdId = (await call({ method: 'POST', path: `/accounts/${acct}/campaigns`, query: v.fields }))?.data?.id;
     } else if (v.op === 'LINE_ITEM CREATE') {
-      const liQuery = v.fields.start_time ? v.fields : { ...v.fields, start_time: new Date(now).toISOString() };
+      // X requires both start_time and end_time on line items. Defaults (outside the preview
+      // fingerprint): start now, end X_ADS_LINE_ITEM_DEFAULT_DAYS later.
+      const liStartIso = String(v.fields.start_time ?? new Date(now).toISOString());
+      const liEndIso = String(v.fields.end_time ?? new Date(Date.parse(liStartIso) + X_ADS_LINE_ITEM_DEFAULT_DAYS * 86400000).toISOString());
+      const liQuery = { ...v.fields, start_time: liStartIso, end_time: liEndIso };
       createdId = (await call({ method: 'POST', path: `/accounts/${acct}/line_items`, query: liQuery }))?.data?.id;
     } else if (v.op === 'PROMOTED_TWEET CREATE') {
       await call({ method: 'POST', path: `/accounts/${acct}/promoted_tweets`, query: v.fields });

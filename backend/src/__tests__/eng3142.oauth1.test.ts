@@ -105,4 +105,14 @@ describe('ENG-3142 X Ads client', () => {
     expect(lost).toBeInstanceOf(XAdsApiError);
     expect(lost.status).toBe(0);
   });
+
+  it('batch item-level operation_errors become a readable message', async () => {
+    const fetchImpl = jest.fn().mockResolvedValueOnce(res(400, JSON.stringify({
+      request: [{ params: { line_item_id: 'l1' }, operation_type: 'Create' }],
+      operation_errors: [[], [{ code: 'INVALID_TARGETING_VALUE', message: 'bad keyword' }]],
+    })));
+    const credentials = { ...app, token: 't', tokenSecret: 'ts' };
+    await expect(xAdsRequest({ method: 'POST', path: '/batch/x', json: [], credentials, fetchImpl }))
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining('item 2: INVALID_TARGETING_VALUE bad keyword') });
+  });
 });
