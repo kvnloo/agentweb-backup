@@ -428,7 +428,7 @@ export async function executeXAdsWrite(
       await call({
         method: 'POST',
         path: `/batch/accounts/${acct}/targeting_criteria`,
-        json: v.targeting.map((c) => ({ operation_type: 'Create', params: { line_item_id: createdId, ...c } })),
+        json: v.targeting.map((c) => ({ operation_type: 'Create', params: { line_item_id: createdId, operator_type: 'EQ', ...c } })),
       });
     } catch (error) {
       targetingError = (error as Error).message;
