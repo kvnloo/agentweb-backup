@@ -1,7 +1,7 @@
 type Tool = { name: string; definition: { description: string; inputSchema: { properties: object } }; execute: (args: unknown, context: unknown) => Promise<Record<string, unknown>> };
 const handlers = new Map<string, Tool>();
 jest.mock('../emma/registry', () => ({ emmaToolRegistry: { register: (tool: Tool) => handlers.set(tool.name, tool) } }));
-jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn() }, orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() } }));
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: { getChatSession: jest.fn(), getMessagesFromMessagesTable: jest.fn(), claimMetaWriteManifestDigest: jest.fn() },
 }));
@@ -145,6 +145,8 @@ const allLogs = () => logSpies.flatMap(s => s.mock.calls).map(c => c.map(String)
 
 beforeAll(() => { process.env.JWT_SECRET = 'test-secret-not-real'; });
 beforeEach(() => {
+  // The consistent re-read (ENG-3152) answers what the indexed read answers in these tests.
+  (userDb.getUserByIdConsistent as jest.Mock).mockImplementation((id: string) => (userDb.getUserById as jest.Mock)(id));
   jest.clearAllMocks();
   setHotLeadCallEntitledOverride(true);
   jest.useFakeTimers({ now: T0, doNotFake: ['nextTick', 'setImmediate', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask'] });
@@ -183,6 +185,7 @@ describe('permissions and registration', () => {
   it.each(SETUP_TOOLS)('%s needs authentication, a persisted membership and cannot reach another org', async name => {
     await expect(run(name, VALID_ARGS[name], {})).rejects.toThrow('Authentication');
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'owner' });
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce({ userId: 'owner' }); // the consistent re-read also shows no org
     await expect(run(name, VALID_ARGS[name])).rejects.toThrow('membership');
     org.orgId = 'org-b';
     await expect(run(name, VALID_ARGS[name])).rejects.toThrow('Organization not found');
