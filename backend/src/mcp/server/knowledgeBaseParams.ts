@@ -10,6 +10,10 @@
 /** The kinds of knowledge base source Emma's list tool can narrow to. */
 export const KB_LIST_TYPES = ['google-drive', 'private', 'public', 'clickup', 'clickup-tasks', 'foreplay-swipefile', 'foreplay-board'] as const;
 
+/** Most files one call may ask for (`limit`) and most it may skip (`offset`): the service has no bound, and an unbounded value makes it walk a whole Drive folder. */
+export const MAX_KB_LIST_LIMIT = 1_000;
+export const MAX_KB_LIST_OFFSET = 100_000;
+
 /** The only date form the service accepts (`validateDriveDateFilter`): a real calendar date, YYYY-MM-DD. */
 const CALENDAR_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
@@ -27,23 +31,33 @@ export function buildKbListQuery(args: any): Record<string, string> {
     const text = value.trim();
     if (text === '') return;
     const m = CALENDAR_DATE.exec(text);
-    const real = m && (() => { const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))); return d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() === Number(m[2]) - 1 && d.getUTCDate() === Number(m[3]); })();
+    const real = m && (() => {
+      // setUTCFullYear, not Date.UTC: Date.UTC reads the years 0 to 99 as 1900 to 1999.
+      const d = new Date(0);
+      d.setUTCFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      return d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() === Number(m[2]) - 1 && d.getUTCDate() === Number(m[3]);
+    })();
     if (!real) return refuse(`${name} must be a calendar date in YYYY-MM-DD form, such as 2026-04-15.`);
     qp[name] = text;
   };
   date(args?.modified_after, 'modified_after');
   date(args?.modified_before, 'modified_before');
+  // The two dates are compared as text: YYYY-MM-DD sorts like the dates themselves.
+  if (qp.modified_after && qp.modified_before && qp.modified_after > qp.modified_before) {
+    return refuse('modified_after must not be later than modified_before (no file could match).');
+  }
 
-  const whole = (value: unknown, name: string): void => {
+  const whole = (value: unknown, name: string, max: number): void => {
     if (value === undefined || value === null) return;
     const text = typeof value === 'string' ? value.trim() : undefined;
     const n = text === undefined ? value : text === '' ? 0 : /^\d+$/.test(text) ? Number(text) : NaN;
     if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return refuse(`${name} must be a whole number.`);
-    // 0 means "not given": a limit of 0 would return nothing, and 0 is the default offset.
+    if (n > max) return refuse(`${name} must be ${max} or less.`);
+    // 0 means "not given" (the default applies): the service would take a limit of 0 literally and return no file.
     if (n !== 0) qp[name] = String(n);
   };
-  whole(args?.limit, 'limit');
-  whole(args?.offset, 'offset');
+  whole(args?.limit, 'limit', MAX_KB_LIST_LIMIT);
+  whole(args?.offset, 'offset', MAX_KB_LIST_OFFSET);
 
   const type = args?.kb_type;
   if (type !== undefined && type !== null) {

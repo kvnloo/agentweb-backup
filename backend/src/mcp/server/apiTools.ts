@@ -35,7 +35,7 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-import { buildKbListQuery, KB_LIST_TYPES } from './knowledgeBaseParams';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -1949,17 +1949,18 @@ mcpToolRegistry.register({
   name: 'list_knowledge_bases',
   definition: {
     name: 'list_knowledge_bases',
-    description: 'List knowledge base files for the authenticated user: your private knowledge bases, public ones, and connected Google Drive folders, ClickUp docs and Foreplay boards. '
-      + 'With no arguments it returns everything it can. kb_type narrows to one kind of source: "private" and "public" both mean only the platform knowledge bases (yours and the public ones; the two are not told apart), "google-drive", "clickup", "clickup-tasks", "foreplay-swipefile" and "foreplay-board" mean only that connected source. '
-      + 'modified_after and modified_before (dates as YYYY-MM-DD), limit (default 100) and offset page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay, and limit and offset apply per Drive folder.',
+    description: 'List knowledge base files for the authenticated user: the platform knowledge bases (yours, those your organisation shares with you, and public ones) and your connected Google Drive folders, ClickUp docs and Foreplay boards. '
+      + 'With no arguments it returns everything it can. kb_type narrows the sources: "private" and "public" both mean only the platform knowledge bases (the two are not told apart), "google-drive", "clickup", "clickup-tasks" and "foreplay-swipefile" / "foreplay-board" mean only that connected source (the two Foreplay values are not told apart, and ClickUp folder entries are listed whatever kb_type is). '
+      + 'modified_after and modified_before (dates as YYYY-MM-DD), limit (1 to 1000, default 100) and offset (0 to 100000) page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay (the answer still echoes them), and limit and offset apply per Google Drive source, a source being a registered folder with everything under it. '
+      + 'Blank or 0 for limit and offset means the default, not "none". To page Drive files send the same arguments with a new offset.',
     inputSchema: {
       type: 'object',
       properties: {
         kb_type: { type: 'string', enum: [...KB_LIST_TYPES], description: 'Only return this kind of source ("private" and "public" both mean the platform knowledge bases). Omit to return every source.' },
         modified_after: { type: 'string', description: 'Google Drive files modified on or after this date, YYYY-MM-DD (e.g. "2026-04-15").' },
-        modified_before: { type: 'string', description: 'Google Drive files modified on or before this date, YYYY-MM-DD (e.g. "2026-04-22").' },
-        limit: { type: 'number', description: 'Most Google Drive files to return per folder (default 100).' },
-        offset: { type: 'number', description: 'Google Drive files to skip per folder (default 0). Use with limit to page.' }
+        modified_before: { type: 'string', description: 'Google Drive files modified on or before this date, YYYY-MM-DD (e.g. "2026-04-22"); not earlier than modified_after.' },
+        limit: { type: 'number', minimum: 1, maximum: MAX_KB_LIST_LIMIT, description: 'Most Google Drive files to return per source (default 100).' },
+        offset: { type: 'number', minimum: 0, maximum: MAX_KB_LIST_OFFSET, description: 'Google Drive files to skip per source (default 0). Use with limit to page.' }
       },
       required: []
     }
