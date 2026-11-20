@@ -837,7 +837,7 @@ describe('update: third round', () => {
   });
 
   it.each([
-    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom'))],
+    ['cannot be read', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockRejectedValueOnce(new Error('lookup boom arn:aws:iam::123456789012:role/internal-role'))],
     ['has no record', () => jest.spyOn(userDb, 'getUserByIdConsistent').mockResolvedValueOnce(undefined)],
   ])('refuses the call when the caller\'s record %s, instead of locking per user', async (_label, arrange) => {
     const spy = arrange();
@@ -846,6 +846,8 @@ describe('update: third round', () => {
       const r = await update(owner, { competitors: [{ name: 'Delta' }] });
       expect(r.isError).toBe(true);
       expect(r.text).toMatch(/strategy: the account could not be identified.*nothing was changed/);
+      // The lookup's own message (it can name roles and tables) stays in the log.
+      expect(r.text).not.toMatch(/arn:aws|lookup boom/);
     } finally {
       spy.mockRestore();
     }
@@ -868,6 +870,45 @@ describe('update: third round', () => {
   it('identity-style arguments are listed on the answer of a call that changes nothing too', async () => {
     const r = await update(owner, { competitors: [{ name: 'AlphaRival', description: 'The old incumbent' }], client_id: TENANT_B.owner });
     expect(r.json).toMatchObject({ changed: false, ignoredArguments: ['client_id'] });
+  });
+});
+
+describe('update: solo accounts, the org flag and the memory\'s end', () => {
+  it('a solo user\'s parallel calls are taken in turn too (the commonest case): both land', async () => {
+    const [x, y] = await Promise.all([update(solo, { competitors: [{ name: 'Delta' }] }), update(solo, { competitors: [{ name: 'Epsilon' }], icp: [{ title: 'Analyst' }] })]);
+    expect(x.isError).toBe(false);
+    expect(y.isError).toBe(false);
+    const row = fake.items('AW-Users').find((u: any) => u.userId === SOLO).marketStrategy;
+    expect(names(row.competitors).sort()).toEqual(['Delta', 'Epsilon', 'SoloRival']);
+    expect(row.icp.map((e: any) => e.title)).toEqual(['Solo ICP', 'Analyst']);
+  });
+
+  it('an org caller whose read answered with the caller\'s personal strategy (the org read missed) is refused, not merged onto and saved over the org\'s', async () => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const personal = { success: true, data: { businessOverview: 'Personal', competitors: [{ name: 'PersonalRival' }], icp: [], createdAt: STORED_AT, updatedAt: STORED_AT }, isOrgLevel: false };
+    await withStrategyReadsOverridden(() => personal, async () => {
+      const r = await update(owner, { competitors: [{ name: 'Delta' }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/the organisation's market strategy could not be read.*Nothing was changed/);
+    });
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('after a minute the memory is gone: a read that is older than our last save (a writer with an older stamp) is used, not replaced by the saved copy', async () => {
+    const now = Date.now();
+    const spy = jest.spyOn(Date, 'now');
+    try {
+      spy.mockReturnValue(now);
+      expect((await update(owner, { competitors: [{ name: 'Delta' }] })).isError).toBe(false);
+      // A foreign writer (for example an onboarding mirror stamping a backdated time) changes the strategy and leaves an older updatedAt than our save.
+      const saved = strategyOf(TENANT_A.orgId);
+      fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...saved, updatedAt: STORED_AT, competitors: [...saved.competitors, { name: 'Foreign' }] } });
+      spy.mockReturnValue(now + 61_000);
+      expect((await update(owner, { businessOverview: 'Later overview' })).isError).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta', 'Foreign']);
   });
 });
 
