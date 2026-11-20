@@ -24,6 +24,7 @@ jest.mock('../utils/secretsManager', () => ({
 import app from '../app';
 import {
   clearRecentStrategyWrites,
+  executeStrategyUpdate,
   COMPETITOR_LOOKUP_MAX,
   COMPETITOR_PAGE_CHAR_BUDGET,
   MAX_STORED_COMPETITORS,
@@ -645,6 +646,134 @@ describe('arguments the action does not take', () => {
     expect(r.json.data.competitors.map((e: any) => e.name)).not.toContain('BravoRival');
     // A call without them says nothing about them.
     expect((await read(owner)).json.ignoredArguments).toBeUndefined();
+  });
+});
+
+/** The bodies of the POSTs the tool makes to the strategy route while `run` goes on. */
+async function recordStrategyPosts(run: () => Promise<void>): Promise<Array<Record<string, any>>> {
+  const realFetch = global.fetch;
+  const bodies: Array<Record<string, any>> = [];
+  global.fetch = (async (url: any, init: any = {}) => {
+    if (String(url).includes('/api/market-strategy') && String(init.method || 'GET').toUpperCase() === 'POST') bodies.push(JSON.parse(init.body));
+    return realFetch(url, init);
+  }) as any;
+  try {
+    await run();
+  } finally {
+    global.fetch = realFetch;
+  }
+  return bodies;
+}
+
+describe('update: parts the route would fill from its own, possibly older, read', () => {
+  it('a part that a save of the last minute changed is sent again by the next call, whatever that call changes (the route reads through an eventually consistent index)', async () => {
+    const posts = await recordStrategyPosts(async () => {
+      expect((await update(owner, { competitors: [{ name: 'Delta' }] })).isError).toBe(false);
+      expect((await update(owner, { businessOverview: 'A new overview' })).isError).toBe(false);
+      expect((await update(owner, { icp: [{ title: 'Analyst' }] })).isError).toBe(false);
+    });
+    expect(posts.map((b) => Object.keys(b).sort())).toEqual([
+      ['competitors'],
+      ['businessOverview', 'competitors'],
+      ['businessOverview', 'competitors', 'icp'],
+    ]);
+    // The part carried along is the saved one, not an older copy.
+    expect(posts[1].competitors.map((e: any) => e.name)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta']);
+    expect(posts[2].businessOverview).toBe('A new overview');
+    const s = strategyOf(TENANT_A.orgId);
+    expect(names(s.competitors)).toEqual(['AlphaRival', 'Beta Corp', 'Gamma', 'Delta']);
+    expect(s.businessOverview).toBe('A new overview');
+    expect(s.icp.map((e: any) => e.title)).toEqual(['IT Director', 'Founder', 'Analyst']);
+  });
+
+  it('a part nobody saved recently is not sent (so an ICP the call did not touch is not marked as edited)', async () => {
+    const posts = await recordStrategyPosts(async () => {
+      await update(owner, { competitors: [{ name: 'Delta' }] });
+      await update(owner, { competitors: [{ name: 'Epsilon' }] });
+    });
+    expect(posts.map((b) => Object.keys(b))).toEqual([['competitors'], ['competitors']]);
+    expect(strategyOf(TENANT_A.orgId).icpUpdatedAt).toBe(STORED_AT);
+  });
+
+  it('after a minute the memory is gone and a call sends only its own parts', async () => {
+    const now = Date.now();
+    const spy = jest.spyOn(Date, 'now');
+    try {
+      spy.mockReturnValue(now);
+      await update(owner, { competitors: [{ name: 'Delta' }] });
+      spy.mockReturnValue(now + 61_000);
+      const posts = await recordStrategyPosts(async () => {
+        expect((await update(owner, { businessOverview: 'Later overview' })).isError).toBe(false);
+      });
+      expect(posts.map((b) => Object.keys(b))).toEqual([['businessOverview']]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('the parts carried along are the member-shared ones: the owner\'s save is carried by an editor\'s next call', async () => {
+    makeMemberEditor();
+    await update(owner, { competitors: [{ name: 'FromOwner' }] });
+    const posts = await recordStrategyPosts(async () => {
+      expect((await update(member, { businessOverview: 'Editor overview' })).isError).toBe(false);
+    });
+    expect(Object.keys(posts[0]).sort()).toEqual(['businessOverview', 'competitors']);
+    expect(names(strategyOf(TENANT_A.orgId).competitors)).toContain('FromOwner');
+  });
+});
+
+describe('update: names, arguments and who may write', () => {
+  it.each(['constructor', 'toString', 'hasOwnProperty', 'valueOf'])('an argument named %s is refused by name, not dropped', async (name) => {
+    const before = JSON.stringify(orgRow(TENANT_A.orgId));
+    const r = await update(owner, { businessOverview: 'x', [name]: 'y' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain(`"${name}" is not an input of update`);
+    expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
+  });
+
+  it('an own key named __proto__ (which the MCP transport itself drops before a tool sees it) is refused by name too', async () => {
+    const args = JSON.parse('{"action":"update","businessOverview":"x","__proto__":"y"}');
+    await expect(executeStrategyUpdate(args, { userId: TENANT_A.owner })).rejects.toThrow(/"__proto__" is not an input of update/);
+  });
+
+  it('a call that changes nothing is answered without the route\'s editor check (it writes nothing, and the caller can read all of it); a change is still refused', async () => {
+    const same = await update(member, { competitors: [{ name: 'AlphaRival', description: 'The old incumbent' }] });
+    expect(same.isError).toBe(false);
+    expect(same.json.changed).toBe(false);
+    const change = await update(member, { competitors: [{ name: 'AlphaRival', description: 'Different' }] });
+    expect(change.isError).toBe(true);
+    expect(change.text).toMatch(/Not authorized to edit marketing strategy/);
+  });
+
+  it('a name that is only invisible characters is refused, and one with an invisible character is the same competitor', async () => {
+    for (const bad of ['\u200b', ' \u200d\ufeff ']) {
+      const r = await update(owner, { competitors: [{ name: bad }] });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/competitors\[0\]\.name is required/);
+    }
+    const r = await update(owner, { competitors: [{ name: 'Alpha\u200bRival', description: 'Zero-width in the middle' }] });
+    expect(r.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors).toHaveLength(3);
+    expect(strategyOf(TENANT_A.orgId).competitors[0]).toEqual({ name: 'AlphaRival', description: 'Zero-width in the middle' });
+    // A stored name that holds one is matched too.
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: [{ name: 'Stored\u200bRival', description: 'x' }] } });
+    expect((await update(owner, { competitors: [{ name: 'StoredRival', description: 'y' }] })).isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors).toEqual([{ name: 'Stored\u200bRival', description: 'y' }]);
+  });
+
+  it('when two stored entries differ only by case, the one with the exact spelling is the one updated', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: [{ name: 'Acme', description: 'one' }, { name: 'ACME', description: 'two' }] } });
+    const r = await update(owner, { competitors: [{ name: 'ACME', description: 'changed' }] });
+    expect(r.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).competitors).toEqual([{ name: 'Acme', description: 'one' }, { name: 'ACME', description: 'changed' }]);
+  });
+
+  it('stored lists that are not lists block only an update of that list: an overview-only update goes through and leaves them as they are', async () => {
+    fake.seed('AW-Organizations', { ...orgRow(TENANT_A.orgId), marketStrategy: { ...strategyOf(TENANT_A.orgId), competitors: 'oops' } });
+    const r = await update(owner, { businessOverview: 'Fixed overview' });
+    expect(r.isError).toBe(false);
+    expect(strategyOf(TENANT_A.orgId).businessOverview).toBe('Fixed overview');
+    expect(strategyOf(TENANT_A.orgId).competitors).toBe('oops');
   });
 });
 
