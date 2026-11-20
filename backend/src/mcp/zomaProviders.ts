@@ -14,11 +14,11 @@
 import type { ConnectedAccount } from '../services/connectedAccountsDb';
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 
-export type ZomaPlatform = 'meta' | 'google_ads';
+export type ZomaPlatform = 'meta' | 'google_ads' | 'x_ads';
 
 export interface ZomaProvider {
   platform: ZomaPlatform;
-  /** "Meta", "Google Ads": used in status lines. */
+  /** "Meta", "Google Ads", "X Ads": used in status lines. */
   label: string;
   /** "Meta ad account": singular noun used in refusals. */
   accountNoun: string;
@@ -80,12 +80,35 @@ export const GOOGLE_ADS_PROVIDER: ZomaProvider = {
   accountIds: (a) => [normalizeGoogleId((a.config as any)?.customer_id)].filter(Boolean),
 };
 
+const normalizeXAdsId = (id: unknown) => String(id ?? '').trim().toLowerCase();
+
+/**
+ * ENG-3142: an X Ads connection (routes/xAdsAuth.ts) holds an OAuth 1.0a access token + secret,
+ * which do not expire; it is unusable once either is missing or an Ads API call saw a 401.
+ */
+export function xAdsConnectionIsUsable(account: ConnectedAccount, _now: number): boolean {
+  const cfg: any = account.config;
+  return Boolean(cfg?.ad_account_id && cfg?.access_token && cfg?.access_token_secret && !cfg?.needs_reconnect);
+}
+
+export const X_ADS_PROVIDER: ZomaProvider = {
+  platform: 'x_ads',
+  label: 'X Ads',
+  accountNoun: 'X Ads account',
+  accountArg: 'account_id',
+  isAdAccount: (a) => a.platform === 'x_ads',
+  isUsable: xAdsConnectionIsUsable,
+  normalizeId: normalizeXAdsId,
+  accountIds: (a) => [normalizeXAdsId((a.config as any)?.ad_account_id)].filter(Boolean),
+};
+
 export const ZOMA_PROVIDERS: Record<ZomaPlatform, ZomaProvider> = {
   meta: META_PROVIDER,
   google_ads: GOOGLE_ADS_PROVIDER,
+  x_ads: X_ADS_PROVIDER,
 };
 
-export { googleToolkitEnabled } from './zomaToolDefinitions';
+export { googleToolkitEnabled, xAdsToolkitEnabled } from './zomaToolDefinitions';
 
 export type AccountResolution =
   | { ok: true; accountId: string; account: ConnectedAccount }

@@ -366,6 +366,11 @@ function applyUpdateExpression(
 export class InMemoryDynamo {
   readonly tables = new Map<string, Map<string, Record<string, any>>>();
   private readonly schemas = new Map<string, TableKeySchema>();
+  /**
+   * Off by default. When set (DynamoDB's real limit is 409,600 bytes, 400 KB), an update that would leave an item larger than this many bytes
+   * (its JSON size, which is close to the service's own count) is refused with the ValidationException the service raises, and nothing is written.
+   */
+  maxItemBytes: number | undefined;
 
   constructor(schemas: Record<string, TableKeySchema>) {
     for (const [table, schema] of Object.entries(schemas)) {
@@ -456,6 +461,9 @@ export class InMemoryDynamo {
             }
             const item = { ...(existing || params.Key) };
             applyUpdateExpression(item, params.UpdateExpression, names, values);
+            if (self.maxItemBytes !== undefined && Buffer.byteLength(JSON.stringify(item), 'utf8') > self.maxItemBytes) {
+              throw Object.assign(new Error('Item size to update has exceeded the maximum allowed size'), { code: 'ValidationException' });
+            }
             store.set(key, item);
             return { Attributes: item };
           },

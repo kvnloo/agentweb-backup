@@ -129,8 +129,9 @@ export function isBillableResult(result: unknown): boolean {
  * Google Ads status → ENABLED on CREATE or UPDATE. Everything else — reads, drafts, paused
  * creates, pauses, edits — stays free.
  */
-export function isZomaPublishWrite(platform: 'meta' | 'google_ads', args: any): boolean {
+export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
+  if (platform === 'x_ads') return args?.action === 'ACTIVATE'; // ENG-3142: creates are always PAUSED
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
 
