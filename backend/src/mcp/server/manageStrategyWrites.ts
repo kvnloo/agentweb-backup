@@ -66,6 +66,26 @@ const NEVER_STORED_ARGUMENTS: Record<string, string> = {
 type Entry = Record<string, unknown>;
 type KeyField = 'name' | 'title';
 
+/** The top-level arguments each action takes. Any other argument is refused by name: it would be dropped while the call reported success. */
+const UPDATE_ARGUMENTS = ['action', 'businessOverview', 'competitors', 'icp'];
+const READ_ARGUMENTS = ['action', 'competitorOffset', 'competitorNames'];
+/** Identity-style arguments some callers add to every tool. They are never used (the strategy is always the caller's own); the answer says they were ignored. */
+const IGNORED_ARGUMENTS = ['client_id', 'clientId', 'user_id', 'userId'];
+
+/** Refuse an argument this action does not take. Returns the identity-style arguments that were sent and will be ignored. */
+function checkArguments(args: any, action: 'read' | 'update'): string[] {
+  const accepted = action === 'update' ? UPDATE_ARGUMENTS : READ_ARGUMENTS;
+  const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined);
+  // The three never-stored arguments of an update have their own, more specific refusal below.
+  const unknown = sent.filter((k) => !accepted.includes(k) && !IGNORED_ARGUMENTS.includes(k) && !(action === 'update' && k in NEVER_STORED_ARGUMENTS));
+  if (unknown.length > 0) {
+    const names = unknown.map((k) => `"${k}"`).join(', ');
+    const takes = accepted.filter((a) => a !== 'action').join(', ');
+    throw new Error(`manage_market_strategy ${action}: ${names} ${unknown.length > 1 ? 'are not inputs' : 'is not an input'} of ${action} (it would be dropped, not saved). ${action === 'update' ? 'Update' : 'Read'} takes ${takes}.${action === 'update' ? ' Nothing was changed.' : ''}`);
+  }
+  return sent.filter((k) => IGNORED_ARGUMENTS.includes(k));
+}
+
 const fail = (message: string): never => { throw new Error(`manage_market_strategy update: ${message} Nothing was changed.`); };
 
 /** Case, padding and repeated-space insensitive identity of an entry (Emma's stored / not-stored lookup ignores case and padding; runs of spaces are folded too). */
@@ -200,6 +220,7 @@ function newestOf(key: string, read: Record<string, any>): Record<string, any> {
 
 /** `update`: read the stored strategy, merge, and send the route only the parts that changed. */
 export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
+  const ignored = checkArguments(args, 'update');
   for (const [name, advice] of Object.entries(NEVER_STORED_ARGUMENTS)) {
     if (args[name] !== undefined) fail(`"${name}" is not stored by the market strategy (${advice}). The market strategy holds businessOverview, competitors and icp.`);
   }
@@ -255,7 +276,7 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     }
 
     if (Object.keys(body).length === 0) {
-      return jsonResult({ ...answer, changed: false, message: 'Everything sent is already stored exactly as given; nothing was written.' });
+      return jsonResult({ ...answer, changed: false, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}), message: 'Everything sent is already stored exactly as given; nothing was written.' });
     }
     const sizeBefore = bytesOf({ businessOverview: stored.businessOverview, competitors: stored.competitors, icp: stored.icp });
     const sizeAfter = bytesOf({ businessOverview: body.businessOverview ?? stored.businessOverview, competitors: body.competitors ?? stored.competitors, icp: body.icp ?? stored.icp });
@@ -269,7 +290,7 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
       const section = answer[kind] as Record<string, unknown> | undefined;
       if (section && Array.isArray(saved[kind])) section.total = (saved[kind] as unknown[]).length;
     }
-    return jsonResult({ ...answer, changed: true });
+    return jsonResult({ ...answer, changed: true, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}) });
   });
 }
 
@@ -288,6 +309,7 @@ function offsetOf(value: unknown): number {
  * (null on the last). `competitorNames` answers stored / not stored for up to 50 names whatever the page shows, so a caller can check before adding.
  */
 export async function executeStrategyRead(args: any, c: any): Promise<any> {
+  const ignored = checkArguments(args, 'read');
   const names = args.competitorNames;
   if (names !== undefined && names !== null && (!Array.isArray(names) || names.some((n: unknown) => typeof n !== 'string'))) {
     throw new Error('manage_market_strategy read: competitorNames must be a list of text.');
@@ -313,6 +335,7 @@ export async function executeStrategyRead(args: any, c: any): Promise<any> {
     competitorOffset: start,
     competitorsReturned: end - start,
     nextCompetitorOffset: end < all.length ? end : null,
+    ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}),
   };
   if (Array.isArray(names) && names.length > 0) {
     const byName = new Map<string, number>();
