@@ -24,7 +24,7 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
-import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool } from './zomaToolDefinitions';
+import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool, xAdsToolkitEnabled } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
 import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
 import { getMetaHelpArticles } from './metaToolkitHelp';
@@ -480,7 +480,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
 
   // ENG-3131: the paywall sits in front of writes that make ads live (preview included, so the
   // user never approves a launch that cannot run). Reads, drafts and paused creates never reach it.
-  const assertPublishAllowed = async (platform: 'meta' | 'google_ads') => {
+  const assertPublishAllowed = async (platform: 'meta' | 'google_ads' | 'x_ads') => {
     try {
       await (deps.assertPublishAllowed ?? assertZomaPublishAllowed)(caller.userId, { platform, toolName: request.toolName });
     } catch (error) {
@@ -576,6 +576,30 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
       });
       if (!googleWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'google_ads', toolName: request.toolName });
       return stripCredentials(googleResult);
+    }
+  }
+
+  // ENG-3142: X Ads provider (dark until ZOMA_X_ADS_ENABLED=true), loaded lazily like Google.
+  if (xAdsToolkitEnabled()) {
+    const x = await import('./xAdsToolkitGateway');
+    if (x.isXAdsToolkitTool(request.toolName)) {
+      const xWrite = x.isXAdsToolkitWrite(request.toolName);
+      assertMetaToolkitScope(caller, request.toolName, xWrite);
+      if (xWrite && isZomaPublishWrite('x_ads', request.args)) await assertPublishAllowed('x_ads');
+      const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
+      const xResult = await x.handleXAdsToolkitCall(caller, request, {
+        listAccounts: deps.listAccounts,
+        now: deps.now,
+        meter: (result) => meter('x_ads', result),
+        recordWrite: async (input) => {
+          const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
+          journeyAfterCall(caller.userId, 'first_write', { platform: 'x_ads', toolName: request.toolName });
+          return recorded;
+        },
+        accessError: (message) => new MetaToolkitAuthError(message, 403),
+      });
+      if (!xWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'x_ads', toolName: request.toolName });
+      return stripCredentials(xResult);
     }
   }
 
