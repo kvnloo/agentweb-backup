@@ -35,7 +35,8 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
+import { buildKbListQuery, KB_APPEND_MAX_FILE_BYTES, KB_APPEND_SEPARATOR, KB_LIST_TYPES } from './knowledgeBaseParams';
+import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL, withLeadLock } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -1948,11 +1949,22 @@ mcpToolRegistry.register({
   name: 'list_knowledge_bases',
   definition: {
     name: 'list_knowledge_bases',
-    description: 'List all knowledge base files for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List knowledge base files for the authenticated user (private and public knowledge bases, connected Google Drive folders, ClickUp docs and Foreplay boards). '
+      + 'With no arguments it returns up to 100 files per source. Use kb_type to narrow to one kind of source, modified_after / modified_before (ISO dates such as 2026-04-15) to find recent files, and limit with offset to page through a large account; limit and offset apply per knowledge base source.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_type: { type: 'string', enum: [...KB_LIST_TYPES], description: 'Only return this kind of knowledge base. Omit to return all kinds.' },
+        modified_after: { type: 'string', description: 'Only files modified on or after this ISO date, e.g. "2026-04-15". Applies to Google Drive files.' },
+        modified_before: { type: 'string', description: 'Only files modified on or before this ISO date, e.g. "2026-04-22". Applies to Google Drive files.' },
+        limit: { type: 'number', description: 'Most files to return per knowledge base source (default 100).' },
+        offset: { type: 'number', description: 'Files to skip within each knowledge base source (default 0). Use with limit to page.' }
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
     return jsonResult(data);
   }
 });
@@ -2077,11 +2089,17 @@ async function readBackKbFile(kbId: string, fileName: string, context: any): Pro
   return entry ? { file_key: entry.key, size_bytes: Number(entry.size) || 0 } : null;
 }
 
-async function verifiedKbWrite(kbId: string, fileName: string, content: string, context: any) {
-  const expected = Buffer.byteLength(content, 'utf8');
+async function verifiedKbWrite(kbId: string, fileName: string, content: string, context: any, append?: { previousBytes: number }) {
+  const written = Buffer.byteLength(content, 'utf8');
+  // A replace leaves exactly the content; an append leaves what was stored, the separator Emma's append adds, and the content.
+  const expected = append ? append.previousBytes + Buffer.byteLength(KB_APPEND_SEPARATOR, 'utf8') + written : written;
   const stored = await readBackKbFile(kbId, fileName, context);
   if (!stored || stored.size_bytes !== expected) {
     return jsonResult({ success: false, error: 'Write could not be verified on read-back', kb_id: kbId, file_name: fileName });
+  }
+  if (append) {
+    // The whole file is not read back, so there is no hash of it to report: the size proves the text was added once.
+    return jsonResult({ success: true, mode: 'append', kb_id: kbId, file_name: fileName, file_key: stored.file_key, size_bytes: stored.size_bytes, previous_size_bytes: append.previousBytes, appended_bytes: written });
   }
   return jsonResult({
     success: true,
@@ -2157,33 +2175,51 @@ mcpToolRegistry.register({
   name: 'update_knowledge_base_file_content',
   definition: {
     name: 'update_knowledge_base_file_content',
-    description: `Replace the full content of an existing text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes, no binary). Returns the stored file key, size and sha256.`,
+    description: `Change the content of an existing text or markdown file in one of your own knowledge bases (max ${KB_TEXT_FILE_MAX_BYTES} bytes per call, no binary). `
+      + 'mode "replace" (the default) replaces the whole file; mode "append" adds content after the stored text, separated by a blank line, and never loses what is stored (use it to add notes or findings). '
+      + 'An append keeps the file under 10 MB. Returns the stored file key and size; a replace also returns the sha256 of the content, an append returns the bytes appended.',
     inputSchema: {
       type: 'object',
       properties: {
         kb_id: { type: 'string', description: 'Your knowledge base ID (from list_knowledge_bases)' },
         file_name: { type: 'string', description: `Existing file name (e.g. ${KB_MAIN_FILE})` },
-        content: { type: 'string', description: 'New file text (replaces the old content)' }
+        content: { type: 'string', description: 'File text: the new content for a replace, the text to add for an append' },
+        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) overwrites the file; append adds the content after the stored text.' }
       },
       required: ['kb_id', 'file_name', 'content']
     }
   },
   execute: async (args: any, context: any) => {
+    const mode = args?.mode === undefined || args?.mode === null || args?.mode === '' ? 'replace' : args.mode;
+    if (mode !== 'replace' && mode !== 'append') return jsonResult({ success: false, error: 'mode must be "replace" or "append"' });
     const contentError = kbTextContentError(args?.content);
     if (contentError) return jsonResult({ success: false, error: contentError });
     const content: string = args.content;
     const fileName = kbArg(args?.file_name);
     const nameError = kbFileNameError(fileName);
     if (nameError) return jsonResult({ success: false, error: nameError });
-    const task = await loadOwnKnowledgeBase(kbArg(args?.kb_id), context);
-    const exists = fileName === KB_MAIN_FILE || (task?.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName);
-    if (!task || !exists) return jsonResult({ success: false, error: KB_NOT_FOUND });
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/update-knowledge-base-file', context: ctx(context),
-      body: { task_id: task.taskId, file_name: fileName, content, mode: 'replace' }
-    });
-    if (!data?.success) return routeFailure(data);
-    return verifiedKbWrite(task.taskId, fileName, content, context);
+    const kbId = kbArg(args?.kb_id);
+    // An append is read, add, write on the storage side: one agent's parallel appends to one file are taken in turn (this process only).
+    const work = async () => {
+      const task = await loadOwnKnowledgeBase(kbId, context);
+      const exists = fileName === KB_MAIN_FILE || (task?.knowledgeBaseFiles || []).some((f: any) => f?.filename === fileName);
+      if (!task || !exists) return jsonResult({ success: false, error: KB_NOT_FOUND });
+      let previousBytes = 0;
+      if (mode === 'append') {
+        previousBytes = (await readBackKbFile(task.taskId, fileName, context))?.size_bytes ?? 0;
+        const after = previousBytes + Buffer.byteLength(KB_APPEND_SEPARATOR, 'utf8') + Buffer.byteLength(content, 'utf8');
+        if (after > KB_APPEND_MAX_FILE_BYTES) {
+          return jsonResult({ success: false, error: `the file would be ${after} bytes after this append; the maximum is ${KB_APPEND_MAX_FILE_BYTES} bytes. Nothing was changed.` });
+        }
+      }
+      const data = await mcpFetch({
+        method: 'POST', path: '/api/emma/update-knowledge-base-file', context: ctx(context),
+        body: { task_id: task.taskId, file_name: fileName, content, mode }
+      });
+      if (!data?.success) return routeFailure(data);
+      return verifiedKbWrite(task.taskId, fileName, content, context, mode === 'append' ? { previousBytes } : undefined);
+    };
+    return mode === 'append' ? withLeadLock(`kb:${kbId}/${fileName}`, work) : work();
   }
 });
 
