@@ -10,12 +10,32 @@
  *
  * Pure: no I/O. The caller supplies the account config and an already-minted link.
  */
-import { getMetaAdsNoPagesMessage, type MetaAdsScopeConfigLike } from '../utils/metaAdsScope';
+import { getAccessiblePageIds, getMetaAdsNoPagesMessage, type MetaAdsScopeConfigLike } from '../utils/metaAdsScope';
 
 export const META_BUSINESS_PAGES_SETTINGS_URL = 'https://business.facebook.com/settings/pages';
+/** Same URL as zomaOnboarding.META_CREATE_PAGE_URL (kept local to avoid an import cycle). */
+export const META_CREATE_PAGE_URL = 'https://www.facebook.com/pages/create';
+
+/** True when the probe found zero Pages and no existing-ads Page is recorded (nothing to grant access on). */
+export function metaHasNoPageAtAll(config: MetaAdsScopeConfigLike | null | undefined): boolean {
+  if (typeof config?.existing_ads_page_id === 'string' && config.existing_ads_page_id) return false;
+  const ids = getAccessiblePageIds(config);
+  return (ids !== undefined && ids.length === 0) || config?.meta_page_count === 0;
+}
 
 /** The fix steps, numbered. `pageId` names Page X when known; `link` is a fresh Meta connect link. */
-export function metaPageAccessFixSteps(opts: { pageId?: string; link?: string } = {}): string[] {
+export function metaPageAccessFixSteps(opts: { pageId?: string; link?: string; noPage?: boolean } = {}): string[] {
+  if (opts.noPage) {
+    const connect = opts.link
+      ? `Reconnect Meta with this one-click link, logged in as the same Facebook user → ${opts.link}`
+      : 'Reconnect Meta: run zoma_status for a one-click reconnect link and open it, logged in as the same Facebook user.';
+    return [
+      `Create a Facebook Page for the business (skip if you already have one) → ${META_CREATE_PAGE_URL}`,
+      connect,
+      'When Meta asks which Pages to share, select that Page (or all current and future Pages) and approve every requested permission.',
+      'Tell me when it is done and I will re-check.',
+    ];
+  }
   const page = opts.pageId ? `Facebook Page ${opts.pageId}` : 'the Facebook Page you advertise from';
   const reconnect = opts.link
     ? `Then reconnect Meta with this one-click link, logged in as the same Facebook user → ${opts.link}`
@@ -33,13 +53,18 @@ export function metaPageAccessRefusalText(
   config: MetaAdsScopeConfigLike | null | undefined,
   opts: { pageId?: string; link?: string } = {},
 ): string {
+  const noPage = !opts.pageId && metaHasNoPageAtAll(config);
   const existing = typeof config?.existing_ads_page_id === 'string' && config.existing_ads_page_id ? config.existing_ads_page_id : undefined;
   const pageId = opts.pageId || existing;
+  // A requested Page overrides the recorded existing-ads Page, so the text names only the Page asked for.
+  const problem = opts.pageId && existing && opts.pageId !== existing
+    ? `Meta Ads access is incomplete for this connection: Facebook Page ${opts.pageId} isn't one of the Pages this connection can currently access.`
+    : getMetaAdsNoPagesMessage(config);
   return [
-    getMetaAdsNoPagesMessage(config),
+    problem,
     'Nothing was sent to Meta. Reading campaigns and reports still works.',
     '',
     'To fix it:',
-    ...metaPageAccessFixSteps({ pageId, link: opts.link }).map((step, i) => `${i + 1}. ${step}`),
+    ...metaPageAccessFixSteps({ pageId, link: opts.link, noPage }).map((step, i) => `${i + 1}. ${step}`),
   ].join('\n');
 }

@@ -36,7 +36,7 @@ import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
-import { getMetaPagesAccessState } from '../utils/metaAdsScope';
+import { getAccessiblePageIds, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
@@ -299,6 +299,8 @@ export async function assertMetaPageAccessForCreate(
 ) {
   const config = findMetaAdAccount(accounts, accountId)?.config as any;
   if (getMetaPagesAccessState(config) !== 'missing') return;
+  // The account flag is account-wide; a requested Page the probe lists as accessible is usable.
+  if (opts.pageId && getAccessiblePageIds(config)?.includes(opts.pageId)) return;
   const link = opts.connectLink ? await opts.connectLink().catch(() => undefined) : undefined;
   throw new MetaToolkitRefusal(metaPageAccessRefusalText(config, { pageId: opts.pageId, link }));
 }
@@ -340,7 +342,8 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
   }
   const accounts = await deps.listAccounts(userId);
   assertAdsManagementGranted(accounts, accountId);
-  if (action === 'CREATE') {
+  // Only an AD needs a Page here (creatives are gated in metaToolkitCreatives); CAMPAIGN / AD_SET carry none.
+  if (action === 'CREATE' && entity === 'AD') {
     // A repeat confirm of a CREATE that already ran gets its recorded outcome, not a
     // "nothing was sent" Page refusal; only new CREATE dispatch is gated.
     // The replay is bound to the request that recorded it: the same token with changed

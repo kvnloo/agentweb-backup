@@ -151,7 +151,7 @@ describe('ENG-3129 Page gate on Zoma Meta creates', () => {
 
   it('names Page X when the account\'s existing ads run under a specific Page', async () => {
     const d = writeDeps({ has_meta_pages: false, existing_ads_page_id: '9001' });
-    const message = await refusalOf(executeMetaToolkitWrite('u1', { ...adCreate, entity_type: 'CAMPAIGN', params: { name: 'C', objective: 'OUTCOME_LEADS' } }, d));
+    const message = await refusalOf(executeMetaToolkitWrite('u1', adCreate, d));
     expectNoMetaCall(d);
     expect(message).toContain(buildMetaAdsWrongPageMessage('9001'));
     expect(message).toContain('access on Facebook Page 9001');
@@ -172,6 +172,39 @@ describe('ENG-3129 Page gate on Zoma Meta creates', () => {
     expect(message).toContain(LINK);
     expect(message).toContain('"Create ads" (Advertiser) access on Facebook Page 4242');
     await refusalOf(executeMetaToolkitCreative('u1', { ...creativeCreate(), action: 'BULK_CREATE', params: { page_id: '4242', items: [{ image_hash: 'h' }] } }, d));
+    expectNoMetaCall(d);
+  });
+
+  it('a creative for a Page the probe lists as accessible is not refused, even with the account flag false (Opslane run 2362 #1)', async () => {
+    const d = creativeDeps({ has_meta_pages: false, existing_ads_page_id: '9001', accessible_page_ids: ['4242'], meta_page_count: 1 });
+    (d.previewCreative as jest.Mock).mockResolvedValue({ success: true, awaitingUserConfirmation: true, summary: 'creative' });
+    await executeMetaToolkitCreative('u1', creativeCreate(), d).catch((e) => {
+      expect(e).not.toBeInstanceOf(MetaToolkitRefusal);
+    });
+    expect(d.connectLink).not.toHaveBeenCalled();
+  });
+
+  it('a refused creative for an inaccessible Page names only the requested Page, not the existing-ads Page', async () => {
+    const d = creativeDeps({ has_meta_pages: false, existing_ads_page_id: '9001', accessible_page_ids: ['5555'], meta_page_count: 1 });
+    const message = await refusalOf(executeMetaToolkitCreative('u1', creativeCreate(), d));
+    expect(message).toContain('Facebook Page 4242');
+    expect(message).not.toContain('9001');
+    expectNoMetaCall(d);
+  });
+
+  it('CAMPAIGN and AD_SET CREATE carry no Page and are not gated (Opslane run 2362 #2)', async () => {
+    const d = writeDeps({ has_meta_pages: false, existing_ads_page_id: '9001' });
+    const result: any = await executeMetaToolkitWrite('u1', { entity_type: 'CAMPAIGN', action: 'CREATE', account_id: ACCOUNT, params: { name: 'C', objective: 'OUTCOME_SALES' } }, d)
+      .catch((e) => { expect(String(e?.message)).not.toMatch(/Facebook Page/); return null; });
+    if (result) expect(result.status).toBe('PREVIEW');
+    expect(d.connectLink).not.toHaveBeenCalled();
+  });
+
+  it('with zero Pages at all, the first step is creating a Page, not granting access to one (Opslane run 2362 #3)', async () => {
+    const d = writeDeps({ has_meta_pages: false, accessible_page_ids: [], meta_page_count: 0 });
+    const message = await refusalOf(executeMetaToolkitWrite('u1', adCreate, d));
+    expect(message).toMatch(/1\. Create a Facebook Page for the business/);
+    expect(message).not.toContain('Assign people');
     expectNoMetaCall(d);
   });
 
