@@ -75,7 +75,7 @@ const IGNORED_ARGUMENTS = ['client_id', 'clientId', 'user_id', 'userId'];
 /** Refuse an argument this action does not take. Returns the identity-style arguments that were sent and will be ignored. */
 function checkArguments(args: any, action: 'read' | 'update'): string[] {
   const accepted = action === 'update' ? UPDATE_ARGUMENTS : READ_ARGUMENTS;
-  const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined);
+  const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined && args[k] !== null);
   // The three never-stored arguments of an update have their own, more specific refusal below.
   const unknown = sent.filter((k) => !accepted.includes(k) && !IGNORED_ARGUMENTS.includes(k) && !(action === 'update' && Object.prototype.hasOwnProperty.call(NEVER_STORED_ARGUMENTS, k)));
   if (unknown.length > 0) {
@@ -163,10 +163,11 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
   const index = new Map<string, number>();
   const exact = new Map<string, number>();
   merged.forEach((entry, i) => {
-    if (!plainObject(entry)) return;
-    const key = identity(entry[keyField]);
+    // A stored entry can be a bare string (the old tool's schema was a bare array, and Emma's own lookup reads such entries as names): it is an entry named by that text.
+    const named = typeof entry === 'string' ? entry : plainObject(entry) ? entry[keyField] : undefined;
+    const key = identity(named);
     if (key && !index.has(key)) index.set(key, i);
-    const spelled = cleanName(String(entry[keyField] ?? ''));
+    const spelled = cleanName(String(named ?? ''));
     if (spelled && !exact.has(spelled)) exact.set(spelled, i);
   });
   const added: string[] = [];
@@ -183,7 +184,8 @@ export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyFiel
       added.push(String(entry[keyField]));
       continue;
     }
-    const current = merged[at] as Entry;
+    // A bare string becomes an entry holding that name, with what the caller sent laid over it.
+    const current: Entry = typeof merged[at] === 'string' ? { [keyField]: cleanName(merged[at] as string) } : (merged[at] as Entry);
     const next: Entry = { ...current };
     let changed = false;
     for (const [field, value] of Object.entries(entry)) {
@@ -212,21 +214,30 @@ function checkedStrategy(response: any, action: 'read' | 'update'): Record<strin
 }
 
 /** What this process last saved for an account (the route's own answer), so a read that is older than that save is not mistaken for the current strategy. */
-const recentWrites = new Map<string, { at: number; updatedAt: string; data: Record<string, any>; changed: Set<string> }>();
+const recentWrites = new Map<string, { at: number; updatedAt: string; data: Record<string, any>; saves: Array<{ at: number; parts: string[] }> }>();
 export function clearRecentStrategyWrites(): void { recentWrites.clear(); }
 const freshWrite = (key: string) => {
   const mine = recentWrites.get(key);
   if (mine && Date.now() - mine.at > RECENT_WRITE_TTL_MS) { recentWrites.delete(key); return undefined; }
   return mine;
 };
-/** Remember a save (the route's answer) and which of the three parts it sent; the parts of saves made within the last minute add up. */
-function rememberWrite(key: string, data: Record<string, any>, sent: string[]): void {
+/**
+ * Remember a save (the route's answer) and which parts the call itself changed. A part counts for one minute from the save that changed it: parts that were
+ * only carried along by a later call do not start a new minute, so the memory does not chain.
+ */
+function rememberWrite(key: string, data: Record<string, any>, ownParts: string[]): void {
   if (typeof data.updatedAt !== 'string') return;
-  const changed = new Set<string>([...(freshWrite(key)?.changed ?? []), ...sent]);
+  const now = Date.now();
+  const saves = [...(freshWrite(key)?.saves ?? []).filter((x) => now - x.at <= RECENT_WRITE_TTL_MS), { at: now, parts: ownParts }];
   recentWrites.delete(key);
-  recentWrites.set(key, { at: Date.now(), updatedAt: data.updatedAt, data, changed });
+  recentWrites.set(key, { at: now, updatedAt: data.updatedAt, data, saves });
   for (const k of [...recentWrites.keys()]) freshWrite(k);
   while (recentWrites.size > RECENT_WRITE_MAX_ACCOUNTS) recentWrites.delete(recentWrites.keys().next().value as string);
+}
+/** The parts a save of the last minute changed. */
+function recentlyChangedParts(key: string): Set<string> {
+  const now = Date.now();
+  return new Set((freshWrite(key)?.saves ?? []).filter((x) => now - x.at <= RECENT_WRITE_TTL_MS).flatMap((x) => x.parts));
 }
 function newestOf(key: string, read: Record<string, any>): Record<string, any> {
   const mine = freshWrite(key);
@@ -238,7 +249,7 @@ function newestOf(key: string, read: Record<string, any>): Record<string, any> {
 export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
   const ignored = checkArguments(args, 'update');
   for (const [name, advice] of Object.entries(NEVER_STORED_ARGUMENTS)) {
-    if (args[name] !== undefined) fail(`"${name}" is not stored by the market strategy (${advice}). The market strategy holds businessOverview, competitors and icp.`);
+    if (args[name] !== undefined && args[name] !== null) fail(`"${name}" is not stored by the market strategy (${advice}). The market strategy holds businessOverview, competitors and icp.`);
   }
   let overview: string | undefined;
   if (args.businessOverview !== undefined && args.businessOverview !== null) {
@@ -295,7 +306,8 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     // The route fills every part this call does not send from its OWN read of the account, which can be older than a save made a moment ago (it reads through an
     // eventually consistent index) and would write that older part back over the saved one. So a part that a save of the last minute changed is sent again
     // from the checked baseline, whatever this call changes.
-    for (const part of freshWrite(lockKey)?.changed ?? []) {
+    const ownParts = Object.keys(body);
+    for (const part of recentlyChangedParts(lockKey)) {
       if (body[part] === undefined && stored[part] !== undefined && stored[part] !== null) body[part] = stored[part];
     }
     const sizeBefore = bytesOf({ businessOverview: stored.businessOverview, competitors: stored.competitors, icp: stored.icp });
@@ -304,7 +316,7 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
       fail(`the strategy would take ${sizeAfter} bytes, over the limit of ${MAX_STRATEGY_BYTES} (it sits on the account record, which has a hard size limit). Shorten entries or update existing ones instead of adding more.`);
     }
     const saved = strategyOf(await mcpFetch({ method: 'POST', path: '/api/market-strategy', context: c, body }));
-    rememberWrite(lockKey, saved, Object.keys(body));
+    rememberWrite(lockKey, saved, ownParts);
     // Totals are what the route reports as saved, not what was computed here.
     for (const kind of ['competitors', 'icp'] as const) {
       const section = answer[kind] as Record<string, unknown> | undefined;
@@ -349,6 +361,7 @@ export async function executeStrategyRead(args: any, c: any): Promise<any> {
     end++;
   }
   const out: Record<string, unknown> = {
+    ...(strategy.competitors !== undefined && strategy.competitors !== null && !Array.isArray(strategy.competitors) ? { warning: 'The stored competitors are not a list; totalCompetitors counts none of them. They are shown as stored.' } : {}),
     ...response,
     data: { ...strategy, competitors: all.slice(start, end) },
     totalCompetitors: all.length,
