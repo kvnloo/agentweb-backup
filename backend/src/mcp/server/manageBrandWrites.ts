@@ -15,12 +15,15 @@
  * This differs from Emma on purpose, and the PR says so.
  *
  * The REST route is unchanged. The founder merge is read, merge, write through the route, so a founder change made between the read and the write (by
- * the portal, or another session) can be overwritten; one agent's parallel calls are serialized in this process (the same lock the lead tools use).
+ * the portal, or another session) can be overwritten. Three things keep its baseline honest: calls on one ACCOUNT (the org, when the caller belongs to one)
+ * are taken in turn in this process; a read that shows no brand is read once more before it is believed (a missed read of a long-lived account would
+ * otherwise turn the write into a replace of the stored founders); and a read older than what this process just saved and read back is not used. Calls
+ * that reach different server instances are not covered.
  */
 
 import { mcpFetch } from './httpClient';
 import { jsonResult } from './toolHelpers';
-import { withLeadLock } from './manageLeadsWrites';
+import { withAccountLock } from './accountLock';
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 
 export const MAX_FOUNDERS_PER_CALL = 20;
@@ -43,8 +46,24 @@ const FOUNDER_TEXT_LIMITS: Record<string, number> = {
 
 type Founder = Record<string, unknown>;
 
+/** The top-level arguments an update takes. Any other argument is refused by name: it would be dropped while the call reported success. */
+const UPDATE_ARGUMENTS = ['action', 'company_name', 'mission', 'tone_of_voice', 'target_audience', 'key_messages', 'tagline', 'domain', 'brand_values', 'brand_personality', 'visual_identity', 'founders', 'remove_founders'];
+/** Identity-style arguments some callers add to every tool. They are never used (the brand is always the caller's own); the answer says they were ignored. */
+const IGNORED_ARGUMENTS = ['client_id', 'clientId', 'user_id', 'userId'];
+
+/** Refuse an argument an update does not take. Returns the identity-style arguments that were sent and will be ignored. */
+function checkArguments(args: any): string[] {
+  const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined);
+  const unknown = sent.filter((k) => !UPDATE_ARGUMENTS.includes(k) && !IGNORED_ARGUMENTS.includes(k));
+  if (unknown.length > 0) {
+    const names = unknown.map((k) => `"${k}"`).join(', ');
+    throw new Error(`manage_brand update: ${names} ${unknown.length > 1 ? 'are not inputs' : 'is not an input'} of update (it would be dropped, not saved). Update takes ${UPDATE_ARGUMENTS.filter((a) => a !== 'action').join(', ')}. Nothing was changed.`);
+  }
+  return sent.filter((k) => IGNORED_ARGUMENTS.includes(k));
+}
+
 const fail = (message: string): never => { throw new Error(`manage_brand update: ${message} Nothing was changed.`); };
-const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase();
+const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
 const plainObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Plain text field: undefined / null = not given; text is trimmed; blank = not given. */
@@ -147,8 +166,37 @@ export function mergeFoundersForMcp(stored: unknown, incoming: Founder[], remove
 
 const storedFoundersOf = (response: any): unknown[] => (Array.isArray(response?.brandData?.founders) ? response.brandData.founders : []);
 
+/** The route's answer to GET /api/brand/guidelines, checked: it answers either `exists: false` or `exists: true` with the brand data; anything else is not a baseline. */
+function checkedBrandRead(response: any): any {
+  if (!plainObject(response) || typeof response.exists !== 'boolean' || (response.exists && !plainObject(response.brandData))) {
+    throw new Error('manage_brand update: the stored brand guidelines could not be read, so nothing was changed. Try again.');
+  }
+  return response;
+}
+
+/** What this process last saved and read back for an account's founders, so a read that is older than that save is not mistaken for the current roster. */
+const RECENT_WRITE_TTL_MS = 60_000;
+const RECENT_WRITE_MAX_ACCOUNTS = 200;
+const recentWrites = new Map<string, { at: number; updatedAt: string; founders: unknown[] }>();
+export function clearRecentBrandWrites(): void { recentWrites.clear(); }
+function rememberWrite(key: string, read: any): void {
+  if (typeof read?.updatedAt !== 'string') return;
+  recentWrites.delete(key);
+  recentWrites.set(key, { at: Date.now(), updatedAt: read.updatedAt, founders: storedFoundersOf(read) });
+  const now = Date.now();
+  for (const [k, v] of recentWrites) if (now - v.at > RECENT_WRITE_TTL_MS) recentWrites.delete(k);
+  while (recentWrites.size > RECENT_WRITE_MAX_ACCOUNTS) recentWrites.delete(recentWrites.keys().next().value as string);
+}
+/** The founders to merge onto: what the read shows, unless it is older than what this process saved a moment ago. */
+function baselineFounders(key: string, read: any): unknown[] {
+  const mine = recentWrites.get(key);
+  if (!mine || Date.now() - mine.at > RECENT_WRITE_TTL_MS) return storedFoundersOf(read);
+  return typeof read?.updatedAt === 'string' && read.updatedAt >= mine.updatedAt ? storedFoundersOf(read) : mine.founders;
+}
+
 /** `update`: the six fields the tool always had, plus tagline, domain, brand values, brand personality and founders (merge by name; removal only by name). */
 export async function executeBrandUpdate(args: any, c: any): Promise<any> {
+  const ignored = checkArguments(args);
   // The six fields the tool always had keep their mapping and behaviour unchanged.
   const body: Record<string, unknown> = mapManageBrandUpdate(args);
 
@@ -179,23 +227,29 @@ export async function executeBrandUpdate(args: any, c: any): Promise<any> {
     fail('send at least one field to change. Blank text and empty lists change nothing, and a founder is only removed with remove_founders.');
   }
 
-  const who = c?.userId || c?.agentUserId || 'unknown';
-  return withLeadLock(`brand:${who}`, async () => {
+  return withAccountLock('brand', c, async (lockKey) => {
     let outcome: FounderOutcome | undefined;
     if (touchesFounders) {
-      const current: any = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
-      outcome = mergeFoundersForMcp(storedFoundersOf(current), incoming, removeNames);
+      let current: any = checkedBrandRead(await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c }));
+      if (!current.exists) {
+        // No brand is stored, per this read. True for an account that never saved one, and also what a missed read of a long-lived account looks like (the
+        // route's read can miss the org owner's record for a moment); a write built on a missed read replaces the stored founders. Read once more first.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const again = checkedBrandRead(await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c }));
+        if (again.exists) current = again;
+      }
+      outcome = mergeFoundersForMcp(baselineFounders(lockKey, current), incoming, removeNames);
       if (outcome.added.length > 0 && outcome.founders.length > MAX_STORED_FOUNDERS) {
         fail(`the brand would hold ${outcome.founders.length} founders, over the limit of ${MAX_STORED_FOUNDERS}. Update existing founders instead of adding more.`);
       }
       const changed = outcome.added.length + outcome.updated.length + outcome.removed.length > 0;
       if (changed) body.founders = outcome.founders;
       if (!changed && Object.keys(body).length === 0) {
-        return jsonResult({ success: true, changed: false, founders: foundersAnswer(outcome, outcome.founders.length), message: 'Everything sent is already stored exactly as given; nothing was written.' });
+        return jsonResult({ success: true, changed: false, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}), founders: foundersAnswer(outcome, outcome.founders.length), message: 'Everything sent is already stored exactly as given; nothing was written.' });
       }
     }
     const saved: any = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
-    const answer: Record<string, unknown> = { ...(plainObject(saved) ? saved : {}), success: true, changed: true };
+    const answer: Record<string, unknown> = { ...(plainObject(saved) ? saved : {}), success: true, changed: true, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}) };
     if (outcome && body.founders !== undefined) {
       // The route answers with a message only; read the founders back so the answer reports what is stored, not what was intended.
       const after: any = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
@@ -205,6 +259,7 @@ export async function executeBrandUpdate(args: any, c: any): Promise<any> {
       if (wanted.length !== got.length || wanted.some((n, i) => n !== got[i])) {
         return jsonResult({ success: false, error: 'The founders could not be verified on read-back; check them with manage_brand read before retrying.', founders: foundersAnswer(outcome, stored.length) });
       }
+      rememberWrite(lockKey, after);
       answer.founders = foundersAnswer(outcome, stored.length);
     } else if (outcome) {
       answer.founders = foundersAnswer(outcome, outcome.founders.length);

@@ -2276,11 +2276,14 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
-    if (args.action === 'read') {
+    // Any other action used to be taken as an update, so a mistyped "Read" wrote; now it is refused.
+    const action = typeof args?.action === 'string' ? args.action.trim().toLowerCase() : '';
+    if (action === 'read') {
       const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
       return jsonResult(data);
     }
-    return executeBrandUpdate(args, c);
+    if (action === 'update') return executeBrandUpdate(args, c);
+    throw new Error('manage_brand: action must be "read" or "update".');
   }
 });
 
