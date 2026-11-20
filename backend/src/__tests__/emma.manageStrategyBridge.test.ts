@@ -80,14 +80,36 @@ describe('manage_market_strategy is a tool of agent mode', () => {
     expect(emma!.definition).toBe(mcp!.definition);
   });
 
-  it('is offered by a real agent-mode service, next to Emma\'s own update_market_strategy', () => {
+  it('is registered in a real agent-mode service\'s tool registry, next to Emma\'s own update_market_strategy', () => {
     const names = service.getAvailableTools().map((t: any) => t.function?.name);
     expect(names).toContain('manage_market_strategy');
     expect(names).toContain('update_market_strategy');
   });
+});
 
-  it('is not a foundation tool: only a skill that lists it offers it to a session', () => {
-    expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).not.toContain('manage_market_strategy');
+describe('which sessions are offered it (review of f8ca60f: not through the catch-all pool)', () => {
+  const skill = (isPublished: boolean) => ({
+    skillId: 'strategy-skill', name: 'Strategy', description: 'Maintains the market strategy', isPublished, toolNames: ['manage_market_strategy'],
+  });
+
+  it('a session with foundation tools only is not offered it', () => {
+    const { allowedToolNames } = service.buildSkillContext([], ['*'], [], []);
+    expect(allowedToolNames.has('manage_market_strategy')).toBe(false);
+  });
+
+  it('the __other_skills__ catch-all pool does not carry it, although it still carries other tools', () => {
+    const pool = service.getUnassociatedToolNames([]);
+    expect(pool.length).toBeGreaterThan(0);
+    expect(pool).not.toContain('manage_market_strategy');
+    const { allowedToolNames } = service.buildSkillContext([], ['*'], [], ['__other_skills__']);
+    expect(allowedToolNames.has('manage_market_strategy')).toBe(false);
+  });
+
+  it('a session whose installed skill lists it is offered it (a private skill, then a published one)', () => {
+    for (const published of [false, true]) {
+      const { allowedToolNames } = service.buildSkillContext([skill(published)], ['*'], [skill(published)], ['strategy-skill']);
+      expect(allowedToolNames.has('manage_market_strategy')).toBe(true);
+    }
   });
 });
 
@@ -136,13 +158,30 @@ describe('a call made the way a chat turn makes it', () => {
     expect(JSON.stringify(soloRow())).toBe(before);
   });
 
-  it('writes nothing for a caller whose account cannot be identified', async () => {
+  it('refuses a caller whose account cannot be identified, with the tool\'s own refusal, and writes nothing', async () => {
     const before = JSON.stringify(fake.items('AW-Users'));
     const outcome = await callAsAgent({ action: 'update', competitors: [{ name: 'Ghost' }] }, 'user-that-does-not-exist').then(
       (r: any) => r,
       (e: any) => ({ success: false, error: String(e?.message ?? e) }),
     );
     expect(outcome.success).toBe(false);
+    expect(String(outcome.error)).toMatch(/could not be identified/);
+    expect(String(outcome.error)).not.toMatch(/Unknown tool/);
+    expect(JSON.stringify(fake.items('AW-Users'))).toBe(before);
+  });
+
+  it('refuses an anonymous (not signed-in) session with the same deferred refusal Emma\'s own strategy tool gives, for update and read, and writes nothing', async () => {
+    const before = JSON.stringify(fake.items('AW-Users'));
+    const update: any = await callAsAgent({ action: 'update', competitors: [{ name: 'Ghost' }] }, 'anon_abc123');
+    const read: any = await callAsAgent({ action: 'read' }, 'anon_abc123');
+    const emma: any = await service.executeTool(MODEL, 'update_market_strategy', { competitors: [{ name: 'Ghost' }] }, 'anon_abc123', 'bridge-session');
+
+    for (const refusal of [update, read]) {
+      expect(refusal.deferred).toBe(true);
+      expect(refusal.retryable).toBe(false);
+      expect(refusal.message).toContain('Sign in to use manage_market_strategy');
+    }
+    expect(update.reason).toBe(emma.reason);
     expect(JSON.stringify(fake.items('AW-Users'))).toBe(before);
   });
 });
