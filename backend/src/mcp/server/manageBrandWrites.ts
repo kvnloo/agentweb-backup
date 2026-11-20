@@ -50,6 +50,8 @@ type Founder = Record<string, unknown>;
 
 /** The top-level arguments an update takes. Any other argument is refused by name: it would be dropped while the call reported success. */
 const UPDATE_ARGUMENTS = ['action', 'company_name', 'mission', 'tone_of_voice', 'target_audience', 'key_messages', 'tagline', 'domain', 'brand_values', 'brand_personality', 'visual_identity', 'founders', 'remove_founders'];
+/** The keys of `visual_identity` that the brand stores (`mapManageBrandUpdate`); any other is refused by name. */
+const VISUAL_IDENTITY_FIELDS = ['primaryColor', 'primaryColorEnd', 'secondaryColor', 'fontFamily', 'isGradient'];
 /** Identity-style arguments some callers add to every tool. They are never used (the brand is always the caller's own); the answer says they were ignored. */
 const IGNORED_ARGUMENTS = ['client_id', 'clientId', 'user_id', 'userId'];
 
@@ -65,10 +67,14 @@ function checkArguments(args: any): string[] {
 }
 
 const fail = (message: string): never => { throw new Error(`manage_brand update: ${message} Nothing was changed.`); };
-/** Characters that show nothing (zero-width spaces and joiners, word joiner, byte-order mark, soft hyphen): a name holding one would look like another and not match it. */
-const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
-/** A name as it is stored: no invisible characters, no padding. */
-const cleanName = (value: string): string => value.replace(INVISIBLE, '').trim();
+/**
+ * Characters that show nothing: every Unicode format character (zero-width spaces and joiners, left-to-right and right-to-left marks and embeddings, word joiner,
+ * invisible operators, byte-order mark, soft hyphen), the variation selectors, the Mongolian vowel separator, the combining grapheme joiner and the blank braille
+ * pattern. A name holding one would look like another and not match it.
+ */
+const INVISIBLE = /[\p{Cf}\u180E\uFE00-\uFE0F\u034F\u2800]/gu;
+/** A name as it is stored: no invisible characters, accents composed (so "e" + a combining accent is the same as the single letter), no padding. */
+const cleanName = (value: string): string => value.replace(INVISIBLE, '').normalize('NFC').trim();
 /** Case, padding, repeated-space and invisible-character insensitive identity of a founder. */
 const identity = (value: unknown): string => cleanName(String(value ?? '')).toLowerCase().replace(/\s+/g, ' ');
 const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
@@ -89,6 +95,7 @@ export function validateFounders(value: unknown): Founder[] | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) return fail('founders must be a list of objects.');
   if (value.length > MAX_FOUNDERS_PER_CALL) return fail(`founders may hold at most ${MAX_FOUNDERS_PER_CALL} entries per call (got ${value.length}).`);
+  const seen = new Map<string, number>();
   return value.map((raw, i) => {
     const at = `founders[${i}]`;
     if (!plainObject(raw)) return fail(`${at} must be an object with a name.`);
@@ -97,6 +104,9 @@ export function validateFounders(value: unknown): Founder[] | undefined {
     const name = typeof raw.name === 'string' ? cleanName(raw.name) : '';
     if (name === '') return fail(`${at}.name is required and must be text.`);
     if (name.length > MAX_FOUNDER_NAME_CHARS) return fail(`${at}.name must be ${MAX_FOUNDER_NAME_CHARS} characters or fewer.`);
+    const again = seen.get(identity(name));
+    if (again !== undefined) return fail(`${at} names the same founder as founders[${again}] ("${name}"); send each founder once.`);
+    seen.set(identity(name), i);
     const clean: Founder = { name };
     for (const [field, max] of Object.entries(FOUNDER_TEXT_LIMITS)) {
       const text = optionalText(raw[field], `${at}.${field}`, max);
@@ -236,7 +246,12 @@ export async function executeBrandRead(args: any, c: any): Promise<any> {
 /** `update`: the six fields the tool always had, plus tagline, domain, brand values, brand personality and founders (merge by name; removal only by name). */
 export async function executeBrandUpdate(args: any, c: any): Promise<any> {
   const ignored = checkArguments(args);
-  // The six fields the tool always had keep their mapping and behaviour unchanged.
+  // The six fields the tool always had keep their mapping and behaviour unchanged, except that what would be dropped while the call reports success is refused.
+  if (args.visual_identity !== undefined && args.visual_identity !== null) {
+    if (!plainObject(args.visual_identity)) fail('visual_identity must be an object.');
+    const unknownVisual = Object.keys(args.visual_identity as object).filter((k) => !VISUAL_IDENTITY_FIELDS.includes(k));
+    if (unknownVisual.length > 0) fail(`visual_identity has fields that are not stored: ${unknownVisual.map((k) => `"${k}"`).join(', ')}. Supported fields: ${VISUAL_IDENTITY_FIELDS.join(', ')}.`);
+  }
   const body: Record<string, unknown> = mapManageBrandUpdate(args);
 
   const tagline = optionalText(args.tagline, 'tagline', MAX_TAGLINE_CHARS);
