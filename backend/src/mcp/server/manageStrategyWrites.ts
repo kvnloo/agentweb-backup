@@ -42,7 +42,7 @@ export const MAX_STORED_ICPS = 100;
 export const MAX_STRATEGY_BYTES = 250_000;
 /** How long this process remembers what it last saved for an account, to recognise a read that is older than that save. */
 const RECENT_WRITE_TTL_MS = 60_000;
-const RECENT_WRITE_MAX_ACCOUNTS = 200;
+const RECENT_WRITE_MAX_ACCOUNTS = 100;
 export const MAX_ENTRY_KEY_CHARS = 200;
 export const MAX_ENTRY_TEXT_CHARS = 5_000;
 export const MAX_BUYER_PERSONAS = 50;
@@ -77,7 +77,7 @@ function checkArguments(args: any, action: 'read' | 'update'): string[] {
   const accepted = action === 'update' ? UPDATE_ARGUMENTS : READ_ARGUMENTS;
   const sent = Object.keys(args ?? {}).filter((k) => args[k] !== undefined);
   // The three never-stored arguments of an update have their own, more specific refusal below.
-  const unknown = sent.filter((k) => !accepted.includes(k) && !IGNORED_ARGUMENTS.includes(k) && !(action === 'update' && k in NEVER_STORED_ARGUMENTS));
+  const unknown = sent.filter((k) => !accepted.includes(k) && !IGNORED_ARGUMENTS.includes(k) && !(action === 'update' && Object.prototype.hasOwnProperty.call(NEVER_STORED_ARGUMENTS, k)));
   if (unknown.length > 0) {
     const names = unknown.map((k) => `"${k}"`).join(', ');
     const takes = accepted.filter((a) => a !== 'action').join(', ');
@@ -88,8 +88,12 @@ function checkArguments(args: any, action: 'read' | 'update'): string[] {
 
 const fail = (message: string): never => { throw new Error(`manage_market_strategy update: ${message} Nothing was changed.`); };
 
-/** Case, padding and repeated-space insensitive identity of an entry (Emma's stored / not-stored lookup ignores case and padding; runs of spaces are folded too). */
-const identity = (value: unknown): string => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+/** Characters that show nothing (zero-width spaces and joiners, word joiner, byte-order mark, soft hyphen): a name holding one would look like another and not match it. */
+const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+/** A name as it is stored: no invisible characters, no padding. */
+const cleanName = (value: string): string => value.replace(INVISIBLE, '').trim();
+/** Case, padding, repeated-space and invisible-character insensitive identity of an entry (Emma's stored / not-stored lookup ignores case and padding). */
+const identity = (value: unknown): string => cleanName(String(value ?? '')).toLowerCase().replace(/\s+/g, ' ');
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -111,9 +115,10 @@ export function validateStrategyEntries(kind: 'competitors' | 'icp', value: unkn
     const unknownKeys = Object.keys(raw).filter((k) => !known.includes(k));
     if (unknownKeys.length > 0) return fail(`${at} has fields that are not stored: ${unknownKeys.map((k) => `"${k}"`).join(', ')}. Supported fields: ${known.join(', ')}. Other fields shown when you read an entry (such as extractedFilters) are kept for you: leave them out.`);
     const key = raw[keyField];
-    if (typeof key !== 'string' || key.trim() === '') return fail(`${at}.${keyField} is required and must be text.`);
-    if (key.trim().length > MAX_ENTRY_KEY_CHARS) return fail(`${at}.${keyField} must be ${MAX_ENTRY_KEY_CHARS} characters or fewer.`);
-    const clean: Entry = { [keyField]: key.trim() };
+    const name = typeof key === 'string' ? cleanName(key) : '';
+    if (name === '') return fail(`${at}.${keyField} is required and must be text.`);
+    if (name.length > MAX_ENTRY_KEY_CHARS) return fail(`${at}.${keyField} must be ${MAX_ENTRY_KEY_CHARS} characters or fewer.`);
+    const clean: Entry = { [keyField]: name };
     for (const field of known) {
       if (field === keyField || raw[field] === undefined || raw[field] === null) continue;
       if (field === 'buyerPersonas') {
@@ -156,20 +161,25 @@ export interface MergeOutcome {
 export function mergeStrategyEntries(stored: unknown, incoming: Entry[], keyField: KeyField): MergeOutcome {
   const merged: unknown[] = Array.isArray(stored) ? stored.slice() : [];
   const index = new Map<string, number>();
+  const exact = new Map<string, number>();
   merged.forEach((entry, i) => {
     if (!plainObject(entry)) return;
     const key = identity(entry[keyField]);
     if (key && !index.has(key)) index.set(key, i);
+    const spelled = cleanName(String(entry[keyField] ?? ''));
+    if (spelled && !exact.has(spelled)) exact.set(spelled, i);
   });
   const added: string[] = [];
   const updated: string[] = [];
   const unchanged: string[] = [];
   for (const entry of incoming) {
     const key = identity(entry[keyField]);
-    const at = index.get(key);
+    // The entry stored under exactly this spelling wins over a stored entry that differs only in case or spacing.
+    const at = exact.get(String(entry[keyField])) ?? index.get(key);
     if (at === undefined) {
       merged.push(entry);
       index.set(key, merged.length - 1);
+      exact.set(String(entry[keyField]), merged.length - 1);
       added.push(String(entry[keyField]));
       continue;
     }
@@ -202,19 +212,25 @@ function checkedStrategy(response: any, action: 'read' | 'update'): Record<strin
 }
 
 /** What this process last saved for an account (the route's own answer), so a read that is older than that save is not mistaken for the current strategy. */
-const recentWrites = new Map<string, { at: number; updatedAt: string; data: Record<string, any> }>();
+const recentWrites = new Map<string, { at: number; updatedAt: string; data: Record<string, any>; changed: Set<string> }>();
 export function clearRecentStrategyWrites(): void { recentWrites.clear(); }
-function rememberWrite(key: string, data: Record<string, any>): void {
+const freshWrite = (key: string) => {
+  const mine = recentWrites.get(key);
+  if (mine && Date.now() - mine.at > RECENT_WRITE_TTL_MS) { recentWrites.delete(key); return undefined; }
+  return mine;
+};
+/** Remember a save (the route's answer) and which of the three parts it sent; the parts of saves made within the last minute add up. */
+function rememberWrite(key: string, data: Record<string, any>, sent: string[]): void {
   if (typeof data.updatedAt !== 'string') return;
+  const changed = new Set<string>([...(freshWrite(key)?.changed ?? []), ...sent]);
   recentWrites.delete(key);
-  recentWrites.set(key, { at: Date.now(), updatedAt: data.updatedAt, data });
-  const now = Date.now();
-  for (const [k, v] of recentWrites) if (now - v.at > RECENT_WRITE_TTL_MS) recentWrites.delete(k);
+  recentWrites.set(key, { at: Date.now(), updatedAt: data.updatedAt, data, changed });
+  for (const k of [...recentWrites.keys()]) freshWrite(k);
   while (recentWrites.size > RECENT_WRITE_MAX_ACCOUNTS) recentWrites.delete(recentWrites.keys().next().value as string);
 }
 function newestOf(key: string, read: Record<string, any>): Record<string, any> {
-  const mine = recentWrites.get(key);
-  if (!mine || Date.now() - mine.at > RECENT_WRITE_TTL_MS) return read;
+  const mine = freshWrite(key);
+  if (!mine) return read;
   return typeof read.updatedAt === 'string' && read.updatedAt >= mine.updatedAt ? read : mine.data;
 }
 
@@ -248,11 +264,6 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
       if (typeof again.createdAt === 'string') stored = again;
     }
     stored = newestOf(lockKey, stored);
-    for (const kind of ['competitors', 'icp'] as const) {
-      if (stored[kind] !== undefined && stored[kind] !== null && !Array.isArray(stored[kind])) {
-        fail(`the stored ${kind} are not a list, so they cannot be merged safely.`);
-      }
-    }
     const body: Record<string, unknown> = {};
     const answer: Record<string, unknown> = { success: true };
 
@@ -267,6 +278,9 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     ];
     for (const [kind, incoming, keyField, cap] of lists) {
       if (!incoming || incoming.length === 0) continue;
+      if (stored[kind] !== undefined && stored[kind] !== null && !Array.isArray(stored[kind])) {
+        fail(`the stored ${kind} are not a list, so they cannot be merged safely.`);
+      }
       const outcome = mergeStrategyEntries(stored[kind], incoming, keyField);
       if (outcome.added.length > 0 && outcome.merged.length > cap) {
         fail(`${kind} would hold ${outcome.merged.length} entries, over the limit of ${cap}. Update existing entries instead of adding more.`);
@@ -278,13 +292,19 @@ export async function executeStrategyUpdate(args: any, c: any): Promise<any> {
     if (Object.keys(body).length === 0) {
       return jsonResult({ ...answer, changed: false, ...(ignored.length > 0 ? { ignoredArguments: ignored } : {}), message: 'Everything sent is already stored exactly as given; nothing was written.' });
     }
+    // The route fills every part this call does not send from its OWN read of the account, which can be older than a save made a moment ago (it reads through an
+    // eventually consistent index) and would write that older part back over the saved one. So a part that a save of the last minute changed is sent again
+    // from the checked baseline, whatever this call changes.
+    for (const part of freshWrite(lockKey)?.changed ?? []) {
+      if (body[part] === undefined && stored[part] !== undefined && stored[part] !== null) body[part] = stored[part];
+    }
     const sizeBefore = bytesOf({ businessOverview: stored.businessOverview, competitors: stored.competitors, icp: stored.icp });
     const sizeAfter = bytesOf({ businessOverview: body.businessOverview ?? stored.businessOverview, competitors: body.competitors ?? stored.competitors, icp: body.icp ?? stored.icp });
     if (sizeAfter > MAX_STRATEGY_BYTES && sizeAfter > sizeBefore) {
       fail(`the strategy would take ${sizeAfter} bytes, over the limit of ${MAX_STRATEGY_BYTES} (it sits on the account record, which has a hard size limit). Shorten entries or update existing ones instead of adding more.`);
     }
     const saved = strategyOf(await mcpFetch({ method: 'POST', path: '/api/market-strategy', context: c, body }));
-    rememberWrite(lockKey, saved);
+    rememberWrite(lockKey, saved, Object.keys(body));
     // Totals are what the route reports as saved, not what was computed here.
     for (const kind of ['competitors', 'icp'] as const) {
       const section = answer[kind] as Record<string, unknown> | undefined;
