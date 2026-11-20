@@ -41,6 +41,11 @@ function errorMessage(status: number, text: string): { message: string; code?: s
   try {
     const body = JSON.parse(text);
     const first = Array.isArray(body?.errors) ? body.errors[0] : undefined;
+    if (!first && Array.isArray(body?.operation_errors)) {
+      // Batch endpoints: item-level errors, one array per input item (X preserves order).
+      const items = (body.operation_errors as any[]).flatMap((errs, i) => (Array.isArray(errs) ? errs : []).map((e: any) => `item ${i + 1}: ${e?.code ?? ''} ${e?.message ?? ''}`.trim()));
+      if (items.length) return { message: `X Ads API ${status}: ${items.join('; ')}`.replace(/\s+/g, ' ').slice(0, 600), code: 'OPERATION_ERRORS' };
+    }
     if (first) return { message: `X Ads API ${status}: ${first.code ?? ''} ${first.message ?? ''}`.replace(/\s+/g, ' ').trim(), code: first.code };
   } catch {
     /* not JSON */
