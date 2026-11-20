@@ -16,7 +16,7 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
-import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { googleToolkitEnabled, xAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
 import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
@@ -46,12 +46,21 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
  * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
-function toolkitManifest(measurementReports: boolean) {
+export function toolkitManifest(measurementReports: boolean) {
   // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
-  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest(undefined, { measurementReports }));
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return annotateToolkitTools([...getMetaToolkitManifest(undefined, { measurementReports }), ...getGoogleToolkitManifest()]);
+  const tools: any[] = [...getMetaToolkitManifest(undefined, { measurementReports })];
+  if (googleToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
+    tools.push(...getGoogleToolkitManifest());
+  }
+  // ENG-3142: X Ads tools only while ZOMA_X_ADS_ENABLED is on.
+  if (xAdsToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getXAdsToolkitManifest } = require('../mcp/xAdsToolkitManifest') as typeof import('../mcp/xAdsToolkitManifest');
+    tools.push(...getXAdsToolkitManifest());
+  }
+  return annotateToolkitTools(tools);
 }
 
 /**
