@@ -7,21 +7,28 @@ knowledge-base tool changes (`create_knowledge_base_file`, `update_knowledge_bas
 `read_knowledge_base_files`). Creating a knowledge base through MCP still makes a private one only.
 
 - **What each input does is decided by the service** (`emma/impl/knowledgeBase.ts`, `listKnowledgeBaseFiles`), and the tool says so in its description:
-  `kb_type` picks the sources: `private` and `public` both mean "only the platform knowledge bases" (yours and the public ones; the service does not tell the
-  two apart), `google-drive`, `clickup`, `clickup-tasks`, `foreplay-swipefile` and `foreplay-board` mean only that connected source. `modified_after`,
-  `modified_before`, `limit` (default 100) and `offset` apply to the Google Drive files only (`limit` and `offset` per Drive folder); they have no effect on the
-  platform knowledge bases, ClickUp or Foreplay.
+  - `kb_type` picks the sources. `private` and `public` both mean "only the platform knowledge bases" (the service does not tell the two apart, and the
+    platform list is your own, those your organisation shares with you when org sharing is on, and the public ones: a `private` row is not necessarily
+    yours). `google-drive`, `clickup`, `clickup-tasks`, `foreplay-swipefile` and `foreplay-board` mean only that connected source; the two Foreplay values
+    return the same thing (the swipefile and every board). ClickUp folder entries are listed whatever `kb_type` is (the service has no guard there).
+  - `modified_after`, `modified_before`, `limit` (default 100) and `offset` apply to the Google Drive files only; they have no effect on the platform
+    knowledge bases, ClickUp or Foreplay (the answer's message still echoes them). `limit` and `offset` apply per Google Drive source (a registered folder
+    with everything under it), so paging Drive files repeats the other sources on every page; send `kb_type: google-drive` to page Drive alone (ClickUp folder
+    entries still come with it).
 - **Validated before anything is sent, refused by name:** `kb_type` must be one of the seven kinds (case and padding ignored); the dates must be calendar dates
   in `YYYY-MM-DD` form (the only form the service accepts; a date with a time, or a date that does not exist, is refused here instead of coming back from the
-  service as a failure); `limit` and `offset` must be whole numbers, as a number or as digits in text. Empty, blank and 0 mean "not given". With no
-  arguments the call is exactly what it was.
+  service as a failure), and `modified_after` must not be later than `modified_before` (no file could match); `limit` (1 to 1,000) and `offset` (0 to 100,000)
+  must be whole numbers, as a number or as digits in text. Empty, blank and 0 mean "not given", so 0 means the default, not "none" (the service would take a
+  limit of 0 literally and return no file). The bounds are the tool's: the service has none, and an unbounded value makes it walk a whole Drive folder on the
+  shared service account. With no arguments the call is exactly what it was.
 
 **Behaviour changes for outside callers:** none for a call that sends no argument. A call that sent one of these arguments used to have it dropped (the tool
 never forwarded it); it is now forwarded, or refused by name when it cannot be understood.
 
-**Limits (stated):** (1) `limit` and `offset` have no upper bound here (the service has none); a very large value may make the Drive listing walk until the
-service's own time limit (not observed). (2) The public knowledge bases of other users are part of the no-argument answer, as they always were. (3) The tests run the tool
-against a fake of the route; the service's handling of each input is as read from `emma/impl/knowledgeBase.ts`, not observed live.
+**Limits (stated):** (1) The no-argument answer includes the public knowledge bases of other users and, when org sharing is on, teammates' private ones, as it
+always did. (2) `foreplay-swipefile` and `foreplay-board` fetch the same things. (3) The tests run the tool against a fake of the route; the service's handling of
+each input is as read from `emma/impl/knowledgeBase.ts` (and run against a stubbed service by the independent review), not observed against live Drive, ClickUp
+or Foreplay. (4) The tool is classified `write` by the annotation policy, as before, so a `tools:read` key cannot call it.
 
 **Not in this change, on purpose:** an `append` mode for `update_knowledge_base_file_content`. A first version was built and reviewed; the review showed it
 cannot be verified by the recorded file size: `knowledgeBaseSize` holds the main file's size after a main-file write but the SUM of the attachments after an
