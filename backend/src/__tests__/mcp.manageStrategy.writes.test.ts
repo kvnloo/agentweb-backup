@@ -903,9 +903,12 @@ describe('update: solo accounts, the org flag and the memory\'s end', () => {
       expect(r.text).toMatch(/the organisation's market strategy could not be read.*Try again\. Nothing was changed/);
     });
     const personal = { success: true, data: { businessOverview: 'Personal', competitors: [{ name: 'PersonalRival' }], icp: [], createdAt: STORED_AT, updatedAt: STORED_AT }, isOrgLevel: false };
-    await withStrategyReadsOverridden((call) => (call === 1 ? emptyPersonal : personal), async () => {
+    // The first read is flagged as the org's but shows nothing stored, so the tool reads again; the second read is the personal strategy: its flag is the one that counts.
+    const emptyOrgLevel = { success: true, data: { businessOverview: '', competitors: [], icp: [] }, isOrgLevel: true };
+    await withStrategyReadsOverridden((call) => (call === 1 ? emptyOrgLevel : personal), async () => {
       const r = await update(owner, { competitors: [{ name: 'Delta' }] });
       expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/the organisation's market strategy could not be read/);
     });
     expect(JSON.stringify(orgRow(TENANT_A.orgId))).toBe(before);
   });
