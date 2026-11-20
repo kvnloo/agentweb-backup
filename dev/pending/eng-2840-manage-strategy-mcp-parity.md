@@ -28,7 +28,8 @@ for the lists the tool hands it, because they are already the merged ones.
 - **a call that changes nothing writes nothing.** A write that carries `icp` marks the ICPs as hand-edited, which switches the account off its cached ICP
   search filters (`icpUpdatedAt`), so repeating what is already stored must not do that. Stored text is compared trimmed, so stored padding does not make a
   repeat look like a change. Only the parts that changed are sent to the route.
-- **read:** the competitor list comes back one page at a time (about 12,000 characters of competitors per page, at least one entry); `totalCompetitors` is
+- **read:** the competitor list comes back one page at a time (about 12,000 characters of compact JSON of competitors per page, at least one entry; the answer is pretty-printed, so the text a client receives is up to about
+  half as large again); `totalCompetitors` is
   the true count and `nextCompetitorOffset` (null on the last page) says where the next page starts; an offset past the end (including one too big to be
   exact) lands on the last entry rather than an empty page. `competitorNames` (up to 50) answers stored / not stored with the offset, whatever the page
   shows; names past 50 are reported as not checked. A roster that fits one page reads as before, with the extra paging fields. The overview and ICPs are
@@ -37,7 +38,7 @@ for the lists the tool hands it, because they are already the merged ones.
   something. A call that changes nothing makes no write at all, so it is answered (`changed: false`) without the route's editor check; the caller can read
   everything such an answer tells it. Isolation of which strategy is the caller's is the route's (tests: `mcp.twoTenantIsolation.test.ts`,
   `mcp.manageStrategy.writes.test.ts`).
-- **parallel calls:** calls on one ACCOUNT are serialized in arrival order within the server process (the same lock as `manage_leads`; the key is the org
+- **parallel calls:** calls on one ACCOUNT are serialized, in the order their account lookups finish, within the server process (the same locking mechanism as `manage_leads`, with its own keys; the key is the org
   when the caller belongs to one, else the user, because an org's strategy is shared by its members), since the merge is read, merge, write: two calls sent
   together (one agent's parallel calls, or the owner's agent and an editor's) would each merge onto the same stored lists and the second write would drop the
   first one's entries.
@@ -46,6 +47,9 @@ for the lists the tool hands it, because they are already the merged ones.
   believed, because the route's read can miss the org owner's record for a moment and a write built on that would replace the real lists; and a read whose
   `updatedAt` is older than the strategy this process saved for that account within the last minute is not used (the saved copy is), because the route reads
   through an eventually consistent index and the next call of a serialized pair starts right after the first one's write.
+- **an org caller is never merged onto a personal strategy:** the route's read answers with the org's strategy (`isOrgLevel` true) or, when its read of the org
+  misses, with the caller's personal one. If the caller belongs to an org and the answer is not the org's, the call is refused ("the organisation's market
+  strategy could not be read ... Nothing was changed"). The account lookup's own error text (it can name roles and tables) goes to the log, not to the caller.
 - **parts the route would fill from its own read:** the tool sends the route only the parts a call changes (so a no-change part does not stamp `icpUpdatedAt`),
   and for every part it does not send the route fills the value from its OWN read of the account, which can be older than a save made a moment ago and would
   write that older part back over the saved one (the second independent review reproduced this: a competitors save followed straight away by an
@@ -65,7 +69,7 @@ not folded and still make a second entry); when two stored entries
 differ only by case or spacing, the one with the exact spelling is the one updated. Every update does at least one extra read of the strategy, and one more
 after a 200 ms wait when the read shows no `createdAt` (older strategies). Stored lists that are not lists block only an update of that list. The answer of an
 update changed shape: it used to be `{success, data: <the whole saved strategy>, message}` and is now `{success, changed, businessOverview?, competitors?,
-icp?}` with added / updated / unchanged names and the saved totals (no `data`, no `message`). A blank `businessOverview` used to clear the overview and is
+icp?}` with added / updated / unchanged names and the saved totals (no `data`; a call that changes nothing also carries a `message`). A blank `businessOverview` used to clear the overview and is
 now refused as "nothing to send" (the overview can no longer be cleared over MCP). Any `action` other than `read` or `update` (case ignored) used to be taken
 as an update, so a mistyped "Read" wrote; it is now refused. A field shown when an entry is read (such as the ICP's `extractedFilters`) cannot be sent back:
 it is refused with a hint to leave it out (it is kept for you).
@@ -74,7 +78,7 @@ it is refused with a hint to leave it out (it is kept for you).
 route does not, so this tool does not. The route rebuilds the stored strategy from its six known keys (`businessOverview`, `competitors`, `icp`, `createdAt`,
 `updatedAt`, `icpUpdatedAt`); Emma's merge keeps any other top-level key the record happens to hold, so for such a stray key the route's replace is not a
 no-op. Emma's merge matches names exactly (only its lookup ignores case); Emma floors a fractional read offset and clamps a negative one where this tool
-refuses them; Emma stamps `icpUpdatedAt` on any `icp` argument, including one that changes nothing; Emma's read answers with the whole `marketData`.
+refuses them; Emma stamps `icpUpdatedAt` on any `icp` argument, including one that changes nothing; Emma's update answers with the saved `marketData`, and its read answers with formatted text and paging fields.
 
 **Limits (stated):** (0) An admin's `client_id` is ignored (and listed in `ignoredArguments`): the tool has never supported client scoping, so an admin who
 means a client's account gets a write on their own account, with only that note to catch it; other tools refuse `client_id`, but the two-tenant isolation tests
