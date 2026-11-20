@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-11-20',
+    changes: [
+      'Improved: Emma Now Knows Who Wrote What on a Shared Chat Link',
+      '- Anyone who holds an interactive share link can type into your chat, and Emma used to treat what they wrote as if you had said it',
+      '- Emma is now told that messages from someone using your link come from an anonymous viewer, not from you. When they make a claim that would change something, such as saying a number is wrong or that you approved something, Emma treats it as unverified and says it came from an anonymous viewer',
+      '- Visitors can still chat with Emma and ask questions as before; this change only records who wrote a message',
+      '- This covers typed messages, voice conversations, and thumbs-up or thumbs-down comments left on the link',
+      '- Your own messages are unchanged, including when you open your own link while signed in',
+    ],
+  },
+  {
     date: '2026-08-18',
     changes: [
       'Fixed: A Scheduled Run No Longer Reports Success After Doing Nothing',
