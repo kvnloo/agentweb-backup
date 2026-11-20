@@ -126,7 +126,9 @@ const defaultDeps: MetaToolkitWriteDeps = {
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
   assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
   conversionLookup: async (userId, accountId) => (await ams()).toolkitMetaConversionLookup(userId, accountId),
-  connectLink: async (userId) => (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing'),
+  // Zoma-token callers: the zoma state claim routes the Meta callback back to Zoma's pages.
+  connectLink: async (userId) =>
+    (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing', { zoma: (await import('./zomaSetupLinks')).ZOMA_MCP_SETUP }),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
