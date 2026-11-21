@@ -1017,6 +1017,7 @@ export class HubSpotService {
       properties: opts.properties,
       limit: Math.min(Math.max(opts.limit ?? 100, 1), 100),
     };
+    if (!Number.isInteger(body.limit)) throw new Error(`HubSpot search limit must be an integer (got ${opts.limit})`);
     if (opts.cursor) body.after = opts.cursor;
     if (opts.sortBy) body.sorts = [{ propertyName: opts.sortBy, direction: opts.sortDirection ?? 'DESCENDING' }];
     const res = await axiosInstance.post(
@@ -1043,6 +1044,8 @@ export class HubSpotService {
         { properties, inputs: chunk.map((id) => ({ id })) },
         { headers: await this.authHeaders() }
       );
+      // A 207 means some contacts failed to read; never report a partial read as complete.
+      throwIfBatchPartialFailure(res);
       out.push(...(((res.data as any)?.results ?? []).map((r: any) => ({ id: String(r.id), properties: r.properties ?? {} }))));
     }
     return out;

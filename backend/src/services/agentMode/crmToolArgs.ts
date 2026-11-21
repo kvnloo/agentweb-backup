@@ -9,7 +9,8 @@ export function normalizeHubSpotArgs(raw: any): any {
     const method = typeof args.method === 'string' ? args.method.trim().toUpperCase() : 'GET';
     if (entity && (args.action || method === 'GET')) {
       args.entity_type = entity;
-      if (!args.action) args.action = 'LIST';
+      // DEALS has no LIST action; a bare collection GET means "search deals".
+      if (!args.action) args.action = entity === 'DEALS' ? 'SEARCH' : 'LIST';
       delete args.endpoint;
       delete args.method;
     }

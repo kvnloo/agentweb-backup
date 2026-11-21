@@ -1711,9 +1711,11 @@ export async function handleHubspotApi(userId: string, args: any): Promise<any> 
             // Accept either an internal stage id or a human label ("New Business Meetings").
             const wanted = String(stageArg).trim().toLowerCase();
             const pipelines = await svc.listDealPipelines();
-            for (const p of pipelines) {
-              if (args?.pipeline && p.id !== String(args.pipeline)) continue;
-              for (const s of p.stages) if (s.id.toLowerCase() === wanted || s.label.trim().toLowerCase() === wanted) stageIds.push(s.id);
+            const scoped = pipelines.filter((p) => !args?.pipeline || p.id === String(args.pipeline));
+            // An exact stage id wins over a stage whose label happens to equal it.
+            for (const p of scoped) for (const s of p.stages) if (s.id.toLowerCase() === wanted) stageIds.push(s.id);
+            if (!stageIds.length) {
+              for (const p of scoped) for (const s of p.stages) if (s.label.trim().toLowerCase() === wanted) stageIds.push(s.id);
             }
             if (!stageIds.length) {
               return {
