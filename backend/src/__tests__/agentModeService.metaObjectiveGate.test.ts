@@ -115,6 +115,39 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(metaService.createCampaign).toHaveBeenCalled();
     });
 
+    // ENG-3164: a share-link visitor runs under the owner's userId, so their message is a plain 'user' row. The objective
+    // is immutable once the campaign exists; it must be in the OWNER's own words.
+    it('REJECTS a real quote when the last user message is a share-link visitor\'s (falls through to the ask card)', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Create a leads campaign for our new offer.', metadata: { ishareSender: { isAnonymous: true } } },
+      ]);
+      const result = await callApi(
+        service,
+        validParams({ objective: 'OUTCOME_LEADS', objective_quote: 'leads campaign' }),
+        'session-1',
+      );
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+      expect(chatbotDb.updateSessionObjectiveConfirmation).not.toHaveBeenCalled();
+    });
+
+    it('still ALLOWS the owner\'s own quote when an earlier row in the session was a visitor\'s', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'what is the weather', metadata: { ishareSender: { isAnonymous: true } } },
+        { role: 'assistant', content: 'I cannot check the weather.' },
+        { role: 'user', content: 'Create a leads campaign for our new offer.' },
+      ]);
+      const result = await callApi(
+        service,
+        validParams({ objective: 'OUTCOME_LEADS', objective_quote: 'leads campaign' }),
+        'session-1',
+      );
+      expect(result.success).toBe(true);
+      expect(metaService.createCampaign).toHaveBeenCalled();
+    });
+
     it('REJECTS a quote that does not actually appear in the message (falls through to the ask gate)', async () => {
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
         { role: 'user', content: 'Just make me a campaign, whatever works.' },

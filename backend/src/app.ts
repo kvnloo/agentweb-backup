@@ -69,6 +69,7 @@ import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
 import linkedInAdsAuthRoutes from "./routes/linkedInAdsAuth";
 import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
+import xAdsAuthRoutes from "./routes/xAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook";
@@ -558,6 +559,7 @@ app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/google-ads", googleAdsAuthRoutes);
+app.use("/api/oauth/x-ads", xAdsAuthRoutes); // ENG-3142: 404s while ZOMA_X_ADS_ENABLED is off
 app.use("/api/oauth/fathom", fathomAuthRoutes);
 app.use("/api/oauth/hubspot", hubspotAuthRoutes);
 app.use("/api/oauth/attio", attioAuthRoutes);
