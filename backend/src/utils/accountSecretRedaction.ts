@@ -14,7 +14,7 @@
  * account platform: OAuth access/refresh tokens, Fathom's API key, and the
  * Attio/Calendly webhook HMAC signing key.
  */
-const SECRET_CONFIG_KEYS = ['access_token', 'refresh_token', 'api_key', 'webhook_signing_key'] as const;
+const SECRET_CONFIG_KEYS = ['access_token', 'refresh_token', 'api_key', 'webhook_signing_key', 'access_token_secret'] as const;
 
 // Compile-time tripwire: `SECRET_CONFIG_KEYS` above is a hand-maintained
 // literal list with nothing forcing it to stay in sync with
