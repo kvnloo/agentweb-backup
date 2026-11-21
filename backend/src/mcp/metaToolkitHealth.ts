@@ -192,6 +192,13 @@ export const OPTIMIZATION_WINDOW = 'last_7d';
 export const OPTIMIZATION_ADSET_FIELDS =
   `id,name,campaign_id,effective_status,optimization_goal,promoted_object,insights.date_preset(${OPTIMIZATION_WINDOW}){spend,actions}`;
 
+/**
+ * Optimization goals that deliver against the promoted conversion event. Other goals (for
+ * example LINK_CLICKS on a conversions campaign) may still carry a promoted_object, but Meta
+ * does not optimize toward that event, so its volume says nothing about delivery.
+ */
+export const CONVERSION_OPTIMIZATION_GOALS = new Set(['OFFSITE_CONVERSIONS', 'VALUE']);
+
 type OptimizationVerdict = 'ok' | 'low_volume' | 'no_events' | 'not_judged';
 
 export interface OptimizationEventRow {
@@ -228,6 +235,10 @@ export function summarizeOptimizationEvents(adSets: any[]) {
     };
     const notJudged = (note: string): OptimizationEventRow => ({ ...base, verdict: 'not_judged', note });
 
+    const goal = typeof a.optimization_goal === 'string' ? a.optimization_goal.toUpperCase() : '';
+    if (goal && !CONVERSION_OPTIMIZATION_GOALS.has(goal) && resolved.kind !== 'none') {
+      return notJudged(`Optimizes for ${goal}, not for its promoted conversion event, so that event's volume does not apply to this ad set.`);
+    }
     if (resolved.kind === 'none') return notJudged('Not optimizing for a conversion event, so there is no event volume to check.');
     if (resolved.kind === 'ignored') {
       return notJudged('Optimizes for a custom conversion. Meta insights do not report it under a standard event, so it is not counted here; check it in Events Manager.');

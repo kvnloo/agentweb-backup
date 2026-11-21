@@ -72,6 +72,18 @@ describe('ENG-2917 summarizeOptimizationEvents', () => {
     expect(r.warnings).toEqual([]);
   });
 
+  it('does not judge a promoted event the ad set is not optimizing for', () => {
+    const r = summarizeOptimizationEvents([
+      { id: 'clicks', optimization_goal: 'LINK_CLICKS', promoted_object: pixel('PURCHASE'), insights: insights('25') },
+      { id: 'conv', optimization_goal: 'OFFSITE_CONVERSIONS', promoted_object: pixel('PURCHASE'), insights: insights('25') },
+    ]);
+    expect(r.ad_sets[0]).toMatchObject({ verdict: 'not_judged' });
+    expect(r.ad_sets[0]).not.toHaveProperty('events_7d');
+    expect(r.ad_sets[0].note).toMatch(/LINK_CLICKS/);
+    expect(r.ad_sets[1]).toMatchObject({ verdict: 'no_events', events_7d: 0 });
+    expect(r.warnings).toHaveLength(1);
+  });
+
   it('tolerates a malformed ad set list', () => {
     expect(summarizeOptimizationEvents(undefined as any).summary.total).toBe(0);
     expect(summarizeOptimizationEvents([null, { id: '1', promoted_object: 'x', insights: { data: 'nope' } }] as any).ad_sets[0].verdict).toBe('not_judged');
