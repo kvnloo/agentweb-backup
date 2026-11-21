@@ -2865,7 +2865,7 @@
   {
     "name": "manage_market_strategy",
     "listed": false,
-    "description": "Read or update market strategy. Use action: \"read\" or \"update\".",
+    "description": "Read or update the market strategy: the business overview, the competitors and the ideal customer profiles (ICPs). Use action: \"read\" or \"update\". Read: the competitor list comes back one page at a time (about 12,000 characters per page); totalCompetitors is always the true count and nextCompetitorOffset (null on the last page) is where the next page starts. Before adding a competitor, pass competitorNames (up to 50) to learn which are already stored, whatever the page shows. Update: send only what changes. Competitors are merged by name and ICPs by title (case and padding ignored): an entry that is already stored is updated field by field and every other stored entry is kept; new ones are added. An empty list or blank text changes nothing, and nothing can be removed here. businessOverview replaces the stored overview. A competitor holds name and description; an ICP holds title, description, valueProposition and buyerPersonas (a list of text that replaces that profile's persona list). Other fields are refused. positioning, differentiators and channels are not stored and are refused (put them in businessOverview). At most 100 entries per list per call. The answer lists what was added, updated or unchanged and the true totals. Changing an org's market strategy needs the same editor rights as in the app.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2877,27 +2877,71 @@
           ],
           "description": "Action"
         },
-        "positioning": {
+        "competitorOffset": {
+          "type": "number",
+          "description": "Read: 0-based index of the first competitor to return. Use nextCompetitorOffset from the previous answer for the next page."
+        },
+        "competitorNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Read: names to check against the stored competitors (up to 50). The answer says stored or not for each, with its offset."
+        },
+        "businessOverview": {
           "type": "string",
-          "description": "Market positioning (update)"
+          "description": "Update: the business overview (mission, vision, value propositions). Replaces the stored overview; blank changes nothing."
         },
         "competitors": {
           "type": "array",
-          "description": "Competitor list (update)"
-        },
-        "differentiators": {
-          "type": "array",
+          "description": "Update: competitors to add or update, merged by name. Never removes a stored competitor.",
           "items": {
-            "type": "string"
-          },
-          "description": "Key differentiators (update)"
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Competitor name"
+              },
+              "description": {
+                "type": "string",
+                "description": "Competitor description or analysis"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
         },
-        "channels": {
+        "icp": {
           "type": "array",
+          "description": "Update: ideal customer profiles to add or update, merged by title. Never removes a stored profile.",
           "items": {
-            "type": "string"
-          },
-          "description": "Marketing channels (update)"
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "ICP title or name"
+              },
+              "description": {
+                "type": "string",
+                "description": "ICP description or characteristics"
+              },
+              "valueProposition": {
+                "type": "string",
+                "description": "Value proposition for this customer type"
+              },
+              "buyerPersonas": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Buyer personas for this customer type (replaces this profile's list)"
+              }
+            },
+            "required": [
+              "title"
+            ]
+          }
         }
       },
       "required": [
