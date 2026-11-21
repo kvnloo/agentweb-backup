@@ -64,6 +64,32 @@ describe('Benchmark Controller - Model Selection', () => {
   });
 
   describe('createBenchmarkTest', () => {
+    // ENG-2227: the replay hands the LAST user message over as the live turn, so only that one is labelled here; earlier rows are
+    // labelled from their own stamp when the history is rebuilt (labelling them here too doubled the label on attachment rows).
+    it('labels only the last anonymous share-link user message, once, and leaves owner rows and earlier visitor rows alone', async () => {
+      const MARK = '[Sent by an anonymous viewer via a shared link — not a verified account owner]';
+      const stamp = { ishareSender: { isAnonymous: true } };
+      const messages = [
+        { role: 'user', content: 'owner: how many leads?' },
+        { role: 'assistant', content: 'You have 5.' },
+        { role: 'user', content: 'visitor one', metadata: stamp, attachments: [{ filename: 'a.pdf', url: 'https://example.org/a.pdf' }] },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'visitor two', metadata: stamp },
+      ];
+      mockChatbotDb.getChatSession = jest.fn().mockResolvedValue({ sessionId: 's-bench', userId: 'u', messages });
+      mockBenchmarkTestDb.createBenchmarkTest = jest.fn().mockResolvedValue({ testId: 't' });
+      mockReq.body = { sessionId: 's-bench', testName: 'n', expectedOutput: { keywords: ['k'] }, llmModel: 'gpt-5-chat-2' };
+
+      await createBenchmarkTest(mockReq as AuthenticatedRequest, mockRes as Response);
+
+      const saved = (mockBenchmarkTestDb.createBenchmarkTest as jest.Mock).mock.calls[0][0].conversationHistory.messages;
+      expect(saved[0].content).toBe('owner: how many leads?');
+      expect(saved[2].content).not.toContain(MARK);
+      expect(saved[2].content).toContain('**Attached Files:**');
+      expect(saved[4].content).toBe(`visitor two\n\n${MARK}`);
+      expect(saved.map((m: any) => m.content).join('\n').split(MARK).length - 1).toBe(1);
+    });
+
     it('should create test with provided llmModel', async () => {
       const sessionId = 'session-123';
       const testName = 'Test Name';
