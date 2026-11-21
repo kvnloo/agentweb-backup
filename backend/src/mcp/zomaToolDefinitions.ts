@@ -9,10 +9,23 @@
  * surface — tool list, routing, zoma_status, setup pages, tool descriptions, MCP instructions,
  * docs — is Meta only. On: the Google Ads implementation is listed, routed and shown again.
  */
+import { ZOMA_INDUSTRY_BENCHMARK_DEFINITION } from './zomaIndustryBenchmark';
+
 export const ZOMA_GOOGLE_FLAG = 'ZOMA_GOOGLE_ENABLED';
 
 export function googleToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[ZOMA_GOOGLE_FLAG] === 'true';
+}
+
+/**
+ * ENG-3142: Zoma's X (Twitter) Ads switch. Off (unset or anything but "true", the default): X is
+ * not listed, routed, offered in zoma_status, or reachable through its connect routes. On: the
+ * X Ads provider is advertised alongside Meta (and Google when that flag is on).
+ */
+export const ZOMA_X_ADS_FLAG = 'ZOMA_X_ADS_ENABLED';
+
+export function xAdsToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[ZOMA_X_ADS_FLAG] === 'true';
 }
 
 export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload', 'zoma_custom_audiences'] as const;
@@ -124,5 +137,7 @@ export function zomaToolDefinitions(google: boolean = googleToolkitEnabled()) {
         additionalProperties: false,
       },
     },
+    // ENG-3156: read-only CPA vs a sourced industry benchmark; dispatched by the gateway on the resolved ad account.
+    ZOMA_INDUSTRY_BENCHMARK_DEFINITION,
   ];
 }

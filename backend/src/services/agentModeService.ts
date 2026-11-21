@@ -256,6 +256,7 @@ import { getCrmSenders as sharedGetCrmSenders } from '../emma/impl/shared/crmSen
 // ENG-2103 (F2): brand guidelines / market strategy tool cluster, same
 // treatment as leadsImpl above.
 import * as brandMarketStrategyImpl from '../emma/impl/brandMarketStrategy';
+import { unattendedBrandContextMessage } from './brandMessagingContext';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same
 // treatment as leadsImpl above.
 import * as mediaVideoImpl from '../emma/impl/mediaVideo';
@@ -377,7 +378,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'read_client_meta_budgets', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -620,6 +621,7 @@ import {
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
+import { isAnonymousShareMessage, isServerAuthoredContinuation, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 
 /**
@@ -3224,7 +3226,7 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
       }
     }
-    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare, messageContent);
 
     // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
     let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
@@ -3409,6 +3411,11 @@ export class AgentModeService {
     // so undefined must be excluded, not just false — same strict-true discriminator
     // already used at the Meta-write approval-deck gate below.
     if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+      // ENG-3066: nobody is present to notice outreach written without knowing what the sender
+      // sells, so the compact brand block is given up front instead of depending on the model
+      // choosing to call read_brand_guidelines. Pushed before the publish directive, which stays last.
+      const brandContext = await unattendedBrandContextMessage(() => this.readBrandGuidelines(userId));
+      if (brandContext) messages.push({ role: 'system', content: brandContext });
       // ENG-2204: owner opt-out for the Slack-send override — resolved independently
       // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
       // for why this isn't threaded through publishAuthorizationOverride instead.
@@ -6459,7 +6466,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false, ownTurnContent?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6475,12 +6482,37 @@ export class AgentModeService {
       return true;
     });
 
+    // ENG-3164: the stored row of THIS turn's own message (the controller stores it before generating, so it is the last
+    // row), so that who wrote it is read from the `kind` the server stored on it, never from the text. `messageContent`
+    // can carry a suffix the stored row does not (the voice-card prompt suffix), so the caller also hands over the turn's
+    // own content before that suffix. Neither matches (an attachment or a deck answer also changes the text) = not
+    // provably the server's = labelled, which is the safe direction.
+    const lastRow = sessionHistory[sessionHistory.length - 1];
+    const currentTurnRow: ChatMessage | undefined =
+      lastRow?.role === 'user' && (lastRow.content === messageContent || (ownTurnContent !== undefined && lastRow.content === ownTurnContent))
+        ? lastRow
+        : undefined;
+
     // Merge consecutive user messages into one — keeps the 10-message window from dropping
     // the original task when many retry messages ("Please try again...") pile up behind it.
+    // ENG-2227: merging mutates only `.content`, never `.metadata` — if an anonymous ishare
+    // message landed adjacent to a real owner message (the exact retry-pileup shape this merge
+    // exists for), only the FIRST message's metadata survived the merge, silently dropping the
+    // anonymous tag (when it merged INTO an owner message) or mislabeling the owner's own words
+    // as anonymous (when an owner message merged into one). This merge was only ever meant to
+    // collapse retries from the SAME actor, so only merge when both sides share the same
+    // anonymity status — a genuine identity change between two adjacent messages now keeps them
+    // as separate entries, each correctly tagged by the per-message loop below.
     const mergedHistory: ChatMessage[] = [];
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
-      if (last && last.role === 'user' && msg.role === 'user') {
+      const sameAnonymity = isAnonymousShareMessage(last) === isAnonymousShareMessage(msg);
+      // ENG-3164: two visitor-stamped rows are also kept apart when only one of them was written by the server (a
+      // continuation directive next to a visitor's message): the merged row keeps the FIRST row's metadata, so a visitor's
+      // words merged behind a server-written row would read as the server's and lose the label.
+      const sameAuthor = !(isAnonymousShareMessage(last) && isAnonymousShareMessage(msg))
+        || isServerAuthoredContinuation(last) === isServerAuthoredContinuation(msg);
+      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity && sameAuthor) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
         mergedHistory.push({ ...msg });
@@ -6555,6 +6587,24 @@ export class AgentModeService {
           contentStr = String(content);
         }
         content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
+      }
+
+      // ENG-2227: a message submitted via an anonymous ishare link carries no verified
+      // identity — metadata.ishareSender is stored on the message (agentModeController.ts)
+      // but was never surfaced into what the model actually reads, so a claim from an
+      // anonymous viewer looked identical to one from the verified account owner. Fold the
+      // marker into content on every reconstruction (not just the turn it arrived in), the
+      // same way attachments are folded in above, so it survives into later turns.
+      if (msg.role === 'user' && isAnonymousShareMessage(msg) && !isServerAuthoredContinuation(msg as any)) {
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = withAnonymousShareMarker(contentStr);
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -6644,16 +6694,27 @@ export class AgentModeService {
     messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
+    // ENG-2227: this turn's own message is deliberately filtered OUT of sessionHistory above
+    // (the dedupe filter at the top of this function) and reconstructed here as a bare string,
+    // bypassing the per-message loop above entirely — including its anonymous-sender marker.
+    // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
+    // before it's even "history") with zero provenance signal. Apply the same marker here when
+    // this turn itself came through the public ishare endpoint.
+    // ENG-3164: a server-written turn is told by the stored kind of its own row, never by its text (a visitor can open a
+    // message with the server's own continuation line). No stored row found = not provably the server's = labelled.
+    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(currentTurnRow)
+      ? withAnonymousShareMarker(messageContent)
+      : messageContent;
     if (screenshotUrl) {
       messages.push({
         role: 'user',
         content: [
-          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'text', text: `${currentMessageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
           { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
         ]
       });
     } else {
-      messages.push({ role: 'user', content: messageContent });
+      messages.push({ role: 'user', content: currentMessageContent });
     }
 
     return messages;
@@ -15258,11 +15319,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * The last message with role 'user' in the session, or undefined. Used ONLY
    * to verify an "explicitly stated by the user" claim against real transcript
    * text (verifyExplicitStatement) — never to infer or parse an answer.
+   *
+   * ENG-3164: `ownerOnly` is for a caller that treats the text as the ACCOUNT OWNER's own words. A share-link visitor
+   * runs under the owner's userId, so their message is a 'user' row like any other; when the last one is a visitor's
+   * (stamped by the share route) there is no owner statement to verify, so the answer is undefined and the caller
+   * falls back to asking. It does not look further back: the owner restates it, as before.
    */
-  private async getLastUserMessageText(sessionId: string): Promise<string | undefined> {
+  private async getLastUserMessageText(sessionId: string, ownerOnly: boolean = false): Promise<string | undefined> {
     const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') return messages[i].content;
+      if (messages[i].role === 'user') {
+        if (ownerOnly && isAnonymousShareMessage(messages[i])) return undefined;
+        return messages[i].content;
+      }
     }
     return undefined;
   }
@@ -15382,7 +15451,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // genuine-but-unrelated quote could rubber-stamp any objective the model
     // names alongside it.
     if (claimedObjective && AgentModeService.META_OBJECTIVE_VALUES.includes(claimedObjective) && quote) {
-      const lastUserText = await this.getLastUserMessageText(sessionId);
+      // ENG-3164: the objective must be in the OWNER's own words; a share-link visitor's message does not count.
+      const lastUserText = await this.getLastUserMessageText(sessionId, true);
       const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
       if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
         // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN

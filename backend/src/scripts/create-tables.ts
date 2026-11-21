@@ -2374,6 +2374,38 @@ export const createZomaReferralLedgerTable = async () => {
   }
 };
 
+/**
+ * ENG-3155: Zoma measurement-report schedules (mcp/zomaReportSchedule.ts, the only module that touches it). One item per user + Meta
+ * ad account: PK `userId` (S), SK `adAccountId` (S), no GSI. The hourly runner scans it for due active rows (it stays small: one row per
+ * shipped ad account). Point-in-time recovery is on (non-fatal, like the referral tables).
+ */
+export const createZomaReportSchedulesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ZomaReportSchedules`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'adAccountId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'adAccountId', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+  try {
+    await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+    await dynamodb.updateContinuousBackups({
+      TableName: params.TableName,
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+    }).promise();
+    console.log(`Enabled point-in-time recovery on ${params.TableName}`);
+  } catch (error: any) {
+    console.warn(`[create-tables] Could not enable point-in-time recovery on ${params.TableName}: ${error.code || error.message}. Run: aws dynamodb update-continuous-backups --table-name ${params.TableName} --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`);
+  }
+};
+
 export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
@@ -3012,6 +3044,7 @@ const main = async () => {
     await createZomaDeviceAuthTable();
     await createZomaReferralCodesTable();
     await createZomaReferralLedgerTable();
+    await createZomaReportSchedulesTable();
     await createLlmConnectionsTable();
     await createAttemptUsageTable();
     await createSmartleadPushRunsTable();
