@@ -68,6 +68,7 @@
  */
 
 import { isPublishName } from './hardeningGaps';
+import { isScheduleMarked } from './scheduleProvenance';
 
 /** The shape this resolver reads. Deliberately minimal — only the owner's opt-out. */
 export interface SchedulePublishApprovalInput {
@@ -92,6 +93,11 @@ export interface ScheduleSlackSendApprovalInput {
    *  only (kept off the manage_scheduled_chat MCP allowlist, same reasoning as
    *  requirePublishApproval). */
   requireSlackApproval?: boolean;
+  /**
+   * ENG-2816 (step 3): the content fields a share-link visitor wrote (a String Set off the wire, or the array the db layer returns;
+   * see utils/scheduleProvenance.ts). A marked schedule never sends Slack messages unattended.
+   */
+  provenance?: unknown;
 }
 
 /**
@@ -116,7 +122,24 @@ export interface ScheduleSlackSendApprovalInput {
  */
 export function resolveSlackSendAuthorized(schedule?: ScheduleSlackSendApprovalInput | null): boolean {
   if (!schedule) return false;
+  // ENG-2816 (step 3): this gate's default is AUTHORIZED (absent opt-out = may send), so a schedule a share-link visitor wrote
+  // content into would otherwise tell its unattended run it may post to the owner's Slack without anyone approving the text. A
+  // marked schedule is WITHHELD, exactly like `requireSlackApproval: true`, until the owner adopts it.
+  if (isScheduleMarked(schedule)) return false;
   return schedule.requireSlackApproval !== true;
+}
+
+/**
+ * ENG-2816 (step 3): `resolveSlackSendAuthorized` plus WHY, for the one place that tells the model: a withheld Slack send because a
+ * visitor wrote part of the schedule must not be explained as "the owner turned ON Require approval before Slack sends", which is a
+ * different setting and a different remedy (the owner adopts the schedule).
+ */
+export type SlackSendState = { authorized: boolean; reason?: 'visitor_edited' };
+
+export function describeSlackSendState(schedule?: ScheduleSlackSendApprovalInput | null): SlackSendState {
+  const authorized = resolveSlackSendAuthorized(schedule);
+  if (authorized) return { authorized };
+  return isScheduleMarked(schedule) ? { authorized, reason: 'visitor_edited' } : { authorized };
 }
 
 /**

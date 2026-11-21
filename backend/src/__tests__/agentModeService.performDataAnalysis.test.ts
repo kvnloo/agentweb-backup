@@ -18,6 +18,8 @@ import { AgentModeService } from '../services/agentModeService';
 // a clean cache each time, so it must reset the module's cache itself now).
 import { __resetDataAnalysisConsistencyCacheForTests } from '../emma/impl/searchResearch';
 
+// The download goes through utils/callerUrlFetch (guarded, covered in callerUrlFetch.test.ts); here it is handed to the axios mock below.
+jest.mock('../utils/callerUrlFetch', () => require('./helpers/callerUrlFetchAxiosBridge').callerUrlFetchViaAxiosMock());
 jest.mock('axios', () => ({
   get: jest.fn(),
   post: jest.fn()
@@ -38,6 +40,13 @@ jest.mock('../utils/s3Utils', () => ({
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn()
+}));
+
+// This suite is about the analysis itself. Who may read which S3 key (ENG-2988 rule) is a boundary here; it is covered with the
+// real policy in performDataAnalysis.storageAccess.test.ts. No assertion of this suite was changed.
+jest.mock('../services/storageAccessPolicy', () => ({
+  ...jest.requireActual('../services/storageAccessPolicy'),
+  decideStorageAccess: jest.fn().mockResolvedValue({ allow: true }),
 }));
 
 const mockedAxiosGet = axios.get as jest.Mock;

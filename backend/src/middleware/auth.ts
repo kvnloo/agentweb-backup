@@ -3,6 +3,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
 import { getJwtSecret } from '../config/jwt';
+import { normalizeRestrictionClaim, type RestrictionProfileId } from '../services/toolRestrictionProfiles';
 
 export interface AuthenticatedRequest extends Request {
   user: {
@@ -22,6 +23,13 @@ export interface AuthenticatedRequest extends Request {
    * tool on someone's behalf, not by a person in the app. Routes that need a person's own action (approving an outward action) check it.
    */
   isSelfCall?: boolean;
+  /**
+   * ENG-2816 (step 3): the restriction the person or run behind a SELF-CALL acts under (a share-link visitor, or a scheduled run of
+   * a schedule a visitor wrote), carried as the `_rp` claim of the self-call token mcpFetch mints. Set ONLY from a verified `_svc`
+   * token (see `restrictionProfileOfToken`); never from a header, a body or an ordinary login. A schedule write that arrives with it
+   * is a visitor's write.
+   */
+  restrictionProfile?: RestrictionProfileId;
 }
 
 export interface UserPayload {
@@ -37,6 +45,8 @@ export interface UserPayload {
   sv?: number;
   /** Marks short-lived service-to-service self-call tokens — isAdmin claim is trusted directly */
   _svc?: boolean;
+  /** ENG-2816 (step 3): the restriction profile the self-call acts under. Only meaningful on a `_svc` token; see `restrictionProfileOfToken`. */
+  _rp?: unknown;
   // Delegation fields
   delegateAccess?: {
     scope?: 'evaluation';
@@ -212,6 +222,18 @@ export async function getUserFromToken(req: Request): Promise<{
   }
 }
 
+/**
+ * ENG-2816 (step 3): the restriction profile a verified token carries, or undefined.
+ *
+ * Trusted ONLY on a self-call token (`_svc`), which only mcpFetch mints and signs with the server secret: an ordinary login, a
+ * delegate token or any other token that happens to carry an `_rp` field is ignored, so nothing a caller controls can set (or
+ * strip) it. A claim that is present but not a known profile id reads as the strictest known profile, not as no claim.
+ */
+export function restrictionProfileOfToken(decoded: UserPayload | undefined): RestrictionProfileId | undefined {
+  if (!decoded || decoded._svc !== true || decoded.delegateAccess) return undefined;
+  return normalizeRestrictionClaim(decoded._rp);
+}
+
 export async function authenticateToken(req: Request, res: Response, next: NextFunction) {
   const result = await getUserFromToken(req);
 
@@ -233,6 +255,7 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   const authReq = req as AuthenticatedRequest;
   authReq.user = result.user;
   authReq.isSelfCall = result.decoded?._svc === true;
+  authReq.restrictionProfile = restrictionProfileOfToken(result.decoded);
 
   // Handle delegate info if needed (for backward compatibility)
   if (result.decoded?.delegateAccess && result.adminUser) {

@@ -35,6 +35,8 @@ import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '..
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import { MetaToolkitRefusal } from './metaToolkitErrors';
+import { metaPageAccessRefusalText } from './metaPageAccessRefusal';
+import { getAccessiblePageIds, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { assertOptimisationEventConfigured, type ConversionLookup } from './metaToolkitConversionGate';
 import { GUARDED_WRITE_ACTIONS, GUARDED_WRITE_ENTITIES, isGuardedWriteRequest } from './metaToolkitWriteSurface';
 import { adsManagementScopeState, assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
@@ -83,6 +85,8 @@ export interface MetaToolkitWriteDeps {
   readBack: (userId: string, accountId: string, entity: string, id: string) => Promise<Record<string, any> | null>;
   /** ENG-2913: throws unless the creative belongs to the selected ad account (creative ids are global). */
   assertCreativeOwned: (userId: string, accountId: string, creativeId: string) => Promise<void>;
+  /** ENG-3129: one-click Meta reconnect link for the Page-access refusal. */
+  connectLink?: (userId: string) => Promise<string>;
   /** ENG-2942: account-scoped custom conversion / pixel event reads for AD_SET CREATE. */
   conversionLookup?: (userId: string, accountId: string) => Promise<ConversionLookup>;
   spendCeilingPolicy: () => MetaSpendCeilingPolicy | null;
@@ -90,7 +94,8 @@ export interface MetaToolkitWriteDeps {
   now: () => number;
   consumedTokens: ConsumedTokens;
   /** ENG-2931: outcome per consumed preview token, replayed on a repeat confirm. */
-  tokenOutcomes?: Map<string, { exp: number; outcome: any }>;
+  /** requestKey binds a recorded CREATE outcome to its exact request (see createRequestKey). */
+  tokenOutcomes?: Map<string, { exp: number; outcome: any; requestKey?: string }>;
 }
 
 /**
@@ -121,6 +126,9 @@ const defaultDeps: MetaToolkitWriteDeps = {
   readBack: async (userId, accountId, entity, id) => (await ams()).readBackMetaWriteTarget(userId, accountId, entity, id),
   assertCreativeOwned: async (userId, accountId, creativeId) => (await ams()).assertToolkitMetaCreativeOwned(userId, accountId, creativeId),
   conversionLookup: async (userId, accountId) => (await ams()).toolkitMetaConversionLookup(userId, accountId),
+  // Zoma-token callers: the zoma state claim routes the Meta callback back to Zoma's pages.
+  connectLink: async (userId) =>
+    (await import('../services/metaConnectUrl')).buildMetaConnectUrl(userId, 'marketing', { zoma: (await import('./zomaSetupLinks')).ZOMA_MCP_SETUP }),
   spendCeilingPolicy: () => spendCeilingPolicyFromEnv(),
   secret: () => getJwtSecret(),
   now: () => Date.now(),
@@ -261,11 +269,15 @@ export function fieldDiffLines(params: any, minor: any, prior: Record<string, an
   });
 }
 
-export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
+function findMetaAdAccount(accounts: ConnectedAccount[], accountId: string): ConnectedAccount | undefined {
   const norm = (v: unknown) => String(v ?? '').trim().replace(/^act_/, '');
-  const account = accounts.filter(isMetaAdAccount).find(
+  return accounts.filter(isMetaAdAccount).find(
     (a) => norm((a.config as any)?.ad_account_id) === norm(accountId) || norm(a.account_id) === norm(accountId),
   );
+}
+
+export function assertAdsManagementGranted(accounts: ConnectedAccount[], accountId: string) {
+  const account = findMetaAdAccount(accounts, accountId);
   const state = account ? adsManagementScopeState(account) : 'missing';
   if (state === 'granted') return;
   throw new MetaToolkitRefusal(
@@ -273,6 +285,32 @@ export function assertAdsManagementGranted(accounts: ConnectedAccount[], account
       ? 'This Meta connection was not granted the ads_management permission, so Zoma cannot change ads on it. Reconnect Meta (run zoma_status for the link) and approve ads management.'
       : 'Zoma cannot verify that this Meta connection was granted the ads_management permission. Reconnect Meta (run zoma_status for the link) so the granted permissions are recorded.',
   );
+}
+
+/**
+ * ENG-3129: refuse an ad / creative CREATE on an account whose stored Page probe says no
+ * Facebook Page is accessible, before anything reaches Meta. Only a confirmed 'missing'
+ * refuses; never-probed ('unknown') goes through, as in the Emma gate (adsApis.ts).
+ * A link that cannot be minted degrades to "run zoma_status for the link", never blocks.
+ */
+export async function assertMetaPageAccessForCreate(
+  accounts: ConnectedAccount[], accountId: string,
+  opts: { pageId?: string; pageIds?: string[]; connectLink?: () => Promise<string> } = {},
+) {
+  const config = findMetaAdAccount(accounts, accountId)?.config as any;
+  if (getMetaPagesAccessState(config) !== 'missing') return;
+  // The account flag is account-wide; requested Pages the probe lists as accessible are usable.
+  // Ids compare as text (callers may send numbers); every requested Page must be reachable.
+  const requested = [...(opts.pageIds ?? []), ...(opts.pageId ? [opts.pageId] : [])].map(String);
+  const storedList = getAccessiblePageIds(config);
+  // No stored reachable-Page list but the probe counted Pages: the flag is a wrong-Page
+  // mismatch we cannot check per Page, so a named Page goes on to Meta (Opslane run 2370 AT4).
+  if (requested.length && storedList === undefined && Number(config?.meta_page_count) > 0) return;
+  const accessible = (storedList ?? []).map(String);
+  const blocked = requested.find((id) => !accessible.includes(id));
+  if (requested.length && !blocked) return;
+  const link = opts.connectLink ? await opts.connectLink().catch(() => undefined) : undefined;
+  throw new MetaToolkitRefusal(metaPageAccessRefusalText(config, { pageId: blocked, link }));
 }
 
 function errorText(result: any): string {
@@ -290,6 +328,13 @@ function statusLine(action: string, params: any): string {
  * Execute (or preview) one guarded write. `args.account_id` must already be the resolved,
  * ownership-checked ad account (the gateway does that before calling here).
  */
+/** Stable identity of a CREATE request (user + every argument except confirm/preview_token). */
+function createRequestKey(userId: string, args: any): string {
+  const stable = (v: any): any => Array.isArray(v) ? v.map(stable)
+    : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, stable(v[k])])) : v;
+  return JSON.stringify([userId, stable(args)]);
+}
+
 export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps: MetaToolkitWriteDeps = defaultDeps) {
   const { confirm, preview_token: previewToken, ...args } = rawArgs ?? {};
   const entity = String(args.entity_type);
@@ -303,7 +348,21 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
     if (error instanceof ZomaNotReadyError) throw new MetaToolkitRefusal(error.message);
     throw error;
   }
-  assertAdsManagementGranted(await deps.listAccounts(userId), accountId);
+  const accounts = await deps.listAccounts(userId);
+  assertAdsManagementGranted(accounts, accountId);
+  // Only an AD needs a Page here (creatives are gated in metaToolkitCreatives); CAMPAIGN / AD_SET carry none.
+  if (action === 'CREATE' && entity === 'AD') {
+    // A repeat confirm of a CREATE that already ran gets its recorded outcome, not a
+    // "nothing was sent" Page refusal; only new CREATE dispatch is gated.
+    // The replay is bound to the request that recorded it: the same token with changed
+    // arguments falls through to the gate (and later PREVIEW_MISMATCH), never a stale success.
+    if (confirm === true && typeof previewToken === 'string') {
+      const outcomes = (deps.tokenOutcomes ??= new Map());
+      const replay = replayTokenOutcome(outcomes, previewToken, deps.now());
+      if (replay && outcomes.get(previewToken)?.requestKey === createRequestKey(userId, args)) return replay;
+    }
+    await assertMetaPageAccessForCreate(accounts, accountId, { connectLink: deps.connectLink && (() => deps.connectLink!(userId)) });
+  }
 
   // Currency echo + minor units, via the same normalizer the writers use.
   let money: { params: any; confirmation: string } = { params, confirmation: '' };
@@ -498,7 +557,10 @@ export async function executeMetaToolkitWrite(userId: string, rawArgs: any, deps
       message: `UNCONFIRMED: Meta accepted the ${action} request${id ? ` (id ${id})` : ''}, but the read-back could not confirm it. Do not report this as done and do not retry blindly — check the ${entity} first.`,
     };
   })();
-  return rememberTokenOutcome((deps.tokenOutcomes ??= new Map()), previewToken, outcome);
+  const outcomes = (deps.tokenOutcomes ??= new Map());
+  rememberTokenOutcome(outcomes, previewToken, outcome);
+  if (action === 'CREATE') outcomes.get(previewToken)!.requestKey = createRequestKey(userId, args);
+  return outcome;
 }
 
 function verify(action: string, params: any, minor: any, readBack: Record<string, any> | null): WriteVerification {
