@@ -184,6 +184,18 @@ describe('ENG-3129 Page gate on Zoma Meta creates', () => {
     expect(d.connectLink).not.toHaveBeenCalled();
   });
 
+  it('BULK_CREATE checks each item page_id, and a numeric page_id compares as text (Opslane run 2370 #1/#2)', async () => {
+    const d = creativeDeps({ has_meta_pages: false, existing_ads_page_id: '9001', accessible_page_ids: ['4000000000000001', '4242'], meta_page_count: 2 });
+    (d.previewCreative as jest.Mock).mockResolvedValue({ success: true, awaitingUserConfirmation: true, summary: 'creative' });
+    const notRefused = (e: any) => { expect(e).not.toBeInstanceOf(MetaToolkitRefusal); };
+    await executeMetaToolkitCreative('u1', { ...creativeCreate(), action: 'BULK_CREATE', params: { items: [{ page_id: '4000000000000001', image_hash: 'h' }, { page_id: 4242, image_hash: 'h' }] } }, d).catch(notRefused);
+    await executeMetaToolkitCreative('u1', { ...creativeCreate(), params: { ...creativeCreate().params, page_id: 4242 } }, d).catch(notRefused);
+    expect(d.connectLink).not.toHaveBeenCalled();
+    const message = await refusalOf(executeMetaToolkitCreative('u1', { ...creativeCreate(), action: 'BULK_CREATE', params: { items: [{ page_id: '4242', image_hash: 'h' }, { page_id: '7777', image_hash: 'h' }] } }, d));
+    expect(message).toContain('7777');
+    expect(message).not.toContain('9001');
+  });
+
   it('a refused creative for an inaccessible Page names only the requested Page, not the existing-ads Page', async () => {
     const d = creativeDeps({ has_meta_pages: false, existing_ads_page_id: '9001', accessible_page_ids: ['5555'], meta_page_count: 1 });
     const message = await refusalOf(executeMetaToolkitCreative('u1', creativeCreate(), d));
@@ -258,6 +270,11 @@ describe('ENG-3129 explainMetaError maps Page-permission errors', () => {
   it('a code-200 refusal that is not about a Page keeps the generic hint', () => {
     expect(explainMetaError({ code: '200' })).toEqual({ code: '200', known: true, ...META_ERROR_EXPLANATIONS['200'] });
     expect(explainMetaError({ code: '200', message: 'Ad account owner has NOT granted ads_management permission' })).not.toHaveProperty('page_access');
+  });
+
+  it('a 283 or ad-account refusal that names no Facebook Page keeps the generic hint (Opslane run 2370 #3/#5)', () => {
+    expect(explainMetaError({ code: '283', message: 'Requires extended permission: leads_retrieval' })).not.toHaveProperty('page_access');
+    expect(explainMetaError({ code: '200', message: 'User does not have permission on this ad account; see the help page' })).not.toHaveProperty('page_access');
   });
 
   it('rejects a non-string message', () => {

@@ -295,14 +295,18 @@ export function assertAdsManagementGranted(accounts: ConnectedAccount[], account
  */
 export async function assertMetaPageAccessForCreate(
   accounts: ConnectedAccount[], accountId: string,
-  opts: { pageId?: string; connectLink?: () => Promise<string> } = {},
+  opts: { pageId?: string; pageIds?: string[]; connectLink?: () => Promise<string> } = {},
 ) {
   const config = findMetaAdAccount(accounts, accountId)?.config as any;
   if (getMetaPagesAccessState(config) !== 'missing') return;
-  // The account flag is account-wide; a requested Page the probe lists as accessible is usable.
-  if (opts.pageId && getAccessiblePageIds(config)?.includes(opts.pageId)) return;
+  // The account flag is account-wide; requested Pages the probe lists as accessible are usable.
+  // Ids compare as text (callers may send numbers); every requested Page must be reachable.
+  const requested = [...(opts.pageIds ?? []), ...(opts.pageId ? [opts.pageId] : [])].map(String);
+  const accessible = (getAccessiblePageIds(config) ?? []).map(String);
+  const blocked = requested.find((id) => !accessible.includes(id));
+  if (requested.length && !blocked) return;
   const link = opts.connectLink ? await opts.connectLink().catch(() => undefined) : undefined;
-  throw new MetaToolkitRefusal(metaPageAccessRefusalText(config, { pageId: opts.pageId, link }));
+  throw new MetaToolkitRefusal(metaPageAccessRefusalText(config, { pageId: blocked, link }));
 }
 
 function errorText(result: any): string {

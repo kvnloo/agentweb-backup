@@ -71,10 +71,12 @@ export const DIAGNOSTICS_READ_DEFINITIONS = names.map((name) => ({
  * generic ad-account hint.
  */
 const PAGE_PERMISSION_CODES = new Set(['283']);
-const PAGE_ERROR_TEXT = /\bpages?\b|page_id|pages_[a-z_]+/i;
+// Page-specific wording only: a bare "page" also appears in ad-account / leads / Instagram refusals.
+const PAGE_ERROR_TEXT = /facebook page|page_id|pages_[a-z_]+/i;
 
 function isPagePermissionError(code: string, message: string): boolean {
-  if (PAGE_PERMISSION_CODES.has(code)) return true;
+  // 283 with no message is a Page refusal; with a message, the message must name a Page.
+  if (PAGE_PERMISSION_CODES.has(code)) return !message.trim() || PAGE_ERROR_TEXT.test(message);
   const n = Number(code);
   return (n === 10 || (n >= 200 && n <= 299)) && PAGE_ERROR_TEXT.test(message);
 }

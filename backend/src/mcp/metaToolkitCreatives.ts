@@ -423,8 +423,14 @@ export async function executeMetaToolkitCreative(userId: string, rawArgs: any, d
   assertAdsManagementGranted(accounts, accountId);
   // ENG-3129: a creative needs a Page; refuse before any upload/preview reaches Meta. Uploads stay ungated.
   if (action === 'CREATE' || action === 'BULK_CREATE') {
+    const asId = (v: any) => (typeof v === 'string' && v) || (typeof v === 'number' && Number.isFinite(v)) ? String(v) : undefined;
+    const topPage = asId(params.page_id);
+    // BULK_CREATE: each item's page_id (falling back to the top-level one) is what Meta will use.
+    const itemPages = action === 'BULK_CREATE' && Array.isArray(params.items)
+      ? params.items.map((it: any) => asId(it?.page_id) ?? topPage).filter((v: any): v is string => !!v)
+      : [];
     await assertMetaPageAccessForCreate(accounts, accountId, {
-      pageId: typeof params.page_id === 'string' ? params.page_id : undefined,
+      pageIds: itemPages.length ? itemPages : topPage ? [topPage] : [],
       connectLink: deps.connectLink && (() => deps.connectLink!(userId)),
     });
   }
