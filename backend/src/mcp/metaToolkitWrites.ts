@@ -302,7 +302,11 @@ export async function assertMetaPageAccessForCreate(
   // The account flag is account-wide; requested Pages the probe lists as accessible are usable.
   // Ids compare as text (callers may send numbers); every requested Page must be reachable.
   const requested = [...(opts.pageIds ?? []), ...(opts.pageId ? [opts.pageId] : [])].map(String);
-  const accessible = (getAccessiblePageIds(config) ?? []).map(String);
+  const storedList = getAccessiblePageIds(config);
+  // No stored reachable-Page list but the probe counted Pages: the flag is a wrong-Page
+  // mismatch we cannot check per Page, so a named Page goes on to Meta (Opslane run 2370 AT4).
+  if (requested.length && storedList === undefined && Number(config?.meta_page_count) > 0) return;
+  const accessible = (storedList ?? []).map(String);
   const blocked = requested.find((id) => !accessible.includes(id));
   if (requested.length && !blocked) return;
   const link = opts.connectLink ? await opts.connectLink().catch(() => undefined) : undefined;
