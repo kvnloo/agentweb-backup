@@ -9,7 +9,7 @@ import { emitAppSignal } from './serverSignalEmitter';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma' | 'smartlead';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack' | 'luma' | 'smartlead' | 'x_ads';
 
 /**
  * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
@@ -387,6 +387,26 @@ export interface TwitterXConfig extends BaseOAuthConfig {
 }
 
 /**
+ * ENG-3142 — X (Twitter) Ads API connection, one row per ad account. OAuth 1.0a user context:
+ * the access token never expires (token_expires_at 0) until the user revokes it. Both
+ * access_token and access_token_secret are stored encrypted (utils/crypto encryptPassword);
+ * the toolkit decrypts them per call.
+ */
+export interface XAdsConfig extends BaseOAuthConfig {
+  account_type: 'x_ads';
+  /** X Ads account id (e.g. "18ce54d4x5t"). */
+  ad_account_id: string;
+  /** Encrypted OAuth 1.0a token secret. */
+  access_token_secret: string;
+  x_user_id?: string;
+  screen_name?: string;
+  currency?: string;
+  timezone?: string;
+  /** Set when an Ads API call returns 401 (token revoked); cleared on reconnect. */
+  needs_reconnect?: boolean;
+}
+
+/**
  * Calendly OAuth configuration (ENG-524).
  *
  * `booking_tracking_active` is false when the connecting account's Calendly plan
@@ -433,7 +453,7 @@ export interface SlackConfig extends BaseOAuthConfig {
   team_id: string;
 }
 
-export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig | SmartleadConfig;
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig | LumaConfig | SmartleadConfig | XAdsConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data

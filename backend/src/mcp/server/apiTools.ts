@@ -1,4 +1,3 @@
-import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { summarizeItemizedUsage, USAGE_MONTH_PATTERN } from './usageBreakdown';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
@@ -35,6 +34,9 @@ import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
+import { executeBrandRead, executeBrandUpdate } from './manageBrandWrites';
+import { executeStrategyRead, executeStrategyUpdate } from './manageStrategyWrites';
+import { buildKbListQuery, KB_LIST_TYPES, MAX_KB_LIST_LIMIT, MAX_KB_LIST_OFFSET } from './knowledgeBaseParams';
 import { buildLeadListQuery, executeLeadAdd, executeLeadDelete, executeLeadListDelete, executeLeadListUpdate, executeLeadUpdate, MAX_LEAD_ROWS_PER_CALL } from './manageLeadsWrites';
 
 function normalizeSkillQuery(value: unknown): string {
@@ -1948,11 +1950,24 @@ mcpToolRegistry.register({
   name: 'list_knowledge_bases',
   definition: {
     name: 'list_knowledge_bases',
-    description: 'List all knowledge base files for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List knowledge base files for the authenticated user: the platform knowledge bases (yours, those your organisation shares with you, and public ones) and your connected Google Drive folders, ClickUp docs and Foreplay boards. '
+      + 'With no arguments it returns everything it can. kb_type narrows the sources: "private" and "public" both mean only the platform knowledge bases (the two are not told apart), "google-drive", "clickup", "clickup-tasks" and "foreplay-swipefile" / "foreplay-board" mean only that connected source (the two Foreplay values are not told apart, and ClickUp folder entries are listed whatever kb_type is). '
+      + 'modified_after and modified_before (dates as YYYY-MM-DD), limit (1 to 1000, default 100) and offset (0 to 100000) page and narrow the Google Drive files only; they have no effect on the platform knowledge bases, ClickUp or Foreplay (the answer still echoes them), and limit and offset apply per Google Drive source, a source being a registered folder with everything under it. '
+      + 'Blank or 0 for limit and offset means the default, not "none". To page Drive files send the same arguments with a new offset.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kb_type: { type: 'string', enum: [...KB_LIST_TYPES], description: 'Only return this kind of source ("private" and "public" both mean the platform knowledge bases). Omit to return every source.' },
+        modified_after: { type: 'string', description: 'Google Drive files modified on or after this date, YYYY-MM-DD (e.g. "2026-04-15").' },
+        modified_before: { type: 'string', description: 'Google Drive files modified on or before this date, YYYY-MM-DD (e.g. "2026-04-22"); not earlier than modified_after.' },
+        limit: { type: 'number', minimum: 1, maximum: MAX_KB_LIST_LIMIT, description: 'Most Google Drive files to return per source (default 100).' },
+        offset: { type: 'number', minimum: 0, maximum: MAX_KB_LIST_OFFSET, description: 'Google Drive files to skip per source (default 0). Use with limit to page.' }
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context) });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: ctx(context), queryParams: buildKbListQuery(args) });
     return jsonResult(data);
   }
 });
@@ -2235,7 +2250,11 @@ mcpToolRegistry.register({
   name: 'manage_brand',
   definition: {
     name: 'manage_brand',
-    description: 'Read or update brand guidelines. Use action: "read" or "update".',
+    description: 'Read or update brand guidelines. Use action: "read" or "update". '
+      + 'Update changes only the fields you send. company_name, mission, tone_of_voice, target_audience, key_messages, tagline, domain, brand_values, brand_personality and visual_identity replace the stored value of that field (a list replaces the whole list). For tagline, domain, brand_personality, brand_values and founders, blank text or an empty list means "not given" and changes nothing. '
+      + 'FOUNDERS: founders is merged BY NAME, never replaced: a founder already stored (same name, case and padding ignored) is updated field by field, a new name is added, and every founder you do not mention is kept, so you can send just the founder you are changing. An empty founders list changes nothing. '
+      + 'To remove a founder, name them in remove_founders (at most 20 per call; the name is matched as for founders: case, padding and repeated spaces ignored); the answer says which were removed and which were not found. A name may not appear in both. '
+      + 'A founder holds name, jobTitle, styleTone, signaturePosts and voiceExamples (text); other fields are refused. The answer reports the founders that were added, updated, removed and the stored total, read back after the save.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2245,20 +2264,38 @@ mcpToolRegistry.register({
         tone_of_voice: { type: 'string', description: 'Tone of voice (update)' },
         target_audience: { type: 'string', description: 'Target audience (update)' },
         key_messages: { type: 'array', items: { type: 'string' }, description: 'Key messages (update)' },
-        visual_identity: { type: 'object', description: 'Visual identity settings (update)' }
+        tagline: { type: 'string', description: 'Brand tagline or slogan (update)' },
+        domain: { type: 'string', description: 'Website domain, e.g. example.com (update)' },
+        brand_values: { type: 'array', items: { type: 'string' }, description: 'Brand values (update; replaces the stored list; at most 50)' },
+        brand_personality: { type: 'string', description: 'Brand personality description (update)' },
+        visual_identity: { type: 'object', description: 'Visual identity settings (update)' },
+        founders: {
+          type: 'array',
+          description: 'Founder profiles to add or update (update). Merged by name; founders you leave out are kept. Use remove_founders to remove one.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Founder name' },
+              jobTitle: { type: 'string', description: 'Founder job title' },
+              styleTone: { type: 'string', description: 'Founder communication style and tone' },
+              signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' },
+              voiceExamples: { type: 'string', description: 'Actual post examples (verbatim) written by or for this founder, used as a style reference for social posts' }
+            },
+            required: ['name']
+          }
+        },
+        remove_founders: { type: 'array', items: { type: 'string' }, description: 'Names of founders to remove (update). Only these are removed.' }
       },
       required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
-    if (args.action === 'read') {
-      const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
-      return jsonResult(data);
-    }
-    const body = mapManageBrandUpdate(args);
-    const data = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
-    return jsonResult(data);
+    // Any other action used to be taken as an update, so a mistyped "Read" wrote; now it is refused.
+    const action = typeof args?.action === 'string' ? args.action.trim().toLowerCase() : '';
+    if (action === 'read') return executeBrandRead(args, c);
+    if (action === 'update') return executeBrandUpdate(args, c);
+    throw new Error('manage_brand: action must be "read" or "update".');
   }
 });
 
@@ -2266,28 +2303,58 @@ mcpToolRegistry.register({
   name: 'manage_market_strategy',
   definition: {
     name: 'manage_market_strategy',
-    description: 'Read or update market strategy. Use action: "read" or "update".',
+    description: 'Read or update the market strategy: the business overview, the competitors and the ideal customer profiles (ICPs). Use action: "read" or "update". '
+      + 'Read: the competitor list comes back one page at a time (about 12,000 characters per page); totalCompetitors is always the true count and nextCompetitorOffset (null on the last page) is where the next page starts. '
+      + 'Before adding a competitor, pass competitorNames (up to 50) to learn which are already stored, whatever the page shows. '
+      + 'Update: send only what changes. Competitors are merged by name and ICPs by title (case and padding ignored): an entry that is already stored is updated field by field and every other stored entry is kept; new ones are added. '
+      + 'An empty list or blank text changes nothing, and nothing can be removed here. businessOverview replaces the stored overview. '
+      + 'A competitor holds name and description; an ICP holds title, description, valueProposition and buyerPersonas (a list of text that replaces that profile\'s persona list). Other fields are refused. '
+      + 'positioning, differentiators and channels are not stored and are refused (put them in businessOverview). At most 100 entries per list per call. The answer lists what was added, updated or unchanged and the true totals. '
+      + 'Changing an org\'s market strategy needs the same editor rights as in the app.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['read', 'update'], description: 'Action' },
-        positioning: { type: 'string', description: 'Market positioning (update)' },
-        competitors: { type: 'array', description: 'Competitor list (update)' },
-        differentiators: { type: 'array', items: { type: 'string' }, description: 'Key differentiators (update)' },
-        channels: { type: 'array', items: { type: 'string' }, description: 'Marketing channels (update)' }
+        competitorOffset: { type: 'number', description: 'Read: 0-based index of the first competitor to return. Use nextCompetitorOffset from the previous answer for the next page.' },
+        competitorNames: { type: 'array', items: { type: 'string' }, description: 'Read: names to check against the stored competitors (up to 50). The answer says stored or not for each, with its offset.' },
+        businessOverview: { type: 'string', description: 'Update: the business overview (mission, vision, value propositions). Replaces the stored overview; blank changes nothing.' },
+        competitors: {
+          type: 'array',
+          description: 'Update: competitors to add or update, merged by name. Never removes a stored competitor.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Competitor name' },
+              description: { type: 'string', description: 'Competitor description or analysis' }
+            },
+            required: ['name']
+          }
+        },
+        icp: {
+          type: 'array',
+          description: 'Update: ideal customer profiles to add or update, merged by title. Never removes a stored profile.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'ICP title or name' },
+              description: { type: 'string', description: 'ICP description or characteristics' },
+              valueProposition: { type: 'string', description: 'Value proposition for this customer type' },
+              buyerPersonas: { type: 'array', items: { type: 'string' }, description: 'Buyer personas for this customer type (replaces this profile\'s list)' }
+            },
+            required: ['title']
+          }
+        }
       },
       required: ['action']
     }
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
-    if (args.action === 'read') {
-      const data = await mcpFetch({ method: 'GET', path: '/api/market-strategy', context: c });
-      return jsonResult(data);
-    }
-    const { action, ...body } = args;
-    const data = await mcpFetch({ method: 'POST', path: '/api/market-strategy', context: c, body });
-    return jsonResult(data);
+    // Any other action used to be taken as an update, so a mistyped "Read" wrote; now it is refused.
+    const action = typeof args?.action === 'string' ? args.action.trim().toLowerCase() : '';
+    if (action === 'read') return executeStrategyRead(args, c);
+    if (action === 'update') return executeStrategyUpdate(args, c);
+    throw new Error('manage_market_strategy: action must be "read" or "update".');
   }
 });
 
