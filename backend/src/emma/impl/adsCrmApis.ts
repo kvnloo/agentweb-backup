@@ -1636,8 +1636,17 @@ export function hubspotDateFilters(args: any):
   for (const [key, op] of [['created_after', 'GTE'], ['created_before', 'LT']] as const) {
     const raw = args?.[key];
     if (raw === undefined || raw === null || raw === '') continue;
-    const ms = /^\d{10,}$/.test(String(raw)) ? Number(raw) : Date.parse(String(raw));
-    if (!Number.isFinite(ms)) return { error: `${key} must be an ISO date (e.g. 2026-11-01) or epoch milliseconds.` };
+    const s = String(raw).trim();
+    // Pure digits: 13+ digits is epoch ms; 9-12 digits is epoch seconds (an epoch-ms value
+    // that short would be a 1970 date, which no caller means). Shorter digit runs are rejected.
+    let ms: number;
+    if (/^\d+$/.test(s)) {
+      if (s.length < 9) return { error: `${key} must be an ISO date (e.g. 2026-11-01), epoch seconds, or epoch milliseconds.` };
+      ms = s.length >= 13 ? Number(s) : Number(s) * 1000;
+    } else {
+      ms = Date.parse(s);
+    }
+    if (!Number.isFinite(ms)) return { error: `${key} must be an ISO date (e.g. 2026-11-01), epoch seconds, or epoch milliseconds.` };
     filters.push({ propertyName: 'createdate', operator: op, value: String(ms) });
   }
   return { filters };

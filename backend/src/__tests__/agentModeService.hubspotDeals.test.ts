@@ -182,5 +182,9 @@ describe('CONTACTS SEARCH', () => {
 
   it('rejects a bad date', () => {
     expect(hubspotDateFilters({ created_after: 'not-a-date' })).toHaveProperty('error');
+    // Epoch seconds must not be read as 1970 milliseconds (Opslane P1, run 2265).
+    expect(hubspotDateFilters({ created_after: '1793491200' })).toEqual({ filters: [{ propertyName: 'createdate', operator: 'GTE', value: '1793491200000' }] });
+    expect(hubspotDateFilters({ created_after: 1793491200000 })).toEqual({ filters: [{ propertyName: 'createdate', operator: 'GTE', value: '1793491200000' }] });
+    expect(hubspotDateFilters({ created_after: '2026' })).toHaveProperty('error');
   });
 });
