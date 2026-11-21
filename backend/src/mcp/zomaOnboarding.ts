@@ -27,6 +27,7 @@ import { ZOMA_MCP_SETUP } from './zomaSetupLinks';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
 import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
+import { META_BUSINESS_PAGES_SETTINGS_URL } from './metaPageAccessRefusal';
 import {
   GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled,
   ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
@@ -66,7 +67,7 @@ export interface ZomaMetaAccountSummary {
 export type ZomaMetaPageBlockerReason = 'no_page_exists' | 'page_not_granted' | 'no_advertiser_role';
 
 export const META_CREATE_PAGE_URL = 'https://www.facebook.com/pages/create';
-export const META_BUSINESS_PAGES_SETTINGS_URL = 'https://business.facebook.com/settings/pages';
+export { META_BUSINESS_PAGES_SETTINGS_URL };
 
 export interface ZomaMetaPageBlocker {
   type: 'meta_page_access';
