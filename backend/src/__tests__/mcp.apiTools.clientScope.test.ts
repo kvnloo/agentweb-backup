@@ -39,12 +39,19 @@ jest.mock('../services/crmAccessControl', () => ({
   CRM_EDITOR_REQUIRED_MESSAGE: 'You need CRM-editor access to this list.',
 }));
 
+// ENG-2840: every add now runs the do-not-contact inheritance the bulk imports run. Its own behaviour is tested in mcp.manageLeads.writes.test.ts;
+// here it is a recorded stub, so what is pinned is WHO it acts for and WITH WHICH token.
+jest.mock('../services/leadImportFollowups', () => ({
+  applyLeadImportFollowups: jest.fn().mockResolvedValue({ inheritedDoNotContact: [], doNotContactCheckFailed: 0 }),
+}));
+
 const mockRecordAdminAudit = jest.fn();
 jest.mock('../services/adminAuditLog', () => ({
   recordAdminAudit: (...a: any[]) => mockRecordAdminAudit(...a),
 }));
 
 import { mcpFetch } from '../mcp/server/httpClient';
+import { applyLeadImportFollowups } from '../services/leadImportFollowups';
 import { userDb, crmDb } from '../services/db';
 import { canDestructiveCrmList } from '../services/crmAccessControl';
 import { mcpToolRegistry } from '../mcp/server/registry';
@@ -290,10 +297,16 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
 
       await mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: false }), callerContext);
 
-      expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+      // The write, then the list read the do-not-contact inheritance needs (the owner of the list). Both travel as the DELEGATED target.
+      expect(mockMcpFetch).toHaveBeenCalledTimes(2);
       const call = mockMcpFetch.mock.calls[0][0];
       expect(call.method).toBe('POST');
       expect(call.path).toBe('/api/crm/lists/list-1/leads');
+      const listRead = mockMcpFetch.mock.calls[1][0];
+      expect({ method: listRead.method, path: listRead.path }).toEqual({ method: 'GET', path: '/api/crm/lists/list-1' });
+      expect(listRead.context.overrideToken).toBe(call.context.overrideToken);
+      // The inheritance flags the new lead on behalf of the ADMIN who acted (the audit identity), not the customer.
+      expect(applyLeadImportFollowups).toHaveBeenCalledWith('list-1', expect.any(String), [{ leadId: 'new-lead-1', email: 'lead@example.com' }], { actingUserId: 'admin-1', validate: false });
       // Regression guard for the {leads:[...]} payload-shape bug — the real
       // route reads req.body as a single lead's fields directly.
       expect(call.body).toEqual({ email: 'lead@example.com' });
@@ -304,6 +317,16 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
 
       expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'planned', dryRun: false }));
       expect(mockRecordAdminAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'created', leadId: 'new-lead-1' }));
+    });
+
+    it('when the do-not-contact check fails on the admin add, the answer names the lead that was NOT checked', async () => {
+      process.env.MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED = 'true';
+      mockMcpFetch.mockResolvedValue({ leadId: 'new-lead-1' });
+      (applyLeadImportFollowups as jest.Mock).mockResolvedValueOnce({ inheritedDoNotContact: [], doNotContactCheckFailed: 1 });
+
+      const result: any = await mcpToolRegistry.execute('manage_leads', addArgs({ dry_run: false }), callerContext);
+      const body = JSON.parse(result.content[0].text);
+      expect(body).toMatchObject({ leadId: 'new-lead-1', doNotContactCheckFailed: 1, doNotContactUnchecked: ['new-lead-1'] });
     });
 
     it('records a failed-outcome audit and rethrows when the real write itself fails', async () => {
@@ -349,16 +372,27 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
       expect(call.body).toEqual({ email: 'lead@example.com' });
     });
 
-    it('rejects a leads array that is empty or has more than one entry', async () => {
+    // ENG-2840: the self-scoped add now takes up to 100 leads (counted honestly, manageLeadsWrites.ts). Exactly one lead is still required
+    // for a dry_run preview and for the admin client_id path, whose audit trail and flag are written for a single lead.
+    it('rejects an empty leads array, more than 100 leads, and several leads for a preview', async () => {
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [] }, callerContext)
-      ).rejects.toThrow('exactly one lead per call');
+      ).rejects.toThrow('leads must be a non-empty array');
+
+      await expect(
+        mcpToolRegistry.execute('manage_leads', {
+          action: 'add',
+          list_id: 'list-1',
+          leads: Array.from({ length: 101 }, (_, i) => ({ email: `l${i}@example.com` })),
+        }, callerContext)
+      ).rejects.toThrow('at most 100 per call');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', {
           action: 'add',
           list_id: 'list-1',
           leads: [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          dry_run: true,
         }, callerContext)
       ).rejects.toThrow('exactly one lead per call');
 
@@ -372,15 +406,15 @@ describe('admin client_id scoping — end to end (ENG-1596 / ENG-1557 v1)', () =
     it('rejects a non-object lead entry (null, string, array) instead of silently sending an empty body', async () => {
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [null] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: ['not-an-object'] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       await expect(
         mcpToolRegistry.execute('manage_leads', { action: 'add', list_id: 'list-1', leads: [['nested', 'array']] }, callerContext)
-      ).rejects.toThrow('requires the single lead to be an object');
+      ).rejects.toThrow('must be an object with fields');
 
       expect(mockMcpFetch).not.toHaveBeenCalled();
     });

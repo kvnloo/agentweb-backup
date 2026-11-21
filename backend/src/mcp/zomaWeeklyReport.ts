@@ -265,26 +265,27 @@ export function weekInsight(ads: ZomaAdsWeek): string | undefined {
 // ---- escaping, signing -----------------------------------------------------------------------
 
 /** A key derived from the JWT secret, only for these links. */
-const tokenKey = (secret: string): Buffer => Buffer.from(crypto.hkdfSync('sha256', secret, UNSUBSCRIBE_CONTEXT, 'user-id-token', 32));
+/** `context` keeps each email's links apart (ENG-3155's measurement report uses its own). */
+const tokenKey = (secret: string, context: string = UNSUBSCRIBE_CONTEXT): Buffer => Buffer.from(crypto.hkdfSync('sha256', secret, context, 'user-id-token', 32));
 
 /**
  * An opaque, authenticated token for the user id (AES-256-GCM, key derived from the JWT secret): the link shows no
  * internal id, and any change to it is rejected. Random per send; opting out is idempotent, so reuse is harmless.
  */
-export function signUnsubscribeToken(userId: string, secret: string = getJwtSecret()): string {
+export function signUnsubscribeToken(userId: string, secret: string = getJwtSecret(), context: string = UNSUBSCRIBE_CONTEXT): string {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', tokenKey(secret), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', tokenKey(secret, context), iv);
   const ciphertext = Buffer.concat([cipher.update(userId, 'utf8'), cipher.final()]);
   return Buffer.concat([iv, ciphertext, cipher.getAuthTag()]).toString('base64url');
 }
 
 /** The user id inside a valid token, else null. */
-export function verifyUnsubscribeToken(token: unknown, secret: string = getJwtSecret()): string | null {
+export function verifyUnsubscribeToken(token: unknown, secret: string = getJwtSecret(), context: string = UNSUBSCRIBE_CONTEXT): string | null {
   if (typeof token !== 'string' || token.length > 400 || !/^[A-Za-z0-9_-]+$/.test(token)) return null;
   const raw = Buffer.from(token, 'base64url');
   if (raw.length < 12 + 1 + 16 || raw.length > 12 + 120 + 16) return null;
   try {
-    const decipher = crypto.createDecipheriv('aes-256-gcm', tokenKey(secret), raw.subarray(0, 12));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', tokenKey(secret, context), raw.subarray(0, 12));
     decipher.setAuthTag(raw.subarray(raw.length - 16));
     const userId = Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]).toString('utf8');
     return userId && userId.length <= 120 ? userId : null;
@@ -604,6 +605,11 @@ export interface ZomaWeeklyReportDeps {
   backendUrl: () => string;
   secret: () => string;
   now: () => number;
+  /**
+   * ENG-3155: a user with an active measurement-report schedule already gets that report, so the weekly email
+   * skips them (no double email). Optional; absent means nobody is skipped.
+   */
+  hasMeasurementSchedule?: (userId: string) => Promise<boolean>;
 }
 
 export interface WeeklyReportRunResult {
@@ -653,6 +659,7 @@ export async function runZomaWeeklyReports(deps: ZomaWeeklyReportDeps = defaultZ
       const usage = usageByUser.get(user.userId);
       if (!usage || usage.toolCalls < 1) continue;
       if (await deps.hasClaimed(user.userId, week)) continue;
+      if (deps.hasMeasurementSchedule && (await deps.hasMeasurementSchedule(user.userId))) continue;
       // A transient failure here skips the user for this pass (nothing claimed, retried next hour) instead of
       // sending an email that claims "no ad account" or "could not read".
       const platforms = await deps.getAdsWeeks(user.userId, win, { final });
@@ -961,4 +968,8 @@ export const defaultZomaWeeklyReportDeps: ZomaWeeklyReportDeps = {
   backendUrl: getBackendUrl,
   secret: () => getJwtSecret(),
   now: () => Date.now(),
+  async hasMeasurementSchedule(userId) {
+    const { hasActiveReportSchedule } = await import('./zomaReportSchedule');
+    return hasActiveReportSchedule(userId);
+  },
 };

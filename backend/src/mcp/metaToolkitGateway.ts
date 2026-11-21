@@ -24,7 +24,7 @@ import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } fr
 import { isSignalsRead } from './metaToolkitSignals';
 import { RateLimiter } from '../middleware/rateLimiter';
 import { effectiveApiKeyScopes, findScopeDenial } from './server/apiKeyScopes';
-import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool } from './zomaToolDefinitions';
+import { AUDIENCE_TOOL_NAME, isAudienceWriteRequest, isZomaTool, xAdsToolkitEnabled } from './zomaToolDefinitions';
 import { isExperimentRead } from './metaToolkitExperiments';
 import { explainMetaError, isDiagnosticsRead } from './metaToolkitDiagnostics';
 import { getMetaHelpArticles } from './metaToolkitHelp';
@@ -48,6 +48,17 @@ import { DATABRICKS_READ_ONLY_MESSAGE, isDatabricksAllowedCall, isDatabricksClie
 import { noteProductUse, zomaMilestone } from '../services/journeyMilestones';
 import { zomaWriteKindFor } from '../services/zomaWriteKind';
 import { isZomaAdsReportTool, runZomaAdsReport } from './zomaAdsReport';
+import { isZomaIndustryBenchmarkTool, runZomaIndustryBenchmark } from './zomaIndustryBenchmark';
+import { isZomaMeasurementReportTool, measurementReportsEnabledForUserId, runZomaMeasurementReport } from './zomaMeasurementReport';
+import {
+  defaultClassifyIndustry,
+  enrollReportSchedule,
+  isReportScheduleWrite,
+  isZomaReportScheduleTool,
+  runZomaReportScheduleTool,
+  type ScheduleNotice,
+  storedIndustry,
+} from './zomaReportSchedule';
 import crypto from 'crypto';
 import { assertZomaPublishAllowed, isBillableResult, isZomaPublishWrite, reportZomaBillableCall } from './zomaBilling';
 
@@ -143,6 +154,21 @@ export interface MetaToolkitGatewayDeps {
   accountSpend?: (account: ConnectedAccount, accountId: string) => Promise<number>;
   /** ENG-3134 zoma_ads_report; defaults to runZomaAdsReport (Graph insights read). */
   runAdsReport?: (account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
+  /** ENG-3156 zoma_industry_benchmark; defaults to runZomaIndustryBenchmark (Graph reads + one classification call). */
+  runIndustryBenchmark?: (account: ConnectedAccount, accountId: string, userId: string, args: any) => Promise<any>;
+  /** ENG-3155 per-user gate (flag or allowlist); defaults to measurementReportsEnabledForUserId. */
+  measurementReportsEnabledFor?: (userId: string) => Promise<boolean>;
+  /** ENG-3155 zoma_measurement_report (dark until the flag or the allowlist); defaults to runZomaMeasurementReport. */
+  runMeasurementReport?: (userId: string, account: ConnectedAccount, accountId: string, args: any) => Promise<any>;
+  /** ENG-3155 zoma_report_schedule; defaults to runZomaReportScheduleTool. */
+  runReportScheduleTool?: (userId: string, args: any) => Promise<any>;
+  /**
+   * ENG-3155 auto-enrollment after a confirmed launch; defaults to enrollReportSchedule (null while the flag is off)
+   * with a one-time background industry classification when none is stored.
+   */
+  enrollReportSchedule?: (userId: string, adAccountId: string) => Promise<ScheduleNotice | null>;
+  /** ENG-3155 the industry stored on the account's report schedule (null when none or unreadable); defaults to storedIndustry. */
+  getStoredIndustry?: (userId: string, adAccountId: string) => Promise<string | null>;
 }
 
 /** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
@@ -337,7 +363,8 @@ function ambiguousAccountMessage(usable: ConnectedAccount[]): string {
 // Fail closed: if the manifest cannot be read, let the error propagate so the call is
 // refused (and not metered) rather than executing without the resolved account binding.
 function toolAcceptsAccountId(name: string): boolean {
-  const def = getMetaToolkitManifest().find((d: any) => d.name === name);
+  // Schema lookup only (listing is gated per caller elsewhere): include every gated definition.
+  const def = getMetaToolkitManifest(undefined, { measurementReports: true }).find((d: any) => d.name === name);
   return !!def?.inputSchema?.properties?.account_id;
 }
 
@@ -453,7 +480,7 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
 
   // ENG-3131: the paywall sits in front of writes that make ads live (preview included, so the
   // user never approves a launch that cannot run). Reads, drafts and paused creates never reach it.
-  const assertPublishAllowed = async (platform: 'meta' | 'google_ads') => {
+  const assertPublishAllowed = async (platform: 'meta' | 'google_ads' | 'x_ads') => {
     try {
       await (deps.assertPublishAllowed ?? assertZomaPublishAllowed)(caller.userId, { platform, toolName: request.toolName });
     } catch (error) {
@@ -495,6 +522,16 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (request.toolName === 'zoma_prepare_upload') {
     assertMetaToolkitScope(caller, request.toolName, true);
     const result = await (deps.prepareUpload ?? prepareZomaUpload)(caller.userId, request.args ?? {});
+    await meter(undefined, result);
+    return result;
+  }
+
+  // ENG-3155: the measurement-report schedule is Zoma's own setting (no Meta call). Not routed unless the flag is
+  // on or the caller is allowlisted, so otherwise the call falls through to the v1 refusal like any unknown tool.
+  const reportsEnabled = () => (deps.measurementReportsEnabledFor ?? measurementReportsEnabledForUserId)(caller.userId);
+  if (isZomaReportScheduleTool(request.toolName) && (await reportsEnabled())) {
+    assertMetaToolkitScope(caller, request.toolName, isReportScheduleWrite(request.args));
+    const result = await (deps.runReportScheduleTool ?? runZomaReportScheduleTool)(caller.userId, request.args ?? {});
     await meter(undefined, result);
     return result;
   }
@@ -542,6 +579,30 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     }
   }
 
+  // ENG-3142: X Ads provider (dark until ZOMA_X_ADS_ENABLED=true), loaded lazily like Google.
+  if (xAdsToolkitEnabled()) {
+    const x = await import('./xAdsToolkitGateway');
+    if (x.isXAdsToolkitTool(request.toolName)) {
+      const xWrite = x.isXAdsToolkitWrite(request.toolName);
+      assertMetaToolkitScope(caller, request.toolName, xWrite);
+      if (xWrite && isZomaPublishWrite('x_ads', request.args)) await assertPublishAllowed('x_ads');
+      const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;
+      const xResult = await x.handleXAdsToolkitCall(caller, request, {
+        listAccounts: deps.listAccounts,
+        now: deps.now,
+        meter: (result) => meter('x_ads', result),
+        recordWrite: async (input) => {
+          const recorded = await recordWrite({ ...input, product: TOOLKIT_PRODUCT });
+          journeyAfterCall(caller.userId, 'first_write', { platform: 'x_ads', toolName: request.toolName });
+          return recorded;
+        },
+        accessError: (message) => new MetaToolkitAuthError(message, 403),
+      });
+      if (!xWrite) journeyAfterCall(caller.userId, 'first_read', { platform: 'x_ads', toolName: request.toolName });
+      return stripCredentials(xResult);
+    }
+  }
+
   const args = { ...(request.args ?? {}) };
   assertMetaToolkitScope(
     caller,
@@ -569,12 +630,30 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   if (audienceTool || toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
 
   // ENG-3134: reporting on the resolved (owned, usable) account with that connection's own token.
-  if (isZomaAdsReportTool(request.toolName)) {
+  // ENG-3156: the industry benchmark reads the same report on the same account.
+  if (isZomaAdsReportTool(request.toolName) || isZomaIndustryBenchmarkTool(request.toolName)) {
     const account = (await deps.listAccounts(caller.userId)).find(
       (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
     );
     if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
-    const report = await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
+    const report = isZomaIndustryBenchmarkTool(request.toolName)
+      ? await (deps.runIndustryBenchmark ?? ((acc, id, uid, a) => runZomaIndustryBenchmark(acc, id, uid, a)))(account, accountId, caller.userId, args)
+      : await (deps.runAdsReport ?? ((acc, id, a) => runZomaAdsReport(acc, id, a)))(account, accountId, args);
+    await meter('meta');
+    journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
+    return stripCredentials(report);
+  }
+
+  // ENG-3155: the full measurement report (campaigns, CRM leads, breakdowns, hosted HTML) on the resolved account.
+  if (isZomaMeasurementReportTool(request.toolName) && (await reportsEnabled())) {
+    const account = (await deps.listAccounts(caller.userId)).find(
+      (a) => META_PROVIDER.isAdAccount(a) && META_PROVIDER.isUsable(a, deps.now()) && META_PROVIDER.accountIds(a).includes(accountId),
+    );
+    if (!account) throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
+    // Caller omitted the industry: use the one stored on the report schedule (user-set or classified), if any.
+    const industry = args.industry === undefined ? await (deps.getStoredIndustry ?? storedIndustry)(caller.userId, accountId) : null;
+    const reportArgs = industry ? { ...args, industry } : args;
+    const report = await (deps.runMeasurementReport ?? runZomaMeasurementReport)(caller.userId, account, accountId, reportArgs);
     await meter('meta');
     journeyAfterCall(caller.userId, 'first_read', { platform: 'meta', toolName: request.toolName });
     return stripCredentials(report);
@@ -690,6 +769,16 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     const entityType = audienceTool ? 'CUSTOM_AUDIENCE' : String(args.entity_type);
     const executedWrites: any[] = Array.isArray((result as any)?.results) ? (result as any).results : [result];
     for (const write of executedWrites) await recordExecutedWrite(entityType, String(args.action), write, args.params);
+    // ENG-3155: a confirmed launch enrolls the account in measurement reports (idempotent; no-op unless the flag
+    // is on or the caller is allowlisted). A schedule failure is logged and never makes the executed write look failed.
+    if (!audienceTool && !creativeAsset && !lifecycle && isZomaPublishWrite('meta', args) && result?.verification === 'CONFIRMED') {
+      try {
+        const notice = await (deps.enrollReportSchedule ?? ((u, a) => enrollReportSchedule(u, a, { classifyIndustry: defaultClassifyIndustry })))(caller.userId, accountId);
+        if (notice) result.report_schedule = notice;
+      } catch (error) {
+        console.error('[meta-toolkit] measurement report enrollment failed:', error instanceof Error ? error.message : error);
+      }
+    }
   }
 
   await meter('meta', result);

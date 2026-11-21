@@ -38,6 +38,7 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'monitor_lead_volume',
   'check_account_tracking_health',
   'read_client_meta_activity',
+  'read_client_meta_budgets',
   'diagnose_leads_at_zero',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
@@ -45,6 +46,11 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'list_meta_ads_campaigns',
   'call_meta_ads_insights_api',
   'get_meta_ads_metrics',
+  // ENG-1904: the Google Ads tools take the same admin-only `client_id` as the Meta tools (resolveGoogleAdsCredentialScope)
+  // and were never on this list, so an admin-run report built from a client's Google Ads account reached any recipient.
+  // Treated exactly like the Meta tools: see ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS.
+  'call_google_ads_api',
+  'call_google_ads_reporting_api',
 ];
 
 // ENG-2785: the ENG-1801 Meta Ads tools are customer-facing. They can only read
@@ -57,6 +63,9 @@ export const ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS = [
   'list_meta_ads_campaigns',
   'call_meta_ads_insights_api',
   'get_meta_ads_metrics',
+  // ENG-1904: same rule for the Google Ads tools (customer tools; only an admin's `client_id` reaches another account).
+  'call_google_ads_api',
+  'call_google_ads_reporting_api',
 ];
 
 export interface CrossAccountClassifyOptions {
@@ -67,7 +76,7 @@ export interface CrossAccountClassifyOptions {
   ownerIsAdmin?: boolean;
 }
 
-function crossAccountToolsFor(opts?: CrossAccountClassifyOptions): string[] {
+export function crossAccountToolsFor(opts?: CrossAccountClassifyOptions): string[] {
   if (opts?.ownerIsAdmin === false) {
     return CROSS_ACCOUNT_USER_DATA_TOOLS.filter((t) => !ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS.includes(t));
   }
@@ -219,6 +228,16 @@ export async function resolveAuthorizedReportRecipients(params: {
 
 export function deliveryEnforcementEnabled(): boolean {
   return process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT === 'true';
+}
+
+/**
+ * ENG-1904: whether a NON-admin recipient may receive an admin-owned run's report when everything the run read was about
+ * that recipient (`scheduledReportScope.ts`). OFF by default: with the flag unset the guard behaves exactly as before and
+ * only logs what it WOULD have done (`[ENG-1904 shadow]`). A separate flag from ENG-1552's, because that one is already
+ * understood as the delivery-log rollout and this one widens who receives data.
+ */
+export function recipientScopingEnabled(): boolean {
+  return process.env.SCHEDULED_REPORT_RECIPIENT_SCOPING === 'true';
 }
 
 /** One grep-able line per decision shadow mode did not act on. */

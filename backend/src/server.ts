@@ -892,6 +892,24 @@ createTestAccount().then(async () => {
       }, 11 * 60 * 1000);
       console.log('[ZomaWeeklyReport] Initialized — hourly, first pass in 11 minutes (active only when ZOMA_WEEKLY_REPORT_ENABLED=true)');
 
+      // ENG-3155: proactive measurement reports for accounts Zoma shipped a campaign on. Hourly tick; a no-op
+      // until ZOMA_MEASUREMENT_REPORTS_ENABLED=true. Each due slot is claimed by a conditional write before the
+      // send, so it goes out at most once across instances.
+      setTimeout(() => {
+        let running = false;
+        const tick = () => {
+          if (!isCronEnabled() || running) return;
+          running = true;
+          import('./mcp/zomaReportSchedule')
+            .then(({ runZomaMeasurementReports }) => cronJobRegistry.track('ZomaMeasurementReports', runZomaMeasurementReports()))
+            .catch(e => console.error('[ZomaMeasurementReports] Error:', e))
+            .finally(() => { running = false; });
+        };
+        tick();
+        setInterval(tick, 60 * 60 * 1000);
+      }, 13 * 60 * 1000);
+      console.log('[ZomaMeasurementReports] Initialized — hourly, first pass in 13 minutes (active only when ZOMA_MEASUREMENT_REPORTS_ENABLED=true)');
+
       // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
       // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
       try {

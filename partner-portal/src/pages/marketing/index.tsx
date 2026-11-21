@@ -9,10 +9,6 @@ import NotFound from './NotFound';
 import MarketResearch from './MarketResearch';
 import MarketResearchDetail from './MarketResearchDetail';
 
-// Placeholders for components we haven't implemented yet
-const ReportDetail = () => <div>Report Detail</div>;
-const Blog = () => <div>Blog</div>;
-
 const Marketing: React.FC = () => {
   const theme = useTheme();
   
@@ -25,13 +21,14 @@ const Marketing: React.FC = () => {
     }}>
       <Routes>
         <Route path="/" element={<Home />} />
-        <Route path="/social-listening" element={<NotFound />} />
-        <Route path="/creative-generation" element={<NotFound />} />
+        {/* ENG-3141: unbuilt pages redirect to the marketing home instead of a placeholder. */}
+        <Route path="/social-listening" element={<Navigate to="/marketing" replace />} />
+        <Route path="/creative-generation" element={<Navigate to="/marketing" replace />} />
         <Route path="/research" element={<MarketResearch />} />
         <Route path="/research/:taskId" element={<MarketResearchDetail />} />
         <Route path="/market-research" element={<Navigate to="/marketing/research" replace />} />
-        <Route path="/report/:id" element={<ReportDetail />} />
-        <Route path="/blog" element={<Blog />} />
+        <Route path="/report/:id" element={<Navigate to="/marketing" replace />} />
+        <Route path="/blog" element={<Navigate to="/marketing" replace />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
     </Box>

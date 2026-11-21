@@ -16,7 +16,7 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
-import { googleToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { googleToolkitEnabled, xAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
 import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
@@ -24,6 +24,7 @@ import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } 
 import { validateRef } from '../services/journeyAttribution';
 import { toZomaVoice, zomaErrorNextStep, zomaNextStep } from '../mcp/zomaNextStep';
 import { ZOMA_ADS_EXPERIENCE_QUESTION, ZOMA_WELCOME } from '../mcp/zomaAdsExperience';
+import { measurementReportsEnabledForUserId } from '../mcp/zomaMeasurementReport';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -45,17 +46,29 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
  * ENG-2823: Meta tools + Zoma tools, plus the Google Ads provider's tools while it is enabled.
  * The Google manifest is loaded lazily so the Meta-only path never imports it.
  */
-function toolkitManifest() {
+export function toolkitManifest(measurementReports: boolean) {
   // ENG-2747: every advertised tool carries MCP annotations (deny-by-default; see toolkitToolAnnotations.ts).
-  if (!googleToolkitEnabled()) return annotateToolkitTools(getMetaToolkitManifest());
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
-  return annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+  const tools: any[] = [...getMetaToolkitManifest(undefined, { measurementReports })];
+  if (googleToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getGoogleToolkitManifest } = require('../mcp/googleToolkitManifest') as typeof import('../mcp/googleToolkitManifest');
+    tools.push(...getGoogleToolkitManifest());
+  }
+  // ENG-3142: X Ads tools only while ZOMA_X_ADS_ENABLED is on.
+  if (xAdsToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getXAdsToolkitManifest } = require('../mcp/xAdsToolkitManifest') as typeof import('../mcp/xAdsToolkitManifest');
+    tools.push(...getXAdsToolkitManifest());
+  }
+  return annotateToolkitTools(tools);
 }
 
-/** ENG-2747 (option B): Databricks-origin callers see only the tools they may call. */
-function toolsFor(caller: { databricksOrigin?: boolean } | undefined) {
-  const tools = toolkitManifest();
+/**
+ * ENG-2747 (option B): Databricks-origin callers see only the tools they may call.
+ * ENG-3155: the measurement report tools are listed when the flag is on or this caller is allowlisted.
+ */
+async function toolsFor(caller: { userId: string; databricksOrigin?: boolean }) {
+  const tools = toolkitManifest(await measurementReportsEnabledForUserId(caller.userId));
   return caller?.databricksOrigin ? databricksToolView(tools) : tools;
 }
 
@@ -90,7 +103,7 @@ router.get('/skill.md', (_req: Request, res: Response) => {
 router.get('/tools', async (req: Request, res: Response) => {
   try {
     const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-    return res.json({ tools: toolsFor(caller) });
+    return res.json({ tools: await toolsFor(caller) });
   } catch (error) {
     return sendMetaToolkitError(res, error);
   }
@@ -203,7 +216,7 @@ router.post('/mcp', async (req: Request, res: Response) => {
         return rpcResult(res, id, {});
       case 'tools/list': {
         const caller = await authenticateMetaToolkitCaller(req.headers.authorization);
-        return rpcResult(res, id, { tools: toolsFor(caller) });
+        return rpcResult(res, id, { tools: await toolsFor(caller) });
       }
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
