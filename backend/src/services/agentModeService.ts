@@ -3226,7 +3226,7 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
       }
     }
-    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare);
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare, messageContent);
 
     // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
     let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
@@ -6466,7 +6466,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false, ownTurnContent?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6482,6 +6482,17 @@ export class AgentModeService {
       return true;
     });
 
+    // ENG-3164: the stored row of THIS turn's own message (the controller stores it before generating, so it is the last
+    // row), so that who wrote it is read from the `kind` the server stored on it, never from the text. `messageContent`
+    // can carry a suffix the stored row does not (the voice-card prompt suffix), so the caller also hands over the turn's
+    // own content before that suffix. Neither matches (an attachment or a deck answer also changes the text) = not
+    // provably the server's = labelled, which is the safe direction.
+    const lastRow = sessionHistory[sessionHistory.length - 1];
+    const currentTurnRow: ChatMessage | undefined =
+      lastRow?.role === 'user' && (lastRow.content === messageContent || (ownTurnContent !== undefined && lastRow.content === ownTurnContent))
+        ? lastRow
+        : undefined;
+
     // Merge consecutive user messages into one — keeps the 10-message window from dropping
     // the original task when many retry messages ("Please try again...") pile up behind it.
     // ENG-2227: merging mutates only `.content`, never `.metadata` — if an anonymous ishare
@@ -6496,7 +6507,12 @@ export class AgentModeService {
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
       const sameAnonymity = isAnonymousShareMessage(last) === isAnonymousShareMessage(msg);
-      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity) {
+      // ENG-3164: two visitor-stamped rows are also kept apart when only one of them was written by the server (a
+      // continuation directive next to a visitor's message): the merged row keeps the FIRST row's metadata, so a visitor's
+      // words merged behind a server-written row would read as the server's and lose the label.
+      const sameAuthor = !(isAnonymousShareMessage(last) && isAnonymousShareMessage(msg))
+        || isServerAuthoredContinuation(last) === isServerAuthoredContinuation(msg);
+      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity && sameAuthor) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
         mergedHistory.push({ ...msg });
@@ -6684,7 +6700,9 @@ export class AgentModeService {
     // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
     // before it's even "history") with zero provenance signal. Apply the same marker here when
     // this turn itself came through the public ishare endpoint.
-    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(null, messageContent)
+    // ENG-3164: a server-written turn is told by the stored kind of its own row, never by its text (a visitor can open a
+    // message with the server's own continuation line). No stored row found = not provably the server's = labelled.
+    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(currentTurnRow)
       ? withAnonymousShareMarker(messageContent)
       : messageContent;
     if (screenshotUrl) {
@@ -15301,11 +15319,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * The last message with role 'user' in the session, or undefined. Used ONLY
    * to verify an "explicitly stated by the user" claim against real transcript
    * text (verifyExplicitStatement) — never to infer or parse an answer.
+   *
+   * ENG-3164: `ownerOnly` is for a caller that treats the text as the ACCOUNT OWNER's own words. A share-link visitor
+   * runs under the owner's userId, so their message is a 'user' row like any other; when the last one is a visitor's
+   * (stamped by the share route) there is no owner statement to verify, so the answer is undefined and the caller
+   * falls back to asking. It does not look further back: the owner restates it, as before.
    */
-  private async getLastUserMessageText(sessionId: string): Promise<string | undefined> {
+  private async getLastUserMessageText(sessionId: string, ownerOnly: boolean = false): Promise<string | undefined> {
     const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') return messages[i].content;
+      if (messages[i].role === 'user') {
+        if (ownerOnly && isAnonymousShareMessage(messages[i])) return undefined;
+        return messages[i].content;
+      }
     }
     return undefined;
   }
@@ -15425,7 +15451,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // genuine-but-unrelated quote could rubber-stamp any objective the model
     // names alongside it.
     if (claimedObjective && AgentModeService.META_OBJECTIVE_VALUES.includes(claimedObjective) && quote) {
-      const lastUserText = await this.getLastUserMessageText(sessionId);
+      // ENG-3164: the objective must be in the OWNER's own words; a share-link visitor's message does not count.
+      const lastUserText = await this.getLastUserMessageText(sessionId, true);
       const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
       if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
         // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN
