@@ -9553,7 +9553,9 @@ TYPICAL WORKFLOW:
         deal_id:          { type: 'string', description: 'DEALS GET_CONTACTS: deal id.' },
         created_after:    { type: 'string', description: 'CONTACTS/DEALS SEARCH: inclusive lower bound on createdate (ISO date, epoch seconds, or epoch ms).' },
         created_before:   { type: 'string', description: 'CONTACTS/DEALS SEARCH: exclusive upper bound on createdate (ISO date, epoch seconds, or epoch ms).' },
-        properties:       { type: 'array', items: { type: 'string' }, description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return.' },
+        // Untyped on purpose: a write attempt (e.g. DEALS UPDATE with an object) must reach the
+        // handler's read-only refusal instead of failing schema validation; mergeProps ignores non-lists.
+        properties:       { description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return (string array or comma-separated string).' },
         limit:            { type: 'integer', description: 'CONTACTS/DEALS SEARCH page size (integer, max 100). HubSpot caps one search query at 10,000 total results; for larger sets split into non-overlapping created_after/created_before ranges and restart paging per range.' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
