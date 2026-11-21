@@ -1,6 +1,7 @@
 /** One immutable, paused campaign build carried by an existing approval-deck write item. */
 import { MetaService } from '../metaService';
 import { META_OBJ_GOAL_MAP, META_GOAL_BILLING_MAP, META_WEBSITE_OPTIMIZATION_GOALS } from '../../utils/metaConstants';
+import { isAnonymousShareMessage } from '../../utils/anonymousShareProvenance';
 
 export const PAUSED_BUNDLE_ACTION = 'CREATE_PAUSED_BUNDLE';
 type Params = Record<string, any>;
@@ -89,7 +90,8 @@ export function assertPausedBundleUserCount(bundle: PausedMetaBundle, messages: 
   const countPattern = new RegExp(`\\b(\\d+|${names.slice().reverse().join('|')})\\s+(?:(?:paused|new|different|distinct|separate)\\s+)*ads?\\b(?![ -]+sets?\\b)(?:\\s+variants?)?`, 'gi');
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (message.role !== 'user' || message.metadata?.approvalDeckAnswer) continue;
+    // ENG-3164: the count must come from the owner's own brief; a share-link visitor's message is skipped.
+    if (message.role !== 'user' || message.metadata?.approvalDeckAnswer || isAnonymousShareMessage(message)) continue;
     const counts = [...message.content.matchAll(countPattern)].map((match: RegExpMatchArray) =>
       /^\d+$/.test(match[1]) ? Number(match[1]) : names.findIndex(name => new RegExp(`^${name}$`, 'i').test(match[1])));
     if (!counts.length) continue;

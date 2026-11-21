@@ -114,17 +114,37 @@ describe('Partner Portal route catalog', () => {
     expect(withContractor.operate.map(({ label }) => label)).toContain('Contractor Accesses');
   });
 
-  it('flags every known placeholder and reachable dead-end explicitly', () => {
-    const unavailable = portalRouteCatalog
-      .filter(({ availability }) => availability === 'placeholder' || availability === 'dead-end')
-      .map(({ routePattern, availability }) => [routePattern, availability]);
+  it('redirects the four unbuilt marketing pages instead of flagging them as placeholders (ENG-3141)', () => {
+    const redirected = ['/marketing/social-listening', '/marketing/creative-generation', '/marketing/report/:id', '/marketing/blog'];
+    for (const pattern of redirected) {
+      const entry = portalRouteCatalog.find(({ routePattern }) => routePattern === pattern);
+      expect(entry).toMatchObject({ availability: 'redirect', navigationSurface: 'redirect', routeRegistered: true });
+    }
+  });
 
-    expect(unavailable).toEqual(expect.arrayContaining([
-      ['/marketing/social-listening', 'placeholder'],
-      ['/marketing/creative-generation', 'placeholder'],
-      ['/marketing/report/:id', 'placeholder'],
-      ['/marketing/blog', 'placeholder'],
-    ]));
+  it.each([
+    ['admin', { authenticated: true, isAdmin: true, isContractor: false }],
+    ['partner', { authenticated: true, isAdmin: false, isContractor: false }],
+    ['contractor', { authenticated: true, isAdmin: false, isContractor: true }],
+    ['customer', { authenticated: true, isAdmin: false, isContractor: false }],
+    ['anonymous', { authenticated: false, isAdmin: false, isContractor: false }],
+  ])('never offers a placeholder or dead-end destination to a %s viewer (ENG-3141)', (_viewer, context) => {
+    const grouped = getGroupedHeaderNavigation(context);
+    const items = [...getHeaderNavigation(context), ...grouped.direct, ...grouped.build, ...grouped.operate];
+    expect(items.length).toBeGreaterThan(0);
+    const unavailable = items.filter(({ availability }) => availability === 'placeholder' || availability === 'dead-end');
+    expect(unavailable).toEqual([]);
+  });
+
+  it('keeps no in-page marketing link to a redirected placeholder (ENG-3141)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('path');
+    const home = fs.readFileSync(path.join(__dirname, '../../pages/marketing/Home.tsx'), 'utf8');
+    for (const target of ['/marketing/social-listening', '/marketing/creative-generation', '/marketing/report/', '/marketing/blog']) {
+      expect(home).not.toContain(`to="${target}`);
+    }
   });
 
   it('no longer records the workflow builder post-save dead-end (ENG-2401)', () => {
