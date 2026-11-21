@@ -44,6 +44,19 @@ export function maskLeadPhone(phone: string): string {
   return digits.length > 4 ? `***-***-${digits.slice(-4)}` : '***';
 }
 
+/** Case-insensitive: "@domain" matches the exact domain or its subdomains; anything else is a substring match. */
+export function emailExcluded(email: string, patterns?: string[]): boolean {
+  const value = email.trim().toLowerCase();
+  if (!value || !patterns?.length) return false;
+  const domain = value.slice(value.lastIndexOf('@') + 1);
+  return patterns.some(raw => {
+    const pattern = raw.trim().toLowerCase();
+    if (!pattern) return false;
+    if (pattern.startsWith('@')) return domain === pattern.slice(1) || domain.endsWith(`.${pattern.slice(1)}`);
+    return value.includes(pattern);
+  });
+}
+
 /** All routing comes from persisted list ownership, never lead.userId/tenantId or form input. */
 async function routingContext(listId: string, expectedOrgId?: string) {
   const list = await crmDb.getLeadListById(listId);
@@ -87,6 +100,7 @@ async function leadContext(routing: RoutingContext, leadId: string) {
   ].map(value => string(value).toLowerCase()).filter(Boolean);
   if (config.sources && !config.sources.some(s => sources.includes(s.trim().toLowerCase()))) return;
   const email = string(lead.email);
+  if (emailExcluded(email, config.excludeEmailPatterns)) return;
   const hideEmail = /^noemail\+[^@]*@waterheater\.app$/i.test(email);
   return { ...routing, lead, source, customFields, hideEmail };
 }

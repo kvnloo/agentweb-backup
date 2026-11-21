@@ -7659,7 +7659,22 @@ const bridgedToolNames = [
   // had no self-status tool and fell back to assess_client_health (admin lookup
   // by email) — the user-reported "asked me for my email" bug.
   'get_account_status',
+  // ENG-2840: the market strategy tool of the MCP server (competitors merged by name, ICPs by title, nothing removed). Bridged
+  // so a skill that lists it in `toolNames` has a tool to offer in agent mode: it was registered for MCP callers only, so such a
+  // skill silently offered nothing and a call answered "Unknown tool". It is not a foundation tool and is kept out of the
+  // __other_skills__ pool (SKILL_ONLY_TOOL_NAMES in emma/impl/misc.ts), so a session is offered it through a skill that lists it;
+  // Emma's own update_market_strategy is unchanged.
+  'manage_market_strategy',
 ];
+
+/**
+ * Bridged tools that act on one signed-in account's data and must refuse an anonymous (not signed-in) session with the same
+ * deferred refusal Emma's own account tools give. The bridge copies a definition and an execute function, not the MCP handler's
+ * flags, so a tool that needs this names itself here. (None of the other bridged tools' MCP handlers sets the flag today, so
+ * the loop below carrying every handler's flag would change nothing now; naming the tool keeps the change to this tool, and a
+ * handler that sets the flag later does not silently start refusing anonymous in-app sessions.) ENG-2840.
+ */
+const BRIDGED_REQUIRES_USER_ACCOUNT: ReadonlySet<string> = new Set(['manage_market_strategy']);
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
@@ -7679,6 +7694,7 @@ const adminToolNames = [
   'monitor_lead_volume',
   'check_account_tracking_health',
   'read_client_meta_activity',
+  'read_client_meta_budgets',
   'diagnose_leads_at_zero',
   'get_pr_digest',
   'freeze_user_account',
@@ -7746,6 +7762,7 @@ for (const toolName of bridgedToolNames) {
         ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
         : handler.definition,
       execute,
+      ...(BRIDGED_REQUIRES_USER_ACCOUNT.has(toolName) ? { requiresUserAccount: true } : {}),
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
@@ -9444,7 +9461,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
-For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts, CONTACTS + SEARCH (created_after/created_before) for contacts with source/UTM attribution fields, and DEALS (read-only) for pipeline data.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9506,6 +9523,14 @@ ASSET METRICS (CAMPAIGN LIST_ASSETS):
   WORKFLOW → enrolled, active, completed counts
   SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
 
+  CONTACTS     → LIST (cursor?) | SEARCH (created_after?, created_before?, properties[]?, limit?, cursor?)
+               SEARCH returns source/UTM attribution fields (hs_analytics_source*, hs_latest_source*, utm_*, first/recent conversion).
+  DEALS        → (read-only; scope crm.objects.deals.read)
+               LIST_PIPELINES → pipelines with stage ids + labels
+               SEARCH (deal_stage? [stage label like "New Business Meetings" or stage id], pipeline?, created_after?, created_before?, properties[]?, limit?, cursor?)
+               GET_CONTACTS (deal_id) → associated contacts with source/UTM attribution fields
+               Attribution rule: only report a deal as campaign-attributed when an associated contact's UTM/source value
+               actually names the campaign. Never estimate unmatched deals.
   CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
                → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
                → DELETE (list_id)
@@ -9522,7 +9547,16 @@ TYPICAL WORKFLOW:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST).' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS', 'DEALS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST/SEARCH; DEALS supports LIST_PIPELINES/SEARCH/GET_CONTACTS, read-only).' },
+        deal_stage:       { type: 'string', description: 'DEALS SEARCH: stage label (e.g. "New Business Meetings") or internal stage id.' },
+        pipeline:         { type: 'string', description: 'DEALS SEARCH: pipeline id (from LIST_PIPELINES).' },
+        deal_id:          { type: 'string', description: 'DEALS GET_CONTACTS: deal id.' },
+        created_after:    { type: 'string', description: 'CONTACTS/DEALS SEARCH: inclusive lower bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        created_before:   { type: 'string', description: 'CONTACTS/DEALS SEARCH: exclusive upper bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        // Untyped on purpose: a write attempt (e.g. DEALS UPDATE with an object) must reach the
+        // handler's read-only refusal instead of failing schema validation; mergeProps ignores non-lists.
+        properties:       { description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return (string array or comma-separated string).' },
+        limit:            { type: 'integer', description: 'CONTACTS/DEALS SEARCH page size (integer, max 100). HubSpot caps one search query at 10,000 total results; for larger sets split into non-overlapping created_after/created_before ranges and restart paging per range.' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
         guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },

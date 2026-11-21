@@ -5,6 +5,7 @@ import {
   sitesFromPages,
   repoFullNameFromUrl,
   CAPTURE_DRIFT_ALERT_CLASS,
+  captureDriftAlertScope,
   MIDDLEWARE_PATH,
   CAPTURE_ROUTE_PATH,
 } from '../captureDriftMonitor';
@@ -44,6 +45,26 @@ describe('runCaptureDriftSweep (ENG-3120)', () => {
     expect(body).toContain('org/drifted');
     expect(body).toContain('middleware.ts');
     expect(ctx).toMatchObject({ 'Alert Class': CAPTURE_DRIFT_ALERT_CLASS, 'Drifted Files': 'middleware.ts' });
+  });
+
+  it('two drifted sites file two distinct, repo-scoped oncall items (ENG-3143)', async () => {
+    const transport = jest.fn(async () => {});
+    const drift = { ...CLEAN, [MIDDLEWARE_PATH]: CLEAN[MIDDLEWARE_PATH] + '\n// stale edit' };
+    const s = await runCaptureDriftSweep({
+      listSites: async () => [
+        { repoFullName: 'org/site-a', name: 'Site A' },
+        { repoFullName: 'org/site-b', name: 'Site B' },
+      ],
+      readFile: repos({ 'org/site-a': drift, 'org/site-b': drift }),
+      transport,
+      now: 1,
+    });
+    expect(s).toMatchObject({ drifted: 2, alertsSent: 2 });
+    const ctxs = transport.mock.calls.map((c: any[]) => c[2]);
+    expect(ctxs.map((c: any) => c['Alert Class'])).toEqual([CAPTURE_DRIFT_ALERT_CLASS, CAPTURE_DRIFT_ALERT_CLASS]);
+    expect(ctxs.map((c: any) => c['Alert Scope'])).toEqual(['lp-repo:org/site-a', 'lp-repo:org/site-b']);
+    expect(new Set(ctxs.map((c: any) => c['Alert Scope'])).size).toBe(2);
+    expect(captureDriftAlertScope('Org/Site-A')).toBe('lp-repo:org/site-a');
   });
 
   it('a repeat run inside the window does not re-file', async () => {
