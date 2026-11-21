@@ -214,11 +214,13 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
     },
   ),
   route('marketing', 'Marketing home', '/marketing', 'Open customer marketing workspace', 'customer', 'Choose marketing work', 'Home owns its empty state'),
-  route('marketing-social-listening', 'Social listening', '/marketing/social-listening', 'Monitor social conversations', 'customer', 'Return to marketing', 'Not implemented; renders Not Found', {
-    availability: 'placeholder',
+  route('marketing-social-listening', 'Social listening', '/marketing/social-listening', 'Monitor social conversations', 'customer', 'Return to marketing', 'Redirects to /marketing (ENG-3141)', {
+    availability: 'redirect',
+    surface: 'redirect',
   }),
-  route('marketing-creative-generation', 'Creative generation', '/marketing/creative-generation', 'Generate marketing creative', 'customer', 'Return to marketing', 'Not implemented; renders Not Found', {
-    availability: 'placeholder',
+  route('marketing-creative-generation', 'Creative generation', '/marketing/creative-generation', 'Generate marketing creative', 'customer', 'Return to marketing', 'Redirects to /marketing (ENG-3141)', {
+    availability: 'redirect',
+    surface: 'redirect',
   }),
   route('marketing-research', 'Market research', '/marketing/research', 'Run market research', 'customer', 'Create or open research', 'Empty research collection is handled by the page'),
   route('marketing-research-detail', 'Research detail', '/marketing/research/:taskId', 'Review market research', 'customer', 'Open research result', 'Missing research task is handled by the page'),
@@ -226,11 +228,13 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
     availability: 'redirect',
     surface: 'redirect',
   }),
-  route('marketing-report', 'Marketing report', '/marketing/report/:id', 'Review a marketing report', 'customer', 'View report', 'Placeholder component only', {
-    availability: 'placeholder',
+  route('marketing-report', 'Marketing report', '/marketing/report/:id', 'Review a marketing report', 'customer', 'View report', 'Redirects to /marketing (ENG-3141)', {
+    availability: 'redirect',
+    surface: 'redirect',
   }),
-  route('marketing-blog', 'Marketing blog', '/marketing/blog', 'Review blog work', 'customer', 'View blog', 'Placeholder component only', {
-    availability: 'placeholder',
+  route('marketing-blog', 'Marketing blog', '/marketing/blog', 'Review blog work', 'customer', 'View blog', 'Redirects to /marketing (ENG-3141)', {
+    availability: 'redirect',
+    surface: 'redirect',
   }),
   route('marketing-not-found', 'Marketing not found', '/marketing/*', 'Recover from an unknown marketing URL', 'customer', 'Return to marketing', 'Renders Not Found', {
     availability: 'placeholder',

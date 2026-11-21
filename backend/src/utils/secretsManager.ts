@@ -472,6 +472,38 @@ export async function getTwitterCredentials(): Promise<TwitterCredentials> {
 }
 
 /**
+ * ENG-3142: X (Twitter) Ads API app credentials (OAuth 1.0a consumer key/secret of app 33152933).
+ * Deliberately separate from getTwitterCredentials (OAuth2 client), which the Ads API does not accept.
+ */
+export interface XAdsCredentials {
+  consumerKey: string;
+  consumerSecret: string;
+}
+
+/**
+ * Get X Ads OAuth 1.0a consumer credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/XAds (or prod/AgentWeb/XAds for production)
+ * Secret format: { "consumerKey": "...", "consumerSecret": "..." }
+ */
+export async function getXAdsCredentials(): Promise<XAdsCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production' ? 'prod/AgentWeb/XAds' : 'dev/AgentWeb/XAds';
+    const secretString = await getSecret(secretName);
+    if (!secretString || secretString.trim() === '') throw new Error('X Ads credentials secret is empty');
+    const credentials = JSON.parse(secretString) as XAdsCredentials;
+    if (!credentials.consumerKey || !credentials.consumerSecret) {
+      throw new Error('X Ads credentials missing consumerKey or consumerSecret');
+    }
+    return { consumerKey: credentials.consumerKey, consumerSecret: credentials.consumerSecret };
+  } catch (error) {
+    console.error('Error fetching X Ads credentials from Secrets Manager:', error instanceof Error ? error.message : error);
+    throw new Error('Failed to fetch X Ads credentials from Secrets Manager');
+  }
+}
+
+/**
  * Get YouTube OAuth credentials from AWS Secrets Manager.
  * Reuses the Gmail Google OAuth credentials (same Google Cloud project).
  *

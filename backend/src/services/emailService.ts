@@ -6,7 +6,16 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision, recipientScopingEnabled } from './scheduledReportAccess';
+import { evaluateRunForRecipient, extractRunScope } from './scheduledReportScope';
+
+/** Resolve `fallback` when `p` takes longer than `ms` or rejects; never rejects, never leaves a timer running. */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then((v) => { clearTimeout(timer); resolve(v); }, () => { clearTimeout(timer); resolve(fallback); });
+  });
+}
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
@@ -94,6 +103,123 @@ async function getAlertEmails(settingKey: string, fallback: string[]): Promise<s
     return process.env.ONCALL_EMAIL_LIST.split(',').filter(Boolean);
   }
   return settingsService.getJsonArraySetting(settingKey, fallback);
+}
+
+/** ENG-3149: the longest schedule name (in characters, ellipsis included) the visitor-schedule alert will show. */
+export const SHARE_SCHEDULE_ALERT_NAME_MAX = 100;
+
+// A visitor chooses the name and nothing else limits its length (the request body limit is megabytes), and it is cleaned inside the
+// visitor's own request. So the work is bounded FIRST: only the first 300 code points of what was sent are ever looked at, and NFKC
+// (which can lengthen a string) is followed by a second cut to 400. Every step after that runs over at most 400 code points.
+const NAME_MAX_RAW_CODE_POINTS = 300;
+const NAME_MAX_NORMALIZED_CODE_POINTS = 400;
+
+/** The first `max` code points of `text`, found by looking at no more than `max` of them (a surrogate pair counts once). */
+function firstCodePoints(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = 0;
+  for (let counted = 0; counted < max && end < text.length; counted++) {
+    const unit = text.charCodeAt(end);
+    const next = end + 1 < text.length ? text.charCodeAt(end + 1) : 0;
+    end += unit >= 0xd800 && unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? 2 : 1;
+  }
+  return text.slice(0, end);
+}
+
+/** The most combining marks kept after any one base character (a name must not be able to stack or strike through a letter). */
+const NAME_MAX_MARKS_PER_BASE = 3;
+
+// Every regex below is ONE character class (or a one-character lookaround around it), applied globally: nothing in them can
+// backtrack, so the cost is linear in the (bounded) input.
+
+// Whitespace of any kind becomes a separator.
+const NAME_WHITESPACE = /[\t\n\v\f\r\u0085\u2028\u2029\p{Zs}]/gu;
+// Characters that draw nothing, or draw something other than what is there, are DELETED (not turned into a space), so a name cannot
+// hide a dot, a slash or a word inside one and then have the rest read as separate words: every default-ignorable code point
+// (soft hyphen, zero-width and joiner characters, bidi controls, variation selectors, the filler letters, the tag range ...), every
+// control, format, surrogate and private-use character, and the invisible ones that are none of those but are listed by name
+// (U+115F, U+1160, U+3164, U+FFA0 fillers, U+034F combining grapheme joiner, U+2800 blank braille, the tag characters).
+const NAME_INVISIBLE =
+  /[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Co}\u115F\u1160\u3164\uFFA0\u034F\u2800\u{E0000}-\u{E007F}]/gu;
+// A "." is kept only between two digits ("v2.1", "Release 3.0", "1.2.3"); every other dot becomes a space.
+const NAME_DOT_NOT_BETWEEN_DIGITS = /(?<!\d)\.|\.(?!\d)/g;
+// One character at a time: a letter or digit (the only things a combining mark may belong to), and a combining mark.
+const NAME_BASE_CHARACTER = /^[\p{L}\p{N}]$/u;
+const NAME_MARK = /^\p{M}$/u;
+// A name needs at least one letter or digit to be a name at all.
+const NAME_HAS_LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+// ALLOW-LIST: letters, combining marks (so Devanagari, Thai, Arabic and accented text keep their signs), digits, space, the dots
+// kept above, and a small set of punctuation: _ - ' (U+2019) & , ( ) + # ! ? %. Everything else becomes a space. In particular
+// : / \ @ < > " ; = [ ] { } | ~ ^ * $ and every look-alike of a dot, and emoji and other symbols.
+const NAME_NOT_ALLOWED = /[^\p{L}\p{M}\p{N} _\-'’&,()+#!?%.]/gu;
+
+/**
+ * Keeps at most NAME_MAX_MARKS_PER_BASE combining marks after a letter or digit and drops every other mark (one after a space or
+ * punctuation, or at the start, has nothing to combine with). One pass over the code points, no backtracking, so it is linear in a
+ * string that is already bounded.
+ */
+function capCombiningMarks(text: string): string {
+  let kept = '';
+  let marksAfterBase = 0;
+  let afterBase = false;
+  for (const character of text) {
+    if (NAME_MARK.test(character)) {
+      if (afterBase && marksAfterBase < NAME_MAX_MARKS_PER_BASE) {
+        kept += character;
+        marksAfterBase++;
+      }
+    } else {
+      kept += character;
+      afterBase = NAME_BASE_CHARACTER.test(character);
+      marksAfterBase = 0;
+    }
+  }
+  return kept;
+}
+
+/**
+ * ENG-3149: a schedule name written by a share-link visitor, made safe to show in an email to the owner. It is the one piece of
+ * visitor text in a real AgentWeb mail, so nothing in it may be clickable, look like an address, hide anything or reorder text. An
+ * ALLOW-LIST does that (a list of what may stay, not of what may not), in this order:
+ *  0. not a string -> "Untitled"; only the first 300 code points are used, before any other work;
+ *  1. NFKC (folds full-width and compatibility characters, including look-alike dots, to their plain form), then cut to 400;
+ *  2. whitespace of any kind becomes a space, then invisible characters are deleted;
+ *  3. a "." not between two digits becomes a space, then everything but letters, marks, digits, spaces and a few punctuation marks
+ *     becomes a space (so "evil.example/x" can only ever read "evil example x");
+ *  4. combining marks are capped at 3 per letter or digit (and dropped where there is nothing to combine with), runs of spaces
+ *     collapse and the ends are trimmed;
+ *  5. a name over SHARE_SCHEDULE_ALERT_NAME_MAX characters is cut on whole characters to fit WITH its ellipsis;
+ *  6. no letter or digit left (nothing, or only punctuation) -> "Untitled".
+ * Cleaning an already clean name returns it unchanged (a single trailing ellipsis is carried over rather than cleaned away). HTML
+ * escaping is the caller's job where it writes HTML; the plain-text part uses this as is. Costs and consequences are in
+ * dev/pending/eng-3149-owner-alert-for-visitor-schedules.md.
+ */
+export function shareScheduleAlertName(name: unknown): string {
+  if (typeof name !== 'string') return 'Untitled';
+  let raw = firstCodePoints(name, NAME_MAX_RAW_CODE_POINTS);
+  // The ellipsis this function adds when it cuts a name must survive being cleaned again, so a single trailing one is set aside.
+  const hadTrailingEllipsis = raw.endsWith('…');
+  if (hadTrailingEllipsis) raw = raw.slice(0, -1);
+
+  const allowed = firstCodePoints(raw.normalize('NFKC'), NAME_MAX_NORMALIZED_CODE_POINTS)
+    .replace(NAME_WHITESPACE, ' ')
+    .replace(NAME_INVISIBLE, '')
+    .replace(NAME_DOT_NOT_BETWEEN_DIGITS, ' ')
+    .replace(NAME_NOT_ALLOWED, ' ')
+    // Deleting a character can put a base and a mark next to each other that were not: compose them again, so that cleaning is
+    // stable. (Letters stay letters; this cannot bring back anything the steps above removed.)
+    .normalize('NFKC');
+  const cleaned = capCombiningMarks(allowed).replace(/ +/g, ' ').trim();
+  if (!NAME_HAS_LETTER_OR_DIGIT.test(cleaned)) return 'Untitled';
+
+  const characters = Array.from(cleaned);
+  const addEllipsis = hadTrailingEllipsis || characters.length > SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const room = addEllipsis ? SHARE_SCHEDULE_ALERT_NAME_MAX - 1 : SHARE_SCHEDULE_ALERT_NAME_MAX;
+  const shown = characters.length > room
+    // A cut must not leave a dot dangling (it would not survive cleaning again), nor spaces before the ellipsis.
+    ? characters.slice(0, room).join('').replace(/[ .]+$/, '')
+    : cleaned;
+  return addEllipsis ? `${shown}…` : shown;
 }
 
 export const emailService = {
@@ -1877,6 +2003,81 @@ Schedule ID: ${scheduleId}
     }
   },
 
+  // ENG-3149: a share-link visitor has just made the first mark on one of the owner's scheduled chats (the owner otherwise only
+  // sees the "Visitor-edited" badge). A notification only. The subject is fixed and the schedule NAME is the one piece of
+  // visitor-controlled text in the mail: it is reduced to letters, marks, digits and a little punctuation, cut to
+  // SHARE_SCHEDULE_ALERT_NAME_MAX characters and escaped (see shareScheduleAlertName). No prompt text, share token, IP or recipient
+  // list goes in. Never throws, like its siblings.
+  async sendVisitorScheduleAlertEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string
+  ) {
+    const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const reviewUrl = `${customerFrontendUrl}/agent-mode?tab=scheduled`;
+      const name = shareScheduleAlertName(scheduleName);
+
+      const header = 'A scheduled chat was set up through your share link';
+      const paragraph1Before = 'Someone using one of your Emma share links created or changed the scheduled chat "';
+      const paragraph1After = '".';
+      const paragraph2 = "Until you review it, it runs with limited access: it can't use account-level tools such as saving memory or changing organization settings, and anything it would publish or post to Slack is kept as a draft.";
+      const paragraph3 = "If it's yours or you trust it, open Scheduled chats, read what it does and press Adopt. If you don't recognise it, delete it, and consider turning off the share link.";
+      const buttonText = 'Review the schedule';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #f9a825; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #f9a825; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">${header}</h2>
+            </div>
+            <div class="content">
+              <p>${paragraph1Before}${this.escapeHtml(name)}${paragraph1After}</p>
+              <p>${paragraph2}</p>
+              <p>${paragraph3}</p>
+              <a class="button" href="${reviewUrl}">${buttonText}</a>
+            </div>
+            <div class="footer" style="color: #6c757d; font-size: 13px;">Schedule ID: ${this.escapeHtml(scheduleId)}</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+${header}
+
+${paragraph1Before}${name}${paragraph1After}
+
+${paragraph2}
+
+${paragraph3}
+
+${buttonText}:
+${reviewUrl}
+
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = 'Someone using your share link set up a scheduled chat';
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`[ENG-3149] visitor schedule alert email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      console.error(`[ENG-3149] error sending visitor schedule alert email to ${emailList.join(', ')}:`, error);
+    }
+  },
+
   async sendScheduledChatResultEmail(
     toEmails: string | string[],
     scheduleName: string,
@@ -1997,7 +2198,19 @@ Schedule ID: ${scheduleId}
         minute: '2-digit'
       });
 
-      const html = `
+      // ENG-1904: the "Continue the Conversation" block links to the run's whole session, and "Function Call Details" lists the
+      // run's internal tool names. A recipient authorized only because every cross-account call was about them
+      // (scheduledReportScope) gets the report WITHOUT either (the session is an admin's and its share view has not been proven safe
+      // for a customer). Everyone else gets the email exactly as before (`adminView`).
+      const conversationSectionHtml = `<div class="section">
+                <h3>🔗 Continue the Conversation</h3>
+                <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
+                <a href="${sessionUrl}" class="button">Continue Chatting</a>
+                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
+                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
+                </p>
+              </div>`;
+      const composeHtml = (adminView: boolean): string => `
         <html>
         <head>
           <style>
@@ -2048,7 +2261,7 @@ Schedule ID: ${scheduleId}
               </div>
               ` : ''}
 
-              ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+              ${adminView && result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
               <div class="section">
                 <h3>🔧 Function Call Details</h3>
                 <div class="criteria">
@@ -2072,14 +2285,7 @@ Schedule ID: ${scheduleId}
                 <div class="response">${marked(result.actualResponse)}</div>
               </div>
               
-              <div class="section">
-                <h3>🔗 Continue the Conversation</h3>
-                <p>Click the button below to view the complete conversation and continue chatting with the AI.</p>
-                <a href="${sessionUrl}" class="button">Continue Chatting</a>
-                <p style="margin-top: 10px; font-size: 14px; color: #6c757d;">
-                  Or copy this link: <a href="${sessionUrl}">${sessionUrl}</a>
-                </p>
-              </div>
+              ${adminView ? conversationSectionHtml : ''}
             </div>
             
             <div class="footer">
@@ -2092,8 +2298,9 @@ Schedule ID: ${scheduleId}
         </body>
         </html>
       `;
+      const html = composeHtml(true);
 
-      const text = `
+      const composeText = (adminView: boolean): string => `
 Scheduled Chat Results: ${scheduleName}
 
 Your scheduled chat "${scheduleName}" ${primaryMessage}
@@ -2102,7 +2309,7 @@ ${isBlockedRun ? `
 ${outageNoteText}
 ` : ''}
 
-${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
+${adminView && result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
 ${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
         `- ${funcName}: ${details.actual}/${details.required} calls ${details.actual >= details.required ? '✅' : '❌'}`
@@ -2111,12 +2318,13 @@ ${Object.entries(result.functionCallDetails).map(([funcName, details]) =>
 ` : ''}AI Response:
 ${result.actualResponse}
 
-Continue the conversation: ${sessionUrl}
+${adminView ? `Continue the conversation: ${sessionUrl}
 
----
+` : ''}---
 This is an automated email from your scheduled chat.
 Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
+      const text = composeText(true);
 
       const subject = `${statusIcon} Scheduled Chat: ${scheduleName}${summary ? ` — ${summary}` : ''}`;
 
@@ -2129,14 +2337,17 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // recipients + the owner, rather than auto-sending to every configured
       // address. No-op for ordinary reports. Fail-closed throughout; see
       // classifyAndResolveScheduledReportRecipients.
-      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList);
+      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList, { allowScopedRecipients: true });
       const recipients = guard.authorized;
-      const notice = this.withheldRecipientsNotice(guard.withheld);
+      // ENG-1904: recipients the guard withheld that the run read ONLY about (scheduledReportScope) get a separate, link-free copy.
+      const scoped = guard.scoped ?? [];
+      const stillWithheld = guard.withheld.filter((e) => !scoped.includes(e));
+      const notice = this.withheldRecipientsNotice(stillWithheld);
       const finalHtml = notice ? `${notice.html}${html}` : html;
       const finalText = notice ? `${notice.text}\n\n${text}` : text;
       const runKey = result.runId || result.sessionId;
 
-      if (recipients.length === 0) {
+      if (recipients.length === 0 && scoped.length === 0) {
         // Fail-closed left no authorized recipient. Do NOT silently drop the
         // completed report: notify the schedule owner that delivery was blocked
         // (a status message ONLY — never the report data) so the report is not
@@ -2161,8 +2372,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         });
       } else {
         // Send ONE email to all authorized recipients
-        await this.deliverScheduledReport(deliveryScheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
+        const outcome = await this.deliverScheduledReport(
+          deliveryScheduleId, runKey, recipients, stillWithheld, subject, finalText, finalHtml,
+          scoped.length > 0 ? { recipients: scoped, text: composeText(false), html: composeHtml(false) } : undefined,
+        );
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
+        if (scoped.length > 0) {
+          console.log(`[ENG-1904] scheduled report for session ${result.sessionId}: link-free copy for ${scoped.length} recipient(s) (every cross-account call in the run was about them): ${outcome === 'sent' ? 'sent' : `NOT confirmed sent (${outcome ?? 'unknown'})`}`);
+        }
       }
 
     } catch (error) {
@@ -2186,7 +2403,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   async classifyAndResolveScheduledReportRecipients(
     sessionIds: string[],
     recipients: string[],
-  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string }> {
+    // ENG-1904: only the single-report send asks for scoped recipients; the digest merges runs and keeps today's rule.
+    opts?: { allowScopedRecipients?: boolean },
+  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string; scoped?: string[] }> {
     let ownerEmail: string | undefined;
     let ownerUserId: string | undefined;
     try {
@@ -2196,6 +2415,8 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // full (safe) classification.
       let ownerIsAdmin: boolean | undefined;
       let ownerResolved = false;
+      // ENG-1904: each session's own tool counter, kept for the scoped-recipient check (a second record of which tools ran).
+      const calledBySession: Record<string, Record<string, number> | string[] | undefined> = {};
       const resolveOwner = async () => {
         if (ownerResolved || !ownerUserId) return;
         ownerResolved = true;
@@ -2210,6 +2431,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         try {
           const session: any = await chatbotDb.getChatSession(sessionId);
           if (session) {
+            calledBySession[sessionId] = session.calledFunctions;
             ownerUserId = ownerUserId || session.userId;
             await resolveOwner();
             if (!reportContainsCrossAccountData(session.calledFunctions, { ownerIsAdmin })) {
@@ -2237,13 +2459,77 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       if (authz.withheld.length > 0) {
         console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
       }
-      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId };
+      // ENG-1904: of the recipients withheld above, which ones does the run read ONLY about? This can only ADD recipients to
+      // the authorized set (as a separate copy); `authorized` and `withheld` stay exactly what the guard decided.
+      let scoped: string[] = [];
+      if (opts?.allowScopedRecipients && isSensitive && authz.withheld.length > 0) {
+        if (recipientScopingEnabled()) {
+          scoped = await withTimeout(this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession), 10_000, []);
+        } else {
+          // Shadow mode: measure only. Detached, so the flag-off send is never delayed or changed by the extra reads.
+          void this.resolveScopedReportRecipients(sessionIds, authz.withheld, calledBySession);
+        }
+      }
+      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId, ...(scoped.length > 0 ? { scoped } : {}) };
     } catch (guardError) {
       // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
       // than risk distributing possibly-sensitive data to unverified addresses.
       // The caller's empty-recipients branch notifies the owner so it is not silent.
       console.error(`Scheduled report guard errored for session(s) ${sessionIds.join(', ')}; failing closed:`, guardError);
       return { authorized: [], withheld: [...recipients], ownerEmail, ownerUserId };
+    }
+  },
+
+  /**
+   * ENG-1904: the subset of `withheld` (non-admin recipients the ENG-500 guard held back) for whom EVERYTHING the run read was
+   * about them and nothing else (`scheduledReportScope`). Never throws: any failure answers "none". With
+   * SCHEDULED_REPORT_RECIPIENT_SCOPING unset it only logs what it would have done and returns none. The log carries counts and
+   * fixed reasons, never an address, so the rollout can be measured.
+   */
+  async resolveScopedReportRecipients(
+    sessionIds: string[],
+    withheld: string[],
+    calledBySession: Record<string, Record<string, number> | string[] | undefined> = {},
+  ): Promise<string[]> {
+    const enabled = recipientScopingEnabled();
+    const tag = enabled ? '[ENG-1904]' : '[ENG-1904 shadow]';
+    try {
+      const scopes = [];
+      for (const sessionId of sessionIds) {
+        // The same strongly consistent read the guard uses: this fires right after the run wrote these rows.
+        const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
+        scopes.push(extractRunScope(messages as any, calledBySession[sessionId]));
+      }
+      const eligible: string[] = [];
+      const kept: Record<string, number> = {};
+      const keep = (reason: string) => { kept[reason] = (kept[reason] || 0) + 1; };
+      for (const email of withheld) {
+        const normalized = (email || '').trim().toLowerCase();
+        if (!normalized) continue;
+        let user: any;
+        try {
+          user = await userDb.getUserByEmailConsistent(normalized);
+        } catch {
+          user = undefined;
+        }
+        // No account, or a deleted one: nothing to compare the run's subject against.
+        if (!user?.userId || !user?.email) { keep('recipient_unresolved'); continue; }
+        const identity = { userId: String(user.userId), email: String(user.email) };
+        let reason: string | undefined;
+        for (const scope of scopes) {
+          const decision = evaluateRunForRecipient(scope, identity);
+          if (!decision.ok) { reason = decision.reason || 'not_scoped'; break; }
+        }
+        if (reason) keep(reason); else eligible.push(email);
+      }
+      const keptSummary = Object.entries(kept).map(([r, n]) => `${r} x${n}`).join(', ');
+      console.log(`${tag} session(s) ${sessionIds.join(', ')}: ${eligible.length} of ${withheld.length} withheld recipient(s) eligible for a link-free copy${keptSummary ? `; kept withheld: ${keptSummary}` : ''}`);
+      if (eligible.length === 0) return [];
+      if (!enabled) return [];
+      return eligible;
+    } catch (error) {
+      console.error(`${tag} could not decide scoped recipients for session(s) ${sessionIds.join(', ')}; none are added (${(error as any)?.name || 'Error'}${(error as any)?.code ? ' ' + (error as any).code : ''})`);
+      return [];
     }
   },
 
@@ -2272,13 +2558,28 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     subject: string,
     text: string,
     html: string,
-  ): Promise<void> {
+    // ENG-1904: a second, link-free copy for recipients authorized by scheduledReportScope. Sent separately so the
+    // authorized recipients' email stays exactly as it was.
+    scopedCopy?: { recipients: string[]; text: string; html: string },
+  ): Promise<EmailSendOutcome | void> {
     const base = {
       runId,
-      authorizedRecipients: recipients,
+      authorizedRecipients: scopedCopy ? [...recipients, ...scopedCopy.recipients] : recipients,
       ...(withheld.length > 0 ? { withheldRecipients: withheld } : {}),
     };
-    const outcome = await this.sendEmail(recipients, subject, text, html);
+    let outcome: EmailSendOutcome | void;
+    if (!scopedCopy) {
+      outcome = await this.sendEmail(recipients, subject, text, html);
+    } else {
+      const outcomes: Array<EmailSendOutcome | void> = [];
+      // sendEmail is documented never to throw; if either send did, it is a failed send, not a lost delivery record.
+      const attempt = async (to: string[], t: string, h: string): Promise<EmailSendOutcome | void> => {
+        try { return await this.sendEmail(to, subject, t, h); } catch { return 'failed'; }
+      };
+      if (recipients.length > 0) outcomes.push(await attempt(recipients, text, html));
+      outcomes.push(await attempt(scopedCopy.recipients, scopedCopy.text, scopedCopy.html));
+      outcome = outcomes.includes('failed') ? 'failed' : outcomes.includes('suppressed') ? 'suppressed' : outcomes.every((o) => o === 'sent') ? 'sent' : undefined;
+    }
     await recordReportDeliveryState(scheduleId, outcome === 'sent'
       ? { ...base, state: 'delivered' }
       : {
@@ -2287,6 +2588,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           ...(outcome === 'failed' ? { reason: 'provider_error' as const } : {}),
           ...(outcome === 'suppressed' ? { reason: 'suppressed_nonprod' as const } : {}),
         });
+    return outcome;
   },
 
   /**
