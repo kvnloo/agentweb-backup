@@ -116,7 +116,11 @@ function narrowDefinition(definition: any): any {
  * Fails loudly when a v1 tool is missing from the registry. A silently shorter
  * manifest would read as a product change.
  */
-export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry) {
+/**
+ * `opts.measurementReports`: whether this caller sees the ENG-3155 report tools (resolve per user with
+ * measurementReportsEnabledForUserId); default: the global flag only.
+ */
+export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry, opts: { measurementReports?: boolean } = {}) {
   const metaTools = META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Meta Toolkit manifest: tool ${name} is not registered`);
@@ -148,8 +152,8 @@ export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegis
     ...zomaToolDefinitions().map((d) => JSON.parse(JSON.stringify(d))),
     // ENG-3134: the one reporting tool (spend, impressions, clicks, CTR, CPC, conversions, ROAS).
     JSON.parse(JSON.stringify(ZOMA_ADS_REPORT_DEFINITION)),
-    // ENG-3155: the proactive measurement report and its schedule (dark until ZOMA_MEASUREMENT_REPORTS_ENABLED).
-    ...(measurementReportsEnabled()
+    // ENG-3155: the proactive measurement report and its schedule (dark until the flag or the caller's allowlist entry).
+    ...((opts.measurementReports ?? measurementReportsEnabled())
       ? [ZOMA_MEASUREMENT_REPORT_DEFINITION, ZOMA_REPORT_SCHEDULE_DEFINITION].map((d) => JSON.parse(JSON.stringify(d)))
       : []),
   ];

@@ -295,15 +295,24 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wm
 // — see this module's header comment ("ADMIN_SKILL_TOOL_NAMES is DUPLICATED
 // here, not imported back") for why this is a plain literal copy rather than
 // a shared import.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'read_client_meta_budgets', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 export function getAdminToolNames(): string[] {
   return [...ADMIN_SKILL_TOOL_NAMES];
 }
 
 /**
+ * Tools registered for agent mode that a session is offered only through a skill that lists them, never through the
+ * `__other_skills__` catch-all pool (every registered tool that no published skill lists). `manage_market_strategy` (ENG-2840) is the
+ * MCP server's market strategy tool, bridged so a skill can list it; Emma's own `update_market_strategy` is a foundation tool, and a
+ * second strategy writer with different merge rules should not appear in every catch-all session next to it.
+ */
+export const SKILL_ONLY_TOOL_NAMES: readonly string[] = ['manage_market_strategy'];
+
+/**
  * Get tools that are not associated with any published skill.
- * Excludes foundation tools and admin-only tools.
+ * Excludes foundation tools, admin-only tools, the page-context-only get_visual_context and the skill-only tools
+ * (SKILL_ONLY_TOOL_NAMES).
  *
  * `foundationTools`/`getAllTools` are injected — see this module's header
  * comment ("ENG-2103 F2 FOLLOW-UP") for why: `foundationTools` must be a LIVE
@@ -329,11 +338,14 @@ export function getUnassociatedTools(
     skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
   });
 
-  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
+  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools + skill-only tools
   const excludedTools = new Set<string>(foundationTools);
   ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
   // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
   excludedTools.add('get_visual_context');
+  // Skill-only tools (ENG-2840): offered through a skill that lists them, not through this catch-all pool. A work plan or
+  // schedule that names one in requiredFunctionCalls therefore does not get it from the pool either.
+  SKILL_ONLY_TOOL_NAMES.forEach(t => excludedTools.add(t));
 
   // Get all registered tools and find those not in any skill
   const allTools = getAllTools();

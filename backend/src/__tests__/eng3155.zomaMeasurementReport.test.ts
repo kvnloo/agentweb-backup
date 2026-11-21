@@ -476,6 +476,7 @@ describe('ENG-3155 runner: exactly once per slot', () => {
   function runnerDeps(store: MemoryStore, over: Partial<MeasurementRunnerDeps> = {}): MeasurementRunnerDeps & { sendEmail: jest.Mock } {
     return {
       enabled: () => true,
+      enabledFor: () => true,
       maxPerPass: () => 100,
       store: () => store,
       getUser: async (userId: string) => ({ userId, email: 'owner@shop.com', isAdmin: false }),
@@ -730,7 +731,7 @@ describe('ENG-3155 industry stored on the report schedule', () => {
     const report = { summary: 's', date_range: { since: 'a', until: 'b' }, report_url: 'https://r' } as unknown as MeasurementReport;
     const buildReport = jest.fn(async () => report);
     await runZomaMeasurementReports({
-      enabled: () => true, maxPerPass: () => 10, store: () => store,
+      enabled: () => true, enabledFor: () => true, maxPerPass: () => 10, store: () => store,
       getUser: async (userId: string) => ({ userId, email: 'owner@shop.com', isAdmin: false }),
       recentSpend: async () => 10, buildReport, sendEmail: jest.fn(async () => 'sent' as const),
       backendUrl: () => 'https://api.example', secret: () => 's', now: () => NOW,

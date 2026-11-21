@@ -3,8 +3,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -50,8 +50,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -109,8 +109,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -249,8 +249,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -377,8 +377,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -511,8 +511,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -645,8 +645,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -773,8 +773,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -784,9 +784,9 @@
       },
       {
         "role": "assistant",
-        "length": 979,
-        "sha256": "c28f486b03956a7a47a54412f0f41d79c5fa4a35fb730044431bfbd8aa688cf8",
-        "text": "Installed Skills:\ns1- Skill s1: Does s1 \n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
+        "length": 1005,
+        "sha256": "1da8d83f48a75e0399abe384471ef14b4748f8c088f2fa8c269f0e5777617d78",
+        "text": "Installed Skills:\ns1- Skill s1: Does s1 \n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, read_client_meta_budgets, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
       },
       {
         "role": "user",
@@ -891,6 +891,7 @@
           "provision_hot_lead_call_number",
           "read_brand_guidelines",
           "read_client_meta_activity",
+          "read_client_meta_budgets",
           "read_file_content",
           "read_google_doc",
           "read_knowledge_base_files",
@@ -941,8 +942,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -1073,14 +1074,14 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
-        "length": 956,
-        "sha256": "cf427f2ed6f0ebcc3406a387f594fd3a0f26036c3d5fadb38ab409a8b10817c2",
-        "text": "Installed Skills:\n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
+        "length": 982,
+        "sha256": "626b3846f00bb0fbf3ea3929c34c473e33f333533a5228d92cbfee7eceb6de77",
+        "text": "Installed Skills:\n__admin_tools__- Admin Tools (always active for admins): Use manage_user_notes to read/add/delete time-stamped notes on any user — lookup by email OR userId. Use list_all_clients, assess_client_health, freeze_user_account, manage_scoring_judges, and other admin tools for platform management. Tools: evaluation_workspace, inspect_orphaned_org_join_requests, manage_linear_governance_label, read_linear_issues, manage_user_funnel_status, manage_predefined_work_plan, list_skills, manage_skill, get_chat_history, get_session_transcript, get_user_by_id, inspect_client_usage, list_all_clients, assess_client_health, read_client_meta_activity, read_client_meta_budgets, monitor_lead_volume, check_account_tracking_health, diagnose_leads_at_zero, get_pr_digest, freeze_user_account, manage_scoring_judges, manage_user_notes, get_users_by_lifecycle_stage, get_registration_status, resolve_landing_page_by_url, share_landing_page_with_org, get_landing_page_effective_view"
       },
       {
         "role": "system",
@@ -1191,6 +1192,7 @@
           "provision_hot_lead_call_number",
           "read_brand_guidelines",
           "read_client_meta_activity",
+          "read_client_meta_budgets",
           "read_file_content",
           "read_google_doc",
           "read_knowledge_base_files",
@@ -1240,14 +1242,14 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
-        "length": 17,
-        "sha256": "99f2235f0ea947c9c6b5959d198e8cc0d3516fa2c78e994019576eeade21b801",
-        "text": "Check the account"
+        "length": 97,
+        "sha256": "45335c49e60132b8b4bf4328356e9e60c50dabbe39c011e6f9a2ca555d8ee905",
+        "text": "Check the account\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]"
       }
     ],
     "options": {
@@ -1368,8 +1370,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -1496,8 +1498,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -1543,8 +1545,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -1694,8 +1696,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
@@ -1822,8 +1824,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "assistant",
@@ -1962,8 +1964,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 104337,
-        "sha256": "98e6110362a6d60c5f8e7d73f52825f8180973c78fc1d2a7af2b7455c7c6a3f0"
+        "length": 106415,
+        "sha256": "c302e704883fc90bd5c8c00ecf4a13ab15f5e95cbb1f2a7f7326ddbded37029e"
       },
       {
         "role": "user",
@@ -2095,8 +2097,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 105350,
-        "sha256": "2571df9801070e77100ffd69756105276329518334e797e833e4ece95dd61bac"
+        "length": 107428,
+        "sha256": "eac41afdd5f81981cbc8000d2a9bed4dcc8d62cb89cb549880c26aa34aa0dcb7"
       },
       {
         "role": "user",
@@ -2228,8 +2230,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 101610,
-        "sha256": "7e40d665df516c5048c922ca183c04c5460683c9c109629b591506224c987956"
+        "length": 103688,
+        "sha256": "460839275899fb74456b1d27dc6ac482bb10bf45a891c3113934309cc3e1b2e4"
       },
       {
         "role": "user",
@@ -2356,8 +2358,8 @@
     "messages": [
       {
         "role": "system",
-        "length": 100359,
-        "sha256": "deea7365ad236f69a816b74fbcdc308835cff2393fdb96942623693e68dcf37c"
+        "length": 102437,
+        "sha256": "af9407cca6b1dffe8c6c8fa6d61d446adc57c10ab8bc374e4479bfe2e8ef8996"
       },
       {
         "role": "user",
