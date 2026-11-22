@@ -997,6 +997,62 @@ export class HubSpotService {
   // ─── Deals ────────────────────────────────────────────────────────────────────
 
   /**
+   * Read-only CRM object search (deals or contacts) via POST /crm/v3/objects/{type}/search.
+   * Filters are ANDed. Dates are ISO strings or epoch ms; HubSpot compares createdate in ms.
+   */
+  async searchCrmObjects(
+    objectType: 'deals' | 'contacts',
+    opts: {
+      filters?: Array<{ propertyName: string; operator: string; value?: string; values?: string[] }>;
+      properties: string[];
+      cursor?: string;
+      limit?: number;
+      sortBy?: string;
+      sortDirection?: 'ASCENDING' | 'DESCENDING';
+      associations?: boolean;
+    }
+  ): Promise<{ total: number; results: Array<{ id: string; properties: Record<string, any> }>; nextCursor?: string }> {
+    const body: any = {
+      filterGroups: opts.filters && opts.filters.length ? [{ filters: opts.filters }] : [],
+      properties: opts.properties,
+      limit: Math.min(Math.max(opts.limit ?? 100, 1), 100),
+    };
+    if (!Number.isInteger(body.limit)) throw new Error(`HubSpot search limit must be an integer (got ${opts.limit})`);
+    if (opts.cursor) body.after = opts.cursor;
+    if (opts.sortBy) body.sorts = [{ propertyName: opts.sortBy, direction: opts.sortDirection ?? 'DESCENDING' }];
+    const res = await axiosInstance.post(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/${objectType}/search`,
+      body,
+      { headers: await this.authHeaders() }
+    );
+    const data = res.data as any;
+    return {
+      total: Number(data?.total ?? 0),
+      results: (data?.results ?? []).map((r: any) => ({ id: String(r.id), properties: r.properties ?? {} })),
+      nextCursor: data?.paging?.next?.after,
+    };
+  }
+
+  /** Batch-read contacts by id (max 100 per call) with the requested properties. */
+  async batchReadContacts(ids: string[], properties: string[]): Promise<Array<{ id: string; properties: Record<string, any> }>> {
+    const out: Array<{ id: string; properties: Record<string, any> }> = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      if (!chunk.length) break;
+      const res = await axiosInstance.post(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+        { properties, inputs: chunk.map((id) => ({ id })) },
+        { headers: await this.authHeaders() }
+      );
+      // A 207 means some contacts failed to read; never report a partial read as complete.
+      throwIfBatchPartialFailure(res);
+      out.push(...(((res.data as any)?.results ?? []).map((r: any) => ({ id: String(r.id), properties: r.properties ?? {} }))));
+    }
+    return out;
+  }
+
+
+  /**
    * Create a deal. Returns the new deal's HubSpot ID.
    */
   async createDeal(properties: Record<string, string>): Promise<string> {
