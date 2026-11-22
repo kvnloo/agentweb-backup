@@ -43,6 +43,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
+import { requiredToolsBudgetNote, uncalledRequiredTools } from './agentMode/core/stepBudgetRequiredTools';
 import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
@@ -3973,9 +3974,12 @@ export class AgentModeService {
         // can self-regulate (prefer batch ops, skip unnecessary pages, wrap up early).
         const remaining = maxIterations - iteration;
         if (remaining <= 10 && remaining > 0) {
-          const urgency = remaining <= 3
+          const urgency = (remaining <= 3
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
-            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
+            : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`) +
+            // ENG-3147: name the scheduled run's still-uncalled required tools (in both the
+            // urgent and normal reminder) so the remaining steps go to the deliverable.
+            requiredToolsBudgetNote(uncalledRequiredTools(requiredToolNamesForTurn, toolCalls));
           // Opslane 2026-10-13: in-turn control text is role 'system' (as ENG-763 did for
           // the cross-turn loop-breaker) — as 'user' the model attributes it to the user.
           (messages as any[]).push({ role: 'system', content: urgency });
