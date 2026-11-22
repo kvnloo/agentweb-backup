@@ -132,6 +132,9 @@ export async function runCaptureDriftSweep(deps: CaptureDriftDeps): Promise<Capt
         lines.join('\n'),
         {
           'Alert Class': CAPTURE_DRIFT_ALERT_CLASS,
+          // ENG-3143: intake dedupes on Alert Class unless Alert Scope narrows it (ENG-2267).
+          // Without a per-repo scope every drifted site folded into the first site's issue.
+          'Alert Scope': captureDriftAlertScope(site.repoFullName),
           'Alert Priority': 'low',
           Repo: site.repoFullName,
           'Owner User Id': site.userId,
@@ -150,6 +153,11 @@ export async function runCaptureDriftSweep(deps: CaptureDriftDeps): Promise<Capt
       `${summary.drifted} drifted, ${summary.unreadable} unreadable, ${summary.alertsSent} alert(s)`,
   );
   return summary;
+}
+
+/** Per-site intake dedupe scope (ENG-3143): one oncall item per landing-page repo. */
+export function captureDriftAlertScope(repoFullName: string): string {
+  return `lp-repo:${repoFullName.toLowerCase()}`;
 }
 
 /** Repo full name from a page's githubRepoUrl, or null. */
