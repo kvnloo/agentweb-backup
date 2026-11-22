@@ -1,6 +1,0 @@
-## ENG-2812: the session-breaker shadow counted every BYOK turn as $0; spend now follows the ledger rule (2026-11-18)
-
-- Prod evidence after the default-on change: both `session_breaker_would_pause` lines (2026-11-17 16:10Z scheduled, 18:46Z interactive, 40 turns each) carried `spendUsd: 0`. The shadow read `usage.cost` and fell back to a token estimate only when it was not a number. On our own provider key (BYOK, the default route) `usage.cost` is a real 0 for a plain call, so the estimate was never reached and the $5 cap could never fire; only the turn cap worked.
-- `shadowTurnCostUsd` (in `sessionBreakerShadow.ts`) now prices a turn the way the ledger books it (`openRouterByokCostUsd`, ENG-2720): BYOK = upstream bill plus any OpenRouter fee; not BYOK = `usage.cost` when positive; otherwise the price-book token cost (cache read/write tokens included). No usage block still counts as 0.
-- Still log-only: same one line per cap multiple, never pauses, writes, or notifies. Only the `spendUsd` figure and the `spend_cap` / `turn_and_spend_cap` reasons change, from now on.
-- Lines written before this deploy keep `spendUsd: 0` and are turn-cap evidence only; read spend from lines after the deploy.
