@@ -138,4 +138,10 @@ describe('ENG-2927 gateway: scope + metering', () => {
     await handleMetaToolkitCall({ authorization: 'Bearer aw_fixture', toolName: 'meta_event_source_connect', args: { catalog_id: '501', pixel_id: '41' } }, rw.deps);
     expect(rw.raw.recordWrite).toHaveBeenCalledWith(expect.objectContaining({ entityType: 'CATALOG_EVENT_SOURCE', action: 'CREATE', verification: 'CONFIRMED' }));
   });
+  it('ENG-3060: a replayed confirm is not metered as a second executed write', async () => {
+    const rw = gateway(['tools:read', 'tools:execute']);
+    rw.raw.runEventSourceTool.mockResolvedValueOnce({ success: true, verification: 'CONFIRMED', id: '41', replayed: true });
+    await handleMetaToolkitCall({ authorization: 'Bearer aw_fixture', toolName: 'meta_event_source_connect', args: { catalog_id: '501', pixel_id: '41' } }, rw.deps);
+    expect(rw.raw.recordWrite).not.toHaveBeenCalled();
+  });
 });

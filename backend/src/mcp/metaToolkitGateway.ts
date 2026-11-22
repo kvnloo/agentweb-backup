@@ -496,6 +496,8 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
   // and a duplicate), so it is logged and surfaced on the result instead of thrown.
   const recordExecutedWrite = async (entityType: string, action: string, result: any, params?: unknown) => {
     if (typeof result?.verification !== 'string') return;
+    // ENG-3060: a replayed confirm sends nothing to Meta, so it is not a second executed write.
+    if (result?.replayed === true) return;
     await (deps.recordWrite ?? recordMcpWriteExecuted)({
       product: TOOLKIT_PRODUCT,
       userId: caller.userId,
