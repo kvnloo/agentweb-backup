@@ -44,11 +44,17 @@ function same(want: unknown, got: unknown): boolean {
   return String(want).trim() === String(got).trim();
 }
 
-/** Meta answers a read of a hard-deleted or unknown node with code 100 / subcode 33. */
+/**
+ * Meta answers a read of a hard-deleted node with code 100 (often subcode 33). Subcode 33 is also
+ * used for permission and unsupported-operation failures ("cannot be loaded due to missing
+ * permissions"), so neither the subcode nor the generic message alone proves deletion.
+ */
 export function isMetaObjectNotFound(error: any): boolean {
   const e = error?.structuredError ?? error?.response?.error ?? error?.response ?? error ?? {};
-  if (Number(e.error_subcode) === 33) return true;
-  return Number(e.code) === 100 && /does not exist|unsupported get request/i.test(String(e.message ?? error?.message ?? ''));
+  if (Number(e.code) !== 100) return false;
+  const msg = String(e.message ?? error?.message ?? '');
+  if (/permission|does not support this operation/i.test(msg)) return false;
+  return /does not exist/i.test(msg);
 }
 
 /**

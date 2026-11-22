@@ -137,6 +137,16 @@ describe('checkMetaDelete', () => {
     expect(out).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['status'] });
   });
 
+  it('subcode 33 for a permission or unsupported-operation failure is not proof of deletion', async () => {
+    const perm = Object.assign(new Error('Unsupported get request. Object with ID does not exist, cannot be loaded due to missing permissions, or does not support this operation'), {
+      structuredError: { code: 100, error_subcode: 33 },
+    });
+    expect(isMetaObjectNotFound(perm)).toBe(false);
+    expect(isMetaObjectNotFound({ structuredError: { code: 190, error_subcode: 33, message: 'x' } })).toBe(false);
+    const out = await checkMetaDelete('ad', 'a1', jest.fn().mockRejectedValue(perm), fast);
+    expect(out).toMatchObject({ success: false, errorType: 'read_back_failed' });
+  });
+
   it('a read error other than not-found is a failure, not a pass', async () => {
     expect(isMetaObjectNotFound(new Error('Meta rate limit exceeded'))).toBe(false);
     const out = await checkMetaDelete('ad', 'a1', jest.fn().mockRejectedValue(new Error('Meta rate limit exceeded')), fast);
