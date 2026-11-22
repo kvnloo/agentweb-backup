@@ -13,6 +13,17 @@ const S3_BUCKET = process.env.AWS_S3_BUCKET || 'agentweb-user-files';
 
 router.use(authenticateToken);
 
+// ENG-2408: reference image keys must live under the caller's own upload prefix
+// (uploadFileToS3 writes users/{userId}/files/...). Anything else could point at
+// another tenant's object in the shared bucket.
+export function isOwnUploadKey(key: unknown, userId: string): key is string {
+  if (typeof key !== 'string' || !userId) return false;
+  const prefix = `users/${userId}/files/`;
+  if (!key.startsWith(prefix) || key.length <= prefix.length) return false;
+  // Reject traversal segments only; filenames containing '..' (e.g. a..b.png) are legitimate.
+  return !key.split(/[\\/]/).some((seg) => seg === '..' || seg === '.');
+}
+
 // GET /api/characters — list all characters for the authenticated user
 router.get('/', async (req, res) => {
   try {
@@ -67,6 +78,9 @@ router.post('/', async (req, res) => {
     if (!name || !description || !referenceImageUrl) {
       return res.status(400).json({ message: 'name, description, and referenceImageUrl are required' });
     }
+    if (referenceImageKey && !isOwnUploadKey(referenceImageKey, userId)) {
+      return res.status(400).json({ message: 'referenceImageKey must reference your own uploaded image' });
+    }
     const character = await characterDb.createCharacter(userId, {
       name,
       description,
@@ -90,12 +104,14 @@ router.delete('/:characterId', async (req, res) => {
     if (!character) return res.status(404).json({ message: 'Character not found' });
     if (character.userId !== userId) return res.status(403).json({ message: 'Not authorized' });
 
-    if (character.referenceImageKey) {
+    if (character.referenceImageKey && isOwnUploadKey(character.referenceImageKey, userId)) {
       try {
         await s3.deleteObject({ Bucket: S3_BUCKET, Key: character.referenceImageKey }).promise();
       } catch (s3Error) {
         console.warn('Failed to delete character image from S3:', s3Error);
       }
+    } else if (character.referenceImageKey) {
+      console.warn(`Skipping S3 delete for character ${characterId}: key outside caller prefix`);
     }
 
     await characterDb.deleteCharacter(userId, characterId);

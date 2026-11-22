@@ -33,8 +33,8 @@ Comments:
 
 ## Investigating with production data (read-only)
 
-This machine has READ-ONLY AWS access to the production DynamoDB tables (`AW-*`) and Elastic
-Beanstalk. Use it to CONFIRM the root cause against real data instead of guessing — especially
+This machine has READ-ONLY AWS access to the production DynamoDB tables (`AW-*`). It has no
+access to production logs. Use it to CONFIRM the root cause against real data instead of guessing — especially
 when the bug names a Session ID, User ID, or execution ID.
 
 - If the bug references a session, a summary is shown above. For the full record:
@@ -42,16 +42,11 @@ when the bug names a Session ID, User ID, or execution ID.
 - Query any prod table directly, e.g.:
   `aws dynamodb get-item --table-name AW-ChatSessions --key '{"sessionId":{"S":"<id>"}}'`
   (useful tables: `AW-ChatSessions`, `AW-TaskExecutions`, `AW-Tasks`, `AW-Users`, `AW-Configs`).
-- Recent backend logs (best-effort; they rotate fast, so only useful for a just-reported bug):
-  `request-environment-info`, wait ~40s, then retrieve the NEWEST bundle — do NOT take `[0]`, which
-  can be a stale entry from a terminated instance:
-  ```
-  aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail
-  # wait ~40s, then get the freshest bundle's presigned URL and curl it:
-  aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail \
-    --query 'reverse(sort_by(EnvironmentInfo, &SampleTimestamp))[0].Message' --output text
-  ```
-  Prefer the DynamoDB session/records above when they answer the question.
+- Do NOT read production backend logs, by any path: no `elasticbeanstalk request-environment-info` /
+  `retrieve-environment-info`, no CloudWatch Logs (`logs:StartQuery`, `filter-log-events`). The
+  runner's least-privilege role deliberately denies them (ENG-1031 decision); every attempt fails and
+  writes an ERROR event to the prod environment (ENG-1012). Use the DynamoDB records above, a local
+  repro, or staging instead. If the bug truly needs prod logs, say so in the PR for a human to pull.
 
 Rules: **read-only — never write to prod.** This is real customer data (PII): use it to understand
 the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, or comments. Also

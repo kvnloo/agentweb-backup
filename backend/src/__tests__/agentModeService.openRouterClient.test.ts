@@ -157,7 +157,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     'openrouter/x-ai/grok-4.6',
     'openrouter/deepseek/deepseek-v4-pro',
     'openrouter/deepseek/deepseek-v4-flash',
-    'openrouter/qwen/qwen3.8-max',
+    'openrouter/qwen/qwen3.8-max-0902',
     'openrouter/mistralai/mistral-small-2603',
     'openrouter/moonshotai/kimi-k3',
     'openrouter/moonshotai/kimi-k2.7-code',
@@ -713,6 +713,40 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       ...OPENROUTER_PROVIDER_PREFERENCES,
       require_parameters: true,
       ignore: ['Google'],
+    });
+  });
+
+  describe('ENG-55 Compare data-collection policy', () => {
+    async function providerFor(options: any, model = 'gemini-3.7-flash') {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({ chat: { completions: { create } } } as any);
+      await service.callLLM(model, [{ role: 'user', content: 'Hello' }], options);
+      return create.mock.calls[0][0].provider;
+    }
+
+    it('without providerPolicy the provider object is exactly today\'s (no data_collection)', async () => {
+      expect(await providerFor({ taskClass: 'interactive_chat' }, 'gpt-5.4')).toEqual({
+        order: ['amazon-bedrock', 'azure', 'google-vertex', 'anthropic', 'openai'],
+        allow_fallbacks: true,
+        require_parameters: true,
+      });
+    });
+
+    it('with providerPolicy deny, data_collection is merged and order/allow_fallbacks/require_parameters/ignore survive', async () => {
+      expect(await providerFor({ taskClass: 'interactive_chat', providerPolicy: { data_collection: 'deny' } })).toEqual({
+        ...OPENROUTER_PROVIDER_PREFERENCES,
+        require_parameters: true,
+        ignore: ['Google'],
+        data_collection: 'deny',
+      });
+    });
+
+    it('a normal chat call never carries data_collection (guards against applying it to every call)', async () => {
+      for (const model of ['gpt-5.4', 'gemini-3.7-flash', 'anthropic.claude-sonnet-5']) {
+        expect(await providerFor({ taskClass: 'interactive_chat' }, model)).not.toHaveProperty('data_collection');
+        expect(await providerFor(undefined, model)).not.toHaveProperty('data_collection');
+      }
     });
   });
 

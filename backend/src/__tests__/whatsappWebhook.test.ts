@@ -23,17 +23,44 @@ jest.mock('../services/whatsappService', () => ({
   recordInboundMessage: jest.fn(),
   recordOptOut: jest.fn(),
   recordOptIn: jest.fn(),
+  sendText: jest.fn(),
+  sendOptOutConfirmation: jest.fn(),
+  OPT_IN_CONFIRMATION: 'opt-in-confirmation-copy',
   redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
+  disconnectWhatsAppForNumber: jest.fn(),
+  resumeVerificationAfterStart: jest.fn(),
+}));
+jest.mock('../services/approvalChannelNotifier', () => ({
+  handleApprovalButtonTap: jest.fn(),
+  lookupApprovalMessage: jest.fn(),
+}));
+jest.mock('../services/approvalDb', () => ({ approvalDb: { getApproval: jest.fn() } }));
+jest.mock('../services/whatsappOwnerNotices', () => ({
+  notifyOwnerUnreachable: jest.fn(),
+}));
+jest.mock('../services/whatsappInboundSupport', () => ({
+  handleUnrecognizedMessage: jest.fn(),
 }));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
 
-const { recordInboundMessage, recordOptOut, recordOptIn } = require('../services/whatsappService');
-const { handleVerificationMessage } = require('../services/whatsappVerificationService');
+const {
+  recordInboundMessage,
+  recordOptOut,
+  recordOptIn,
+  sendText,
+  sendOptOutConfirmation,
+} = require('../services/whatsappService');
+const { lookupApprovalMessage } = require('../services/approvalChannelNotifier');
+const { notifyOwnerUnreachable } = require('../services/whatsappOwnerNotices');
+const { approvalDb } = require('../services/approvalDb');
+const { handleVerificationMessage, disconnectWhatsAppForNumber, resumeVerificationAfterStart } = require('../services/whatsappVerificationService');
+const { handleApprovalButtonTap } = require('../services/approvalChannelNotifier');
+const { handleUnrecognizedMessage } = require('../services/whatsappInboundSupport');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
 import whatsappWebhookRouter from '../routes/whatsappWebhook';
@@ -208,6 +235,68 @@ describe('POST — inbound messages', () => {
     expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
   });
 
+  it('takes WhatsApp off the account that holds the number when it texts STOP', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue('user-1');
+    await post(inboundPayload('STOP'));
+    expect(disconnectWhatsAppForNumber).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('records the opt-out BEFORE disconnecting, and disconnects BEFORE confirming', async () => {
+    const order: string[] = [];
+    recordOptOut.mockImplementation(async () => void order.push('opt-out'));
+    disconnectWhatsAppForNumber.mockImplementation(async () => {
+      order.push('disconnect');
+      return 'user-1';
+    });
+    sendOptOutConfirmation.mockImplementation(async () => void order.push('confirm'));
+    await post(inboundPayload('STOP'));
+    expect(order).toEqual(['opt-out', 'disconnect', 'confirm']);
+  });
+
+  it('is fine when no account holds the number', async () => {
+    disconnectWhatsAppForNumber.mockResolvedValue(null);
+    sendOptOutConfirmation.mockResolvedValue(undefined);
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(200);
+    expect(sendOptOutConfirmation).toHaveBeenCalled();
+  });
+
+  it('answers 500 (so Meta redelivers) when the disconnect hits a storage error, and confirms nothing yet', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    disconnectWhatsAppForNumber.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('STOP'));
+    expect(res.status).toBe(500);
+    expect(recordOptOut).toHaveBeenCalled(); // the opt-out itself is already safe
+    expect(sendOptOutConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('START finishes a connection that was waiting on it, and sends the opt-in text only when nothing was waiting', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(true);
+    await post(inboundPayload('START'));
+    expect(resumeVerificationAfterStart).toHaveBeenCalledWith('+14155550123');
+    expect(sendText).not.toHaveBeenCalled(); // the resume already replied "You're connected"
+  });
+
+  it('START with nothing waiting sends the ordinary opt-in confirmation', async () => {
+    resumeVerificationAfterStart.mockResolvedValue(false);
+    sendText.mockResolvedValue(undefined);
+    await post(inboundPayload('START'));
+    expect(sendText).toHaveBeenCalledWith('+14155550123', 'opt-in-confirmation-copy');
+  });
+
+  it('START answers 500 (Meta redelivers) when finishing the waiting connection hits a storage error', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    resumeVerificationAfterStart.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('START'));
+    expect(res.status).toBe(500);
+    expect(recordOptIn).toHaveBeenCalled(); // the opt-in itself is already safe
+  });
+
+  it('does not disconnect anyone for START / UNSTOP', async () => {
+    await post(inboundPayload('UNSTOP'));
+    expect(disconnectWhatsAppForNumber).not.toHaveBeenCalled();
+  });
+
   it('records an opt-out on STOP', async () => {
     await post(inboundPayload('STOP'));
     expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
@@ -218,9 +307,143 @@ describe('POST — inbound messages', () => {
     expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
   });
 
+  it.each(['Stop.', 'STOP!', 'please stop', 'Stop please.', 'stop all'])(
+    'treats %s as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+    },
+  );
+
+  it.each([
+    'Stop 🛑',
+    'stop 👋',
+    'ＳＴＯＰ',
+    'stop…',
+    '"stop"',
+    'STOP\u200b',
+    'Stop 。',
+    'stop  all',
+    '  STOP\n  ',
+  ])('treats %j as an opt-out (emoji, quotes, fullwidth and zero-width noise)', async (text) => {
+    await post(inboundPayload(text));
+    expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it.each(['cancel my order', 'please stop by the office tomorrow', "don't stop", 'stop 2 items', 'what is the end date'])(
+    'does NOT treat %j as an opt-out',
+    async (text) => {
+      await post(inboundPayload(text));
+      expect(recordOptOut).not.toHaveBeenCalled();
+    },
+  );
+
+  it('logs a FAILED delivery receipt by message id and never opens a window', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('failed'));
+    expect(errSpy.mock.calls.flat().join(' ')).toMatch(/…[\w.]+ FAILED to deliver/);
+    expect(errSpy.mock.calls.flat().join(' ')).not.toContain('4155550123');
+    expect(recordInboundMessage).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('emails the owner when a failed receipt belongs to an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status: 'pending' });
+    await post(statusPayload('failed'));
+    expect(lookupApprovalMessage).toHaveBeenCalledWith('wamid.OUT1');
+    expect(notifyOwnerUnreachable).toHaveBeenCalledWith('user-1');
+  });
+
+  it.each(['approved', 'rejected', 'needs_changes'])(
+    'does NOT email the owner when the approval is already %s (the results are not on hold)',
+    async (status) => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+      approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1', status });
+      await post(statusPayload('failed'));
+      expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does NOT email the owner when the record now belongs to someone else', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-1' });
+    approvalDb.getApproval.mockResolvedValue({ assetUrl: 'https://a/x.png', userId: 'user-2', status: 'pending' });
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('does not email anyone for a failed receipt that was not an approval request', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    lookupApprovalMessage.mockResolvedValue(null);
+    await post(statusPayload('failed'));
+    expect(notifyOwnerUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('a failure while acting on a receipt never fails the webhook', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    lookupApprovalMessage.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(statusPayload('failed'));
+    expect(res.status).toBe(200);
+  });
+
+  it('stays quiet for a delivered receipt', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await post(statusPayload('delivered'));
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
   it('records an opt-in on UNSTOP', async () => {
     await post(inboundPayload('UNSTOP'));
     expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
+  });
+
+  it('confirms the opt-out, so a STOP is never answered with silence', async () => {
+    await post(inboundPayload('STOP'));
+    expect(sendOptOutConfirmation).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('records the opt-out BEFORE confirming it', async () => {
+    const order: string[] = [];
+    (recordOptOut as jest.Mock).mockImplementationOnce(async () => {
+      order.push('record');
+    });
+    (sendOptOutConfirmation as jest.Mock).mockImplementationOnce(async () => {
+      order.push('confirm');
+    });
+    await post(inboundPayload('STOP'));
+    // Recording is the compliance-critical half. If the confirmation were sent first and
+    // the process died between the two, the customer would believe they had opted out
+    // while still being subscribed — the one ordering that is actually unsafe.
+    expect(order).toEqual(['record', 'confirm']);
+  });
+
+  it('still records the opt-out when the confirmation fails to send', async () => {
+    (sendOptOutConfirmation as jest.Mock).mockRejectedValueOnce(new Error('meta down'));
+    const res = await post(inboundPayload('STOP'));
+    expect(recordOptOut).toHaveBeenCalledWith('+14155550123');
+    // 200, not 500: a retry would re-record an opt-out that already landed and send a
+    // second confirmation. The opt-out is not lost, so there is nothing to retry.
+    expect(res.status).toBe(200);
+  });
+
+  it('confirms the opt-in on UNSTOP through the ordinary send path', async () => {
+    await post(inboundPayload('UNSTOP'));
+    // Plain sendText, not the opt-out bypass: the number is opted back in by now, so the
+    // normal guards are the right ones to apply.
+    expect(sendText).toHaveBeenCalledWith('+14155550123', 'opt-in-confirmation-copy');
+    expect(sendOptOutConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('still records the opt-in when its confirmation fails to send', async () => {
+    (sendText as jest.Mock).mockRejectedValueOnce(new Error('meta down'));
+    const res = await post(inboundPayload('UNSTOP'));
+    expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
+    expect(res.status).toBe(200);
   });
 
   it('never puts the raw phone number in a STOP/START log line', async () => {
@@ -370,5 +593,162 @@ describe('POST — number verification', () => {
   it('200s when verification completes, whatever the outcome it chose to reply with', async () => {
     handleVerificationMessage.mockResolvedValue(true);
     expect((await post(inboundPayload('Verify K7Q2M9XA'))).status).toBe(200);
+  });
+});
+
+describe('POST — tapped buttons', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  const envelope = (msg: any) =>
+    JSON.stringify({
+      object: 'whatsapp_business_account',
+      entry: [
+        { id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [msg] } }] },
+      ],
+    });
+
+  const base = { from: '14155550123', id: 'wamid.IN', timestamp: '1' };
+
+  it('routes a non-template reply button, keeping the id we set', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'approve',
+    });
+  });
+
+  it('routes a TEMPLATE quick-reply, where Meta sends back the label', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleApprovalButtonTap).toHaveBeenCalledWith({
+      phone: '+14155550123',
+      approvalMessageId: 'wamid.APPROVAL',
+      action: 'Approve',
+    });
+  });
+
+  it('ignores a tap with no context — it cannot be attributed to anything', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'interactive',
+        interactive: { type: 'button_reply', button_reply: { id: 'approve', title: 'Approve' } },
+      }),
+    );
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+  });
+
+  it('still opens the service window for a tap', async () => {
+    // The tap is a user message; treating it otherwise would leave us unable to reply.
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
+  });
+
+  it('does not hand a tap to the verification parser', async () => {
+    await post(
+      envelope({
+        ...base,
+        type: 'button',
+        context: { from: 'biz', id: 'wamid.APPROVAL' },
+        button: { payload: 'Approve', text: 'Approve' },
+      }),
+    );
+    expect(handleVerificationMessage).not.toHaveBeenCalled();
+  });
+
+  it('leaves ordinary text alone', async () => {
+    await post(inboundPayload('hello there'));
+    expect(handleApprovalButtonTap).not.toHaveBeenCalled();
+    expect(handleVerificationMessage).toHaveBeenCalled();
+  });
+});
+
+describe('POST — messages that are not commands', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  it('hands an ordinary message to the support hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    // replaced below with the media-aware assertion
+  });
+
+  it('passes a media message\'s caption and where to find the file to the hand-off', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.M', timestamp: '1', type: 'image',
+          image: { id: 'MEDIA-123', caption: 'my dashboard is broken', mime_type: 'image/jpeg' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', 'my dashboard is broken', 'image', 'image, media id MEDIA-123', 'wamid.M',
+    );
+  });
+
+  it('names a document by its filename', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'W', changes: [{ field: 'messages', value: { messaging_product: 'whatsapp', messages: [{
+          from: '14155550123', id: 'wamid.D', timestamp: '1', type: 'document',
+          document: { id: 'MEDIA-9', filename: 'invoice.pdf' },
+        }] } }] }],
+      }),
+    );
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith(
+      '+14155550123', '', 'document', 'document, file "invoice.pdf", media id MEDIA-9', 'wamid.D',
+    );
+  });
+
+  it('gives plain text no media detail', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(false);
+    await post(inboundPayload('hi'));
+    expect(handleUnrecognizedMessage).toHaveBeenCalledWith('+14155550123', 'hi', 'text', '', 'wamid.IN1');
+  });
+
+  it('does not greet someone who just sent a verification code', async () => {
+    (handleVerificationMessage as jest.Mock).mockResolvedValue(true);
+    await post(inboundPayload('Verify ABCD2345'));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['STOP', 'UNSTOP'])('does not greet on %s', async (kw) => {
+    await post(inboundPayload(kw));
+    expect(handleUnrecognizedMessage).not.toHaveBeenCalled();
   });
 });

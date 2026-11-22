@@ -31,9 +31,11 @@ import './evaluationTools';
 import './workflowTools';
 // ENG-1004: tranche 2 (landing pages). Same additive contract.
 import './landingWorkflowTools';
+import './publishWorkflowTools';
 // ENG-983: progressive disclosure — tools/list returns the workflow layer plus
 // emma_search_tools; the granular catalogue stays callable and discoverable.
 import { getListedToolDefinitions } from './toolDiscovery';
+import { sanitizePublicToolResult, shouldSanitizePublicResponse } from './publicResponseSanitizer';
 
 export interface McpSessionContext {
   agentUserId?: string;
@@ -124,7 +126,11 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
     };
 
     try {
-      const result = await mcpToolRegistry.execute(name, toolArgs, context);
+      const rawResult = await mcpToolRegistry.execute(name, toolArgs, context);
+      // ENG-2335: public (external, non-admin) responses never carry internal IDs.
+      const result = shouldSanitizePublicResponse(name, toolArgs, context)
+        ? sanitizePublicToolResult(rawResult)
+        : rawResult;
       if (context.externalMcp && effectiveUserId) {
         void Promise.all([
           recordMcpToolUse({

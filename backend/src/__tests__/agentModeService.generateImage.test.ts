@@ -1267,4 +1267,29 @@ describe('Data-fabrication backstop wiring (ENG-1027)', () => {
     expect(result.success).toBe(true);
     expect(result.dataReliabilityWarning).toBeUndefined();
   });
+
+  // ENG-1535 AC3: the generate_image handler contract forwards the typed provider
+  // errorClass so the gateway/agent can distinguish retryable from terminal failures.
+  describe('typed errorClass contract (ENG-1535)', () => {
+    const call = () =>
+      (agentModeService as unknown as {
+        generateImage: (...args: unknown[]) => Promise<Record<string, unknown>>;
+      }).generateImage(
+        'Ad prompt', 'ad.png', '1:1', 'medium', [], 'user123', 'session123',
+        'gemini-3-pro-image-preview', undefined, undefined, 'ad', undefined, undefined,
+      );
+
+    it.each(['transient', 'rate_limited', 'policy', 'config'])('forwards errorClass=%s on failure', async (errorClass) => {
+      mockImageService.generateImage.mockResolvedValue({ success: false, error: `boom ${errorClass}`, errorClass });
+      const result = await call();
+      expect(result).toMatchObject({ success: false, error: `boom ${errorClass}`, errorClass });
+    });
+
+    it('omits errorClass when the provider did not classify the failure', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: false, error: 'unknown' });
+      const result = await call();
+      expect(result.success).toBe(false);
+      expect(result).not.toHaveProperty('errorClass');
+    });
+  });
 });

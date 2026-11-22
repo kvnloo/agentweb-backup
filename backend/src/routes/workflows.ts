@@ -7,7 +7,6 @@ import {
   updateWorkflow,
   deleteWorkflow,
   getWorkflowExecutions,
-  runWorkflow,
   generateWorkflow
 } from '../controllers/workflows';
 import { WorkflowTask } from '../services/workflow';
@@ -97,6 +96,11 @@ router.post('/:id/run', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Workflow not found' });
     }
 
+    // ENG-2402: only the workflow owner may run it (same rule as kill).
+    if (workflow.userId !== userId) {
+      return res.status(403).json({ error: 'Not authorized to run this workflow' });
+    }
+
     console.log('Retrieved workflow:', JSON.stringify(workflow, null, 2));
 
     // Parse YAML to get nodes and edges
@@ -106,6 +110,19 @@ router.post('/:id/run', async (req: Request, res: Response) => {
     if (!workflowData?.nodes || !Array.isArray(workflowData.nodes)) {
       console.error(`Workflow ${id} has no valid nodes array in YAML:`, workflowData?.nodes);
       return res.status(400).json({ error: 'Workflow has no tasks defined' });
+    }
+
+    // ENG-2402: every referenced task must exist and belong to the caller.
+    for (const node of workflowData.nodes) {
+      const refTaskId = node?.data?.taskId;
+      if (!refTaskId) continue;
+      const refTask = await taskDb.getTaskById(refTaskId);
+      if (!refTask) {
+        return res.status(400).json({ error: `Referenced task ${refTaskId} not found` });
+      }
+      if (refTask.userId !== userId) {
+        return res.status(403).json({ error: `Not authorized to use task ${refTaskId}` });
+      }
     }
 
     // Create workflow execution
@@ -211,6 +228,14 @@ router.put('/:workflowId/executions/:executionId/tasks/:taskId/rerun', authentic
     const workflowExecution = await workflowDb.getWorkflowExecution(executionId) as ExtendedWorkflowExecution;
     if (!workflowExecution) {
       return res.status(404).json({ message: 'Workflow execution not found' });
+    }
+
+    // ENG-2402: the execution must belong to the route's workflow and the caller.
+    if (workflowExecution.workflowId !== workflowId) {
+      return res.status(404).json({ message: 'Workflow execution not found' });
+    }
+    if (workflowExecution.userId !== userId) {
+      return res.status(403).json({ message: 'Not authorized to rerun tasks in this workflow execution' });
     }
 
     // Check if workflow execution is in a state that allows rerunning tasks

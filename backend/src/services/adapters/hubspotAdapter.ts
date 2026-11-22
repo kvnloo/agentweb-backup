@@ -289,20 +289,10 @@ export class HubspotAdapter implements CrmAdapter {
                 // contact B, and overwrote our stored id. Contact A was orphaned in the
                 // customer's HubSpot: a real person, now a duplicate nobody updates again.
                 //
-                // SCOPE, stated plainly: this is pushLeadsPerLead. `batchEnabled()` defaults
-                // TRUE (HUBSPOT_BATCH_PUSH_ENABLED is set nowhere), so in production this
-                // path is reached only for EMAIL-LESS leads — which is the ENG-2082
-                // population and the point of the fix. A lead that HAS an email goes to
-                // pushLeadsBatched, whose Stage 1 partitions on email alone, upserts by
-                // email, and overwrites the stored id at Stage 3. So the orphaning described
-                // above is closed for a lead that never had an address and is NOT closed for
-                // one that later gains it.
-                //
-                // Fixing the batched half means routing stored-id leads to
-                // batchUpdateContacts (which exists) AND handling its all-or-nothing partial
-                // failure — one contact the customer deleted in HubSpot would otherwise 404
-                // an entire 100-lead batch, where the per-lead path falls back to create on
-                // 404/410. That is its own change with its own failure modes: ENG-2167.
+                // `batchEnabled()` defaults TRUE, so in production this path is reached
+                // for email-less leads. pushLeadsBatched applies the same stored-id-first
+                // rule to leads that have an email (Stage 1.5, ENG-2171); it is not
+                // reached by this method for those, so the two must be kept in step.
                 const existingContactId: string | undefined =
                     lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
                 const upsertOrCreate = async () => {
@@ -450,9 +440,12 @@ export class HubspotAdapter implements CrmAdapter {
             lead: any;
             emailLower: string;            // '' for email-less
             allContactProps: Record<string, string>;
+            storedId?: string;             // contact id we stored on an earlier push
         }
         const emailLeads: PreppedLead[] = [];
+        const storedIdLeads: PreppedLead[] = [];
         const emaillessLeads: any[] = [];
+        const pushByStoredId = this.pushByStoredIdEnabled();
         // Tracks leads where a per-lead field mapping already set lifecyclestage —
         // these must skip the two-step so the explicit mapping value is preserved.
         const perLeadLifecycleSet = new Set<any>();
@@ -490,10 +483,54 @@ export class HubspotAdapter implements CrmAdapter {
             if ('lifecyclestage' in allContactProps) perLeadLifecycleSet.add(lead);
 
             if (email) {
-                emailLeads.push({ lead, emailLower: email.toLowerCase(), allContactProps });
+                const prepped: PreppedLead = { lead, emailLower: email.toLowerCase(), allContactProps };
+                // A contact id we stored ourselves is a stronger identity than the email
+                // (ENG-2171): upserting by email would create a second contact for a lead
+                // whose first contact was created without one, and Stage 3 would then
+                // overwrite the stored id, orphaning the original.
+                const storedId = pushByStoredId ? this.getStoredContactId(lead) : undefined;
+                if (storedId) {
+                    prepped.storedId = storedId;
+                    storedIdLeads.push(prepped);
+                } else {
+                    emailLeads.push(prepped);
+                }
             } else {
                 // Email-less leads cannot upsert-by-email; route to per-lead path (Stage 5).
                 emaillessLeads.push(lead);
+            }
+        }
+
+        // ── Stage 1.5: update leads that already have a stored contact id, by id ──
+        // One update input per contact id carries ONE lead's properties. Leads that
+        // share an id AND an email are the same person (collapsed); a lead sharing the
+        // id with a DIFFERENT email would be reported synced on someone else's data, so
+        // it takes the pre-ENG-2171 path (upsert by its own email) instead.
+        const emailByClaimedId = new Map<string, string>();
+        for (const p of [...storedIdLeads]) {
+            const claimedBy = emailByClaimedId.get(p.storedId!);
+            if (claimedBy === undefined) {
+                emailByClaimedId.set(p.storedId!, p.emailLower);
+            } else if (claimedBy !== p.emailLower) {
+                console.warn(
+                    `[HubspotAdapter] stored contact ${p.storedId} is shared by leads with different emails ` +
+                    `— lead ${p.lead.leadId} will upsert by its own email.`,
+                );
+                storedIdLeads.splice(storedIdLeads.indexOf(p), 1);
+                p.storedId = undefined;
+                emailLeads.push(p);
+            }
+        }
+        const idOutcome = await this.updateContactsByStoredId(svc, storedIdLeads);
+        // A stored contact HubSpot says no longer exists falls back to the email
+        // upsert below, exactly as pushLeadsPerLead does on 404/410.
+        for (const p of storedIdLeads) {
+            if (idOutcome.gone.has(p.storedId!)) {
+                console.warn(
+                    `[HubspotAdapter] stored contact ${p.storedId} for lead ${p.lead.leadId} ` +
+                    `no longer exists — falling back to upsert-by-email.`,
+                );
+                emailLeads.push(p);
             }
         }
 
@@ -502,16 +539,24 @@ export class HubspotAdapter implements CrmAdapter {
         // must send exactly ONE input per unique email (a duplicate input 409s and
         // produces phantom processing). leadByEmail keeps the FIRST prepped lead per
         // email purely to source the contact props for that single input.
+        const contactResults = new Map<string, { email: string; contactId: string; isNew: boolean }>();
+        // An email whose stored-id update just succeeded already resolves to that
+        // contact: adopt it instead of upserting, so we never depend on HubSpot
+        // finding an email we wrote a moment ago (undocumented read-after-write).
+        for (const p of storedIdLeads) {
+            if (idOutcome.updated.has(p.storedId!) && !contactResults.has(p.emailLower)) {
+                contactResults.set(p.emailLower, { email: p.emailLower, contactId: p.storedId!, isNew: false });
+            }
+        }
         const leadByEmail = new Map<string, PreppedLead>();
         for (const p of emailLeads) {
-            if (!leadByEmail.has(p.emailLower)) leadByEmail.set(p.emailLower, p);
+            if (!leadByEmail.has(p.emailLower) && !contactResults.has(p.emailLower)) leadByEmail.set(p.emailLower, p);
         }
         // ALWAYS force properties.email so the upsert response echoes it for mapping.
         const upsertInputs = Array.from(leadByEmail.values()).map(p => ({
             email: p.emailLower,
             properties: { ...p.allContactProps, email: p.emailLower },
         }));
-        const contactResults = new Map<string, { email: string; contactId: string; isNew: boolean }>();
         // Emails HubSpot rejected as invalid (e.g. a bad TLD that passed our local
         // format check). Collected here and reported as errors after the stage.
         const invalidEmails: string[] = [];
@@ -556,6 +601,26 @@ export class HubspotAdapter implements CrmAdapter {
             } else {
                 result.errorCount++;
                 const reason = failureReason.get(p.emailLower) || 'contact upsert failed';
+                result.errors.push(`${p.emailLower}: ${reason}`);
+                failedEmailLeads.push({ lead: p.lead, reason });
+            }
+        }
+        // Stored-id leads. A "gone" lead was moved into emailLeads above and is
+        // already counted there. Everything else either updated in place or failed;
+        // a failure keeps the stored id (buildFailedMetadata preserves it) and creates
+        // nothing, so a 429 or a 5xx can never fork a duplicate contact.
+        for (const p of storedIdLeads) {
+            const id = p.storedId!;
+            if (idOutcome.gone.has(id)) continue;
+            if (idOutcome.updated.has(id)) {
+                result.successCount++;
+                result.updatedCount++;
+                contactIdByLead.set(p.lead, id);
+                isNewByLead.set(p.lead, false);
+                succeededEmailLeads.push(p.lead);
+            } else {
+                const reason = `updating stored contact ${id} failed (${idOutcome.failed.get(id) || 'unknown error'})`;
+                result.errorCount++;
                 result.errors.push(`${p.emailLower}: ${reason}`);
                 failedEmailLeads.push({ lead: p.lead, reason });
             }
@@ -643,6 +708,100 @@ export class HubspotAdapter implements CrmAdapter {
             errorCount: result.errorCount,
             durationMs: Date.now() - t0,
         });
+    }
+
+    /** Kill switch: HUBSPOT_PUSH_BY_STORED_ID='off' restores upsert-by-email for every email lead. */
+    private pushByStoredIdEnabled(): boolean {
+        return (process.env.HUBSPOT_PUSH_BY_STORED_ID || '').trim().toLowerCase() !== 'off';
+    }
+
+    private getStoredContactId(lead: any): string | undefined {
+        const raw = lead?.syncMetadata?.hubspot_contact_id || lead?.customFields?.hubspot_contact_id;
+        const id = raw === undefined || raw === null ? '' : String(raw).trim();
+        return id || undefined;
+    }
+
+    /**
+     * True only when HubSpot says the contact is gone: a 404/410, or a 207 whose every
+     * error is a not-found category. HubSpot does not document the category values or
+     * the status for a missing contact id on batch update, so this is deliberately
+     * strict: anything else is treated as a real failure (visible, id kept) rather
+     * than as licence to create a replacement contact.
+     */
+    private isContactGoneError(error: any): boolean {
+        const status = error?.response?.status;
+        if (status === 404 || status === 410) return true;
+        if (status !== 207) return false;
+        const errs = error?.response?.data?.errors;
+        return Array.isArray(errs) && errs.length > 0 && errs.every((e: any) => /NOT_FOUND/i.test(e?.category || ''));
+    }
+
+    /**
+     * Rate limit, lock, gateway or network failure: smaller batches cannot help, and
+     * bisecting would multiply the calls being throttled. A bare 500 is NOT included:
+     * it can be one bad record, which bisection isolates (as the email upsert does).
+     */
+    private isTransientHubSpotError(error: any): boolean {
+        const status = error?.response?.status;
+        if (status === undefined) return true;
+        return status === 429 || status === 423 || status === 502 || status === 503 || status === 504;
+    }
+
+    /**
+     * Update contacts we already hold an id for, in batches, by id. Duplicate ids
+     * collapse to one input. splitAndRetry isolates a bad record by bisection, except
+     * for transient failures, which fail their chunk once: bisecting a rate limit
+     * would only multiply the calls that are being throttled.
+     */
+    private async updateContactsByStoredId(
+        svc: HubSpotService,
+        leads: Array<{ storedId?: string; emailLower: string; allContactProps: Record<string, string> }>,
+    ): Promise<{ updated: Set<string>; failed: Map<string, string>; gone: Set<string> }> {
+        const updated = new Set<string>();
+        const failed = new Map<string, string>();
+        const gone = new Set<string>();
+        if (leads.length === 0) return { updated, failed, gone };
+
+        const byId = new Map<string, { id: string; properties: Record<string, string> }>();
+        for (const p of leads) {
+            const id = p.storedId!;
+            if (!byId.has(id)) byId.set(id, { id, properties: { ...p.allContactProps, email: p.emailLower } });
+        }
+
+        const outcome = await splitAndRetry(
+            Array.from(byId.values()),
+            async (batch) => {
+                try {
+                    await svc.batchUpdateContacts(batch);
+                    for (const i of batch) updated.add(i.id);
+                } catch (err: any) {
+                    if (!this.isTransientHubSpotError(err)) throw err; // bisect to isolate the bad record
+                    const msg = this.formatError(err);
+                    for (const i of batch) failed.set(i.id, msg);
+                }
+            },
+            {
+                maxBatchSize: 100,
+                concurrency: PUSH_BATCH_CONCURRENCY,
+                onSplit: (n, e) => console.log(`[HubspotAdapter] batch contact update of ${n} failed, splitting: ${this.formatError(e)}`),
+            },
+        );
+        for (const f of outcome.failed) {
+            if (this.isContactGoneError(f.error)) {
+                gone.add(f.item.id);
+            } else {
+                failed.set(f.item.id, this.formatError(f.error));
+                // HubSpot does not document what a missing/merged/colliding contact id
+                // returns, so log the raw shape: it is how the real values get learned.
+                const e = f.error as any;
+                console.warn(
+                    `[HubspotAdapter] stored-id update of contact ${f.item.id} not classified as gone: ` +
+                    `status=${e?.response?.status ?? 'none'} categories=${
+                        JSON.stringify((Array.isArray(e?.response?.data?.errors) ? e.response.data.errors : []).map((x: any) => x?.category ?? null))}`,
+                );
+            }
+        }
+        return { updated, failed, gone };
     }
 
     /**
@@ -1239,7 +1398,7 @@ export class HubspotAdapter implements CrmAdapter {
             }
 
             if (pageLeadData.length > 0) {
-                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData);
+                const batchResult = await crmDb.batchCreateLeads(listId, pageLeadData, { origin: 'integration' });
                 result.successCount += batchResult.successCount;
                 result.newCount += batchResult.newCount;
                 result.updatedCount += batchResult.mergedCount;

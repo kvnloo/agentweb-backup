@@ -1561,6 +1561,22 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(flagWrite).toBeUndefined();
     });
 
+    // ENG-2493: a schedule created with email_notifications: [] persists emailOptOut;
+    // the owner fallback must not resurrect the address they declined.
+    it('sends no run-failed email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          emailNotifications: [], emailOptOut: true } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+    });
+
     it('alerts on each exhausted failing slot (no persisted dedup state to diverge)', async () => {
       // No "already alerted" flag is persisted, so there is no state to get out of sync
       // with delivery — every exhausted run notifies (a stale flag value is ignored).
@@ -2122,6 +2138,36 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
+    it('rejects a manual test run with 503 before any claim when the instance is draining (ENG-1805)', async () => {
+      const instanceState = require('../utils/instanceState');
+      const spy = jest.spyOn(instanceState, 'isCronEnabled').mockReturnValue(false);
+      try {
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {},
+        } as unknown as Request;
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.testScheduledChat(mockReq, mockRes);
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        expect(mockRes.status).toHaveBeenCalledWith(503);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({ error: expect.stringMatching(/draining/i) })
+        );
+        // Rejected before claim: no session, no worker dispatch, no failure record.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(mockScheduleDb.addRunResult).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it('should send notification email when sendNotificationEmail is true and schedule has email notifications', async () => {
       const scheduleWithEmails = {
         ...baseSchedule,
@@ -2415,7 +2461,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           variableRequestExpiresAt: expect.any(String),
         })
       );
-      expect(nextRunTime - variableRequestExpiresAt).toBe(30 * 60 * 1000);
+      // ENG-1379: link is retained across suppressed runs, so it must outlive the next run.
+      expect(variableRequestExpiresAt - nextRunTime).toBe(60 * 60 * 1000);
       expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
         mockScheduleId,
         expect.objectContaining({
@@ -2511,6 +2558,104 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect.any(String)
       );
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    // ENG-1379 AC1: an outstanding, unconsumed request from the last week must not re-email daily.
+    it('ENG-1379: skips the run but does not re-email while a recent unconsumed request is outstanding', async () => {
+      const sentAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.results[0]).toEqual(expect.objectContaining({
+        status: 'waiting_for_variables',
+        reminderSuppressed: true,
+        missingVariables: ['company_name'],
+      }));
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).not.toHaveBeenCalled();
+      const update = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(c => c[0] === mockScheduleId)[1];
+      // Token preserved (link in the earlier email keeps working), only expiry extended.
+      expect(update.variableRequestAccessTokenHash).toBeUndefined();
+      expect(update.variableRequestSentAt).toBeUndefined();
+      expect(update.variableRequestAccessTokenExpiresAt).toBe(response.results[0].variableRequestExpiresAt);
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    // ENG-1379 AC2: weekly reminder once the window elapses.
+    it('ENG-1379: re-sends the request once the reminder window has elapsed', async () => {
+      const sentAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledTimes(1);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(mockScheduleId, expect.objectContaining({
+        variableRequestStatus: 'pending',
+        variableRequestAccessTokenHash: expect.any(String),
+      }));
+    });
+
+    // ENG-1379 (CodeRabbit): a failed delivery must not suppress the next reminder.
+    it('ENG-1379: drops the token when the request email fails so the next run re-sends', async () => {
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        emailNotifications: ['notify@example.com'],
+      }] as any);
+      (mockEmailService.sendScheduledChatVariableRequestEmail as jest.Mock).mockRejectedValueOnce(new Error('ses down'));
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const updates = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.filter(c => c[0] === mockScheduleId).map(c => c[1]);
+      expect(updates[updates.length - 1]).toEqual(expect.objectContaining({ variableRequestAccessTokenHash: '' }));
+    });
+
+    // ENG-1379 (CodeRabbit): the retained link must outlive the next due run.
+    it('ENG-1379: link expiry extends past the next run so a retained link never lapses first', async () => {
+      const sentAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([{
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        variableRequestStatus: 'pending',
+        variableRequestSentAt: sentAt,
+        variableRequestAccessTokenHash: 'existing-hash',
+        variableRequestAccessTokenConsumedAt: '',
+      }] as any);
+      const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.runScheduledChats({} as Request, mockRes);
+
+      const r = (mockRes.json as jest.Mock).mock.calls[0][0].results[0];
+      expect(new Date(r.variableRequestExpiresAt).getTime()).toBeGreaterThan(new Date(r.nextRunTime).getTime());
     });
 
     it('should default to max 5 concurrent runs when MAX_CONCURRENT_RUNS is not set', async () => {
@@ -3885,7 +4030,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // see agentModeController.scheduledChatConsentShape.test.ts for why.
       autopublishAuthorized: s.autopublishAuthorized === true,
       // ENG-1131 adds lastRunBlockedBy (why the last run could not source), null here.
-      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null },
+      // ENG-2234 adds missedRuns/lastMissedRunReason; these fixtures carry stale
+      // January nextRunTimes, so the overdue count depends on wall-clock time and
+      // is asserted in agentModeController.missedRuns.test.ts instead.
+      runHealth: expect.objectContaining({
+        lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null,
+        missedRuns: expect.any(Number),
+      }),
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
@@ -4037,6 +4188,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Should only return scheduled_chat type
       expect(mockRes.json).toHaveBeenCalledWith([withHealth(scheduledChat)]);
     });
+
+    // ENG-1611: opt-in bounded pagination for large (admin client_id-scoped) accounts.
+    describe('pagination (ENG-1611)', () => {
+      const schedules = Array.from({ length: 250 }, (_, i) => ({
+        scheduleId: `s-${i}`,
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: new Date(Date.UTC(2026, 0, 1) + i * 60_000).toISOString(),
+      }));
+      const run = async (query: any) => {
+        mockScheduleDb.getSchedulesByUserId.mockResolvedValue([...schedules]);
+        const mockRes = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+        await agentModeController.getScheduledChats({ user: { userId: mockUserId }, query } as unknown as Request, mockRes);
+        return mockRes as any;
+      };
+
+      it('keeps the legacy bare array when no limit/cursor is passed', async () => {
+        const res = await run({});
+        expect(Array.isArray(res.json.mock.calls[0][0])).toBe(true);
+        expect(res.json.mock.calls[0][0]).toHaveLength(250);
+      });
+
+      it('walks every item newest-first in capped pages and terminates', async () => {
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const res = await run({ limit: '1000', ...(cursor ? { cursor } : {}) });
+          const body = res.json.mock.calls[0][0];
+          expect(body.items.length).toBeLessThanOrEqual(100);
+          seen.push(...body.items.map((s: any) => s.scheduleId));
+          cursor = body.nextCursor ?? undefined;
+          pages++;
+        } while (cursor && pages < 10);
+        expect(pages).toBe(3);
+        expect(seen).toHaveLength(250);
+        expect(seen[0]).toBe('s-249');
+        expect(seen[249]).toBe('s-0');
+      });
+
+      it('rejects a malformed cursor with 400', async () => {
+        const res = await run({ cursor: '%%%' });
+        expect(res.status).toHaveBeenCalledWith(400);
+      });
+    });
   });
 
   describe('subscription wildcard handling', () => {
@@ -4185,6 +4381,28 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         scheduleNoEmails.scheduleId,
         expect.objectContaining({ allowed: false })
       );
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('sends no usage-limit or disallowed-tool email to the owner when the schedule opted out (ENG-2493)', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false, warning: false, used: 1050000, allowance: 1000000, percentUsed: 105,
+        effectiveAllowance: 1000000, bonus: 0, month: '2026-04', costUsed: 0, costAllowance: null,
+        costPercentUsed: 0, costEnforced: false,
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
+      });
+      await runScheduledChat(
+        { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).not.toHaveBeenCalled();
+
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce([]);
+      await runScheduledChat(
+        { ...baseSchedule, emailNotifications: [], emailOptOut: true } as any,
+        mockUserId, true,
+      );
+      expect(mockEmailService.sendScheduledChatErrorEmail).not.toHaveBeenCalled();
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
@@ -4721,6 +4939,20 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       });
 
       await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('sends no sourcing-block email to the owner when the schedule opted out of email (ENG-2493)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      const optedOut = { ...baseSchedule, emailNotifications: [], emailOptOut: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...optedOut,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(optedOut, mockUserId, false);
 
       expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });

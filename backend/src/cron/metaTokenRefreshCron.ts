@@ -31,6 +31,7 @@ import { ensureFreshMetaAdAccountToken, needsMetaRefresh, isMetaAdAccount } from
 import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
 import { reconcilePendingConversionsForUser } from '../services/metaConversionReconcile';
 import { isEvaluationUser } from '../services/evaluationPolicy';
+import { raiseMetaConnectionHandoff } from '../services/metaConnectionHandoff';
 
 const TAG = '[metaTokenRefreshCron]';
 
@@ -50,6 +51,8 @@ export interface MetaTokenRefreshCronSummary {
   pendingConversionsDispatched: number;
   /** Accounts whose Ads permission came back, un-refusing them. */
   adsScopeRecovered: number;
+  /** ENG-1986: failed refreshes escalated as an actionable oncall handoff this sweep. */
+  handoffsRaised: number;
 }
 
 /**
@@ -66,6 +69,7 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
     failed: 0,
     adsScopeRevoked: 0,
     adsScopeRecovered: 0,
+    handoffsRaised: 0,
     adsScopeSuspected: 0,
     pendingConversionsFound: 0,
     pendingConversionsDispatched: 0,
@@ -122,6 +126,15 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
           summary.refreshed++;
         } else if (result.attempted) {
           summary.failed++;
+          // ENG-1986: a failed refresh used to leave only a console.warn. Make it a handoff.
+          const raised = await raiseMetaConnectionHandoff({
+            reason: 'refresh_failed',
+            userId: user.userId,
+            customerEmail: (user as any).email,
+            account,
+            error: result.error || 'unknown error',
+          });
+          if (raised) summary.handoffsRaised++;
         }
       } catch (error) {
         // ensureFreshMetaAdAccountToken does not throw, but guard anyway.
@@ -149,7 +162,7 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
 
   console.log(
     `${TAG} Run complete — users=${summary.scannedUsers} metaAccounts=${summary.metaAccounts} ` +
-      `due=${summary.dueForRefresh} refreshed=${summary.refreshed} failed=${summary.failed} ` +
+      `due=${summary.dueForRefresh} refreshed=${summary.refreshed} failed=${summary.failed} handoffs=${summary.handoffsRaised} ` +
       `adsScopeRevoked=${summary.adsScopeRevoked} adsScopeRecovered=${summary.adsScopeRecovered} ` +
       `adsScopeSuspected=${summary.adsScopeSuspected} ` +
       `owedConversions=${summary.pendingConversionsFound} ` +

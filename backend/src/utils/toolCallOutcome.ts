@@ -47,7 +47,23 @@ export function toolCallSucceeded(toolCall: any): boolean {
   if (!toolCall || typeof toolCall !== 'object') return false;
   if ('error' in toolCall) return false;
   if (toolCall.result?.success === false) return false;
-  return !toolCallNeverExecuted(toolCall);
+  if (toolCallNeverExecuted(toolCall)) return false;
+  // ENG-1005: these names also return successful draft/account-selection previews.
+  // Only a confirmed publication may back a publish claim or satisfy a schedule.
+  if (toolCall.name === 'emma_publish_social_post' || toolCall.name === 'emma_publish_blog_post') {
+    try {
+      const args = typeof toolCall.arguments === 'string' ? JSON.parse(toolCall.arguments) : toolCall.arguments;
+      if (args?.publish !== true) return false;
+      let result = typeof toolCall.result === 'string' ? JSON.parse(toolCall.result) : toolCall.result;
+      if (result?.isError === true) return false;
+      if (Array.isArray(result?.content)) {
+        if (result.content.length !== 1 || result.content[0]?.type !== 'text' || typeof result.content[0]?.text !== 'string') return false;
+        result = JSON.parse(result.content[0].text);
+      }
+      return result?.published === true && result?.success !== false && result?.blocked !== true && result?.deferred !== true;
+    } catch { return false; }
+  }
+  return true;
 }
 
 /**

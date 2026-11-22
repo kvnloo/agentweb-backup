@@ -248,7 +248,10 @@ export async function uploadFileToS3(
     // Sanitize filename for S3 key (ASCII-only, safe chars)
     const sanitizedFilename = normalizedFilename
       .replace(/[^a-zA-Z0-9.-]/g, '_')
-      .replace(/\s+/g, '_');
+      .replace(/\s+/g, '_')
+      // ENG-2408: '.'/'..' (or empty) would yield a dot-segment key that the
+      // character route's own-prefix check rightly rejects.
+      .replace(/^\.{0,2}$/, 'file');
 
     // S3 object metadata values must be US-ASCII. Prepare a safe metadata value.
     const asciiMetadataFilename = normalizedFilename

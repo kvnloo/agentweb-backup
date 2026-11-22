@@ -188,6 +188,28 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockCrmDb.getLeadListById).toHaveBeenCalledWith(listId);
     });
 
+    // ENG-425: export path gets the full row in one call; default stays compact.
+    it('returns full export fields only when includeAllFields is set', async () => {
+      const fullLead = { ...mockLead, notes: 'met at expo', linkedin: 'https://linkedin.com/in/j', customFields: { tier: 'gold' }, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-02-01T00:00:00Z' };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [fullLead], lastEvaluatedKey: undefined } as any);
+
+      const compact = await service.getLeads(listId, userId, {});
+      expect(compact.leads[0]).not.toHaveProperty('customFields');
+      expect(compact.leads[0]).not.toHaveProperty('notes');
+
+      const full = await service.getLeads(listId, userId, { includeAllFields: true });
+      expect(full.leads[0]).toMatchObject({
+        email: 'john@acme.com',
+        notes: 'met at expo',
+        linkedin: 'https://linkedin.com/in/j',
+        customFields: { tier: 'gold' },
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-02-01T00:00:00Z',
+      });
+      expect(mockCrmDb.getLeadById).not.toHaveBeenCalled();
+    });
+
     it('should filter by text search', async () => {
       const noMatchLead = { ...mockLead, leadId: 'lead-2', email: 'jane@other.com', firstName: 'Jane', lastName: 'Smith', company: 'Other Inc', title: 'Designer', customFields: {} };
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
@@ -555,10 +577,10 @@ describe('AgentModeService - CRM Tools', () => {
       expect(notEmptyResult.leads[0].leadId).toBe(leadId);
     });
 
-    it('should return error when no filters provided', async () => {
+    it('should return error when no filters, search, or list scope provided (ENG-2360)', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
 
-      const result = await service.searchLeads(listId, [], userId);
+      const result = await service.searchLeads(undefined as any, [], userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('filter');

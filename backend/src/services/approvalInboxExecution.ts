@@ -116,7 +116,7 @@ export async function resumeOriginSession(sessionId: string, messageContent: str
     return;
   }
 
-  if (!tryClaimSessionGeneration(sessionId)) {
+  if (!tryClaimSessionGeneration(sessionId, session.userId)) {
     console.warn(`[approval-inbox-execution] session ${sessionId} already generating — recording a passive note instead of actively resuming.`);
     await recordPassiveSessionNote(sessionId, messageContent);
     return;

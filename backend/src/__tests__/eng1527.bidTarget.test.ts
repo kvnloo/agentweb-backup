@@ -32,6 +32,13 @@ function svc(): any {
   const s = new GoogleAdsService() as any;
   s.getAccountCredentials = jest.fn().mockResolvedValue({ accessToken: 't', loginCustomerId: undefined });
   s.mutate = mutate;
+  // ENG-592: updateCampaign now reads the campaign back. Echo the last write so these
+  // payload-level tests keep asserting on the mutate request only.
+  s.search = jest.fn(async () => {
+    const u = lastUpdate();
+    const type = Object.keys(u).find((k) => /^(maximize|target|manual)/.test(k));
+    return [{ campaign: { ...u, biddingStrategyType: type && type.replace(/([A-Z])/g, '_$1').toUpperCase() } }];
+  });
   return s;
 }
 

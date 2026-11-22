@@ -66,7 +66,7 @@ export async function runActivationAnalysis() {
             }
             // Map back to the format crmDb expects for leads
             const leadsToUpdate = metrics.map(m => ({ email: m.email, customFields: m.customFields }));
-            const crmResult = await crmDb.batchCreateLeads(parsed.listId, leadsToUpdate);
+            const crmResult = await crmDb.batchCreateLeads(parsed.listId, leadsToUpdate, { origin: 'integration' });
             console.log(`[ActivationCron] CRM Update complete: ${crmResult.mergedCount} merged, ${crmResult.newCount} new, ${crmResult.errorCount} errors`);
         } else {
             console.log("[ActivationCron] CRM Sync disabled or no list ID configured for users.");

@@ -175,6 +175,14 @@ export interface UpdateSequenceInput {
   status?: SequenceStatus;
 }
 
+/** ENG-964: optional atomic preconditions for updateSequence. */
+export interface SequenceWriteGuard {
+  /** Write only if the stored updatedAt still equals this value. */
+  expectedUpdatedAt?: string;
+  /** Write only if the stored status is not this value. */
+  requireStatusNot?: SequenceStatus;
+}
+
 export interface SequenceEnrollment {
   enrollmentId: string;
   sequenceId: string;
@@ -297,6 +305,7 @@ async function updateSequence(
   sequenceId: string,
   userId: string,
   input: UpdateSequenceInput,
+  guard: SequenceWriteGuard = {},
 ): Promise<DripSequence> {
   const existing = await getSequence(sequenceId);
   if (!existing) throw new SequenceNotFoundError(sequenceId);
@@ -355,15 +364,37 @@ async function updateSequence(
   if (setExpressions.length > 0) updateExpression += `SET ${setExpressions.join(', ')}`;
   if (removeExpressions.length > 0) updateExpression += ` REMOVE ${removeExpressions.join(', ')}`;
 
-  const result = await dynamodb.update({
-    TableName: SEQUENCES_TABLE,
-    Key: { sequenceId },
-    UpdateExpression: updateExpression.trim(),
-    ExpressionAttributeNames: names,
-    ...(Object.keys(values).length > 0 ? { ExpressionAttributeValues: values } : {}),
-    ConditionExpression: 'attribute_exists(sequenceId)',
-    ReturnValues: 'ALL_NEW',
-  }).promise();
+  // ENG-964: optional optimistic-concurrency guard, evaluated atomically with the write so a
+  // concurrent edit cannot slip between a caller's read and this update.
+  const conditions = ['attribute_exists(sequenceId)'];
+  if (guard.expectedUpdatedAt !== undefined) {
+    names['#gUpdatedAt'] = 'updatedAt';
+    values[':gUpdatedAt'] = guard.expectedUpdatedAt;
+    conditions.push('#gUpdatedAt = :gUpdatedAt');
+  }
+  if (guard.requireStatusNot !== undefined) {
+    names['#gStatus'] = 'status';
+    values[':gStatusNot'] = guard.requireStatusNot;
+    conditions.push('#gStatus <> :gStatusNot');
+  }
+
+  let result;
+  try {
+    result = await dynamodb.update({
+      TableName: SEQUENCES_TABLE,
+      Key: { sequenceId },
+      UpdateExpression: updateExpression.trim(),
+      ExpressionAttributeNames: names,
+      ...(Object.keys(values).length > 0 ? { ExpressionAttributeValues: values } : {}),
+      ConditionExpression: conditions.join(' AND '),
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+  } catch (err: any) {
+    if (err?.code === 'ConditionalCheckFailedException' && conditions.length > 1) {
+      throw new SequenceConflictError(sequenceId);
+    }
+    throw err;
+  }
 
   return result.Attributes as DripSequence;
 }
@@ -840,6 +871,13 @@ export class SequenceNotFoundError extends Error {
   constructor(sequenceId: string) {
     super(`Sequence ${sequenceId} not found`);
     this.name = 'SequenceNotFoundError';
+  }
+}
+
+export class SequenceConflictError extends Error {
+  constructor(sequenceId: string) {
+    super(`Sequence ${sequenceId} changed since it was read`);
+    this.name = 'SequenceConflictError';
   }
 }
 

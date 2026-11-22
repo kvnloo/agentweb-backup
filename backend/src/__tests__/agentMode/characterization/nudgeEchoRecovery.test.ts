@@ -140,7 +140,7 @@ describe('ENG-1188 — the real loop never delivers an echoed system nudge as an
         const messages = args[1] || [];
         const isFinalSynthesis = messages.some(
           (m: any) =>
-            m?.role === 'user' &&
+            m?.role === 'system' &&  // Opslane 2026-10-13: budget nudges are system-role
             typeof m.content === 'string' &&
             /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
         );

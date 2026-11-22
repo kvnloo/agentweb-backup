@@ -554,7 +554,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
             source: 'api',
             forwardedAt: expect.any(String),
           }),
-        })
+        }), 'form_fill'
       );
 
       expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalledWith(
@@ -778,7 +778,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
             forwardedAt: expect.any(String),
             campaign: 'spring2024',
           }),
-        })
+        }), 'form_fill'
       );
     });
 
@@ -1223,7 +1223,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
             lastTouch: expect.objectContaining({
               utm: expect.objectContaining({ source: 'linkedin' }),
             }),
-          })
+          }), 'form_fill'
         );
       });
 
@@ -1247,7 +1247,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
             firstTouch: expect.objectContaining({
               utm: expect.objectContaining({ source: 'google', medium: 'cpc' }),
             }),
-          })
+          }), 'form_fill'
         );
       });
 

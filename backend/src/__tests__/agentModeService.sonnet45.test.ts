@@ -1,6 +1,14 @@
 import { AgentModeService } from '../services/agentModeService';
 import { getSecret } from '../utils/secretsManager';
 
+// Catalog snapshots may change precision, version and date on every refresh.
+function expectSourcedQuality(model: { qualityScore?: number; qualityScoreSource?: string }) {
+  expect(Number.isFinite(model.qualityScore)).toBe(true);
+  expect(model.qualityScore).toBeGreaterThanOrEqual(0);
+  expect(model.qualityScore).toBeLessThanOrEqual(100);
+  expect(model.qualityScoreSource).toMatch(/Artificial Analysis.*snapshot \d{4}-\d{2}-\d{2}, .+/);
+}
+
 // Mock the dependencies
 jest.mock('../services/db', () => ({
   getSession: jest.fn(),
@@ -78,19 +86,27 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-sonnet-4-6');
     });
 
-    it('should include Claude Opus 4.6 in the supported models for admins', async () => {
-      const models = await agentModeService.getSupportedModels(true);
+    // Every user and admin selects from the same catalog: Opus 4.6 was the last adminOnly model.
+    it.each([true, false])('includes Claude Opus 4.6 in the supported models (isAdmin=%s)', async (isAdmin) => {
+      const models = await agentModeService.getSupportedModels(isAdmin);
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 in the supported models for non-admins', async () => {
-      const models = await agentModeService.getSupportedModels(false);
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('includes Claude Opus 4.6 by default (no admin flag)', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 by default (non-admin)', async () => {
-      const models = await agentModeService.getSupportedModels();
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('no model is gated by name: adminOnly is only ever on unreviewed auto-added entries', () => {
+      const entries = Object.entries((agentModeService as any).llmModels) as [string, any][];
+      const gated = entries.filter(([, m]) => m.adminOnly === true);
+      for (const [id, m] of gated) {
+        expect({ id, description: String(m.description).startsWith('Auto-added') }).toEqual({ id, description: true });
+      }
+      expect(entries.find(([id]) => id === 'anthropic.claude-opus-4-6-v1')?.[1].adminOnly).not.toBe(true);
+      for (const [id, m] of entries.filter(([id]) => id.includes('opus'))) {
+        expect({ id, adminOnly: m.adminOnly === true }).toEqual({ id, adminOnly: false });
+      }
     });
 
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
@@ -199,11 +215,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
           expect(info.tier).toBe('ultra_premium');
         });
 
-        it('reports the AA Intelligence Index v4.3.2 quality score (58, #1)', async () => {
+        it('reports an in-range, snapshot-sourced AA Intelligence Index quality score', async () => {
           const models = await agentModeService.getSupportedModelsWithMetadata(false);
           const info = models.find((m) => m.id === OPUS_5_5)!;
-          expect(info.qualityScore).toBe(58);
-          expect(info.qualityScoreSource).toBe('Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort');
+          expectSourcedQuality(info);
         });
 
         it('Opus 5.5 supersedes Opus 5: same cost band, higher quality, so dominance flags Opus 5 legacy', async () => {
@@ -258,7 +273,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('AC #6 — leaves the live voice model untouched', () => {
         const live = (agentModeService as any).llmModels['gemini-3.1-flash-live-preview'];
-        expect(live).toEqual({ client: null, supportsTemperature: false, isLive: true });
+        expect(live).toMatchObject({ client: null, supportsTemperature: false, isLive: true });
       });
     });
 
@@ -364,16 +379,16 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * 2026-08-19 — every OpenRouter entry opened to everyone. Harsha: "i'm
      * fine to include open source / open router stuff for all users not
      * just isadmin." Was `adminOnly: true` on each (gated as
-     * unproven-in-our-stack); removed. Does NOT touch adminOnly gates
-     * elsewhere in the registry that exist for unrelated reasons (e.g.
-     * anthropic.claude-opus-4-6-v1, still Bedrock-Claude-tier-gated).
+     * unproven-in-our-stack); removed. Opus 4.6 (formerly kept adminOnly as
+     * "Bedrock-Claude-tier-gated") was opened afterwards: every user and admin
+     * selects from one catalog.
      */
     describe('2026-08-19 — OpenRouter models opened to everyone (no longer adminOnly)', () => {
       const OPENROUTER_IDS = [
         'openrouter/x-ai/grok-4.6',
         'openrouter/deepseek/deepseek-v4-pro',
         'openrouter/deepseek/deepseek-v4-flash',
-        'openrouter/qwen/qwen3.8-max',
+        'openrouter/qwen/qwen3.8-max-0902',
         'openrouter/mistralai/mistral-small-2603',
         'openrouter/moonshotai/kimi-k3',
         'openrouter/moonshotai/kimi-k2.7-code',
@@ -394,8 +409,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(models).toContain(id);
       });
 
-      it('does NOT touch an adminOnly gate that exists for a non-OpenRouter reason', () => {
-        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBe(true);
+      it('Opus 4.6, the last adminOnly model, is open to everyone too', () => {
+        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBeUndefined();
       });
     });
 
@@ -413,89 +428,86 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * live there at all).
      */
     describe('2026-08-19 — quality/cost meter scores', () => {
-      // 2026-09-22: AA Intelligence Index v4.3.2, read live off each model's
-      // artificialanalysis.ai page. Canonical variants, not runtime effort settings.
-      const AA_V42: [string, number, string][] = [
-        ['openrouter/anthropic/claude-opus-5.5', 58, 'Claude Opus 5.5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/anthropic/claude-fable-5.1', 53, 'Claude Fable 5.1, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-astra', 53, 'GPT-6 Astra, max'],
-        ['anthropic.claude-opus-5', 51, 'Claude Opus 5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-sol', 48, 'GPT-6 Sol, max'],
-        ['openrouter/openai/gpt-5.6-sol', 47, 'GPT-5.6 Sol, max'],
-        ['openrouter/x-ai/grok-4.7', 46, 'Grok 4.7, xhigh'],
-        ['openrouter/x-ai/grok-4.6', 44, 'Grok 4.6, high'],
-        ['openrouter/moonshotai/kimi-k3', 44, 'Kimi K3, max'],
-        ['openrouter/openai/gpt-5.6-terra', 42, 'GPT-5.6 Terra, max'],
-        ['anthropic.claude-opus-4-8', 42, 'Claude Opus 4.8, Adaptive Reasoning, Max Effort'],
-        ['gemini-3.8-flash', 41, 'Gemini 3.8 Flash, high'],
-        ['openrouter/qwen/qwen3.8-max', 40, 'Qwen3.8 Max, reasoning'],
-        ['gpt-5.4', 39, 'GPT-5.4, xhigh'],
-        ['gemini-3.7-flash', 39, 'Gemini 3.7 Flash, high'],
-        ['gpt-5.5', 38, 'GPT-5.5, xhigh'],
-        ['openrouter/openai/gpt-5.6-luna', 38, 'GPT-5.6 Luna, max'],
-        ['anthropic.claude-sonnet-5', 38, 'Claude Sonnet 5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-luna', 37, 'GPT-6 Luna, max'],
-        ['openrouter/deepseek/deepseek-v4-pro', 36, 'DeepSeek V4 Pro 0813, Reasoning, Max Effort'],
-        ['openrouter/deepseek/deepseek-v4-flash', 35, 'DeepSeek V4 Flash 0731, Reasoning, Max Effort'],
-        ['openrouter/qwen/qwen3.8-27b', 34, 'Qwen3.8 27B, xhigh'],
-        ['openrouter/z-ai/glm-5.2', 34, 'GLM 5.2, max'],
-        ['gemini-3.5-flash', 33, 'Gemini 3.5 Flash'],
-        ['gemini-3.1-pro-preview', 30, 'Gemini 3.1 Pro Preview, reasoning'],
-        ['anthropic.claude-sonnet-4-6', 30, 'Claude Sonnet 4.6, Adaptive Reasoning, Max Effort'],
-        ['openrouter/moonshotai/kimi-k2.7-code', 26, 'Kimi K2.7 Code, reasoning'],
-        ['anthropic.claude-opus-4-6-v1', 26, 'Claude Opus 4.6, Non-reasoning, High Effort'],
-        ['gpt-5.4-nano', 21, 'GPT-5.4 Nano, xhigh'],
-        ['anthropic.claude-sonnet-4-5-20250929-v1:0', 19, 'Claude Sonnet 4.5, Non-reasoning'],
-        ['gemini-3-flash-preview', 18, 'Gemini 3 Flash Preview, Non-reasoning'],
-        ['gemini-3.1-flash-lite', 16, 'Gemini 3.1 Flash Lite'],
-        ['openrouter/z-ai/glm-4.7-flash', 15, 'GLM 4.7 Flash, reasoning'],
-        ['anthropic.claude-haiku-4-5-20251001-v1:0', 15, 'Claude Haiku 4.5, Non-reasoning'],
-        ['openrouter/mistralai/mistral-small-2603', 11, 'Mistral Small 4, reasoning'],
-        ['openrouter/openai/gpt-4o-mini', 7, 'GPT-4o Mini, non-reasoning'],
+      // Keep coverage of the established catalog while allowing refreshed scores
+      // and newly added rows. Every scored row is checked below as well.
+      const SCORED_IDS = [
+        'openrouter/anthropic/claude-opus-5.5',
+        'openrouter/anthropic/claude-fable-5.1',
+        'openrouter/openai/gpt-6-astra',
+        'anthropic.claude-opus-5',
+        'openrouter/openai/gpt-6-sol',
+        'openrouter/openai/gpt-5.6-sol',
+        'openrouter/x-ai/grok-4.7',
+        'openrouter/x-ai/grok-4.6',
+        'openrouter/moonshotai/kimi-k3',
+        'openrouter/openai/gpt-5.6-terra',
+        'anthropic.claude-opus-4-8',
+        'gemini-3.8-flash',
+        'openrouter/qwen/qwen3.8-max-0902',
+        'gpt-5.4',
+        'gemini-3.7-flash',
+        'gpt-5.5',
+        'openrouter/openai/gpt-5.6-luna',
+        'anthropic.claude-sonnet-5',
+        'openrouter/openai/gpt-6-luna',
+        'openrouter/deepseek/deepseek-v4-pro',
+        'openrouter/deepseek/deepseek-v4-flash',
+        'openrouter/qwen/qwen3.8-27b',
+        'openrouter/z-ai/glm-5.2',
+        'gemini-3.5-flash',
+        'gemini-3.1-pro-preview',
+        'anthropic.claude-sonnet-4-6',
+        'openrouter/moonshotai/kimi-k2.7-code',
+        'anthropic.claude-opus-4-6-v1',
+        'gpt-5.4-nano',
+        'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'gemini-3-flash-preview',
+        'gemini-3.1-flash-lite',
+        'openrouter/z-ai/glm-4.7-flash',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+        'openrouter/mistralai/mistral-small-2603',
+        'openrouter/openai/gpt-4o-mini',
       ];
-      const SCORED_IDS = AA_V42.map(([id]) => id);
 
-      it.each(AA_V42)('ENG-1786: %s reports its v4.3.2 score and canonical variant', async (id, score, variant) => {
+      it.each(SCORED_IDS)('ENG-1786: %s reports a sourced AA score without rounding it', async (id) => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const info = models.find((model) => model.id === id)!;
-        expect(info.qualityScore).toBe(score);
-        expect(info.qualityScoreSource).toBe(`Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, ${variant}`);
+        expectSourcedQuality(info);
+        const config = (agentModeService as any).llmModels[id];
+        expect(info.qualityScore).toBe(config.qualityScore);
+        expect(info.qualityScoreSource).toBe(config.qualityScoreSource);
       });
 
-      it('every scored registry row uses the v4.3.2 / 2026-09-22 snapshot', () => {
+      it('every scored registry row has an in-range AA score with a snapshot date', () => {
         const registry = (agentModeService as any).llmModels;
         const scoredIds = Object.keys(registry).filter((id) => typeof registry[id].qualityScore === 'number');
-        expect(scoredIds.sort()).toEqual([...SCORED_IDS].sort());
+        expect(scoredIds).toEqual(expect.arrayContaining(SCORED_IDS));
         for (const id of scoredIds) {
-          expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index v4\.3\.2, snapshot 2026-09-22, .+/);
+          expectSourcedQuality(registry[id]);
         }
       });
 
-      it('v4.3.2 order at the top: Opus 5.5 (58) > Fable 5.1 = Astra (53) > Opus 5 (51)', async () => {
+      it('keeps Opus 5.5 above Fable 5.1 and Astra, both above Opus 5 on quality', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const quality = (id: string) => models.find((model) => model.id === id)!.qualityScore!;
-        expect(quality('openrouter/anthropic/claude-opus-5.5')).toBe(58);
-        expect(quality('openrouter/anthropic/claude-fable-5.1')).toBe(53);
-        expect(quality('openrouter/openai/gpt-6-astra')).toBe(53);
-        expect(quality('anthropic.claude-opus-5')).toBe(51);
-        expect(models.filter((model) => model.qualityScore! > 53).map((model) => model.id))
-          .toEqual(['openrouter/anthropic/claude-opus-5.5']);
+        for (const id of ['openrouter/anthropic/claude-fable-5.1', 'openrouter/openai/gpt-6-astra']) {
+          expect(quality('openrouter/anthropic/claude-opus-5.5')).toBeGreaterThan(quality(id));
+          expect(quality(id)).toBeGreaterThan(quality('anthropic.claude-opus-5'));
+        }
       });
 
       it.each<[string | undefined, string[]]>([
         ['gpt5-chat', ['gpt-5.5']],
-        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini']],
+        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini', 'openrouter/openai/gpt-5.6-luna']],
         ['gemini-flash', ['gemini-3.5-flash', 'gemini-3.7-flash']],
         ['claude-opus', ['anthropic.claude-opus-5']],
-        ['claude-sonnet', []],
+        ['claude-sonnet', ['anthropic.claude-sonnet-5']],
         ['claude-fable', []],
-        // GPT-6 Sol ("Strong reasoning at half the price of GPT-5.6 Sol") was added
-        // alongside modelSupersession.ts's name-inferred product-line dominance —
-        // neither Sol variant carries an explicit `family`, but both infer to the
-        // same "sol" line, and GPT-6 Sol genuinely dominates (cheaper, equal-or-
-        // better quality). No longer an empty family-less bucket.
-        [undefined, ['openrouter/openai/gpt-5.6-sol']],
-      ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
+        // Refreshes now assign explicit product-line families. Admin-visible
+        // Sonnet 5.5 and GPT-6.1 Sol supersede their older same-line models;
+        // GPT-6 Luna's raw score now also exceeds GPT-5.6 Luna's.
+        ['gpt-sol', ['openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-6-sol']],
+      ])('ENG-1786: %s keeps its current same-family dominance-only legacy rows', async (family, expected) => {
         // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
         // Static legacy rows remain covered by the existing legacy tests.
         const registry = (agentModeService as any).llmModels;
@@ -512,7 +524,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(info).toBeDefined();
         expect(info!.qualityScore).toBeGreaterThanOrEqual(0);
         expect(info!.qualityScore).toBeLessThanOrEqual(100);
-        expect(Number.isInteger(info!.qualityScore)).toBe(true);
+        expect(Number.isFinite(info!.qualityScore)).toBe(true);
         expect(info!.qualityScoreSource).toEqual(expect.any(String));
         expect(info!.costScore).toBeGreaterThanOrEqual(0);
         expect(info!.costScore).toBeLessThanOrEqual(100);
@@ -520,29 +532,27 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(info!.costScoreSource).toEqual(expect.any(String));
       });
 
-      // Regression pins on a few real, hand-verified values — catches an
-      // accidental reshuffle without re-deriving the whole table in the
-      // assertion. qualityScore is AA Intelligence Index v4.2
-      // (snapshot 2026-09-05); costScore is computed from MODEL_PRICING.
-      it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
+      // Billing-derived cost values remain pinned; benchmark values may refresh.
+      // Check provenance/range rather than duplicating a volatile AA snapshot.
+      it('keeps Claude Opus 5 in the Flagship cost band with sourced quality', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
-        expect(info.qualityScore).toBe(51);
+        expectSourcedQuality(info);
         expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
         // 70 was the top of the old 64–70 "pro" band; ENG-1784 (2026-09-05)
         // re-cut Flagship to ≥64 precisely so Opus 5 sits with GPT-5.6 Sol.
         expect(info.tier).toBe('ultra_premium');
       });
 
-      it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
+      it('keeps GPT-4o Mini in the very cheap cost band with sourced quality', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
-        expect(info.qualityScore).toBe(7);
+        expectSourcedQuality(info);
         expect(info.costScore).toBe(22);
         expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
       });
 
-      it('does not lower a legacy model\'s quality score merely for being legacy', () => {
+      it('does not lower a legacy model\'s quality score merely for being legacy', async () => {
         // Claude Opus 4.8 (legacy: true) scores lower than Opus 5 because it
         // IS a weaker model per AA, not because `legacy` itself penalizes it —
         // Opus 4.6 (also legacy) is correctly lower still, tracking real
@@ -550,8 +560,13 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
         const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
         const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
-        expect(opus48.qualityScore).toBe(42);
-        expect(opus46.qualityScore).toBe(26);
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        for (const id of ['anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1']) {
+          const info = models.find((m) => m.id === id)!;
+          expect(info.legacy).toBe(true);
+          expect(info.qualityScore).toBe((agentModeService as any).llmModels[id].qualityScore);
+          expectSourcedQuality(info);
+        }
         expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
         expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
       });
@@ -618,9 +633,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         return models.find((m) => m.id === id)!.qualityTier;
       };
 
-      it('puts Claude Fable 5.1 and GPT-6 Astra in the Flagship quality tier', async () => {
+      it('puts Claude Fable 5.1 in Flagship and GPT-6 Astra below the 53 boundary in Pro', async () => {
         expect(await qualityTierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
-        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('pro');
       });
 
       it('puts Claude Opus 5 and GPT-5.6 Sol in the Pro quality tier', async () => {
@@ -633,11 +648,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(await qualityTierOf('openrouter/openai/gpt-5.6-terra')).toBe('medium');
       });
 
-      // On v4.3.2 GPT-5.6 Luna (38) ties Sonnet 5 (38); ties resolve to the
-      // higher band per Harsha 2026-09-06, so Luna is Medium now. Haiku stays Cheap.
-      it('puts Claude Haiku 4.5 in Cheap and GPT-5.6 Luna (tied with Sonnet 5) in Medium', async () => {
+      // Raw AA scores are not rounded before classification: Luna's 37.3
+      // is below Medium's 38 boundary, while Sonnet 5's 38.2 is above it.
+      it('puts Claude Haiku 4.5 and GPT-5.6 Luna below the 38 boundary in Cheap', async () => {
         expect(await qualityTierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
-        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('medium');
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('cheap');
       });
 
       // The quality axis is independent of the cost axis: Opus 5/Sol are
@@ -686,7 +701,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('carries a sourced Artificial Analysis quality score', () => {
         const config = (agentModeService as any).llmModels[ASTRA];
-        expect(config.qualityScore).toBe(53);
+        expectSourcedQuality(config);
         expect(config.qualityScoreSource).toMatch(/Artificial Analysis/);
       });
 
@@ -708,7 +723,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // Inferred Astra and Sol families remain distinct across generations.
       it('keeps Astra current while GPT-6 Sol supersedes GPT-5.6 Sol (AC3)', async () => {
         const config = (agentModeService as any).llmModels[ASTRA];
-        expect(config.family).toBeUndefined();
+        expect(config.family).toBe('gpt-astra');
+        expect(config.family).not.toBe((agentModeService as any).llmModels['openrouter/openai/gpt-6-sol'].family);
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         expect(models.find((m) => m.id === ASTRA)!.legacy).toBeUndefined();
         expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBe(true); // Cheaper GPT-6 Sol supersedes it.
@@ -1033,13 +1049,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
-    it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
+    // ENG-2028: flipped. The name-based Opus exclusion is gone; only the registry
+    // adminOnly flag filters, so non-admins now get the Opus anthropic models too.
+    it('should return only anthropic models (including opus) from getReportsModelOptions for non-admins', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions(false);
       expect(reportsModels.length).toBeGreaterThan(0);
       reportsModels.forEach(model => {
         expect(model).toMatch(/^anthropic\./);
-        expect(model).not.toContain('opus');
       });
+      expect(reportsModels).toContain('anthropic.claude-opus-5');
     });
 
     it('should include opus in getReportsModelOptions for admins', async () => {
@@ -1047,9 +1065,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include opus in getReportsModelOptions by default (non-admin)', async () => {
+    // ENG-2028: flipped (Opus 4.6 is no longer adminOnly; no name-based deny).
+    it('should include opus in getReportsModelOptions by default (non-admin)', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions();
-      expect(reportsModels).not.toContain('anthropic.claude-opus-4-6-v1');
+      expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
     it('should return only anthropic models from getReportsModelOptions', async () => {
@@ -1106,10 +1125,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const { settingsService } = require('../services/settingsService');
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
 
-      // Pin default_model to a known valid key — env var may point to a
-      // placeholder not in llmModels, which would make the ordering untestable.
+      // Pin the approved non-admin default, not the first registry key:
+      // auto-added admin-only models can now precede customer-visible entries.
+      // An env override may also point to a placeholder absent from llmModels.
       const originalDefault = (agentModeService as any).default_model;
-      const validDefault = Object.keys((agentModeService as any).llmModels)[0];
+      const validDefault = 'gemini-3.8-flash';
       (agentModeService as any).default_model = validDefault;
       try {
         const models = await agentModeService.getSupportedModels();
@@ -1125,9 +1145,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         settingValue: 'nonexistent-model-xyz',
       });
 
-      // Pin default_model to a known valid key — same reason as above.
+      // Pin the approved non-admin default — same reason as above.
       const originalDefault = (agentModeService as any).default_model;
-      const validDefault = Object.keys((agentModeService as any).llmModels)[0];
+      const validDefault = 'gemini-3.8-flash';
       (agentModeService as any).default_model = validDefault;
       try {
         const models = await agentModeService.getSupportedModels();

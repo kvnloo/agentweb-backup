@@ -67,6 +67,16 @@ export interface RecordUsageContext {
    */
   costUsdOverride?: number;
   /**
+   * ENG-2106: what the customer's OWN provider account was charged for this call, in
+   * USD, on a response OpenRouter flags as BYOK (`upstream_inference_cost`). Distinct
+   * from `costUsdOverride`, which on a non-BYOK response is AgentWeb's own cost: reading
+   * that as the customer's would book AgentWeb's money against their provider account.
+   * Read ONLY by recordLlmUsage's customer-funded branch, for the attempt journal; it is
+   * stripped before any AgentWeb metering rail sees the context and is never priced,
+   * summed or stored there.
+   */
+  upstreamCostUsd?: number;
+  /**
    * ENG-1934: where `costUsdOverride` came from, stamped on the spend event as
    * its rate version. Pass `LLM_PRICE_BOOK_PROVENANCE` when the override was
    * itself read from llmPricing (image/video generation prices). Omitted, an

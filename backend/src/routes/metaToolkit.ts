@@ -4,10 +4,12 @@
  * Mounts the ENG-2283 gateway so an external agent can list and call the ENG-2282 manifest:
  *   GET  /api/meta-toolkit/tools              -> manifest (bearer auth required)
  *   POST /api/meta-toolkit/tools/:name/call   -> handleMetaToolkitCall
- * Auth, account resolution, write guards and metering all live in the gateway; this file only
+ * Auth, account resolution, reads-only enforcement and metering all live in the gateway; this file only
  * maps HTTP <-> gateway and errors -> status codes. No new storage.
  */
 import { Router, type Request, type Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import {
   authenticateMetaToolkitCaller,
   handleMetaToolkitCall,
@@ -15,6 +17,7 @@ import {
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { rateLimiter } from '../middleware/rateLimiter';
+import { buildMcpAuthChallenge, getBackendUrl, META_TOOLKIT_MCP_RESOURCE_PATH } from '../mcp/oauth/authChallenge';
 
 /** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
 export const META_TOOLKIT_MAX_PER_MINUTE = 60;
@@ -40,6 +43,15 @@ router.use((req: Request, res: Response, next) => {
     return res.status(429).json({ error: 'Too many Meta Toolkit requests. Try again shortly.' });
   }
   return next();
+});
+
+/** ENG-2303 P5 — public agent guide for the toolkit (served from backend/docs, like /skill.md). */
+router.get('/skill.md', (_req: Request, res: Response) => {
+  try {
+    res.type('text/markdown').send(fs.readFileSync(path.join(__dirname, '../../docs/meta-toolkit-skill.md'), 'utf-8'));
+  } catch {
+    res.status(404).json({ error: 'Documentation not found' });
+  }
 });
 
 router.get('/tools', async (req: Request, res: Response) => {
@@ -70,7 +82,7 @@ router.post('/tools/:name/call', async (req: Request, res: Response) => {
 /**
  * ENG-2295 — stateless MCP (JSON-RPC 2.0) surface so an MCP client such as Claude can add the
  * toolkit as a remote server (`claude mcp add --transport http <base>/api/meta-toolkit/mcp`).
- * Same gateway as the REST routes above: auth, account resolution, write guards and metering are
+ * Same gateway as the REST routes above: auth, account resolution, reads-only enforcement and metering are
  * not re-implemented here. No session state, no storage.
  */
 export const META_TOOLKIT_MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -118,6 +130,10 @@ router.post('/mcp', async (req: Request, res: Response) => {
   try {
     switch (method) {
       case 'initialize':
+        // MCP authorization: the protected resource answers an unauthenticated initialize with
+        // 401 + an RFC 9728 challenge, which is what makes Claude Code / Codex open the browser
+        // OAuth login. Serving initialize anonymously left clients "connected" with no tools.
+        await authenticateMetaToolkitCaller(req.headers.authorization);
         return rpcResult(res, id, {
           protocolVersion:
             typeof params.protocolVersion === 'string' && META_TOOLKIT_MCP_SUPPORTED_VERSIONS.has(params.protocolVersion)
@@ -164,7 +180,16 @@ router.post('/mcp', async (req: Request, res: Response) => {
   } catch (error) {
     if (error instanceof MetaToolkitAuthError) {
       if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
-      if (error.status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+      if (error.status === 401) {
+        res.setHeader(
+          'WWW-Authenticate',
+          buildMcpAuthChallenge(
+            getBackendUrl(),
+            req.headers.authorization ? 'invalid_token' : undefined,
+            META_TOOLKIT_MCP_RESOURCE_PATH,
+          ),
+        );
+      }
       return rpcError(res, id, -32001, error.message, error.status);
     }
     console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);

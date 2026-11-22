@@ -11,8 +11,10 @@ export const EVT_MCP_OAUTH_TOKEN_ISSUED = 'mcp_oauth_token_issued';
 export const EVT_MCP_CONNECTION_ATTEMPTED = 'mcp_connection_attempted';
 export const EVT_MCP_TOOL_USED = 'mcp_tool_used';
 export const EVT_MCP_FIRST_TOOL_USED = 'mcp_first_tool_used';
+/** ENG-2303 P4: a Meta Toolkit write that was dispatched to Meta (the billable unit). */
+export const EVT_MCP_WRITE_EXECUTED = 'mcp_write_executed';
 
-export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'unknown';
+export type McpAuthMethod = 'api_key' | 'oauth' | 'internal_token' | 'zoma_token' | 'unknown';
 export type McpClientType =
   | 'claude_ai'
   | 'claude_code'
@@ -26,6 +28,8 @@ export type McpClientType =
 export interface McpUsageEventStore {
   put(item: DynamoAttributeMap, options?: { condition?: 'attribute_not_exists' }): Promise<void>;
   queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]>;
+  /** Range read on the existing (loopId, tsSession) key; ts-prefixed sort keys only. */
+  queryByLoopIdTsRange?(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]>;
 }
 
 export interface McpConnectionAttemptInput {
@@ -74,6 +78,22 @@ export interface McpToolUseInput {
   llmModel?: string;
   userAgent?: string;
   now?: Date;
+}
+
+export interface McpWriteExecutedInput extends McpToolUseInput {
+  entityType: string;
+  action: string;
+  /** Read-back verdict: CONFIRMED | MISMATCH | UNCONFIRMED. */
+  verification: string;
+  objectId?: string;
+}
+
+export interface McpUserUsage {
+  start: string;
+  end: string;
+  toolCalls: number;
+  writes: { total: number; confirmed: number; mismatch: number; unconfirmed: number };
+  recentWrites: Array<{ ts: string; entityType?: string; action?: string; verification?: string; objectId?: string }>;
 }
 
 export interface McpUsageReport {
@@ -136,6 +156,25 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
         ? { ConditionExpression: 'attribute_not_exists(loopId) AND attribute_not_exists(tsSession)' }
         : {}),
     } });
+  }
+
+  async queryByLoopIdTsRange(loopId: string, startIso: string, endIso: string, subjectId: string): Promise<DynamoAttributeMap[]> {
+    const items: DynamoAttributeMap[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.doc
+        .query({
+          TableName: LOOP_EVENTS_TABLE,
+          KeyConditionExpression: 'loopId = :loopId AND tsSession BETWEEN :start AND :end',
+          FilterExpression: 'subjectId = :subjectId',
+          ExpressionAttributeValues: { ':loopId': loopId, ':start': startIso, ':end': endIso, ':subjectId': subjectId },
+          ExclusiveStartKey: lastKey,
+        })
+        .promise();
+      items.push(...((result.Items ?? []) as DynamoAttributeMap[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return items;
   }
 
   async queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]> {
@@ -258,6 +297,71 @@ export async function recordMcpToolUse(
 
   await store.put(item);
   return true;
+}
+
+/**
+ * ENG-2303 P4: one event per Meta Toolkit write dispatched to Meta, distinct from
+ * `mcp_tool_used` (which still counts every call, previews included). Recorded only —
+ * no Stripe charge is made (price undecided). Same table and key shape as tool use.
+ */
+export async function recordMcpWriteExecuted(
+  input: McpWriteExecutedInput,
+  store: McpUsageEventStore = defaultStore,
+): Promise<boolean> {
+  if (!input.userId) return false;
+  const ts = (input.now ?? new Date()).toISOString();
+  const item = eventItem({
+    eventType: EVT_MCP_WRITE_EXECUTED,
+    subjectId: input.userId,
+    ts,
+    tsSession: `${ts}#${input.userId}#${EVT_MCP_WRITE_EXECUTED}#${Math.random().toString(36).slice(2, 10)}`,
+    dimensions: {
+      authMethod: input.authMethod ?? 'unknown',
+      apiKeyId: cleanString(input.apiKeyId),
+      clientId: cleanString(input.clientId),
+      clientType: input.clientType ?? classifyMcpClient(input),
+      sessionId: cleanString(input.sessionId),
+      toolName: input.toolName,
+      userAgent: cleanString(input.userAgent),
+      entityType: input.entityType,
+      action: input.action,
+      verification: input.verification,
+      objectId: cleanString(input.objectId),
+    },
+  });
+  await store.put(item);
+  return true;
+}
+
+/** Per-user usage for [start, end): tool calls and dispatched writes by read-back verdict. */
+export async function getMcpUserUsage(
+  userId: string,
+  params: { start: string; end: string },
+  store: McpUsageEventStore = defaultStore,
+): Promise<McpUserUsage> {
+  const rows = store.queryByLoopIdTsRange
+    ? await store.queryByLoopIdTsRange(EMMA_MCP_LOOP_ID, params.start, params.end, userId)
+    : await store.queryByLoopId(EMMA_MCP_LOOP_ID);
+  const startMs = Date.parse(params.start);
+  const endMs = Date.parse(params.end);
+  const events = rows
+    .map(parseEventRow)
+    .filter((e): e is ParsedMcpEvent => !!e && e.subjectId === userId && e.ts.getTime() >= startMs && e.ts.getTime() < endMs);
+  const writes = events.filter((e) => e.eventType === EVT_MCP_WRITE_EXECUTED).sort((a, b) => a.ts.getTime() - b.ts.getTime());
+  const count = (v: string) => writes.filter((w) => w.dimensions.verification === v).length;
+  return {
+    start: params.start,
+    end: params.end,
+    toolCalls: events.filter((e) => e.eventType === EVT_MCP_TOOL_USED).length,
+    writes: { total: writes.length, confirmed: count('CONFIRMED'), mismatch: count('MISMATCH'), unconfirmed: count('UNCONFIRMED') },
+    recentWrites: writes.slice(-5).map((w) => ({
+      ts: w.tsIso,
+      entityType: w.dimensions.entityType,
+      action: w.dimensions.action,
+      verification: w.dimensions.verification,
+      objectId: w.dimensions.objectId,
+    })),
+  };
 }
 
 export async function recordMcpFirstToolUse(

@@ -28,6 +28,7 @@ import {
   Select,
   MenuItem,
   FormControl,
+  FormHelperText,
   InputLabel,
   Autocomplete,
   Checkbox,
@@ -48,6 +49,7 @@ import {
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
+import { readStepModelsHint, stepModelOptions } from "../utils/workPlanStepModel";
 import WorkPlanInputEditor from "../components/WorkPlanInputEditor";
 import {
   type EditableWorkPlanInputRequest,
@@ -98,6 +100,8 @@ interface WorkPlanStep {
   /** Media assets this step must actually produce before it can be marked
    *  completed. Enforced at run time by the session work plan's asset gate. */
   expectedAssetCount?: number;
+  /** ENG-2378: explicit model for this step (canonical id). Absent = the plan default, then the account default. */
+  model?: string;
   inputRequest?: EditableWorkPlanInputRequest;
 }
 
@@ -153,6 +157,8 @@ const visibilityColor = (v: string) => {
  */
 interface StepLossRefusal {
   message?: string;
+  /** The 422 model_unavailable body (shared with the launch routes) uses `error`. */
+  error?: string;
   stepsWouldBeRemoved?: number;
   removedStepTitles?: string[];
   stepContentLoss?: { stepCount?: number; title?: string; fields?: string[]; kind?: "blanked" | "unpaired" }[];
@@ -183,6 +189,8 @@ export default function WorkPlans() {
   const [defaultModel, setDefaultModel] = useState("");
   const [category, setCategory] = useState("");
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
+  // ENG-2378: capability hint from the backend; the per-step model picker is only offered while it is on.
+  const [stepModelsEnabled, setStepModelsEnabled] = useState(false);
 
   // Customer-facing browse metadata (ENG-1469) — optional, never affects execution.
   const [displayTitle, setDisplayTitle] = useState("");
@@ -251,6 +259,18 @@ export default function WorkPlans() {
     }
   }, [token]);
 
+  const fetchStepModelsHint = useCallback(async () => {
+    try {
+      const res = await axios.get(buildApiUrl("/api/agent-mode/model-options"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setStepModelsEnabled(readStepModelsHint(res.data));
+    } catch {
+      // Non-critical — without the hint the per-step picker simply stays hidden.
+      setStepModelsEnabled(false);
+    }
+  }, [token]);
+
   const fetchAvailableFunctionCalls = useCallback(async () => {
     try {
       const res = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
@@ -268,7 +288,7 @@ export default function WorkPlans() {
     }
   }, [token]);
 
-  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); fetchSupportedModels(); }, [fetchPlans, fetchAvailableFunctionCalls, fetchSupportedModels]);
+  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); fetchSupportedModels(); fetchStepModelsHint(); }, [fetchPlans, fetchAvailableFunctionCalls, fetchSupportedModels, fetchStepModelsHint]);
 
   const openCreateDialog = () => {
     setEditingPlan(null);
@@ -528,7 +548,8 @@ export default function WorkPlans() {
         );
         return;
       }
-      setError(data?.message || "Failed to save work plan");
+      // A 422 model_unavailable body carries `error` (not `message`).
+      setError(data?.error || data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
     }
@@ -1123,6 +1144,24 @@ export default function WorkPlans() {
                       sx={{ mt: 1, maxWidth: 220 }}
                       helperText="This step cannot be completed until the run has generated this many images/videos. Counted across the whole run, not just this step. Leave blank for no requirement."
                     />
+                    {stepModelsEnabled && (
+                      <FormControl size="small" sx={{ mt: 1, minWidth: 260 }} data-testid={`step-model-${i}`}>
+                        <InputLabel>Step Model (Optional)</InputLabel>
+                        <Select
+                          value={step.model || ""}
+                          label="Step Model (Optional)"
+                          onChange={(e) => updateStep(i, "model", e.target.value || undefined)}
+                        >
+                          <MenuItem value=""><em>Use plan default</em></MenuItem>
+                          {stepModelOptions(step.model, supportedModels).map((o) => (
+                            <MenuItem key={o.value} value={o.value} disabled={o.disabled}>{o.label}</MenuItem>
+                          ))}
+                        </Select>
+                        <FormHelperText>
+                          This step runs on exactly this model. If it becomes unavailable the plan pauses instead of switching models.
+                        </FormHelperText>
+                      </FormControl>
+                    )}
                   </Box>
                   {steps.length > 1 && (
                     <IconButton size="small" onClick={() => removeStep(i)} sx={{ mt: 0.5 }}>

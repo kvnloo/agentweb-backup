@@ -129,7 +129,7 @@ describe("crmAutoSyncService", () => {
           lastActiveDate: "2026-03-25",
         }),
       }),
-    ]);
+    ], { origin: 'integration' });
   });
 
   it("does not throw when batchCreateLeads fails", async () => {

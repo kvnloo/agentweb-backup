@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: npm
           cache-dependency-path: backend/package-lock.json
@@ -105,7 +105,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           cache: npm
           cache-dependency-path: partner-portal/package-lock.json
@@ -147,8 +147,11 @@ jobs:
           bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
+          bash .github/scripts/staging-env-override.test.sh
+          bash .github/scripts/sha-jest.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
           bash .github/scripts/paths-filter-hygiene.test.sh
+          bash .github/scripts/idor-probe.test.sh
           bash .github/scripts/offline-eval-report.test.sh
           bash .github/scripts/dev-md-fragments.test.sh
 
@@ -225,7 +228,7 @@ jobs:
       # any workflow. Every other job floats too. Pinning one new job is worth
       # doing on its own, but it is not the fix for that.
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: 'npm'

@@ -7,6 +7,8 @@
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --exit-child --transpile-only src/server.ts",
     "build": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc -p tsconfig.build.json",
+    "eval:label-coverage": "ts-node --transpile-only src/scripts/goldenSetLabelCoverage.ts",
+    "eval:draft-labels": "ts-node --transpile-only src/scripts/generateGoldenDraftLabels.ts",
     "typecheck": "node --max-old-space-size=6144 ./node_modules/typescript/bin/tsc --noEmit",
     "lint": "eslint .",
     "test": "node --max-old-space-size=4096 node_modules/.bin/jest --maxWorkers=2 --forceExit",
@@ -30,6 +32,7 @@
   "description": "",
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.26.4",
+    "@anthropic-ai/claude-code": "2.1.294",
     "@anthropic-ai/sdk": "^0.80.0",
     "@aws-sdk/client-bedrock-runtime": "^3.972.0",
     "@google-analytics/data": "^5.2.1",

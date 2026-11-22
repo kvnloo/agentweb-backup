@@ -35,6 +35,31 @@ describe('SettingsService — compare-and-swap set/delete', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
+  describe('setSettingIfAbsent', () => {
+    it('puts with attribute_not_exists so two callers cannot both win', async () => {
+      putPromise.mockResolvedValue({});
+      await expect(settingsService.setSettingIfAbsent('k', 'v', 'd', 'system', 99)).resolves.toBe(true);
+      const params = mockPut.mock.calls[0][0];
+      expect(params.ConditionExpression).toBe('attribute_not_exists(settingName)');
+      expect(params.Item.ttl).toBe(99);
+    });
+
+    it('returns false, writing nothing, when a row already exists', async () => {
+      putPromise.mockRejectedValue(Object.assign(new Error('c'), { code: 'ConditionalCheckFailedException' }));
+      await expect(settingsService.setSettingIfAbsent('k', 'v')).resolves.toBe(false);
+    });
+
+    it('surfaces any other storage error', async () => {
+      putPromise.mockRejectedValue(new Error('throttled'));
+      await expect(settingsService.setSettingIfAbsent('k', 'v')).rejects.toThrow('throttled');
+    });
+
+    it('rejects a non-finite ttl before touching storage', async () => {
+      await expect(settingsService.setSettingIfAbsent('k', 'v', 'd', 'system', NaN)).rejects.toThrow(/ttl/);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+  });
+
   describe('setSettingIfValueMatches', () => {
     it('issues a conditional put, conditioned on the exact expected raw value', async () => {
       putPromise.mockResolvedValue({});

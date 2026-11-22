@@ -15,6 +15,12 @@ interface ImageGenerationResult {
   filename?: string;
   error?: string;
   /**
+   * ENG-1535: typed failure class so callers (agent-mode generate_image) can tell a
+   * transient/rate-limited provider error from a permanent policy/config one instead of
+   * the gateway bucketing every unclassified failure as `repeated_failure`.
+   */
+  errorClass?: ImageErrorClass;
+  /**
    * Advisory deterministic checks on the rendered image (ENG-2139). A provider that returns a
    * remote URL (Runway) is gated after download, or marked `notChecked` (ENG-2187). Absent only
    * when the gates themselves threw or the S3 upload failed.
@@ -95,6 +101,43 @@ interface ImageGenerationParams {
 function meteredUserId(params: ImageGenerationParams): string | undefined {
   if (params.meterUserId === null) return undefined;
   return params.meterUserId ?? params.userId;
+}
+
+export type ImageErrorClass = "transient" | "rate_limited" | "quota_exceeded" | "policy" | "config" | "invalid_args";
+
+const IMAGE_ERROR_ACTIONS: Record<ImageErrorClass, string> = {
+  transient: "The image provider had a temporary failure; retry in a moment.",
+  rate_limited: "The image provider is rate-limiting requests; wait ~30s and retry.",
+  quota_exceeded: "The image provider account is out of quota; retrying will not help until billing/quota is restored.",
+  policy: "The provider's content policy rejected this prompt; rephrase the prompt (remove the flagged content) and retry.",
+  config: "Image generation is not configured for this model (missing or invalid provider credentials); try a different imageModel or contact support.",
+  invalid_args: "The request arguments were rejected; fix the arguments and retry.",
+};
+
+/**
+ * ENG-1535: map any image-provider failure (thrown error or error string) to a typed class.
+ * Pure: reads status/code/provider body/message only.
+ */
+export function classifyImageProviderError(error: unknown): ImageErrorClass {
+  const e = error as any;
+  const status: unknown = e?.status ?? e?.statusCode ?? e?.response?.status
+    ?? (typeof e?.code === "number" ? e.code : undefined);
+  const providerDetail = e?.response?.data?.error?.message ?? e?.response?.data?.error?.code ?? "";
+  const message = `${typeof error === "string" ? error : e?.message ?? ""} ${providerDetail}`.toLowerCase();
+
+  if (/api key|secrets manager|secret (must|is|json)|not valid json|missing "?(apikey|endpoint)/.test(message)) return "config";
+  if (/content.?(policy|filter)|safety|moderation|responsible ai|prohibited|blocked/.test(message)) return "policy";
+  if (/insufficient_quota|exceeded your current quota|check your plan and billing/.test(message)) return "quota_exceeded";
+  if (status === 429 || /\b429\b|rate.?limit|too many requests/.test(message)) return "rate_limited";
+  if (status === 401 || status === 403) return "config";
+  if (typeof status === "number" && status >= 500) return "transient";
+  if (/timed out|timeout|etimedout|econnreset|socket hang up|\b5\d\d\b|unavailable/.test(message)) return "transient";
+  if (status === 400 || status === 422 || /invalid|must be one of|unsupported/.test(message)) return "invalid_args";
+  return "transient";
+}
+
+export function imageErrorAction(errorClass: ImageErrorClass): string {
+  return IMAGE_ERROR_ACTIONS[errorClass];
 }
 
 export class ImageService {
@@ -535,6 +578,7 @@ export class ImageService {
         return {
           success: false,
           error: `Invalid imageModel '${params.imageModel}'. Must be one of: ${SUPPORTED_MODELS.join(", ")}`,
+          errorClass: "invalid_args",
         };
       }
       
@@ -544,6 +588,7 @@ export class ImageService {
         return {
           success: false,
           error: validationResult.error,
+          errorClass: "invalid_args",
         };
       }
       
@@ -572,6 +617,12 @@ export class ImageService {
           this.IMAGE_GENERATION_TIMEOUT_MS,
           `Image generation with ${modelToUse}`
         );
+
+        // ENG-1535: provider methods (Gemini, Runway) catch their own errors and return
+        // { success: false, error } — classify those too so the failure stays typed.
+        if (!result.success && !result.errorClass) {
+          result = { ...result, errorClass: classifyImageProviderError(result.error ?? "") };
+        }
         
         // If generation was successful, upload to S3
         if (result.success && result.imageUrl) {
@@ -664,14 +715,18 @@ export class ImageService {
         const providerDetail = apiError?.response?.data?.error?.message;
         const errorDetail = providerDetail || apiError.message || apiError.error || 'Unknown error';
 
-        // Re-throw the error with more context
-        throw new Error(`${modelToUse} API failed: ${errorDetail}`);
+        // Re-throw the error with more context; carry the typed class (ENG-1535).
+        const wrapped = new Error(`${modelToUse} API failed: ${errorDetail}`) as Error & { imageErrorClass?: ImageErrorClass };
+        wrapped.imageErrorClass = classifyImageProviderError(apiError);
+        throw wrapped;
       }
     } catch (error: any) {
       console.error("Error generating image:", error);
+      const errorClass: ImageErrorClass = error?.imageErrorClass ?? classifyImageProviderError(error);
       return {
         success: false,
-        error: `Failed to generate image: ${error.message}`,
+        error: `Failed to generate image: ${error.message}. ${imageErrorAction(errorClass)}`,
+        errorClass,
       };
     }
   }

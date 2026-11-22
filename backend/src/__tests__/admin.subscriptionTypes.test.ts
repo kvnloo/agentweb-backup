@@ -53,20 +53,29 @@ jest.mock('../services/agentModeService', () => ({
       'gemini-3.1-flash-lite',
       'anthropic.claude-haiku-4-5-20251001-v1:0',
       'anthropic.claude-opus-5',
+      'openrouter/qwen/qwen3.8-max-0902',
     ]),
+    // Same alias map as the real service (single source: llmModelRegistry).
+    normalizeModelId: jest.fn((model: string) =>
+      require('../services/agentMode/llmModelRegistry').LEGACY_MODEL_ALIASES[model] ?? model),
   },
 }));
 
 import { settingsService } from '../services/settingsService';
 import * as subscriptionService from '../services/subscriptionService';
+import { userDb } from '../services/db';
 
 const mockedSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 
 let app: express.Application;
 
 describe('Admin subscription types routes', () => {
+  let scanSpy: jest.SpyInstance;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    // Never reach the real users table from the stranded-tier guard.
+    scanSpy = jest.spyOn(userDb, 'scanWithFilter').mockResolvedValue([]);
 
     app = express();
     app.use(express.json());
@@ -115,7 +124,7 @@ describe('Admin subscription types routes', () => {
     expect(basic.allowedSkills).not.toContain('*');
   });
 
-  it('GET /api/admin/subscription-types backward compat: old format with allowedFunctionCalls gets all skills', async () => {
+  it('GET /api/admin/subscription-types: old format with allowedFunctionCalls shows no skills (runtime refuses to resolve it)', async () => {
     // Old format without allowedSkills
     const storedTypes = [
       {
@@ -141,12 +150,9 @@ describe('Admin subscription types routes', () => {
     expect(res.body).toHaveLength(1);
     const legacy = res.body[0];
 
-    // Missing allowedSkills should be expanded to all available skills
-    expect(legacy.allowedSkills).toEqual(
-      await (subscriptionService.getAllAvailableSkills as jest.Mock).mock.results[0].value,
-    );
-    // Should not have allowedFunctionCalls in the response (replaced by allowedSkills)
-    expect(legacy.allowedSkills).toContain('skill-1');
+    // ENG-1978: missing allowedSkills is no longer expanded to all skills — the runtime denies such
+    // a row, and showing it as "all" would let an admin save it back as a full grant.
+    expect(legacy.allowedSkills).toEqual([]);
     expect(legacy.allowedFeatures).toEqual(['scheduled_chats']);
   });
 
@@ -316,6 +322,24 @@ describe('Admin subscription types routes', () => {
 
     const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
     expect(saved[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  it('POST /api/admin/subscription-types canonicalises a renamed model id in a stored policy and saves the new id', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite', 'openrouter/qwen/qwen3.8-max'],
+      optimizedDefaultModel: 'openrouter/qwen/qwen3.8-max',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.optimizedModelIds).toEqual(['gemini-3.1-flash-lite', 'openrouter/qwen/qwen3.8-max-0902']);
+    expect(saved[0].llmUsagePolicy.optimizedDefaultModel).toBe('openrouter/qwen/qwen3.8-max-0902');
   });
 
   // ENG-1214 AC5: the alert thresholds are only "admin-configurable" if the
@@ -712,5 +736,122 @@ describe('Admin subscription types routes', () => {
     expect(res.body[2].skillId).toBe('__other_skills__');
     expect(res.body[2].name).toBe('Other Skills');
     expect(res.body[2].toolNames).toEqual(['other_tool_1', 'other_tool_2']);
+  });
+  // ENG-1978: a tier is referenced by NAME from each user. Removing or renaming one that accounts
+  // are still on leaves them unresolvable, and the entitlement gate now fails closed on that.
+  describe('stranded-tier guard (ENG-1978)', () => {
+    const tier = (name: string) => ({ name, allowedPages: ['/tasks'], allowedSkills: ['skill-1'] });
+    const stored = (names: string[]) =>
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify(names.map(tier)),
+      } as any);
+    const post = (names: string[], extra: Record<string, unknown> = {}) =>
+      request(app)
+        .post('/api/admin/subscription-types')
+        .set('Authorization', 'Bearer test-token')
+        .send({ subscriptionTypes: names.map(tier), ...extra });
+
+    beforeEach(() => {
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+    });
+
+    it('rejects removing a tier that accounts are still on, and saves nothing', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }, { subscriptionType: 'Pro' }]);
+
+      const res = await post(['Free']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Pro', userCount: 2 }]);
+      expect(res.body.message).toContain('"Pro" (2 accounts)');
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('treats a rename as a removal of the old name', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }]);
+
+      const res = await post(['Free', 'Pro-Renamed']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Pro', userCount: 1 }]);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('allows removing a tier nobody is on', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([]);
+
+      await post(['Free']).expect(200);
+
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets an API caller override with allowStrandedUsers and skips the scan', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ subscriptionType: 'Pro' }]);
+
+      await post(['Free'], { allowStrandedUsers: true }).expect(200);
+
+      expect(scanSpy).not.toHaveBeenCalled();
+      expect(mockedSettingsService.setSetting).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not scan users when nothing is removed (edit or add only)', async () => {
+      stored(['Free', 'Pro']);
+
+      await post(['Free', 'Pro', 'Extra']).expect(200);
+
+      expect(scanSpy).not.toHaveBeenCalled();
+    });
+
+    it('lists every removed tier that has accounts, with one IN placeholder per removed name', async () => {
+      stored(['Free', 'Pro', 'Starter']);
+      scanSpy.mockResolvedValue([
+        { subscriptionType: 'Pro' }, { subscriptionType: 'Starter' }, { subscriptionType: 'Starter' },
+      ]);
+
+      const res = await post(['Free']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([
+        { name: 'Pro', userCount: 1 },
+        { name: 'Starter', userCount: 2 },
+      ]);
+      const [filter, values] = scanSpy.mock.calls[0];
+      expect(filter).toContain('subscriptionType IN (:t0, :t1)');
+      expect(values).toEqual({ ':t0': 'Pro', ':t1': 'Starter' });
+    });
+
+    it('counts a null subscriptionType as Free and asks DynamoDB for NULL-typed attributes', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ userId: 'a', subscriptionType: null }]);
+
+      const res = await post(['Pro']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Free', userCount: 1 }]);
+      const [filter, values] = scanSpy.mock.calls[0];
+      expect(filter).toContain('attribute_type(subscriptionType, :nullType)');
+      expect(values[':nullType']).toBe('NULL');
+    });
+
+    it('answers 503 and saves nothing when the account check itself fails', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const res = await post(['Free']).expect(503);
+
+      expect(res.body.message).toMatch(/nothing was saved/i);
+      expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+    });
+
+    it('counts accounts with no subscriptionType as Free when Free is removed', async () => {
+      stored(['Free', 'Pro']);
+      scanSpy.mockResolvedValue([{ userId: 'a' }, { userId: 'b', subscriptionType: '' }, { subscriptionType: 'Free' }]);
+
+      const res = await post(['Pro']).expect(409);
+
+      expect(res.body.strandedTiers).toEqual([{ name: 'Free', userCount: 3 }]);
+      const [filter] = scanSpy.mock.calls[0];
+      expect(filter).toContain('attribute_not_exists(subscriptionType)');
+    });
   });
 });

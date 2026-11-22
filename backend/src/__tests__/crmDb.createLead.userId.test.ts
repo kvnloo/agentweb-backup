@@ -245,11 +245,16 @@ describe('lead-created notification write boundary', () => {
     getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'owner' } });
     putPromiseMock.mockResolvedValue({});
   });
+  it('threads only the explicit server origin and does not persist it on the lead', async () => {
+    const lead = await crmDb.createLead('list-1', { firstName: 'Jane', customFields: { origin: 'form_fill' } }, 'linkedin');
+    expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', lead.leadId, 'linkedin');
+    expect(lead).not.toHaveProperty('origin');
+  });
   it('returns the saved lead while Slack work remains pending', async () => {
     (dispatchLeadCreated as jest.Mock).mockReturnValue(new Promise(() => {}));
     const lead = await crmDb.createLead('list-1', { firstName: 'Jane', customFields: {} });
     expect(lead.leadId).toBeDefined();
-    expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', lead.leadId);
+    expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', lead.leadId, undefined);
   });
   it('contains a rejected notification without failing lead save', async () => {
     (dispatchLeadCreated as jest.Mock).mockRejectedValue(new Error('Slack down'));
@@ -276,11 +281,11 @@ describe('batch notification write boundary', () => {
     (dispatchLeadsCreated as jest.Mock).mockImplementation(() => state === 'pending'
       ? new Promise(() => {}) : Promise.reject(new Error('Slack down')));
     const rows = Array.from({ length: 51 }, (_, i) => ({ email: `person${i}@example.com` }));
-    const result = await crmDb.batchCreateLeads('list-1', rows);
+    const result = await crmDb.batchCreateLeads('list-1', rows, { origin: 'enrichment_import' });
     await new Promise(resolve => setImmediate(resolve));
     expect(result.successCount).toBe(51);
     expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
-    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId));
+    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId), 'enrichment_import');
     expect(dispatchLeadCreated).not.toHaveBeenCalled();
   });
 
@@ -295,7 +300,7 @@ describe('batch notification write boundary', () => {
     await new Promise(resolve => setImmediate(resolve));
     expect(result.created).toHaveLength(25);
     expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
-    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId));
+    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId), undefined);
     expect(dispatchLeadCreated).not.toHaveBeenCalled();
   });
 

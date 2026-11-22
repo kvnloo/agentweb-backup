@@ -122,7 +122,13 @@ describe('McpToolRegistry', () => {
       registry.register(handler);
 
       const definitions = registry.getToolDefinitions();
-      expect(definitions[0]).toEqual(expectedDefinition);
+      // ENG-336: getToolDefinitions() adds default annotations (derived from the handler's
+      // `readOnly` flag, unset here so it defaults to a destructive/write classification) —
+      // `expectedDefinition` itself stays unannotated since it doubles as the registered input.
+      expect(definitions[0]).toEqual({
+        ...expectedDefinition,
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+      });
     });
   });
 

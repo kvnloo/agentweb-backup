@@ -1,6 +1,6 @@
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { deriveDominanceLegacyIds, inferFamily, scheduleBackupModels } from '../modelSupersession';
-import { discoverNewModels, refreshModelCatalog, refreshScores } from '../modelCatalogRefresh';
+import { cleanModelName, discoverNewModels, refreshModelCatalog, refreshScores } from '../modelCatalogRefresh';
 import { MODEL_PRICING } from '../../../utils/llmPricing';
 import { patchObject, mergeSetLiteral } from '../../../scripts/refreshModelCatalog';
 
@@ -50,6 +50,8 @@ describe('catalog critical invariants', () => {
       { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '', completion: 'NaN' } }] });
     expect(additions.map(m => m.id)).toEqual(['openrouter/x-ai/grok-4.8']);
     expect(additions[0].price).toEqual({ inPerM: 1, outPerM: 3 });
+    // Unreviewed models must never reach customers on their own (ENG-2293).
+    expect(additions[0].config.adminOnly).toBe(true);
     expect(discoverNewModels({ data: [{ ...row, pricing: { prompt: '0.00000029', completion: '0.000003' } }] })[0].price.inPerM).toBe(0.29);
     // A fixed local registry, not the live LLM_MODEL_REGISTRY — these assertions pin
     // exact qualityScore/qualityScoreSource matching behavior, which the live import
@@ -66,6 +68,26 @@ describe('catalog critical invariants', () => {
     expect(scores.changes[grok[1]]).toBeUndefined();
     expect(refreshScores(scoreRegistry, { data: [{ ...valid, slug: 'grok-4-6-high', name: 'Grok 4.6 (high)' }] }, '2026-09-24').changes[grok[0]].qualityScore).toBe(45);
     expect(refreshScores(scoreRegistry, { data: [valid, valid] }, '2026-09-24').changes).toEqual({});
+  });
+  it('matches the 0423 and 0813 DeepSeek V4 Pro entries to their own AA rows, not the bare-name row (ENG-2293)', () => {
+    // AA's bare `deepseek-v4-pro` slug names the 0813 release; OpenRouter's bare
+    // `deepseek-v4-pro` is the 0423 release (AA: `deepseek-v4-pro-0424`). Matching
+    // by bare name wrote 0813's score (36) onto the 0423 entry (true: 30) every run.
+    const old = 'openrouter/deepseek/deepseek-v4-pro', ga = 'openrouter/deepseek/deepseek-v4-pro-0813';
+    const reg = {
+      [old]: { client: null, supportsTemperature: true, provider: 'deepseek' as const, qualityScore: 36, qualityScoreSource: 'stale' },
+      [ga]: { client: null, supportsTemperature: true, provider: 'deepseek' as const },
+    };
+    const aa = (slug: string, score: number) => ({ slug, model_creator: { slug: 'deepseek' }, evaluations: { artificial_analysis_intelligence_index: score } });
+    const { changes } = refreshScores(reg, { data: [aa('deepseek-v4-pro', 36), aa('deepseek-v4-pro-0424', 30)] }, '2026-10-07');
+    expect(changes[old].qualityScore).toBe(30);
+    expect(changes[old].qualityScoreSource).toContain('deepseek-v4-pro-0424');
+    expect(changes[ga].qualityScore).toBe(36);
+    // Idempotent once correct: the next daily run must not flip the old entry back.
+    const settled = { [old]: { ...reg[old], qualityScore: 30 }, [ga]: { ...reg[ga], qualityScore: 36 } };
+    expect(refreshScores(settled, { data: [aa('deepseek-v4-pro', 36), aa('deepseek-v4-pro-0424', 30)] }, '2026-10-07').changes).toEqual({});
+    // A missing slug is a loud "unmatched", never a silent wrong match.
+    expect(refreshScores(settled, { data: [aa('deepseek-v4-pro', 36)] }, '2026-10-07').reports.join()).toContain(`${old}: AA unmatched`);
   });
   it('merges additions into an override Set regardless of existing quote style, and is idempotent (ENG-2293)', () => {
     const singleQuoted = "const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1']);";
@@ -90,6 +112,54 @@ describe('catalog critical invariants', () => {
     const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
     expect(plan.additions).toContain('openrouter/x-ai/grok-4.9');
     expect(plan.reports.some(r => r.includes('PRICE OUTLIER') && r.includes('openrouter/x-ai/grok-4.9'))).toBe(true);
+  });
+  it('reports a much CHEAPER addition as information, not a warning (generation-over-generation drop)', async () => {
+    const cheapRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.0000001', completion: '0.0000003' } }; // ~20x under grok's ~$2-6
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [cheapRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.reports.some(r => r.startsWith('⚠️ PRICE OUTLIER'))).toBe(false);
+    expect(plan.reports.some(r => r.startsWith('ℹ️ PRICE DROP') && r.includes('openrouter/x-ai/grok-4.9'))).toBe(true);
+  });
+  it('still warns when a free ($0) quote lands against paid siblings', async () => {
+    const freeRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0', completion: '0' } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [freeRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.reports.some(r => r.startsWith('⚠️ PRICE OUTLIER'))).toBe(true);
+  });
+  it('warns about a long-prompt price tier and lists what a human must set before customer exposure', async () => {
+    const tiered = { ...row, id: 'x-ai/grok-4.9', name: 'xAI: Grok 4.9',
+      pricing: { prompt: '0.000002', completion: '0.000006', overrides: [{ min_prompt_tokens: 100000, prompt: '0.00001', completion: '0.00003' }] },
+      supported_parameters: ['tools', 'temperature', 'reasoning_effort'],
+      architecture: { output_modalities: ['text'], input_modalities: ['text', 'image'] } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [tiered] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.reports.some(r => r.startsWith('⚠️ LONG-PROMPT PRICE TIER') && r.includes('5.0x'))).toBe(true);
+    const exposure = plan.reports.find(r => r.startsWith('ℹ️ BEFORE CUSTOMER EXPOSURE'))!;
+    expect(exposure).toContain('description and tier');
+    expect(exposure).toContain('accepts images');
+    expect(exposure).toContain('reasoning_effort');
+    // The registry entry itself stays admin-only and carries the cleaned name.
+    expect(plan.registryChanges['openrouter/x-ai/grok-4.9']).toMatchObject({ adminOnly: true, name: 'Grok 4.9' });
+  });
+  it('notes time-of-day price windows on an existing model instead of reporting plain drift', async () => {
+    const windowed = { ...row, id: 'x-ai/grok-4.7', pricing: { prompt: '0.000001', completion: '0.000003',
+      overrides: [{ utc_days: ['monday'], prompt: '0.000002', completion: '0.000006' }] } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [windowed] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '' });
+    expect(plan.reports.some(r => r.startsWith('openrouter/x-ai/grok-4.7:') && r.includes('time-of-day price windows'))).toBe(true);
+  });
+  it('keeps a NEW model\'s own "no Artificial Analysis match" line visible as information', async () => {
+    const newRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.000002', completion: '0.000006' } };
+    const aa = { data: [{ slug: 'something-else', model_creator: { slug: 'x-ai' }, evaluations: { artificial_analysis_intelligence_index: 40 } }] };
+    const plan = await refreshModelCatalog({ catalog: { data: [newRow] }, aa, additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.reports.some(r => r.startsWith('ℹ️ AA SCORE: openrouter/x-ai/grok-4.9'))).toBe(true);
+    expect(plan.reports.some(r => r === 'openrouter/x-ai/grok-4.9: AA unmatched; score unchanged')).toBe(false);
+  });
+  it('strips the "<Vendor>: " prefix from OpenRouter display names', () => {
+    expect(cleanModelName('Anthropic: Claude Haiku 5.5')).toBe('Claude Haiku 5.5');
+    expect(cleanModelName('Z.ai: GLM 5.3')).toBe('GLM 5.3');
+    expect(cleanModelName('Grok 4.8')).toBe('Grok 4.8');
+    expect(cleanModelName('Mistral: ')).toBe('Mistral:'); // nothing after the colon: keep it
   });
   it('does not flag an addition priced in line with its family', async () => {
     const normalRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.000002', completion: '0.000006' } }; // in grok's real range

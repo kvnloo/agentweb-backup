@@ -120,6 +120,19 @@ function classFromMessage(message: string): string | null {
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';
   /*
+   * ENG-1627 — create_html_file's remaining generic `Error` cluster. Matched
+   * early because these messages embed JSON positions and S3 URLs whose digits
+   * can trip the embedded-status patterns below.
+   *  - "Failed to parse arguments: … cut off …" is a mid-generation cutoff
+   *    (retryable), anything else from the arg parser is malformed JSON.
+   *  - Private-image size limits (inlineS3Images.ts) are oversized input, not
+   *    a runtime bug; access failures keep falling through (e.g. not_found).
+   */
+  if (/^failed to parse arguments:/.test(m)) {
+    return /were cut off before the json object was complete/.test(m) ? 'truncated_response' : 'invalid_args';
+  }
+  if (/decoded image exceeds the \d+ mb limit|exceeds? the \d+ mb (aggregate )?decoded limit/.test(m)) return 'invalid_args';
+  /*
    * The entitlement sentence needs the same protection, and for the same reason: a published
    * skillId beginning with a "500"/"404"/"403"-shaped token would otherwise be caught by the
    * embedded-status regex below and classified `upstream_5xx` / `not_found` / `auth`.
@@ -274,11 +287,11 @@ function classFromMessage(message: string): string | null {
   // reclassifies it to invalid_args too. Accepted: a genuinely oversized input
   // isn't retryable either way, and consistent classification across the app
   // outweighs one error keeping a bespoke class name.
-  if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
+  if (/arguments failed schema validation|has the wrong type|missing required (array )?(argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short|too large to save|is too large/.test(m)) return 'invalid_args';
 
   if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
-  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
-  if (/does not exist|not found/.test(m)) return 'not_found';
+  if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed|connection error|premature close|invalid response body/.test(m)) return 'network';
+  if (/does not exist|not found|no landing page found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';
   // Meta Graph transient (codes 1/2): the SDK/campaign path surfaces Meta's generic
   // body verbatim with NO HTTP status in the string, so the status-regex above misses
@@ -308,8 +321,26 @@ function legacyNameClass(error: unknown): string {
   return 'UnknownError';
 }
 
+/**
+ * ENG-1949 — semantic classes a tool may stamp on its own structured failure
+ * result (`{ success: false, errorClass }`). coding_agent's failures are
+ * returned, not thrown, and the message is often the sub-agent's own prose
+ * summary ("Done! ..."), so message matching cannot classify them; the tool
+ * knows the class and says so. Only names from this taxonomy are honoured —
+ * an arbitrary string never becomes a new cluster.
+ */
+export const KNOWN_TOOL_ERROR_CLASSES: ReadonlySet<string> = new Set([
+  'timeout', 'auth', 'rate_limit', 'quota_exceeded', 'payment_required', 'invalid_args',
+  'not_found', 'network', 'upstream_5xx', 'policy_blocked', 'repeated_failure',
+  'tool_unavailable', 'upstream_rejected', 'empty_result', 'invalid_output',
+  'truncated_response',
+]);
+
 export function classifyToolErrorClass(error: unknown): string {
   if (error instanceof Error) {
+    const declared = (error as { toolErrorClass?: unknown }).toolErrorClass;
+    if (typeof declared === 'string' && KNOWN_TOOL_ERROR_CLASSES.has(declared)) return declared;
+
     // Check both the explicit .name and the constructor name — `class
     // TimeoutError extends Error {}` inherits .name === 'Error'.
     const byName = GATEWAY_NAME_CLASSES[error.name]

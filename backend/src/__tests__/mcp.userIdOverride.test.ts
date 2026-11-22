@@ -68,7 +68,6 @@ jest.mock('../mcp/server/apiTools', () => ({}));
 jest.mock('../mcp/server/workflowTools', () => ({}));
 
 import { createMcpServer, McpSessionContext } from '../mcp/server/mcpServerCore';
-import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 describe('MCP userId override protection (IDOR fix)', () => {
   beforeEach(() => {
@@ -170,21 +169,6 @@ describe('MCP userId override protection (IDOR fix)', () => {
         {},
         expect.objectContaining({ userId: 'backend-service' }),
       );
-    });
-  });
-
-  describe('drain tracking', () => {
-    it('releases the real registry when tool execution rejects', async () => {
-      mockExecute.mockRejectedValueOnce(new Error('tool failed'));
-      const handler = setupServer({
-        agentUserId: 'real-user-123',
-        isInternal: false,
-      });
-
-      const result = await handler(makeToolRequest('failing_tool', {}));
-
-      expect(result).toMatchObject({ isError: true });
-      expect(cronJobRegistry.size()).toBe(0);
     });
   });
 

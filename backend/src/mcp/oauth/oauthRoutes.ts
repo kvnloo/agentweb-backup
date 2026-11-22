@@ -18,6 +18,7 @@ import {
   recordMcpOAuthStarted,
   recordMcpOAuthTokenIssued,
 } from '../../services/mcpUsageEventsService';
+import { getBackendUrl, MCP_RESOURCE_PATH, META_TOOLKIT_MCP_RESOURCE_PATH } from './authChallenge';
 
 /**
  * Middleware: accept the user's JWT either from the Authorization header
@@ -73,21 +74,28 @@ export function setupMcpOAuth(app: express.Express) {
     });
   });
 
-  const protectedResourceMetadata = (_req: Request, res: Response) => {
+  // RFC 9728: one metadata document per protected resource; `resource` must equal the URL
+  // the client connected to or MCP clients refuse to start the OAuth flow.
+  const protectedResourceMetadata = (resourcePath: string) => (_req: Request, res: Response) => {
     const baseUrl = getBackendUrl();
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({
-      resource: `${baseUrl}/mcp`,
+      resource: `${baseUrl}${resourcePath}`,
       authorization_servers: [baseUrl],
       bearer_methods_supported: ['header'],
       scopes_supported: ['mcp:tools'],
-      resource_documentation: `${baseUrl}/skill.md`,
+      resource_documentation:
+        resourcePath === META_TOOLKIT_MCP_RESOURCE_PATH ? `${baseUrl}/api/meta-toolkit/skill.md` : `${baseUrl}/skill.md`,
     });
   };
 
-  app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
-  app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
+  app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata(MCP_RESOURCE_PATH));
+  app.get(`/.well-known/oauth-protected-resource${MCP_RESOURCE_PATH}`, protectedResourceMetadata(MCP_RESOURCE_PATH));
+  app.get(
+    `/.well-known/oauth-protected-resource${META_TOOLKIT_MCP_RESOURCE_PATH}`,
+    protectedResourceMetadata(META_TOOLKIT_MCP_RESOURCE_PATH),
+  );
 
   // ─── Dynamic Client Registration (RFC 7591) ────────────────────────────
   // Body parser is applied globally in app.ts (express.json + urlencoded)
@@ -429,6 +437,3 @@ function extractClientSecret(req: Request): string | undefined {
   return req.body.client_secret;
 }
 
-function getBackendUrl(): string {
-  return process.env.BACKEND_URL || 'https://api.agentweb.pro';
-}

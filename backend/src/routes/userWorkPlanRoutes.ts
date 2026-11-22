@@ -3,6 +3,9 @@ import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { userDb, orgDb } from "../services/db";
 import { can } from "../services/orgAuthz";
+import { checkPlanDefaultModelWrite, isUserAdminSafe, planAdminStatusApplies } from "../services/agentMode/modelPin";
+import { workPlanStepModels } from "../services/agentMode/workPlanStepModelsInstance";
+import { anyStepCarriesModel, checkPlanStepModelsWrite, checkStoredStepModelsForPublic } from "../services/agentMode/workPlanStepModels";
 import {
   canEditItem,
   isFeatureEffectivelyEnabled,
@@ -75,10 +78,26 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
-
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
+
+    // ENG-903: an unservable/unselectable plan model is refused now (422), not at launch.
+    // A plan created by an org member is org-scoped (shared with the org), so the creator's
+    // admin status does not clear an adminOnly pin.
+    const modelCheck = await checkPlanDefaultModelWrite(
+      () => planAdminStatusApplies({ visibility: 'private', ownerId: userId, orgId }) ? isUserAdminSafe(userId) : Promise.resolve(false),
+      defaultModel,
+    );
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+
+    // ENG-2378: a step `model` is stored (and validated like the plan default) only while the switch is on.
+    const stepModelsEnabled = anyStepCarriesModel(steps) && await workPlanStepModels.isEnabled();
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps, { stepModelsEnabled });
+    const stepModelCheck = await checkPlanStepModelsWrite(
+      () => planAdminStatusApplies({ visibility: 'private', ownerId: userId, orgId }) ? isUserAdminSafe(userId) : Promise.resolve(false),
+      normalizedSteps,
+    );
+    if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
 
     // Work plans are member-owned: any user may create their own. Org-wide
     // visibility is governed separately by the shareSettings `enabled` toggle.
@@ -92,7 +111,7 @@ router.post("/", async (req, res) => {
       requireLogin: requireLogin || false,
       showLoginSignup: showLoginSignup || 'after_plan_completed',
       showInAgentMode: false,
-      defaultModel,
+      defaultModel: modelCheck.touched ? modelCheck.value : undefined,
       ownerId: userId,
       ...(orgId && { orgId }),
       visibility: 'private',
@@ -141,7 +160,24 @@ router.put("/:planId", async (req, res) => {
     // Normalize here too. This path used to store the caller's step objects
     // verbatim, which made the same resource behave differently by verb and
     // left it the one write path with no report of what it discarded (ENG-889).
-    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    // ENG-903: validate only a CHANGED model; re-sending the stored value never blocks an edit.
+    const modelCheck = await checkPlanDefaultModelWrite(
+      () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+      defaultModel,
+      plan.defaultModel,
+    );
+    if (!modelCheck.ok) return res.status(422).json(modelCheck.body);
+    const stepModelsEnabled = (anyStepCarriesModel(steps) || anyStepCarriesModel(plan.steps)) && await workPlanStepModels.isEnabled();
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps, { stepModelsEnabled, storedSteps: plan.steps, keepStoredWhenOmitted: true }) : undefined;
+    if (normalized) {
+      // ENG-2378: only a NEW or CHANGED step model is validated; an unchanged stored one is tolerated.
+      const stepModelCheck = await checkPlanStepModelsWrite(
+        () => planAdminStatusApplies(plan) ? isUserAdminSafe(plan.ownerId) : Promise.resolve(false),
+        normalized.steps,
+        plan.steps,
+      );
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const warnings = normalized?.warnings ?? [];
     const updated = {
       ...plan,
@@ -152,7 +188,7 @@ router.put("/:planId", async (req, res) => {
       ...(autocomplete !== undefined && { autocomplete }),
       ...(requireLogin !== undefined && { requireLogin }),
       ...(showLoginSignup !== undefined && { showLoginSignup }),
-      ...(defaultModel !== undefined && { defaultModel }),
+      ...(modelCheck.touched && { defaultModel: modelCheck.value }),
     };
     // Same stake as the admin PUT: `null` means "the plan I read had no
     // revision", so presence of the key is what counts (ENG-890).
@@ -217,6 +253,14 @@ router.post("/:planId/submit-for-review", async (req, res) => {
     const { userId } = (req as any).user;
     const { planId } = req.params;
 
+    // ENG-2378: submitting widens who can launch this plan (an approved plan is launched by non-admins), so its step
+    // models must be selectable by a NON-admin now, not discovered at the first launch. The owner's own plan only: any
+    // other caller gets the service's usual refusal. Nothing is written when a model is refused.
+    const existing = await workPlanService.getWorkPlan(planId);
+    if (existing && existing.ownerId === userId && existing.visibility === 'private') {
+      const stepModelCheck = await checkStoredStepModelsForPublic(existing.steps, () => workPlanStepModels.shouldHonor());
+      if (!stepModelCheck.ok) return res.status(422).json(stepModelCheck.body);
+    }
     const plan = await workPlanService.submitForReview(planId, userId);
 
     res.json(plan);

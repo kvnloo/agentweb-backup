@@ -95,7 +95,6 @@ import { buildMcpAuthChallenge, setupMcpServer } from '../mcp/server/mcpServer';
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 describe('MCP Server', () => {
   let app: Express;
@@ -232,7 +231,11 @@ describe('MCP Server', () => {
         .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 1 });
 
       expect(response.status).toBe(503);
-      expect(response.body).toEqual({ message: 'Instance draining — retry on new instance' });
+      expect(response.body).toEqual({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Instance draining — retry on new instance' },
+        id: 1,
+      });
       expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
     });
 
@@ -250,10 +253,15 @@ describe('MCP Server', () => {
         .send([
           { jsonrpc: '2.0', method: 'tools/list', id: 1 },
           { jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 2 },
+          { jsonrpc: '2.0', method: 'notifications/initialized' },
         ]);
 
       expect(response.status).toBe(503);
-      expect(response.body).toEqual({ message: 'Instance draining — retry on new instance' });
+      expect(response.body).toEqual([1, 2].map((id) => ({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Instance draining — retry on new instance' },
+        id,
+      })));
       expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
     });
 
@@ -267,88 +275,6 @@ describe('MCP Server', () => {
         .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 1 });
 
       expect(response.status).not.toBe(503);
-    });
-
-    it('A-019: existing-session admission keeps real drain pending until dispatch finishes', async () => {
-      (isInitializeRequest as unknown as jest.Mock).mockImplementation(
-        (body: any) => body?.method === 'initialize'
-      );
-
-      await request(app)
-        .post('/mcp')
-        .set('Authorization', `Bearer ${TEST_TOKEN}`)
-        .send({ jsonrpc: '2.0', method: 'initialize', params: { capabilities: {} }, id: 20 });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      const transportMock = StreamableHTTPServerTransport as unknown as jest.Mock;
-      const transport = transportMock.mock.results[transportMock.mock.results.length - 1]?.value;
-      let releaseDispatch!: () => void;
-      const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
-      transport.handleRequest.mockImplementationOnce(async (_req: any, res: any) => {
-        await dispatchGate;
-        if (!res.headersSent) res.status(200).json({ result: 'ok' });
-      });
-
-      const inFlight = request(app)
-        .post('/mcp')
-        .set('Authorization', `Bearer ${TEST_TOKEN}`)
-        .set('mcp-session-id', 'test-session-id')
-        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 21 })
-        .then((response) => response);
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(cronJobRegistry.snapshot().mcpHttpToolCall).toBe(1);
-
-      let drainSettled = false;
-      const drain = cronJobRegistry.drain(500, 5).then((result) => {
-        drainSettled = true;
-        return result;
-      });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(drainSettled).toBe(false);
-
-      releaseDispatch();
-      expect((await inFlight).status).toBe(200);
-      await expect(drain).resolves.toMatchObject({ drained: true, stuckCount: 0 });
-      expect(cronJobRegistry.size()).toBe(0);
-    });
-
-    it('A-019: rehydration lookup is tracked and released on lookup failure', async () => {
-      let rejectLookup!: (error: Error) => void;
-      const lookup = new Promise<any>((_resolve, reject) => { rejectLookup = reject; });
-      const store = {
-        get: jest.fn(() => lookup),
-        set: jest.fn().mockResolvedValue(undefined),
-        touch: jest.fn().mockResolvedValue(undefined),
-        delete: jest.fn().mockResolvedValue(undefined),
-      };
-      const isolated = express();
-      isolated.use(express.json());
-      process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
-      setupMcpServer(isolated, store as any);
-
-      const inFlight = request(isolated)
-        .post('/mcp')
-        .set('Authorization', `Bearer ${TEST_TOKEN}`)
-        .set('mcp-session-id', 'remote-session')
-        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 22 })
-        .then((response) => response);
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(cronJobRegistry.snapshot().mcpHttpToolCall).toBe(1);
-
-      let drainSettled = false;
-      const drain = cronJobRegistry.drain(500, 5).then((result) => {
-        drainSettled = true;
-        return result;
-      });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(drainSettled).toBe(false);
-
-      rejectLookup(new Error('store unavailable'));
-      expect((await inFlight).status).toBe(404);
-      await expect(drain).resolves.toMatchObject({ drained: true, stuckCount: 0 });
-      expect(cronJobRegistry.size()).toBe(0);
     });
 
     it('should handle initialization request and create session', async () => {

@@ -188,7 +188,7 @@ describe('applyAttioPersonEvent', () => {
       phone: '+15551234567',
       title: 'Engineer',
       syncMetadata: { attio_record_id: 'rec-1' },
-    }));
+    }), 'integration');
   });
 
   // ENG-2322: both lookups said "absent" but createLead's own email pre-check found the row (a
@@ -256,7 +256,7 @@ describe('applyAttioPersonEvent', () => {
     expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
       email: 'new@example.com',
       company: 'Acme Corp',
-    }));
+    }), 'integration');
   });
 
   it('does NOT sync linkedin via webhook — the default mapping marks it push-only, same as manual pull respects', async () => {
@@ -346,7 +346,7 @@ describe('applyAttioPersonEvent', () => {
 
     expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
       customFields: { favoriteColor: 'blue' },
-    }));
+    }), 'integration');
   });
 
   it('merges enabled custom fields into an existing lead\'s customFields on update, rather than overwriting them', async () => {

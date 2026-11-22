@@ -1,14 +1,15 @@
 import { randomUUID } from 'crypto';
+import { MODIFY_WORK_PLAN_INPUT_SCHEMA, validateModifyWorkPlanArgs } from './impl/modifyWorkPlanArgs';
 import { agentModeService } from '../services/agentModeService';
 import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
-import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
-import { askCrm, AskCrmLead } from '../services/askCrmService';
+import { askCrm } from '../services/askCrmService';
+import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
 import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
@@ -91,6 +92,7 @@ import * as twitterImpl from './impl/twitter';
 // bags, so those keep calling `agentModeService.<method>` (the class's own
 // delegating wrapper, which injects the private dependencies internally).
 import * as adsApisImpl from './impl/adsApis';
+import { listMetaAdsCampaignsTool, callMetaMarketingApiTool, callMetaAdsInsightsApiTool, getMetaAdsMetricsTool } from './metaTools';
 // ENG-2103 (F2), cluster 19: Google Ads + HubSpot/Attio CRM passthrough
 // tools. handleCallGoogleAdsApi/handleCallGoogleAdsReportingApi/
 // handleHubspotApi call the module directly. handleAttioApi is re-exported
@@ -120,6 +122,7 @@ import * as miscImpl from './impl/misc';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
+import './leadNotificationTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
@@ -806,11 +809,15 @@ emmaToolRegistry.register({
       const { skillService } = await import('../services/skillService');
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
         skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
+      // ENG-1978: null = entitlement unresolved. Admit nothing on the tier's behalf — the user's
+      // own skills still install via the ownerId check below, but an unproven tier entitlement
+      // must never be the thing that admits a skill into a session.
+      const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
@@ -899,11 +906,14 @@ emmaToolRegistry.register({
       // best-effort: degrade to non-org behavior
     }
 
-    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+    const [publishedSkills, rawAllowedSkillIds] = await Promise.all([
       skillService.getSkillsAvailableToUser(userId, userOrgId),
       getAllowedSkills(userId)
     ]);
 
+    // ENG-1978: null = entitlement unresolved. List nothing extra rather than the whole catalog;
+    // the user's own skills still appear via the ownerId check below.
+    const userAllowedSkillIds: string[] = rawAllowedSkillIds ?? [];
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
 
@@ -1349,433 +1359,10 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
   }
 });
 
-emmaToolRegistry.register({
-  name: 'list_meta_ads_campaigns',
-  definition: {
-    name: 'list_meta_ads_campaigns',
-    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics. Admin-only: pass client_id to run against a specific client\'s account instead of the caller\'s own.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        account_id: {
-          type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
-        },
-        client_id: CLIENT_ID_SCHEMA_PROPERTY,
-      },
-      required: []
-    }
-  },
-  execute: async (args, context) => {
-    if (args.client_id) {
-      return await agentModeService.listMetaAdsCampaignsNew(
-        context?.userId,
-        args.account_id,
-        {},
-        { clientId: args.client_id, toolName: 'list_meta_ads_campaigns' }
-      );
-    }
-    return args.account_id
-      ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
-      : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
-  }
-});
+emmaToolRegistry.register(listMetaAdsCampaignsTool);
 
 // --- Tools from marketingTools.ts ---
-emmaToolRegistry.register({
-  name: "call_meta_marketing_api",
-  definition: {
-    name: "call_meta_marketing_api",
-    description:
-      `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
-
-LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a pre-flight
-  tracking check on the campaign's destination URLs first. A destination is measurable only if its served HTML
-  carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some other account
-  will never receive these conversions, so it does not count. If any destination fails, the launch is BLOCKED
-  (result has blocked=true, reason='tracking_preflight') and the message names each destination and what was
-  checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel is
-  receiving events server-side, the page may be measured through the Conversions API, which this check cannot
-  see. Only pass params.override_tracking_check=true if the user explicitly chooses to launch anyway — never set
-  it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
-  or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
-  The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
-  unconfirmed preview call and show the user the WARNING line that comes back in the summary. NOTE: the
-  override-waiver replay described elsewhere in this codebase (a second call carrying
-  params.tracking_override_token) is not currently supported for a write routed through the approval-deck
-  flow below — if the user explicitly wants to waive the tracking check, say so plainly rather than promising
-  a mechanism that isn't wired through yet, and flag it for a human rather than guessing a workaround.
-
-⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
-  CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
-  destroy live entities. For these, the API halts before ever writing — it does NOT execute on the first call:
-    1. Call normally (without params.confirm — this flag does nothing on its own; see its own parameter
-       description below). The API returns awaitingUserConfirmation:true with a "target" object naming the
-       exact campaign + ad set + asset that will be affected, and adds the write to an approval deck the user
-       answers directly in the UI with real approve/reject controls — not a typed reply you relay for them.
-    2. Do NOT re-call this tool for the SAME write after this halt, with or without params.confirm=true.
-       There is no flag or retry on your end that makes this execute — the only thing that authorizes it is
-       the user's own answer, submitted through the deck UI, which the backend then executes automatically.
-       Treat the halt as the end of your turn for that write. A later turn will tell you the outcome (applied,
-       failed, or rejected) once the user has answered — do not assume success and do not ask the user to
-       confirm again via chat text.
-    3. When one user directive covers multiple gated writes with no data dependency between them (for example,
-       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message — every halted
-       write from that one message is front-loaded into ONE deck the user answers once, instead of one prompt
-       per write. Split only on a real data dependency, such as creating a creative before an ad can reference
-       its creative_id.
-  If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
-  candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
-  user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
-  (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
-
-⚠️ CAMPAIGN OBJECTIVE IS IMMUTABLE — cannot be changed after creation. There is NO "start with Traffic/LPV
-  and switch to conversions later" on Meta; that is not a valid plan. Because of this, a CAMPAIGN CREATE
-  with no objective the user explicitly chose is BLOCKED SERVER-SIDE before it reaches Meta: if you omit
-  objective_quote (see below) and the objective hasn't already been confirmed by the user in this session,
-  the call returns a blocking question instead of creating the campaign — do not try to work around this
-  by guessing an objective or retrying.
-
-  If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
-  build anything: do NOT use ask_user_question or present_question_deck to ask about the objective
-  yourself — both tools explicitly exclude it for this exact reason, and doing so anyway produces a
-  SECOND, uncorrelated question on top of this gate's own, meaning the user answers the same question
-  twice. You also have no way to render an interactive card any other way — do not fabricate one out of
-  HTML, markdown tables, or styled text in your reply; a hand-written "card" you write is not real and
-  answering it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/
-  targeting params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't
-  settled, the call itself returns the real blocking question, which the platform renders as an actual
-  clickable card. Do not stall in prose waiting to "ask first"; attempting the call is how the real card
-  appears.
-
-ACTION MATRIX (entity_type → supported actions):
-  CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
-  AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
-  CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
-  TARGETING     → SEARCH
-  PAGE          → LIST
-  DATASET       → LIST, GET_MATCH_QUALITY
-
-AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
-  LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
-  Use GET to verify a creative you just built or swapped onto an ad, and to read a
-  placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
-
-AD / AD_CREATIVE PREVIEW — render an existing ad or creative for one Meta placement.
-  AD requires ad_id; AD_CREATIVE requires params.creative_id. Pass params.ad_format (for example
-  DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY). The response contains Meta's
-  iframe HTML, not a permanent public URL; Meta preview iframes expire after 24 hours and are only
-  visible to people who can access the selected ad account.
-
-SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
-  ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
-  accepts both and scopes the read to that node. AD_CREATIVE LIST accepts ad_set_id only —
-  Meta has no campaign→creatives edge, so for campaign-scoped creatives use AD LIST with
-  campaign_id, which returns creative{...} inline on every ad.
-
-  Every LIST result carries "complete" and "hasMore" fields. A list is only the whole set when
-  complete is true, and the message says "(complete list)". When hasMore is true the read
-  stopped at a page bound and the set is PARTIAL.
-
-  ⚠ NEVER conclude that an ad, creative, campaign or ad set does not exist from a list where
-  complete is not true. An unscoped account-wide list is the weakest possible evidence of
-  absence. To check whether one specific thing exists, scope the list to its parent
-  (campaign_id / ad_set_id) or read the object directly by id — do not search a broad list and
-  report a miss. Reporting "not found" off a partial list has already told a customer that an
-  ad they were protecting did not exist, when it existed and we had paused it ourselves.
-
-READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
-  AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
-  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / spend_cap / bid_strategy. Pass campaign_id to read a single campaign. budget_remaining is only populated by Meta when the campaign itself carries the budget (CBO); for ad-set-budgeted campaigns it is absent — read the ad sets' budgets instead, do not infer 0.
-  Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
-
-SPEND CAP (campaign hard money stop):
-  params.spend_cap sets the campaign's lifetime hard stop, in MAJOR units of the ad account currency (e.g. 3000 = $3,000 USD, 300 = NT$300 TWD); the server converts to Meta's minor units and echoes both. Unknown account currencies are rejected. Writable on CAMPAIGN CREATE and CAMPAIGN UPDATE.
-  Every spend_cap write is verified server-side by re-reading the campaign, and the result says which happened:
-    spend_cap_verified:true  → the cap is really on the campaign (the value is echoed back as spend_cap). ONLY then may you tell the user a cap is in place.
-    spend_cap_verified:false with error SPEND_CAP_UNCONFIRMED → the cap could not be confirmed. This does NOT mean it failed: Meta sometimes reports a campaign without the field for a few seconds after a write that did land. Never claim the cap is set, and never announce it as missing either — re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap"). If it is still absent, apply it with CAMPAIGN UPDATE (on CREATE the campaign already exists — use the returned campaign id, do NOT create it again). The message says what was actually read.
-  Never report a spend cap as set based on the write response alone.
-
-BUDGET READ-BACK (CAMPAIGN/AD_SET UPDATE with daily_budget, lifetime_budget, or budget_amount):
-  The result carries budget_verification: CONFIRMED (read back as requested — only then say the budget is set), MISMATCH (error BUDGET_MISMATCH — tell the user the requested vs applied values from budget_requested/budget_applied, in cents), or UNCONFIRMED (error BUDGET_UNCONFIRMED — the write was accepted but could not be read back; not a failure, do not re-send blindly, do not claim it is set; re-read with LIST first).
-
-DATASET USAGE:
-  LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
-  GET_MATCH_QUALITY → Asks Meta for Event Match Quality (EMQ) scores per event type. Requires params.dataset_id.
-  WORKFLOW: First LIST to discover pixel/dataset IDs, then GET_MATCH_QUALITY with the dataset_id.
-  ⚠ META USUALLY RETURNS NOTHING HERE. Its event_stats field comes back empty on live pixels, and no other EMQ API exists.
-     When that happens the response sets meta_event_match_quality_available: false and includes send_side_identity_coverage
-     instead — the share of conversions WE sent that carried each identity parameter (em, ph, fn, ln, fbc, fbp, IP, user agent).
-     That is OUR send-side measurement, NOT Meta's match-quality score. Never report it as Meta's EMQ, and never state or imply
-     an EMQ score when meta_event_match_quality_available is false — say Meta does not expose the number and give the coverage.
-
-REQUIRED IDs PER ACTION:
-  CAMPAIGN UPDATE/DELETE  → campaign_id required
-  AD_SET CREATE           → campaign_id required
-  AD_SET UPDATE/DELETE    → ad_set_id required
-  AD CREATE               → ad_set_id required
-  AD UPDATE/DELETE        → ad_id required
-  AD COPY_AD              → ad_id (source ad to copy) required
-  AD RETAG_UTM            → ad_id required
-  TARGETING SEARCH        → params.q and params.type required
-
-AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them):
-  Only for ads that already exist and were found untagged, e.g. via audit_ad_utm_coverage. Never call this
-  in a loop over multiple ads — it is a single-target action, one ad per call, always. Retagging swaps in a
-  NEW creative for the ad, which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client
-  campaign. You MUST tell the user this cost explicitly before calling — do not call it as a quiet "fix" in
-  the middle of another task. The normal confirmation flow (see above) will also surface this same warning,
-  but say it yourself first regardless.
-
-REQUIRED PARAMS PER ENTITY + ACTION:
-  CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
-                        Optional: status, spend_cap (major currency units, e.g. dollars), advantage_campaign_budget + budget_amount (major units of the ad account currency).
-                        Any OTHER param is REJECTED before the campaign is created, naming the field — nothing is ever accepted and silently dropped. Campaign-level budget goes through advantage_campaign_budget + budget_amount (never a bare daily_budget/lifetime_budget); scheduling (start_time/stop_time) comes from the AD SETS, because Meta accepts those on a campaign create and then ignores them; ad-set fields (bid_strategy, targeting, optimization_goal, billing_event) belong on AD_SET CREATE.
-  AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
-                        Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
-                        Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
-                        bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
-                        Dayparting/ad scheduling (adset_schedule, pacing_type) IS supported but requires lifetime_budget (never daily_budget) plus end_time — Meta silently ignores the schedule and delivers 24/7 on a daily-budget ad set, so that combination is REJECTED, naming the requirement. pacing_type defaults to ['day_parting'] automatically whenever adset_schedule is present and pacing_type is omitted. start_time/end_time are the flight window, not dayparting, and remain independent (ENG-842).
-                        After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
-  AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
-  AD CREATE:            name, creative_id (plus ad_set_id top-level param)
-  AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
-  CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
-  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics | adgeolocation). For type=adgeolocation, results include a location key/region_id for use in ad set geo_locations; optionally pass location_types (e.g. ['city']).
-
-COPY_AD WORKFLOW (clone an existing ad with optional overrides):
-  1. Use AD LIST to find the source ad and get its ad_id
-  2. Call AD COPY_AD with the source ad_id and any overrides (e.g. link_url for new landing page)
-  3. The system automatically: reads source creative → copies images (re-uploading from CDN if needed) → creates new creative → creates new ad
-  4. Returns new_ad_id and new_creative_id
-  NOTE: AD LIST now includes creative.object_story_spec so you can inspect image/video/URL details before copying.
-
-CHANGING AN AD'S CREATIVE/IMAGE (AD UPDATE):
-  Meta ads cannot mutate a creative in place — you must point the ad at a different creative.
-  - To swap to a creative you already built: AD UPDATE with params.creative_id (the system nests it correctly; a top-level creative_id is silently dropped by Meta and the old image keeps showing).
-  - To change copy/destination/image content: AD UPDATE with link_url / body / title / image_hash / image_url — the system auto-builds a new creative from the old one (preserving existing UTM/url_tags unless you override them) and swaps it in.
-  Either way the change is reflected on the SAME ad_id; deleting and recreating the ad is NOT required.
-  VERIFICATION: after ANY creative swap the system re-fetches the ad to confirm the new creative actually attached, and for link_url/destination changes that the live URL matches what you requested. Behavior depends on which path:
-    - params.creative_id (direct swap): a single read-back. If it returns error SWAP_NOT_REFLECTED the change did NOT take effect (usually transient Meta propagation) — retry the AD UPDATE with the same params.creative_id (the creative already exists, don't rebuild it).
-    - auto-built swap (link_url / body / title / image_hash / image_url): the system re-attaches and re-verifies up to 3 times before giving up. Outcomes:
-        - verified:true → confirmed live; the user will see the new URL in Ads Manager. (May also include effective_status / review_feedback, e.g. PENDING_REVIEW, as informational — Meta's ad review can take up to ~24h but the destination is already set.)
-        - pending:true with error SWAP_PENDING or DESTINATION_PENDING → after 3 checks Meta had not yet reflected the change. This is almost always transient propagation, NOT a failure: tell the user the update is applied on Meta's side and will reflect within a few minutes; do NOT keep retrying in a tight loop. Re-check after a short wait if confirmation is needed.
-    - success with verified:false (either path) → the swap was sent but the confirmation read-back itself failed; re-check the ad before telling the user it's done.
-
-CAMPAIGN OBJECTIVES (valid values for 'objective'):
-  OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
-
-BUDGET RULES (Campaign & Ad Set):
-  - Provide daily_budget OR lifetime_budget, NEVER both
-  - lifetime_budget requires end_time (ISO 8601)
-  - advantage_campaign_budget=true enables campaign-level budget; use budget_amount instead of ad-set-level budget
-
-CREATIVE SUB-TYPES (mutually exclusive — pick exactly one):
-  IMAGE creative:    provide image_hash (from UPLOAD_IMAGE) OR image_url
-  VIDEO creative:    provide video_id (from UPLOAD_VIDEO) + REQUIRED thumbnail: image_hash or image_url
-                     (Meta API error 1443226 if thumbnail is missing — always upload thumbnail first)
-  CAROUSEL creative: provide carousel_cards array with 2–10 items; each card needs at least one of image_hash, image_url, or video_id; plus title, link_url per card
-  PLACEMENT-CUSTOMIZED creative: provide placement_assets — different image per placement in ONE creative (e.g. square for Feed, 9:16 for Stories/Reels). See below.
-  RULE: video_id, carousel_cards, and placement_assets are mutually exclusive — pick one.
-
-PLACEMENT ASSET CUSTOMIZATION (placement_assets) — fixes "invalid format / lacking 9:16 for story and reel":
-  When an ad set uses manual placements that include Stories/Reels, a creative with only a square/4:5
-  Feed image is rejected (missing 9:16) and the ad is auto-paused. Attach a vertical 9:16 asset for
-  Stories/Reels while keeping the square image for Feed — in the SAME creative — via placement_assets.
-  Shape: placement_assets = [
-    { image_hash OR image_url, is_default: true },                 // fallback (square/Feed image) — exactly one
-    { image_hash OR image_url, placements: ["story", "reels"] }     // 9:16 vertical asset for Stories/Reels
-  ]
-  Rules: at least 2 assets; EXACTLY ONE default (is_default:true or omit placements); body/title/link_url
-  apply to all placements. image_url is auto-uploaded to a hash. Placement tokens: feed, facebook_feed,
-  instagram_feed, story/stories, facebook_story, instagram_story, reels, facebook_reels, instagram_reels, explore.
-  TO FIX AN EXISTING AD: AD UPDATE with ad_id + params.placement_assets — the system builds the new
-  multi-placement creative and points the SAME ad at it (no Ads Manager UI, same ad_id).
-  NOTES:
-  - Instagram placements (story/reels/etc.) need an Instagram actor; the system auto-resolves it from the
-    Page, or pass params.instagram_user_id explicitly. (Meta error 1772103 = "Instagram Account Is Missing".)
-  - CTA must be allowed for the campaign objective on asset-feed creatives. e.g. BOOK_NOW is rejected under
-    OUTCOME_SALES (Meta error 1885396) — use a supported CTA like LEARN_MORE / SIGN_UP / SHOP_NOW.
-
-VIDEO CREATIVE WORKFLOW (3 steps, all required):
-  Step 1: UPLOAD_VIDEO → returns video_id
-  Step 2: UPLOAD_IMAGE → returns image_hash  (thumbnail — MANDATORY for video creatives)
-  Step 3: AD_CREATIVE CREATE with video_id + image_hash (or image_url)
-
-OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
-  OUTCOME_TRAFFIC   → LINK_CLICKS, LANDING_PAGE_VIEWS
-  OUTCOME_AWARENESS → REACH, IMPRESSIONS
-  OUTCOME_ENGAGEMENT → POST_ENGAGEMENT, PAGE_LIKES
-  OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
-  OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
-  OUTCOME_APP_PROMOTION → APP_INSTALLS
-
-AD LIST COMPLETENESS:
-  AD LIST returns ALL non-deleted ads including those paused at the campaign or adset level.
-  Each ad includes effective_status which shows the true running state:
-    ACTIVE           → ad is running
-    PAUSED           → ad itself is paused
-    CAMPAIGN_PAUSED  → ad's campaign is paused (ad would run if campaign is unpaused)
-    ADSET_PAUSED     → ad's adset is paused (ad would run if adset is unpaused)
-  To fully pause all spend, you must pause ads/adsets/campaigns in ALL effective statuses, not just ACTIVE.
-  When asked to "pause all ads", always LIST first then UPDATE every ad regardless of effective_status.
-
-GETTING DESTINATION URLS / CREATIVE DETAILS:
-  AD LIST now returns creative sub-fields directly (name, body, title, image_url, thumbnail_url, object_story_spec).
-  Extract link from: image creative → creative.object_story_spec.link_data.link
-                     video creative → creative.object_story_spec.video_data.call_to_action.value.link
-                     carousel       → creative.object_story_spec.link_data.child_attachments[].link
-  If you need creatives for ALL ads in the account without filtering: use AD_CREATIVE LIST.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        entity_type: {
-          type: "string",
-          enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE", "DATASET"],
-          description: "The Meta Ads entity to operate on."
-        },
-        action: {
-          type: "string",
-          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
-          description: "The operation to perform. Must be valid for the chosen entity_type."
-        },
-        account_id: {
-          type: "string",
-          description: "Ad Account ID (without 'act_' prefix). Must be obtained from list_connected_accounts(platform='meta')."
-        },
-        campaign_id: {
-          type: "string",
-          description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter), AD LIST (optional filter — scopes the read to that campaign; strongly preferred over listing the whole account)."
-        },
-        ad_set_id: {
-          type: "string",
-          description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter), AD_CREATIVE LIST (optional filter). Scopes the read to that ad set; takes precedence over campaign_id when both are given."
-        },
-        ad_id: {
-          type: "string",
-          description: "Ad ID. Required for: AD UPDATE/DELETE/COPY_AD/RETAG_UTM."
-        },
-        params: {
-          type: "object",
-          description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
-          properties: {
-            // --- Confirmation gate (write actions) ---
-            confirm: { type: "boolean", description: "Does nothing on its own — kept only so existing calls that still set it don't error. A CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD write only ever executes once the user has approved it through the approval-deck UI; this flag cannot authorize a write by itself, and re-calling with it set to true after a halt will NOT make the write execute. See MANDATORY TARGET CONFIRMATION above." },
-
-            // --- Common ---
-            name: { type: "string", description: "Entity name." },
-            status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
-
-            // --- Campaign ---
-            objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
-            objective_quote: {
-              type: "string",
-              description:
-                "CAMPAIGN CREATE ONLY: the exact, literal substring from the user's own message that names this objective (e.g. the user typed \"set up a leads campaign\" → objective_quote: \"leads campaign\"). Provide this ONLY when the user explicitly named the objective themselves — it is checked against their actual message, and a quote that doesn't genuinely appear there is rejected. Do NOT invent or paraphrase a quote, and do NOT provide this if the user did not actually name an objective — just omit it and the objective will be confirmed automatically before the campaign is created.",
-            },
-            special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
-            advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
-            spend_cap: { type: "number", minimum: 0.01, description: "CAMPAIGN CREATE/UPDATE: lifetime hard-stop spend cap for the campaign, as a positive amount of MAJOR account-currency units (e.g. 3000 = $3,000; 100.50 = $100.50; 300 = NT$300) — never cents/minor units; the server converts and echoes raw + major values. The write is verified by an independent read-back — see SPEND CAP in the tool description; only claim the cap is set when spend_cap_verified is true. Read it back any time via CAMPAIGN LIST with params.fields including spend_cap." },
-            budget_amount: { type: "number", description: "Campaign-level daily budget in major units of the ad account currency (when advantage_campaign_budget is true)." },
-
-            // --- Ad Set ---
-            optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
-            billing_event: { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
-            daily_budget: { type: "number", description: "Daily budget in major units of the ad account currency. Minimum 1, maximum 5,000." },
-            lifetime_budget: { type: "number", description: "Lifetime budget in major units of the ad account currency. Minimum 1, maximum 50,000. Requires end_time." },
-            bid_strategy: { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
-            bid_amount: { type: "number", description: "Bid amount in major units of the ad account currency. Required for BID_CAP and COST_CAP strategies." },
-            targeting: {
-              type: "object",
-              description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
-            },
-            start_time: { type: "string", description: "ISO 8601 start datetime." },
-            end_time: { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
-            promoted_object: { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
-            destination_type: { type: "string", description: "Conversion location for the ad set. Defaults to 'WEBSITE' for website traffic/conversion goals (LINK_CLICKS, LANDING_PAGE_VIEWS, OFFSITE_CONVERSIONS, VALUE) so the ad-level Destination is explicitly set. Pass explicitly for other destinations: 'ON_AD' (instant lead forms), 'MESSENGER', 'APP'." },
-
-            // --- Creative ---
-            page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
-            instagram_user_id: { type: "string", description: "Instagram actor ID for the creative. Required when serving Instagram placements (e.g. placement_assets targeting story/reels); auto-resolved from the Page if omitted." },
-            image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
-            image_url: { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
-            video_id: { type: "string", description: "Video ID from UPLOAD_VIDEO." },
-            video_url: { type: "string", description: "Video URL (for UPLOAD_VIDEO action)." },
-            carousel_cards: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  image_hash: { type: "string" }, video_id: { type: "string" },
-                  title: { type: "string" }, description: { type: "string" }, link_url: { type: "string" }
-                }
-              },
-              description: "Carousel card array for multi-card creatives."
-            },
-            placement_assets: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  image_hash: { type: "string", description: "Image hash from UPLOAD_IMAGE." },
-                  image_url: { type: "string", description: "Image URL (auto-uploaded to a hash)." },
-                  placements: {
-                    type: "array",
-                    items: { type: "string" },
-                    description: "Placement tokens this image serves (e.g. ['story','reels']). Omit for the default/fallback asset."
-                  },
-                  is_default: { type: "boolean", description: "Marks the fallback image that serves every unmatched placement (e.g. the square Feed image). Exactly one asset must be the default." }
-                }
-              },
-              description: "Placement-level image customization (asset_feed_spec). Map different images to different placements in ONE creative (square→Feed, 9:16→Stories/Reels). Requires ≥2 assets and exactly one default. Mutually exclusive with video_id and carousel_cards."
-            },
-            body: { type: "string", description: "Ad body / primary text." },
-            title: { type: "string", description: "Ad headline." },
-            link_url: { type: "string", description: "Destination URL." },
-            lander_id: { type: "string", description: "Generated landing page ID. When provided, its UTM override is resolved over the customer default for Meta url_tags." },
-            url_tags: { type: "string", description: "Meta creative URL parameters as a query string. Validated as a string at the tool boundary; configured lander UTMs are resolved around it without overwriting gclid/fbclid." },
-            call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
-            creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
-            ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
-
-            // --- Custom Audience ---
-            subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
-            description: { type: "string", description: "Audience description." },
-            customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
-            lookalike_spec: { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
-            id: { type: "string", description: "Audience ID for UPLOAD_USERS." },
-            schema: { type: "array", items: { type: "string" }, description: "PII field types for UPLOAD_USERS (e.g., ['EMAIL', 'FN', 'LN'])." },
-            payload: { type: "string", description: "User data as JSON array-of-arrays for UPLOAD_USERS." },
-
-            // --- Targeting Search ---
-            q: { type: "string", description: "Search query for targeting search." },
-            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics", "adgeolocation"], description: "Targeting category to search. Use 'adgeolocation' to resolve geo-targeting locations (cities/regions/zips) into keys usable in ad set geo_locations." },
-            location_types: { type: "array", items: { type: "string" }, description: "For type='adgeolocation' only: restrict results to specific location kinds, e.g. ['city'], ['region'], ['zip'], ['country']." },
-
-            // --- Dataset ---
-            dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
-          }
-        }
-      },
-      required: ["entity_type", "action", "account_id"]
-    }
-  },
-  execute: async (args, context) => {
-    return await agentModeService.callMetaMarketingApi(
-      context?.userId,
-      args.entity_type,
-      args.action,
-      args.account_id,
-      args.campaign_id,
-      args.ad_set_id,
-      args.ad_id,
-      args.params,
-      context?.sessionId,
-    );
-  }
-});
+emmaToolRegistry.register(callMetaMarketingApiTool);
 
 // ENG-600: audience_source shape shared by both new tools below. Exactly one
 // of hubspot_list_id / csv_url must be given — csv_url accepts a chat file
@@ -1846,186 +1433,9 @@ emmaToolRegistry.register({
   }
 });
 
-emmaToolRegistry.register({
-  name: "call_meta_ads_insights_api",
-  definition: {
-    name: "call_meta_ads_insights_api",
-    description:
-      "Fetch performance reporting data from Meta Ads (impressions, clicks, spend, conversions, ROAS, etc.). Use this for custom queries with specific fields, date ranges, breakdowns, or filtering. Handles Meta's async reporting internally and returns the insights rows inline as { totalRows, metadata, data }. (If the result set is very large it may be offloaded to an S3 key readable with read_tool_response/search_tool_response.) You MUST provide either date_preset or time_range (defaults to all-time if omitted, which can be very large). For a quick pre-built dashboard summary of specific campaigns, use get_meta_ads_metrics instead.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        account_id: {
-          type: "string",
-          description:
-            "The ad account ID (numeric, without 'act_' prefix). Use list_connected_accounts to retrieve this. DO NOT guess.",
-        },
-        object_type: {
-          type: "string",
-          enum: ["account", "campaign", "adset", "ad"],
-          description:
-            "Entity level to fetch insights for. Use 'account' for the whole account.",
-        },
-        object_id: {
-          type: "string",
-          description:
-            "The entity ID. REQUIRED when object_type is campaign, adset, or ad. Omit for account-level.",
-        },
-        fields: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Metrics to retrieve. Common: impressions, reach, clicks, spend, ctr, cpc, cpm, actions, action_values, purchase_roas, conversions, video_views, cost_per_action_type.",
-        },
-        date_preset: {
-          type: "string",
-          enum: [
-            "today",
-            "yesterday",
-            "this_month",
-            "last_month",
-            "this_quarter",
-            "maximum",
-            "last_3d",
-            "last_7d",
-            "last_14d",
-            "last_28d",
-            "last_30d",
-            "last_90d",
-            "this_year",
-            "last_year"
-          ],
-          description:
-            "Predefined date range. Recommended default: 'last_30d'. Use 'maximum' for lifetime. Mutually exclusive with time_range.",
-        },
-        time_range: {
-          type: "object",
-          properties: {
-            since: {
-              type: "string",
-              description: "Start date (YYYY-MM-DD). Must be <= until.",
-            },
-            until: {
-              type: "string",
-              description: "End date (YYYY-MM-DD). Must be >= since.",
-            },
-          },
-          required: ["since", "until"],
-          description:
-            "Custom date range. Both since and until are required. Mutually exclusive with date_preset.",
-        },
-        level: {
-          type: "string",
-          enum: ["account", "campaign", "adset", "ad"],
-          description:
-            "Row aggregation level. Example: object_type='account' + level='campaign' returns one row per campaign.",
-        },
-        breakdowns: {
-          type: "array",
-          items: {
-            type: "string",
-            enum: ["age", "gender", "country", "region", "publisher_platform", "platform_position", "device_platform"],
-          },
-          description:
-            "Segment results by dimension. E.g., ['age', 'gender'] splits each row by age+gender.",
-        },
-        action_breakdowns: {
-          type: "array",
-          items: {
-            type: "string",
-            enum: ["action_type", "action_target_id", "action_destination", "action_device", "action_reaction", "action_video_sound", "action_video_type", "action_carousel_card_id", "action_carousel_card_name"],
-          },
-          description:
-            "Segment action/conversion metrics. Use 'action_type' to break down the 'actions' and 'action_values' fields by event type (e.g., purchase, link_click).",
-        },
-        filtering: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              field: { type: "string", description: "Field to filter on (e.g., 'campaign.name', 'adset.name', 'campaign.objective')." },
-              operator: { type: "string", enum: ["EQUAL", "NOT_EQUAL", "GREATER_THAN", "LESS_THAN", "IN", "NOT_IN", "CONTAIN", "NOT_CONTAIN"] },
-              value: { description: "Filter value. String for EQUAL/CONTAIN, array for IN/NOT_IN." },
-            },
-            required: ["field", "operator", "value"],
-          },
-          description:
-            "Server-side filters to narrow results before aggregation.",
-        },
-        client_id: CLIENT_ID_SCHEMA_PROPERTY,
-      },
-      required: ["account_id", "object_type", "fields"],
-    },
-  },
-  execute: async (args, context) => {
-    return await agentModeService.callMetaAdsInsightsApiWrapper(
-      context?.userId,
-      args as any,
-    );
-  },
-});
+emmaToolRegistry.register(callMetaAdsInsightsApiTool);
 
-emmaToolRegistry.register({
-  name: 'get_meta_ads_metrics',
-  definition: {
-    name: 'get_meta_ads_metrics',
-    description: 'Quick pre-built dashboard: returns a formatted summary of campaign, ad set, and ad performance with demographics, placement, and device breakdowns for specific campaigns. Best for "how are my campaigns doing?" questions. For custom field selection, custom date ranges, or raw data export, use call_meta_ads_insights_api instead.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        timeframe: {
-          type: 'string',
-          description: 'Time period for metrics (7d, 14d, 30d, 90d)',
-          enum: ['7d', '14d', '30d', '90d'],
-          default: '7d'
-        },
-        campaign_ids: {
-          // Union type so the static schema accepts exactly the shapes execute()
-          // normalizes (array preferred; legacy single string also accepted).
-          // minItems only fires for arrays, so a string id is not rejected.
-          type: ['array', 'string'],
-          items: { type: 'string' },
-          minItems: 1,
-          description: 'List of campaign IDs to filter metrics by (array preferred; a single campaign id string is also accepted). Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
-        },
-        campaign_id: {
-          // Legacy single-id alias. execute() normalizes this into campaign_ids.
-          type: 'string',
-          description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
-        },
-        account_id: {
-          type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
-        },
-        client_id: CLIENT_ID_SCHEMA_PROPERTY,
-      }
-    }
-  },
-  execute: async (args, context) => {
-    // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = normalizeMetaCampaignIds(
-      args.campaign_ids,
-      args.campaign_id,
-    );
-
-    if (args.client_id) {
-      return await agentModeService.getMetaAdsMetrics(
-        args.timeframe || '7d',
-        context?.userId,
-        normalizedCampaignIds,
-        args.account_id,
-        { clientId: args.client_id, toolName: 'get_meta_ads_metrics' },
-      );
-    }
-
-    return await agentModeService.getMetaAdsMetrics(
-      args.timeframe || '7d',
-      context?.userId,
-      normalizedCampaignIds,
-      args.account_id,
-    );
-  }
-});
+emmaToolRegistry.register(getMetaAdsMetricsTool);
 
 // ENG-918: read the resolved per-client detection thresholds (creative fatigue, campaign health)
 // for one of the caller's own connected ad accounts. Mirrors GET /api/ads-thresholds/:platform/:accountId
@@ -2624,7 +2034,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId);
+    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2704,7 +2116,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId);
+    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -2723,7 +2137,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId, {}, {
+      sessionId: context?.sessionId,
+    });
   }
 });
 
@@ -3378,7 +2794,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. Always call list_html_templates first and pass a template_id exactly as returned; never guess or invent a template_id. If this tool returns error_code TEMPLATE_NOT_FOUND, pick from its available_templates instead of retrying the same id. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4235,6 +3651,10 @@ emmaToolRegistry.register({
         cursor: {
           type: 'string',
           description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
+        },
+        include_all_fields: {
+          type: 'boolean',
+          description: 'If true, each lead also includes notes, linkedin, customFields, enrichmentMetadata, createdAt and updatedAt. Use for exports (e.g. CSV) instead of calling get_lead_details per lead.'
         }
       },
       required: ['list_id']
@@ -4242,6 +3662,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await leadsImpl.getLeads(args.list_id, context?.userId, {
+      includeAllFields: args.include_all_fields === true,
       search: args.search,
       status: args.status,
       icpOnly: args.icp_only,
@@ -4256,7 +3677,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. Filters are optional for list-scoped reads: passing list_id or list_ids with filters: [] (and no search) returns the leads of those lists page by page — follow next_cursor via cursor to read every page. A call with no filters, no search and no list_id/list_ids is rejected. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4289,7 +3710,7 @@ emmaToolRegistry.register({
             },
             required: ['field', 'operator']
           },
-          description: 'Array of filter criteria (AND logic — all must match)'
+          description: 'Array of filter criteria (AND logic — all must match). May be empty ([]) when list_id or list_ids is provided, to page through those lists unfiltered.'
         },
         search: {
           type: 'string',
@@ -4334,7 +3755,7 @@ emmaToolRegistry.register({
         },
         load_limit: {
           type: 'number',
-          description: 'Max number of leads to scan across the user\'s lists (default 500). Rarely needed — only raise if the user has tons of lists.'
+          description: 'Max number of leads to scan across the user\'s lists (default 500, hard cap 500 — every scanned lead also gets a live account/deal lookup, bounded at this same number, so raising it has no effect).'
         }
       },
       required: ['question']
@@ -4347,46 +3768,20 @@ emmaToolRegistry.register({
     }
 
     const resultLimit = Math.min(Math.max(args.limit ?? 10, 1), 25);
-    const loadLimit = Math.max(args.load_limit ?? 500, 1);
+    // Capped at USER_LOOKUP_BUDGET, not just floored: scanning more leads than the
+    // loader can enrich would silently return some leads live-corrected and others
+    // still frozen on their stored value, with nothing distinguishing which is which.
+    const loadLimit = Math.min(Math.max(args.load_limit ?? 500, 1), USER_LOOKUP_BUDGET);
 
-    // Lazy lead iteration across all of the user's lists. We flatten into the
-    // AskCrmLead shape so askCrm doesn't have to know about the underlying
-    // storage layout.
-    const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
-      const lists = excludeSessionLists(await crmDb.getLeadListsForUser(uid)); // ENG-2311: session rows would eat the load cap
-      const out: AskCrmLead[] = [];
-      for (const list of lists as any[]) {
-        if (out.length >= opts.limit) break;
-        const remaining = opts.limit - out.length;
-        const page = await crmDb.getLeadsByListId(list.listId, Math.min(remaining, 200));
-        const items: any[] = (page && (page as any).items) || [];
-        for (const it of items) {
-          out.push({
-            leadId: it.leadId,
-            listId: it.listId,
-            email: it.email || null,
-            // ENG-2082: without this the phone never reaches askCrm, so its projection and
-            // its specific_contact haystack stay blind to phone-only leads.
-            phone: it.phone || null,
-            firstName: it.firstName || null,
-            lastName: it.lastName || null,
-            company: it.company || null,
-            title: it.title || null,
-            status: it.status || null,
-            dealValue: typeof it.dealValue === 'number' ? it.dealValue : null,
-            lifecycle: it.lifecycle || null,
-            heatScore: typeof it.heatScore === 'number' ? it.heatScore : null,
-            healthScore: typeof it.healthScore === 'number' ? it.healthScore : null,
-            isICP: typeof it.isICP === 'boolean' ? it.isICP : null,
-            lastEngagementAt: it.lastEngagementAt || null,
-            openDealStages: Array.isArray(it.openDealStages) ? it.openDealStages : null,
-            contactStatus: it.contactStatus || null,
-          });
-          if (out.length >= opts.limit) break;
-        }
-      }
-      return out;
-    };
+    // Live account/deal enrichment is centralized in a tested loader so its
+    // authorization and partial-read semantics cannot drift from ask_crm.
+    const loadLeadsForUser = createAskCrmLeadLoader({
+      getLeadListsForUser: (uid) => crmDb.getLeadListsForUser(uid),
+      getLeadsByListId: (listId, limit) => crmDb.getLeadsByListId(listId, limit),
+      getUserById: (uid) => userDb.getUserById(uid),
+      getUserByEmail: (email) => userDb.getUserByEmail(email),
+      getDealsByOwner: (uid, opts) => dealDb.getDealsByOwner(uid, opts),
+    });
 
     try {
       const answer = await askCrm(
@@ -4734,6 +4129,18 @@ emmaToolRegistry.register({
         notes: {
           type: 'string',
           description: 'Optional notes about this status change'
+        },
+        message_draft: {
+          type: 'string',
+          description: 'Optional. The exact LinkedIn message text you drafted for this lead. Saved verbatim on the lead (messageDraft) so it appears in the CRM lead panel and the Pending Review queue for human approval. Pass it whenever you set status to pending_review for a LinkedIn draft.'
+        },
+        email_subject: {
+          type: 'string',
+          description: 'Optional. Subject of the email you drafted for this lead. Must be passed together with email_body. Saved verbatim on the lead (emailDraft).'
+        },
+        email_body: {
+          type: 'string',
+          description: 'Optional. Plain-text body of the email you drafted for this lead. Must be passed together with email_subject. Saved verbatim on the lead (emailDraft).'
         }
       },
       required: ['list_id', 'lead_id', 'status']
@@ -4742,7 +4149,8 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
-      args.deal_value, args.deal_currency, args.notes
+      args.deal_value, args.deal_currency, args.notes,
+      { messageDraft: args.message_draft, emailSubject: args.email_subject, emailBody: args.email_body, sessionId: context?.sessionId }
     );
   }
 });
@@ -5066,7 +4474,9 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
-        }
+        },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
+        save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
       },
       required: ['content']
     }
@@ -5074,7 +4484,9 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true || args.in_reply_to_post_id
+      ? [{ ...(args.save_as_draft === true ? { saveAsDraft: true } : {}), ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}) }]
+      : []));
   }
 });
 
@@ -5648,7 +5060,7 @@ emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
-    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the Veo fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default. LENGTH: infer the duration from the request (4–15s for the default Seedance model); if the user gives no length and you cannot infer one, ASK before generating rather than defaulting silently.',
+    description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation. Can optionally post-process the generated clip with Remotion to add brand overlays (headline, tagline, logo, CTA). IMPORTANT: For multi-clip videos (e.g. 24s = 3 clips), ALWAYS use a single generate_video call with durationSeconds=24 and compose=true — do NOT generate clips separately and stitch later. To stitch already-generated clips, use compose_video instead. REFERENCE IMAGES: When the user provides image(s) to base the video on, ALWAYS pass the actual image(s) as frames — never use a text description in place of the image. Recommended flow: (1) call describe_image on each reference image so you understand what it depicts (this grounds your motion prompt; it does NOT replace the frame); (2) pass the image URL(s) as frames — ONE image → set startFrame to its URL and leave endFrame unset (do NOT invent or duplicate a second frame); TWO images → startFrame = the opening/first image, endFrame = the closing/last image (only set endFrame when the user actually intends an end frame); (3) write a prompt that describes the MOTION/transition you want (informed by the descriptions) rather than restating the static contents the frame already carries. You may skip describe_image (step 1) when the user has already given a clear, detailed prompt and just wants the exact image animated. The default model (seedance-2.0 via Higgsfield) and the gemini-omni-1.1-flash fallback BOTH accept a single reference frame or two frames natively, so the actual image(s) are used. Only if a generation explicitly fails because a reference frame could not be loaded/imported should you fall back to describing the image(s) with describe_image and adding that to the prompt as text. ASPECT RATIO: infer the aspect ratio from the user\'s intent (e.g. a reel/short → vertical 9:16); if the user gives no orientation/format cue AND no reference frame to match, ASK them for the orientation before generating. Never ask about resolution — infer it or use the default. LENGTH: infer the duration from the request (4–15s for the default Seedance model); if the user gives no length and you cannot infer one, ASK before generating rather than defaulting silently.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5662,16 +5074,16 @@ emmaToolRegistry.register({
         },
         videoModel: {
           type: 'string',
-          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). Veo 3.1 is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
-          enum: ['veo-3.1-generate-preview', 'seedance-2.0']
+          description: 'Optional: video generation model. Leave unset — the default is seedance-2.0 (ByteDance Seedance 2.0 via Higgsfield; text-to-video, or image-to-video when startFrame/endFrame are given). gemini-omni-1.1-flash is used automatically as a fallback if Seedance fails. Do not surface model choice to the user.',
+          enum: ['gemini-omni-1.1-flash', 'seedance-2.0']
         },
         durationSeconds: {
           type: 'number',
-          description: 'Requested total video length in seconds. INFER it from the user\'s request (e.g. "a 12-second video" → 12, "make it 15s" → 15); if the user does not specify a length and you cannot infer one, ASK them before generating — do NOT silently default. The default model (Seedance 2.0) produces a SINGLE clip of 4–15s, so for the normal path set this to the requested length within 4–15. (If a generation falls back to Veo, which caps at 8s/clip, durations >8s are produced as multiple 8s clips stitched to the target length via Remotion — needs compose:true; for ≤8s Veo uses a single clip.) Falls back to 8 only if truly unspecified.'
+          description: 'Requested total video length in seconds. INFER it from the user\'s request (e.g. "a 12-second video" → 12, "make it 15s" → 15); if the user does not specify a length and you cannot infer one, ASK them before generating — do NOT silently default. The default model (Seedance 2.0) produces a SINGLE clip of 4–15s, so for the normal path set this to the requested length within 4–15. (If a generation falls back to gemini-omni-1.1-flash, which produces ~10s clips, durations >10s are produced as multiple clips stitched to the target length via Remotion; for ≤10s it uses a single clip.) Falls back to 8 only if truly unspecified.'
         },
         useKeyframes: {
           type: 'boolean',
-          description: 'Optional: When true and durationSeconds > 8 (multiple clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so Veo interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
+          description: 'Optional: When true and durationSeconds > 10 (multiple fallback clips), automatically generate AI keyframe images (f0, f1, ... fN) to guide each clip. Clip i gets startFrame=f[i] and endFrame=f[i+1], so the model interpolates between visually coherent waypoints. This greatly improves visual continuity across clip boundaries. Recommended for multi-clip videos. Defaults to false.'
         },
         startFrame: {
           type: 'string',
@@ -6615,7 +6027,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await miscImpl.readFileContent(args.file_url);
+    const result = await miscImpl.readFileContent(args.file_url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
@@ -6665,7 +6077,7 @@ emmaToolRegistry.register({
     }
 
     // Default: read raw HTML
-    const result = await miscImpl.readFileContent(args.url);
+    const result = await miscImpl.readFileContent(args.url, { userId: context?.userId || context?.agentUserId });
     if (result.success === false) {
       return {
         content: [
@@ -7062,59 +6474,12 @@ emmaToolRegistry.register({
   definition: {
     name: 'modify_work_plan',
     description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        steps: {
-          type: 'array',
-          description: 'Array of steps to add or update',
-          items: {
-            type: 'object',
-            properties: {
-              stepCount: {
-                type: 'number',
-                description: 'Step number'
-              },
-              title: {
-                type: 'string',
-                description: 'Step title'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional detailed description'
-              },
-              requiredFunctionCalls: {
-                type: 'array',
-                description: 'Optional array of function names that must be called before marking this step as completed',
-                items: {
-                  type: 'string'
-                }
-              },
-              expectedAssetCount: {
-                type: 'number',
-                description: 'Optional. Number of media assets the step must produce before it can be completed. Set to a lower number (or 0 to remove the requirement entirely) when the user explicitly approves generating fewer assets than originally planned. Omitting it leaves the existing value unchanged.'
-              }
-            },
-            required: ['stepCount', 'title']
-          }
-        },
-        removeStepCounts: {
-          type: 'array',
-          description: 'Optional array of step numbers to remove',
-          items: {
-            type: 'number'
-          }
-        },
-        autocomplete: {
-          type: 'boolean',
-          description: 'Optional. Update the autocomplete setting. When true, Emma runs all steps automatically without asking for user confirmation between steps.'
-        }
-      },
-      required: ['steps']
-    }
+    inputSchema: MODIFY_WORK_PLAN_INPUT_SCHEMA
   },
   execute: async (args: any, context?: any) => {
-    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
+    const argsError = validateModifyWorkPlanArgs(args);
+    if (argsError) return argsError;
+    return await workPlansImpl.modifyWorkPlan(args.steps || [], args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 
@@ -8142,8 +7507,15 @@ const SELF_ONLY_BRIDGE_DEFINITIONS: Record<string, { description: string; inputS
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   list_scheduled_chats: {
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'List scheduled chats (newest first) for the authenticated user. Paginated: returns { items, nextCursor }; pass nextCursor back as cursor for the next page (null = last page).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Page size (default 50, max 100)' },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
+      required: [],
+    },
   },
 };
 
@@ -8225,6 +7597,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } = await import('../services/codingAgentService');
+    const { classifyCodingAgentFailure } = await import('../services/codingAgentFailureClass');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
         return context.service.executeTool(
@@ -8290,6 +7663,9 @@ emmaToolRegistry.register({
       return {
         success: false,
         error: result.message,
+        // ENG-1949: semantic class for telemetry/retry guidance; the message is
+        // often the sub-agent's own prose and cannot be classified by text.
+        errorClass: classifyCodingAgentFailure(result),
         iterations: result.iterations,
         previewUrl: result.previewUrl,
         branch: result.branch,
@@ -8478,11 +7854,17 @@ emmaToolRegistry.register({
       }
     }
 
+    // ENG-2378: a step model on the session plan is the user's explicit choice; carry it into the saved template
+    // while per-step models are honoured (switch on, or unknown after a settings outage).
+    const { anyStepCarriesModel, carryStoredStepModels } = await import('../services/agentMode/workPlanStepModels');
+    const carrySessionModels = anyStepCarriesModel(sessionWorkPlan?.steps)
+      && await (await import('../services/agentMode/workPlanStepModelsInstance')).workPlanStepModels.shouldHonor();
+
     const plan = await workPlanService.createWorkPlan({
       title: args.title,
       description: args.description || '',
       welcomeMessage: args.welcomeMessage || '',
-      steps: steps.map((s: any, i: number) => {
+      steps: (carrySessionModels ? (list: any[]) => carryStoredStepModels(list, sessionWorkPlan.steps) : (list: any[]) => list)(steps.map((s: any, i: number) => {
         const stepNum = s.stepCount || i + 1;
         const sessionStep = sessionStepMap.get(stepNum);
         return {
@@ -8505,7 +7887,7 @@ emmaToolRegistry.register({
             return count !== undefined ? { expectedAssetCount: count } : {};
           })(),
         };
-      }),
+      })),
       ownerId: userId,
       visibility: 'private',
       isBuiltIn: false,
@@ -9884,8 +9266,10 @@ ACTION MATRIX:
               ENG-1944: enabling the CAMPAIGN does NOT enable its ad groups, keywords, or ads — those default to PAUSED on creation and stay that way unless explicitly updated. A successful RESUME/UPDATE(ENABLED) response may include pausedChildEntitiesWarning naming ad groups/keywords/ads still PAUSED underneath — if present, the campaign will deliver ZERO traffic despite showing ENABLED. Do not report a launch as live until you've enabled those too (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED) and re-checked. Never rely on CAMPAIGN status alone to confirm something is live.
               ADD_PROXIMITY (campaign_resource_name, radius, and EITHER address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?} OR latitude+longitude (decimal degrees); radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
+              DISCLOSURE RULE (AGW-155): if any targeting step cannot be completed via this API (ADD_PROXIMITY errors, or the user asks for a targeting type this tool does not support), tell the user explicitly in the same reply what was NOT applied and why, give the exact manual UI steps, and list it as an outstanding manual action in the launch summary. Never silently substitute a UI workaround or report the campaign as fully configured while a targeting step is pending.
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
-  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
+  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?), SET_DEVICE_BID_ADJUSTMENT (campaign_resource_name OR ad_group_resource_name, device_bid_adjustments[{device, bid_modifier_percent}])
+              SET_DEVICE_BID_ADJUSTMENT: device is MOBILE|TABLET|DESKTOP|CONNECTED_TV; bid_modifier_percent -100..900 (-100 excludes the device, e.g. desktop-only B2B = MOBILE -100 + TABLET -100). Campaign level updates the campaign's device criteria; ad-group level overrides for that ad group. Google may reject some combinations (e.g. excluding every device) — relay its error verbatim.
               Adds campaign-scoped negative placement and mobile-app-category criteria atomically. placement_urls accepts domains or HTTP(S) URLs. mobile_app_category_resource_names must use canonical mobileAppCategoryConstants/<id> resource names. This is not a keyword/ad-group fallback.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
@@ -9974,6 +9358,7 @@ ACTION MATRIX:
         criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD UPDATE and KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
         placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
+        device_bid_adjustments: { type: 'array', items: { type: 'object', properties: { device: { type: 'string', enum: ['MOBILE', 'TABLET', 'DESKTOP', 'CONNECTED_TV'] }, bid_modifier_percent: { type: 'number', description: '-100 (exclude device) to 900.' } }, required: ['device', 'bid_modifier_percent'] }, description: 'For CAMPAIGN_CRITERION SET_DEVICE_BID_ADJUSTMENT.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },
@@ -10029,7 +9414,9 @@ UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry c
 
 GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
-  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS`,
+  Keywords: SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, metrics.clicks, metrics.cost_micros, metrics.average_cpc FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
+  Quality Score: SELECT ad_group_criterion.keyword.text, ad_group_criterion.quality_info.quality_score, ad_group_criterion.quality_info.creative_quality_score, ad_group_criterion.quality_info.post_click_quality_score, ad_group_criterion.quality_info.search_predicted_ctr FROM keyword_view WHERE ad_group_criterion.status = 'ENABLED'
+  (There is no quality_info.ad_relevance field; "ad relevance" is creative_quality_score. quality_info.* + segments.date is accepted FROM keyword_view but rejected FROM ad_group_criterion; for a per-day quality score history use metrics.historical_quality_score for date-segmented quality score. quality_info.* fields only support =, !=, IN, NOT IN in a WHERE clause; IS NULL / IS NOT NULL is invalid on them. Unpopulated scores (keywords below Google's auction-impression threshold) come back as absent/null fields on the row, not as rows you can filter out with a null check - don't attempt to filter on quality_info.* presence.)`,
     inputSchema: {
       type: 'object',
       properties: {

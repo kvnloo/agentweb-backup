@@ -16,7 +16,7 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 
 jest.mock('../services/metaService', () => ({
   metaService: {
-    listCampaigns: jest.fn().mockResolvedValue([]),
+    listCampaigns: jest.fn().mockResolvedValue({ campaigns: [], truncated: false, pagesFetched: 1 }),
   },
 }));
 

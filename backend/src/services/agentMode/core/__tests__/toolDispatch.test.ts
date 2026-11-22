@@ -105,6 +105,54 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  // ENG-2263: the ledger stores a MINIMISED result, so number checks need the full one.
+  describe('observeFullToolResult (ENG-2263)', () => {
+    const full = { success: true, lists: [{ leadCount: 5 }, { leadCount: 12 }], totalLists: 17 };
+
+    it('hands the observer the FULL result while the ledger keeps the minimised one', async () => {
+      const seen: Array<[string, any]> = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        extractMinimalToolResult: () => ({}),
+        observeFullToolResult: (name: string, r: any) => { seen.push([name, r]); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await executePreparedTools(input);
+      expect(seen).toEqual([['get_lead_lists', full]]);
+      expect(input.toolCallsLedger[0].result).toEqual({});
+    });
+
+    it('a throwing observer cannot break the turn or lose the ledger entry', async () => {
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        observeFullToolResult: () => { throw new Error('observer exploded'); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await expect(executePreparedTools(input)).resolves.toBeDefined();
+      expect(input.toolCallsLedger).toHaveLength(1);
+      expect(input.toolCallsLedger[0].name).toBe('get_lead_lists');
+      expect(input.toolCallsLedger[0].error).toBeUndefined();
+    });
+
+    it('works when no observer is wired (every other caller)', async () => {
+      const ports = makePorts({ executePreparedAgentTool: async () => full } as any);
+      const input = makeInput([toolCall('c1', 'get_lead_lists', '{}')], ports);
+      await executePreparedTools(input);
+      expect(input.toolCallsLedger).toHaveLength(1);
+    });
+
+    it('does not observe a call that was refused', async () => {
+      const seen: string[] = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async () => full,
+        observeFullToolResult: (name: string) => { seen.push(name); },
+      } as any);
+      const input = makeInput([toolCall('c1', 'send_email', '{}')], ports, { loopBreakerActive: true });
+      await executePreparedTools(input);
+      expect(seen).toEqual([]);
+    });
+  });
+
   // ENG-1337: the loop-breaker is a hard execution-layer deny, not just prose.
   describe('while loopBreakerActive', () => {
     const run = async (name: string, active = true) => {
@@ -721,6 +769,40 @@ describe('executePreparedTools', () => {
     expect(result.failedCounterUpdates).toEqual({ freeze_user_account: 1 });
     // the gateway should never have been reached for a preflight failure
     expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it('preflight-blocks org notification settings writes in a shared (share-link) session', async () => {
+    const ports = makePorts();
+    const input = makeInput(
+      [toolCall('a', 'update_lead_notification_settings', '{"leadTypes":[]}')],
+      ports,
+      { hasAdminAccess: false, isInteractiveShare: true },
+    );
+    await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it.each([
+    ['get_lead_notification_settings', '{}'],
+    ['save_org_memory', '{"content":"Remember for the whole org: x"}'],
+    ['delete_org_memory', '{"memoryId":"m1"}'],
+    ['save_memory', '{"content":"x"}'],
+    ['delete_memory', '{"memoryId":"m1"}'],
+  ])('preflight-blocks owner-scoped %s in a shared (share-link) session', async (name, args) => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', name, args)], ports, { hasAdminAccess: true, isInteractiveShare: true });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
+  it('still allows save_org_memory in the owner\'s own session', async () => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('a', 'save_org_memory', '{"content":"x"}')], ports, { hasAdminAccess: true, isInteractiveShare: false });
+    await executePreparedTools(input);
+    expect(input.toolCallsLedger[0].error).toBeUndefined();
   });
 
   it('records a JSON-parse failure as a preflight error', async () => {
@@ -1402,6 +1484,90 @@ describe('executePreparedTools', () => {
       expect(executed).toHaveLength(3);
       expect(result.mediaAssetsProduced).toBe(3);
       expect(result.mediaBudgetDeferred).toBe(true);
+    });
+  });
+
+  describe('media deferral halts state-changing dependents (ENG-922)', () => {
+    // Policy: Meta Graph calls are writes, lookups are reads, media-gen is a write.
+    function graphPorts() {
+      const executed: string[] = [];
+      const ports = makePorts({
+        evaluateAgentToolPolicy: (i: any) => ({
+          allowed: true,
+          effect: i.toolName === 'lookup_thing' ? 'read' : 'write',
+          flags: [],
+        }) as any,
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+    const img = (id: string) => toolCall(id, 'generate_image', `{"prompt":"${id}"}`);
+    const graph = (id: string) => toolCall(id, 'call_meta_marketing_api', `{"path":"act_1/adimages","id":"${id}"}`);
+
+    it('3 completed + 1 deferred image -> zero Graph writes after the deferral (same iteration)', async () => {
+      const { ports, executed } = graphPorts();
+      // Graph write emitted FIRST: must still not run before or after the deferred image.
+      const input = makeInput(
+        [graph('g'), img('a'), img('b'), img('c'), img('d')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+      expect(executed.filter((n) => n === 'generate_image')).toHaveLength(3);
+      expect(executed).not.toContain('call_meta_marketing_api');
+      expect(result.mediaAssetsProduced).toBe(3);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      // Every tool_call_id is still answered, in emission order.
+      expect(input.messages.map((m: any) => m.tool_call_id)).toEqual(['g', 'a', 'b', 'c', 'd']);
+      expect(input.toolCallsLedger.find((t: any) => t.id === 'g').result).toMatchObject({ deferred: true });
+    });
+
+    it('still runs read-only calls after a deferral', async () => {
+      const { ports, executed } = graphPorts();
+      const input = makeInput(
+        [img('a'), img('b'), img('c'), img('d'), toolCall('r', 'lookup_thing', '{}')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      await executePreparedTools(input);
+      expect(executed).toContain('lookup_thing');
+    });
+
+    it('defers a Graph write in a LATER iteration once media was deferred earlier this run', async () => {
+      const { ports, executed } = graphPorts();
+      const input = makeInput([graph('g')], ports, { priorMediaBudgetDeferred: true });
+      const result = await executePreparedTools(input);
+      expect(executed).toEqual([]);
+      expect(input.messages.map((m: any) => m.tool_call_id)).toEqual(['g']);
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(result.failedCounterUpdates).toEqual({});
+    });
+
+    it('defers a Graph write on the sequential (wait_seconds) path after a deferral', async () => {
+      const { ports, executed } = graphPorts();
+      const input = makeInput(
+        [toolCall('w', 'wait_seconds', '{"seconds":0}'), img('a'), graph('g')],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      await executePreparedTools(input);
+      expect(executed).not.toContain('call_meta_marketing_api');
+      expect(executed).not.toContain('generate_image');
+    });
+
+    it('normal 4-image + Graph batch under budget runs everything (unchanged path)', async () => {
+      const { ports, executed } = graphPorts();
+      const input = makeInput([img('a'), img('b'), img('c'), img('d'), graph('g')], ports);
+      const result = await executePreparedTools(input);
+      expect(executed.filter((n) => n === 'generate_image')).toHaveLength(4);
+      expect(executed[executed.length - 1]).toBe('call_meta_marketing_api');
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(4);
     });
   });
 

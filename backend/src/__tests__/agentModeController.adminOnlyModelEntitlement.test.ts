@@ -201,15 +201,14 @@ describe('resolveEffectiveModelForUser — admin-only model entitlement (ENG-120
   it('still corrects an admin-only model for a non-admin owner', async () => {
     setOwner({ isAdmin: false });
 
-    await runScheduledChat({ ...baseSchedule, llmModel: ADMIN_ONLY_MODEL } as any, OWNER_ID, false);
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: ADMIN_ONLY_MODEL } as any, OWNER_ID, false);
 
-    expect(stampedModel()).toBe(DEFAULT_MODEL);
-    expect(stampedDecision()).toMatchObject({
-      requestedModel: ADMIN_ONLY_MODEL,
-      effectiveModel: DEFAULT_MODEL,
-      modelSelection: 'corrected',
-      modelSelectionReason: 'requested_model_unavailable_using_default',
-    });
+    // FAIL-LOUD (WP-G): this used to assert the silent 'corrected' swap to the default.
+    // The pinned model is not selectable for this owner, so the run fails and nothing
+    // is stamped or run on another model.
+    expect(result.status).toBe('failure');
+    expect(result.actualResponse).toContain('model_unavailable');
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
   });
 
   it('does not consult the admin catalog for a model everyone can already use', async () => {
@@ -229,9 +228,10 @@ describe('resolveEffectiveModelForUser — admin-only model entitlement (ENG-120
     // is strict-equality against `true`, not truthiness.
     mockUserDb.getUserById.mockResolvedValue({ userId: OWNER_ID, email: 'owner@example.com' } as any);
 
-    await runScheduledChat({ ...baseSchedule, llmModel: ADMIN_ONLY_MODEL } as any, OWNER_ID, false);
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: ADMIN_ONLY_MODEL } as any, OWNER_ID, false);
 
-    expect(stampedModel()).toBe(DEFAULT_MODEL);
-    expect(stampedDecision()).toMatchObject({ modelSelection: 'corrected' });
+    // FAIL-LOUD (WP-G): was the silent 'corrected' swap; now the run fails (see above).
+    expect(result.status).toBe('failure');
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
   });
 });

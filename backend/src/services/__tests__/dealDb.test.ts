@@ -136,6 +136,21 @@ describe('dealDb.createDeal', () => {
       dealDb.createDeal({ ownerUserId: 'u1', primaryContactId: 'c1', heatScore: 150 })
     ).rejects.toThrow('heatScore');
   });
+
+  // ENG-2340: heatScore is the owner GSI sort key; an item without it never appears in
+  // getDealsByOwner, so an omitted score must still be written.
+  it('defaults heatScore to 0 when omitted so the deal lands in the owner GSI', async () => {
+    mockClient.put.mockReturnValueOnce(ok({}));
+    const deal = await dealDb.createDeal({ ownerUserId: 'u1', primaryContactId: 'c1' });
+    expect(deal.heatScore).toBe(0);
+    expect(mockClient.put.mock.calls.at(-1)[0].Item.heatScore).toBe(0);
+  });
+
+  it('keeps an explicit heatScore', async () => {
+    mockClient.put.mockReturnValueOnce(ok({}));
+    const deal = await dealDb.createDeal({ ownerUserId: 'u1', primaryContactId: 'c1', heatScore: 50 });
+    expect(deal.heatScore).toBe(50);
+  });
 });
 
 describe('dealDb.updateDeal', () => {
@@ -169,6 +184,16 @@ describe('dealDb.updateDeal', () => {
     await dealDb.updateDeal('d1', 'u1', { stage: 'Won' });
     const updateCall = mockClient.update.mock.calls[0][0];
     expect(updateCall.UpdateExpression).toContain('closedDate = :closedDate');
+  });
+
+  it('resets heatScore to 0 instead of REMOVE when cleared (ENG-2340)', async () => {
+    mockClient.get.mockReturnValueOnce(ok({ Item: existing }));
+    mockClient.update.mockReturnValueOnce(ok({ Attributes: { ...existing, heatScore: 0 } }));
+    await dealDb.updateDeal('d1', 'u1', { heatScore: null });
+    const call = mockClient.update.mock.calls.at(-1)[0];
+    expect(call.UpdateExpression).toContain('heatScore = :heatScore');
+    expect(call.UpdateExpression).not.toMatch(/REMOVE[^]*heatScore/);
+    expect(call.ExpressionAttributeValues[':heatScore']).toBe(0);
   });
 
   it('rejects promoting a primary not present in contactIds', async () => {

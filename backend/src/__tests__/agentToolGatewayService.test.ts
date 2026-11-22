@@ -358,6 +358,161 @@ describe('agentToolGatewayService', () => {
         expect(result.repairs).toEqual([]);
       });
 
+      describe('evaluate source alias -> function (ENG-2473)', () => {
+        // Repro from live telemetry: playwright_browser_evaluate {"expression": "..."} rejected with
+        // 'Unknown argument "expression". ... Missing required argument "function".'
+        const evaluateSchema = {
+          type: 'object',
+          properties: {
+            function: { type: 'string' },
+            element: { type: 'string' },
+            ref: { type: 'string' },
+            filename: { type: 'string' },
+          },
+          required: ['function'],
+        };
+
+        it.each(['expression', 'script', 'js', 'code'])('maps %s to function', (alias) => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_evaluate',
+            args: { [alias]: '() => document.title' },
+            inputSchema: evaluateSchema,
+            effect: 'read',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.args).toEqual({ function: '() => document.title' });
+          expect(result.repairs).toEqual(expect.arrayContaining([`${alias}->function`]));
+        });
+
+        it('does not overwrite an existing function argument', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'playwright_browser_evaluate',
+            args: { function: '() => 1', expression: '() => 2' },
+            inputSchema: evaluateSchema,
+            effect: 'read',
+          });
+          expect(result.repairs).not.toEqual(expect.arrayContaining(['expression->function']));
+          expect(result.args).toMatchObject({ function: '() => 1' });
+        });
+
+        it('does not map expression when the schema has no function property', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'other_tool',
+            args: { expression: 'x' },
+            inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: [] },
+            effect: 'read',
+          });
+          expect(result.repairs).not.toEqual(expect.arrayContaining(['expression->function']));
+          expect(result.args).not.toHaveProperty('function');
+        });
+      });
+
+      describe('number/boolean -> string (ENG-2472)', () => {
+        // Repro from live telemetry: call_hubspot_api {"list_id":17} rejected with
+        // 'Argument "list_id" has the wrong type. Expected string.' three times in a row.
+        const hubspotSchema = {
+          type: 'object',
+          properties: {
+            entity_type: { type: 'string', enum: ['CONTACT_LIST', 'CONTACT'] },
+            action: { type: 'string' },
+            list_id: { type: 'string' },
+            flag: { type: 'string' },
+            ratio: { type: 'string' },
+          },
+          required: ['entity_type', 'action'],
+        };
+
+        it('coerces an integer list_id to a string (repro)', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'call_hubspot_api',
+            args: { entity_type: 'CONTACT_LIST', action: 'GET', list_id: 17 },
+            inputSchema: hubspotSchema,
+            effect: 'read',
+          });
+          expect(result.status).toBe('repaired');
+          expect(result.args).toEqual({ entity_type: 'CONTACT_LIST', action: 'GET', list_id: '17' });
+          expect(result.repairs).toEqual(expect.arrayContaining(['list_id:scalar_coerce']));
+        });
+
+        it('coerces finite decimals and booleans for exactly-string fields (ENG-2509)', () => {
+          const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+            [{ ratio: 1.5 }, { ratio: '1.5' }],
+            [{ ratio: -0.25 }, { ratio: '-0.25' }],
+            [{ flag: true }, { flag: 'true' }],
+            [{ flag: false }, { flag: 'false' }],
+            [{ list_id: 1.5 }, { list_id: '1.5' }],
+          ];
+          for (const [args, expected] of cases) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { entity_type: 'CONTACT', action: 'GET', ...args },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('repaired');
+            expect(result.args).toEqual({ entity_type: 'CONTACT', action: 'GET', ...expected });
+            expect(result.repairs).toEqual(expect.arrayContaining([`${Object.keys(args)[0]}:scalar_coerce`]));
+          }
+        });
+
+        it('does not coerce booleans/decimals outside a declared string enum (negative)', () => {
+          for (const args of [{ entity_type: true }, { entity_type: 1.5 }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { action: 'GET', ...args },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('invalid');
+          }
+        });
+
+        it('still rejects integers in non-identifier string fields', () => {
+          for (const args of [{ action: 7 }, { ratio: 2 }]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { entity_type: 'CONTACT', action: 'GET', ...args },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('invalid');
+          }
+        });
+
+        it('does not coerce non-finite, unsafe, or container values', () => {
+          for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 2 ** 60, { id: 1 }, [1]]) {
+            const result = validateAndRepairToolArgs({
+              toolName: 'call_hubspot_api',
+              args: { entity_type: 'CONTACT', action: 'GET', list_id: bad },
+              inputSchema: hubspotSchema,
+              effect: 'read',
+            });
+            expect(result.status).toBe('invalid');
+          }
+        });
+
+        it('does not coerce when the schema also accepts the original type', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'some_tool',
+            args: { record_id: 42 },
+            inputSchema: { type: 'object', properties: { record_id: { type: ['string', 'number'] } }, required: [] },
+            effect: 'read',
+          });
+          expect(result.status).toBe('valid');
+          expect(result.args).toEqual({ record_id: 42 });
+        });
+
+        it('does not coerce an id outside a declared string enum (negative)', () => {
+          const result = validateAndRepairToolArgs({
+            toolName: 'some_tool',
+            args: { kind_id: 5 },
+            inputSchema: { type: 'object', properties: { kind_id: { type: 'string', enum: ['1', '2'] } }, required: [] },
+            effect: 'read',
+          });
+          expect(result.status).toBe('invalid');
+        });
+      });
+
       it('still rejects a non-numeric string as a type mismatch (no silent NaN)', () => {
         const result = validateAndRepairToolArgs({
           toolName: 'read_tool_response',

@@ -268,7 +268,75 @@ async function extractAndUploadAnalysisFiles(
   return { cleanedText, links };
 }
 
+/**
+ * ENG-1889 — semantic class for a perform_data_analysis structured failure.
+ * The tool's failures are RETURNED (`{ success: false, message }`), and the
+ * run recorder previously bucketed most of them as a generic `Error`, which
+ * made the 33% failure cluster undiagnosable. Every failure now carries a
+ * class from KNOWN_TOOL_ERROR_CLASSES so telemetry and retry guidance can
+ * distinguish caller mistakes from upstream/runtime faults.
+ */
+export function classifyDataAnalysisFailure(result: { message?: unknown; error?: unknown }): string {
+  const code = typeof result.error === 'string' ? result.error : '';
+  if (code === 'invalid_argument') return 'invalid_args';
+  if (code === 'execution_failed' || code === 'inconsistent_result') return 'invalid_output';
+  const m = (typeof result.message === 'string' ? result.message : '').toLowerCase();
+  // Timeout first: its guidance text also says "too large".
+  if (/timed out/.test(m)) return 'timeout';
+  // Before the broad "is empty" pattern: "Gemini API key is empty" is a config fault.
+  if (/gemini api key/.test(m)) return 'tool_unavailable';
+  if (/too large|exceeds the .* limit|is required|must be|local file paths|cannot parse s3 url/.test(m)) return 'invalid_args';
+  if (/could not be read|no longer available|cannot read tool-response|is empty|failed to download or process file/.test(m)) return 'not_found';
+  if (/did not return any results/.test(m)) return 'empty_result';
+  return 'upstream_5xx';
+}
+
+/**
+ * Public entry point. Validates argument types against the declared tool
+ * schema (file_urls: string[]; analysis_instruction: string — no stricter
+ * handler-only constraints) and stamps a structured `errorClass` on every
+ * failure, including unexpected throws, so no failure surfaces as a bare
+ * generic `Error`.
+ */
 export async function performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
+  if (fileUrls !== undefined && fileUrls !== null
+    && (!Array.isArray(fileUrls) || fileUrls.some(u => typeof u !== 'string'))) {
+    return {
+      success: false,
+      message: 'file_urls must be an array of S3 or HTTPS URL strings. Pass an empty array when all data is inline in analysis_instruction.',
+      error: 'invalid_argument',
+      errorClass: 'invalid_args',
+    };
+  }
+  if (analysisInstruction !== undefined && analysisInstruction !== null && typeof analysisInstruction !== 'string') {
+    return {
+      success: false,
+      message: 'analysis_instruction must be a string describing the analysis task.',
+      error: 'invalid_argument',
+      errorClass: 'invalid_args',
+    };
+  }
+  let result: any;
+  try {
+    result = await performDataAnalysisUnclassified(fileUrls, analysisInstruction, userId);
+  } catch (error) {
+    // Defensive: the implementation catches internally, but anything that
+    // escapes must still be structured and actionable.
+    console.error('AgentMode: performDataAnalysis unexpected throw:', error);
+    return {
+      success: false,
+      message: 'The data analysis failed with an unexpected internal error. Retry once; if it fails again, save the dataset with save_file and retry with a shorter, more specific analysis_instruction.',
+      error: error instanceof Error ? error.message : String(error),
+      errorClass: 'upstream_5xx',
+    };
+  }
+  if (result && result.success === false && !result.errorClass) {
+    result.errorClass = classifyDataAnalysisFailure(result);
+  }
+  return result;
+}
+
+async function performDataAnalysisUnclassified(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
   try {
     const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
@@ -955,7 +1023,7 @@ export async function performDataAnalysis(fileUrls: string[], analysisInstructio
     }
     return {
       success: false,
-      message: 'Failed to perform data analysis. Please check that the file URLs are accessible.',
+      message: `The data analysis failed during upstream code execution (${errorMessage.slice(0, 200)}). Verify each file_urls entry is a fetchable S3/HTTPS URL, then retry once with a simpler, more specific analysis_instruction. Do NOT re-inline the raw data.`,
       error: errorMessage
     };
   }

@@ -168,7 +168,7 @@ export async function saveOutreachProspects(
       .map((p) => mapProspectToLead(p, drafts[p?.id], args.icpId))
       .filter((lead) => !isAnonymizedSearchLead(lead));
 
-    await crmDb.batchCreateLeads(leadListId, leads);
+    await crmDb.batchCreateLeads(leadListId, leads, { origin: 'enrichment_import' });
 
     return { ok: true, leadListId };
   } catch (err: any) {

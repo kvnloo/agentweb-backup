@@ -1,0 +1,10 @@
+{
+  "name": "Fall Sneaker Drop",
+  "objective": "OUTCOME_SALES",
+  "dailyBudget": 50,
+  "audience": { "countries": ["US"], "ageMin": 21, "ageMax": 45, "interests": ["Sneakers", "Streetwear"] },
+  "creatives": [
+    { "primaryText": "New fall colorways just landed.", "headline": "Shop the Drop", "imageUrl": "https://example.com/sneaker-1.jpg", "linkUrl": "https://example.com/shop", "callToAction": "SHOP_NOW" },
+    { "primaryText": "Limited pairs. Free shipping.", "headline": "Limited Release", "imageUrl": "https://example.com/sneaker-2.jpg", "linkUrl": "https://example.com/shop", "callToAction": "SHOP_NOW" }
+  ]
+}

@@ -33,7 +33,7 @@ export const SANDBOX_TOOL_CLASSES: Record<string, ToolMatcher> = {
   sends: exact(
     'send_email', 'send_email_to_lead', 'send_email_from_sender', 'notify_session', 'send_for_review',
     'send_gtm_status_report', 'report_product_issues', 'email', 'slack_send_message', 'enqueue_human_eval',
-    'fathom_route_action_items', 'emma_send_message',
+    'fathom_route_action_items', 'emma_send_message', 'manage_crm_sequence',
   ),
   social: anyOf(
     prefix('linkedin_', 'twitter_', 'google_calendar_'),

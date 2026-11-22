@@ -3,7 +3,7 @@
  * argument parser is strict (a typo must not start live judge calls) and the report is
  * aggregates only.
  */
-import { parseArgs, replaySession, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
+import { loadPromptFile, parseArgs, replaySession, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
 import type { ChatSession } from '../services/chatbotService';
 import { DEFAULT_OUTCOME_JUDGE_MODEL } from '../services/outcomeJudge';
 
@@ -18,6 +18,23 @@ describe('evalOutcomeJudge parseArgs', () => {
       model: DEFAULT_OUTCOME_JUDGE_MODEL,
       dryRun: false,
     });
+  });
+
+  it('accepts --no-judge-clauses for a serializer-only replay (ENG-2483)', () => {
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--no-judge-clauses'])).toEqual(
+      expect.objectContaining({ mode: 'replay', noJudgeClauses: true }),
+    );
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07'])).not.toHaveProperty('noJudgeClauses');
+  });
+
+  it('accepts --prompt-file for a candidate rubric and rejects an empty one (ENG-2380)', () => {
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--prompt-file', '/tmp/B.txt'])).toEqual(
+      expect.objectContaining({ mode: 'replay', promptFile: '/tmp/B.txt' }),
+    );
+    expect(parseArgs(['--from', '2026-07-10', '--to', '2026-10-07'])).not.toHaveProperty('promptFile');
+    expect(() => parseArgs(['--from', '2026-07-10', '--to', '2026-10-07', '--prompt-file'])).toThrow(/--prompt-file needs a value/);
+    expect(loadPromptFile('x', () => '  rubric B  \n')).toBe('rubric B');
+    expect(() => loadPromptFile('x', () => ' \n ')).toThrow(/is empty/);
   });
 
   it('rejects unknown flags, missing operands, bad dates and a reversed window', () => {
@@ -37,6 +54,20 @@ describe('evalOutcomeJudge parseArgs', () => {
 
 describe('summarizeReplay', () => {
   const row = (success: boolean, score: number, model = 'm-a'): JudgedSession => ({ success, score, model });
+
+  it('counts a 5 as a score of at least 4.95, so a decimal 4.6 is not a 5', () => {
+    const rows = [row(true, 4.97), row(true, 4.6), row(true, 4.5), row(false, 2.3), row(false, 4.95)];
+    const s = summarizeReplay(rows);
+    expect(s.shareAt5).toBeCloseTo(2 / 5, 10);
+    // The histogram keeps whole-number buckets for display.
+    expect(s.histogram).toEqual({ 1: 0, 2: 1, 3: 0, 4: 0, 5: 4 });
+    // ENG-2138: the rounded share is a separate field, so the two printed numbers are not confused.
+    expect(s.shareRoundingTo5).toBeCloseTo(4 / 5, 10);
+  });
+
+  it('has no rounded share for an empty replay', () => {
+    expect(summarizeReplay([])).toEqual(expect.objectContaining({ shareAt5: null, shareRoundingTo5: null }));
+  });
 
   it('reports AUC, share at 5, histogram, means and per-model rows from n >= 5', () => {
     const rows = [

@@ -209,6 +209,7 @@ import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { matchLifecyclePresenceFilter } from '../../utils/lifecycleFilterSemantics';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../../utils/linkedInInfraError';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -356,6 +357,7 @@ export async function addLeadsToList(
 
       const { leadImportWriteBudgetMs } = await import('../../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        origin: 'enrichment_import',
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
@@ -533,6 +535,10 @@ export async function getLeads(listId: string, userId: string, options: {
     status?: string;
     limit?: number;
     cursor?: string;
+    // ENG-425: export callers (CSV) need the full row; without this they fan
+    // out one get_lead_details call per lead. Off by default so the model's
+    // compact browse rows (and token budget) are unchanged.
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -622,6 +628,27 @@ export async function getLeads(listId: string, userId: string, options: {
 
       const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
 
+      // ENG-425: full export fields. Same card-revenue boundary as
+      // getLeadDetails (ENG-1388) — org-shared lists must not leak Enigma
+      // card revenue to a non-allowlisted caller through the bulk path.
+      let fullFieldProjector: ((lead: any) => Record<string, any>) | null = null;
+      if (options.includeAllFields) {
+        const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
+        const hide = shouldHideCardRevenueForViewer(userId);
+        fullFieldProjector = (lead: any) => {
+          const meta = sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata as Record<string, any> | undefined);
+          return {
+            listId: lead.listId || listId,
+            notes: lead.notes || '',
+            linkedin: lead.linkedin || '',
+            customFields: hide ? (stripCardRevenueKeys(lead.customFields) ?? {}) : (lead.customFields || {}),
+            ...(meta ? { enrichmentMetadata: hide ? stripCardRevenueKeys(meta) : meta } : {}),
+            createdAt: lead.createdAt || null,
+            updatedAt: lead.updatedAt || null,
+          };
+        };
+      }
+
       return {
         success: true,
         // ENG-1207: same contract as searchLeads — a truncated page must not be
@@ -651,6 +678,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
@@ -778,9 +806,18 @@ export async function searchLeads(
       const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
-        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
+      // ENG-2360: a list-scoped read (non-empty list_id or list_ids) with no
+      // filters/search is a valid "page through these lists" intent. Only a
+      // call with no filters, no search AND no list scope is rejected.
+      const hasListScope = Boolean(listId) || Boolean(options?.listIds && options.listIds.length > 0);
+      if ((!filters || filters.length === 0) && !options?.search?.trim() && !hasListScope) {
+        return {
+          success: false,
+          message: 'At least one filter, a search query, or a list_id/list_ids is required',
+          error: 'Provide at least one filter criterion, a search query, or list_id/list_ids to scope the read',
+        };
       }
+      filters = Array.isArray(filters) ? filters : [];
 
       // Resolve target list set. list_ids takes precedence over single list_id.
       let targetListIds: string[];
@@ -1863,7 +1900,8 @@ export async function updateLeadStatus(
     userId: string,
     dealValue?: number | null,
     dealCurrency?: string,
-    notes?: string
+    notes?: string,
+    drafts?: { messageDraft?: string; emailSubject?: string; emailBody?: string; sessionId?: string }
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1890,6 +1928,40 @@ export async function updateLeadStatus(
       if (dealValue !== undefined) updates.dealValue = dealValue;
       if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
 
+      // ENG-2361: a drafting agent that moves a lead to review must be able to put the
+      // exact text it wrote on the lead in the same write — otherwise the Pending Review
+      // queue lists the lead with nothing to approve. Stored in the same shapes the
+      // portal's lead panel and queue already read. Empty strings are ignored, never
+      // used to clear an existing draft.
+      const now = new Date().toISOString();
+      const savedDrafts: string[] = [];
+      const dm = typeof drafts?.messageDraft === 'string' ? drafts.messageDraft.trim() : '';
+      if (dm) {
+        updates.messageDraft = {
+          content: dm,
+          createdAt: existingLead.messageDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        savedDrafts.push('messageDraft');
+      }
+      const subj = typeof drafts?.emailSubject === 'string' ? drafts.emailSubject.trim() : '';
+      const body = typeof drafts?.emailBody === 'string' ? drafts.emailBody.trim() : '';
+      if (subj || body) {
+        if (!subj || !body) {
+          return { success: false, message: 'Email draft needs both email_subject and email_body', error: 'Provide both email_subject and email_body, or neither' };
+        }
+        updates.emailDraft = {
+          subject: subj,
+          textContent: body,
+          createdAt: existingLead.emailDraft?.createdAt || now,
+          updatedAt: now,
+          ...(drafts?.sessionId ? { sessionId: drafts.sessionId } : {}),
+        };
+        updates.emailDraftFormat = 'text';
+        savedDrafts.push('emailDraft');
+      }
+
       await crmDb.updateLead(listId, leadId, updates);
 
       // Auto-create status change engagement
@@ -1914,6 +1986,7 @@ export async function updateLeadStatus(
         previousStatus,
         newStatus: status,
         leadName,
+        ...(savedDrafts.length ? { savedDrafts } : {}),
       };
     } catch (error) {
       console.error('AgentMode: Error updating lead status:', error);
@@ -2995,7 +3068,7 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
   }
 
-  const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+  const { linkedInOutreachService, isProvenDisconnectError } = await import('../../services/linkedInOutreachService');
 
   // Access check (ENG-1049): this function creates leads (batchCreateLeads
   // below), and is called directly by the import_leads_from_search Emma tool
@@ -3019,8 +3092,11 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'Failed to verify list access' };
   }
 
-  // Resolve account: user's own or platform-wide fallback
-  const accountId = await linkedInOutreachService.resolveAccountId(userId);
+  // Resolve account: user's own or platform-wide fallback. Keep usedSharedAccount
+  // (not the flag-discarding resolveAccountId wrapper) — the reactive handler
+  // below needs it to know whether accountId is this user's own account or the
+  // ownerless site-wide pool (see the ownerUserId comment there).
+  const { accountId, usedSharedAccount } = await linkedInOutreachService.resolveAccountIdWithSource(userId);
   if (!accountId) {
     return {
       success: false,
@@ -3116,7 +3192,49 @@ export async function importLeadsFromSearch(
         cursor: lastFetchCursor ?? undefined,
       });
     } catch (e: any) {
-      searchError = e?.message ? String(e.message) : String(e);
+      const infraFailure = isLinkedInInfraError(e);
+      if (infraFailure) {
+        console.warn('[importLeadsFromSearch] LinkedIn search unavailable (infrastructure):', e?.message);
+      }
+      searchError = infraFailure
+        ? LINKEDIN_UNAVAILABLE_MESSAGE
+        : (e?.message ? String(e.message) : String(e));
+      // ENG-2205: resolveAccountId can now hand back an account whose probe was
+      // merely indeterminate (not proven dead — see linkedInOutreachService's
+      // probeAccountSession), so a real failure here is the backstop that proves
+      // it either way. On a proven-dead session, correct the probe cache and
+      // record the health event — otherwise this account stays cached as
+      // 'unknown' for the full 10-minute window and gets handed to the next
+      // caller (same user's retry, or another user sharing the site-wide pool)
+      // instead of the pool correctly skipping it. Mirrors the identical reactive
+      // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
+      // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
+      // excludes a bare 403 — a permission/plan restriction, not a dead session.
+      let provenDead = isProvenDisconnectError(e);
+      if (provenDead) {
+        linkedInOutreachService.clearStatusCache(accountId);
+        // Unipile's explicit `errors/disconnected_account` is conclusive. A bare 401 is not (it can be a one-off
+        // auth blip), and recording a disconnect pauses scheduled runs and emails the owner, so take a fresh
+        // second opinion first; the sync cron still catches a genuinely dead session on its next pass.
+        const explicitDisconnect = (e?.structuredError?.code || e?.body?.code || e?.code) === 'errors/disconnected_account';
+        if (!explicitDisconnect) {
+          provenDead = (await linkedInOutreachService.probeAccountSession(accountId)) === 'disconnected';
+        }
+      }
+      if (provenDead) {
+        const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+        // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
+        // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
+        // getAccountsByUserIdIncludingOrgShared(ownerUserId) — neither of which can ever
+        // find the global fallback pool account under an unrelated customer's userId. A
+        // truthy-but-wrong ownerUserId silently no-ops instead of reaching the dedicated
+        // ownerless/oncall branch that exists specifically for this account class.
+        await recordUnipileAccountHealth({
+          accountId,
+          ownerUserId: usedSharedAccount ? undefined : userId,
+          state: 'disconnected',
+        });
+      }
       break;
     }
 
@@ -3302,7 +3420,7 @@ export async function importLeadsFromSearch(
       continue;
     }
 
-    const result = await crmDb.batchCreateLeads(listId, importable);
+    const result = await crmDb.batchCreateLeads(listId, importable, { origin: 'linkedin' });
     cumulativeNew += result.newCount ?? 0;
     cumulativeMerged += result.mergedCount ?? 0;
     if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);

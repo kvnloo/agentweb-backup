@@ -308,14 +308,17 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(sessionId, {});
     });
 
-    it('does not change the model when the plan default is unsupported', async () => {
+    it('ENG-903: refuses the launch (nothing applied) when the plan default is unsupported', async () => {
       const planWithBadModel = { ...systemTemplate, defaultModel: 'not-a-real-model' };
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [planWithBadModel] : []
       );
 
-      await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+      const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
 
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('model_unavailable');
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
       expect(chatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
     });
 

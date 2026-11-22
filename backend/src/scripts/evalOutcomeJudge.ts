@@ -21,13 +21,16 @@
  *
  * Usage (default AWS profile; NODE_ENV=development reads the Dev- tables):
  *   npx ts-node --transpile-only src/scripts/evalOutcomeJudge.ts --from 2026-09-14 --to 2026-09-27 \
- *     [--sample 150] [--seed eng-2138] [--model anthropic.claude-sonnet-4-6] [--dry-run]
+ *     [--sample 150] [--seed eng-2138] [--model anthropic.claude-sonnet-4-6] [--prompt-file F] [--no-judge-clauses] [--dry-run]
  *   npx ts-node --transpile-only src/scripts/evalOutcomeJudge.ts --print-judge-row --sample-rate 0.33
  *
  *   --dry-run          grade and count, call no model
+ *   --prompt-file F    replay a candidate system prompt read from F instead of the committed
+ *                      rubric (ENG-2380: re-measure the recovered ENG-1710 text before adopting it)
  *   --print-judge-row  print the AW-Settings scoring-judges row for OPS-1 (ENG-2146) and exit
  */
 import AWS from 'aws-sdk';
+import { readFileSync } from 'node:fs';
 import { argv, exit } from 'node:process';
 import { bootstrapCI, rocAuc, type Interval, type LabelPair } from '../loops/eval/agreement';
 import { gradeSession } from '../loops/eval/agentGraders';
@@ -56,27 +59,29 @@ import {
 import { SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
 const USAGE =
-  'Usage: evalOutcomeJudge.ts --from <date> --to <date> [--sample N] [--seed S] [--model ID] [--dry-run]\n' +
+  'Usage: evalOutcomeJudge.ts --from <date> --to <date> [--sample N] [--seed S] [--model ID] [--prompt-file F] [--no-judge-clauses] [--dry-run]\n' +
   '       evalOutcomeJudge.ts --print-judge-row --sample-rate <0..1> [--model ID]';
 
 export const TARGET_AUC = 0.75;
 export const TARGET_MAX_SHARE_AT_5 = 0.15;
+/** A score at or above this counts as "a 5" (the ENG-1710 rule, applied to raw decimals). */
+const SHARE_AT_5_MIN_SCORE = 4.95;
 /** Per-model rows are printed only from this many judged sessions up. */
 const MIN_MODEL_N = 5;
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 
 export type Args =
   | { mode: 'print-row'; sampleRate: number; model: string }
-  | { mode: 'replay'; from: string; to: string; sample: number; seed: string; model: string; dryRun: boolean };
+  | { mode: 'replay'; from: string; to: string; sample: number; seed: string; model: string; dryRun: boolean; promptFile?: string; noJudgeClauses?: boolean };
 
 /** Strict: an unknown flag or a missing operand is an error, so a typo cannot start live judge calls. */
 export function parseArgs(raw: readonly string[]): Args {
   const values = new Map<string, string>();
   const flags = new Set<string>();
-  const withValue = new Set(['--from', '--to', '--sample', '--seed', '--model', '--sample-rate']);
+  const withValue = new Set(['--from', '--to', '--sample', '--seed', '--model', '--sample-rate', '--prompt-file']);
   for (let i = 0; i < raw.length; i++) {
     const flag = raw[i];
-    if (flag === '--dry-run' || flag === '--print-judge-row') flags.add(flag);
+    if (flag === '--dry-run' || flag === '--print-judge-row' || flag === '--no-judge-clauses') flags.add(flag);
     else if (withValue.has(flag)) {
       const operand = raw[++i];
       if (operand === undefined || operand.startsWith('--') || !operand.trim()) throw new Error(`${flag} needs a value.\n${USAGE}`);
@@ -103,13 +108,18 @@ export function parseArgs(raw: readonly string[]): Args {
   if (from > to) throw new Error('--from must not be after --to');
   const sample = Number(values.get('--sample') ?? 150);
   if (!Number.isInteger(sample) || sample <= 0) throw new Error('--sample must be a positive integer');
-  return { mode: 'replay', from, to, sample, seed: values.get('--seed') ?? 'eng-2138', model, dryRun: flags.has('--dry-run') };
+  const promptFile = values.get('--prompt-file');
+  return {
+    mode: 'replay', from, to, sample, seed: values.get('--seed') ?? 'eng-2138', model, dryRun: flags.has('--dry-run'),
+    ...(promptFile ? { promptFile } : {}),
+    ...(flags.has('--no-judge-clauses') ? { noJudgeClauses: true } : {}),
+  };
 }
 
 export interface JudgedSession {
   /** Deterministic label: task succeeded. */
   success: boolean;
-  /** Judge score 1-5. */
+  /** Judge score 1-5; a shadow judge keeps one decimal. */
   score: number;
   /** Agent model that ran the session. */
   model: string;
@@ -120,7 +130,10 @@ export interface ReplaySummary {
   successes: number;
   auc: number | null;
   aucCI: Interval | null;
+  /** Share of raw scores >= 4.95 (the target's definition of "at 5"). */
   shareAt5: number | null;
+  /** Share of scores that round to 5, i.e. the histogram's 5 bucket; always >= shareAt5. */
+  shareRoundingTo5: number | null;
   histogram: Record<1 | 2 | 3 | 4 | 5, number>;
   meanScore: { success: number | null; failure: number | null };
   perModel: Array<{ model: string; n: number; successRate: number; meanScore: number }>;
@@ -150,13 +163,14 @@ export function summarizeReplay(rows: readonly JudgedSession[]): ReplaySummary {
     .sort((a, b) => b.meanScore - a.meanScore);
 
   const auc = bothClasses ? rocAuc(pairs) : null;
-  const shareAt5 = rows.length ? histogram[5] / rows.length : null;
+  const shareAt5 = rows.length ? rows.filter((r) => r.score >= SHARE_AT_5_MIN_SCORE).length / rows.length : null;
   return {
     judged: rows.length,
     successes,
     auc,
     aucCI: bothClasses ? bootstrapCI(pairs, rocAuc, { seed: 2138 }) : null,
     shareAt5,
+    shareRoundingTo5: rows.length ? histogram[5] / rows.length : null,
     histogram,
     meanScore: {
       success: mean(rows.filter((r) => r.success).map((r) => r.score)),
@@ -256,6 +270,13 @@ async function unmeteredJudgeCall(cost: { usd: number }): Promise<ScoringLlmCall
   };
 }
 
+/** A candidate prompt file must be non-empty; whitespace-only would silently judge with no rubric. */
+export function loadPromptFile(path: string, read: (p: string) => string = (p) => readFileSync(p, 'utf8')): string {
+  const text = read(path).trim();
+  if (!text) throw new Error(`--prompt-file ${path} is empty`);
+  return text;
+}
+
 const pct = (x: number | null) => (x === null ? '-' : `${(x * 100).toFixed(1)}%`);
 const fixed = (x: number | null, d = 2) => (x === null ? '-' : x.toFixed(d));
 
@@ -282,7 +303,12 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
     return;
   }
 
-  const judge = buildOutcomeShadowJudgeRow({ sampleRate: 1, model: args.model });
+  const base = buildOutcomeShadowJudgeRow({ sampleRate: 1, model: args.model });
+  const judge = args.promptFile ? { ...base, systemPrompt: loadPromptFile(args.promptFile) } : base;
+  if (args.promptFile) console.log(`Judge prompt: ${args.promptFile} (${judge.systemPrompt.length} chars), not the committed rubric.`);
+  // ENG-2483: serializer-only replay drops the six appended clauses; production keeps the default.
+  const judgeOptions = args.noJudgeClauses ? { appendClauses: false } : undefined;
+  if (judgeOptions) console.log('Judge clauses: off (serializer-only prompt).');
   const cost = { usd: 0 };
   const call = await unmeteredJudgeCall(cost);
   const rows: JudgedSession[] = [];
@@ -297,7 +323,7 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
       ]);
       const session = { ...item, sessionId: g.sessionId, messages, messageCount: messages.length } as unknown as ChatSession;
       const outcome = await replaySession(session, (s) =>
-        scoreSessionWithJudge(messages, messages.length, judge, s.sessionType, { sessionId: g.sessionId }, call));
+        scoreSessionWithJudge(messages, messages.length, judge, s.sessionType, { sessionId: g.sessionId }, call, judgeOptions));
       if (outcome.kind === 'scored') {
         if (outcome.failedRun) failedRuns++;
         rows.push({ success: g.task.verdict === 'success', score: outcome.score, model: g.model });
@@ -311,7 +337,8 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   const s = summarizeReplay(rows);
   console.log(`\nScored ${s.judged} (${s.successes} success; ${failedRuns} failed runs at production's fixed 1, no model call) on ${args.model}; not scored: ${JSON.stringify(skipped)}; reported cost $${cost.usd.toFixed(2)}.`);
   console.log(`AUC vs deterministic success: ${fixed(s.auc)} ${s.aucCI ? `[95% CI ${fixed(s.aucCI.low)}-${fixed(s.aucCI.high)}]` : ''} (target >= ${TARGET_AUC})`);
-  console.log(`Share at 5: ${pct(s.shareAt5)} (target < ${TARGET_MAX_SHARE_AT_5 * 100}%)   histogram 1..5: ${JSON.stringify(s.histogram)}`);
+  console.log(`Share of raw scores >= ${SHARE_AT_5_MIN_SCORE}: ${pct(s.shareAt5)} (target < ${TARGET_MAX_SHARE_AT_5 * 100}%)`);
+  console.log(`Share of scores that round to 5: ${pct(s.shareRoundingTo5)} (the histogram's 5 bucket)   rounded-bucket histogram 1..5: ${JSON.stringify(s.histogram)}`);
   console.log(`Mean score: success ${fixed(s.meanScore.success)} / failure ${fixed(s.meanScore.failure)}`);
   console.log(`Per agent model (n >= ${MIN_MODEL_N}), by mean judge score:`);
   for (const m of s.perModel) console.log(`  ${m.model.padEnd(40)} n=${String(m.n).padStart(4)}  success ${pct(m.successRate).padStart(6)}  judge ${m.meanScore.toFixed(2)}`);

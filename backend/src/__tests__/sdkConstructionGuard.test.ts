@@ -282,6 +282,17 @@ describe('SDK construction guard', () => {
     }
     expect(stale).toEqual([]);
   });
+
+  it('does not retain unreachable AgentMode text-provider adapter remnants after gateway cutover', () => {
+    const agentModeSource = fs.readFileSync(path.join(SRC_ROOT, 'services/agentModeService.ts'), 'utf8');
+
+    // These only supported the deleted Vertex Claude text adapter. Keeping them
+    // makes a future direct-provider revival look supported even though every
+    // text/tool request now crosses the OpenRouter gateway.
+    expect(agentModeSource).not.toContain('vertex_client');
+    expect(agentModeSource).not.toContain('vertex_client_promise');
+    expect(agentModeSource).not.toContain('convertContentToAnthropicBlocks');
+  });
 });
 
 describe('SDK construction guard ignores type-only imports (ENG-1937)', () => {

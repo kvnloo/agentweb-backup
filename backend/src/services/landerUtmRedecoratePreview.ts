@@ -3,6 +3,7 @@ import {
   CLICK_ID_KEYS,
   LANDER_PROVENANCE_KEY,
   resolveLanderParams,
+  validateUtmConfig,
   type UtmConfig,
 } from "../utils/landerUtm";
 
@@ -155,22 +156,21 @@ export async function previewLanderUtmRedecoration(
   const rows: LanderPreviewRow[] = [];
 
   for (const lander of landers) {
-    if (
-      lander.utmOverride &&
-      Object.keys(lander.utmOverride).length > 0 &&
-      !selected.has(lander.id)
-    ) {
-      rows.push({
-        landerId: lander.id,
-        name: lander.name,
-        status: "skipped",
-        reason: "explicit_per_lander_override",
-        changes: [],
-      });
-      continue;
-    }
-
     try {
+      // Validate before skipping: a corrupt override is an error, not a valid
+      // customer override protected from a default update (ENG-728 AC5).
+      const override = validateUtmConfig(lander.utmOverride, "per-lander override");
+      if (Object.keys(override).length > 0 && !selected.has(lander.id)) {
+        rows.push({
+          landerId: lander.id,
+          name: lander.name,
+          status: "skipped",
+          reason: "explicit_per_lander_override",
+          changes: [],
+        });
+        continue;
+      }
+
       const links = await deps.readDeployedLinks(lander);
       if (links === null) throw new Error("deployed artifact is missing");
       if (!Array.isArray(links)) throw new Error("deployed artifact is corrupt");

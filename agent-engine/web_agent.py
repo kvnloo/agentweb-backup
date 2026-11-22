@@ -120,32 +120,74 @@ class VideoAnalysisParams(BaseModel):
     prompt: str
 
 class GenerateVideoParams(BaseModel):
-    """Parameters for generating videos using Google VEO API."""
+    """Parameters for generating videos using Google gemini-omni-1.1-flash."""
     prompt: str
     output_file_name: str
     image_file_name: Optional[str] = None  # Optional input image for image-to-video generation
     negative_prompt: Optional[str] = None  # Optional negative prompt to avoid certain elements
 
-# Single source of truth for the Veo model ID, so a future Google retirement
-# (ENG-1070: the prior preview ID 404'd) only needs updating in one place
-# instead of two duplicated literals across the image-to-video and
-# text-to-video branches.
-VEO_MODEL_ID = "veo-3.1-generate-preview"
+# Single source of truth for the Google video model. Google shut down the Veo
+# preview models on 2026-10-22 (ENG-1070 was the previous retirement); the
+# replacement, gemini-omni-1.1-flash, is served ONLY by the Gemini Interactions
+# API (generateContent / generate_videos are rejected for it), so it is called
+# over plain REST rather than through the google-genai SDK.
+OMNI_VIDEO_MODEL_ID = "gemini-omni-1.1-flash"
+GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+# Retired ids still stored on old tasks; they resolve to OMNI_VIDEO_MODEL_ID.
+LEGACY_GOOGLE_VIDEO_MODEL_IDS = (
+    "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-preview",
+    "veo-3-generate-preview",
+    "veo-3.0-generate-preview",
+)
 
 
-def build_veo_config_params(negative_prompt: Optional[str] = None) -> dict:
-    """Build the kwargs for types.GenerateVideosConfig() used by both Veo generation branches.
+def build_omni_interaction_body(
+    prompt: str,
+    image_b64: Optional[str] = None,
+    image_mime_type: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+) -> dict:
+    """Build the Interactions API request body for one gemini-omni-1.1-flash clip.
 
-    Pure and dependency-free (no google.genai import needed) so it's directly
-    unit-testable without the full browser-use/langchain import chain.
+    Text-to-video sends the prompt as a plain string; image-to-video sends the
+    image part first, then the text part. The API has no negative-prompt field,
+    so a negative prompt is folded into the text. Output is fixed at 16:9 720p.
+
+    Pure and dependency-free so it's directly unit-testable without the full
+    browser-use/langchain import chain.
     """
-    config_params = {
-        "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-        "number_of_videos": 1,  # 1 video generated per request
-    }
+    text = prompt
     if negative_prompt:
-        config_params["negative_prompt"] = negative_prompt
-    return config_params
+        text = f"{prompt}\n\nAvoid: {negative_prompt}"
+    if image_b64:
+        model_input = [
+            {"type": "image", "data": image_b64, "mime_type": image_mime_type or "image/jpeg"},
+            {"type": "text", "text": text},
+        ]
+    else:
+        model_input = text
+    return {
+        "model": OMNI_VIDEO_MODEL_ID,
+        "input": model_input,
+        "response_format": {"type": "video", "aspect_ratio": "16:9", "resolution": "720p"},
+    }
+
+
+def extract_omni_video_base64(response_json) -> Optional[str]:
+    """Return the base64 video from a completed Interactions API response, else None.
+
+    The clip lives in steps[].content[] as {"type": "video", "data": "<base64>"}.
+    """
+    if not isinstance(response_json, dict) or response_json.get("status") != "completed":
+        return None
+    for step in response_json.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for part in step.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "video" and part.get("data"):
+                return part["data"]
+    return None
 
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
@@ -1781,13 +1823,13 @@ class WebAgent:
         if self.create_video:
             @self.controller.registry.action('Generate short video', param_model=GenerateVideoParams)
             async def generate_short_video(params: GenerateVideoParams) -> ActionResult:
-                """Generate videos using Google VEO API or Runway AI API.
+                """Generate videos using Google gemini-omni-1.1-flash, Runway AI, or ReelMind.
                 
                 This action uses the selected video model to generate videos based on text prompts or input images.
                 The generated video is saved to the downloads folder.
                 
                 Supported models:
-                - veo-3.1-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
+                - gemini-omni-1.1-flash (Google, default): ~10-second videos with audio, 16:9 aspect ratio
                 - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
                 - kling-v2.1-std (ReelMind): 5-second image-to-video generation, 16:9 aspect ratio (Kling V1.6 Std used for text-to-video)
                 
@@ -1802,8 +1844,11 @@ class WebAgent:
                 - ActionResult with the generation results or error message
                 """
                 try:
-                    # Get the video model to use (default to Google VEO if not specified)
-                    video_model = self.video_model or VEO_MODEL_ID
+                    # Get the video model to use (default to Google Omni if not specified;
+                    # retired Veo ids stored on old tasks resolve to Omni)
+                    video_model = self.video_model or OMNI_VIDEO_MODEL_ID
+                    if video_model in LEGACY_GOOGLE_VIDEO_MODEL_IDS:
+                        video_model = OMNI_VIDEO_MODEL_ID
                     logger.info(f"Using video model: {video_model}")
                     
                     # Validate output file extension (must end with .mp4)
@@ -1927,9 +1972,9 @@ class WebAgent:
                         # Use ReelMind API for Kling V2.1 Std.
                         # requests/json/time/uuid are already imported at module level (ENG-1122:
                         # redundant local imports here silently made those names LOCAL for this
-                        # entire closure -- including the Veo branch's time.sleep() polling loop
-                        # below, which raised UnboundLocalError since that local import statement
-                        # never executes on the Veo path).
+                        # entire closure -- including the then-Veo branch's time.sleep() polling
+                        # loop, which raised UnboundLocalError since that local import statement
+                        # never executed on that path).
 
                         # Get API key
                         api_key = secrets_manager.get_reelmind_api_key()
@@ -2137,88 +2182,57 @@ class WebAgent:
                             return ActionResult(error=f"ReelMind video generation error: {str(e)} (Do not retry - this is a permanent failure)")
                     
                     else:
-                        # Use Google VEO (default)
-                        try:
-                            from google import genai
-                            from google.genai import types
-                        except ImportError:
-                            return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
-                        
-                        # Get API key
+                        # Google gemini-omni-1.1-flash (default) via the Interactions API.
+                        # The call is synchronous: the finished clip comes back as base64.
                         api_key = secrets_manager.get_google_veo_api_key()
                         if not api_key:
                             return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
-                        
-                        client = genai.Client(api_key=api_key)
-                        logger.info("Google VEO: Generating 8-second video with audio support in 16:9 aspect ratio")
-                        
-                        # Handle input image for Google VEO
-                        image_object = None
+
+                        image_b64 = None
+                        mime_type = None
                         if image_path:
                             try:
                                 with open(image_path, "rb") as f:
-                                    image_bytes = f.read()
-                                
-                                # Determine MIME type based on file extension
-                                image_ext = Path(params.image_file_name).suffix.lower()
-                                mime_type_map = {
+                                    image_b64 = base64.b64encode(f.read()).decode("ascii")
+                                # Use the resolved path (an SVG has already been converted to PNG)
+                                mime_type = {
                                     '.png': 'image/png',
                                     '.jpg': 'image/jpeg',
                                     '.jpeg': 'image/jpeg',
                                     '.gif': 'image/gif',
                                     '.bmp': 'image/bmp',
                                     '.webp': 'image/webp'
-                                }
-                                mime_type = mime_type_map.get(image_ext, 'image/jpeg')
-                                
-                                image_object = types.Image(image_bytes=image_bytes, mime_type=mime_type)
-                                logger.info(f"Loaded input image for Google VEO: {params.image_file_name} (MIME: {mime_type})")
+                                }.get(Path(image_path).suffix.lower(), 'image/jpeg')
+                                logger.info(f"Loaded input image for {OMNI_VIDEO_MODEL_ID}: {params.image_file_name} (MIME: {mime_type})")
                             except Exception as e:
                                 return ActionResult(error=f"Failed to read image file {params.image_file_name}: {str(e)}")
-                        
-                        # Generate video using VEO API
-                        if image_object:
-                            # Image-to-video generation
-                            logger.info("Generating video from input image using Google VEO")
-                            config_params = build_veo_config_params(params.negative_prompt)
 
-                            operation = client.models.generate_videos(
-                                model=VEO_MODEL_ID,
-                                prompt=params.prompt,
-                                image=image_object,
-                                config=types.GenerateVideosConfig(**config_params)
-                            )
-                        else:
-                            # Text-to-video generation
-                            logger.info("Generating video from text prompt using Google VEO")
-                            config_params = build_veo_config_params(params.negative_prompt)
+                        body = build_omni_interaction_body(params.prompt, image_b64, mime_type, params.negative_prompt)
+                        logger.info(f"Generating video with {OMNI_VIDEO_MODEL_ID} ({'image' if image_b64 else 'text'}-to-video, 16:9 720p)")
+                        response = await asyncio.to_thread(
+                            requests.post,
+                            GEMINI_INTERACTIONS_URL,
+                            params={"key": api_key},
+                            json=body,
+                            timeout=600,
+                        )
+                        if response.status_code == 429:
+                            return ActionResult(error=f"{OMNI_VIDEO_MODEL_ID} video quota exhausted (HTTP 429). Try again later.")
+                        if response.status_code != 200:
+                            try:
+                                detail = response.json().get("error", {}).get("message") or response.text
+                            except ValueError:
+                                detail = response.text
+                            return ActionResult(error=f"{OMNI_VIDEO_MODEL_ID} video generation failed (HTTP {response.status_code}): {detail[:500]}")
 
-                            operation = client.models.generate_videos(
-                                model=VEO_MODEL_ID,
-                                prompt=params.prompt,
-                                config=types.GenerateVideosConfig(**config_params)
-                            )
-                        
-                        # Wait for the video to be generated
-                        logger.info("Waiting for Google VEO video generation to complete...")
-                        while not operation.done:
-                            time.sleep(20)
-                            operation = client.operations.get(operation)
-                            logger.info(f"Video generation update: {operation}")
-                        
-                        result = operation.result
-                        
-                        # Check if video was generated successfully
-                        if result and result.generated_videos and len(result.generated_videos) > 0:
-                            # Download and save the video
-                            generated_video = result.generated_videos[0]
-                            client.files.download(file=generated_video.video)
-                            generated_video.video.save(output_path)
-                            
-                            logger.info(f"Google VEO video saved to: {output_path}")
-                            return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully using Google VEO and saved to downloads folder!")
-                        else:
-                            return ActionResult(error="No video data received from Google VEO API")
+                        video_b64 = extract_omni_video_base64(response.json())
+                        if not video_b64:
+                            return ActionResult(error=f"No video data received from {OMNI_VIDEO_MODEL_ID}")
+                        with open(output_path, "wb") as f:
+                            f.write(base64.b64decode(video_b64))
+
+                        logger.info(f"{OMNI_VIDEO_MODEL_ID} video saved to: {output_path}")
+                        return ActionResult(extracted_content=f"✅ Video {params.output_file_name} generated successfully using Google {OMNI_VIDEO_MODEL_ID} and saved to downloads folder!")
 
                 except Exception as e:
                     logger.error(f"Error generating video: {e}")
@@ -4212,7 +4226,7 @@ async def main():
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
-    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.1-generate-preview, gen4_turbo, or kling-v2.1-std)')
+    parser.add_argument('--video-model', help='Video model to use for video generation (gemini-omni-1.1-flash, gen4_turbo, or kling-v2.1-std)')
     parser.add_argument('--image-model', help='Image model to use for image generation (openai-image-1 or FLUX.1-Kontext-pro)')
     args = parser.parse_args()
 

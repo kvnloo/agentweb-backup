@@ -31,8 +31,8 @@ import {
 import { userDb } from '../services/db';
 import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
 import { claimLoopDailyDigestPost } from '../loops/core/digest/dailyDigestClaim';
+import { TABLE_PREFIX } from '../config/constants';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const RUNS_TABLE = `${TABLE_PREFIX}AW-OnboardingLoopRuns`;
 const ONBOARDING_LEGACY_LOOP_ID = 'onboarding-loop-legacy';
 const ONBOARDING_HEARTBEAT_LOOP_ID = 'onboarding-loop-heartbeat';

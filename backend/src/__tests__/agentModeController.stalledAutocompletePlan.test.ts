@@ -12,7 +12,7 @@
  * the full continuation plumbing, which reuses generateSessionResponse/withGenerationTimeout/
  * the session-generation lock exactly as the already-covered media case does.
  */
-import { hasStalledAutocompleteWorkPlan } from '../controllers/agentModeController';
+import { hasStalledAutocompleteWorkPlan, hasNonRetryableWorkPlanStatusBlock } from '../controllers/agentModeController';
 
 // Same mock scaffolding agentModeController.autoMediaContinuation.test.ts uses — required
 // just to import the module (its top-level code touches these services).
@@ -247,5 +247,42 @@ describe('hasStalledAutocompleteWorkPlan (ENG-1813 — unresolved debt from a re
       pendingRequiredFunctionCalls: [],
     };
     expect(hasStalledAutocompleteWorkPlan(workPlan, [{ name: 'modify_work_plan' }], {})).toBe(false);
+  });
+});
+
+describe('ENG-2019 non-retryable set_work_plan_status block', () => {
+  const plan = {
+    autocomplete: true,
+    steps: [{ status: 'completed' }, { status: 'completed' }],
+    pendingRequiredFunctionCalls: ['publish_landing_page'],
+  };
+  const blocked = {
+    name: 'set_work_plan_status',
+    result: {
+      success: false, blocked: true, reason: 'workplan_unresolved_removed_requirements',
+      message: 'Cannot finish this work plan. A required function call from a removed step was never made.',
+    },
+  };
+
+  it('session 15b230eb shape: unresolved debt + blocked status call fires zero continuation rounds', () => {
+    expect(hasNonRetryableWorkPlanStatusBlock([blocked])).toBe(true);
+    expect(hasStalledAutocompleteWorkPlan(plan, [blocked], {})).toBe(false);
+  });
+
+  it('parses a JSON-string tool result', () => {
+    expect(hasNonRetryableWorkPlanStatusBlock([{ ...blocked, result: JSON.stringify(blocked.result) }])).toBe(true);
+  });
+
+  it('only the LAST status call counts: a later success re-enables the debt stall', () => {
+    const ok = { name: 'set_work_plan_status', result: { success: true } };
+    expect(hasNonRetryableWorkPlanStatusBlock([blocked, ok])).toBe(false);
+    expect(hasStalledAutocompleteWorkPlan(plan, [blocked, ok], {})).toBe(true);
+  });
+
+  it('other block reasons and other tools still stall-retry', () => {
+    const other = { name: 'set_work_plan_status', result: { success: false, blocked: true, reason: 'out_of_order' } };
+    expect(hasNonRetryableWorkPlanStatusBlock([other])).toBe(false);
+    expect(hasNonRetryableWorkPlanStatusBlock([{ ...blocked, name: 'create_html_file' }])).toBe(false);
+    expect(hasStalledAutocompleteWorkPlan(plan, [other], {})).toBe(true);
   });
 });

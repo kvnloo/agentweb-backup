@@ -25,6 +25,7 @@ jest.mock('../loops/eval/evalRegistry', () => ({ mayGate: jest.fn() }));
 jest.mock('../utils/instanceState', () => ({ isCronEnabled: jest.fn() }));
 jest.mock('../services/chatbotService', () => ({ chatbotDb: { getRecentSessionFeedback: jest.fn() } }));
 jest.mock('../services/metaTrackingMonitor', () => ({ monitorUserTracking: jest.fn() }));
+jest.mock('../services/googleAdsService', () => ({ googleAdsService: { getCampaignDelivery: jest.fn() } }));
 
 import { userDb } from '../services/db';
 import { paymentHistoryDb, type PaymentHistoryRecord } from '../services/paymentHistoryDb';
@@ -53,6 +54,7 @@ import { isCronEnabled } from '../utils/instanceState';
 import { chatbotDb } from '../services/chatbotService';
 import { monitorUserTracking, type MonitorSummary } from '../services/metaTrackingMonitor';
 import type { AdsMetricsSnapshotRow } from '../services/adsMetricsDb';
+import { googleAdsService } from '../services/googleAdsService';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
@@ -536,5 +538,82 @@ describe('gatherAccountHealthSignals: behavioural inputs (ENG-2143 audit)', () =
     expect(monitorUserTracking).not.toHaveBeenCalled();
     jest.mocked(monitorUserTracking).mockRejectedValueOnce(new Error('graph down'));
     expect((await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW)).signals.tracking).toBeNull();
+  });
+});
+
+describe('gatherAccountHealthSignals: live Google Ads campaign delivery (ENG-1913)', () => {
+  const liveGoogle = { platform: 'google_ads', account_id: '1234567890', config: { token_expires_at: NOW + 30 * DAY_MS } };
+  const campaign = (id: string, over: Record<string, unknown> = {}) => ({
+    campaignId: id, status: 'ENABLED', approvedDailyBudget: 33, liveSince: iso(NOW - 7 * DAY_MS), impressions: 0, clicks: 0, ...over,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.mocked(getAccountCapabilityRequirement).mockResolvedValue(null);
+    jest.mocked(paymentHistoryDb.getByUserId).mockResolvedValue([]);
+    jest.mocked(chatbotDb.getRecentSessionFeedback).mockResolvedValue([]);
+    jest.mocked(adsMetricsDb.getAccountDaySnapshots).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
+  });
+
+  // AC5: Smart Water Heater — three enabled Search campaigns, $100/day combined, 7 days of zero delivery.
+  it('feeds the SWH zero-delivery replay into the classifier and flags it at_risk', async () => {
+    jest.mocked(googleAdsService.getCampaignDelivery).mockResolvedValue([
+      campaign('core'), campaign('competitor'), campaign('exact', { approvedDailyBudget: 34 }),
+    ]);
+    const { signals } = await gatherAccountHealthSignals({ userId: 'swh', connected_accounts: [liveGoogle] }, NOW);
+    expect(googleAdsService.getCampaignDelivery).toHaveBeenCalledWith('swh', '1234567890', NOW);
+    expect(signals.campaigns).toHaveLength(3);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(result.state).toBe('at_risk');
+    expect(JSON.stringify(result)).toContain('zero_delivery');
+  });
+
+  it('does not flag delivering, paused, or warming-up campaigns (AC2-AC4)', async () => {
+    jest.mocked(googleAdsService.getCampaignDelivery).mockResolvedValue([
+      campaign('delivering', { impressions: 900, clicks: 12 }),
+      campaign('paused', { status: 'PAUSED' }),
+      campaign('new', { liveSince: iso(NOW - 2 * 60 * 60 * 1000) }),
+    ]);
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle] }, NOW);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(JSON.stringify(result)).not.toContain('zero_delivery');
+  });
+
+  it('a failed Google read is unread (null), never zero delivery', async () => {
+    jest.mocked(googleAdsService.getCampaignDelivery).mockRejectedValue(new Error('quota'));
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle] }, NOW);
+    expect(signals.campaigns).toBeNull();
+  });
+
+  it('accounts without Google Ads stay unread and never call Google', async () => {
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW);
+    expect(signals.campaigns).toBeNull();
+    expect(googleAdsService.getCampaignDelivery).not.toHaveBeenCalled();
+  });
+
+  it('regression: a non-Google account still classifies with delivery_not_read and no zero_delivery', async () => {
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(result.evidence.find((e) => e.code === 'delivery_not_read')?.kind).toBe('gap');
+    expect(JSON.stringify(result)).not.toContain('zero_delivery');
+  });
+
+  it('an ENDED campaign is excluded, not stuck', async () => {
+    jest.mocked(googleAdsService.getCampaignDelivery).mockResolvedValue([campaign('done', { status: 'ENDED' })]);
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle] }, NOW);
+    const result = classifyAccountHealth({ ...signals, requirement: { requirementSource: 'contracted' } } as AccountHealthSignals);
+    expect(JSON.stringify(result)).not.toContain('zero_delivery');
+  });
+
+  it('one failing Google account leaves the whole user unread, never a verdict from the others', async () => {
+    const second = { ...liveGoogle, account_id: '999' };
+    jest.mocked(googleAdsService.getCampaignDelivery).mockImplementation(async (_u: string, id: string) => {
+      if (id === '999') throw new Error('429');
+      return [campaign('stuck')] as any;
+    });
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveGoogle, second] }, NOW);
+    expect(signals.campaigns).toBeNull();
   });
 });

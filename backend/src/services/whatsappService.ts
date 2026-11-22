@@ -73,6 +73,12 @@ export interface WhatsAppTemplate {
    * legality: 'marketing' cannot be delivered to +1 numbers at all (131049).
    */
   category: 'utility' | 'authentication' | 'marketing';
+  /**
+   * Quick-reply buttons the template was created with, in order. Each entry is the payload
+   * sent with that button. Meta requires every quick-reply button to be addressed by index
+   * at send time. A tap comes back as a `button` message carrying this payload.
+   */
+  quickReplies?: readonly string[];
 }
 
 /**
@@ -101,6 +107,19 @@ export const TEMPLATES = {
     language: 'en_US',
     variables: ['asset_type', 'asset_name', 'review_url'],
     category: 'utility',
+  },
+  /**
+   * Same words as APPROVAL_REQUEST plus Approve / Reject quick-reply buttons, so a customer
+   * outside the 24-hour window can answer with a tap. Created in Meta as its own template
+   * (a template's buttons cannot be changed after approval). Until Meta approves it the
+   * notifier falls back to APPROVAL_REQUEST — see approvalChannelNotifier.
+   */
+  APPROVAL_REQUEST_BUTTONS: {
+    name: 'agentweb_approval_request_buttons',
+    language: 'en_US',
+    variables: ['asset_type', 'asset_name', 'review_url'],
+    category: 'utility',
+    quickReplies: ['approve', 'reject'],
   },
 } as const satisfies Record<string, WhatsAppTemplate>;
 
@@ -131,6 +150,7 @@ export function toE164(raw: string, defaultCountry?: CountryCode): string | null
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const windowKey = (phone: string) => `whatsapp:window:${phone}`;
 const optOutKey = (phone: string) => `whatsapp:optout:${phone}`;
+const phoneUserKey = (phone: string) => `whatsapp:phone-user:${phone}`;
 
 /**
  * Record an inbound message, opening (or extending) the 24-hour service window.
@@ -188,6 +208,124 @@ export async function recordOptIn(phone: string, source: string): Promise<void> 
 export async function isOptedOut(phone: string): Promise<boolean> {
   const row = await settingsService.getSetting(optOutKey(phone));
   return !!row?.settingValue;
+}
+
+// ── Sender identity ────────────────────────────────────────────────────────
+
+/**
+ * Phone -> user, the reverse of the binding `messagingChannels` already stores.
+ *
+ * Verification runs the other way round: a code identifies the user, and the sender's
+ * number is written onto that user's record. That is enough to SEND, which is all the
+ * channel did at first. Anything the customer initiates — tapping an approval button,
+ * answering a form — arrives identified only by a phone number, and there is no index
+ * from a number back to an account. Scanning every user per inbound message is not an
+ * option on the webhook's latency budget.
+ *
+ * So the inverse row is written at bind time, next to the window and opt-out rows that
+ * are already keyed this way. It is a cache of a fact the user record owns, never the
+ * source of truth: `resolveUserIdByPhone` re-reads the user and confirms the number is
+ * still their verified destination before trusting it, so a stale row resolves to
+ * nothing rather than to the wrong account.
+ */
+export async function bindPhoneToUser(phone: string, userId: string): Promise<void> {
+  await settingsService.setSetting(
+    phoneUserKey(phone),
+    userId,
+    'WhatsApp sender identity (phone -> user)',
+    'system',
+  );
+}
+
+/**
+ * Claim a number for an account, atomically. Two accounts racing for one number cannot
+ * both win: the first conditional put takes it. A row left behind by an account that no
+ * longer holds the number (resolveUserIdByPhone heals those) does not block a new owner.
+ */
+const PHONE_CLAIM_GRACE_MS = 2 * 60 * 1000;
+
+export async function claimPhoneForUser(
+  phone: string,
+  userId: string,
+): Promise<'claimed' | 'already_yours' | 'held_by_other'> {
+  const desc = 'WhatsApp sender identity (phone -> user)';
+  const tryClaim = () => settingsService.setSettingIfAbsent(phoneUserKey(phone), userId, desc, 'system');
+  if (await tryClaim()) return 'claimed';
+  const existing = await settingsService.getSetting(phoneUserKey(phone));
+  if (existing?.settingValue === userId) return 'already_yours';
+  // A claim is written before its owner's user record is saved, so for a moment it looks
+  // "stale" to resolveUserIdByPhone (the account does not hold the number yet) and would be
+  // healed away from under a save that is about to land. Give a fresh claim a grace period
+  // before treating it as abandoned; an abandoned one only blocks others for that long.
+  const claimedAt = existing?.updatedAt ? Date.parse(existing.updatedAt) : NaN;
+  if (Number.isFinite(claimedAt) && Date.now() - claimedAt < PHONE_CLAIM_GRACE_MS) {
+    return 'held_by_other';
+  }
+  // Held by someone else per the row: only if that account really still has the number.
+  const holder = await resolveUserIdByPhone(phone);
+  if (holder && holder !== userId) return 'held_by_other';
+  // Stale row (now healed) or vanished: one more atomic attempt.
+  return (await tryClaim()) ? 'claimed' : 'held_by_other';
+}
+
+/**
+ * Remove the phone -> user row.
+ *
+ * With `onlyIfUserId`, the row is removed only if it still points at that account, in one
+ * atomic conditional delete. One number can have been re-bound to a different account since
+ * the caller last looked, and an unconditional delete from the old account's disconnect
+ * would silently break the new owner's inbound taps.
+ */
+export async function unbindPhone(phone: string, onlyIfUserId?: string): Promise<void> {
+  if (onlyIfUserId) {
+    try {
+      await settingsService.deleteSettingIfValueMatches(phoneUserKey(phone), onlyIfUserId);
+    } catch (error: any) {
+      // The row already points elsewhere, or is gone: nothing of this account's to remove.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      throw error;
+    }
+    return;
+  }
+  await settingsService.deleteSetting(phoneUserKey(phone));
+}
+
+/**
+ * The user who has verified this number, or null.
+ *
+ * Deliberately re-reads and re-checks the user record rather than trusting the index.
+ * The row is written at bind time and cleared on disconnect, but a crash between those
+ * two writes, or a number that moved to another account, would otherwise resolve an
+ * inbound action to someone who no longer owns the number — which, for an approval
+ * button, means one customer answering another customer's decision.
+ */
+export async function resolveUserIdByPhone(phone: string): Promise<string | null> {
+  const row = await settingsService.getSetting(phoneUserKey(phone));
+  const userId = row?.settingValue;
+  if (!userId) return null;
+
+  const { userDb } = await import('./db');
+  const user = await userDb.getUserById(userId);
+  const stillBound = (Array.isArray((user as any)?.messagingChannels)
+    ? (user as any).messagingChannels
+    : []
+  ).some(
+    (c: any) =>
+      c?.channel === 'whatsapp' &&
+      c?.destination === phone &&
+      c?.enabled &&
+      c?.optIn?.verifiedAt,
+  );
+
+  if (!stillBound) {
+    // Self-healing: the index outlived the binding it describes.
+    console.warn(
+      `[whatsapp] stale phone->user row for ${redactPhone(phone)} — clearing`,
+    );
+    await unbindPhone(phone, userId).catch(() => {});
+    return null;
+  }
+  return userId;
 }
 
 /**
@@ -397,6 +535,12 @@ export async function sendTemplate(
           type: 'body',
           parameters: variables.map((text) => ({ type: 'text', text: toTemplateParam(text) })),
         },
+        ...(template.quickReplies ?? []).map((payload, index) => ({
+          type: 'button',
+          sub_type: 'quick_reply',
+          index: String(index),
+          parameters: [{ type: 'payload', payload }],
+        })),
       ],
     },
   });
@@ -425,6 +569,144 @@ export async function sendText(
     text: { body: text },
   });
 }
+
+export const OPT_OUT_CONFIRMATION =
+  "You're opted out. AgentWeb won't send any more WhatsApp messages to this number, and it is " +
+  'no longer connected to your AgentWeb account. Reply START if you change your mind, then ' +
+  'reconnect it from Settings in AgentWeb.';
+
+export const OPT_IN_CONFIRMATION =
+  "You're opted back in. AgentWeb can message this number again. To receive notifications " +
+  'here, connect it again from Settings in AgentWeb. Reply STOP at any time to opt out.';
+
+/**
+ * The one message an opted-out number is allowed to receive: confirmation that the
+ * opt-out landed (ENG-273).
+ *
+ * Every other send goes through `assertSendable`, which refuses an opted-out number
+ * outright. That is right for notifications and wrong for this: a STOP that is answered
+ * with silence is indistinguishable, to the person who sent it, from a STOP that was
+ * dropped. Acknowledging it once is what people expect from SMS, and the webhook records
+ * the opt-out BEFORE calling this, so a failure here can never leave someone still
+ * subscribed.
+ *
+ * Deliberately a separate narrow export rather than a `force`/`ignoreOptOut` flag on
+ * sendText: a bypass any caller can pass is a bypass that eventually gets passed by
+ * accident. This one takes no text and no template, so it cannot be repurposed into a
+ * way to message someone who opted out — and it still honours the service window, which
+ * the inbound STOP itself just opened.
+ */
+export async function sendOptOutConfirmation(
+  destination: string,
+): Promise<{ messageId: string | null }> {
+  const phone = toE164(destination);
+  if (!phone) {
+    throw new WhatsAppError(
+      `"${redactPhone(destination)}" is not a valid phone number in E.164 form — refusing to send.`,
+    );
+  }
+  if (!(await isServiceWindowOpen(phone))) {
+    throw new WhatsAppWindowClosedError(
+      `${redactPhone(phone)} is outside the 24-hour service window.`,
+    );
+  }
+  return postToGraph({
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'text',
+    text: { body: OPT_OUT_CONFIRMATION },
+  });
+}
+
+// ── Interactive messages ───────────────────────────────────────────────────
+
+/** One tappable reply button. `id` comes back on the tap; `title` is what is shown. */
+export interface WhatsAppReplyButton {
+  /** Returned verbatim as `interactive.button_reply.id`. Max 256 chars. */
+  id: string;
+  /** Button face. Max 20 chars, and must be unique among the buttons sent. */
+  title: string;
+}
+
+const MAX_REPLY_BUTTONS = 3;
+const BUTTON_TITLE_MAX = 20;
+const BUTTON_ID_MAX = 256;
+const INTERACTIVE_BODY_MAX = 1024;
+
+/**
+ * Reply buttons, for use INSIDE the 24-hour service window (ENG-273).
+ *
+ * The window is the whole reason this is separate from `sendTemplate`. Interactive
+ * messages are "service messages" in Meta's taxonomy, which need no pre-approval —
+ * so inside the window we can put real Approve/Reject buttons on a message with no
+ * template round-trip at all. Outside it, the same affordance has to be carried by an
+ * approved template instead, which is a different send and a different registry entry.
+ *
+ * Unlike Slack, the buttons CANNOT be removed once tapped — there is no edit operation
+ * in the Cloud API. Callers must therefore treat a tap as repeatable and make the
+ * action behind it idempotent; the buttons stay on the customer's screen forever.
+ *
+ * `id` is the only field a caller controls that survives the round trip. Meta sets a
+ * TEMPLATE quick-reply's `button.payload` to the button's own label, so a template
+ * cannot carry an identifier this way — only this non-template form can.
+ */
+export async function sendInteractiveButtons(
+  destination: string,
+  body: string,
+  buttons: WhatsAppReplyButton[],
+): Promise<{ messageId: string | null }> {
+  const phone = await assertSendable(destination);
+
+  if (!(await isServiceWindowOpen(phone))) {
+    throw new WhatsAppWindowClosedError(
+      `${redactPhone(phone)} is outside the 24-hour service window — ` +
+        'interactive buttons require an approved template out there.',
+    );
+  }
+
+  // Validated locally rather than discovered as a Meta rejection: these limits are
+  // fixed and documented, and a 400 from Graph names the field, not the caller.
+  if (buttons.length === 0 || buttons.length > MAX_REPLY_BUTTONS) {
+    throw new WhatsAppError(
+      `WhatsApp allows 1-${MAX_REPLY_BUTTONS} reply buttons, got ${buttons.length}.`,
+    );
+  }
+  const titles = buttons.map((b) => b.title);
+  if (new Set(titles).size !== titles.length) {
+    // Meta rejects duplicate titles outright.
+    throw new WhatsAppError('Reply button titles must be unique.');
+  }
+  for (const b of buttons) {
+    if (!b.id || b.id.length > BUTTON_ID_MAX) {
+      throw new WhatsAppError(`Reply button id must be 1-${BUTTON_ID_MAX} characters.`);
+    }
+    if (!b.title || b.title.length > BUTTON_TITLE_MAX) {
+      throw new WhatsAppError(
+        `Reply button title "${b.title}" must be 1-${BUTTON_TITLE_MAX} characters.`,
+      );
+    }
+  }
+
+  const text = formatForChannel(body, 'whatsapp').slice(0, INTERACTIVE_BODY_MAX);
+
+  return postToGraph({
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text },
+      action: {
+        buttons: buttons.map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: b.title },
+        })),
+      },
+    },
+  });
+}
+
+
 
 export interface WhatsAppSendParams {
   destination: string;

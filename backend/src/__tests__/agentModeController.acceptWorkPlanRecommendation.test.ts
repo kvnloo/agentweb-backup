@@ -151,6 +151,29 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     }));
   });
 
+  // ENG-903 FAIL-LOUD: the plan's pinned model cannot be served -> 422, shared body, never 404/409.
+  it('maps a model_unavailable launch result to the shared 422 body', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    const body = { error: 'The model you selected (Old) isn\'t available right now, so nothing was sent to a different model. Choose another model and try again.', code: 'model_unavailable', requestedModel: 'old', reason: 'not_served' };
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_unavailable', modelUnavailable: body, message: body.error });
+    const req = mockRequest(authedUser, { sessionId: 'sess-1', recommendationId: 'reco-abc' });
+    const res = mockResponse();
+
+    await agentModeController.acceptWorkPlanRecommendation(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith(body);
+  });
+
+  it('maps a model_save_failed launch result to a transient 503 (not 404)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_save_failed', code: 'model_save_failed', message: 'x' });
+    const res = mockResponse();
+    await agentModeController.acceptWorkPlanRecommendation(mockRequest(authedUser, { sessionId: 'sess-1', recommendationId: 'reco-abc' }), res);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_save_failed' }));
+  });
+
   it('is idempotent: double accept (same templatePlanId already active) returns 200 alreadyApplied without re-applying', async () => {
     const existingWorkPlan = { title: 'Client Onboarding', steps: [{ stepCount: 1, title: 'Analyze website', status: 'pending' }], templatePlanId: 'plan-onboard' };
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({ workPlan: existingWorkPlan }) as any);
@@ -238,6 +261,27 @@ describe('agentModeController.launchWorkPlan', () => {
     // work-plan autocomplete via sessionType.
     expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1', { isUnattendedRun: false });
     expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('ENG-903: maps a model_unavailable launch result to the shared 422 body', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    const body = { error: 'The model you selected (Old) isn\'t available right now, so nothing was sent to a different model. Choose another model and try again.', code: 'model_unavailable', requestedModel: 'old', reason: 'not_selectable' };
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_unavailable', modelUnavailable: body, message: body.error });
+    const res = mockResponse();
+
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith(body);
+  });
+
+  it('launchWorkPlan maps a model_save_failed result to 503', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({ success: false, errorType: 'model_save_failed', code: 'model_save_failed', message: 'x' });
+    const res = mockResponse();
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'model_save_failed' }));
   });
 
   it('refuses to launch in another user\'s session', async () => {

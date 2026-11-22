@@ -15,7 +15,11 @@ export interface ValidationRecord {
   n: number;
   date: string;
   evidence: string;
+  /** Who wrote the labels the run was scored against. A validation can qualify a grader for gating only when this is `human`. */
+  labelSource?: LabelSource;
 }
+
+export type LabelSource = 'human';
 
 export interface LabelPair<L extends string | number = string> {
   truth: L;
@@ -337,6 +341,6 @@ export function pairwiseWinRate(choices: ReadonlyArray<PairwiseChoice>): {
 }
 
 /** The registry `validation` record for a finished agreement run. */
-export function toGraderValidation(report: AgreementReport, evidence: string, date: Date = new Date()): ValidationRecord {
-  return { kappa: report.kappa, n: report.n, date: date.toISOString().slice(0, 10), evidence };
+export function toGraderValidation(report: AgreementReport, evidence: string, date: Date = new Date(), labelSource?: LabelSource): ValidationRecord {
+  return { kappa: report.kappa, n: report.n, date: date.toISOString().slice(0, 10), evidence, ...(labelSource ? { labelSource } : {}) };
 }

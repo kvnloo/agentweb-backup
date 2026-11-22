@@ -24,6 +24,11 @@ jest.mock('../services/metaTokenRefresh', () => {
   };
 });
 
+const mockRaiseHandoff = jest.fn().mockResolvedValue(true);
+jest.mock('../services/metaConnectionHandoff', () => ({
+  raiseMetaConnectionHandoff: (...args: any[]) => mockRaiseHandoff(...args),
+}));
+
 import { runMetaTokenRefresh } from '../cron/metaTokenRefreshCron';
 import { userDb } from '../services/db';
 import { ensureFreshMetaAdAccountToken } from '../services/metaTokenRefresh';
@@ -173,5 +178,24 @@ describe('runMetaTokenRefresh', () => {
     expect(summary.dueForRefresh).toBe(1);
     expect(summary.refreshed).toBe(0);
     expect(summary.failed).toBe(1);
+  });
+
+  it('ENG-1986: a failed refresh raises exactly one handoff naming customer and account', async () => {
+    mockRaiseHandoff.mockClear();
+    (userDb.getAllUsers as jest.Mock).mockResolvedValue([
+      { userId: 'u1', email: 'a@x.com', connected_accounts: [metaAd('act1', SOON), metaAd('act2', SOON)] },
+    ]);
+    (ensureFreshMetaAdAccountToken as jest.Mock)
+      .mockResolvedValueOnce({ attempted: true, refreshed: false, error: 'too old' })
+      .mockResolvedValueOnce({ attempted: true, refreshed: true });
+
+    const summary = await runMetaTokenRefresh();
+    expect(summary.failed).toBe(1);
+    expect(summary.handoffsRaised).toBe(1);
+    expect(mockRaiseHandoff).toHaveBeenCalledTimes(1);
+    expect(mockRaiseHandoff.mock.calls[0][0]).toMatchObject({
+      reason: 'refresh_failed', userId: 'u1', customerEmail: 'a@x.com', error: 'too old',
+      account: expect.objectContaining({ account_id: 'act1' }),
+    });
   });
 });

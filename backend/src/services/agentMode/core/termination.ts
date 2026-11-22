@@ -84,6 +84,11 @@ export const CONTINUE_PROMPT =
 const CONTENT_FILTER_MESSAGE =
   "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
 
+// Returned (and persisted) when a turn ends with no answer text at all, so the user
+// never gets — and a reload never shows — a blank assistant message (Opslane 2026-10-13).
+export const EMPTY_FINAL_RESPONSE_FALLBACK =
+  "I wasn't able to produce a response this time. Please try again, or rephrase your request.";
+
 export const SYNTHESIS_NUDGE =
   '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.';
 

@@ -1,5 +1,5 @@
 import { supersession } from './agentMode/modelSupersession';
-import { LLM_MODEL_REGISTRY, type LLMModelConfig } from './agentMode/llmModelRegistry';
+import { LLM_MODEL_REGISTRY, LEGACY_MODEL_ALIASES, type LLMModelConfig } from './agentMode/llmModelRegistry';
 import { IMAGE_MODEL_IDS } from './imageModelRegistry';
 
 export const MODEL_ROLES = ['chat', 'enrichment', 'image', 'embedding', 'scoring_judge', 'content_generation', 'research', 'voice'] as const;
@@ -32,7 +32,13 @@ export function getRoleModelOptions(role: ModelRole): string[] {
 
 // A persisted admin default is honoured even when the picker hides it (a legacy
 // model, or the image preview alias), as long as the role can still run it.
-function canRunPersistedDefault(role: ModelRole, id: string): boolean {
+function canonicalModelId(id: string): string {
+  return Object.prototype.hasOwnProperty.call(LEGACY_MODEL_ALIASES, id) ? LEGACY_MODEL_ALIASES[id] : id;
+}
+
+function canRunPersistedDefault(role: ModelRole, rawId: string): boolean {
+  // A stored default may hold a renamed model's old id; callLLM maps it forward, so judge the canonical id.
+  const id = canonicalModelId(rawId);
   if (role === 'image') return (IMAGE_MODEL_IDS as readonly string[]).includes(id);
   if (role === 'embedding') return false; // Only the compatible space in getRoleModelOptions.
   // Own keys only: a setting value such as "constructor" must not match Object.prototype.
@@ -72,6 +78,7 @@ export async function getRoleDefault(role: ModelRole): Promise<string> {
       }
     } catch { console.warn(`[modelRoles] Default lookup unavailable for ${role}; using registry default`); }
   }
+  candidate = canonicalModelId(candidate);
   const options = getRoleModelOptions(role);
   if (options.includes(candidate) || canRunPersistedDefault(role, candidate)) return candidate;
   if (options.includes(FALLBACKS[role])) return FALLBACKS[role];

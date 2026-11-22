@@ -103,7 +103,7 @@ export async function syncNewUserToLeadList(user: {
       },
     };
 
-    await crmDb.batchCreateLeads(parsed.listId, [lead]);
+    await crmDb.batchCreateLeads(parsed.listId, [lead], { origin: 'integration' });
   } catch (error) {
     console.error("[crmAutoSync] Failed to sync new user to lead list:", error);
   }

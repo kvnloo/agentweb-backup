@@ -12,11 +12,16 @@ const REGISTRY = [
   'anthropic.claude-opus-4-8',
   'anthropic.claude-opus-5',
   'gemini-3.5-flash',
+  'openrouter/example/admin-only-model',
+  'internal-model',
+  'admin-only-model',
 ];
 const ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
 };
 const FALLBACK = 'gpt-5-chat-2';
+const ADMIN_ONLY = new Set(['openrouter/example/admin-only-model', 'admin-only-model']);
+const INTERNAL_ONLY = new Set(['internal-model', 'live-model']);
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
@@ -28,6 +33,14 @@ jest.mock('../services/agentModeService', () => ({
         return { model: normalized, fellBack: false, requestedModel: model };
       }
       return { model: FALLBACK, fellBack: true, requestedModel: model };
+    }),
+    // ENG-2293: mirrors the real gate the controller now delegates to instead
+    // of re-deriving a subset inline (allow-list membership was already
+    // covered above; this adds adminOnly + internal/live; no model-name check).
+    isModelSelectableBy: jest.fn((modelId: string, isAdmin: boolean) => {
+      if (!REGISTRY.includes(modelId) || INTERNAL_ONLY.has(modelId)) return false;
+      if (ADMIN_ONLY.has(modelId) && !isAdmin) return false;
+      return true;
     }),
   },
   AgentModeService: jest.fn(),
@@ -131,15 +144,66 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
       );
     });
 
-    it('still blocks opus for non-admins, evaluated on the canonical id', async () => {
+    // ENG-2028: flipped from 'still blocks opus for non-admins'. The name-based
+    // Opus deny is gone; only registry adminOnly/internalOnly flags gate selection.
+    it('allows opus for non-admins, evaluated on the canonical id', async () => {
       const res = makeRes();
       await agentModeController.updateSessionLlmModel(
         patch({ llmModel: 'claude-opus-4-8' }) as any,
         res
       );
 
+      expect(res.status).not.toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-4-8');
+    });
+
+    it('still refuses registry-restricted models (internalOnly; adminOnly for non-admins)', async () => {
+      for (const [model, admin, allowed] of [
+        ['internal-model', false, false],
+        ['internal-model', true, false],
+        ['admin-only-model', false, false],
+        ['admin-only-model', true, true],
+      ] as const) {
+        jest.clearAllMocks();
+        const res = makeRes();
+        await agentModeController.updateSessionLlmModel(
+          patch({ llmModel: model }, { userId: ownerId, isAdmin: admin }) as any,
+          res
+        );
+        if (allowed) {
+          expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, model);
+        } else {
+          expect(res.status).toHaveBeenCalledWith(403);
+          expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+        }
+      }
+    });
+
+    it('blocks an adminOnly model for non-admins even though it is a registered id (ENG-2293)', async () => {
+      // Before this fix, only the opus-substring check ran here, so a
+      // non-admin who named an adminOnly auto-added model directly (not
+      // through the picker, which already hides it) still got a 200.
+      const res = makeRes();
+      await agentModeController.updateSessionLlmModel(
+        patch({ llmModel: 'openrouter/example/admin-only-model' }) as any,
+        res
+      );
+
       expect(res.status).toHaveBeenCalledWith(403);
       expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it('allows an adminOnly model for admins', async () => {
+      const res = makeRes();
+      await agentModeController.updateSessionLlmModel(
+        patch({ llmModel: 'openrouter/example/admin-only-model' }, { userId: ownerId, isAdmin: true }) as any,
+        res
+      );
+
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        sessionId,
+        'openrouter/example/admin-only-model'
+      );
     });
 
     it('still enforces session ownership', async () => {
@@ -168,6 +232,27 @@ describe('AgentModeController - llmModel picker validation (ENG-892)', () => {
       expect(res.status).toHaveBeenCalledWith(400);
       expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    });
+
+    it('allows opus for shared viewers but refuses admin-only/internal models', async () => {
+      const call = async (llmModel: string) => {
+        jest.clearAllMocks();
+        const res = makeRes();
+        mockChatbotDb.getChatSession.mockResolvedValue({ sessionId, interactiveShareMetadata: { isActive: true, token: 'token-1', createdAt: new Date() } } as any);
+        await agentModeController.updateSharedSessionLlmModel(
+          { params: { shareId: sessionId }, query: { conversable: 'token-1' }, body: { llmModel } } as unknown as Request,
+          res
+        );
+        return res;
+      };
+      const ok = await call('anthropic.claude-opus-5');
+      expect(ok.status).not.toHaveBeenCalledWith(403);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(sessionId, 'anthropic.claude-opus-5');
+      for (const m of ['internal-model', 'admin-only-model']) {
+        const r = await call(m);
+        expect(r.status).toHaveBeenCalledWith(403);
+        expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+      }
     });
   });
 });

@@ -17,6 +17,7 @@ import {
   reconcileAllStripeUsers,
   findBasePlanItem,
   getSubscriptionPeriodEndIso,
+  isSetupModeCheckoutSession,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -91,7 +92,10 @@ export async function handleWebhook(req: Request, res: Response) {
   try {
     switch (event.type) {
       case 'checkout.session.completed':
-        if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
+        if (isSetupModeCheckoutSession(event.data.object)) {
+          // Saved a payment method only (ENG-2303 Zoma onboarding); no subscription exists.
+          console.log(`[STRIPE] Setup-mode checkout ${event.data.object?.id} completed; no subscription changes.`);
+        } else if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
           await handleLlmUsageTopUpCheckoutCompleted(event.data.object);
         } else {
           await handleCheckoutSessionCompleted(event.data.object);
@@ -163,7 +167,10 @@ export async function handleWebhook(req: Request, res: Response) {
     // CRM signal (B3): mirror billing events into AW-ContactEvents so lifecycle
     // and health scores reflect live billing state. Fire-and-forget — never
     // blocks the webhook ack. Errors are swallowed inside the hook.
-    void sendStripeEventToCrm(event);
+    // A setup-mode checkout is not a subscription event (it would map to payment.subscribed).
+    if (!(event.type === 'checkout.session.completed' && isSetupModeCheckoutSession(event.data.object))) {
+      void sendStripeEventToCrm(event);
+    }
 
     res.json({ received: true });
   } catch (error: any) {

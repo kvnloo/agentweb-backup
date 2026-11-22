@@ -211,8 +211,10 @@ describe('AgentModeService.searchLeads — multi-list (list_ids)', () => {
     expect(result.error).toMatch(/filter criterion/i);
   });
 
-  it('still rejects search_leads with neither filters nor a search term', async () => {
-    const result = await service.searchLeads('list-A', [], userId);
+  // ENG-2360: a list-scoped read without filters is now allowed; only a call
+  // with no filters, no search AND no list scope is rejected.
+  it('still rejects search_leads with neither filters, a search term, nor a list scope', async () => {
+    const result = await service.searchLeads(undefined as any, [], userId);
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/filter criterion/i);

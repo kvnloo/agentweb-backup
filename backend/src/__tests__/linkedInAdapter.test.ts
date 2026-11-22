@@ -98,6 +98,16 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('createPost', () => {
+    it('ENG-428: draft mode passes draft option, skips posts cache, claims no public URL', async () => {
+      mockLinkedInService.createPost.mockResolvedValue('urn:li:share:draft9');
+      const result = await adapter.createPost(mockPersonalAccount, 'Draft post', undefined, 'user-1', undefined, { draft: true });
+      expect(mockLinkedInService.createPost.mock.calls[0][5]).toEqual({ draft: true });
+      expect(mockPostsDb.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.postUrl).toBeUndefined();
+      expect(result.message).toMatch(/draft/i);
+    });
+
     it('should create a post successfully for personal account', async () => {
       mockLinkedInService.createPost.mockResolvedValue('urn:li:share:987654');
 

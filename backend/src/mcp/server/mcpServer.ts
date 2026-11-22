@@ -18,9 +18,14 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { buildMcpAuthChallenge } from '../oauth/authChallenge';
+
+export { buildMcpAuthChallenge };
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
 import { cronJobRegistry } from '../../utils/cronJobRegistry';
+import { effectiveApiKeyScopes, findScopeDenial } from './apiKeyScopes';
+import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -118,6 +123,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
       (req as any)._mcpIsInternal = false;  // External client
       (req as any)._mcpAuthMethod = 'api_key';
       (req as any)._mcpApiKeyId = keyRecord.keyId;
+      (req as any)._mcpApiKeyScopes = effectiveApiKeyScopes(keyRecord.scopes);
       (req as any)._mcpClientType = classifyMcpClient({ authMethod: 'api_key', userAgent: req.get('user-agent') });
       return next();
     } catch (error) {
@@ -169,15 +175,6 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
     setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
   });
-}
-
-export function buildMcpAuthChallenge(baseUrl: string, error?: string): string {
-  const params = [
-    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
-    `scope="mcp:tools"`,
-  ];
-  if (error) params.push(`error="${error}"`);
-  return `Bearer ${params.join(", ")}`;
 }
 
 function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {
@@ -299,18 +296,48 @@ export function setupMcpServer(
     // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
     // this listener open specifically so those calls can finish.
     const mcpMessages = Array.isArray(req.body) ? req.body : [req.body];
-    const hasToolCall = mcpMessages.some((message: any) => message?.method === 'tools/call');
+    const hasToolCall = mcpMessages.some((message: unknown) =>
+      message && typeof message === 'object' && 'method' in message && message.method === 'tools/call'
+    );
     if (
       hasToolCall &&
       (req as any)._mcpIsInternal !== true &&
       !isCronEnabled()
     ) {
-      return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+      const rejection = (message: unknown) => {
+        const id = message && typeof message === 'object' && 'id' in message ? message.id : null;
+        return {
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Instance draining — retry on new instance' },
+          id: typeof id === 'string' || typeof id === 'number' ? id : null,
+        };
+      };
+      return res.status(503).json(Array.isArray(req.body)
+        ? mcpMessages.filter((message: unknown) =>
+          message && typeof message === 'object' && 'id' in message
+        ).map(rejection)
+        : rejection(req.body));
     }
 
-    // Track from the admission decision onward, before session lookup/rehydration
-    // can await. Otherwise graceful drain can observe zero active MCP work and
-    // close the listener while an admitted call is still resolving its session.
+    // ENG-1083: API key scopes are enforced. Checked per request (the auth
+    // middleware re-validates the key on every POST), so a reused or
+    // rehydrated session cannot outlive a scope restriction.
+    if ((req as any)._mcpAuthMethod === 'api_key') {
+      const denial = findScopeDenial(req.body, (req as any)._mcpApiKeyScopes ?? [], (name) => mcpToolRegistry.getTool(name));
+      if (denial) {
+        return res.status(403).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32003,
+            message: `Forbidden: API key lacks scope '${denial.requiredScope}' required for tool '${denial.tool}'. Create a key with that scope at https://agentweb.pro (Settings > API Keys).`,
+          },
+          id: Array.isArray(req.body) ? null : (req.body?.id ?? null),
+        });
+      }
+    }
+
+    // Track from admission onward, before session lookup/rehydration can await.
+    // Scope refusals above have not admitted any work and need no drain token.
     let finishAdmittedToolCall: (() => void) | undefined;
     if (hasToolCall) {
       const admitted = new Promise<void>((resolve) => {

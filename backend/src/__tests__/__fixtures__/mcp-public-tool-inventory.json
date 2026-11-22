@@ -1,0 +1,3514 @@
+[
+  {
+    "name": "assess_client_health",
+    "listed": false,
+    "description": "Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.\n\nReturns a structured health assessment with:\n- **Ads layer**: Meta ad account connectivity, active campaigns\n- **Lander layer**: Landing page / website presence (productDomain, seoDomains)\n- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)\n- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators\n- **Overall status**: healthy / mediocre / needs-attention / blocked / onboarding with reasons\n  - onboarding = activation incomplete (no ad account ever connected). This is NOT churn or at-risk — treat it as an activation nudge.\n  - ads_layer.connection other_platform = ads run on Google Ads or LinkedIn Ads; the Meta layer is not assessed and this is not a problem.\n  - needs-attention = setup or reconnect work: every ad connection expired (ads_layer.connection_all_platforms, all_platforms_expired_at) or several setup gaps. This is NOT churn or at-risk evidence — never describe it as churn risk.\n  - This tool never returns at-risk: churn risk needs behavioural evidence (spend, results, payments, feedback) and is not assessed here.\n\nUse this to quickly diagnose a client's marketing funnel completeness.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "check_account_tracking_health",
+    "listed": false,
+    "description": "Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.\n\nResolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.\n\nReturns:\n- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.\n- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.\n\nUse this to check \"is the pixel broken\" / \"is CAPI deployed\" / \"does this ad's destination actually carry a pixel this account owns\" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.\n\nIf the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "configure_landing_page_subdomain",
+    "listed": false,
+    "description": "Set or update the subdomain for a Vercel project that hosts landing pages (e.g. \"everyio\" → everyio.agentwebforms.com). IMPORTANT: A subdomain is scoped to the entire Vercel project — all landing pages under the same project share it. Changing the subdomain updates the URL for every page in that project simultaneously. To find the vercelProjectId, call list_landing_pages or get_landing_page first. Use get_landing_page_subdomain to read the current subdomain before making changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vercel_project_id": {
+          "type": "string",
+          "description": "The Vercel project ID shared by all pages in the project (from list_landing_pages or get_landing_page)"
+        },
+        "subdomain": {
+          "type": "string",
+          "description": "The subdomain prefix to assign (e.g. \"everyio\" → everyio.agentwebforms.com). Must be lowercase alphanumeric and hyphens only."
+        }
+      },
+      "required": [
+        "vercel_project_id",
+        "subdomain"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "create_lead_list",
+    "listed": false,
+    "description": "Create, update, or delete a lead list. Use action: \"create\", \"get\", \"update\", or \"delete\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "get",
+            "update",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "list_id": {
+          "type": "string",
+          "description": "List ID (required for get/update/delete)"
+        },
+        "name": {
+          "type": "string",
+          "description": "List name (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "List description (create/update)"
+        },
+        "list_type": {
+          "type": "string",
+          "description": "List type: sales | customers | session (create only; validated by the API)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "create_schedule_from_template",
+    "listed": false,
+    "description": "Create a new scheduled chat from a schedule template. The template provides the prompt, variables, keywords, and other defaults. You can override frequency, notifications, and provide variable values.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "template_id": {
+          "type": "string",
+          "description": "The template ID to create from"
+        },
+        "schedule_name": {
+          "type": "string",
+          "description": "Name for the new scheduled chat (defaults to template name)"
+        },
+        "schedule_frequency": {
+          "type": "string",
+          "description": "Override frequency: hourly, daily, weekly, monthly, every_n_days"
+        },
+        "frequency_interval_days": {
+          "type": "number",
+          "description": "Override days between runs for every_n_days"
+        },
+        "next_run_time": {
+          "type": "string",
+          "description": "ISO 8601 datetime for the first run"
+        },
+        "email_notifications": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Override notification emails"
+        },
+        "variable_values": {
+          "type": "object",
+          "description": "Variable values for the template placeholders"
+        },
+        "run_count": {
+          "type": "number",
+          "description": "Number of runs (-1 for unlimited)"
+        },
+        "llm_model": {
+          "type": "string",
+          "description": "Override LLM model"
+        },
+        "backup_model": {
+          "type": "string",
+          "description": "Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted."
+        },
+        "required_function_calls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Override the function calls required in each run — replaces the template's own list rather than merging with it. Without a tool listed here, its delivery is best-effort — the run can complete \"successfully\" even if the model skips it, silently. IMPORTANT (ENG-2204): if the template's starting message instructs posting, alerting, or notifying via Slack and its own required_function_calls does not already include slack_send_message (older templates predate this guidance), pass the full list here with slack_send_message added — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Omit to use the template's stored list as-is."
+        }
+      },
+      "required": [
+        "template_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "delete_landing_page",
+    "listed": false,
+    "description": "Delete a generated landing page record.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The generated landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "deploy_landing_page",
+    "listed": false,
+    "description": "Retry deploying a landing page that failed during deployment. Only use this if generate_landing_page returned a failed status. Do NOT call this after a successful generate — deployment is already included in generate_landing_page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The generated landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "diagnose_leads_at_zero",
+    "listed": false,
+    "description": "Discriminate between look-alike causes for a client's \"leads at zero\" symptom, per connected Meta ad account. Admin-only, read-only.\n\nEvaluates five causes — pixel_capi_broken, landing_page_unreachable, budget_exhausted, genuine_demand_drop, normal_variance — using monitor_lead_volume and the tracking-health sweep as evidence, and applies a strict discrimination gate: 'determined' is only returned when exactly one cause has DIRECT supporting evidence and every other checkable cause has been ruled out. 'budget_exhausted' has no evidence source anywhere in this system today and is always reported as 'unchecked'. 'genuine_demand_drop' can be ruled out but never confirmed here either — a real drought requires a Conversion Tracking Validator pass this tool cannot run, so it stops at 'unchecked' rather than a confident but unvalidated 'supported'. Neither blocks a determined diagnosis on a different, well-evidenced cause — both are always disclosed.\n\n⚠ When the result is 'could_not_determine', do NOT pick a cause anyway and do NOT recommend an action — report it as an honest diagnosis gap, listing which causes remain live/unchecked. A confidently wrong diagnosis is worse than an honest \"could not determine\" — this is the one thing this tool must never be used to work around.\n\nReturns one diagnosis per connected Meta ad account, each with: outcome ('determined'|'could_not_determine'), concludedCause (null unless determined), causes (every cause evaluated, with its verdict and evidence — always read this, not just the top-line outcome), and reason (populated only when could_not_determine).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "duplicate_landing_page",
+    "listed": false,
+    "description": "Create a copy of an existing landing page for independent editing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID to duplicate"
+        },
+        "name": {
+          "type": "string",
+          "description": "Name for the duplicated page (optional)"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "edit_landing_page_file",
+    "listed": false,
+    "description": "[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors. If you must use this tool, pass \"draft/agentweb-preview\" to stage changes and use publish_landing_page_changes to go live.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Path to the file in the repo (e.g., \"src/app/page.tsx\")"
+        },
+        "content": {
+          "type": "string",
+          "description": "The new file content"
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Git commit message (optional)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch for staging. Use \"draft/agentweb-preview\". Defaults to \"main\" for backward compatibility."
+        }
+      },
+      "required": [
+        "page_id",
+        "file_path",
+        "content"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_answer_question_deck",
+    "listed": true,
+    "description": "Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for \"Let Emma decide\" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The chat session ID with the awaiting deck."
+        },
+        "deck_id": {
+          "type": "string",
+          "description": "The pendingApprovalDeck.deckId from emma_get_session — must match the currently awaiting deck."
+        },
+        "item_id": {
+          "type": "string",
+          "description": "The pendingApprovalDeck.items[0].itemId from emma_get_session — the single item being answered."
+        },
+        "option_id": {
+          "type": "string",
+          "description": "The chosen option id. Required unless delegate is true."
+        },
+        "delegate": {
+          "type": "boolean",
+          "description": "Set true for \"Let Emma decide\" — proceeds with the recommended option, logged as a delegation. option_id is ignored when true."
+        },
+        "label": {
+          "type": "string",
+          "description": "Optional human-readable text to show as the chat message for this selection (e.g. the option label). Defaults to option_id, or \"Let Emma decide\" when delegating."
+        }
+      },
+      "required": [
+        "session_id",
+        "deck_id",
+        "item_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_answer_work_plan_input",
+    "listed": true,
+    "description": "Answer a pending structured work-plan input request shown by emma_get_session. Values must be keyed by the field IDs in pendingWorkPlanInput. A plain emma_send_message does not submit these structured values.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The Emma session ID."
+        },
+        "request_id": {
+          "type": "string",
+          "description": "The pendingWorkPlanInput.requestId. Alias: work_plan_request_id."
+        },
+        "work_plan_request_id": {
+          "type": "string",
+          "description": "Alias for request_id."
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Answers keyed by pendingWorkPlanInput field ID."
+        },
+        "label": {
+          "type": "string",
+          "description": "Optional chat-visible summary. Defaults to a neutral submission message."
+        }
+      },
+      "required": [
+        "session_id",
+        "values"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_create_gtm_plan",
+    "listed": true,
+    "description": "Create a GTM plan with phases and their work items in one call. Pass plan_id to update an existing plan, and phase_id to append work to an existing phase. Do NOT use for executing or scheduling the work.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": {
+          "type": "string",
+          "description": "Existing plan ID to update; omit to create."
+        },
+        "title": {
+          "type": "string",
+          "description": "Title."
+        },
+        "description": {
+          "type": "string",
+          "description": "Description."
+        },
+        "dri": {
+          "type": "string",
+          "description": "Accountable owner email."
+        },
+        "phases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Title."
+              },
+              "description": {
+                "type": "string",
+                "description": "Description."
+              },
+              "dri": {
+                "type": "string",
+                "description": "Accountable owner email."
+              },
+              "dueDate": {
+                "type": "string",
+                "description": "Due date."
+              },
+              "phase_id": {
+                "type": "string",
+                "description": "Existing phase ID; omit to create a phase with title."
+              },
+              "work_items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "title": {
+                      "type": "string",
+                      "description": "Title."
+                    },
+                    "description": {
+                      "type": "string",
+                      "description": "Description."
+                    },
+                    "dri": {
+                      "type": "string",
+                      "description": "Accountable owner email."
+                    },
+                    "dueDate": {
+                      "type": "string",
+                      "description": "Due date."
+                    }
+                  },
+                  "required": [
+                    "title"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_create_landing_page",
+    "listed": true,
+    "description": "Generate and deploy a live landing page from a description, using this account's brand guidelines. Returns the live URL. One call generates, waits for deployment to reach a terminal state, and returns a URL that resolves — never an intermediate id to poll with another tool. Do NOT use this to tweak an existing page — use emma_edit_landing_page for revisions. A failed deploy is reported as failed with the reason, not as a URL.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "What the page should say and show — offer, sections, tone. Brand colors/fonts come from the account automatically."
+        },
+        "name": {
+          "type": "string",
+          "description": "Page name, used for the site title."
+        },
+        "lead_list_id": {
+          "type": "string",
+          "description": "Optional lead-list id for the contact form. Omit to use the default list."
+        }
+      },
+      "required": [
+        "description",
+        "name"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_create_session",
+    "listed": true,
+    "description": "Create a new Emma chat session — the entry point for handing work to Emma, a full GTM (go-to-market) automation agent. Delegate marketing and growth requests to Emma via emma_send_message; she autonomously plans and executes them using far more capability than these MCP tools expose directly. Do not infer from the visible tools whether a given request is supported — delegate it and let Emma determine feasibility.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "llm_model": {
+          "type": "string",
+          "description": "LLM model to use (optional)"
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_edit_landing_page",
+    "listed": true,
+    "description": "Revise a live landing page with plain-language instructions, preview the change, then publish or roll back. One call revises and returns the preview URL; nothing goes live unless publish is explicitly true. Do NOT use this to create a new page — use emma_create_landing_page for that. Pass revert_last_publish true (and nothing else) to undo the most recent publish.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page id."
+        },
+        "instructions": {
+          "type": "string",
+          "description": "What to change, in plain language."
+        },
+        "branch": {
+          "type": "string",
+          "description": "Draft branch to revise on. Defaults to the shared preview branch."
+        },
+        "publish": {
+          "type": "boolean",
+          "description": "Publish to production after preview. Defaults to false — preview only."
+        },
+        "revert_last_publish": {
+          "type": "boolean",
+          "description": "Undo the most recent publish instead of revising. Ignores instructions/publish."
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_find_leads",
+    "listed": true,
+    "description": "Find leads matching an ideal-customer description and return them with the list they belong to. Use filters for structured criteria (title, industry, company size); use description for a plain-language ICP.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Plain-language description of the ideal customer."
+        },
+        "filters": {
+          "type": "object",
+          "description": "Structured filters, when you already know the exact criteria."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum leads to return. Defaults to 50."
+        }
+      }
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_get_account_status",
+    "listed": true,
+    "description": "Get this account's plan, usage, and remaining quota. Call this when a tool returns a quota error, to see how much allowance is left. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      }
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_get_brand_profile",
+    "listed": true,
+    "description": "Read what Emma knows about this company: brand guidelines, market strategy, and the knowledge-base files. Call this FIRST when you need context about the business before writing copy, planning, or generating anything.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_get_session",
+    "listed": true,
+    "description": "Get details of an Emma chat session by ID, including the active workPlan summary and pendingWorkPlanInput when structured details are awaiting an answer, and pendingApprovalDeck when a blocking question/approval deck is awaiting (a single-item deck is the deck-of-one that ask_user_question and the Meta objective confirmation use). Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Check status before assuming a run has completed; resolve an \"awaiting\" pendingApprovalDeck with emma_answer_question_deck and pendingWorkPlanInput with emma_answer_work_plan_input, never with a plain emma_send_message reply. pendingUserQuestion may still appear on a session that predates this mechanism, but nothing produces a new one — always resolve via pendingApprovalDeck.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The session ID"
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The run_id returned by a detached task (runId from emma_send_message). Pass it to check durable terminal status."
+        }
+      },
+      "required": [
+        "session_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_launch_work_plan",
+    "listed": true,
+    "description": "Launch an accessible predefined work plan in an existing Emma session. Find a plan with list_predefined_work_plans first, then poll progress with emma_get_session. Refuses to replace a different active work plan.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The Emma session ID."
+        },
+        "plan_id": {
+          "type": "string",
+          "description": "The predefined plan ID. Alias: work_plan_id."
+        },
+        "work_plan_id": {
+          "type": "string",
+          "description": "Alias for plan_id."
+        }
+      },
+      "required": [
+        "session_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_list_models",
+    "listed": false,
+    "description": "List the Emma models currently selectable for this account. Every entitled model stays selectable right up to the hard usage cap; only a paused account returns an empty list with canGenerate false. scheduleBackupModels is a legacy field and no longer restricts anything.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_list_sessions",
+    "listed": false,
+    "description": "List all Emma chat sessions for the authenticated user.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_publish_blog_post",
+    "listed": true,
+    "description": "Prepare a blog article from a title and Markdown draft. Defaults to a local content preview. With publish true, creates the complete article and publishes it to the connected CMS in one call, returning the live URL. Do NOT use for social posts — use emma_publish_social_post.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title_draft": {
+          "type": "string",
+          "description": "Draft article title."
+        },
+        "content_draft": {
+          "type": "string",
+          "description": "Composed article in Markdown."
+        },
+        "length": {
+          "type": "string",
+          "enum": [
+            "short",
+            "medium",
+            "long"
+          ],
+          "default": "medium"
+        },
+        "researchContext": {
+          "type": "string",
+          "description": "Optional research context."
+        },
+        "requirements": {
+          "type": "string",
+          "description": "Article requirements, links, and branding."
+        },
+        "style": {
+          "type": "string",
+          "enum": [
+            "default",
+            "substack"
+          ],
+          "default": "default"
+        },
+        "deep_research": {
+          "type": "boolean",
+          "default": false
+        },
+        "author": {
+          "type": "string",
+          "description": "Optional CMS author."
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "CMS categories for publication."
+        },
+        "publish": {
+          "type": "boolean",
+          "default": false,
+          "description": "Set true only after approval to publish. Otherwise returns a draft preview without posting."
+        }
+      },
+      "required": [
+        "title_draft",
+        "content_draft"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_publish_social_post",
+    "listed": true,
+    "description": "Prepare a social post and preview its content; publish to a connected account only with publish true. Omit account_id to see connected accounts. Do NOT use for blog articles — use emma_publish_blog_post.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "description": "Connected account ID. Omit to choose from connected accounts."
+        },
+        "content": {
+          "type": "string",
+          "description": "Composed post text to validate and preview or publish."
+        },
+        "media_urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional media URLs."
+        },
+        "publish": {
+          "type": "boolean",
+          "default": false,
+          "description": "Set true only after approval to publish. Otherwise returns a draft preview without posting."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_research",
+    "listed": true,
+    "description": "Research a topic, company, or market using live web search, and get sourced findings back. Set recency to \"news\" for today/latest/breaking questions; leave it off for general research.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to research."
+        },
+        "recency": {
+          "type": "string",
+          "enum": [
+            "general",
+            "news"
+          ],
+          "description": "Use \"news\" only for current-events questions. Defaults to \"general\"."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_run_marketing_task",
+    "listed": true,
+    "description": "Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. Use this when none of the more specific emma_* tools fits the request. Starts a new task unless you pass task_id to continue an existing one. Usually returns the finished result directly (status \"complete\"). If status is \"running\" or \"unconfirmed\", call emma_get_session with session_id set to the returned task_id — \"unconfirmed\" means the result is real but we could not verify Emma is not waiting on you. When status is \"awaiting_input\", answer with emma_answer_question_deck (awaiting_question_deck set).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "goal": {
+          "type": "string",
+          "description": "What you want Emma to achieve, in plain language."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "Continue an existing task instead of starting a new one. Omit to start fresh."
+        }
+      },
+      "required": [
+        "goal"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_schedule_recurring_work",
+    "listed": true,
+    "description": "Schedule recurring work directly from a prompt and daily, weekly, or monthly cadence. No template is needed. Supply variable_values for any {{variables}}; missing names are returned explicitly. Do NOT use for a one-off task or to modify an existing schedule.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_name": {
+          "type": "string",
+          "description": "Schedule name."
+        },
+        "starting_message": {
+          "type": "string",
+          "description": "Work to perform each run. Do not request email delivery here when email_notifications is set; the schedule sends results automatically."
+        },
+        "cadence": {
+          "type": "string",
+          "enum": [
+            "daily",
+            "weekly",
+            "monthly"
+          ],
+          "description": "How often to run."
+        },
+        "next_run_time": {
+          "type": "string",
+          "description": "Optional ISO 8601 first run time."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "Optional IANA timezone."
+        },
+        "email_notifications": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Result notification recipients."
+        },
+        "required_function_calls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tools each run must execute. Include any requested delivery tools."
+        },
+        "variable_values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Values for {{variables}} in the prompt."
+        }
+      },
+      "required": [
+        "schedule_name",
+        "starting_message",
+        "cadence"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "emma_search_tools",
+    "listed": true,
+    "description": "Find more Emma tools by keyword when none of the listed tools fits the job. Returns matching tool names with full input schemas; call a returned tool by its exact name. Use the listed emma_* workflow tools first — only search for specialised operations (e.g. \"google ads keywords\", \"crm sequence\", \"linkedin post\", \"lead list\").",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Keywords describing the capability you need."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max tools to return (default 8, max 20)."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "emma_send_message",
+    "listed": true,
+    "description": "Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking legacy AskUserQuestion card) or an awaiting pendingApprovalDeck (a blocking question/approval deck), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question for pendingUserQuestion, or emma_answer_question_deck for pendingApprovalDeck.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The chat session ID"
+        },
+        "message": {
+          "type": "string",
+          "description": "The message to send"
+        },
+        "llm_model": {
+          "type": "string",
+          "description": "LLM model to use (optional)"
+        },
+        "backup_model": {
+          "type": "string",
+          "description": "Legacy field, retained for compatibility. Since ENG-1211 no threshold below the hard usage cap restricts or rewrites a model, so this is never consulted. The server remains authoritative on model eligibility and on the hard cap."
+        },
+        "media_urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Array of image URLs (S3 paths or public URLs) to attach to the message"
+        }
+      },
+      "required": [
+        "session_id",
+        "message"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "enable_lead_list_public_access",
+    "listed": false,
+    "description": "Enable public access on a CRM lead list so landing page forms can submit leads without authentication. Call this after creating a lead list for a landing page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "The lead list ID to enable public access on"
+        }
+      },
+      "required": [
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "enable_session_tracking",
+    "listed": false,
+    "description": "Turn on organic and paid visitor SESSION tracking for a landing page: creates (or reuses) a session list named \"LP Sessions - {page name}\" and adds the AgentWeb tracking tag to the page's own repo in one commit (the site redeploys in about a minute). Safe to call again: it never duplicates the tag or the list. Use it for a deployed landing page that has no session tracking yet, or after the page gains a new domain (re-running adds the new address to the list). Returns listId, embedSnippet, installed and alreadyInstalled. If the page already has its own tracker the tool refuses with an explanation instead of double-counting visits; report that to the user rather than retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID (from list_landing_pages or get_landing_page)"
+        },
+        "html_path": {
+          "type": "string",
+          "description": "Only for a static-HTML page whose file is not public/<slug>.html or public/index.html: the file to tag, e.g. \"public/offer.html\""
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "evaluation_workspace",
+    "listed": false,
+    "description": "Sandbox account lifecycle (administrators only). Provision a sandbox account for a hiring take-home or customer pilot: a real customer-portal account with a simulated Meta connection, seeded brand guidelines, the Sandbox subscription tier, and a policy record that denies outbound tool classes (connectors, sends, social, publish, third-party writes, browser, automation). Revoke it (invalidates every session, token, key and schedule) or review its status and audit trail as an assigned reviewer. Sandbox principals cannot call this tool.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "provision",
+            "revoke",
+            "review"
+          ]
+        },
+        "evaluation_user_id": {
+          "type": "string",
+          "description": "The eval_ user id to revoke or review."
+        },
+        "provision": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Provisioning request: email, displayName, password (12–72 chars, handed over privately), expiresAt (epoch ms, ≤30 days out), brandGuidelines {brandName, website?, description?}, datasetId + datasetVersion (the frozen dataset the simulated Meta connection serves; must already be loaded, e.g. agentweb-2026q2 @ 1), optional reviewerUserIds (≤5), label (badge text, default \"Sandbox\"), deniedToolClasses (subset of the tool classes; lifecycle is always denied).",
+          "properties": {
+            "email": {
+              "type": "string"
+            },
+            "displayName": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "number"
+            },
+            "brandGuidelines": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "brandName": {
+                  "type": "string"
+                },
+                "website": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "brandName"
+              ]
+            },
+            "reviewerUserIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "label": {
+              "type": "string"
+            },
+            "datasetId": {
+              "type": "string"
+            },
+            "datasetVersion": {
+              "type": "number"
+            },
+            "deniedToolClasses": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "email",
+            "displayName",
+            "password",
+            "expiresAt",
+            "brandGuidelines",
+            "datasetId",
+            "datasetVersion"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "execute_task",
+    "listed": false,
+    "description": "Queue a task for execution by the agent engine.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task ID to execute"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "freeze_user_account",
+    "listed": false,
+    "description": "Freeze (deactivate) or unfreeze (reactivate) a user account. Admin only. Use this to disable bot accounts or re-enable legitimate accounts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "description": "The userId of the account to freeze or unfreeze"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "freeze",
+            "unfreeze"
+          ],
+          "description": "\"freeze\" to deactivate the account, \"unfreeze\" to reactivate it"
+        }
+      },
+      "required": [
+        "user_id",
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "generate_image",
+    "listed": false,
+    "description": "Generate images using AI image generation models.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "Detailed description of the image to generate"
+        },
+        "filename": {
+          "type": "string",
+          "description": "Filename for the generated image"
+        },
+        "size": {
+          "type": "string",
+          "description": "Image size (e.g., 1024x1024, auto)",
+          "default": "auto"
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "description": "Quality",
+          "default": "medium"
+        },
+        "input_images": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Input images for editing"
+        },
+        "logo_image": {
+          "type": "string",
+          "description": "Logo image URL to add"
+        },
+        "image_model": {
+          "type": "string",
+          "description": "Model to use"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "ad",
+            "organic_post"
+          ],
+          "description": "Use-case declaration for the human eval queue: 'ad' for paid ad creatives, 'organic_post' for organic social/content imagery"
+        }
+      },
+      "required": [
+        "prompt",
+        "filename",
+        "category"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "generate_landing_page",
+    "listed": false,
+    "description": "Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named \"LP Leads - {page name}\" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic. IMPORTANT: a returned \"deployed\" status means the BUILD succeeded, not that the page is launch-ready — check the response's launchReadiness field (or call get_deployment_status) before telling the user the page is ready to send traffic to. If launchReadiness.ready is false, relay the reasons plainly instead of calling it done.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional display name for the page"
+        },
+        "lead_list_id": {
+          "type": "string",
+          "description": "ID of the CRM lead list for the contact form (from create_lead_list)"
+        },
+        "template_id": {
+          "type": "string",
+          "description": "Optional ID of a saved landing page template to use as design inspiration (from list_html_templates with type=landing_page)"
+        },
+        "site_id": {
+          "type": "string",
+          "description": "Optional. The id of an existing landing page/site to add this page to — use for a variant or sub-page that should live under that site's existing URL."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "unified",
+            "separate"
+          ],
+          "description": "How to place a NEW page when site_id is not given. \"unified\" (default, cheaper): add it to the user's existing site as a page under the shared subdomain — only their first page does a full generation. \"separate\": give this campaign its OWN site and distinct URL — this costs more (a fresh full generation each time). Only choose \"separate\" when the user explicitly wants this campaign on a separate URL, and tell them it uses more of their generation budget first. When unsure, omit this and let the default (unified) apply."
+        }
+      },
+      "required": [
+        "prompt"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_account_status",
+    "listed": false,
+    "description": "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_chat_history",
+    "listed": false,
+    "description": "Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).\n\nSCORING COVERAGE — a null satisfactionScore is NOT self-explanatory. Under sync=true every session carries scoringOutcome {status, reason}, and the response carries scoringSummary {scored, skipped, failed, notAttempted, timedOut}:\n- status 'scored' — a score was generated on this call.\n- status 'skipped' — deliberately not scored; reason says which rule (in-flight, already-scored, no-task-session, test-run, no-user-message, admin-override). 'in-flight' means the run had not finished at read time, so it is legitimately unscorable — NOT a failure.\n- status 'failed' — scoring was attempted and errored (reason carries the error). The session IS in the cohort and is missing a score it should have. Report these; do not present the window as fully scored.\n- status 'not-attempted' — the sync pass ran out of its wall-clock budget before this session. Same effect as 'failed' for coverage: the session is unscored and nothing re-attempts it later.\nAny non-zero failed/notAttempted count means the satisfaction figures under-sample the window. Say so explicitly, with the counts, rather than reporting an average as if coverage were complete. scoringOutcome and scoringSummary are null when sync was not requested.\n\nMODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.\n- attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.\n- attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).\n- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in \"picker: X · ran: Y\" form when the picker disagrees with what ran, INCLUDING when the picker is one of several models that ran (a multi-model run is never \"agreement\" — it is never equal to the single-value picker, so the picker's involvement doesn't collapse it); collapses to a single model name only when exactly one model ran and it is the picker, or when there is nothing to contrast (selection-only). When attributionBasis is 'partial-transcript' it carries its own \"(partial — N of M assistant turns unlabelled)\" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.\n- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, partialAttributionSessions, truncated, byModel: [{model, sessions, share}] }, byModel sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any \"share of sessions per model\" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. partialAttributionSessions counts how many of sessionsWithModelData were only partially labelled (qualify the shares as approximate when this is > 0). truncated (also returned top-level, sibling of sessions) is true when more sessions exist in the requested range beyond the limit parameter — when true, do not present modelMix, or sessions, as covering the full range; say so, or re-run with a higher limit. Null when no session in range has any resolvable attribution.\n\nThe two underlying fields are also returned, and they are NOT interchangeable:\n- llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).\n- generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.\n\nTOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or \"cheap because few tokens\" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly for lifetime spend; when reporting volume, add cacheTokens to totalTokens and say you did.\n\nIN-WINDOW COST — sessions match the range on last activity, so a long-lived session carries its LIFETIME totalCost into a daily window. inWindowCost is the spend from assistant turns timestamped inside [start_time, end_time); use it for \"spend in this period\" (e.g. true 24h burn) and totalCost for lifetime. inWindowCost is null when no assistant turn recorded a timestamp — then the in-window share is unknown; say so rather than using totalCost as the period's spend.\n\nPER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.\n\nWhenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start_time": {
+          "type": "string",
+          "description": "Start time in ISO 8601 format (e.g., \"2024-03-01T00:00:00.000Z\")"
+        },
+        "end_time": {
+          "type": "string",
+          "description": "End time in ISO 8601 format (e.g., \"2024-03-02T00:00:00.000Z\")"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum number of sessions to return (1-1000, default: 500). Use limit: 1000 when you need complete coverage for accurate counts or percentages over busy time ranges.",
+          "default": 500
+        },
+        "sync": {
+          "type": "boolean",
+          "description": "When true, generates satisfaction scores for sessions that don't have them before returning (default: false). Use this for complete satisfaction score coverage, but expect slower response times.",
+          "default": false
+        }
+      },
+      "required": [
+        "start_time",
+        "end_time"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_deployment_status",
+    "listed": false,
+    "description": "Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits. The response's launchReadiness field is a SEPARATE signal from status/buildStatus: a page can build and deploy successfully and still not be launch-ready (failed post-deploy smoke test, no conversion tracking installed). Check launchReadiness.ready before telling the user the page is ready to send traffic to — if false, relay launchReadiness.reasons plainly.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_landing_page",
+    "listed": false,
+    "description": "Get details of a specific generated landing page. The returned vercelProjectId identifies the Vercel project; all pages in the same project share one subdomain. To read or change the subdomain, use configure_landing_page_subdomain with that vercelProjectId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The generated landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_landing_page_effective_view",
+    "listed": false,
+    "description": "Report what a specific user actually sees for a landing page: whether they can view it, whether they can edit it, the canonical live URL, deploy status, and the connected lead list. Admin-only tool.\n\nUse this after share_landing_page_with_org to verify the target member's effective access, or to diagnose \"user can't see the page\" reports.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page id."
+        },
+        "member": {
+          "type": "string",
+          "description": "The user to check — email or userId."
+        }
+      },
+      "required": [
+        "page_id",
+        "member"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_landing_page_preview_url",
+    "listed": false,
+    "description": "Get the Vercel preview URL for the reusable landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing. IMPORTANT: The branch name MUST come from the coding_agent tool result (normally \"draft/agentweb-preview\"). Do NOT invent random draft branches. If coding_agent returned is_staging=false or no branch, there is no draft to preview. If buildStatus is \"not_found\", the branch does not exist on Vercel — do NOT keep polling. If buildStatus is \"building\", the Vercel deployment is still in progress — wait 20-30 seconds and call this tool again to get the URL once ready.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The draft branch name from the coding_agent result, normally \"draft/agentweb-preview\". Do NOT guess this value."
+        }
+      },
+      "required": [
+        "page_id",
+        "branch"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_landing_page_subdomain",
+    "listed": false,
+    "description": "Read the current subdomain configured for a Vercel project that hosts landing pages. Returns the domain (e.g. everyio.agentwebforms.com), its status, and record ID. Returns null if no subdomain is set.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vercel_project_id": {
+          "type": "string",
+          "description": "The Vercel project ID (from list_landing_pages or get_landing_page)"
+        }
+      },
+      "required": [
+        "vercel_project_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_pr_digest",
+    "listed": false,
+    "description": "Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate change digests to send to the team. When the user asks for \"last N days\" or a specific date range, always pass the appropriate days_ago or since/until — do not rely on the default.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "days_ago": {
+          "type": "integer",
+          "description": "Number of days to look back from now (e.g., 7 for the last 7 days). Use this when the user specifies a relative time range like \"last week\" or \"past 7 days\". Takes precedence over since if both are provided."
+        },
+        "since": {
+          "type": "string",
+          "description": "Start time in ISO 8601 format (e.g., \"2026-03-19T00:00:00Z\"). Defaults to 24 hours ago if neither days_ago nor since is provided."
+        },
+        "until": {
+          "type": "string",
+          "description": "End time in ISO 8601 format (e.g., \"2026-03-20T00:00:00Z\"). Defaults to now."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_registration_status",
+    "listed": false,
+    "description": "Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. When computing a funnel Registered or Premium stage, you MUST call this on the lead emails to get real signup/payment status — do not infer it from list_all_clients or search. Admin-only (non-admin callers get a 403) and read-only.\n\nFor each input email the response reports:\n- `registered`: true if a (non-deleted) AgentWeb account exists for that email.\n- `isPremium`: true if that account's subscription is active or trialing.\n- `subscriptionStatus` / `subscriptionType` / `userId` / `createdAt`: present when registered.\n\nEmails with no matching account come back as `{ registered: false, isPremium: false }`. The response also includes a `summary` with `total`, `registered`, and `premium` counts.\n\nSet `include_chat_session_count: true` to also get `chatSessionCount` (a live count of each registered user's chat sessions) — use it for a funnel Usage/Active stage instead of scraping the admin page. It costs one extra query per registered user, so only request it when you need usage.\n\nExample:\n  action inputs: { emails: [\"lead1@acme.com\", \"lead2@acme.com\"] }\n  response: { statuses: [ { email: \"lead1@acme.com\", registered: true, isPremium: true, ... }, { email: \"lead2@acme.com\", registered: false, isPremium: false } ], summary: { total: 2, registered: 1, premium: 1 } }",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "emails": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Emails to look up (1-1000). Case/whitespace-insensitive; duplicates are collapsed."
+        },
+        "include_chat_session_count": {
+          "type": "boolean",
+          "description": "When true, also return a live chatSessionCount for each registered user (for a funnel Usage/Active stage). Costs one extra query per registered user. Default false."
+        }
+      },
+      "required": [
+        "emails"
+      ],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_scheduled_chat_storage_diagnostics",
+    "listed": false,
+    "description": "Diagnose why a scheduled chat is failing to save with a size-related error, or check whether one is at risk of it. DynamoDB caps a schedule at 400KB; this returns a byte-usage breakdown (current prompt, saved prompt-edit history, saved run history) against that limit and, when the schedule is under storage pressure, the one corrective action the user can take. Returns byte counts only — never the schedule's actual prompt or run content.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_id": {
+          "type": "string",
+          "description": "The scheduled chat ID to diagnose"
+        }
+      },
+      "required": [
+        "schedule_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_scheduled_chat_test_history",
+    "listed": false,
+    "description": "Get test and run history for a scheduled chat.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_id": {
+          "type": "string",
+          "description": "The scheduled chat ID"
+        }
+      },
+      "required": [
+        "schedule_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_session_transcript",
+    "listed": false,
+    "description": "Get the message-level transcript of ONE chat session by session_id. Admin-only, read-only. Use with get_chat_history (which returns session ids and metadata but no messages) when an audit or activity report needs what was actually said. Each message's content is truncated to 4000 chars (truncated=true marks it). Returns at most 50 messages per call; when hasMore=true call again with offset=nextOffset. Returns found=false when the session does not exist or has no user messages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "The chat session id (e.g. from get_chat_history)."
+        },
+        "offset": {
+          "type": "number",
+          "description": "Index of the first message to return (default 0)."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Messages to return (default and max 50)."
+        }
+      },
+      "required": [
+        "session_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_user_by_id",
+    "listed": false,
+    "description": "Resolve a raw userId (e.g. from get_chat_history) to that account's profile: email, displayName, roles, subscription, timestamps. Admin-only, read-only; secret values are never returned. Returns found=false for an unknown userId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "description": "The internal userId to look up."
+        }
+      },
+      "required": [
+        "user_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "get_users_by_lifecycle_stage",
+    "listed": false,
+    "description": "List users filtered by their onboarding lifecycle stage. Admin-only tool — used to segment users for the Lifecycle Drip campaign engine.\n\nStages in order of engagement:\n- `signed_up_no_start` — account exists but no onboarding events recorded\n- `goal_selected` — picked a goal (e.g. paid_ads, seo) but no brand yet\n- `brand_submitted` / `brand_skipped` — completed or skipped the brand step\n- `data_connected` — connected CRM / data source\n- `channel_connected` — connected an outbound channel\n- `onboarding_completed` — finished onboarding (no recent activity)\n- `active` — finished onboarding AND recently active\n- `stale` — finished onboarding but no activity for 30+ days\n\nReturns a structured list (NOT markdown) with: `userId`, `email`, `displayName`, `companyName`, `onboardingStage`, `onboardingGoal` (from the goal_selected event, if present), `lastActiveAt`, `createdAt`, `onboardingEventCount`, `emmaHelpInterests`. The drip campaign UI consumes this list directly.\n\nTypical prompts this answers:\n- \"show me everyone who dropped at the brand step\" → stage=brand_skipped or signed_up_no_start\n- \"who hasn't logged in for 7 days?\" → lastActivityBefore=<now-7d>\n- \"list stale users with completed onboarding\" → stage=stale",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "stage": {
+          "type": "string",
+          "enum": [
+            "signed_up_no_start",
+            "goal_selected",
+            "brand_submitted",
+            "brand_skipped",
+            "data_connected",
+            "channel_connected",
+            "onboarding_completed",
+            "active",
+            "stale"
+          ],
+          "description": "Onboarding stage to filter by. Omit to return all users with any stage set."
+        },
+        "lastActivityBefore": {
+          "type": "string",
+          "description": "ISO 8601 date. Only return users whose lastActiveAt is before this timestamp. Users with no lastActiveAt at all are excluded (we cannot prove they were inactive). Example: \"2026-04-10T00:00:00Z\"."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Cap the number of users returned (max 500). Omit to return up to 500 by default."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "inspect_orphaned_org_join_requests",
+    "listed": false,
+    "description": "Inspect pending organization join requests whose user record no longer exists. Admin-only, read-only; repair is not supported by this tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "iterate_landing_page",
+    "listed": false,
+    "description": "Refine a generated landing page with follow-up instructions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The generated landing page ID"
+        },
+        "message": {
+          "type": "string",
+          "description": "Instructions for how to refine the page"
+        }
+      },
+      "required": [
+        "page_id",
+        "message"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_all_clients",
+    "listed": false,
+    "description": "List all client accounts (including admins) with quick health indicators. Admin-only tool.\n\nReturns for each client:\n- userId: internal account id — use this to map a userId (e.g. from get_chat_history) back to a human-readable email/displayName\n- displayName, email, roles\n- has_ads: whether a Meta ad account is on record (it may have expired — see ad_connection)\n- ad_connection: never_connected (no ad account anywhere: activation, not churn) / connected / expired (Meta connection broke) / other_platform (ads on Google Ads or LinkedIn Ads, no Meta)\n- ad_connection_all_platforms: never_connected / connected / expired across Meta, Google Ads and LinkedIn Ads — expired means no ad account on any platform is usable (reconnect needed; a setup problem, not churn)\n- has_lander: whether they have landing pages (productDomain or seoDomains)\n- has_crm: whether they have CRM integrations (email domain, LinkedIn)\n- last_activity: last login timestamp\n- signup_time: account creation / sign-up timestamp\n- subscription_type: subscription tier (e.g. Free, Basic, Pro)\n- stripe_customer_id: Stripe customer ID (null if not set)\n- current_period_end: ISO date of current billing period end (null if not set)\n- has_payment_method: whether the client has a payment method on file in Stripe\n- monthly_amount_cents: most recent invoice amount in cents (e.g. 4900 = $49.00), null if not set\n\nUse this for a quick overview of all clients before diving into individual health assessments with assess_client_health.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_connected_accounts",
+    "listed": false,
+    "description": "List all connected social media and integration accounts.\n\nGOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spend.\n  test_account: true = Google guarantees the account CANNOT serve ads and CANNOT spend.\n  test_account: false = real, billable.\n  test_account absent = never recorded; treat as billable.\n  can_spend = false ONLY when test_account is true.\nNever infer this from account_name — a fully billable account can be named \"Test\".\n\nAdmin-only: pass client_id to list a specific client's connected accounts instead of the caller's own.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string",
+          "description": "Filter by platform (e.g., \"linkedin\", \"meta\", \"unipile\")"
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_crm_sequences",
+    "listed": false,
+    "description": "List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.\n\nUse this to answer \"are any email campaigns running for our CRM leads?\". Each entry reports `name`, `status` (draft | active | paused | archived), `audience` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), `step_count`, `is_sending` (true ONLY for `active` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and `enrollment_count` when a single sequence is inspected.\n\nAn account with no sequences returns `{ total: 0, sequences: [] }` with a summary line. That is a valid answer meaning \"no campaigns exist\", not an error — report it as such instead of retrying or guessing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "paused",
+            "archived"
+          ],
+          "description": "Only return sequences in this status. Omit to return all of them."
+        },
+        "sequence_id": {
+          "type": "string",
+          "description": "Inspect one sequence: returns its summary plus enrollment counts. Omit to list all."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_gtm_plans",
+    "listed": false,
+    "description": "List all GTM plans for the authenticated user.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_knowledge_bases",
+    "listed": false,
+    "description": "List all knowledge base files for the authenticated user.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_landing_page_files",
+    "listed": false,
+    "description": "List all files in a deployed landing page's GitHub repository. Use this to see what files exist. Note: for code edits, prefer using coding_agent which handles file listing internally.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_landing_pages",
+    "listed": false,
+    "description": "List all generated landing pages for the authenticated user. NOTE: Multiple landing pages can share the same Vercel project (vercelProjectId) and therefore share the same subdomain. The subdomain is configured per-project, not per-page — use configure_landing_page_subdomain with the vercelProjectId to set or change it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_lead_lists",
+    "listed": false,
+    "description": "List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_predefined_work_plans",
+    "listed": false,
+    "description": "List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template's full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "verbose": {
+          "type": "boolean",
+          "description": "Return the full legacy shape (every step's complete body) instead of the compact listing. Defaults to false."
+        },
+        "plan_id": {
+          "type": "string",
+          "description": "Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_schedule_templates",
+    "listed": false,
+    "description": "List all schedule templates available to the user (their own private templates + all platform-wide templates). Schedule templates are reusable blueprints for creating scheduled chats.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_scheduled_chats",
+    "listed": false,
+    "description": "List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_schedules",
+    "listed": false,
+    "description": "List schedules for a task.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task ID"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_skills",
+    "listed": false,
+    "description": "List all skill definitions. Returns each skill's ID, name, description, toolNames, systemPrompt, isPublished status, and extended fields. Admin-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_task_executions",
+    "listed": false,
+    "description": "List execution history for a task, or get details of a specific execution.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task ID"
+        },
+        "execution_id": {
+          "type": "string",
+          "description": "Specific execution ID (optional — omit to list all)"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "list_tasks",
+    "listed": false,
+    "description": "List all tasks owned by the authenticated user, or a specific client (admin-only, via client_id).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_brand",
+    "listed": false,
+    "description": "Read or update brand guidelines. Use action: \"read\" or \"update\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "read",
+            "update"
+          ],
+          "description": "Action"
+        },
+        "company_name": {
+          "type": "string",
+          "description": "Company name (update)"
+        },
+        "mission": {
+          "type": "string",
+          "description": "Mission statement (update)"
+        },
+        "tone_of_voice": {
+          "type": "string",
+          "description": "Tone of voice (update)"
+        },
+        "target_audience": {
+          "type": "string",
+          "description": "Target audience (update)"
+        },
+        "key_messages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Key messages (update)"
+        },
+        "visual_identity": {
+          "type": "object",
+          "description": "Visual identity settings (update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_crm_sequence",
+    "listed": false,
+    "description": "Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.\n\n- \"create\": builds a new sequence as a DRAFT (nothing is sent). `audience_list_ids` are the lead lists whose new leads auto-enroll once it is active.\n- \"update\": edits a draft or paused sequence. An active sequence must be paused first.\n- \"preview_activation\": shows the user the exact steps, audience and timing and asks them to approve. Always do this before \"activate\".\n- \"activate\": starts sending. Only works in a live chat, after \"preview_activation\", once the user has picked \"Activate\" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.\n- \"pause\": stops sending. Always allowed.\n\nUse list_crm_sequences to find sequence ids.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "preview_activation",
+            "activate",
+            "pause"
+          ]
+        },
+        "sequence_id": {
+          "type": "string",
+          "description": "Required for every action except create."
+        },
+        "name": {
+          "type": "string",
+          "description": "Sequence name (create; optional on update)."
+        },
+        "description": {
+          "type": "string"
+        },
+        "campaign_type": {
+          "type": "string",
+          "enum": [
+            "conversion",
+            "onboarding",
+            "reengagement",
+            "nurture",
+            "upsell",
+            "custom"
+          ]
+        },
+        "audience_list_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Lead list ids whose new leads auto-enroll while the sequence is active."
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered steps. Replaces all steps on update.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "delay_days": {
+                "type": "number",
+                "description": "Days after the previous step (or enrollment, for step 1)."
+              },
+              "channel": {
+                "type": "string",
+                "enum": [
+                  "email",
+                  "linkedin"
+                ]
+              },
+              "subject": {
+                "type": "string"
+              },
+              "body_html": {
+                "type": "string"
+              },
+              "message_text": {
+                "type": "string",
+                "description": "LinkedIn steps only."
+              },
+              "sender_id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "preview_token": {
+          "type": "string",
+          "description": "activate only: the preview_token returned by preview_activation."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_gtm_items",
+    "listed": false,
+    "description": "Manage GTM plan phases and work items. Use action: \"add_phase\", \"update_phase\", \"delete_phase\", \"add_work_items\", \"update_work_item\", \"delete_work_item\", \"get_common_items\", \"add_common_items\", or \"send_status_report\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Action to perform"
+        },
+        "plan_id": {
+          "type": "string",
+          "description": "Plan ID"
+        },
+        "phase_id": {
+          "type": "string",
+          "description": "Phase ID"
+        },
+        "work_item_id": {
+          "type": "string",
+          "description": "Work item ID"
+        },
+        "name": {
+          "type": "string",
+          "description": "Phase/item name"
+        },
+        "description": {
+          "type": "string",
+          "description": "Description"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status"
+        },
+        "work_items": {
+          "type": "array",
+          "description": "Array of work item objects"
+        },
+        "items": {
+          "type": "array",
+          "description": "Common items to add"
+        },
+        "target_phase_id": {
+          "type": "string",
+          "description": "Target phase for common items"
+        },
+        "new_phase_name": {
+          "type": "string",
+          "description": "New phase name for common items"
+        },
+        "include_summary": {
+          "type": "boolean",
+          "description": "Include summary in status report"
+        },
+        "include_details": {
+          "type": "boolean",
+          "description": "Include details in status report"
+        }
+      },
+      "required": [
+        "action",
+        "plan_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_gtm_plan",
+    "listed": false,
+    "description": "Create, read, update, or delete a GTM plan. Use action: \"create\", \"get\", \"update\", or \"delete\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "get",
+            "update",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "plan_id": {
+          "type": "string",
+          "description": "Plan ID (required for get/update/delete)"
+        },
+        "title": {
+          "type": "string",
+          "description": "Plan title (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Plan description (create/update)"
+        },
+        "goals": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Plan goals (create/update)"
+        },
+        "target_audience": {
+          "type": "string",
+          "description": "Target audience (create/update)"
+        },
+        "timeline": {
+          "type": "string",
+          "description": "Timeline (create/update)"
+        },
+        "budget": {
+          "type": "string",
+          "description": "Budget (create/update)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Plan status (update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_leads",
+    "listed": false,
+    "description": "Add, get, update, or delete leads in a list. Use action: \"add\", \"get\", \"update\", \"delete\", or \"list\". Admin-only: pass client_id to act on a specific client's list instead of the caller's own — supported for \"list\", \"get\", and \"add\" (ENG-1557 v1: admin creates one lead on a customer's behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for \"update\"/\"delete\" — those need a broader authorization review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "list",
+            "add",
+            "get",
+            "update",
+            "delete"
+          ],
+          "description": "Action to perform"
+        },
+        "list_id": {
+          "type": "string",
+          "description": "The lead list ID"
+        },
+        "lead_id": {
+          "type": "string",
+          "description": "Lead ID (for get/update)"
+        },
+        "leads": {
+          "type": "array",
+          "description": "Exactly one lead object to add, wrapped in an array (for add action)"
+        },
+        "lead_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Lead IDs to delete (for delete action)"
+        },
+        "updates": {
+          "type": "object",
+          "description": "Fields to update (for update action)"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max leads to return (list action)"
+        },
+        "last_key": {
+          "type": "string",
+          "description": "Pagination key (list action)"
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending)."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "\"add\" action only. When true, preview what would be created (list resolution, permission check, duplicate-email check) without creating anything. Advisory, not exhaustive — some real-write validations (e.g. selectedSenderId) aren't replicated, so a preview success doesn't guarantee the real write will succeed. Works regardless of client_id or the cross-account-add feature flag. Must be a real boolean if provided."
+        }
+      },
+      "required": [
+        "action",
+        "list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_market_strategy",
+    "listed": false,
+    "description": "Read or update market strategy. Use action: \"read\" or \"update\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "read",
+            "update"
+          ],
+          "description": "Action"
+        },
+        "positioning": {
+          "type": "string",
+          "description": "Market positioning (update)"
+        },
+        "competitors": {
+          "type": "array",
+          "description": "Competitor list (update)"
+        },
+        "differentiators": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Key differentiators (update)"
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Marketing channels (update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_predefined_work_plan",
+    "listed": false,
+    "description": "Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending \"steps\" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode=\"merge\" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. A replace stores exactly what you send, so a field you omit on a step is erased too — an update that would drop steps, or blank fields on the steps it keeps, is rejected unless confirmed. Every step change comes back as a stepsChange diff summary.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete",
+            "get"
+          ],
+          "description": "CRUD action"
+        },
+        "plan_id": {
+          "type": "string",
+          "description": "Plan ID (required for update/delete/get)"
+        },
+        "title": {
+          "type": "string",
+          "description": "Plan title (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Plan description (create/update)"
+        },
+        "welcome_message": {
+          "type": "string",
+          "description": "Welcome message shown to users (create/update)"
+        },
+        "autocomplete": {
+          "type": "boolean",
+          "description": "Whether the plan auto-completes (create/update)"
+        },
+        "require_login": {
+          "type": "boolean",
+          "description": "Whether login is required (create/update)"
+        },
+        "show_in_agent_mode": {
+          "type": "boolean",
+          "description": "Whether to show in agent mode (create/update)"
+        },
+        "show_login_signup": {
+          "type": "string",
+          "enum": [
+            "after_plan_completed",
+            "always"
+          ],
+          "description": "When to show login/signup (create/update)"
+        },
+        "default_model": {
+          "type": "string",
+          "description": "Default LLM model (create/update)"
+        },
+        "category": {
+          "type": "string",
+          "description": "Plan category shown in the admin list, e.g. Paid Ads, Strategy, Content (create/update)"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "requiredFunctionCalls": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted. Without a tool listed here, its delivery is best-effort — the step can complete even if the model skips it, silently. IMPORTANT (ENG-2204): if this step's instructions call for posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too."
+              },
+              "skillIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids."
+              },
+              "userInstructions": {
+                "type": "string",
+                "description": "Instructions shown to the user for this step. Alias: user_instructions."
+              },
+              "stepCount": {
+                "type": "number",
+                "description": "Step order, 1-based. Defaults to the array position. In steps_mode=\"merge\" this is what selects the existing step to amend. Alias: step_count."
+              },
+              "expectedAssetCount": {
+                "type": "number",
+                "description": "For a step that must produce a fixed number of media assets (e.g. \"generate 18 images\"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step's assets never count toward a later step's requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count."
+              },
+              "expectedAssetCountTools": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren't interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is \"the N things\"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools."
+              }
+            },
+            "required": [
+              "title"
+            ]
+          },
+          "description": "Work plan steps. On create this is the full plan. On update this REPLACES the entire steps array unless steps_mode=\"merge\". Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under \"warnings\"."
+        },
+        "steps_mode": {
+          "type": "string",
+          "enum": [
+            "replace",
+            "merge"
+          ],
+          "description": "How to apply \"steps\" on update. \"replace\" (default) overwrites the whole array. \"merge\" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact. In \"merge\", send ONLY the fields you are actually changing on each step, plus stepCount to say which step you mean: every field you include is applied, so passing a title you did not mean to change RENAMES that step. Do not fill in placeholder values for fields you are leaving alone."
+        },
+        "confirm_step_removal": {
+          "type": "boolean",
+          "description": "Required (true) when a steps_mode=\"replace\" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_schedule",
+    "listed": false,
+    "description": "Create, update, or delete a schedule. Use action: \"create\" (POST), \"update\" (PUT), or \"delete\" (DELETE).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "schedule_id": {
+          "type": "string",
+          "description": "Schedule ID (required for update/delete)"
+        },
+        "task_id": {
+          "type": "string",
+          "description": "Task ID (required for create)"
+        },
+        "frequency": {
+          "type": "string",
+          "description": "Schedule frequency: daily, weekly, monthly, or cron expression"
+        },
+        "next_run_time": {
+          "type": "string",
+          "description": "ISO 8601 datetime for the first/next run"
+        },
+        "schedule_name": {
+          "type": "string",
+          "description": "Schedule name"
+        },
+        "description": {
+          "type": "string",
+          "description": "Description"
+        },
+        "timezone": {
+          "type": "string",
+          "description": "Timezone (e.g. America/Los_Angeles)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status (active or inactive, update only)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_schedule_template",
+    "listed": false,
+    "description": "Create, update, or delete a schedule template. Templates are reusable blueprints for scheduled chats that can be shared across the platform.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "template_id": {
+          "type": "string",
+          "description": "Template ID (required for update/delete)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Template name (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Template description (create/update)"
+        },
+        "category": {
+          "type": "string",
+          "description": "Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "private",
+            "pending_review"
+          ],
+          "description": "Visibility, on 'update' only. 'create' ALWAYS produces a private template and ignores this field. Only these two are settable here: 'private' (visible to you alone) and 'pending_review' (submitted for an administrator to approve). 'system' and 'public' are platform-wide and admin-only — asking for them is refused, not silently downgraded. To share a template with everyone, set 'pending_review' and an administrator approves or rejects it (ENG-1716)."
+        },
+        "starting_message": {
+          "type": "string",
+          "description": "The prompt/message template. Use {{variable_name}} for variables. (create/update)"
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "long_text",
+                  "file"
+                ]
+              }
+            },
+            "required": [
+              "name"
+            ]
+          },
+          "description": "Variable definitions (auto-extracted from message if not provided)"
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Keywords to verify in scheduled chat output (create/update)"
+        },
+        "required_function_calls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete \"successfully\" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone."
+        },
+        "function_call_min_calls": {
+          "type": "object",
+          "description": "Minimum call counts per function (create/update)"
+        },
+        "suggested_frequency": {
+          "type": "string",
+          "description": "Suggested frequency: hourly, daily, weekly, monthly, every_n_days (create/update)"
+        },
+        "frequency_interval_days": {
+          "type": "number",
+          "description": "Days between runs when suggested_frequency is every_n_days (create/update)"
+        },
+        "email_notifications": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Default email addresses for notifications (create/update)"
+        },
+        "daily_digest": {
+          "type": "boolean",
+          "description": "Default daily digest setting (create/update)"
+        },
+        "llm_model": {
+          "type": "string",
+          "description": "Default LLM model (create/update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_scheduled_chat",
+    "listed": false,
+    "description": "Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: \"create\", \"update\", \"toggle\", or \"delete\". For \"create\": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action \"create\" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For \"update\": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "toggle",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "schedule_id": {
+          "type": "string",
+          "description": "Schedule ID (required for update/toggle/delete)"
+        },
+        "schedule_name": {
+          "type": "string",
+          "description": "Schedule name (REQUIRED for create, optional for update)"
+        },
+        "starting_message": {
+          "type": "string",
+          "description": "The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails."
+        },
+        "schedule_frequency": {
+          "type": "string",
+          "description": "Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)"
+        },
+        "frequency_interval_days": {
+          "type": "number",
+          "description": "Number of days between runs when schedule_frequency is every_n_days (create/update)"
+        },
+        "next_run_time": {
+          "type": "string",
+          "description": "ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "The user's IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence."
+        },
+        "description": {
+          "type": "string",
+          "description": "Description (create/update)"
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Keywords to look for in results (create/update)"
+        },
+        "required_function_calls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete \"successfully\" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone."
+        },
+        "function_call_min_calls": {
+          "type": "object",
+          "description": "Minimum call counts per function (create/update)"
+        },
+        "email_notifications": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user's email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing."
+        },
+        "daily_digest": {
+          "type": "boolean",
+          "description": "Send daily digest instead of per-run emails (create/update, hourly only)"
+        },
+        "self_improve": {
+          "type": "boolean",
+          "description": "When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update)."
+        },
+        "run_count": {
+          "type": "number",
+          "description": "Number of runs (-1 for unlimited, create/update)"
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          },
+          "description": "Variable definitions for the starting message (create/update)"
+        },
+        "variable_values": {
+          "type": "object",
+          "description": "Initial variable values (create/update)"
+        },
+        "llm_model": {
+          "type": "string",
+          "description": "LLM model to use (create/update)"
+        },
+        "backup_model": {
+          "type": "string",
+          "description": "Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Existing chat session ID to base the schedule on (create only)"
+        },
+        "revoke_autopublish": {
+          "type": "boolean",
+          "description": "Set true to STOP this schedule publishing to the user's live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "paused"
+          ],
+          "description": "Status (toggle only)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_scoring_judges",
+    "listed": false,
+    "description": "Manage the judge system prompts used to evaluate chat session satisfaction. Admin only. Actions: get_default (view current default prompt), update_default (replace default prompt text), reset_default (revert to hardcoded default), list (list all custom judges), create (add a new custom judge), update (edit an existing custom judge), delete (remove a custom judge).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "get_default",
+            "update_default",
+            "reset_default",
+            "list",
+            "create",
+            "update",
+            "delete"
+          ],
+          "description": "The action to perform"
+        },
+        "system_prompt": {
+          "type": "string",
+          "description": "The system prompt text (required for update_default, create, and update actions)"
+        },
+        "judge_id": {
+          "type": "string",
+          "description": "The judge ID (required for update and delete actions)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable name for the judge (required for create, optional for update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_skill",
+    "listed": false,
+    "description": "Create, update, delete, or get a skill definition. Admin only. CAUTION: These operations modify production skill configuration — changes affect which tools are available to users. For update/delete/get, skill_id is required; if the user gave a skill name, call resolve_skill first and then use the returned skill_id. Always confirm with the user before making changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete",
+            "get"
+          ],
+          "description": "CRUD action"
+        },
+        "skill_id": {
+          "type": "string",
+          "description": "Skill ID (required for update/delete/get)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Skill name (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Skill description (create/update)"
+        },
+        "tool_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tool names included in this skill (create/update)"
+        },
+        "system_prompt": {
+          "type": "string",
+          "description": "System prompt injected when skill is installed (create/update)"
+        },
+        "is_published": {
+          "type": "boolean",
+          "description": "Whether the skill is visible to users (create/update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_task",
+    "listed": false,
+    "description": "Create, read, update, or delete a task. Use action: \"create\" (POST), \"get\" (GET), \"update\" (PUT), or \"delete\" (DELETE).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "get",
+            "update",
+            "delete"
+          ],
+          "description": "CRUD action"
+        },
+        "task_id": {
+          "type": "string",
+          "description": "Task ID (required for get/update/delete)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Task name (create/update)"
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Task prompt (create/update)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Task status (update)"
+        },
+        "category": {
+          "type": "string",
+          "description": "Task category (create/update)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Task description (create/update)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "manage_user_notes",
+    "listed": false,
+    "description": "Manage time-stamped admin notes for a specific user. Notes are stored per user and sorted newest-first. Up to 50 notes per user; adding a 51st removes the oldest. Use this to track client status, blockers, or action items over time. Admin only.\n\nYou can identify the user by either user_id OR email — provide one of them.\n\nActions:\n- list: Get all notes for a user (newest first)\n- add: Add a new note for a user\n- delete: Delete a specific note by note_id",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "list",
+            "add",
+            "delete"
+          ],
+          "description": "The action to perform"
+        },
+        "user_id": {
+          "type": "string",
+          "description": "The userId of the user (use this OR email)"
+        },
+        "email": {
+          "type": "string",
+          "description": "The email address of the user (use this OR user_id)"
+        },
+        "content": {
+          "type": "string",
+          "description": "The note text (required for add)"
+        },
+        "note_id": {
+          "type": "string",
+          "description": "The note ID (required for delete)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "monitor_lead_volume",
+    "listed": false,
+    "description": "Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.\n\nTrigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.\n\n⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.\n\n⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.\n\nReturns one report per connected Meta ad account for the client.\n\n⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "client_name_or_email": {
+          "type": "string",
+          "description": "The client's email address or display name. Email lookup is tried first, then name matching."
+        },
+        "since": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$",
+          "description": "Optional window start, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Must not be after `until`; the since..until window must not exceed 366 days. Defaults to 60 days before `until`."
+        },
+        "until": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$",
+          "description": "Optional window end, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Defaults to today."
+        }
+      },
+      "required": [
+        "client_name_or_email"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "publish_landing_page_changes",
+    "listed": false,
+    "description": "Merge the reusable draft branch into main to make landing page changes live. Use this after the user has reviewed the preview and approved the changes. This merges the draft branch, triggers a production deployment, and deletes the draft branch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The draft branch to merge, normally \"draft/agentweb-preview\""
+        }
+      },
+      "required": [
+        "page_id",
+        "branch"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "read_knowledge_base_files",
+    "listed": false,
+    "description": "Read specific files from the knowledge base.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kb_identifier": {
+                "type": "string",
+                "description": "Knowledge base task ID"
+              },
+              "file_name": {
+                "type": "string",
+                "description": "File name to read"
+              }
+            },
+            "required": [
+              "kb_identifier",
+              "file_name"
+            ]
+          }
+        }
+      },
+      "required": [
+        "files"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "read_landing_page_file",
+    "listed": false,
+    "description": "Read the contents of a specific file in a deployed landing page's GitHub repository. Note: for code edits, prefer using coding_agent which handles file reading and editing internally.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Path to the file in the repo (e.g., \"src/app/page.tsx\")"
+        }
+      },
+      "required": [
+        "page_id",
+        "file_path"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "resolve_landing_page_by_url",
+    "listed": false,
+    "description": "Resolve a landing page by its live URL or domain across ALL accounts. Admin-only tool.\n\nUse this when a customer references a live page (e.g. \"https://acme.agentwebforms.com/book-a-demo\") and you need to find which account owns it — list_landing_pages only shows the calling user's own pages.\n\nReturns matches with the page record (id, status, lead list), the owner (userId, email, orgId), and the canonical live URL. Returns 404 when no page matches. If `scannedAll` is false the lookup hit its scan cap and a non-match is inconclusive.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "The live page URL or bare hostname to resolve, e.g. \"https://acme.agentwebforms.com/book-a-demo\" or \"acme.agentwebforms.com\"."
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "resolve_skill",
+    "listed": false,
+    "description": "Resolve a user-provided skill, engine, or workflow-skill name to compact skill metadata. Normal users search only skills they can access: published, own private, and org-shared private skills. Admin/delegated sessions search admin-visible skills. ALWAYS use this before saying a skill does not exist, and before manage_skill when the user gave a skill name rather than an exact skill_id. Returns compact matches only and never returns the full systemPrompt.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Skill name or partial phrase to resolve, such as \"Event skill\" or \"Luma Event Lead Engagement Engine\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum matches to return, 1-10. Defaults to 5."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "revert_landing_page_publish",
+    "listed": false,
+    "description": "Undo the most recent publish of a landing page, rolling the live site back to exactly how it was before that publish. Use this when the user wants to revert or undo published landing page changes. This restores the previous state and triggers a production redeploy. Only the most recent publish can be reverted, and only once. If nothing has been published, or main has changed since (newer changes were published), the revert is refused with an explanation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        }
+      },
+      "required": [
+        "page_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "search_knowledge_base",
+    "listed": false,
+    "description": "Search the knowledge base for relevant information.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query"
+        },
+        "max_results": {
+          "type": "number",
+          "description": "Max results (default 5)",
+          "default": 5
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "search_leads",
+    "listed": false,
+    "description": "Search leads across lists using structured filters. Admin-only: pass client_id to search a specific client's leads instead of the caller's own.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "list_id": {
+          "type": "string",
+          "description": "The lead list ID to search in"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "operator": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "field",
+              "operator"
+            ]
+          },
+          "description": "Array of filter conditions"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max results (default 20, max 50)"
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected."
+        }
+      },
+      "required": [
+        "list_id",
+        "filters"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "set_landing_page_lead_list",
+    "listed": false,
+    "description": "Attach, change, or clear the CRM lead list on an existing landing page (including imported externally-deployed pages) without regenerating it. Pass lead_list_id=null to clear. Enables public submissions on the list and syncs the page capture route where the page has a repo.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "lead_list_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Lead list ID to associate, or null to clear"
+        }
+      },
+      "required": [
+        "page_id",
+        "lead_list_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "share_landing_page_with_org",
+    "listed": false,
+    "description": "Enable org-level visibility for a landing page's owner organization and grant named org members edit access. Admin-only tool.\n\nWorks entirely through share settings — no page duplication, no redeploy, no raw database access. The members must already belong to the page owner's organization. Returns the updated share state plus each member's effective access (canView/canEdit) so you can verify the grant took effect.\n\nFind the page id first with resolve_landing_page_by_url or list_landing_pages.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page id."
+        },
+        "member_emails": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Org member emails (or userIds) to grant edit access."
+        }
+      },
+      "required": [
+        "page_id",
+        "member_emails"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "submit_scheduled_chat_variables",
+    "listed": false,
+    "description": "Submit variable values for a scheduled chat. Optionally trigger an immediate run after submission.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_id": {
+          "type": "string",
+          "description": "The scheduled chat ID"
+        },
+        "variable_values": {
+          "type": "object",
+          "description": "Object mapping variable names to their values"
+        },
+        "trigger_run": {
+          "type": "boolean",
+          "description": "Whether to trigger a run immediately after submitting variables (default false)"
+        }
+      },
+      "required": [
+        "schedule_id",
+        "variable_values"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "test_scheduled_chat",
+    "listed": false,
+    "description": "Trigger a test run of a scheduled chat. This is a side-effecting action — only call it when the user has EXPLICITLY asked to test or run the schedule now. Do NOT trigger a test run on your own initiative, and do NOT treat a bare \"retry\"/regenerate of your previous turn as authorization to run a test; in that case simply re-answer the prior turn. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schedule_id": {
+          "type": "string",
+          "description": "The scheduled chat ID to test"
+        },
+        "send_notification_email": {
+          "type": "boolean",
+          "description": "Whether to send notification emails with the test results (default false)"
+        }
+      },
+      "required": [
+        "schedule_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "update_landing_page_context",
+    "listed": false,
+    "description": "Save or update the context field on a landing page — a plain-text description of when to use it, its tone, and target audience. Use this whenever the user provides notes about a landing page (e.g. \"this is for cold outreach targeting SaaS founders\"). Keep it concise (max 500 characters). The context is shown in the UI and used by the agent to pick the best matching page for CTAs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "The landing page ID"
+        },
+        "context": {
+          "type": "string",
+          "description": "Free-text notes: when to use this page, tone, audience, offer, etc."
+        }
+      },
+      "required": [
+        "page_id",
+        "context"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": false
+    }
+  }
+]

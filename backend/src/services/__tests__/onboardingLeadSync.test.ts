@@ -173,6 +173,7 @@ describe('mirrorOnboardingEventToLead', () => {
     expect(mockCreateLead).toHaveBeenCalledWith(
       FOUNDERS_LIST.listId,
       expect.objectContaining({ email: 'newuser@example.com' }),
+      'integration',
     );
     expect(mockUpdateLeadOnboarding).toHaveBeenCalled();
   });

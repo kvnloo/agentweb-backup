@@ -343,3 +343,24 @@ async function defaultPinnedRequest(
     },
   } as any);
 }
+
+/** Body cap for user-supplied HTML imports (load-from-url). Routes truncate the
+ * extracted body to 200k chars anyway; 5MB bounds memory without false-blocking
+ * real newsletter pages (ENG-2425). */
+export const DEFAULT_MAX_HTML_BYTES = 5 * 1024 * 1024;
+
+/**
+ * SSRF-safe HTML fetch for endpoints that return a user-supplied URL's body to
+ * the caller (ENG-2425). DNS-pinned, every redirect hop re-validated, size and
+ * total-time bounded. Throws SsrfBlockedError for private/loopback/link-local/
+ * metadata targets before any outbound request is made.
+ */
+export async function fetchPublicHtml(
+  url: string,
+  deps: RedirectFetchDeps = {},
+  timeoutMs: number = 15000,
+  maxBytes: number = DEFAULT_MAX_HTML_BYTES
+): Promise<string> {
+  const { buffer } = await fetchBufferFollowingRedirects(url, deps, DEFAULT_MAX_REDIRECTS, timeoutMs, maxBytes);
+  return buffer.toString('utf8');
+}

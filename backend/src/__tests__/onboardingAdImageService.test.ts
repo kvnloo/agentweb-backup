@@ -57,7 +57,7 @@ import {
   type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
 import { evaluateCreativeGates } from "../services/creativeGates";
-import { adImageReadyPatch } from "../services/adImageStatusService";
+import { adImageReadyPatch, AD_IMAGE_TIMEOUT_MS } from "../services/adImageStatusService";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -1688,6 +1688,11 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
     });
 
+    it("clears the previous attempt's error (null REMOVEs it; undefined is skipped by updateUser)", async () => {
+      await claimAdImageRun("u1");
+      expect(userDb.updateUser.mock.calls[0][1].adImageError).toBeNull();
+    });
+
     it("publishes a start patch and returns THAT run's identity", async () => {
       const run = await claimAdImageRun("u1");
 
@@ -1696,8 +1701,9 @@ describe("onboardingAdImageService", () => {
       expect(written.adImageStatus).toBe("running");
       // The identity handed back is the one just published — not a re-read of
       // the record, which is what let two overlapping runs share a nonce.
-      expect(run.runId).toBe(written.adImageRunId);
-      expect(run.startedAt).toBe(written.adImageStartedAt);
+      expect(run).not.toBeNull();
+      expect(run!.runId).toBe(written.adImageRunId);
+      expect(run!.startedAt).toBe(written.adImageStartedAt);
     });
 
     it("gives every claim a distinct identity, even back-to-back (Greptile)", async () => {
@@ -1706,8 +1712,57 @@ describe("onboardingAdImageService", () => {
       // that is precisely what makes the conditional terminal write able to
       // tell the runs apart.
       const [a, b] = [await claimAdImageRun("u1"), await claimAdImageRun("u1")];
-      expect(a.runId).not.toBe(b.runId);
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      expect(a!.runId).not.toBe(b!.runId);
       expect(userDb.updateUser).toHaveBeenCalledTimes(2);
+    });
+
+    // ENG-2308: claimAdImageRun is shared by the legacy route AND the eager
+    // orchestrator's runAdImage — guard the claim itself with a
+    // ConditionExpression so two concurrent claimants can't both mint a
+    // nonce and both launch a real Gemini generation before either one's
+    // completion-time ownership check (ENG-792) ever runs.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      const before = Date.now();
+      await claimAdImageRun("u1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning OR #adImageStartedAt <= :adImageStaleBefore",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#adImageStatus": "adImageStatus",
+        "#adImageStartedAt": "adImageStartedAt",
+      });
+      expect(options?.condition?.values?.[":adImageRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(options?.condition?.values?.[":adImageStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - AD_IMAGE_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - AD_IMAGE_TIMEOUT_MS + 1000);
+    });
+
+    it("returns null when it loses the race to a concurrent claimant", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const run = await claimAdImageRun("u1");
+
+      expect(run).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(claimAdImageRun("u1")).rejects.toThrow("boom");
     });
   });
 
@@ -1719,12 +1774,65 @@ describe("onboardingAdImageService", () => {
     it("writes the start patch synchronously and launches background work", async () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
-      await startAdImageGenerationForUser("u1");
+      const run = await startAdImageGenerationForUser("u1");
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.adImageStatus).toBe("running");
       expect(startPatch.adImageStartedAt).toBeTruthy();
       expect(startPatch.adImageRunId).toMatch(/^adimg_/);
+      expect(run).not.toBeNull();
+      expect(run!.runId).toBe(startPatch.adImageRunId);
+    });
+
+    // ENG-2308: claimAdImageRun's own ConditionExpression closes the claim
+    // side of the race — this asserts startAdImageGenerationForUser respects
+    // a lost claim by returning null and never invoking the image generator.
+    it("returns null and launches no worker when the claim itself loses the race", async () => {
+      // Not on the eager pipeline, so this exercises the claim path.
+      userDb.getUserById.mockResolvedValue({ userId: "u1" });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+      const gen = new FakeImageGen(okResponder);
+
+      const run = await startAdImageGenerationForUser("u1", { imageGen: gen as any });
+
+      expect(run).toBeNull();
+      expect(gen.callCount).toBe(0);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live against the preview with a real
+    // eager-pipeline test account: `runAdImage` claims this SAME axis itself
+    // (with its own identity) once the orchestrator actually fires the step.
+    // If THIS function also claimed before delegating, its throwaway claim
+    // — discarded immediately after — would permanently win the exclusive
+    // claim and starve runAdImage's real claim moments later, so ad-image
+    // generation would never fire for an eager-pipeline user. Must check
+    // eager status and skip claiming entirely in that case, leaving
+    // claimAdImageRun as the sole claimant.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runAdImage", async () => {
+      // `isEagerPipelineActiveFor` is cheap/pure and fine to run for real;
+      // `reconcileForUser` is NOT — it would drive the real orchestrator
+      // (brandDna, real triggers, ...) as an unawaited side effect of this
+      // unit test. Stub just that export on the SAME lazily-`require`'d
+      // module instance `onboardingAdImageService.ts` resolves internally.
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        userDb.getUserById.mockResolvedValue({ userId: "u1", useEagerPipeline: true });
+
+        const run = await startAdImageGenerationForUser("u1");
+
+        expect(run).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("u1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
     });
 
     it("hands its own nonce to the worker, which abandons when a later start has taken the axis (Greptile)", async () => {

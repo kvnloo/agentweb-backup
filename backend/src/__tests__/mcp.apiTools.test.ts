@@ -2097,3 +2097,27 @@ describe('ENG-1015 durable session polling', () => {
     expect(mockMcpFetch).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('ENG-112: MCP never exposes the branch-family link', () => {
+  const link = { sessionId: 'a', rootSessionId: 'root-secret-id', messageIndex: 2, branchedAt: 'x' };
+  const context: any = { userId: 'user-123', agentUserId: 'user-123' };
+
+  it('emma_get_session strips session-level branchedFrom', async () => {
+    mockMcpFetch.mockResolvedValue({ sessionId: 's1', title: 'T', branchedFrom: link, pendingWorkPlanInput: null } as any);
+    const out = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1' }, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s1');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
+  });
+
+  it('emma_list_sessions strips branchedFrom from every listed session', async () => {
+    mockMcpFetch.mockResolvedValue({ sessions: [{ sessionId: 's1', branchedFrom: link }, { sessionId: 's2' }], hasMore: false } as any);
+    const out = await mcpToolRegistry.execute('emma_list_sessions', {}, context);
+    const text = JSON.stringify(out);
+    expect(text).toContain('s2');
+    expect(text).not.toContain('branchedFrom');
+    expect(text).not.toContain('root-secret-id');
+  });
+});

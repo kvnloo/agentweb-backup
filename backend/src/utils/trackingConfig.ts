@@ -1,4 +1,4 @@
-import { CHANNELS, CHANNEL_GROUPS, type ChannelGroup, type TrafficClassification } from './trafficSource';
+import { CHANNELS, CHANNEL_GROUPS, PAID_CHANNEL_SPLIT, type ChannelGroup, type TrafficClassification } from './trafficSource';
 
 /**
  * ENG-2315 / ENG-2316: the tracker config stored on a SESSION list row as `trackingConfig`.
@@ -45,7 +45,7 @@ const LIST_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
 export const isPlausibleListId = (v: unknown): v is string => typeof v === 'string' && LIST_ID_RE.test(v);
 
 const RULE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
-const CHANNEL_KEYS: ReadonlySet<string> = new Set([...CHANNELS.map((c) => c.key), 'other', 'direct']);
+const CHANNEL_KEYS: ReadonlySet<string> = new Set([...CHANNELS.map((c) => c.key), ...Object.values(PAID_CHANNEL_SPLIT).map((s) => s.key), 'other', 'direct']);
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
@@ -181,6 +181,11 @@ export async function validateRoutingTargets(
  * equal the classification (AND); rules are independent, so a session can land in several children.
  * Defensive about the stored value: a malformed rule matches nothing.
  */
+function baseChannelKey(key: string): string {
+  for (const [base, split] of Object.entries(PAID_CHANNEL_SPLIT)) if (split.key === key) return base;
+  return key;
+}
+
 export function matchRoutingRules(
   rules: unknown,
   c: Pick<TrafficClassification, 'trafficType' | 'channelGroup' | 'channelKey'>,
@@ -193,7 +198,9 @@ export function matchRoutingRules(
     if (m.trafficType === undefined && m.channelGroup === undefined && m.channel === undefined) continue;
     if (m.trafficType !== undefined && m.trafficType !== c.trafficType) continue;
     if (m.channelGroup !== undefined && m.channelGroup !== c.channelGroup) continue;
-    if (m.channel !== undefined && m.channel !== c.channelKey) continue;
+    // A rule saved before 2.1.0 as `google_search` / `youtube` still means "that platform, paid or
+    // organic"; the paid split (google_ads / youtube_ads) must not silently drop it.
+    if (m.channel !== undefined && m.channel !== c.channelKey && m.channel !== baseChannelKey(c.channelKey)) continue;
     out.add(r.childListId);
   }
   return Array.from(out);

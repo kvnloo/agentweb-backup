@@ -254,7 +254,7 @@ describe("Admin CRM sync routes", () => {
             chatSessionCount: 0
           })
         }),
-      ])
+      ]), { origin: 'integration' }
     );
     expect(res.body.attemptedCount).toBe(1);
     expect(res.body.successCount).toBe(1);

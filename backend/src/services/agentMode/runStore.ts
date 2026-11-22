@@ -39,8 +39,8 @@
  */
 import AWS from 'aws-sdk';
 import crypto from 'crypto';
+import { TABLE_PREFIX } from '../../config/constants';
 
-const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const AGENT_RUNS_TABLE = `${TABLE_PREFIX}AW-AgentRuns`;
 
 /** Idempotency lock TTLs (seconds). */

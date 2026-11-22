@@ -154,7 +154,7 @@ export async function mirrorOnboardingEventToLead(
         lifecycle: 'signed_up',
         tenantId: FOUNDERS_USERID,
         accountOwnerUserId: FOUNDERS_USERID,
-      });
+      }, 'integration');
     } catch (createErr: any) {
       // The lookup above missed but createLead's own pre-check found the row (a concurrent
       // signup enrolment won). Mirror onto that row instead of dropping this event's analytics.

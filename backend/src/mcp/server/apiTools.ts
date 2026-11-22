@@ -1,5 +1,6 @@
 import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
+import { carryStoredStepModels } from '../../services/agentMode/workPlanStepModels';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
  *
@@ -15,11 +16,14 @@ import { mcpFetch } from './httpClient';
 import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
+import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
+import { omitBranchedFrom } from '../../utils/adminOnlyMessageFilter';
+import { omitActiveRun } from '../../services/agentMode/sessionActiveRunGuard';
 import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
@@ -387,7 +391,9 @@ mcpToolRegistry.register({
       }
     }
     return jsonResult({
-      ...data,
+      // ENG-112: branch-family linkage is portal-only; MCP clients never see it.
+      // ENG-110: the cross-instance run marker (runId/instanceId) is internal; MCP clients never see it.
+      ...omitActiveRun(omitBranchedFrom(data)),
       run,
       // Terminal means the request ended, not that all detached or continuation work did.
       completion_confirmed: run !== null && run.status !== 'running' &&
@@ -406,7 +412,7 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/sessions', context: ctx(context) });
-    return jsonResult(data);
+    return jsonResult(omitActiveRun(omitBranchedFrom(data)));
   }
 });
 
@@ -607,29 +613,76 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    description: 'List scheduled chats (newest first) for the authenticated user, or a specific client (admin-only, via client_id). Paginated: returns { items, nextCursor }; pass nextCursor back as cursor to get the next page (null = last page).',
     inputSchema: {
       type: 'object',
-      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      properties: {
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
+        limit: { type: 'number', description: `Page size (default ${SCHEDULED_CHATS_DEFAULT_LIMIT}, max ${SCHEDULED_CHATS_MAX_LIMIT})` },
+        cursor: { type: 'string', description: 'Opaque nextCursor from a previous page' },
+      },
       required: []
     }
   },
-  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  /**
+   * Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account.
+   * ENG-1611: always requests a bounded page so a large client account cannot
+   * produce an unbounded response.
+   */
   execute: async (args: any, context: any) => {
+    const limit = Number.isFinite(Number(args?.limit))
+      ? Math.min(SCHEDULED_CHATS_MAX_LIMIT, Math.max(1, Math.floor(Number(args.limit))))
+      : SCHEDULED_CHATS_DEFAULT_LIMIT;
+    const queryParams: Record<string, string> = { limit: String(limit) };
+    if (typeof args?.cursor === 'string' && args.cursor) queryParams.cursor = args.cursor;
     const data = await mcpFetch({
       method: 'GET',
       path: '/api/agent-mode/scheduled-chats',
+      queryParams,
       context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
     });
     return jsonResult(data);
   }
 });
 
+const MANAGE_SCHEDULED_CHAT_ACTIONS = ['create', 'update', 'toggle', 'delete'];
+
+function isNonEmptyString(v: unknown): boolean {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/** ENG-1656: field-named validation for manage_scheduled_chat; null when the call is well-formed. */
+export function validateManageScheduledChatArgs(args: any): string | null {
+  const action = args?.action;
+  if (!MANAGE_SCHEDULED_CHAT_ACTIONS.includes(action)) return null; // default branch reports Unknown action
+  const fail = (msg: string) => `Invalid manage_scheduled_chat arguments: ${msg}`;
+  if (action === 'create') {
+    const missing = ['schedule_name', 'starting_message', 'schedule_frequency'].filter((f) => !isNonEmptyString(args[f]));
+    if (missing.length) return fail(`Missing required fields: ${missing.join(', ')} (required for action "create")`);
+  } else if (!isNonEmptyString(args.schedule_id)) {
+    return fail(`schedule_id is required for action "${action}" — call list_scheduled_chats to get one`);
+  }
+  if (action === 'toggle' && args.status !== 'active' && args.status !== 'paused') {
+    return fail('status must be "active" or "paused" for action "toggle"');
+  }
+  if (action === 'create' || action === 'update') {
+    if (args.email_notifications !== undefined &&
+        !Array.isArray(args.email_notifications)) {
+      // [] is valid: the explicit "no email" opt-out (Opslane #2).
+      return fail('email_notifications must be an array of email addresses when provided (use [] for no email)');
+    }
+    if (args.next_run_time !== undefined && Number.isNaN(Date.parse(args.next_run_time))) {
+      return fail('next_run_time must be an ISO 8601 datetime (e.g. 2026-10-14T09:00:00Z)');
+    }
+  }
+  return null;
+}
+
 mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications: omit it to email results to the requesting user by default; pass [] ONLY when the user explicitly declines email (no emails are sent). For "update": schedule_id is required; omit any field to keep its existing value — email_notifications: [] turns emails off. next_run_time must carry a UTC offset (e.g. 2026-10-19T09:00:00-04:00), or pass timezone (the user IANA zone) and give next_run_time as local time in that zone. The result echoes what was stored — nextRunTime, nextRunTimeLocal (in the schedule timezone) and emailNotifications; tell the user those stored values, not what you intended to send. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -639,12 +692,13 @@ mcpToolRegistry.register({
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (REQUIRED for create, optional for update). IMPORTANT: Do NOT include notify_session or any instruction to send an email in this prompt when email_notifications is set — the system already sends emails automatically, and adding notify_session here will cause duplicate emails.' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (REQUIRED for create, optional for update)' },
         frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
-        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update). Include a UTC offset (2026-10-19T09:00:00-04:00), or omit the offset AND pass timezone so it is read as local time in that zone. An offset-less time with no timezone is rejected.' },
+        timezone: { type: 'string', description: 'The user\'s IANA timezone, e.g. America/New_York (create/update). Used to interpret an offset-less next_run_time and stored on the schedule for its local-calendar cadence.' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update). Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if starting_message instructs posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Same reasoning applies to any other action the run must actually take (a publish tool, etc.) — list it here rather than trusting the prompt wording alone.' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses that receive results after every run (create/update). Omit on create to default to the requesting user\'s email; omit on update to keep the current recipients. Pass [] only when the user explicitly does not want email — that stores no recipients and sends nothing.' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
@@ -661,6 +715,13 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1656: reject malformed calls before any network hop with a message that
+    // names the exact field. Without this an update/toggle/delete missing
+    // schedule_id hit `/scheduled-chats/undefined` and came back as a misleading
+    // "Scheduled chat not found", and a create missing a required field cost a
+    // round-trip before failing.
+    const preflight = validateManageScheduledChatArgs(args);
+    if (preflight) throw new Error(preflight);
     switch (args.action) {
       case 'create': {
         const body: any = {
@@ -674,7 +735,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -683,6 +750,7 @@ mcpToolRegistry.register({
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -698,7 +766,13 @@ mcpToolRegistry.register({
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
         if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
-        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.email_notifications !== undefined) {
+          body.emailNotifications = args.email_notifications;
+          // An explicit [] is the user declining email — tell the API it is deliberate,
+          // so it neither substitutes the requester's address nor refuses the clear.
+          if (Array.isArray(args.email_notifications) && args.email_notifications.length === 0) body.emailNotificationsOptOut = true;
+        }
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
         if (args.run_count !== undefined) body.runCount = args.run_count;
@@ -728,6 +802,7 @@ mcpToolRegistry.register({
         }
 
         if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
+        if (args.timezone !== undefined) body.timezone = args.timezone;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
         return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
@@ -1061,15 +1136,14 @@ mcpToolRegistry.register({
 //
 // `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
 // the campaign itself. Read-only by construction: list + inspect + enrollment
-// counts only. Create/activate/pause live in the sibling ENG-442 work
-// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
-// never be added here.
+// counts only. Create/activate/pause live in manage_crm_sequence (ENG-964,
+// below) behind the activation gate and must never be added here.
 
 mcpToolRegistry.register({
   name: 'list_crm_sequences',
   definition: {
     name: 'list_crm_sequences',
-    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use manage_crm_sequence.
 
 Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
 
@@ -1155,6 +1229,272 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
       });
     } catch (err: any) {
       return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
+});
+
+// ─── CRM drip sequences, write side (ENG-964) ───────────────────────────────
+//
+// create / update / pause are ordinary reversible writes on a DRAFT (or paused)
+// sequence. `activate` is the only path from this tool that ever sets
+// status 'active', and it sits behind the ENG-587 A1+A2 boundary in
+// crmSequenceActivationGate: attended sessions only, and only after the exact
+// content/audience/cadence was previewed and a human picked "Activate" on the
+// approval card. create/update never forward a `status`.
+
+function mapSequenceSteps(steps: unknown): { steps?: any[]; error?: string } {
+  if (steps === undefined) return {};
+  if (!Array.isArray(steps) || steps.length === 0) return { error: 'steps must be a non-empty array' };
+  const mapped: any[] = [];
+  for (const [i, raw] of steps.entries()) {
+    const s: any = raw ?? {};
+    const channel = s.channel ?? 'email';
+    const delayDays = Number(s.delay_days ?? 0);
+    if (!Number.isFinite(delayDays) || delayDays < 0) return { error: `steps[${i}].delay_days must be a non-negative number` };
+    if (channel === 'email' && (!s.subject || !s.body_html)) {
+      return { error: `steps[${i}] is an email step and needs both subject and body_html` };
+    }
+    if (channel === 'linkedin' && !s.message_text) return { error: `steps[${i}] is a LinkedIn step and needs message_text` };
+    if (channel !== 'email' && channel !== 'linkedin') return { error: `steps[${i}].channel must be "email" or "linkedin"` };
+    mapped.push({
+      name: typeof s.name === 'string' && s.name.trim() ? s.name.trim() : `Step ${i + 1}`,
+      delayDays,
+      channel,
+      ...(s.subject !== undefined ? { subject: s.subject } : {}),
+      ...(s.body_html !== undefined ? { bodyHtml: s.body_html } : {}),
+      ...(s.message_text !== undefined ? { messageText: s.message_text } : {}),
+      ...(s.sender_id !== undefined ? { senderId: s.sender_id } : {}),
+    });
+  }
+  return { steps: mapped };
+}
+
+function mapAudienceListIds(ids: unknown): { ids?: string[]; error?: string } {
+  if (ids === undefined) return {};
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !id.trim())) {
+    return { error: 'audience_list_ids must be an array of lead list ids' };
+  }
+  return { ids: ids.map((id: string) => id.trim()) };
+}
+
+mcpToolRegistry.register({
+  name: 'manage_crm_sequence',
+  definition: {
+    name: 'manage_crm_sequence',
+    description: `Create, edit, preview, activate, or pause a CRM email drip sequence on the caller's account.
+
+- "create": builds a new sequence as a DRAFT (nothing is sent). \`audience_list_ids\` are the lead lists whose new leads auto-enroll once it is active.
+- "update": edits a draft or paused sequence. An active sequence must be paused first.
+- "preview_activation": shows the user the exact steps, audience and timing and asks them to approve. Always do this before "activate".
+- "activate": starts sending. Only works in a live chat, after "preview_activation", once the user has picked "Activate" on the approval card, and only if the sequence has not changed since the preview. Never call it in the same turn as the preview — wait for the user's choice.
+- "pause": stops sending. Always allowed.
+
+Use list_crm_sequences to find sequence ids.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'preview_activation', 'activate', 'pause'] },
+        sequence_id: { type: 'string', description: 'Required for every action except create.' },
+        name: { type: 'string', description: 'Sequence name (create; optional on update).' },
+        description: { type: 'string' },
+        campaign_type: { type: 'string', enum: ['conversion', 'onboarding', 'reengagement', 'nurture', 'upsell', 'custom'] },
+        audience_list_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lead list ids whose new leads auto-enroll while the sequence is active.',
+        },
+        steps: {
+          type: 'array',
+          description: 'Ordered steps. Replaces all steps on update.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              delay_days: { type: 'number', description: 'Days after the previous step (or enrollment, for step 1).' },
+              channel: { type: 'string', enum: ['email', 'linkedin'] },
+              subject: { type: 'string' },
+              body_html: { type: 'string' },
+              message_text: { type: 'string', description: 'LinkedIn steps only.' },
+              sender_id: { type: 'string' },
+            },
+          },
+        },
+        preview_token: { type: 'string', description: 'activate only: the preview_token returned by preview_activation.' },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const gate = await import('../../services/crmSequenceActivationGate');
+    const { describeSequenceAudience } = await import('../../services/crmSequenceRead');
+    const action = args?.action;
+    const sequenceId = typeof args?.sequence_id === 'string' ? args.sequence_id.trim() : '';
+    const refuse = (code: string, error: string) => ({ success: false, blocked: true, code, error });
+    const isSequenceConflict = (err: any) => /API error \(409\)/.test(String(err?.message ?? ''));
+    const path = `/api/crm/sequences/${encodeURIComponent(sequenceId)}`;
+    const loadSequence = async () => {
+      const data = await mcpFetch({ method: 'GET', path, context: ctx(context) });
+      if (!data?.sequence) throw new Error(`Sequence not found: ${sequenceId}`);
+      return data.sequence;
+    };
+
+    try {
+      if (action !== 'create' && !sequenceId) return { success: false, error: 'sequence_id is required' };
+
+      switch (action) {
+        case 'create': {
+          const name = typeof args?.name === 'string' ? args.name.trim() : '';
+          if (!name) return { success: false, error: 'name is required' };
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          // No status, no enrollmentTrigger: the route defaults to draft, and the
+          // drip worker enrolls from autoEnrollListIds, not the trigger.
+          const created = await mcpFetch({
+            method: 'POST',
+            path: '/api/crm/sequences',
+            context: ctx(context),
+            body: { name, description: args?.description, campaignType: args?.campaign_type, steps: steps.steps },
+          });
+          let sequence = created?.sequence;
+          if (!sequence?.sequenceId) return { success: false, error: 'Sequence creation returned no sequence' };
+          if (audience.ids?.length) {
+            // PUT is the audience writer that refuses session lists (ENG-2311).
+            try {
+              const updated = await mcpFetch({
+                method: 'PUT',
+                path: `/api/crm/sequences/${encodeURIComponent(sequence.sequenceId)}`,
+                context: ctx(context),
+                body: { autoEnrollListIds: audience.ids },
+              });
+              sequence = updated?.sequence ?? sequence;
+            } catch (err: any) {
+              return {
+                success: false,
+                sequence_id: sequence.sequenceId,
+                error: `Draft sequence ${sequence.sequenceId} was created, but setting its audience failed: ${err?.message || String(err)}. It has no audience and sends nothing.`,
+              };
+            }
+          }
+          return { success: true, sequence_id: sequence.sequenceId, status: sequence.status, audience: describeSequenceAudience(sequence) };
+        }
+
+        case 'update': {
+          const existing = await loadSequence();
+          if (existing.status === 'active') {
+            return refuse('active_sequence', 'This sequence is active. Pause it before editing, then preview and activate it again.');
+          }
+          const steps = mapSequenceSteps(args?.steps);
+          if (steps.error) return { success: false, error: steps.error };
+          const audience = mapAudienceListIds(args?.audience_list_ids);
+          if (audience.error) return { success: false, error: audience.error };
+          const body: Record<string, unknown> = {};
+          if (typeof args?.name === 'string' && args.name.trim()) body.name = args.name.trim();
+          if (args?.description !== undefined) body.description = args.description;
+          if (args?.campaign_type !== undefined) body.campaignType = args.campaign_type;
+          if (steps.steps) body.steps = steps.steps;
+          if (audience.ids) body.autoEnrollListIds = audience.ids;
+          if (Object.keys(body).length === 0) return { success: false, error: 'Nothing to update' };
+          // Atomic: the route refuses (409) if the sequence went active after the check above.
+          body.requireStatusNot = 'active';
+          let data: any;
+          try {
+            data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('active_sequence', 'This sequence became active while editing. Pause it before editing, then preview and activate it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status, audience: describeSequenceAudience(data?.sequence ?? {}) };
+        }
+
+        case 'pause': {
+          const data = await mcpFetch({ method: 'PUT', path, context: ctx(context), body: { status: 'paused' } });
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'paused' };
+        }
+
+        case 'preview_activation':
+        case 'activate': {
+          // A1 first: an unattended/external caller learns nothing more than "no".
+          let session: any = null;
+          if (context?.externalMcp !== true && context?.unattended !== true && context?.sessionId) {
+            const { chatbotDb } = await import('../../services/chatbotService');
+            session = await chatbotDb.getChatSession(context.sessionId).catch(() => null);
+          }
+          const attended = gate.checkAttendedSession({
+            externalMcp: context?.externalMcp,
+            unattended: context?.unattended,
+            sessionId: context?.sessionId,
+            session,
+          });
+          if (!attended.allowed) return refuse(attended.code, attended.reason);
+
+          const sequence = await loadSequence();
+          if (sequence.status === 'active') return { success: true, sequence_id: sequenceId, status: 'active', note: 'Already active.' };
+          if (!Array.isArray(sequence.steps) || sequence.steps.length === 0) {
+            return { success: false, error: 'This sequence has no steps, so there is nothing to send.' };
+          }
+          const token = gate.computeSequencePreviewToken(sequence);
+
+          if (action === 'preview_activation') {
+            const audience = describeSequenceAudience(sequence);
+            const question = gate.buildActivationQuestion(sequence, token, audience);
+            return {
+              success: true,
+              awaitingUserConfirmation: true,
+              type: 'ask_user_question',
+              sessionId: context.sessionId,
+              questionDeckPayload: [question],
+              confirmationPrompt: question.question,
+              summary: question.question,
+              preview_token: token,
+              preview: {
+                sequence_id: sequenceId,
+                name: sequence.name,
+                audience,
+                steps: sequence.steps.map((s: any) => ({
+                  name: s.name,
+                  delay_days: s.delayDays,
+                  channel: s.channel ?? 'email',
+                  subject: s.subject,
+                  body_html: s.bodyHtml,
+                  message_text: s.messageText,
+                })),
+              },
+              message: 'The run halts here until the user picks an option. Do NOT call activate yourself in this turn.',
+            };
+          }
+
+          const { chatbotDb } = await import('../../services/chatbotService');
+          const messages = await chatbotDb.getMessagesFromMessagesTable(context.sessionId);
+          const approval = gate.checkActivationApproval(messages as any, sequenceId, token);
+          if (!approval.allowed) return refuse(approval.code, approval.reason);
+          if (typeof args?.preview_token !== 'string' || args.preview_token !== token) {
+            return refuse('stale_preview', 'preview_token does not match the sequence as it is now. Preview it again.');
+          }
+
+          // Atomic: activate only the exact version the user approved. If anything edited the
+          // sequence after the read that produced `token`, the route returns 409 and nothing goes live.
+          let data: any;
+          try {
+            data = await mcpFetch({
+              method: 'PUT',
+              path,
+              context: ctx(context),
+              body: { status: 'active', expectedUpdatedAt: sequence.updatedAt, requireStatusNot: 'active' },
+            });
+          } catch (err: any) {
+            if (isSequenceConflict(err)) return refuse('stale_preview', 'The sequence changed after the preview was approved. Preview it again.');
+            throw err;
+          }
+          return { success: true, sequence_id: sequenceId, status: data?.sequence?.status ?? 'active' };
+        }
+
+        default:
+          return { success: false, error: `Unknown action: ${action}` };
+      }
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
     }
   },
 });
@@ -1715,7 +2055,8 @@ mcpToolRegistry.register({
       properties: {
         account_id: { type: 'string', description: 'Connected account ID' },
         content: { type: 'string', description: 'Post content' },
-        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' }
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Optional media URLs' },
+        in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to. Omit for a new post.' }
       },
       required: ['account_id', 'content']
     }
@@ -1726,7 +2067,7 @@ mcpToolRegistry.register({
     if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
-      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+      body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [], ...(args.in_reply_to_post_id ? { in_reply_to_post_id: args.in_reply_to_post_id } : {}) }
     });
     return jsonResult(data);
   }
@@ -2547,6 +2888,56 @@ mcpToolRegistry.register({
   }
 });
 
+
+/** ENG-1992: summary of valid plans for an actionable not-found error. */
+function summarizeWorkPlans(plans: any[]): Array<{ id: string; title: string }> {
+  return plans
+    .map((p: any) => ({ id: p?.planId ?? p?.id, title: p?.title }))
+    .filter((p) => typeof p.id === 'string')
+    .slice(0, 50);
+}
+
+/**
+ * ENG-1992: resolve `plan_id` for get/update/delete. An id that matches a plan is
+ * used as-is. For get/update, a value matching exactly one plan TITLE
+ * (case-insensitive) resolves to that plan's id. Anything else — missing, unknown,
+ * or an ambiguous title — returns an actionable error listing the valid plans.
+ * If the plan list itself cannot be read, the original plan_id is passed through
+ * unchanged so the route's own answer (and error) stands.
+ */
+async function resolveWorkPlanTarget(args: any, c: any): Promise<{ planId: string } | { error: Record<string, unknown> }> {
+  const raw = typeof args.plan_id === 'string' ? args.plan_id.trim() : '';
+  let plans: any[] | undefined;
+  try {
+    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: c });
+    plans = Array.isArray(data) ? data : undefined;
+  } catch {
+    plans = undefined;
+  }
+  if (!plans) {
+    if (raw) return { planId: raw };
+    return { error: { error: `plan_id is required for action=${args.action}. Call list_predefined_work_plans to find it.` } };
+  }
+  if (raw && plans.some((p: any) => p?.planId === raw || p?.id === raw)) return { planId: raw };
+  if (raw && args.action !== 'delete') {
+    const needle = raw.toLowerCase();
+    const byTitle = plans.filter((p: any) => typeof p?.title === 'string' && p.title.trim().toLowerCase() === needle);
+    if (byTitle.length === 1) return { planId: byTitle[0].planId ?? byTitle[0].id };
+    if (byTitle.length > 1) {
+      return { error: {
+        error: `plan_id "${raw}" matches ${byTitle.length} work plans by title; pass the exact plan id.`,
+        matchingPlans: summarizeWorkPlans(byTitle),
+      } };
+    }
+  }
+  return { error: {
+    error: raw
+      ? `No work plan with id "${raw}"${args.action === 'delete' ? ' (delete requires the exact plan id, not a title)' : ''}. Use one of the ids below.`
+      : `plan_id is required for action=${args.action}. Use one of the ids below.`,
+    availablePlans: summarizeWorkPlans(plans),
+  } };
+}
+
 mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
@@ -2556,7 +2947,7 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'update', 'delete', 'get'], description: 'CRUD action' },
-        plan_id: { type: 'string', description: 'Plan ID (required for update/delete/get)' },
+        plan_id: { type: 'string', description: 'Plan ID from list_predefined_work_plans (required for update/delete/get). For get/update an exact, unique plan title is also accepted. An unknown value returns the list of valid plan ids.' },
         title: { type: 'string', description: 'Plan title (create/update)' },
         description: { type: 'string', description: 'Plan description (create/update)' },
         welcome_message: { type: 'string', description: 'Welcome message shown to users (create/update)' },
@@ -2582,7 +2973,8 @@ mcpToolRegistry.register({
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
               expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step\'s assets never count toward a later step\'s requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count.' },
-              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' }
+              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' },
+              model: { type: 'string', description: 'Optional model for THIS step (a canonical model id from the model picker). When set, the step runs on exactly this model and the plan pauses (never switches models) if it becomes unavailable. Omit to use the plan default_model, then the account default. Only stored while per-step models are enabled; a blank string clears it in steps_mode="merge". A model that is not served or not selectable is refused with a 422 naming the step.' }
             },
             required: ['title']
           },
@@ -2595,7 +2987,7 @@ mcpToolRegistry.register({
         },
         confirm_step_removal: {
           type: 'boolean',
-          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools, model) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2603,6 +2995,30 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const c = ctx(context);
+    // ENG-1992: the dominant failure cluster (18/28) was `not_found` — the model
+    // passed a plan TITLE, a stale id, or nothing as plan_id, and the route's bare
+    // "Work plan not found" 404 gave it nothing to recover with. Resolve a unique
+    // exact title match to its real id (get/update only — never a destructive delete
+    // by title), and otherwise return the valid plans instead of an opaque 404.
+    // Resolution runs only on a missing plan_id or a 404, so the happy path is unchanged.
+    const targetsPlan = args.action === 'update' || args.action === 'delete' || args.action === 'get';
+    if (targetsPlan && !(typeof args.plan_id === 'string' && args.plan_id.trim())) {
+      const resolved = await resolveWorkPlanTarget(args, c);
+      return jsonResult('error' in resolved ? resolved.error : { error: 'plan_id is required' });
+    }
+    try {
+      return await runManagePredefinedWorkPlan(args, c);
+    } catch (error: any) {
+      if (!targetsPlan || !/API error \(404\)/.test(String(error?.message || ''))) throw error;
+      const resolved = await resolveWorkPlanTarget(args, c);
+      if ('error' in resolved) return jsonResult(resolved.error);
+      if (resolved.planId === args.plan_id) throw error;
+      return await runManagePredefinedWorkPlan({ ...args, plan_id: resolved.planId }, c);
+    }
+  }
+});
+
+async function runManagePredefinedWorkPlan(args: any, c: any): Promise<any> {
     switch (args.action) {
       case 'create': {
         const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
@@ -2652,6 +3068,9 @@ mcpToolRegistry.register({
             // that judgement wrong (ENG-890).
             body.expectedStepsRev = current?.steps_rev ?? null;
           } catch (error: any) {
+            // A 404 means the plan_id itself is wrong: let it reach execute()'s
+            // title/candidate resolution (ENG-1992) instead of masking it here.
+            if (/API error \(404\)/.test(String(error?.message || ''))) throw error;
             // Fail closed in both modes: without the current steps we can
             // neither merge nor tell whether a replace would delete steps, and
             // writing blind is exactly the silent deletion this guards against.
@@ -2681,7 +3100,8 @@ mcpToolRegistry.register({
             }
             body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
           } else {
-            body.steps = incomingSteps;
+            // ENG-2378: a replace built from memory (the tool never shows a step's model) must not erase stored models.
+            body.steps = carryStoredStepModels(incomingSteps, existingSteps);
             if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
               const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
               return jsonResult({
@@ -2749,8 +3169,7 @@ mcpToolRegistry.register({
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
-  }
-});
+}
 
 // ─── Skill Management (admin-only) ──────────────────────────────────────────
 
@@ -3473,14 +3892,51 @@ Returns matches with the page record (id, status, lead list), the owner (userId,
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'GET',
-      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
-      context: ctx(context)
-    });
-    return jsonResult(data);
+    // ENG-1628: the route answers "no match" with 404 and a bad url with 400, and
+    // mcpFetch turns both into a bare `Error` — so ordinary lookups were counted as
+    // bug-class runtime failures (4/4). Return typed results for those outcomes and
+    // reserve a thrown, specifically-named error for genuine faults.
+    const url = typeof args?.url === 'string' ? args.url.trim() : '';
+    if (!url) return jsonResult({ status: 'invalid_url', error: "'url' is required: pass a live page URL or bare hostname." });
+    let data: any;
+    try {
+      data = await mcpFetch({
+        method: 'GET',
+        path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(url)}`,
+        context: ctx(context)
+      });
+    } catch (error: any) {
+      const message = String(error?.message || error);
+      const status = Number(/API error \((\d{3})\)/.exec(message)?.[1]);
+      if (status === 404) {
+        const scannedAll = !/"scannedAll"\s*:\s*false/.test(message);
+        return jsonResult({
+          status: 'not_found',
+          matches: [],
+          scannedAll,
+          message: scannedAll
+            ? `No landing page matches "${url}".`
+            : `No landing page matched "${url}" within the scan cap; the result is inconclusive.`,
+        });
+      }
+      if (status === 400) {
+        return jsonResult({ status: 'invalid_url', error: `"${url}" is not a valid URL or hostname.` });
+      }
+      throw new LandingPageResolveError(message, Number.isFinite(status) ? status : undefined);
+    }
+    return jsonResult({ status: 'found', ...(data && typeof data === 'object' ? data : { data }) });
   }
 });
+
+/** ENG-1628: a genuine (non-404/400) failure of resolve_landing_page_by_url. */
+export class LandingPageResolveError extends Error {
+  readonly httpStatus?: number;
+  constructor(cause: string, httpStatus?: number) {
+    super(`resolve_landing_page_by_url failed${httpStatus ? ` (HTTP ${httpStatus})` : ''}: ${cause}`);
+    this.name = 'LandingPageResolveError';
+    this.httpStatus = httpStatus;
+  }
+}
 
 mcpToolRegistry.register({
   name: 'share_landing_page_with_org',

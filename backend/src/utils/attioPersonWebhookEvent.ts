@@ -193,7 +193,7 @@ export async function applyAttioPersonEvent(
     };
     if (Object.keys(customFields).length > 0) newLead.customFields = customFields;
     try {
-      const created = await crmDb.createLead(listId, newLead);
+      const created = await crmDb.createLead(listId, newLead, 'integration');
       console.log(`[AttioWebhook] Created lead ${created?.leadId ?? '(unknown)'} for recordId=${recordId} in list ${listId}`);
     } catch (createErr: any) {
       // The lookups above said "absent" but createLead's own pre-check found the address — a

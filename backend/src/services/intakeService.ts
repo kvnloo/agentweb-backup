@@ -71,6 +71,8 @@ const EXACT_MATCH_COMMENT_SCAN_LIMIT = 10; // bounds worst-case Linear calls; bo
 async function findExactCanonicalMatch(
   refs: CanonicalRefs,
   candidates: OpenCanonical[],
+  /** ENG-1335: receives the matched candidate's comments so the caller need not re-read them. */
+  onMatchComments?: (comments: Array<{ body: string }>) => void,
 ): Promise<OpenCanonical | null> {
   if (refs.agwNumbers.size === 0 || candidates.length === 0) return null;
 
@@ -79,7 +81,10 @@ async function findExactCanonicalMatch(
     try {
       const comments = await getIssueCommentsDetailed(c.issueId);
       for (const n of refs.agwNumbers) {
-        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) return c;
+        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) {
+          onMatchComments?.(comments);
+          return c;
+        }
       }
     } catch (e) {
       // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
@@ -117,7 +122,8 @@ function idempotencyKeys(context?: Record<string, any>): string[] {
 
 function contextLines(context?: Record<string, any>): string[] {
   if (!context) return [];
-  return Object.entries(context).map(([k, v]) => {
+  // ENG-2492: the legacy match key is matcher input only, never occurrence data.
+  return Object.entries(context).filter(([k]) => k !== 'Alert Legacy Key').map(([k, v]) => {
     const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
     return `- ${k}: ${val.length > 400 ? val.slice(0, 400) + '…' : val}`;
   });
@@ -152,6 +158,27 @@ const BUG_PRIORITY_BY_COARSE_TAG: Record<string, number> = {
 function bugPriorityForFunnel(funnelStatus?: string | null): number {
   const coarse = getUserFunnelStatusCoarseTag(funnelStatus);
   return (coarse && BUG_PRIORITY_BY_COARSE_TAG[coarse]) || BUG_PRIORITY.MEDIUM;
+}
+
+/**
+ * ENG-1335 occurrence ladder (mirrors loop-pm.md: 2 reporters -> >= Medium, 3+ -> >= High).
+ * Counts the reports already recorded on a canonical from the per-report notes this service
+ * writes (`[reporter-ticket #N …]` for attributed reports, the "Surfaced via telemetry/…" note
+ * for unattributed ones). Derived from comments, so no new persisted field is needed.
+ */
+const REPORT_NOTE = /^(?:\[reporter-ticket #\d+ |Surfaced via telemetry\/satisfaction-report review)/m;
+export function countRecordedReports(comments: Array<{ body: string }>): number {
+  return comments.filter((c) => REPORT_NOTE.test(c?.body || '')).length;
+}
+export function occurrencePriority(occurrence: number): number {
+  if (occurrence >= 3) return BUG_PRIORITY.HIGH;
+  if (occurrence >= 2) return BUG_PRIORITY.MEDIUM;
+  return 4; // Low — never raises anything on its own
+}
+
+/** Visible count on the canonical row (ENG-1335 AC2) — only once it is actually a repeat. */
+function occurrenceLine(occurrence: number): string[] {
+  return occurrence >= 2 ? [`Occurrences: ${occurrence} reports on this canonical.`] : [];
 }
 
 export interface FileUserIssueParams {
@@ -311,7 +338,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue } = await import('./linearService');
+  const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue, getIssueCommentsDetailed } = await import('./linearService');
   const { createTicket, findTicketByMarker } = await import('./featurebaseService');
 
   // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
@@ -377,7 +404,8 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   // Deterministic short-circuit (fixes the ENG-329 false-duplicate incident): an explicit AGW-N
   // reference is checked for an EXACT match — via its private reporter-ticket comment — before the
   // fuzzy judge ever runs. No AGW-N reference present -> no-op -> behavior identical to today.
-  const exactOpenMatch = await findExactCanonicalMatch(refs, cans);
+  let exactMatchComments: Array<{ body: string }> | null = null;
+  const exactOpenMatch = await findExactCanonicalMatch(refs, cans, (cm) => { exactMatchComments = cm; });
   const dup = exactOpenMatch
     ? { ref: exactOpenMatch.identifier, title: exactOpenMatch.title, description: exactOpenMatch.description }
     : await findDuplicate(
@@ -412,6 +440,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   let canonicalUrl = '';
   let grouped = false;  // grouped onto an existing canonical (open dup OR reopened resolved one)
   let reopened = false; // reopened a Done/canceled canonical for a regression / failed retest
+  let occurrence = 0;   // ENG-1335: Nth report on an OPEN canonical (0 = not grouped onto one)
   if (dup) {
     const matched = byRef.get(dup.ref)!;
     canonicalUuid = matched.issueId;
@@ -419,11 +448,20 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     // A deduped report returns the SAME canonical link (ENG-289). listOpenBugCanonicals gives us
     // the identifier (e.g. ENG-42) but not the url, so build it from the stable issue-URL base.
     canonicalUrl = `${LINEAR_ISSUE_BASE}/${matched.identifier}`;
+    // ENG-1335 occurrence ladder: count the reports already recorded on this canonical so that
+    // repetition escalates instead of being silently absorbed. Best-effort: a failed read falls
+    // back to "this is the second report" — never blocks the filing.
+    try {
+      occurrence = countRecordedReports(exactMatchComments ?? (await getIssueCommentsDetailed(canonicalUuid))) + 1;
+    } catch (e) {
+      occurrence = 2;
+      console.warn('[intake] bug canonical occurrence count failed:', e instanceof Error ? e.message : e);
+    }
     // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
     // its stage labels in and raises the priority — never lowers it (raise-only by contract of
     // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
     try {
-      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
+      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority: Math.min(priority, occurrencePriority(occurrence)) });
     } catch (e) {
       console.warn('[intake] bug canonical triage upgrade failed:', e instanceof Error ? e.message : e);
     }
@@ -492,6 +530,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `[reporter-ticket #${ticket.number} ${p.userEmail}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      ...occurrenceLine(occurrence),
       // The reopened canonical's body is the OLD report, so fold in this reporter's text too — as we
       // do for any reporter grouped onto an existing canonical. Only the brand-new canonical already
       // carries the text in its description.
@@ -504,6 +543,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `Surfaced via telemetry/satisfaction-report review${p.reportedByAdmin ? ` by ${p.reportedByAdmin}` : ''} — affected user could not be resolved automatically; no reporter-ticket attached (nobody notified on resolve).`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      ...occurrenceLine(occurrence),
       ...(grouped ? ['', 'Report:', p.description] : []),
       ...contextLines(p.notionContext),
     ].join('\n');
@@ -613,6 +653,16 @@ export interface FileAutoIssueParams {
  */
 const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
 const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
+const ALERT_SCOPE_CONTEXT_KEY = 'Alert Scope';
+/**
+ * ENG-2492: `Alert Legacy Key` (e.g. `accountId: <id>`) lets a classed alert fold onto an open
+ * canonical filed BEFORE its filer emitted an Alert Class line. Such a canonical carries no class
+ * marker and a title whose numbers moved ("still disconnected (42d)" vs "(56d)"), so neither the
+ * class nor the title fallback matched and every reminder filed a new issue. Matched only against
+ * open candidates with NO `Alert Class:` line, anchored as a whole context line, so a classed
+ * canonical of a different class can never absorb it. Not rendered into the issue body.
+ */
+const ALERT_LEGACY_KEY_CONTEXT_KEY = 'Alert Legacy Key';
 
 export interface FiledAutoResult {
   pageId: string;
@@ -676,19 +726,54 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
   // thing on its own line.
   const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const classNeedle = alertClass
+  // ENG-2267: an optional `Alert Scope` narrows the class to one subject (e.g. one ad account),
+  // so a fleet detector that alerts per account files one canonical PER ACCOUNT instead of
+  // folding every customer's occurrence onto whichever account happened to file first.
+  const rawScope = p.notionContext?.[ALERT_SCOPE_CONTEXT_KEY];
+  const alertScope = rawScope === undefined || rawScope === null ? '' : String(rawScope).trim();
+  const classRe = alertClass
     ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
+  const scopeRe = alertScope
+    ? new RegExp(`${escapeRegExp(`${ALERT_SCOPE_CONTEXT_KEY}: ${alertScope}`)}\\s*$`, 'm')
+    : null;
+  const classNeedle = classRe
+    ? { test: (d: string) => classRe.test(d) && (!scopeRe || scopeRe.test(d)) }
     : null;
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
   const idKeys = idempotencyKeys(p.notionContext);
+  const rawLegacy = p.notionContext?.[ALERT_LEGACY_KEY_CONTEXT_KEY];
+  const legacyKey = rawLegacy === undefined || rawLegacy === null ? '' : String(rawLegacy).trim();
+  const legacyRe = classRe && legacyKey ? new RegExp(`^[-*]?\\s*${escapeRegExp(legacyKey)}\\s*$`, 'm') : null;
+  const anyClassRe = new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}:`)}`, 'm');
+  const legacyNeedle = legacyRe
+    ? { test: (d: string) => !anyClassRe.test(d) && legacyRe.test(d) }
+    : null;
   const match =
     (classNeedle ? open.find((i) => classNeedle.test(i.description || '')) : undefined) ||
+    (legacyNeedle ? open.find((i) => legacyNeedle.test(i.description || '')) : undefined) ||
     (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
     try {
-      await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));
+      const recurBody = [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n');
+      // ENG-2066: an hourly re-fire with byte-identical context (same day, same facts) adds no
+      // information — it buried ENG-2066 under ~20 identical comments in two days. Post only when
+      // this day's occurrence carries something new. Fails open: a comment-read error still posts.
+      let prior: { body: string }[] = [];
+      try {
+        const { getIssueCommentsDetailed } = await import('./linearService');
+        prior = (await getIssueCommentsDetailed(match.issueId)) || [];
+      } catch {
+        prior = []; // fail open
+      }
+      // Linear stores "- " bullets as "* ", so compare line-by-line with the bullet marker stripped.
+      const canon = (s: string) =>
+        (s || '').split('\n').map((l) => l.trim().replace(/^[-*]\s+/, '')).filter(Boolean).join('\n');
+      const target = canon(recurBody);
+      const alreadyPosted = (prior || []).some((c) => canon(c.body) === target);
+      if (!alreadyPosted) await addIssueComment(match.issueId, recurBody);
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
     }
@@ -755,6 +840,46 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // Outside production nothing is filed (ENG-1099). Report the suppression rather than a fake
     // issue id, so an alert email links nowhere instead of linking somewhere wrong.
     return { pageId: '', deduped: false, tracker: 'Linear', suppressed: true };
+  }
+
+  // Race reconciliation (ENG-2426). The gate above is list-then-create, so two concurrent filers
+  // (two processes, or two sweeps whose in-memory suppression maps are not shared) can both see no
+  // canonical and both create — ENG-2416/2417 were filed 0.3s apart. After creating, re-list with
+  // the SAME matcher; if an older open match exists, the oldest (lowest issue number) is the
+  // canonical. "Oldest wins" is deterministic, so every racer converges on one issue. Best-effort:
+  // any failure here returns the created issue exactly as before.
+  try {
+    const issueNumber = (identifier: string) => Number(String(identifier).split('-').pop()) || Number.MAX_SAFE_INTEGER;
+    const after = await listOpenIssuesByLabel('Auto', 50);
+    const matches = after.filter(
+      (i) =>
+        i.identifier === li.identifier ||
+        (classNeedle ? classNeedle.test(i.description || '') : false) ||
+        (legacyNeedle ? legacyNeedle.test(i.description || '') : false) ||
+        (idKeys.length ? idKeys.some((k) => (i.description || '').includes(k)) : false) ||
+        norm(i.title) === norm(p.title),
+    );
+    const winner = matches.reduce<(typeof matches)[number] | undefined>(
+      (best, i) => (!best || issueNumber(i.identifier) < issueNumber(best.identifier) ? i : best),
+      undefined,
+    );
+    const loserId = li.id || after.find((i) => i.identifier === li.identifier)?.issueId;
+    if (winner && winner.identifier !== li.identifier && loserId) {
+      const { markIssueDuplicateOf } = await import('./linearService');
+      await markIssueDuplicateOf(loserId, winner.issueId);
+      await addIssueComment(
+        loserId,
+        `Duplicate of ${winner.identifier}: filed concurrently with it by a racing filer (ENG-2426). Occurrence recorded there.`,
+      );
+      try {
+        await addIssueComment(winner.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)} (concurrent filing ${li.identifier} folded in).`, ...contextLines(p.notionContext)].join('\n'));
+      } catch (e) {
+        console.warn('[intake] race recur-comment failed:', e instanceof Error ? e.message : e);
+      }
+      return { pageId: winner.identifier, url: `${LINEAR_ISSUE_BASE}/${winner.identifier}`, deduped: true, tracker: 'Linear' };
+    }
+  } catch (e) {
+    console.warn('[intake] auto race reconciliation failed:', e instanceof Error ? e.message : e);
   }
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }

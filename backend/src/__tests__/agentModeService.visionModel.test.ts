@@ -98,12 +98,22 @@ describe('AgentModeService - vision model (describe_image)', () => {
       opts.forEach(m => expect(allModels).toContain(m));
     });
 
-    it('hides admin-only models from non-admin callers', async () => {
+    it('offers the same vision models to every user and admin (no registry model is adminOnly)', async () => {
       const adminOpts = await service.getVisionModelOptions(true);
       const userOpts = await service.getVisionModelOptions(false);
-      // Opus 4.6 (Bedrock) is admin-only in the registry
-      expect(adminOpts).toContain('anthropic.claude-opus-4-6-v1');
-      expect(userOpts).not.toContain('anthropic.claude-opus-4-6-v1');
+      expect(userOpts).toEqual(adminOpts);
+      expect(userOpts).toContain('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('the adminOnly mechanism still filters when a model is flagged (synthetic entry; none is flagged in the registry)', async () => {
+      const models = (service as any).llmModels;
+      models['__synthetic-admin-vision__'] = { ...models['anthropic.claude-opus-4-6-v1'], adminOnly: true };
+      try {
+        expect(await service.getVisionModelOptions(true)).toContain('__synthetic-admin-vision__');
+        expect(await service.getVisionModelOptions(false)).not.toContain('__synthetic-admin-vision__');
+      } finally {
+        delete models['__synthetic-admin-vision__'];
+      }
     });
   });
 

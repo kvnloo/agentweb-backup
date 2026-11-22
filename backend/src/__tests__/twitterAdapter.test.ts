@@ -47,6 +47,16 @@ describe('TwitterAdapter', () => {
   // ── createPost ───────────────────────────────────────────────────────────────
 
   describe('createPost', () => {
+    it('ENG-976: posts a reply when inReplyToPostId is given', async () => {
+      mockPostTweet.mockResolvedValue({ id: 'tweet-1000', text: 'Reply' });
+      const hook = jest.fn();
+
+      const result = await adapter.createPost(makeAccount(), 'Reply', [], USER_ID, hook, { inReplyToPostId: '42' });
+
+      expect(mockPostTweet).toHaveBeenCalledWith(USER_ID, 'tw-user-123', 'Reply', { inReplyToTweetId: '42' }, hook);
+      expect(result.postId).toBe('tweet-1000');
+    });
+
     it('posts a tweet and returns postId and postUrl', async () => {
       mockPostTweet.mockResolvedValue({ id: 'tweet-999', text: 'Hello X!' });
 

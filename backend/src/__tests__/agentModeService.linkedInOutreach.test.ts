@@ -14,6 +14,11 @@ jest.mock('../utils/secretsManager', () => ({
   getJwtSecret: jest.fn().mockResolvedValue('test-jwt-secret'),
 }));
 
+const mockRecordUnipileAccountHealth = jest.fn().mockResolvedValue('no-op');
+jest.mock('../services/linkedInConnectionHealth', () => ({
+  recordUnipileAccountHealth: (...args: any[]) => mockRecordUnipileAccountHealth(...args),
+}));
+
 // Mock connectedAccountsDb
 const mockGetAccountsByUserId = jest.fn();
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
@@ -60,7 +65,25 @@ const mockListSentInvitations = jest.fn();
 // ENG-1719: the bulk drain withdraws through the same service call the single-shot
 // cancel-invitation action uses.
 const mockCancelInvitation = jest.fn().mockResolvedValue({ ok: true });
-jest.mock('../services/linkedInOutreachService', () => ({
+// A faithful inline copy of isProvenDisconnectError's logic (pure,
+// dependency-free). jest.requireActual on this module was tried first, but
+// that pulls in linkedInOutreachService.ts's real top-level `import {
+// UnipileClient } from 'unipile-node-sdk'` at load time, which interacted
+// unreliably with another test file's `{virtual: true}` mock of that same
+// package when both ran in the same jest worker — reproducibly ~50% failure
+// rate across runs of the combined suite, 0% in isolation. Inlining avoids
+// loading the real module's import graph at all.
+function isProvenDisconnectErrorMock(error: any): boolean {
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification = structured?.classification || error?.body?.classification || error?.classification;
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return code === 'errors/disconnected_account' || classification === 'AUTH_ERROR' || Number(status) === 401;
+}
+jest.mock('../services/linkedInOutreachService', () => {
+  return {
+  isProvenDisconnectError: isProvenDisconnectErrorMock,
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
     getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
@@ -86,7 +109,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
-}));
+  };
+});
 
 // Mock emailEventsDb
 const mockAddLinkedInMessageEvent = jest.fn().mockResolvedValue(undefined);
@@ -817,6 +841,43 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockSearchPeople).not.toHaveBeenCalled();
     });
 
+    it('records health with the real owner for the preflight disconnect on an owned account (ENG-2205)', async () => {
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: 'user-1',
+        state: 'disconnected',
+      });
+    });
+
+    it('omits ownerUserId for the preflight disconnect on a site-wide pool account (ENG-2205)', async () => {
+      // account_id is not in the caller's own account list — usedSharedAccount
+      // becomes true (ENG-1198 determination), so recordUnipileAccountHealth
+      // must not be told this customer owns it: its owner lookup can never
+      // resolve the global fallback pool under an unrelated caller's userId.
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue([]);
+      mockProbeAccountSession.mockResolvedValue('disconnected');
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: undefined,
+        state: 'disconnected',
+      });
+    });
+
     it('fails fast on a write action before any invite is attempted', async () => {
       mockProbeAccountSession.mockResolvedValue('disconnected');
 
@@ -951,6 +1012,54 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.error).toContain('Common reasons');
       expect(result.error).toContain('Settings > Connected Accounts');
       expect(result.error).toContain('remove the connection');
+    });
+
+    it('records health with the real owner for the reactive disconnect on an owned account (ENG-2205)', async () => {
+      mockSearchPeople.mockRejectedValue(makeDisconnectedError());
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: 'user-1',
+        state: 'disconnected',
+      });
+    });
+
+    it('omits ownerUserId for the reactive disconnect on a site-wide pool account (ENG-2205)', async () => {
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue([]);
+      mockSearchPeople.mockRejectedValue(makeDisconnectedError());
+
+      await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+        accountId: 'test-account-id',
+        ownerUserId: undefined,
+        state: 'disconnected',
+      });
+    });
+
+    it('does not treat a bare 403 (permission/plan restriction) as a proven disconnect (ENG-2205)', async () => {
+      const forbiddenError: any = new Error('Forbidden');
+      forbiddenError.structuredError = { status: 403, classification: 'AUTH_ERROR' };
+      mockSearchPeople.mockRejectedValue(forbiddenError);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      expect(result.message).not.toBe('LinkedIn account disconnected');
+      expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
     });
 
     // ENG-281: the preflight probe is cached for 10 minutes, so a session that dies

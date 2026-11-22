@@ -26,6 +26,13 @@ export interface RunFunding {
   fallback: "stop" | "agentweb";
   ownerUserId: string;
   billingUserId: string;
+  /**
+   * The account whose provider credential pays for this run's calls: the owner of
+   * `connectionId`. It differs from `ownerUserId` (the person running the turn) when an
+   * org owner has shared a key with the org. Set by whatever resolves the connection
+   * (A2); until then usage falls back to `ownerUserId`.
+   */
+  fundingPrincipalId?: string;
   resolvedAt: string;
 }
 

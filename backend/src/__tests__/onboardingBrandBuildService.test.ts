@@ -17,6 +17,7 @@ jest.mock("../services/db", () => ({
 }));
 
 import {
+  claimBrandBuildRun,
   triggerBrandBuildForUser,
   mapMarketIcpToResult,
   mapMarketCompetitorsToResult,
@@ -29,6 +30,50 @@ beforeEach(() => {
 });
 
 describe("onboardingBrandBuildService", () => {
+  // ENG-2308 follow-up, caught live: the orchestrator's runBrandDna used to
+  // call triggerBrandBuildForUser directly with nothing ever flipping
+  // brandBuildStatus to building first — the real Emma session ran, really
+  // called update_brand_guidelines, but that tool's own "flip to ready if
+  // we were building" hook silently no-op'd, and triggerBrandBuildForUser's
+  // own final check then misreported "Emma finished but did not call
+  // update_brand_guidelines". claimBrandBuildRun is the extracted, reusable
+  // claim both /brand-build/start and runBrandDna now go through.
+  describe("claimBrandBuildRun", () => {
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimBrandBuildRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.brandBuildStatus).toBe("building");
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toContain("brandBuildStatus");
+    });
+
+    it("clears the previous attempt's error (null REMOVEs it; undefined is skipped by updateUser)", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      await claimBrandBuildRun("user-1");
+      expect(userDb.updateUser.mock.calls[0][1].brandBuildError).toBeNull();
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimBrandBuildRun("user-1");
+      expect(patch).toBeNull();
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+      await expect(claimBrandBuildRun("user-1")).rejects.toThrow("boom");
+    });
+  });
+
   describe("mapMarketIcpToResult", () => {
     it("maps marketStrategy.icp[] entries into the icpResult persona shape", () => {
       const input = [
@@ -116,6 +161,106 @@ describe("onboardingBrandBuildService", () => {
       expect(lastCall[0]).toBe("u1");
       expect(lastCall[1].brandBuildStatus).toBe("failed");
       expect(lastCall[1].brandBuildError).toMatch(/companyUrl/i);
+    });
+
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests):
+    // the round-3 stale-claim escape hatch lets a reclaim supersede a
+    // merely-slow (not crashed) run. buildFailedPatch's own write is
+    // unconditional by design ("allowed from any state so watchdogs can
+    // flip stale runs") — the FAILURE WRITE SITE here must condition on
+    // this run's own claim so a zombie failure can't stomp a reclaiming
+    // run's state. (The `ready` transition is written by Emma's
+    // update_brand_guidelines tool-call hook, out of scope for this fix.)
+    it("conditions the failure write on this run's own brandBuildStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "u1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession: jest.fn(),
+        generateSessionResponse: jest.fn(),
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const lastCall =
+        userDb.updateUser.mock.calls[userDb.updateUser.mock.calls.length - 1];
+      expect(lastCall[2]?.condition?.expression).toBe(
+        "#brandBuildStartedAt = :brandBuildOwnerStartedAt",
+      );
+      expect(lastCall[2]?.condition?.values?.[":brandBuildOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the failure silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "u1",
+        brandBuildStatus: "building",
+        // A reclaim's fresh startedAt — different from the stale
+        // expectedStartedAt this (zombie) run was given below.
+        brandBuildStartedAt: "2026-04-24T12:05:00.000Z",
+      });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      await expect(
+        triggerBrandBuildForUser("u1", {
+          createChatSession: jest.fn(),
+          generateSessionResponse: jest.fn(),
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 review follow-up: the update_brand_guidelines hook identifies a
+    // superseded ("zombie") brand-build session by the claim named in its
+    // pageIdentifier, so the build MUST create its session with that marker.
+    it("creates the Emma session with a pageIdentifier naming this run's claim", async () => {
+      const CLAIM = "2026-04-24T11:59:00.000Z";
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: CLAIM,
+      });
+      const createChatSession = jest.fn().mockResolvedValue({ sessionId: "s1" });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession,
+        generateSessionResponse: jest.fn().mockResolvedValue(undefined),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+        expectedStartedAt: CLAIM,
+      });
+
+      expect(createChatSession).toHaveBeenCalledWith("u1", {
+        pageIdentifier: `brand-build|claim:${CLAIM}`,
+      });
+    });
+
+    it("keeps the default session identifier when the caller holds no claim", async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: new Date().toISOString(),
+      });
+      const createChatSession = jest.fn().mockResolvedValue({ sessionId: "s1" });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession,
+        generateSessionResponse: jest.fn().mockResolvedValue(undefined),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+      });
+
+      expect(createChatSession).toHaveBeenCalledWith("u1", undefined);
     });
 
     it("marks the build failed when chat-session creation throws", async () => {
@@ -265,6 +410,94 @@ describe("onboardingBrandBuildService", () => {
       expect(lastCall[1].brandBuildError).toMatch(
         /update_brand_guidelines/i,
       );
+    });
+
+    // The client-side timeout calls /brand-build/fail then /start, which
+    // reclaims the axis while the first run's Emma session is still going. That
+    // run's trigger then carries on after its (refused) session returns.
+    describe("a run reclaimed while its session was still going", () => {
+      const OURS = "2026-04-24T11:59:00.000Z";
+      const NEWER = "2026-04-24T12:05:00.000Z";
+      const market = {
+        icp: [{ title: "Stale ICP", description: "d", valueProposition: "v", buyerPersonas: ["p"] }],
+        competitors: [{ name: "Stale Co", description: "d" }],
+      };
+      const entrance = {
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: OURS,
+      };
+      // triggerBrandBuildForUser also fires an unrelated fire-and-forget Slack
+      // Connect provisioning write at its start; only count writes that belong
+      // to the brand build itself.
+      const buildWrites = () =>
+        userDb.updateUser.mock.calls.filter(
+          ([, patch]: any) => !Object.keys(patch).every((k) => k.startsWith("slackConnect")),
+        );
+      const deps = () => ({
+        createChatSession: jest.fn().mockResolvedValue({ sessionId: "s1" }),
+        generateSessionResponse: jest.fn().mockResolvedValue({}),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+        expectedStartedAt: OURS,
+      });
+
+      it("skips every post-session write once it sees a newer claim: no mirror, no failure, no logo step", async () => {
+        const ensureBrandLogo = jest.fn();
+        // The reads a real run would make if it did NOT stop at the check, so
+        // that removing the check makes this test fail instead of passing
+        // because the mocks ran dry.
+        const newer = { ...entrance, brandBuildStartedAt: NEWER, brandBuildStatus: "ready", marketStrategy: market };
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce(newer)
+          .mockResolvedValueOnce(newer)
+          .mockResolvedValueOnce(newer);
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerBrandBuildForUser("u1", { ...deps(), ensureBrandLogo });
+
+        expect(buildWrites()).toHaveLength(0);
+        expect(ensureBrandLogo).not.toHaveBeenCalled();
+      });
+
+      it("conditions the mirror write on its own claim and drops it quietly when a reclaim lands first", async () => {
+        const conditionalFailure = Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" });
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce({ ...entrance }) // still ours at the check
+          .mockResolvedValueOnce({ ...entrance, marketStrategy: market }); // post-populate read
+        // Reject only the mirror write (the first updateUser call is the
+        // unrelated Slack Connect provisioning write).
+        userDb.updateUser.mockImplementation(async (_id: string, patch: any) => {
+          if (patch.icpResult) throw conditionalFailure;
+          return {};
+        });
+
+        await triggerBrandBuildForUser("u1", deps());
+
+        // Exactly one brand-build write was attempted (the mirror), and nothing
+        // after it: no final-status failure write either.
+        expect(buildWrites()).toHaveLength(1);
+        const [, patch, options] = buildWrites()[0];
+        expect(patch.icpResult).toBeTruthy();
+        expect(options.condition.values[":brandBuildOwnerStartedAt"]).toBe(OURS);
+      });
+
+      it("a run that still owns the claim mirrors as before, with the condition", async () => {
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce({ ...entrance })
+          .mockResolvedValueOnce({ ...entrance, brandBuildStatus: "ready", marketStrategy: market })
+          .mockResolvedValueOnce({ ...entrance, brandBuildStatus: "ready" });
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerBrandBuildForUser("u1", deps());
+
+        const mirror = userDb.updateUser.mock.calls.find(([, p]: any) => p.icpResult);
+        expect(mirror).toBeTruthy();
+        expect(mirror[2].condition.values[":brandBuildOwnerStartedAt"]).toBe(OURS);
+      });
     });
 
     it("mirrors marketStrategy → icpResult + competitorResult and flips statuses on the happy path", async () => {

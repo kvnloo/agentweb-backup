@@ -56,7 +56,10 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Send free-form text | Yes | `services/whatsappService.ts` `sendText` | Only inside the 24h window. |
 | Send template | Yes | `services/whatsappService.ts` `sendTemplate` | Required outside the window. |
 | Window-aware send | Yes | `services/whatsappService.ts` `sendMessage` | Picks text vs template; this is what callers should use. |
-| Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
+| Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged and never treated as inbound; a `failed` one is logged by message id and Meta error code (the send API only confirms acceptance, so this is the one place a dropped message is visible). Opt-out matches the whole message after Unicode (NFKC) folding and removing everything that is not a letter, digit or space — punctuation, quotes, emoji, zero-width characters (`Stop.`, `Stop 🛑`, `ＳＴＯＰ`, `please stop`, `stop all`). A fresh phone claim is protected for two minutes from being treated as abandoned. **STOP also disconnects:** the account that holds the number is moved to no platform automatically (the number is unbound, the verification rows are cleared, the opt-out row stays), so nothing is left "on WhatsApp" but unreachable and the account may connect Slack, or reconnect WhatsApp from Settings after the number sends START. START alone does not reconnect. |
+| Consent acknowledgement | Yes | `services/whatsappService.ts` `sendOptOutConfirmation` | The one message an opted-out number may receive. Sent AFTER the opt-out is recorded, and bypasses only the opt-out check — never the service window. |
+| Approval requests | **Yes, interactive** | `services/approvalRequestService.ts`, `services/approvalChannelNotifier.ts` | Inside the 24h window the customer gets Approve / Reject reply buttons (a service message — no template). Outside it, the `agentweb_approval_request_buttons` template (Approve / Reject quick replies, payloads `approve` / `reject`); until Meta approves that template (it answers 132001) the notifier falls back to the link-only `agentweb_approval_request`, which cannot be answered from WhatsApp. **The button template must be created and approved in the WABA that owns the sending number before it works.** A tap is correlated through `context.id` → `whatsapp:approval-msg:<wamid>`, because Meta returns a template button's LABEL as its payload. The verdict is one atomic conditional write, so the first answer wins and later taps are answered, not acted on, since buttons can never be removed. Approving emails the task's subscribers exactly as a Slack approval does. |
+| Customer writes in | Yes | `services/whatsappInboundSupport.ts` | A non-command message gets a fixed greeting (once per 12h per number) and is forwarded to the team by email — `WHATSAPP_SUPPORT_INBOX`, else the `whatsapp:support-inbox` setting, else founders@ in production only — at most 20 forwards per number per hour. A failed forward is logged. No model is involved. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
 | Threads | **No** | — | Quoted replies only. |
@@ -179,26 +182,122 @@ future channel's errors are covered without editing every call site — the mist
   messages being delivered; counting one as inbound would open a service window and
   let us message someone who never wrote to us.
 
+## One Platform Per Customer
+
+A customer is onboarded on Slack **or** WhatsApp, never both, and neither feature
+depends on the other. `services/customerChannelPolicy.ts` is the single definition of
+which platform an account is on; enforcement and every screen read it.
+
+What counts:
+
+- **WhatsApp:** a number the customer has verified.
+- **Slack:** a channel the account has of its own (assigned, linked, or the deprecated
+  single field). An organisation's shared channel is reported as Slack but is only a
+  default the account inherited, so it does **not** stop a member connecting WhatsApp.
+  A Slack Connect channel provisioned at onboarding is a support room, not a delivery
+  destination, so it is not a platform at all.
+
+Rules:
+
+- Connecting a second platform is refused wherever it can be asked for: starting or
+  completing WhatsApp verification for an account with its own Slack channel; an admin
+  assigning a Slack channel, the `link this channel` command, or Slack Connect
+  provisioning for an account on WhatsApp. The completion check runs before the code is
+  claimed so a refused code is not stranded.
+- **An account with a verified WhatsApp number is on WhatsApp everywhere.**
+  `resolveDestination` returns no Slack destination for it — own channel or inherited —
+  and the same applies to Emma's Slack allow-list and the legacy lead alert, which read
+  Slack directly. This settles every way the two can come to coexist (an organisation
+  gaining a channel, its owner being assigned one, a WhatsApp user joining it, or an
+  account that predates the rule) in one place, and matches what the admin screens report.
+- One number belongs to one account. A second account cannot verify a number that is
+  already connected, and unbinding an account only removes the lookup row if it still
+  points at that account.
+- Approvals the agent engine creates do not require Slack. `POST /api/approval-requests`
+  asks on whichever channel the account has. **Approvals a person starts from the customer
+  portal (Images, Videos, Research Reports) still require choosing a Slack channel** and call
+  `/api/slack/send-approval`, so a WhatsApp-only customer cannot start one there yet. An
+  engine deployed ahead of the backend gets a 404 and treats it as no channel, not as a
+  failed send. A task's Slack channel is ignored for a WhatsApp customer.
+  It answers `409 no_channel` when the account has nowhere to be asked, and
+  **`502 delivery_failed` when it has a channel and the send failed** — the task engine
+  carries on past the first but must hold its output for the second, as it does when a
+  Slack send fails.
+- A caller may only request approval for an asset, and point at an execution, that is
+  theirs: `assetUrl` is the approvals table's primary key and the record is written with a
+  put, so without the check a caller could replace — and, on a failed WhatsApp send, delete —
+  another account's approval, or have approving email another account's subscribers. It is
+  enforced on `POST /api/approval-requests` for everyone (`403 forbidden`) and for any
+  WhatsApp customer through `requestApproval`. The legacy `POST /api/slack/send-approval`
+  has the same exposure for a Slack customer and is left unchanged here, deliberately: who
+  may re-request an approval there is part of flows that were not traced for this change.
+- If the account cannot be read and no Slack channel was supplied, the request fails closed
+  (`502 delivery_failed`) rather than being reported as `no_channel`, so a transient read
+  failure holds a reachable customer's output instead of releasing it.
+- Admins see the platform (WhatsApp number masked to four digits) on each customer row
+  and can disconnect WhatsApp on a customer's behalf. Saving or clearing Slack channels
+  and disconnecting WhatsApp both return the recalculated platform, so the dashboard shows
+  an organisation member as Slack-via-organisation rather than "not connected".
+
+## Approval Taps
+
+Interactive buttons cannot be removed or disabled once sent, so a tap has to be safe to
+repeat and may arrive from a customer who already answered somewhere else. The verdict is
+one atomic conditional update (`approvalDb.answerIfOpen`) that succeeds only while the
+approval is `pending` or `needs_changes` and never creates a row. Exactly one WhatsApp tap
+wins; only the winner emails the task's subscribers; every other tap is told what stands.
+The approval record is written before the message carrying the buttons goes out, and
+removed again if nothing was delivered.
+
+Limits worth knowing:
+
+- A tap cannot overwrite an answer given EARLIER on any surface. Slack, the portal and
+  batch review still write the status with the unconditional `updateApprovalStatus`, so a
+  LATER answer there can overwrite a WhatsApp verdict. That path is outside this change.
+- The correlation row maps a message to an asset, not to a round. If the same asset URL is
+  requested again, buttons from the earlier message answer the new request.
+- A failed send to a customer who is reachable (an opt-out, a standing Meta error) holds
+  their task's output and removes the unsent record, exactly as a failed Slack send does.
+  Nothing retries; it is logged at error level with the user id and asset.
+
+Meta returns a template quick-reply's LABEL as its payload, so an id cannot ride on a
+button: a tap is correlated only through `context.id` against the outbound message id
+(`whatsapp:approval-msg:<wamid>`, 30-day TTL in epoch seconds).
+
 ## Deferred (documented decisions, not oversights)
 
 | Deferred | Why |
 | --- | --- |
 | Campaign / marketing sends | Meta's US (+1) marketing pause makes the primary use case undeliverable to AgentWeb's customer base. |
-| Multi-tenant Embedded Signup | Needs Meta Tech Provider verification and App Review for advanced access — and its main use case is blocked by the same pause. |
+| Multi-tenant Embedded Signup | Half-unblocked as of 2026-10-08: the business is now **verified as a Tech Provider**, confirmed in the app's Verification page. Still needs App Review for advanced access (the app is Unpublished), and its main use case remains blocked by the same US marketing pause. |
 | Group messaging | Needs an Official Business Account and caps at 8 participants. |
-| Conversational Emma over WhatsApp | Prohibited by the Business Solution Terms since 2026-01-15. |
+| Conversational Emma over WhatsApp | A product decision, **not** a platform prohibition. The January 2026 Business Solution Terms restrict *AI Providers* distributing general-purpose assistants, not a business using AI to answer its own customers (verified against Meta's developer docs, 2026-10-09; an earlier version of this row overstated it). It stays out because the 24h window makes an assistant go mute a day after the customer's last message, and a general-purpose Emma sits on the riskier side of that line. A narrow, support-scoped assistant would be defensible. |
 
 ## Live Verification
 
-Meta's sandbox test number works before business verification (up to 5 recipients),
-which is how this was exercised without waiting on the production app registration:
-send a template, reply from the handset, confirm the window opens, confirm a free-form
-reply lands, send `STOP`, confirm the next send is refused locally.
+Exercised end to end against Meta's sandbox on 2026-10-08, from `api-stage.agentweb.pro`
+(which runs `NODE_ENV=development` and so reads `dev/AgentWeb/WhatsApp` and the `Dev-`
+tables). Observed, not inferred:
 
-To exercise connecting a number: sign in, `POST /api/messaging-channels/whatsapp/verification`
-with `{"optIn": true}`, open the returned link from the handset and send the prefilled
-message, then poll `GET /api/messaging-channels/whatsapp/verification` until it reports
-`verified`. The confirmation should arrive on the handset. **Not yet confirmed against
-Meta's test number:** whether it accepts a FIRST message from a recipient. The webhook
-and verification logic can be driven without Meta by posting a payload signed with the
-app secret.
+- Meta delivered the inbound message to the staging webhook and the signature verified
+  against the real app secret.
+- `Verify <CODE>` bound the sender's number to the portal user, with
+  `optIn.source: inbound_verification`.
+- The service-window row was written with a TTL exactly 24h ahead, in epoch seconds.
+- The confirmation reply arrived on the handset.
+- `STOP` recorded the opt-out; `UNSTOP` cleared it and service resumed without
+  re-verifying the number — consent and number-ownership are tracked separately.
+
+**Settled by that run:** Meta's test number DOES accept a first inbound message from an
+allowlisted recipient. No outbound priming is needed, and the earlier note that this was
+unconfirmed no longer applies.
+
+To repeat it: sign in, `POST /api/messaging-channels/whatsapp/verification` with
+`{"optIn": true}`, open the returned `wa.me` link from the handset and send the
+prefilled message, then poll `GET /api/messaging-channels/whatsapp/verification` until
+it reports `verified`. The webhook and verification logic can also be driven without
+Meta by posting a payload signed with the app secret.
+
+Note that the test number only ever reaches the (max 5) allowlisted handsets, and
+templates are per-WABA — ones approved against the test account do not carry over to a
+production WABA.

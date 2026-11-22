@@ -10,6 +10,8 @@
  * macros (`{campaignid}`, `{creative}`) through un-encoded.
  */
 
+import { echoCampaignReadBack } from './helpers/googleAdsCampaignReadBack';
+
 const mockAxiosPost = jest.fn();
 const mockAxiosGet = jest.fn();
 jest.mock('axios', () => ({
@@ -79,7 +81,7 @@ beforeEach(() => {
   // Benign default so an unqueued call (e.g. the inherited-suffix GAQL read that
   // createAd/updateAd now issue before mutating) never crashes. Assertions below
   // check what we SENT, so the response body only has to be well-shaped.
-  mockAxiosPost.mockResolvedValue({ data: { results: [{ resourceName: 'default' }] } });
+  echoCampaignReadBack(mockAxiosPost, { data: { results: [{ resourceName: 'default' }] } });
   service = new GoogleAdsService();
 });
 

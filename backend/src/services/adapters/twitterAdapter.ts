@@ -4,7 +4,7 @@ import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnal
 
 export class TwitterAdapter implements SocialPlatformAdapter {
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized, options?: { inReplyToPostId?: string }): Promise<PostResult> {
     // account.userId is the token owner (differs from userId for org-shared accounts).
     const ownerUserId = (account as any).userId || userId;
     if (!ownerUserId) throw new Error('userId is required to post on X');
@@ -14,7 +14,10 @@ export class TwitterAdapter implements SocialPlatformAdapter {
       // ENG-827 (Greptile, security): postTweet already re-checks at the write —
       // this adapter was dropping the hook on the floor, so a scheduled single tweet
       // was decided only at dispatch while threads were guarded.
-      twitterService.postTweet(ownerUserId, account.account_id, content, undefined, assertStillAuthorized)
+      // ENG-976: an optional parent post id turns the single post into a reply.
+      twitterService.postTweet(ownerUserId, account.account_id, content,
+        options?.inReplyToPostId ? { inReplyToTweetId: options.inReplyToPostId } : undefined,
+        assertStillAuthorized)
     );
     return {
       success: true,

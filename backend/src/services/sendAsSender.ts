@@ -30,6 +30,11 @@ export interface SendAsSenderParams {
   bcc?: string | string[];
   /** Best-effort passthrough. Only meaningful if it happens to be a native id for the resolved provider. */
   replyToMessageId?: string;
+  /**
+   * ENG-2367: extra RFC 5322 headers (e.g. List-Unsubscribe). Honoured by Resend and
+   * Gmail. Dropped for Outlook: Graph's internetMessageHeaders only accepts `x-` headers.
+   */
+  headers?: Record<string, string>;
 }
 
 export interface SendAsSenderResult {
@@ -116,6 +121,7 @@ export async function sendAsSender(
       text: params.text,
       cc: params.cc,
       inReplyTo: params.replyToMessageId,
+      headers: params.headers,
     });
     if (!result || !result.id) {
       throw new SenderSendError(sender, 'Resend did not return a message id — the send may have failed.');
@@ -133,6 +139,7 @@ export async function sendAsSender(
     cc: params.cc,
     bcc: params.bcc,
     replyToMessageId: params.replyToMessageId,
+    headers: params.headers,
   });
 
   return { provider: sender.senderProvider, messageId: result.messageId, threadId: result.threadId };

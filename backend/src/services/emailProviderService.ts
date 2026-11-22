@@ -99,6 +99,7 @@ export interface SendEmailParams {
   bcc?: string | string[];
   replyToMessageId?: string; // provider-native message handle (NOT an RFC Message-ID)
   isHtml?: boolean;          // true = text/html body, false (default) = text/plain
+  headers?: Record<string, string>; // ENG-2367: extra headers; Gmail honours, Outlook (Graph) ignores non-x- headers
 }
 
 export interface SentEmailResult {

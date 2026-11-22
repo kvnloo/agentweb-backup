@@ -20,6 +20,7 @@ import { checkReplayFixture, REPLAY_FIXTURES, type JudgeReplayFixture } from './
 import { loadReplayFixtures, type LoadedReplayFixtures } from './agentModeReplayFixtureSource';
 import { evaluateReplayCase } from './failureReplaySuite';
 import { FAILURE_REPLAY_CATALOG, runRegisteredCheck, toFailureReplayCases, type RegisteredReplayCase } from './failureReplayCatalog';
+import { isAiLabelled } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
 import type { MetricObservation, SuiteSource } from './offlineSuite';
 import { computeCriterionAgreement, type GoldenCaseGrader, type GraderPrediction } from './runValidation';
@@ -130,7 +131,8 @@ export function goldenSetSource(opts: { store: GoldenSetStore; graders: () => re
       const observations: MetricObservation[] = [];
       const notes: string[] = [];
       for (const grader of opts.graders()) {
-        const cases = await opts.store.listCases(grader.surface, { split: 'test' });
+        // Labels an AI wrote are not human agreement (ENG-2135); this baseline is labelled "human-label agreement".
+        const cases = (await opts.store.listCases(grader.surface, { split: 'test' })).filter((c) => !isAiLabelled(c));
         const predictions = new Map<string, GraderPrediction>();
         // A grader that cannot read a case is an evaluator failure: the whole source fails closed.
         for (const c of cases) predictions.set(c.caseId, await grader.grade(c));

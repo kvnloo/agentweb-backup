@@ -130,7 +130,18 @@ export interface DagNode {
  */
 export interface OrchestratorDeps {
   getUser: (userId: string) => Promise<OrchestratorUser | null>;
-  updateUserSteps: (userId: string, steps: UserSteps) => Promise<void>;
+  /**
+   * Persist the whole `steps` map. With `expected`, the write is a
+   * compare-and-swap: it must only apply while the stored map is still exactly
+   * `expected` (`null` = no map stored yet), and otherwise reject with
+   * `code: "ConditionalCheckFailedException"`. `reconcile` claims a step that way
+   * so two passes (here, or on another backend instance) cannot both start it.
+   */
+  updateUserSteps: (
+    userId: string,
+    steps: UserSteps,
+    expected?: { steps: UserSteps | null },
+  ) => Promise<void>;
   /**
    * Optional override for the canonical DAG. Tests pass a synthetic DAG
    * to exercise topo-sort + dependency gating without invoking real
@@ -447,6 +458,9 @@ export function _resetRateLimitState(): void {
 // Orchestrator
 // ──────────────────────────────────────────────────────────────────────
 
+const MAX_CLAIM_ATTEMPTS = 4;
+const MAX_COMMIT_ATTEMPTS = 6;
+
 export class OnboardingPipelineOrchestrator {
   private readonly deps: Required<OrchestratorDeps>;
 
@@ -462,6 +476,50 @@ export class OnboardingPipelineOrchestrator {
       getUser: deps.getUser,
       updateUserSteps: deps.updateUserSteps,
     };
+  }
+
+  /**
+   * Record a step's terminal result. Rebuilt from the freshest stored map and
+   * written as a compare-and-swap, so a sibling step another pass claimed or
+   * finished in the meantime is never erased by this write; if the map moved
+   * between the read and the write it is re-read and rebuilt. Returns
+   * `written: false` when a newer generation of this step exists, whose result
+   * this one must not overwrite.
+   */
+  private async commitStepRecord(
+    userId: string,
+    step: string,
+    generation: number,
+    record: StepRecord<unknown>,
+    fallback: UserSteps,
+  ): Promise<{ written: true; steps: UserSteps } | { written: false; latestGen: number }> {
+    for (let attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+      const latest = await this.deps.getUser(userId);
+      const latestGen = latest?.steps?.[step]?.generation ?? generation;
+      if (!isResultFresh(generation, latestGen)) return { written: false, latestGen };
+      const next: UserSteps = { ...(latest?.steps ?? fallback), [step]: record };
+      // The final attempt is unconditional. A step left `running` is never
+      // revisited (shouldFire skips a running record with unchanged inputs), so
+      // failing to record a finished result would strand it for good, which is
+      // worse than the tiny window in which this write could drop a sibling
+      // that landed since the read above.
+      const lastAttempt = attempt === MAX_COMMIT_ATTEMPTS - 1;
+      try {
+        await this.deps.updateUserSteps(
+          userId,
+          next,
+          latest && !lastAttempt ? { steps: latest.steps ?? null } : undefined,
+        );
+        if (lastAttempt && attempt > 0) {
+          console.warn("[onboardingPipelineOrchestrator] recorded a step result without the compare-and-swap after repeated conflicts", { userId, step });
+        }
+        return { written: true, steps: next };
+      } catch (err) {
+        if ((err as { code?: string })?.code !== "ConditionalCheckFailedException" || lastAttempt) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 15 * (attempt + 1) + Math.random() * 25));
+      }
+    }
+    throw new Error(`could not record the result of step ${step}`);
   }
 
   /**
@@ -506,10 +564,13 @@ export class OnboardingPipelineOrchestrator {
     // Mutable copy of the user's step state so subsequent steps in this
     // pass see updates from earlier ones in the same reconcile() call.
     let workingSteps: UserSteps = { ...(user.steps ?? {}) };
-    const workingUser: OrchestratorUser = { ...user, steps: workingSteps };
+    let workingUser: OrchestratorUser = { ...user, steps: workingSteps };
+    // The map as stored, as of our last read or write of it: what a claim must
+    // still find in place.
+    let persisted: UserSteps | undefined = user.steps;
 
     for (const step of order) {
-      const decision = shouldFire(
+      let decision = shouldFire(
         step,
         workingUser,
         this.deps.dag,
@@ -520,80 +581,116 @@ export class OnboardingPipelineOrchestrator {
         continue;
       }
       const node = this.deps.dag[step];
-      const inputs = node.gatherInputs(workingUser);
-      const inputsHash = decision.inputsHash;
 
-      const prev = workingSteps[step];
-      const generation = (prev?.generation ?? 0) + 1;
+      // Claim the step. Another pass may have read the same state and decided to
+      // fire it too; the claim is a compare-and-swap on the stored map, so only
+      // one of us starts it. A pass that loses re-reads and re-decides: usually
+      // the step is now running with these exact inputs and there is nothing
+      // left to do, but a conflict caused by an unrelated step's write must not
+      // leave THIS step unfired, so the decision is made again, not assumed.
+      let claimed: {
+        inputs: unknown;
+        inputsHash: string;
+        generation: number;
+        prev: StepRecord<unknown> | undefined;
+      } | null = null;
+      for (let attempt = 0; attempt < MAX_CLAIM_ATTEMPTS && !claimed; attempt++) {
+        if (attempt > 0) {
+          const latest = await this.deps.getUser(userId);
+          if (!latest) break;
+          persisted = latest.steps;
+          workingSteps = { ...(latest.steps ?? {}) };
+          workingUser = { ...latest, steps: workingSteps };
+          decision = shouldFire(step, workingUser, this.deps.dag, this.deps.hash);
+          if (!decision.fire) break;
+        }
+        if (!decision.fire) break;
+        const inputs = node.gatherInputs(workingUser);
+        const prev = workingSteps[step];
+        const generation = (prev?.generation ?? 0) + 1;
+        const startRecord: StepRecord<unknown> = {
+          output: prev?.output ?? null,
+          inputsHash: decision.inputsHash,
+          generation,
+          provenance: prev?.provenance ?? "anticipated",
+          status: "running",
+          ranAt: this.deps.now(),
+        };
+        const next = { ...workingSteps, [step]: startRecord };
+        try {
+          await this.deps.updateUserSteps(userId, next, { steps: persisted ?? null });
+        } catch (err) {
+          if ((err as { code?: string })?.code === "ConditionalCheckFailedException") continue;
+          throw err;
+        }
+        workingSteps = next;
+        workingUser.steps = workingSteps;
+        persisted = next;
+        claimed = { inputs, inputsHash: decision.inputsHash, generation, prev };
+      }
+      if (!claimed) {
+        report.skipped.push({
+          step,
+          reason: decision.fire ? "claim kept losing to concurrent writes" : decision.reason,
+        });
+        continue;
+      }
+      const { inputs, inputsHash, generation, prev } = claimed;
 
-      const startRecord: StepRecord<unknown> = {
-        output: prev?.output ?? null,
-        inputsHash,
-        generation,
-        provenance: prev?.provenance ?? "anticipated",
-        status: "running",
-        ranAt: this.deps.now(),
-      };
-      workingSteps = { ...workingSteps, [step]: startRecord };
-      workingUser.steps = workingSteps;
-      await this.deps.updateUserSteps(userId, workingSteps);
-
+      let output: unknown;
+      let runFailure: { reason: string } | null = null;
       try {
-        const output = await node.runner({
+        output = await node.runner({
           userId,
           inputs,
           inputsHash,
           generation,
         });
-
-        // Re-read in case some other process bumped the generation while
-        // we were running. We compare against the *latest* persisted
-        // generation, not our local working copy, to catch
-        // cancel-and-replace from concurrent reconcile() calls.
-        const latest = await this.deps.getUser(userId);
-        const latestGen = latest?.steps?.[step]?.generation ?? generation;
-        if (!isResultFresh(generation, latestGen)) {
-          report.skipped.push({
-            step,
-            reason: `stale generation ${generation} < ${latestGen}`,
-          });
-          continue;
-        }
-
-        const readyRecord: StepRecord<unknown> = {
-          output,
-          inputsHash,
-          generation,
-          provenance: prev?.provenance ?? "anticipated",
-          status: "ready",
-          ranAt: this.deps.now(),
-        };
-        workingSteps = {
-          ...(latest?.steps ?? workingSteps),
-          [step]: readyRecord,
-        };
-        workingUser.steps = workingSteps;
-        await this.deps.updateUserSteps(userId, workingSteps);
-        report.fired.push({ step, generation, status: "ready" });
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        const failedRecord: StepRecord<unknown> = {
-          output: prev?.output ?? null,
-          inputsHash,
-          generation,
-          provenance: prev?.provenance ?? "anticipated",
-          status: "failed",
-          failedReason: reason,
-          ranAt: this.deps.now(),
-        };
-        workingSteps = { ...workingSteps, [step]: failedRecord };
-        workingUser.steps = workingSteps;
-        await this.deps.updateUserSteps(userId, workingSteps);
-        report.fired.push({ step, generation, status: "failed", reason });
-        // On failure, downstream steps will be gated by the
-        // upstream-not-ready check above; no need to break out of the
-        // loop explicitly.
+        runFailure = { reason: err instanceof Error ? err.message : String(err) };
       }
+
+      // Recording the result is deliberately outside the runner's try: a failure
+      // to WRITE a finished step must not be recorded as that step having failed,
+      // which would make the next pass run it again.
+      const record: StepRecord<unknown> = runFailure
+        ? {
+            output: prev?.output ?? null,
+            inputsHash,
+            generation,
+            provenance: prev?.provenance ?? "anticipated",
+            status: "failed",
+            failedReason: runFailure.reason,
+            ranAt: this.deps.now(),
+          }
+        : {
+            output,
+            inputsHash,
+            generation,
+            provenance: prev?.provenance ?? "anticipated",
+            status: "ready",
+            ranAt: this.deps.now(),
+          };
+      // Compared against the *latest* persisted generation, not our local working
+      // copy, to catch cancel-and-replace from concurrent reconcile() calls (see
+      // commitStepRecord). On failure, downstream steps stay gated by the
+      // upstream-not-ready check above.
+      const committed = await this.commitStepRecord(userId, step, generation, record, workingSteps);
+      if (!committed.written) {
+        report.skipped.push({
+          step,
+          reason: `stale generation ${generation} < ${committed.latestGen}`,
+        });
+        continue;
+      }
+      workingSteps = committed.steps;
+      workingUser.steps = workingSteps;
+      persisted = workingSteps;
+      report.fired.push(
+        runFailure
+          ? { step, generation, status: "failed", reason: runFailure.reason }
+          : { step, generation, status: "ready" },
+      );
     }
 
     return report;

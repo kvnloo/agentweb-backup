@@ -46,7 +46,7 @@ jest.mock('../../services/subscriptionService', () => ({
 
 const EMAIL_ARGS = '{"to":"client@example.com","subject":"Weekly report"}';
 const UNTRUE_CLAIM = "Done! I've sent the email to the client with the report attached.";
-const JUDGE_VERDICT = '[{"claimClass":"email_sent"}]';
+const JUDGE_VERDICT = '[{"claimClass":"email_sent","statement":"sent the email"}]';
 const CORRECTED =
   'I was not able to send the email — the send_email call failed in this session. Ask me to retry and I will attempt it again.';
 
@@ -110,5 +110,28 @@ describe('AgentMode finalize guard — monolith ledger mapping (suppressed dupli
       cancelled: false,
     };
     expect(snapshot).toEqual(expected);
+  });
+
+  /**
+   * The ledger result is minimized (post_on_connected_account keeps `{}`), so a draft is visible to the guard
+   * only through the call's arguments. Unit tests that build ledger entries by hand cannot catch a missing
+   * hand-off, so this pins it through the real loop (ENG-2459).
+   */
+  it('a LinkedIn post saved with save_as_draft does not back a "published" claim — the corrective turn runs', async () => {
+    const draftArgs = '{"platform":"linkedin","content":"Launch day!","save_as_draft":true}';
+    const snapshot = await runScenario(service, {
+      message: 'Post the launch update on LinkedIn.',
+      transcript: [
+        { tool_calls: [{ id: 'p1', name: 'post_on_connected_account', arguments: draftArgs }] },
+        { content: 'Done! Your LinkedIn post was published.' },
+        { content: '[{"claimClass":"post_published","statement":"Your LinkedIn post was published."}]' },
+        { content: 'I only saved that as a LinkedIn draft, so nothing has gone live yet. Open it on LinkedIn to finish.' },
+      ],
+      // No `draft` in the result: the call's arguments are the only signal, as in prod where the stored result is `{}`.
+      toolResults: { post_on_connected_account: { result: { success: true, message: 'Saved' } } },
+    });
+
+    expect(snapshot.content).toBe('I only saved that as a LinkedIn draft, so nothing has gone live yet. Open it on LinkedIn to finish.');
+    expect(snapshot.llmTurnsConsumed).toBe(4); // tools + untrue claim + judge + corrective
   });
 });

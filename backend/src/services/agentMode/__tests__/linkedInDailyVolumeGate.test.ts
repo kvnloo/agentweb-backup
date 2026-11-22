@@ -28,8 +28,10 @@ jest.mock('../../linkedInWritePacer', () => {
 
 import {
   paceLinkedInWrite,
+  releaseLinkedInDailySlot,
   resolveLinkedInAccountForWrite,
   setDailyInviteCap,
+  DailyInviteCapNotOwnerError,
 } from '../linkedInDailyVolumeGate';
 
 const ACCOUNT_ID = 'unipile-acc-1';
@@ -69,6 +71,40 @@ describe('resolveLinkedInAccountForWrite — ownership resolution', () => {
     expect(result).not.toBeNull();
     expect(result!.ownerUserId).toBe('user-1');
     expect(result!.configuredDailyInviteCap).toBe(30);
+  });
+
+  // Legacy rows carry two ids (account_id and Unipile's config.unipile_account_id) that can differ; either names the row.
+  it("accepts a legacy row's Unipile id (config.unipile_account_id) as naming the caller's own account", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+
+    const result = await resolveLinkedInAccountForWrite('user-1', ACCOUNT_ID);
+
+    expect(result).not.toBeNull();
+    expect(result!.ownerUserId).toBe('user-1');
+  });
+
+  it("still returns the row's own id when asked by account_id", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', 'our-internal-id')).not.toBeNull();
+  });
+
+  it('does NOT widen access: an id that matches neither id of any of the caller\'s rows is refused (e.g. the shared pool account)', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'our-internal-id', userId: 'user-1', config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', 'site-wide-pool-account')).toBeNull();
+  });
+
+  it('ignores non-unipile rows and rows with no config', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'gmail', account_id: ACCOUNT_ID, userId: 'user-1' },
+      { platform: 'unipile', account_id: 'other', userId: 'user-1' },
+    ]);
+    expect(await resolveLinkedInAccountForWrite('user-1', ACCOUNT_ID)).toBeNull();
   });
 
   it('resolves the caller as owner for their own (non-shared) account', async () => {
@@ -203,20 +239,30 @@ describe('paceLinkedInWrite — every refusal names its gate (ENG-1873)', () => 
   // still passes through the durable daily-volume commit — so a persistence failure
   // refuses EVERY withdrawal even when both gates allow. That commit was the one
   // step the original local reproduction never exercised.
-  it('cancel-invitation still commits the reservation, and a persistence failure refuses it as reservation_persistence', async () => {
-    const allowed = await paceLinkedInWrite('cancel-invitation', account, ACCOUNT_ID);
-    expect(allowed.refusal).toBeNull();
-    expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+  // ENG-1594: a cancel consumes no daily budget, so it must not touch the durable
+  // record at all — and therefore a persistence failure can never refuse it.
+  it('cancel/accept-invitation keep hourly pacing but never persist a daily reservation', async () => {
+    mockUpdateAccountConfig.mockRejectedValue(new Error('ConditionalCheckFailedException'));
+    for (const action of ['cancel-invitation', 'accept-invitation']) {
+      const result = await paceLinkedInWrite(action, account, ACCOUNT_ID);
+      expect(result.refusal).toBeNull();
+    }
+    expect(mockReserveWriteSlot).toHaveBeenCalledTimes(2);
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    mockUpdateAccountConfig.mockReset().mockResolvedValue(undefined);
+  });
 
-    mockUpdateAccountConfig.mockRejectedValueOnce(new Error('ConditionalCheckFailedException'));
-    const refused = await paceLinkedInWrite('cancel-invitation', account, ACCOUNT_ID);
-    expect(refused.refusal!.gate).toBe('reservation_persistence');
+  it('cancel-invitation is still refused by the hourly pacer', async () => {
+    mockReserveWriteSlot.mockResolvedValue({ allowed: false, reason: 'hourly ceiling reached', retryAfterMs: 60_000 });
+    const result = await paceLinkedInWrite('cancel-invitation', account, ACCOUNT_ID);
+    expect(result.refusal!.gate).toBe('write_pacer');
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 });
 
 describe('setDailyInviteCap', () => {
   it('writes the cap through the account OWNER record, not the caller', async () => {
-    await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID, 30);
+    await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID, 30, 'owner-user-id');
 
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner-user-id', 'unipile', ACCOUNT_ID, { daily_invite_cap: 30 });
   });
@@ -226,23 +272,36 @@ describe('setDailyInviteCap', () => {
       { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       -1,
+      'owner-user-id',
     )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
 
     await expect(setDailyInviteCap(
       { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       100,
+      'owner-user-id',
     )).resolves.toBe(30);
   });
 
   // Regression test: Number.isFinite alone accepts fractional values, so a cap
   // of 10.5 would let reserveDailyVolumeSlot's integer count comparison permit
   // an 11th invite — exceeding the configured daily cap.
+  it('ENG-1594: refuses an org-shared member who is not the owner, without persisting', async () => {
+    await expect(setDailyInviteCap(
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
+      ACCOUNT_ID,
+      30,
+      'shared-member-id',
+    )).rejects.toBeInstanceOf(DailyInviteCapNotOwnerError);
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects a fractional cap', async () => {
     await expect(setDailyInviteCap(
       { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       10.5,
+      'owner-user-id',
     )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
   });
 });
@@ -348,5 +407,50 @@ describe('warm-up ramp wiring (ENG-1721)', () => {
     const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
 
     expect(result.refusal).toBeNull();
+  });
+});
+
+describe('ENG-2529: legacy-row id + slot release (Opslane run 725)', () => {
+  it("persists the reservation under the stored account_id when the caller named the row by its Unipile id", async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'legacy-row-w5', userId: 'user-1', config: { unipile_account_id: 'unipile-legacy-w5' } },
+    ]);
+    const resolved = await resolveLinkedInAccountForWrite('user-1', 'unipile-legacy-w5');
+    const result = await paceLinkedInWrite('send-message', resolved!, 'unipile-legacy-w5');
+    expect(result.refusal).toBeNull();
+    expect(mockUpdateAccountConfig.mock.calls[0][2]).toBe('legacy-row-w5');
+  });
+
+  it('releaseLinkedInDailySlot decrements the current window under the stored id', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    await releaseLinkedInDailySlot('send-message', acct, 'uni-1', 5);
+    const [owner, , id, fn] = mockUpdateAccountConfig.mock.calls[0];
+    expect(owner).toBe('owner');
+    expect(id).toBe('row-1');
+    expect(fn({ daily_volume: { message: { count: 2, windowStartedAt: 5 } } }).updates.daily_volume.message).toEqual({ count: 1, windowStartedAt: 5 });
+    expect(fn({ daily_volume: { message: { count: 0, windowStartedAt: 5 } } }).skip).toBe(true);
+  });
+
+  it('releaseLinkedInDailySlot skips the refund when a new daily window started after the reservation', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    await releaseLinkedInDailySlot('send-message', acct, 'uni-1', 5);
+    const fn = mockUpdateAccountConfig.mock.calls[0][3];
+    expect(fn({ daily_volume: { message: { count: 1, windowStartedAt: 999 } } }).skip).toBe(true);
+  });
+
+  it('paceLinkedInWrite reserves the hourly slot under the stored account id', async () => {
+    const acct = { ownerUserId: 'owner', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined, storedAccountId: 'row-1' };
+    mockUpdateAccountConfig.mockImplementation(async (_o: string, _p: string, _i: string, f: any) => f({ daily_invite_cap: 10 }));
+    const res = await paceLinkedInWrite('send-invite', acct, 'uni-1');
+    expect(res.refusal).toBeNull();
+    expect(mockReserveWriteSlot).toHaveBeenCalledWith('row-1');
+    expect(typeof (res as any).reservedWindowStartedAt).toBe('number');
+  });
+
+  it('releaseLinkedInDailySlot never throws when the refund cannot be persisted', async () => {
+    mockUpdateAccountConfig.mockRejectedValueOnce(new Error('boom'));
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(releaseLinkedInDailySlot('send-message', { ownerUserId: 'o', configuredDailyInviteCap: 1, dailyVolumeState: undefined, connectedAt: undefined }, 'a')).resolves.toBeUndefined();
+    spy.mockRestore();
   });
 });

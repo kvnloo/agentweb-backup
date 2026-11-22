@@ -336,6 +336,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // for 97 days while every CRM sync against it returned 401.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — HubSpot revoked the token';
+      } else if (acc.platform === 'luma' && (acc.config as any).needs_reconnect) {
+        // Luma rejected the calendar API key (revoked, or the Plus plan lapsed) — see
+        // emma/lumaTools.ts, which sets this flag when a call comes back 401.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — Luma rejected the API key';
       } else if (adsCapability.ads_capable === false) {
         // The token is valid and unexpired, but the Meta account never granted (or
         // has since lost) ads_read/ads_management, so this ad account cannot serve

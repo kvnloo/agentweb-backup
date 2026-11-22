@@ -64,7 +64,7 @@ import { userDb } from '../services/db';
  *
  *  A. `agentModeService.createMetaAdsAdSet` resolves bid strategy as
  *     `args.bid_strategy || 'LOWEST_COST_WITHOUT_CAP'`, and the model-facing
- *     AD_SET CREATE contract in `emma/tools.ts` never lists bid_strategy as
+ *     AD_SET CREATE contract in `emma/metaTools.ts` never lists bid_strategy as
  *     writable on create. So the model omits it and the silent default lands.
  *
  *  B. Dayparting has no representation anywhere in the backend. A caller asking
@@ -329,7 +329,8 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
   describe('A — the model-facing contract lists every field the handler accepts', () => {
     it('documents bid_strategy on AD_SET CREATE so the model knows it is writable', () => {
       const toolsSrc = fs.readFileSync(
-        path.join(__dirname, '..', 'emma', 'tools.ts'),
+        // The Meta tool definitions moved out of emma/tools.ts into emma/metaTools.ts (ENG-2282).
+        path.join(__dirname, '..', 'emma', 'metaTools.ts'),
         'utf8'
       );
       const lines = toolsSrc.split('\n');

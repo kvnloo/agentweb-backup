@@ -196,6 +196,37 @@ describe('landing-page findings roll up into ONE fleet alert — risk 3, fixed',
     expect(context['Customers Affected']).toBe(3);
   });
 
+  it('skips internal AgentWeb accounts (ENG-2124) and alerts only on customers', async () => {
+    const { raiseLandingPageRollup, __resetTrackingAlertStateForTests: reset } =
+      require('../services/metaTrackingMonitor');
+    reset();
+    const transport = jest.fn().mockResolvedValue(undefined);
+    const site = (u: string) => ({ name: u, url: u, reason: 'no_pixel', detectedPixelIds: [] });
+
+    await raiseLandingPageRollup(
+      [
+        { userId: 'h', email: 'harsha@agentweb.pro', sites: [site('https://h/')] },
+        { userId: 'm', email: 'Matthew@AgentWeb.Pro', sites: [site('https://m/')] },
+      ],
+      { transport, now: Date.parse('2026-10-07T09:00:00Z') },
+    );
+    expect(transport).not.toHaveBeenCalled();
+
+    await raiseLandingPageRollup(
+      [
+        { userId: 'h', email: 'harsha@agentweb.pro', sites: [site('https://h/')] },
+        { userId: 'c', email: 'buyer@customer.test', sites: [site('https://c/')] },
+      ],
+      { transport, now: Date.parse('2026-10-07T09:00:00Z') },
+    );
+    expect(transport).toHaveBeenCalledTimes(1);
+    const [subject, message, context] = transport.mock.calls[0];
+    expect(subject).toContain('1 customer(s)');
+    expect(message).toContain('buyer@customer.test');
+    expect(message).not.toContain('agentweb.pro');
+    expect(context['Customers Affected']).toBe(1);
+  });
+
   it('sends nothing at all when there are no findings', async () => {
     const { raiseLandingPageRollup } = require('../services/metaTrackingMonitor');
     const transport = jest.fn();

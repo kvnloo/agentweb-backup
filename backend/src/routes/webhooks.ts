@@ -9,6 +9,7 @@ import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
+import { parseHubSpotMergeEvent, repointMergedContactIds, HubSpotContactMerge } from '../services/hubspotContactMerge';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { AttioAdapter } from '../services/adapters/attioAdapter';
@@ -35,6 +36,9 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { getPhoneDedupeMode } from '../utils/phoneLeadDedupeMode';
+import { phoneDedupeKey, phoneNamesConflict } from '../utils/phoneLeadDedupe';
+import { findPhoneMatch } from '../services/phoneLeadMatch';
 import { upsertSessionLead } from '../services/sessionUpsertService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
@@ -765,9 +769,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // the body only supplies the identity to use, and an invalid or missing identity falls back
     // to exactly the behaviour below, so LPs that do not send sessionStartMs yet are unchanged.
     const sessionIdentity = isSessionList(leadList) ? resolveSessionIdentity(req.body) : null;
-    const existingLead = normalizedEmail && !sessionIdentity
+    let existingLead: any = normalizedEmail && !sessionIdentity
       ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
       : null;
+
+    // ENG-2123: an EMAIL-LESS capture can be a repeat of an earlier one on the same number. Off unless the
+    // LEAD_PHONE_DEDUPE_MODE setting says otherwise (utils/phoneLeadDedupeMode.ts), never for session lists
+    // or the synthetic smoke-test numbers (which have their own deterministic-id path below).
+    const phoneMode = !normalizedEmail && !leadData.linkedin && normalizedPhone && !sessionIdentity && !isSessionList(leadList) && !isSmokeTestPhone(normalizedPhone)
+      ? await getPhoneDedupeMode()
+      : 'off';
+    const phoneKey = phoneMode === 'off' ? '' : phoneDedupeKey(normalizedPhone);
+    let phoneSharedLine = false;
+    if (phoneKey && (phoneMode === 'shadow' || phoneMode === 'on')) {
+      try {
+        const match = await findPhoneMatch(leadList.listId, phoneKey, leadData);
+        // No phone number, name or lead id in this line: only counts and the decision.
+        console.log(`[phone-dedupe] mode=${phoneMode} list=${leadList.listId} decision=${match.decision} candidates=${match.candidates} valid=${match.valid}`);
+        if (phoneMode === 'on' && match.decision === 'match') existingLead = match.lead;
+        // A known shared line is never collapsed, not even by the same-bucket exactly-once create.
+        phoneSharedLine = match.decision === 'shared-line';
+      } catch (lookupErr: any) {
+        // A failed lookup must never fail the capture: create normally.
+        console.warn(`[phone-dedupe] lookup failed, creating normally: ${lookupErr?.message || lookupErr}`);
+      }
+    }
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     let mergedCustomFields: Record<string, any> = existingLead
@@ -946,17 +972,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // dedupe on top of it. Until then the primary key stops doubling as an index.
       const deterministicLeadId =
         !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
+      const createInput: any = {
+        ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
+        // Only added when true, so every non-session list passes byte-identical input.
+        ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+        // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+        ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
+        // ENG-2123: the phone twin, when the rollout mode is not 'off' and the number is specific enough.
+        ...(phoneKey && !phoneSharedLine ? { phoneUniqueCreate: true } : {}),
+      };
       try {
-        lead = await crmDb.createLead(
-          leadList.listId,
-          {
-            ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
-            // Only added when true, so every non-session list passes byte-identical input.
-            ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
-            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
-            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
-          }
-        );
+        lead = await crmDb.createLead(leadList.listId, createInput, 'form_fill');
         isNew = true;
       } catch (createErr: any) {
         // The conditional create lost to an earlier submission of the same number. That is
@@ -964,7 +990,23 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // report it as a duplicate. isNew stays false, so none of the new-lead side effects
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
-        if (createErr?.duplicateEmail && createErr.existingLead) {
+        // The winner is re-read by primary key: the carried row may predate an edit made since (a corrected
+        // phone, an added email), and a row that no longer qualifies must not be merged into.
+        const phoneWinner: any = createErr?.duplicatePhone && createErr.existingLead
+          ? (await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true })) || createErr.existingLead
+          : null;
+        if (phoneWinner && (
+          phoneNamesConflict(phoneWinner, leadData)
+          || String(phoneWinner.email ?? '').trim() !== ''
+          || phoneDedupeKey(phoneWinner.phone) !== phoneKey
+        )) {
+          // ENG-2123: a concurrent submission on the same number that names a DIFFERENT person (a shared
+          // household/office line). Merging would overwrite the first person's name and answers with the
+          // second's, so keep two rows - exactly what happened before this feature - on an ordinary id.
+          const { phoneUniqueCreate: _separate, ...separateInput } = createInput;
+          lead = await crmDb.createLead(leadList.listId, separateInput, 'form_fill');
+          isNew = true;
+        } else if ((createErr?.duplicateEmail || createErr?.duplicatePhone) && createErr.existingLead) {
           // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
           // above, but createLead's own pre-check found a row a concurrent submission wrote in
           // between. That is a REPEAT submission of an existing lead, not a failure — throwing
@@ -980,7 +1022,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // decides `changed` and the write-once backfills — so re-read by primary key,
           // consistently (one GetItem, race path only); fall back to the carried row only if
           // that read comes back empty.
-          const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
+          const fresh = phoneWinner || await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
           await mergeIntoExistingLead(fresh || createErr.existingLead);
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
@@ -1094,7 +1136,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
@@ -1702,6 +1744,8 @@ interface HubspotContactChange {
 
 interface HubspotJobPayload {
   changesByObjectId: Record<string, HubspotContactChange>;
+  /** contact.merge events (ENG-2465). Optional: jobs queued before this field existed lack it. */
+  merges?: Array<HubSpotContactMerge & { portalId: number }>;
 }
 
 /** Contact/deal sync, run either inline (same request, the common case) or later by
@@ -1709,6 +1753,39 @@ interface HubspotJobPayload {
  *  fast-follow, Greptile P1 — same fire-and-forget crash-loss risk the Calendly
  *  receiver had, since this handler acks HubSpot's webhook before this runs). */
 export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
+  // ── contact.merge: re-point stored contact ids at the survivor ───────────
+  let mergeFailures = 0;
+  for (const merge of payload.merges ?? []) {
+    try {
+      const userId = await getUserIdByHubSpotPortalId(merge.portalId);
+      if (!userId) {
+        console.log(`[HubSpot Webhook] contact.merge: no user found for portal ${merge.portalId}`);
+        continue;
+      }
+      const lists = (await crmDb.getLeadListsByUserId(userId)) || [];
+      for (const list of lists) {
+        const cfgs = (list as any).externalCrmSyncConfigs as Record<string, any> | undefined;
+        if (String(cfgs?.hubspot?.accountId) !== String(merge.portalId)) continue;
+        const r = await repointMergedContactIds(list.listId, merge);
+        mergeFailures += r.lookupFailed;
+      }
+    } catch (err: any) {
+      mergeFailures++;
+      console.error(`[HubSpot Webhook] contact.merge handling failed for survivor ${merge.survivorId}: ${err?.message || err}`);
+    }
+  }
+
+  await processHubspotContactChanges(payload);
+
+  // A merge whose lookup or write failed throws AFTER the rest of the delivery is applied, so the
+  // durable queue retries the job (the repoint is idempotent; the contact changes are idempotent
+  // updates, as for any retry of this job). Attempts are capped by the queue.
+  if (mergeFailures > 0) {
+    throw new Error(`contact.merge: ${mergeFailures} stored contact id(s) could not be re-pointed`);
+  }
+}
+
+async function processHubspotContactChanges(payload: HubspotJobPayload): Promise<void> {
   // ── Process each contact / deal ─────────────────────────────────────────
   for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
@@ -1912,7 +1989,7 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
             try {
-              await crmDb.createLead(list.listId, newLead);
+              await crmDb.createLead(list.listId, newLead, 'integration');
               console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
               continue;
             } catch (createErr: any) {
@@ -1993,6 +2070,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // ── Aggregate events by objectId ────────────────────────────────────────
       const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
       const changesByObjectId: Record<string, HubspotContactChange> = {};
+      const merges: Array<HubSpotContactMerge & { portalId: number }> = [];
 
       for (const event of events) {
         const eventType: string = event?.subscriptionType ?? 'unknown';
@@ -2002,6 +2080,12 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         const propertyValue: string = event?.propertyValue ?? '';
 
         console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const merge = parseHubSpotMergeEvent(event);
+        if (merge) {
+          merges.push({ ...merge, portalId });
+          continue;
+        }
 
         const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
         const isDealEvent = eventType === 'deal.propertyChange';
@@ -2024,7 +2108,7 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       // a hash of the raw body is stable across a genuine redelivery of the exact
       // same payload and distinct for any payload with different actual content.
       const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
-      const jobPayload: HubspotJobPayload = { changesByObjectId };
+      const jobPayload: HubspotJobPayload = merges.length > 0 ? { changesByObjectId, merges } : { changesByObjectId };
 
       // claimImmediately: this same request processes the job right below, so the
       // enqueue writes it straight in as 'processing' — no separate claim call, no

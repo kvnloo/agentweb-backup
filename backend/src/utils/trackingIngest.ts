@@ -143,9 +143,9 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
     }
   }
 
-  const landingUrl = cleanUrl(b.landingUrl, 1000);
+  const landingUrl = repairEscapedQuery(cleanUrl(b.landingUrl, 1000));
   const referrer = cleanUrl(b.referrer, 1000);
-  const firstTouchLanding = cleanUrl(b.firstTouchLanding, 1000);
+  const firstTouchLanding = repairEscapedQuery(cleanUrl(b.firstTouchLanding, 1000));
   return {
     ok: true,
     value: {
@@ -159,6 +159,23 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
       firstTouchLanding: isHttpUrl(firstTouchLanding) ? firstTouchLanding : '',
     },
   };
+}
+
+/**
+ * Undo HTML-entity damage to a shared link's query string. A link copied out of HTML arrives as
+ * `?utm_source=x&amp;utm_medium=y`, and some apps then drop the `&`, leaving `x` + `amp;utm_medium=y`
+ * as one value. Either way every UTM after the first is lost. Only `amp;` immediately followed by
+ * a `name=` pair is rewritten, so a value that merely contains "amp" is left alone.
+ */
+export function repairEscapedQuery(url: string): string {
+  const q = url.indexOf('?');
+  if (q < 0 || !/amp;/i.test(url)) return url;
+  const hashAt = url.indexOf('#', q);
+  const end = hashAt < 0 ? url.length : hashAt;
+  const query = url.slice(q + 1, end)
+    .replace(/&?amp;(?=[A-Za-z_][\w.-]*=)/gi, '&')
+    .replace(/^&+/, '');
+  return url.slice(0, q + 1) + query + url.slice(end);
 }
 
 export function deviceFromUserAgent(ua: string): string {
@@ -229,9 +246,33 @@ export function buildSessionRow(
     fields[`${p.event}_at`] = ctx.nowIso;
   }
 
-  // Server-classified. If the SDK also knew the first-touch landing URL, classify THAT here so the
-  // channel is decided by the same classifier as every other session; else keep the client string.
-  if (p.firstTouchLanding) {
+  // Server-classified first touch (ENG-2494). A creator's single UTM link is
+  // shared across platforms, so the click's own referrer / in-app UA decides the channel. On the
+  // visitor's first visit first touch IS this landing session, so it is derived from this request's own referrer and URL, never from SDK-stored state
+  // left by earlier browser activity.
+  // First touch reports the platform the click came FROM: the observed signal (in-app UA, then
+  // referrer) outranks the link's claim, including an agency-<slug> link (last touch keeps Agency).
+  // Paid links keep the link's channel: the ad platform in utm_source is the spend being attributed.
+  const firstTouchOf = (c: TrafficClassification): string =>
+    c.trafficType === 'paid' ? c.channel : c.detectedChannel || c.channel;
+  if (p.landingUrl && p.client.visitNo === 1) {
+    const ft = classifyTraffic({
+      landingUrl: p.landingUrl,
+      referrer: p.referrer,
+      userAgent: ctx.userAgent,
+    });
+    // Only the session's opening event (or one that still carries an external signal) sets first
+    // touch; a later in-session event (internal referrer, no in-app UA) must not overwrite it with
+    // Direct. Dropping the keys leaves the stored value untouched (the merge is per-key SET).
+    const opening = Number(p.client.eventCount ?? 0) <= 1 || Boolean(ft.referrerHost || ft.detectedChannel);
+    if (opening) {
+      fields.firstTouchChannel = firstTouchOf(ft);
+      if (ft.referrerHost) fields.firstTouchReferrer = ft.referrerHost; else delete fields.firstTouchReferrer;
+    } else {
+      delete fields.firstTouchChannel;
+      delete fields.firstTouchReferrer;
+    }
+  } else if (p.firstTouchLanding) {
     // The SDK stores only the first referrer's HOST (the platforms mostly send origin-only anyway),
     // which is all the referrer rules use.
     const ftHost = typeof p.client.firstTouchReferrer === 'string' ? p.client.firstTouchReferrer.toLowerCase() : '';
@@ -240,7 +281,7 @@ export function buildSessionRow(
       referrer: /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(ftHost) ? `https://${ftHost}/` : '',
       userAgent: ctx.userAgent,
     });
-    fields.firstTouchChannel = ft.channel;
+    fields.firstTouchChannel = firstTouchOf(ft);
   }
 
   fields.trafficType = classification.trafficType;
@@ -248,6 +289,8 @@ export function buildSessionRow(
   fields.channelKey = classification.channelKey;
   fields.channelGroup = classification.channelGroup;
   fields.classifierVersion = classification.classifierVersion;
+  if (classification.linkChannel) fields.linkChannel = classification.linkChannel; else delete fields.linkChannel;
+  if (classification.detectedChannel) fields.detectedChannel = classification.detectedChannel; else delete fields.detectedChannel;
   fields.device = deviceFromUserAgent(ctx.userAgent);
   if (classification.referrerHost) fields.referrerHost = classification.referrerHost; else delete fields.referrerHost;
   if (classification.sourceLink) fields.sourceLink = classification.sourceLink; else delete fields.sourceLink;

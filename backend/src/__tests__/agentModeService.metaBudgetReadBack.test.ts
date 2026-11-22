@@ -79,7 +79,7 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
       const p = service.updateMetaAdsAdSet('user123', 'as_1', { lifetime_budget: 50 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await p;
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.budget_verification).toBe('MISMATCH');
       expect(result.error).toBe('BUDGET_MISMATCH');
       expect(result.budget_requested).toEqual({ lifetime_budget: 5000 });
@@ -94,7 +94,7 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
       const p = service.updateMetaAdsAdSet('user123', 'as_1', { daily_budget: 20 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await p;
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.budget_verification).toBe('UNCONFIRMED');
       expect(result.error).toBe('BUDGET_UNCONFIRMED');
       expect(result.message).toMatch(/could NOT be confirmed/);
@@ -134,7 +134,7 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
       const p = service.updateMetaAdsCampaign('user123', 'c_1', { daily_budget: 7500 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await p;
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.budget_verification).toBe('UNCONFIRMED');
       expect(result.error).toBe('BUDGET_UNCONFIRMED');
     });

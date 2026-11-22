@@ -305,7 +305,9 @@ describe('agentModeController generateResponse — drain admission (A-019)', () 
     );
     const methodIndex = controllerSrc.indexOf('async generateResponse(req: Request, res: Response)');
     const guardIndex = controllerSrc.indexOf("return res.status(503).json({ message: 'Instance draining — retry on new instance' });", methodIndex);
-    const claimIndex = controllerSrc.indexOf('tryClaimSessionGeneration(sessionId)', methodIndex);
+    // The claim now also passes the owner (ENG-110): match the call regardless of its extra arguments.
+    const claimMatch = /tryClaimSessionGeneration\(sessionId\b/.exec(controllerSrc.slice(methodIndex));
+    const claimIndex = claimMatch ? methodIndex + claimMatch.index : -1;
 
     expect(methodIndex).toBeGreaterThan(-1);
     expect(guardIndex).toBeGreaterThan(methodIndex);

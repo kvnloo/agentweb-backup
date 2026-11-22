@@ -10,7 +10,13 @@ describe('Meta currency offsets and currency-read boundary (ENG-2277)', () => {
   it.each('TWD JPY KRW CLP COP CRC HUF ISK IDR PYG VND'.split(' '))('%s uses offset 1', currency => {
     expect(normalizeMetaMoney(300, currency).minorUnits).toBe(300);
   });
-  it.each(['USD', 'EUR', 'GBP'])('%s uses offset 100', currency => {
+  // Meta's currency offset table includes legacy codes and FBZ credits; BHD/JOD use 100, not ISO's 1000.
+  it.each('BGN BHD FBZ HRK JOD LTL LVL RSD RUB SKK VEF VES'.split(' '))('%s accepts major and minor units with Meta offset 100', currency => {
+    expect(normalizeMetaMoney(12.34, currency).minorUnits).toBe(1234);
+    expect(normalizeMetaMoney(1234, currency, 'minor').minorUnits).toBe(1234);
+    expect(normalizeMetaMoney(1234, currency, 'minor').description).toContain('12.34');
+  });
+  it.each(['USD', 'EUR', 'GBP', 'LKR'])('%s uses offset 100', currency => {
     expect(normalizeMetaMoney(3000, currency).minorUnits).toBe(300000);
   });
   it('does not double-convert API read-backs', () => {

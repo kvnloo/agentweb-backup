@@ -12,6 +12,7 @@ import '../mcp/server/apiTools';
 import '../mcp/server/evaluationTools';
 import '../mcp/server/workflowTools';
 import '../mcp/server/landingWorkflowTools';
+import '../mcp/server/publishWorkflowTools';
 import { getListedToolDefinitions, SEARCH_TOOL_NAME, listedToolNames } from '../mcp/server/toolDiscovery';
 
 const CALLER = { userId: 'user-1', sessionId: 'sess-1', externalMcp: true };
@@ -24,9 +25,9 @@ function parse(result: any) {
 describe('ENG-983: progressive disclosure', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('AC1: listed surface is workflow tools + discovery, at most 15', () => {
+  it('AC1: listed surface is workflow tools + discovery, at most 19 (ENG-1005 adds four)', () => {
     const listed = getListedToolDefinitions().map((d: any) => d.name);
-    expect(listed.length).toBeLessThanOrEqual(15);
+    expect(listed.length).toBeLessThanOrEqual(19);
     expect(listed).toContain(SEARCH_TOOL_NAME);
     expect(listed).not.toContain('manage_leads');
     // Every configured listed name is actually registered (no dangling names).
