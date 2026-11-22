@@ -1,3 +1,1010 @@
+## ENG-3147: Name uncalled required tools in step-budget reminder (2026-11-22)
+
+Scheduled runs near the step limit now get the schedule's still-uncalled required tools named in the step-budget reminder, so report runs spend their last steps on the deliverable (e.g. create_html_from_template) instead of more data gathering.
+
+## ENG-3143: capture-drift alerts file one oncall item per site (2026-11-21)
+
+`captureDriftMonitor` now sends `Alert Scope: lp-repo:<owner/repo>` with each alert. Intake dedupes on
+`Alert Class` unless a scope narrows it (ENG-2267), so before this every drifted site folded into the
+first site's issue (ENG-3140 received all five on 2026-11-17). Other alert classes are unchanged.
+
+## ENG-3163: share-link report email can no longer be used as a mail relay (2026-11-20)
+
+- **Problem:** `POST /api/agent-mode/ishare/:shareId/email-report` needs no login (a landing page calls it so a lead gets their own AI report by email). Holding a share link was enough to make AgentWeb send mail from our domain to any address, with any link behind the "View Your Report" button, as often as the caller liked. That is a spam and phishing relay, and it can damage the sending reputation every customer's email depends on.
+- **Kept:** the lead flow. A visitor still gets the report emailed to the address they give, and the email looks the same.
+- **Changed:**
+  - The report link must be on a site we run: agentweb.pro and its subdomains, subdomains of agentwebforms.com, hireemma.ai and its subdomains (the same list the API already trusts for browser calls), plus this environment's configured portal origins. Anything else is a 400. The link is also HTML-escaped where it goes into the email (before, it went into the `href` unescaped).
+  - The recipient must be one plain address. Lists, "Name <address>" and line breaks are a 400.
+  - Sends are limited to 3 per share link per hour, 3 per recipient address per hour, and 60 per caller IP per hour. Over the limit is a 429 with `Retry-After`. The share token and expiry checks are unchanged and still run first, so a caller with a wrong token cannot use up a real link's sends.
+- **Limits are held in memory** on the one prod instance and reset when it is replaced (a deploy). They bound abuse; they are not a permanent quota.
+- **Still possible:** someone holding a share link can send the standard "your report is ready" email, with a link on our own site, to an address they choose, up to the limits above.
+- **Also changed:** `RateLimiter` takes an optional window length (default stays one minute, so existing callers are unchanged).
+
+## ENG-2840: manage_market_strategy over MCP merges like Emma instead of replacing, and the read pages (2026-11-20)
+
+`manage_market_strategy` used to forward its arguments to `POST /api/market-strategy`. That route reads only `businessOverview`, `competitors` and `icp`,
+and it REPLACES the stored competitor and ICP lists with the lists it is given. So an outside agent that sent one new competitor deleted all the others,
+and the three other arguments the tool advertised (`positioning`, `differentiators`, `channels`) were dropped without a word. Emma's own
+`update_market_strategy` reads the strategy first and merges competitors by name and ICPs by title. The MCP tool now does the same
+(`backend/src/mcp/server/manageStrategyWrites.ts`). The REST route changes in one place only (how `icpUpdatedAt` is stamped, below); otherwise the customer portal behaves as before: its replace is harmless
+for the lists the tool hands it, because they are already the merged ones.
+
+- **update:** the stored strategy is read first. Competitors merge by name and ICPs by title (case, padding and repeated spaces ignored; Emma's own stored /
+  not-stored lookup ignores case and padding); an entry that is already stored is updated field by field and keeps its own spelling of the name; every other
+  stored entry is kept, including fields the tool cannot write (the ICP's cached search filters). Nothing can be removed (Emma has no removal either;
+  `regenerate_market_strategy` is the separate destructive tool). The answer lists what was added, updated and unchanged per list, and the totals are the
+  ones the route reports as saved. A name sent more than once in one call is listed once: two entries for a new name are one added competitor (the later fields win), and a stored entry
+  named twice is listed by what the call did to it in the end (updated, or unchanged when it changes an entry and changes it back, in which case a call that only does that writes nothing) (Opslane P2 on `ef2bc22`: it used to be listed as added and updated).
+- **what is accepted:** a competitor holds `name` and `description`; an ICP holds `title`, `description`, `valueProposition` and `buyerPersonas` (a list of
+  text that replaces that profile's list). Any other field is refused by name (Emma spreads any extra key onto the stored strategy; over MCP that would let
+  an outside agent write arbitrary keys into the account record). Blank text (empty, spaces, or only invisible characters) means "not given" and never blanks a stored value; an empty list changes
+  nothing. At most 100 entries per list per call; a name or title of 200 characters, text of 5,000, a persona of 500 (50 per profile), an overview of
+  20,000. A merge that would take a list past 500 competitors or 100 ICPs is refused when it adds an entry, and so is one that would take the overview and
+  both lists past 250,000 bytes together: the strategy sits on the account record, one DynamoDB item of at most 400 KB that also holds everything else of
+  the account, so a save past that is refused here with a reason. The 250,000 bytes do not count the rest of the record, so a save that fits them can still push the whole record past 400 KB (an account with a large saved ICP result, for example): the service refuses that write atomically and `POST /api/market-strategy` answers 413 `market_strategy_too_large` with a message that names the 400 KB limit and says nothing was changed (it used to be a bare 500; Opslane P1 on `ef2bc22`). An account that is already
+  over that size can still edit an entry as long as the edit does not make it bigger.
+- **refused by name:** `positioning`, `differentiators` and `channels` (never stored: callers believed they were saved), and any other top-level argument
+  the action does not take (for example `targetAudience` on an update, or `competitors` on a read): it would be dropped while the call reported success
+  (found by the Opslane check on the first head). Identity-style arguments (`client_id`, `clientId`, `user_id`, `userId`) are not refused: the strategy is
+  always the caller's own and they are never used (the MCP layer already strips `userId` before a tool sees it), and the answer lists them in
+  `ignoredArguments`. A call with nothing to send is refused instead of reported as saved. One bad entry refuses the whole call; nothing is half-saved.
+- **a call that changes nothing writes nothing.** A write that carries `icp` marks the ICPs as hand-edited, which switches the account off its cached ICP
+  search filters (`icpUpdatedAt`), so repeating what is already stored must not do that. Stored text is compared trimmed, so stored padding does not make a
+  repeat look like a change. Only the parts that changed are sent to the route.
+- **read:** the competitor list comes back one page at a time (about 12,000 characters of compact JSON of competitors per page, at least one entry; the answer is pretty-printed, which makes the text a client receives larger: about
+  1.04 times for large entries and up to about 2.7 times for very short ones); `totalCompetitors` is
+  the true count and `nextCompetitorOffset` (null on the last page) says where the next page starts; an offset past the end (including one too big to be
+  exact) lands on the last entry rather than an empty page. `competitorNames` (up to 50) answers stored / not stored with the offset, whatever the page
+  shows; names past 50 are reported as not checked. A roster that fits one page reads as before, with the extra paging fields. The overview and ICPs are
+  returned whole, as before. An answer from the route that is not a success carrying a strategy is an error, not an empty strategy.
+- **who may write:** unchanged and still the route's job: an org member needs the same editor rights as in the app (403 otherwise) for a call that changes
+  something. A call that changes nothing makes no write at all, so it is answered (`changed: false`) without the route's editor check; the caller can read
+  everything such an answer tells it. Isolation of which strategy is the caller's is the route's (tests: `mcp.twoTenantIsolation.test.ts`,
+  `mcp.manageStrategy.writes.test.ts`).
+- **parallel calls:** calls on one ACCOUNT are serialized, in the order their account lookups finish, within the server process (the same locking mechanism as `manage_leads`, with its own keys; the key is the org
+  when the caller belongs to one, else the user, because an org's strategy is shared by its members), since the merge is read, merge, write: two calls sent
+  together (one agent's parallel calls, or the owner's agent and an editor's) would each merge onto the same stored lists and the second write would drop the
+  first one's entries.
+- **the merge baseline is checked, not trusted:** the route's read must be a success carrying a strategy object, else nothing is changed; stored lists that
+  are not lists are refused instead of being treated as empty; a read that shows nothing stored (no `createdAt`) is read once more 200 ms later before it is
+  believed, because the route's read can miss the org owner's record for a moment and a write built on that would replace the real lists; and a read whose
+  `updatedAt` is older than the strategy this process saved for that account within the last minute is not used (the saved copy is), because the route's read is
+  eventually consistent (solo users through an index, org callers through a plain read of the org record) and the next call of a serialized pair starts right
+  after the first one's write.
+- **an org caller is never merged onto a personal strategy:** the route's read answers with the org's strategy (`isOrgLevel` true) or, when its read of the org
+  misses, with the caller's personal one. If the caller belongs to an org and the answer is not the org's, the call is refused ("the organisation's market
+  strategy could not be read ... Nothing was changed"). The account lookup's own error text (it can name roles and tables) goes to the log, not to the caller.
+- **parts the route would fill from its own read:** the tool sends the route only the parts a call changes (so a no-change part does not stamp `icpUpdatedAt`),
+  and for every part it does not send the route fills the value from its OWN read of the account, which can be older than a save made a moment ago and would
+  write that older part back over the saved one (the second independent review reproduced this: a competitors save followed straight away by an
+  overview-only call lost the new competitor). So a part that a save of the last minute changed is sent again by the next call from the checked baseline,
+  whatever that call changes. A part counts for one minute from the save that changed it; parts a later call merely carried along do not start a new minute, so
+  the memory does not chain (a call 40 s after an `icp` save carries `icp`; one 80 s after it does not). The route's stamp does not move for it. `POST /api/market-strategy` now stamps `icpUpdatedAt` only when the ICP list it is given differs from the list already stored (`nextIcpUpdatedAt` in `routes/marketStrategy.ts`): the re-sent list is the stored one, so the stamp the ICP save set stays. A first ICP save, a changed or reordered list, a list that leaves out a field the record holds (a client that drops a field such as the cached filters) and a record that has no stamp yet (saved before the field existed) stamp `now`, as before; a save that sends no `icp` keeps the stamp, as before. `icpUpdatedAt` is what `routes/crm.ts` compares with the user's `icpCompletedAt` to choose between the cached ICP search filters and the market-strategy ICPs, so the stamp should move only when the ICPs change (the ENG-1955 intent); the route used to stamp on any `icp` argument, so a portal save of an unedited ICP form moved it for nothing too. Found by Opslane's P1 on `440bb19` (a competitors-only call within a minute of an ICP edit moved the stamp). In the one case where the route's own read (an eventually consistent index) is older than the list we re-send, the two differ and the stamp moves although the list written is the one already stored: the Opslane symptom, only inside that lag window, with the data correct (the saved list still wins over the older one). It goes away only with a strongly consistent read or a conditional write in this route, which this change does not add. Proof: `backend/src/__tests__/marketStrategy.icpUpdatedAt.test.ts` (the real router, org and solo branches) and the real-path test in `mcp.manageStrategy.writes.test.ts`.
+
+**Behaviour changes for outside callers (stated, not hidden):** a call that sent `competitors` or `icp` used to REPLACE the stored list and now merges;
+sending `[]` used to wipe the list and now changes nothing (to remove entries, use the app, or `regenerate_market_strategy` through Emma); the three
+never-stored arguments, every other argument the action does not take, and unknown entry fields are refused where they used to be ignored or stored; a very
+large roster is paged on read. A competitor or ICP SENT as a bare string (the old schema was a bare array, so `["HubSpot"]` was plausible) is refused: an entry
+is an object with a name or title. A bare string already STORED (older data; Emma's lookup reads such entries as names) is matched by its text and becomes an
+entry holding that name when an update names it (it is not duplicated). `null` for any argument is the same as not sent, refused ones included. Overview, names, descriptions and personas are stored trimmed, and a name loses invisible characters (zero-width spaces and
+joiners, word joiner, byte-order mark, soft hyphen; other look-alikes, such as other invisible marks, full-width letters or differently composed accents, are
+not folded and still make a second entry); when two stored entries
+differ only by case or spacing, the one with the exact spelling is the one updated. Every update does at least one extra read of the strategy, and one more
+after a 200 ms wait when the read shows no `createdAt` (older strategies). Stored lists that are not lists block only an update of that list. The answer of an
+update changed shape: it used to be `{success, data: <the whole saved strategy>, message}` and is now `{success, changed, businessOverview?, competitors?,
+icp?}` with added / updated / unchanged names and the saved totals (no `data`; a call that changes nothing also carries a `message`). A blank `businessOverview` used to clear the overview; it is now "not given": refused as "nothing to send" when it is the only content, and otherwise
+dropped (the answer has no `businessOverview` key), so the overview can no longer be cleared over MCP. Any `action` other than `read` or `update` (case ignored) used to be taken
+as an update, so a mistyped "Read" wrote; it is now refused. A field shown when an entry is read (such as the ICP's `extractedFilters`) cannot be sent back:
+it is refused with a hint to leave it out (it is kept for you).
+
+**Differences from Emma that are not obvious:** Emma also fills empty brand fields from the strategy after each write (`populateEmptyBrandGuidelines`); the
+route does not, so this tool does not. The route rebuilds the stored strategy from its six known keys (`businessOverview`, `competitors`, `icp`, `createdAt`,
+`updatedAt`, `icpUpdatedAt`); Emma's merge keeps any other top-level key the record happens to hold, so for such a stray key the route's replace is not a
+no-op. Emma's merge matches names exactly (only its lookup ignores case); Emma floors a fractional read offset and clamps a negative one where this tool
+refuses them; Emma stamps `icpUpdatedAt` on any `icp` argument, including one that changes nothing; Emma's update answers with the saved `marketData`, and its read answers with formatted text and paging fields.
+
+**Limits (stated):** (0) An admin's `client_id` is ignored (and listed in `ignoredArguments`): the tool has never supported client scoping, so an admin who
+means a client's account gets a write on their own account, with only that note to catch it; other tools refuse `client_id`, but the two-tenant isolation tests
+pin this tool's ignoring it. The lock is held across up to two reads and one write (each may take minutes if the route stalls), so a stalled call holds that
+account's queue. The caller's record is read consistently to find the org; if that cannot be done the call is refused ("the account could not be
+identified, so nothing was changed") rather than locked per user, which would not serialize the org's members. The recent-save memory keeps at most 100 accounts, each entry the route's whole saved strategy (up to the size of the stored strategy: the 250,000-byte limit stops growth, but an account already over it can still
+be edited, up to the 400 KB record), until a minute passes and a later
+save of any account sweeps it. (1a) If the consistent lookup says the caller has no org while the route's own, eventually consistent read still says there is one (a user who just left an org), the
+write lands in the org's strategy under a per-user lock that does not serialize with the org's other members; the reverse (lookup says org, route says
+personal) is refused. A read right after an update can show the older copy: `read` takes no lock and does not use the recent-save memory. (1) The lock and the
+recent-save memory cover one server process. Calls that reach different instances, or a write by the portal or by
+Emma (neither is serialized with this tool) landing between our read and our write, can still be overwritten by the merged lists we send, and a read that is
+older than another writer's save (not ours) cannot be recognised here; a writer that stamps `updatedAt` with an older time than our last save (the onboarding ICP
+mirror stamps its completion time, and instances' clocks can differ) is not recognised either, so such a write made within a minute of our save can be
+overwritten by our next `icp` update. The read's answer is bounded for competitors only: the overview and the ICPs (with their cached filters) come back whole,
+as before, and the 250,000-byte limit applies to writes only. A read of an account whose stored competitors are not a list answers with a `warning` and
+no competitors instead of an error. The portal's own partial saves have the same read-then-write shape but are
+human-paced; here the same read lag can hit calls made back to back, which is why the recent-save check exists. (2) The merge baseline is the route's own
+read. If it degrades (the org owner's record is not yet visible) it returns an empty strategy while the route's write path fails closed on the same miss;
+the second read 200 ms later makes it unlikely that both reads of one call miss, not impossible, and a write built on two missed reads replaces the lists
+and masks the owner's copy. (3) `emma_send_message` with the same key still reaches Emma's own `update_market_strategy`; this PR does not change that.
+
+**Agent mode.** `manage_market_strategy` was registered for MCP callers only (`mcpToolRegistry`); agent mode copies its tools from Emma's registry (`emmaToolRegistry`), so a private skill that listed it offered nothing and a call answered `Unknown tool: manage_market_strategy` (Opslane's AC1 on `e22f517` drove it that way). It is now bridged into Emma's registry (`bridgedToolNames` in `emma/tools.ts`, the list that already carries `resolve_skill`, `get_account_status` and the scheduled-chat tools), with the same definition and the same code, so a skill that lists it works. **Who is offered it:** a session whose installed skill lists it (private or published), provided the user's tier entitles that skill (a skill's tools are added only for a wildcard tier or a tier that lists the skill). It is not a foundation tool and it is kept out of the `__other_skills__` catch-all pool (`SKILL_ONLY_TOOL_NAMES` in `emma/impl/misc.ts`; the independent review of the first bridge head found it landed in that pool), so a session without such a skill is not offered it, and a work plan or schedule that names it in `requiredFunctionCalls` does not get it from the pool either. Sessions that are not skill-filtered still get it, as they get Emma's own `update_market_strategy`: sessions that predate skill gating (`associatedSkills` unset) and live voice sessions (`getFilteredTools` with no skill filter), on a wildcard tier. "Not offered" means not in the tool list: a call by name in a session with no installed skill is not refused at dispatch (true of every tool). Emma's `update_market_strategy` is unchanged and still a foundation tool. **Account:** the bridged copy is marked `requiresUserAccount`, so an anonymous (not signed-in) session gets the same deferred refusal as Emma's own account tools instead of the tool's lookup error. The flag is set for this tool only: none of the other 25 bridged tools' MCP handlers sets it today, so carrying every handler's flag would change nothing now, and naming the tool keeps a later handler's flag from silently changing in-app behaviour. **Restricted principals:** a share-link visitor's profile is a deny-list that does not name `update_market_strategy`, so a visitor could already write the owner's strategy through Emma's tool; this tool is no broader (it cannot remove an entry and it refuses unknown fields). **Limits (stated):** (a) the per-account lock lives in the process that runs the call. Typed-chat turns run in a forked worker, so they are serialized with each other but not with `POST /mcp`, which runs in the server process; the Emma widget (`generateChatResponse`) and live voice run in the server process and do share the lock with MCP calls. Emma's own `update_market_strategy` takes no lock at all; (b) a write through this tool does not emit the page-refresh invalidation Emma's tool emits in an `emma-sidebar` session, so a Market Strategy page open beside such a session can show the old lists until reloaded (the page saves by replacing the lists); (c) Emma's tool has a guard for a superseded brand-build session that this tool does not carry (a brand-build session is not offered it unless a skill lists it); (d) the tool name's `manage_` prefix classifies it as an `admin`-effect tool for the agent tool gateway and the plan route, for a read as well as an update, as with the other `manage_*` tools; (e) in agent mode the typed `competitors` items make a competitor sent as a bare string fail the argument contract before the tool runs (the tool refuses it too). Proof: `backend/src/__tests__/emma.manageStrategyBridge.test.ts`.
+
+Proof: `backend/src/__tests__/mcp.manageStrategy.writes.test.ts` runs the real path (MCP client, MCP server, tool, mcpFetch, the real Express app, db.ts,
+in-memory DynamoDB; strongly consistent, so the read-lag cases are simulated by answering one read with an older copy) for an org owner, a member who is not
+an editor, a listed editor, another tenant and a solo user.
+
+## ENG-2840: knowledge base list over MCP takes the inputs Emma's list takes (2026-11-20)
+
+`list_knowledge_bases` sent no query at all, although the route behind it (`GET /api/emma/knowledge-bases`, `routes/emmaApi.ts`) and Emma's
+`list_knowledge_base_files` take `kb_type`, `modified_after`, `modified_before`, `limit` and `offset`. The tool now takes all five
+(`backend/src/mcp/server/knowledgeBaseParams.ts`). The REST routes are unchanged, so the customer portal and Emma behave as before, and no other
+knowledge-base tool changes (`create_knowledge_base_file`, `update_knowledge_base_file_content`, `delete_knowledge_base_file`, `search_knowledge_base`,
+`read_knowledge_base_files`). Creating a knowledge base through MCP still makes a private one only.
+
+- **What each input does is decided by the service** (`emma/impl/knowledgeBase.ts`, `listKnowledgeBaseFiles`), and the tool says so in its description:
+  - `kb_type` picks the sources. `private` and `public` both mean "only the platform knowledge bases" (the service does not tell the two apart, and the
+    platform list is your own, those your organisation shares with you when org sharing is on, and the public ones: a `private` row is not necessarily
+    yours). `google-drive`, `clickup`, `clickup-tasks`, `foreplay-swipefile` and `foreplay-board` mean only that connected source; the two Foreplay values
+    return the same thing (the swipefile and every board). ClickUp folder entries are listed whatever `kb_type` is (the service has no guard there).
+  - `modified_after`, `modified_before`, `limit` (default 100) and `offset` apply to the Google Drive files only; they have no effect on the platform
+    knowledge bases, ClickUp or Foreplay (the answer's message still echoes them). `limit` and `offset` apply per Google Drive source (a registered folder
+    with everything under it), so paging Drive files repeats the other sources on every page; send `kb_type: google-drive` to page Drive alone (ClickUp folder
+    entries still come with it).
+- **Validated before anything is sent, refused by name:** `kb_type` must be one of the seven kinds (case and padding ignored); the dates must be calendar dates
+  in `YYYY-MM-DD` form (the only form the service accepts; a date with a time, or a date that does not exist, is refused here instead of coming back from the
+  service as a failure), and `modified_after` must not be later than `modified_before` (no file could match); `limit` (1 to 1,000) and `offset` (0 to 100,000)
+  must be whole numbers, as a number or as digits in text. Empty, blank and 0 mean "not given", so 0 means the default, not "none" (the service would take a
+  limit of 0 literally and return no file). The bounds are the tool's: the service has none, and an unbounded value makes it walk a whole Drive folder on the
+  shared service account. With no arguments the call is exactly what it was.
+
+**Behaviour changes for outside callers:** none for a call that sends no argument. A call that sent one of these arguments used to have it dropped (the tool
+never forwarded it); it is now forwarded, or refused by name when it cannot be understood.
+
+**Limits (stated):** (1) The no-argument answer includes the public knowledge bases of other users and, when org sharing is on, teammates' private ones, as it
+always did. (2) `foreplay-swipefile` and `foreplay-board` fetch the same things. (3) The tests run the tool against a fake of the route; the service's handling of
+each input is as read from `emma/impl/knowledgeBase.ts` (and run against a stubbed service by the independent review), not observed against live Drive, ClickUp
+or Foreplay. (4) The tool is classified `write` by the annotation policy, as before, so a `tools:read` key cannot call it.
+
+**Not in this change, on purpose:** an `append` mode for `update_knowledge_base_file_content`. A first version was built and reviewed; the review showed it
+cannot be verified by the recorded file size: `knowledgeBaseSize` holds the main file's size after a main-file write but the SUM of the attachments after an
+attachment write (and other writers set it their own way), so the size read before an append is wrong whenever attachments exist and a correct append is reported as
+"could not be verified" (a retry then duplicates the text); a file listed in the record but missing in storage, two attachments with the same name, a
+failure after the text was stored, and a racing writer give the same false answers (and an equal-length racing writer a false success); the route's append
+decodes the stored bytes as UTF-8, which corrupts a Latin-1 or UTF-16 `.txt` uploaded through the portal; and rewrites of the shared file list by other
+files' writes can orphan a file. A safe append needs the actual text read before and after (prefix and suffix check), one lock per knowledge base, and a
+refusal for text that is not valid UTF-8; that is a separate change.
+
+Proof: `backend/src/mcp/server/__tests__/knowledgeBaseWriteTools.test.ts` (the earlier tests unchanged and green, plus the list query tests).
+
+## ENG-2840: manage_brand over MCP can set tagline, domain, brand values, personality and founders; founders merge by name and are removed only by name (2026-11-20)
+
+`manage_brand` mapped six fields onto `POST /api/brand/guidelines`. That route also stores the tagline, the domain, the brand values, the brand
+personality and the founder profiles, which Emma's `update_brand_guidelines` writes, so an outside agent could not set them. The tool now can
+(`backend/src/mcp/server/manageBrandWrites.ts`). The REST route is unchanged, so the customer portal behaves as before. `read` returns what it did, except
+that an argument it does not take is refused by name.
+
+- **new fields:** `tagline` (300 characters), `domain` (253), `brand_personality` (2,000) and `brand_values` (a list of up to 50, 200 characters each,
+  trimmed, blank entries dropped). They replace the stored value, like `key_messages` always did. For these new fields (and for founders) blank text (empty, spaces, or
+  only invisible characters; text that merely contains a joiner, as an emoji does, is kept as sent) and an empty list mean "not given" and never blank a stored value. The six fields the tool always had (`company_name`, `mission`, `tone_of_voice`,
+  `target_audience`, `key_messages`, `visual_identity`) keep their mapping and behaviour exactly, including the fact that they are forwarded as sent and are
+  not validated: an explicit blank (or `null`, or a very large value) there is stored as sent, as it always was.
+- **founders merge by name (a deliberate difference from Emma).** The route REPLACES the stored founder list (an empty list wipes it). Emma treats a
+  non-empty list as the complete roster: a stored founder it leaves out is removed (ENG-2875). Emma and the portal hold the whole roster; an outside agent
+  that sends one founder does not, and under Emma's rule it would delete the others. So over MCP `founders` merges: a stored founder with the same name
+  (case, padding, repeated spaces, invisible characters (every Unicode format character, the variation selectors, the blank braille pattern and the combining grapheme joiner) and the way an accent is encoded ignored) is updated field by field and keeps its own spelling and every field the caller did not
+  send, a new name is added, and a founder nobody mentions is kept. If older data holds the same founder twice, an update lays the new fields over every
+  copy and a removal drops every copy. An empty list changes nothing (Emma ignores it too). Omission never removes anyone. The same founder twice in one call is refused. A founder holds `name`,
+  `jobTitle`, `styleTone`, `signaturePosts` and `voiceExamples` (text, bounded: 200 / 2,000 / 10,000 / 20,000 characters); other fields are refused by
+  name. At most 20 per call; a call that would take the roster past 50 founders, or the founder profiles past 250,000 bytes together (the founder profiles are one part of the brand record, which also holds the rest of the brand and, for a solo user, the whole user record in one DynamoDB item of at
+  most 400 KB; the cap keeps the roster from taking the record by itself, it does not guarantee that the record fits, and a save that does not fit comes back from
+  the route as an unexplained 500), is refused when it makes them bigger; a roster already over that size can still edit an entry as long as the edit does not
+  make it bigger.
+- **removal is deliberate: `remove_founders: [names]`** removes the founders with those names (matched the same way as the merge; at most 20 names per call,
+  200 characters each). The answer says which were removed and which were not found. A name in both `founders` and `remove_founders` is refused. This is the
+  `removeFounders` shape the ENG-2875 card itself names as the alternative to an authoritative list. (Decided by the owner on 2026-11-19 after weighing Emma's
+  rule, additive-only without removal, and a `replace_founders` flag.)
+- **arguments an update does not take are refused by name** (for example `logo_url` or `brandName`): they would be dropped while the call reported success.
+  Identity-style arguments are not refused: the brand is always the caller's own and, for outside callers, they are never used. `client_id`, `clientId` and
+  `user_id` are listed in `ignoredArguments`; `userId` is removed by the MCP layer before a tool sees it (so it is not listed, and for internal callers it
+  selects the account). An admin who sends a client's id therefore writes to
+  their own account, with only that note to catch it (other tools refuse `client_id`; the two-tenant isolation tests pin this tool's ignoring it). `read` takes
+  no arguments and refuses any other the same way.
+- **honest answers:** the route answers a save with a message only, so after a founder change the founders are read back and the answer reports the stored
+  total and what was changed (added, updated, unchanged, removed, not found: these describe the intended outcome; only `total` comes from the read). The
+  read-back compares each founder's name and the four text fields this tool writes, in order; a read that does not match is repeated once after 300 ms (the
+  org read is eventually consistent, so it can be older than the save) before the answer is a failure ("could not be verified on read-back": the save itself
+  went through, the route answered). If the read-back fails outright, the answer is a failure saying the brand was saved but could not be read back. A call
+  that changes nothing in the founders and sends nothing else (a founder already stored exactly as sent, a name that is not stored) writes nothing; a call that
+  sends scalar fields always saves, even if a value equals the stored one (the route bumps `updatedAt`), and `changed: true` there means "saved", not
+  "different". A call with nothing to change is refused instead of reported as saved.
+- **who may write:** unchanged and still the route's job: an org member needs the same brand-editor rights as in the app (403 otherwise) for a call that changes
+  something. A call that changes nothing makes no write at all, so it is answered (`changed: false`) without the route's editor check; the caller can read
+  everything such an answer tells it. The route saves with
+  an optimistic version check against what it read inside the same request, so a save that lands while the route is saving ours makes ours fail with its
+  "being updated, try again" message (409) and nothing changes (see the limits for what that check does not cover).
+- **parallel calls:** calls on one ACCOUNT are serialized, in the order their account lookups finish, within the server process (the lock the lead tools use; the key is the org when the
+  caller belongs to one, else the user, because an org's brand is shared by its members): the founder merge is read, merge, write, so two calls sent together
+  (one agent's parallel calls, or the owner's agent and an editor's) would each merge onto the same list and the second save would drop the first one's
+  founder. The caller's record is read consistently to find the org; if that cannot be done the call is refused ("the account could not be identified, so
+  nothing was changed") rather than locked per user, which would not serialize the org's members. A call waits for the calls ahead of it with no timeout of
+  its own (each read or write the route does can take up to five minutes if it stalls).
+- **the merge baseline is checked, not trusted:** the route's read must answer `exists` true with brand data, or `exists` false, else nothing is changed; a
+  read that shows no brand is read once more 200 ms later before it is believed, because the route's read can miss the org owner's record for a moment and a
+  founder list built on that would replace the stored founders; and a read whose `updatedAt` is older than the brand this process saved for that account
+  within the last minute is not used (the roster it saved is), because the next call of a serialized pair starts right after the first one's save. The roster
+  that a save meant is remembered even when its own read-back came back older than the save, which is when the next call needs it most. The memory keeps at
+  most 100 accounts for a minute each and is swept whenever a founder save is read back.
+
+**Behaviour changes for outside callers (stated, not hidden):** a call with no field to change used to post an empty body, which the route saves ("saved
+successfully", `updatedAt` moves, an account with no brand gets an empty record and its brand-build status flips to ready); it is now refused. Any `action`
+other than `read` or `update` (case ignored) used to be taken as an update, so a mistyped "Read" wrote; it is now refused. Arguments the update does not take
+(anything outside the tool's own fields) used to be ignored and are now refused by name; so are arguments given to `read`, and keys inside `visual_identity`
+that the brand does not store (`visual_identity` takes `primaryColor`, `primaryColorEnd`, `secondaryColor`, `fontFamily` and `isGradient`; it must be an
+object). The answer of a successful update
+now carries `success`, `changed`, `ignoredArguments` when any, and after a founder change the founders section; the route's own `message` and `attachments`
+fields are still there (its `debug` field is removed from answers to outside callers by the public response sanitiser, as before). Every update now reads the
+caller's record to find the account, and an update with founders reads the brand once or twice before and once or twice after the save.
+
+**Limits (stated):** (1) the lock and the recent-save memory cover one server process; calls that reach different instances are not serialized, and a founder
+change made between our read and our write (by the portal, Emma or another session) can be overwritten by the merged list we send. The route's version check
+covers a save that lands inside its own read-and-write, not ours. A read that is older than another writer's save (not ours) cannot be recognised here.
+(1b) If the route's read misses the org owner's record twice in a row (the second read is 200 ms after the first), a founder list built on it replaces the
+stored founders and masks the owner's copy. (2) Logos and brand assets are not writable here (they need a file upload route), and the brand-guide link
+(`brandGuideUrl`, which the route does accept as JSON) is not forwarded. (3) Emma's `emma_send_message` with the same key still reaches Emma's own
+`update_brand_guidelines` with its authoritative founder list; this PR does not change that. (4) A founder update that is lost without changing any name or
+text this tool writes cannot be told from success; the read-back compares what this tool writes, in order. (5) The remembered roster is compared with a read
+by timestamp (the route's `updatedAt` against this process's clock): a portal edit within a minute that carries an older stamp, as a skewed clock on another
+instance could give, is overwritten by the remembered roster. (6) A read-back that fails or does not match is answered as an ordinary tool result with
+`success: false` (`isError` is false), because the save went through; a client that looks only at `isError` reads it as success.
+
+Proof: `backend/src/__tests__/mcp.manageBrand.writes.test.ts` runs the real path (MCP client, MCP server, tool, mcpFetch, the real Express app, db.ts,
+in-memory DynamoDB; strongly consistent, so the read-lag cases are simulated by answering a read with an older copy) for an org owner, a member who is not an
+editor, a listed editor, another tenant and a solo user.
+
+## ENG-2840: two-tenant isolation test for MCP tools, and two security fixes found on the way (2026-11-19)
+
+**The test.** `backend/src/__tests__/mcp.twoTenantIsolation.test.ts` connects a real MCP client (in-memory transport) as tenant A to the real MCP
+server (`createMcpServer`), through the real tool, `mcpFetch` (real service JWT), the real Express app and the real `db.ts`, onto an in-memory
+DynamoDB (`helpers/inMemoryDynamo.ts`). Tenant B's rows carry unmistakable text (`BRAVO…`); for every covered tool it asserts that A's own read
+works, that nothing of B's is returned in any outcome, that foreign-id attempts are refused and leave B's rows byte-identical, that
+`userId` / `user_id` / `client_id` arguments cannot change whose data is used, and that a second user in A's org sees A's data.
+
+**Adding a tool.** Add its name to `TWO_TENANT_COVERED_TOOLS` (`helpers/twoTenantWaveTools.ts`) and a spec to `SPECS` in the test. A coverage
+guard fails when the two lists differ or a listed tool is not registered. Every wave of new MCP tools extends this list.
+
+**Limits (so nobody reads it as more than it is).** The fake database ignores `FilterExpression`, `Limit` and `ExclusiveStartKey` and has no
+batch operations or S3, so isolation that lives only in a database filter cannot be proven here. The caller's identity is built by hand (the
+`aw_` key lookup is not exercised) and HTTP-layer scope checks in `mcpServer.ts` are not exercised. A foreign list answers 403 while a missing
+one answers 404, so existence is distinguishable; this predates the test and is not asserted.
+
+**Fixes.**
+- Any caller could switch off the public-response sanitiser (ENG-2335) by adding a `client_id` argument to any tool. It now applies only when
+  the caller's account is really an admin (looked up only when the argument is present; any failure means "not admin", so the answer is stripped).
+- `create_html_template` saved a bare `data:` / `file:` / `ftp:` / `sms:` / `s3://` (any non-http(s)) link as the template body. A single
+  whitespace-free `scheme:rest` token that is not a real `http(s)://` link is now refused with a clear error before any fetch, rewrite or save
+  (a list of schemes always missed one: Opslane found `sms:` and `vscode://`). A padded or upper-case `https://` link is now fetched like any
+  other. Text with spaces, real HTML and a bare word are unchanged.
+
+**Fake database.** Conditions on nested paths (`brandGuidelines.updatedAt`) were treated as one attribute with dots in its name, so `=` was
+always false and `attribute_not_exists` always true. They now read nested values; the suites that use the fake were re-run.
+
+## ENG-2840: what an outside agent may write to a lead over MCP, and honest add/delete counts (2026-11-19)
+
+`manage_leads` used to forward its body verbatim to the REST routes the customer portal uses. Emma's own lead tools do not: they forward eleven
+standard fields, merge every other key into `customFields`, turn a do-not-contact status into a real suppression, and cannot write the
+contact-status fields. The MCP actions now follow Emma (`backend/src/mcp/server/manageLeadsWrites.ts`); the REST routes are unchanged, so the
+portal behaves as before.
+
+- **update:** the lead is always read first (a missing id is a 404; the REST update would otherwise create a one-field row). Status
+  `do-not-contact` (any case or spacing, or `dnc`) suppresses the lead. Other keys and an explicit `customFields` object are MERGED into the
+  stored custom fields (the REST update replaces them). Custom fields are written KEY BY KEY by default (no read, see below). Where the
+  wrapper must merge itself (the route's `enforce` mode) the merge starts from the STORED lead, not the REST copy: the REST read hides
+  card-revenue fields from viewers who may not see them and writing that copy back would delete them. Every status or email change also decides from the
+  stored lead; if that read fails nothing is saved. `contactStatus*`, `unsubscribedFromGroupEmail*`, server-owned keys (sync, attribution, auto-send marker), identity keys (`userId`,
+  `tenantId`, `accountOwnerUserId`, `listId`, `leadId`, `client_id`) and the bare `utm` / `attribution` are refused by name: an agent can
+  suppress a lead, never un-suppress one, and cannot say whose lead it is. A refused name can still be stored inside `customFields`.
+- **add:** 1 to 100 leads. One lead answers as before (the created lead); several are created one by one and the answer counts created /
+  duplicate / failed per row, and the same address twice in one call is a duplicate without asking the route (its check reads a lagging index).
+  Same field rules as update. Drafts (`emailDraft`, `messageDraft`, `emailDraftFormat`) are refused on add: `createLead` never stores them, so
+  they would be dropped while the call reported success; an update saves them. Source tracking is accepted only as
+  `attribution: { utm: { source, medium, campaign, content, term } }` (short strings): click ids, referrer and landing URL feed the account's
+  ad-conversion relay and stay system-owned. A new lead cannot be created with status do-not-contact (it would be labelled, not suppressed).
+  An address the owner already marked do-not-contact is flagged on the new lead too, as every bulk import does (`leadImportFollowups`; the
+  single-lead REST route does not); the answer says so. A refused row stops the whole call before anything is created. Dry-run preview and the
+  admin `client_id` add stay exactly one lead (the admin add also runs the inheritance, as the admin).
+- **Field types and CRM fields (added after the fresh review of the final head):** a standard field of the wrong type is refused by name; `status` must be non-empty text (the update route records the status change with the value as given BEFORE it validates the write, so an object there left a malformed engagement on the lead). The CRM fields the verbatim forward used to honour keep working (create layer: `domain`, `pocEmails`, `priority`, `role`, `isPrimary`, `expectedClose`, `closedDate`, `heatScore`, `healthScore`, validated by the create layer; the update layer persists only `domain` and `pocEmails`), while `dealIds` (a link to another record), `icpMatch` and `enrichmentMetadata` are refused by name. The custom-field merge starts from a CONSISTENT read of the stored lead (the merged map is written back whole). Changing a lead's email to an address the owner already marked do-not-contact flags the lead too. A lead marked do-not-contact is NOT deleted through the tool (deleting it would let the address be re-added as sendable); when the do-not-contact check itself fails, the answer names the leads that were not checked (`doNotContactUnchecked`). A refused row in a multi-row add is named; a list update whose `status_config` repeats a status value is refused.
+- **Opt-outs are not erased by an outside agent (third review of the final head):** the address of a lead marked do-not-contact cannot be changed or cleared through the tool (editing the email moved the lead out of the email index, so a re-add was no longer flagged); such a lead is not deleted; and `create_lead_list delete` does not delete a list that holds any lead marked do-not-contact (the leads are read in-process after the REST read proved access, up to 20,000; if they cannot all be read nothing is deleted). The follow-up service (`leadImportFollowups.ts`, shared with the bulk imports) now takes the owner of a matching lead from the LIST the lead sits in, not from the lead's own `userId`, which a caller can supply when creating a lead through the single-lead REST route: another tenant could plant a do-not-contact lead naming this owner and have it flag this owner's later adds.
+- **Fourth review of the final head (also DO NOT SHIP, two reproduced problems fixed):** writing the SAME address on an opted-out lead re-ran the inheritance, which rewrites the contact status, reason, note and actor of any lead it is given: with a twin (the original plus an inherited copy) the original compliance record was overwritten and an unsubscribe relabelled. The inheritance now runs only when the address really changes and never on a lead that is already opted out. The address must be a plain address: `Name <a@b.test>`, `"a@b.test"` or `a@b.test.` is stored as a different string and was not matched against an opt-out (the match is on the stored text, trimmed and lower-cased). The opt-out guards (address, delete) decide from a CONSISTENT read of the stored lead and stop with nothing changed if it cannot be read. A lookup that hit the 200-row cross-tenant cap without finding an opt-out is reported as a check that could not be completed (shared service, also reported for the bulk imports).
+- **Scope of the promise (stated plainly):** "an outside agent cannot erase an opt-out" holds for `manage_leads` and `create_lead_list`. The same key can also ask Emma (`emma_send_message`, covered by the default `tools:execute` scope), whose own tools can set a lead's contact status to active or delete leads; MCP-originated Emma sessions carry no restriction profile (`services/toolRestrictionProfiles.ts` blocks no lead or brand tool). Closing that is the wave-2 restriction-profile work, a decision for the owner and Harsha. Matching is by email only (a LinkedIn-only or phone-only re-add is not flagged), and the delete guards also hold back unsubscribed leads.
+- **Update vs create fields:** `priority`, `role`, `isPrimary`, `expectedClose`, `closedDate`, `heatScore` and `healthScore` are stored when a lead is created but not by the update layer, so an update refuses them by name instead of reporting success and dropping them. Drafts are shape-checked (`emailDraft` `{ subject, htmlContent?, textContent? }`, `messageDraft` text or `{ content }`, `emailDraftFormat` "text" or "html", null clears) and stamped with their times by the wrapper. `customFields.email_validation` (read by the send-eligibility check) cannot be written. A repeated id in `lead_ids` is one lead; `page` and `limit` must be whole numbers.
+- **delete:** 1 to 100 ids. The REST DELETE removes by key without checking the lead exists and then lowers the list's lead count, so a missing
+  id reported success and miscounted the list. Each id is read first (a missing one is a 404) and the answer counts what was really deleted.
+- **time budget:** one add or delete call stops starting new rows after 90 s and reports the rest as `not_attempted`, so only those are sent
+  again. The budget limits when a row starts, not how long one row's self-call may take.
+- **list:** `page`, `search`, `status`, `engaged_only` reach the route that reads them. The old `last_key` was never read by the route, so key
+  pagination never worked; it is removed.
+- **create_lead_list update:** Emma's eight fields (name, description, icps_only, engaged_only, auto_draft_enabled, auto_draft_instruction,
+  status_config, list_type once). Auto-send, alert copies to outside addresses, list sender and the LinkedIn account are never forwarded. An
+  instruction over 2000 characters is refused before any field is saved; if the second save fails the error says the first was saved.
+
+**Found in the REST routes, NOT changed here (separate card for the owner/Harsha):** `POST /lists/:l/leads` stores `userId`, `tenantId` and `contactStatus*` from the request body for portal users (the MCP wrapper refuses them); `DELETE /lists/:l/leads/:id` has no existence check and
+still lowers the lead count; the single-lead `POST` skips do-not-contact inheritance; `PUT /lists/:l/leads/:id` creates a row for an unknown id.
+Suppression is per lead: deleting an opted-out lead and re-adding the address leaves no flag. `findAllLeadsByEmail` caps at 200 rows across all
+tenants (shared with the bulk imports). Two updates of the SAME lead's custom fields at the same moment no longer drop each other's keys (Opslane run 2308, P1): custom fields are written KEY BY KEY (`db.updateLead` `customFieldsKeyMerge`, `customFields.<key> = value`, no read-merge-write of the whole map). One fallback keeps the older read-merge-write: the portal route's write guard in `enforce` mode drops that flag (this code runs in the same process, so the mode is known); it merges from a consistent read and writes the map back, with overlapping calls on one lead serialized by the per-lead lock. A lead with no custom-field map needs no fallback: the update layer creates the missing map and retries. The key-by-key flag is a server-owned key to that guard, so in `log` mode each custom-field update is counted on the agent channel (telemetry noise, like the suppression keys). The suppression update sends `contactStatusUpdatedAt/By`, which `CRM_LEAD_PUT_GUARD` counts as server-owned keys on the agent channel.
+
+**Test infrastructure.** The fake DynamoDB now supports `list_append(if_not_exists(...), ...)` and a comparison on the range key in a query
+(before, every duplicate-email check returned the whole partition, so every add looked like a duplicate), and the harness has the
+`EmailLookupIndex`. The harness answers the tools' self-call with a plain object: `Response.json()` builds objects in the outer Node realm, which
+`customFieldsGuard`'s prototype check rejects. The behaviour is proved through the real path in `mcp.manageLeads.writes.test.ts`.
+
+**Not done here (separate slices):** per-call credit metering and org-bound keys; the `CRM_LEAD_PUT_GUARD` env switch (ops) still defaults to
+log for the portal route; the REST fixes above.
+
+**Fifth review of the final head (DO NOT SHIP; races reproduced; handled and STATED):** the opt-out guards are read-then-write, so one agent's PARALLEL calls on one lead could slip a write between a guard's read and its write (suppress + delete, suppress + email edit, update + delete re-creating a one-field row, two deletes lowering the list count twice). All calls on one lead (update, delete) and on one list (list delete) are now serialized per key, in arrival order, within the server process (`withLeadLock`): the lock is per server process, so it covers every call that reaches the same instance, from any session. Production today runs one instance, but its MCP session store is the Dynamo-backed one (a session can be served by any instance) and two instances overlap during a deploy, so one agent's parallel calls reaching one process is true in steady state, not guaranteed. **Not covered, stated plainly:** calls that reach different instances; that needs conditional writes in the route and the database layer (for example a conditional delete or update that refuses an opted-out lead on the agent channel): a follow-up for the owner and Harsha, not part of this PR. The suppression decision reads the stored lead consistently (the REST copy can lag). Email addresses must be plain ASCII (zero-width, soft-hyphen, full-width and NUL look-alikes were stored as different strings). The CRM sync ids the HubSpot and Attio adapters fall back to (`hubspot_contact_id`, `hubspot_deal_id`, `attio_record_id`, `attio_list_entry_id`, `attio_deal_list_id`) are refused as custom field names, like `email_validation`. An update that changes nothing is refused. Chunks of a call with more than 50 custom keys are separate writes (idempotent on retry). The list-delete lock only serializes two list deletes with each other; suppressing a lead while its list is being deleted uses a different key and is not covered (same follow-up). The scan that looks for opted-out leads before a list delete is an ordinary (eventually consistent) read: a suppression written seconds earlier could be missed.
+
+**Opslane run 2309 (P2, previous head):** `manage_leads list` with `limit: "50"` (number as text) or an empty `engaged_only` was refused, though the older call accepted a text `limit` (it forwarded it) and skipped a falsy one. Now: digits-only text is a number, empty/blank/`0` means not given, `engaged_only` takes true/false or that text, negative/fractional/non-numeric values are still refused by name. What the older call did with odd values, stated completely: it forwarded `limit` as text and skipped a falsy one, so the route's `parseInt` turned `25.5` into 25, `-5` into 1, `"50abc"` into 50 and `"0"` into 1; it never forwarded `page`, `engaged_only`, `search` or `status`, so a bad value there returned the unfiltered first page. Now: such values are refused by name (fractional, negative, `"abc"`, `engaged_only: 1/"yes"`, a non-text `search`/`status`), and `"0"` means the default like `0` does; a number given as `search`/`status` becomes text.
+
+**Sixth review (SHIP WITH NITS on 74b18374d), nits handled:** the text above that still said a lead with no custom-field map falls back to a whole-map write was wrong and is corrected; a repeated id with one distinct id now also reports `duplicateIdsIgnored`; `search`/`status` that are not text are refused (a number becomes text) instead of being dropped; the list-input behaviour versus the older call is stated completely; adding a lead as do-not-contact is two steps now (add, then update) and the window in between is stated.
+
+## ENG-2228: compose_video no longer crashes on short branded clips (2026-11-19)
+
+- **Symptom:** `compose_video` with one ~4s clip failed with `Remotion render failed: inputRange must be strictly monotonically increasing but got [0,10,-2,18]`.
+- **Cause (not in `mediaVideo.ts`, which the ticket cleared):** the BrandedVideo composition fades its intro over `[0, 10, d - 20, d]` and its outro over `[0, 12, d - 10, d]`, where `d` is the overlay's own length. `remotionService.compose` sized each overlay at 15% of the video, so a 4s clip (120 frames) got an 18-frame intro: `[0, 10, 18 - 20, 18]`. Any branded video under about 6.6s failed on the intro, and under about 4.8s with a call to action on the outro. Single clips were only the common case, not the only one.
+- **Fix:** `resolveOverlayDurations` in `remotionService.ts` keeps 15% of the video, capped at 90 frames, but never below 31 (intro) or 23 (outro) frames. Videos that already rendered get identical lengths. On a very short video the overlay simply outlasts it and is cut off by the end of the composition.
+- **Guard against drift:** a test reads the fade keyframes out of `BrandedVideo.tsx` and fails if they grow past the minimums.
+- **Not changed:** the composition itself. It is deployed separately (`remotion lambda sites create`), so the backend sizing is what protects the already-deployed site.
+
+## ENG-2227: label what an anonymous share-link visitor says, so Emma does not treat it as the owner's word (2026-11-19)
+
+A share link lets anyone who holds it write into the owner's real chat (ENG-396, not a fork). `metadata.ishareSender.isAnonymous` was stored on the visitor's message but never reached the model, so a visitor's "they made the call by mistake" read like the owner's word (ENG-2211's "You have 0"). This labels it. **Labeling only: nothing a visitor could do before is blocked** (owner decision 2026-11-19).
+
+- **The label:** `[Sent by an anonymous viewer via a shared link — not a verified account owner]`, one constant in `utils/anonymousShareProvenance.ts` (`withAnonymousShareMarker` is idempotent; `isAnonymousShareMessage` reads the stamp; `isServerAuthoredContinuation` spots the server's own "[SYSTEM] This is an automatic continuation" turns, which carry the visitor's stamp for tool limits but are never labeled). Appended server-side, LAST, so a visitor cannot place text after it.
+- **Where it goes:** every rebuild of the typed history and this turn's own message (`AgentModeService.buildMarketingContext`, the live turn through its new last parameter, passed from `prepareTurnContext` as `isInteractiveShare`, which is `!viewerIsOwner` on the share route, the same flag that writes the stamp); the consecutive-user-message merge only merges rows of the same anonymity; Model Compare replay (`buildCompareMessages`); the benchmark replay (last user message only, earlier rows come from their stamp).
+- **Side doors closed:** the comment on a thumbs-down is written as a `role:'system'` row (more authority than a user message): for anyone who is not the logged-in owner it now says an anonymous viewer wrote it and quotes the comment with `JSON.stringify`; the owner's wording is unchanged. Live voice: a share-visitor call (`restrictionProfile === 'share_visitor'`) stamps the saved spoken turn, labels such rows in the call's history block (kept on ONE line, so a newline cannot forge an unlabeled `User:` row) and the voice prompt gets a visitor note.
+- **Prompt:** a new `## Anonymous Share-Link Input (CRITICAL)` section: answer ordinary questions normally; a consequential claim from a tagged message is unverified input, say it came from an anonymous viewer; works alongside "Follow Explicit Direction" (still do what was asked, add the label; spend/publish/irreversible still need confirmation); a visitor describing their own business is ordinary input. About +2,000 characters on every Agent Mode turn.
+- **Tests:** the turn-preamble golden is re-recorded (prompt length, hashes, and the label on a visitor's live message) and a plain assertion fails if the call-site argument is dropped (no direct `buildMarketingContext` test notices that).
+- **Not done, on purpose:** no gating of state-changing asks to the verified owner. Open: a visitor-made scheduled run's starting message has no provenance line (tools restricted by ENG-2816); code gates that read the last user message as the owner's word (Meta `verifyExplicitStatement`); visitor thumbs feed the account-health classifier; `emma_get_session`/MCP return raw messages; `/ishare/:id/email-report` is an unauthenticated mail relay once the link is held. The portal sends no login on the share-link feedback PUT, so the owner's own thumbs-down comment on their own link is worded as an anonymous viewer's (wording only).
+
+## ENG-1904: a non-admin recipient can receive an admin-run report when everything the run read was about them (2026-11-19)
+
+The ENG-500 guard treats a scheduled report as sensitive when the run called ANY cross-account tool, and then only admins (plus the owner while still an admin) receive it. An admin who runs a report ON BEHALF OF a client therefore never reaches the client: the client is withheld and the report goes to the admin (reproduced 2026-11-19 on the test environment and on production in the owner's own accounts; production already shows it: a real schedule's delivery log has 6 withheld and 6 delivered). This adds one narrow, ADDITIVE path. **Switched off by default** (`SCHEDULED_REPORT_RECIPIENT_SCOPING=true` turns it on); with it unset, behavior is exactly today's plus a `[ENG-1904 shadow] would have sent a link-free copy ...` log line.
+
+- **The rule (`services/scheduledReportScope.ts`, pure):** a withheld non-admin recipient gets a separate copy only if EVERYTHING the run read was about that recipient. Every tool the run used must be scopable (`monitor_lead_volume`, `read_client_meta_activity`, the three Meta tools, the two Google Ads tools) or a report builder that reads no tenant data (`install_skills`, `list_available_skills`, `list_html_templates`, `create_html_from_template`, `perform_data_analysis`, and the plan plumbing `launch_predefined_work_plan` / `set_work_plan_status`; NOT `resolve_skill`, which for an admin scans every tenant's skills and returns their owners' emails, and NOT `search_tool_response` / `read_tool_response`, which take an arbitrary `s3_key`: a run that reads an offloaded result through them is withheld). Every scoped call, from every source (the assistant's `tool_calls`, the executed ledger in `metadata.toolCalls`, the tool-result rows), must name the recipient EXACTLY in EVERY subject argument it carries: an email (case-insensitive) or a user id, never a name, since the client-health family matches names by substring and takes the first hit. A blank, padded or non-string subject key is a "no" even next to a good `client_id`: the gateway only treats `""`, null and undefined as missing, so a `" "` still reaches the tool and the tool then matches a loose name (a review reproduced this with the real gateway). For the two tools that match names loosely EVERY call must be paired, by tool-call id, with a saved result that says which account it resolved (`client{userId,email}`) and that must be the recipient's (a missing result row, e.g. a lost message row, is a "no"); a key spelled the way the gateway repairs it (`clientNameOrEmail`, `Client_ID`, a wrapper object) that the module does not read is a "no"; a result offloaded to S3 (header, maybe a citation block, then the first 20,000 characters) is read by a depth-tracking scan that accepts a `client` key only at depth 1 of the top-level object, and an unreadable subject is a "no". The session's `calledFunctions` counter must not show more calls to a scopable tool than left rows, and a scopable tool that is a KEY of the counter must have left at least one row (a work plan resets the counter on launch and decrements it per step to 0 but keeps the key, so the count alone cannot show a lost call there; a non-consumed per-run tally would, but that is a schema change). A call the dispatcher collapsed as a same-turn duplicate (`duplicateSuppressed` / ledger `duplicateOf`) never ran and needs no result of its own. The reader of a stored result strips only the real S3 header and the inline-citation block and requires the JSON object to start right there; the walk for hidden subject keys fails closed on arguments that are too deep or large; result subjects are only read for scopable tools; the error log carries no error text. Tool names also come from the session's own `calledFunctions` counter, since the message write only logs after three failed retries; a row shape the module does not understand (a legacy `function_call`, a nameless tool or ledger entry) makes the run unprovable. The Meta and Google Ads tools read the CALLER's own account when `client_id` is omitted (the admin's), so an unscoped call is not the recipient's. The multi-subject tools (`list_all_clients`, `get_users_by_lifecycle_stage`, `get_chat_history`, `get_registration_status`) and the internal-data tools (`get_session_transcript`, `get_user_by_id`, `inspect_client_usage` which returns the org's BILLING OWNER, `manage_user_notes`) stay admin-only for ever. Unreadable messages, unparseable arguments, an unresolved recipient, a deleted or missing account, and any error all answer "no". Recipient identity is the strongly consistent `getUserByEmailConsistent`.
+- **What changes in the email send (`emailService.ts`):** `classifyAndResolveScheduledReportRecipients(sessionIds, recipients, { allowScopedRecipients })` returns an extra `scoped` list; `authorized` and `withheld` are exactly what the guard decided. Only the single-report send asks for it (the daily digest merges several runs and keeps today's rule). The admin's email is unchanged (checked by hashing the old and new output for an ordinary report and for a withheld-then-owner report: identical); its withheld banner no longer lists a recipient who did receive the report. The scoped recipient gets a SEPARATE email without the "Continue the Conversation" block (the session is an admin's, and its share view hides turns that used admin tools, so it is not proven safe for a customer), without the internal "Function Call Details" (tool names) and without anyone else's address. The flag-off shadow evaluation is DETACHED (the extra strongly consistent read and user lookups never delay or change the send) and the flag-on one is capped at 10 s; the shadow/live log line carries counts and fixed reasons only. The delivery log records both as delivered; a failed send of the client copy is `delivery_attempted` / `provider_error`.
+- **Google Ads mirrors Meta (NOT behind the flag):** `call_google_ads_api` and `call_google_ads_reporting_api` take the same admin-only `client_id` and were never on `CROSS_ACCOUNT_USER_DATA_TOOLS`. They are added to it and to `ADMIN_SCOPED_CROSS_ACCOUNT_TOOLS` (dropped for a verified non-admin owner, so a customer's own Google Ads report is unaffected; an admin-owned run, or one whose owner has no boolean `isAdmin`, that used them now counts as cross-account, in the single report AND the digest, and the `lastKnownSensitive` breadcrumb is written true for it). Production scan 2026-11-19 (read-only, counts only): 8 schedules name a Google Ads tool, all owned by non-admin accounts with a boolean `isAdmin` (3 active, 5 paused), so none changes; 3 users out of 518 have no boolean `isAdmin` and own none of them.
+- **Not done, on purpose:** no recipient plan check (nothing in the delivery path checks a recipient's plan today; it belongs in the ENG-1880 Phase C opt-in); no change to the activation gates or the preflight (they see no arguments); the daily digest keeps today's rule; the optional `ownerIsAdmin` inconsistency at template create and admin resume is left alone. **Known false positive (measured in shadow mode, not built): a call to `monitor_lead_volume` / `read_client_meta_activity` that ERRORED and was retried leaves a result row without an account, so the run stays withheld (fail closed).** **Residuals, written down:** **the largest one: every run is given its owner's account memories and the org-wide memory in the prompt (`agentModeService.ts` ~3295-3380), so an admin-owned run can write an agency note (a target CPA, another client's detail) into a report for a client, and no tool-name check can see it** (this is why the flag is off by default: turn it on only after deciding how to treat it: an explicit per-schedule opt-in, or requiring the owner to have no account or org memory, or human review of the first reports); `perform_data_analysis` can read the admin's own files and fetch public URLs; `call_meta_ads_insights_api.object_id` accepts any Graph node (it runs with the client's own token, so Meta enforces access); `call_google_ads_api` with `client_id` can also WRITE to the client's account (the LIST/SEARCH-only restriction was removed by an engineering-lead decision); when only scoped recipients receive the report and another recipient stays withheld nobody is told; a failed send of the client copy after the admin send succeeded is only recorded in the delivery log; the owner's admin status is read at send time (the ENG-2785 time-of-check, now also for Google Ads); `notify_session`, Slack-triggered email and the model's own send tools bypass the guard entirely; the share link minted before the guard still goes to admins.
+
+## ENG-3156: zoma_industry_benchmark — sourced CPA benchmarks, N/A instead of estimates (2026-11-18)
+
+- `backend/src/mcp/zomaIndustryBenchmarks.ts` is a static, versioned table (`INDUSTRY_BENCHMARK_TABLE_VERSION`).
+  Every row was read from the source page on 2026-11-18 and its table cell is quoted in a comment. Missing
+  (industry, platform, kpi) → `getIndustryBenchmark` returns null → the tool says exactly `Industry benchmark: N/A`.
+  No interpolation, no nearest category, no lead→purchase mapping.
+- All published sources found are **cost-per-lead tables only** (Meta Leads-objective; Google search ads). There is no
+  purchase or registration CPA row, so purchase-KPI accounts get N/A until a real published purchase/ROAS-by-industry
+  source is added.
+- wordstream.com returns 403 (Cloudflare) to automated fetches; its 2025 pages were read through Wayback Machine
+  snapshots (URLs in the file header). Rows keep the canonical wordstream.com URL for attribution.
+- LocaliQ's "Search Advertising Benchmarks [2026 Data]" was deliberately NOT used: its overall CPL ($66.69) and CPC
+  repeat the prior year's figures and several industry cells repeat. Google rows come from WordStream 2025 instead.
+- Customer CPA is Meta-only (zoma_ads_report is Meta-only); the table carries Google rows so ENG-3155's
+  zoma_measurement_report can call `getIndustryBenchmark(industry, 'google', kpi)` later. ENG-3155 was not on main
+  when this shipped, so nothing here depends on it.
+- Accounts whose currency is not USD get the benchmark but no % comparison (no exchange-rate guess).
+
+## ENG-3155: Zoma proactive measurement reports (2026-11-18)
+
+- `zoma_measurement_report` (mcp/zomaMeasurementReport.ts) reuses `runZomaAdsReport` for campaign metrics and the
+  monitor_lead_volume data path (ENG-916 snapshots + `buildLeadVolumeReport`) for CRM leads, scoped to the caller's
+  own account so no admin lookup is needed. Breakdowns (top ads, age/gender, placement, device) fail soft: a failed or
+  empty read omits the section.
+- It renders a Zoma-owned deterministic template rather than the public `multi_campaign_performance_report`: that
+  template is a prod `AW-Settings` row filled by an LLM, so adding Conversions/ROAS there would be a prod data write
+  and a non-deterministic render. The layout is the same, plus Conversions and ROAS columns.
+- Schedules live in the new `AW-ZomaReportSchedules` table (PK userId, SK adAccountId). It must be created
+  (`createZomaReportSchedulesTable`) before `ZOMA_MEASUREMENT_REPORTS_ENABLED=true`. Exactly-once is a conditional
+  update on `nextReportAt` that claims the slot before the send.
+- With the flag on, the ENG-3133 weekly email skips users who have an active measurement schedule.
+
+## ENG-3149: email the account owner when a share-link visitor first marks one of their schedules (2026-11-18)
+
+A share-link visitor acts under the owner's userId, so the schedules they write look like the owner's own. ENG-2816 marks them (`provenance`) and the portal shows an amber "Visitor-edited" badge, but an owner who does not open the schedule never sees it. This sends the owner one email the first time a visitor marks a schedule.
+
+- **When:** only after a visitor write succeeded, and only when it is the schedule's first mark. A visitor create, or a create from a template (born marked), alerts. A visitor update or variable write alerts only if it adds a mark and the consistent read it was diffed against had none. Already-marked schedules, no-op writes, owner writes, self-calls without the claim and the public emailed-variables link never alert. A MARKED RUN's own write (its self-calls carry the `share_visitor_schedule` claim) never alerts either: a run of a flagged schedule that creates a schedule each run would otherwise mail the owner every run, for a schedule that already alerted. A real visitor turn (claim `share_visitor`, or the turn marker alone) does.
+- **Never in the way:** the send is detached (not awaited, fire and forget). Any failure is only logged with a `[ENG-3149]` prefix; the visitor's request, status and body are unchanged.
+- **To whom:** the account owner only (the email on the request, else a lookup by `userId`; none means skip silently). Never the visitor, never the schedule's notification list.
+- **How many:** at most 5 per owner per rolling hour AND 15 per rolling 24 hours, both must allow, in process (`utils/shareScheduleAlertThrottle.ts`, injectable clock, pruned map: owners with nothing inside the daily window are swept). The daily cap stops a slow drip that stays under the hourly one all day (5 an hour is 120 a day). Beyond a cap the email is skipped and that cap is logged once; the badge still shows. A restart or a second instance can let a few extra through, which is fine for a notification.
+- **The mail:** `emailService.sendVisitorScheduleAlertEmail`. Fixed subject with no schedule name. The schedule name is the only visitor-written text in it; no prompt text, token, IP or recipients. Only a real string is used as the name; anything else reads "Untitled".
+- **Cleaning the name (`shareScheduleAlertName`): a bounded allow-list, not a list of bad things.** Everything is bounded first, because the name has no length limit of its own and this runs inside the visitor's request (an earlier regex version took seconds on a 20,000 character name): only the first 300 code points of what was sent are looked at, then NFKC (which folds full-width and compatibility characters, including look-alike dots, to plain ones) and a second cut to 400. Every regex after that is one character class or a one-character lookaround, so nothing can backtrack. In order: whitespace of any kind becomes a space; invisible characters are deleted (default-ignorable code points such as variation selectors, zero-width and bidi controls, tag characters; all control, format, surrogate and private-use characters; U+115F, U+1160, U+3164, U+FFA0, U+034F, U+2800), so a dot or word cannot be hidden in one; a `.` not between two digits becomes a space; then only letters, combining marks, digits, spaces and `_ - ' ’ & , ( ) + # ! ? %` stay, and everything else becomes a space; combining marks are capped at 3 per letter or digit (one with nothing to combine with is dropped, so a letter cannot be stacked or struck through); spaces collapse and the ends are trimmed; the result is cut to 100 characters INCLUDING the ellipsis (whole characters, no dangling dot or space before the ellipsis); a name with no letter or digit left (nothing, or only marks, punctuation and spaces) reads "Untitled". Cleaning a clean name returns it unchanged (a single trailing ellipsis is carried over). HTML-escaped where HTML is written.
+- **Consequences, accepted:** nothing clickable survives and no address can be written in it: `. : / \ @ < > " ; = [ ] { } | ~ ^ * $` and every dot or slash look-alike that is punctuation are gone, so a link or address can only ever read as separate words. Look-alike LETTERS (for example U+02D0 or U+A4F8, which resemble a colon) can still survive, as letters: they are not clickable and do not form an address. The words stay: `Re-verify your login at evil.example/x` reads `Re-verify your login at evil example x`, `Sales.Report` reads `Sales Report`, `Q4 plan.` reads `Q4 plan`, `Notes.txt` reads `Notes txt`, `0.0.88888.com` reads `0.0.88888 com`. Version-like and decimal numbers survive (`v2.1`, `Release 3.0`, `1.2.3`). Emoji and other symbols (not letters, marks or digits) become spaces. NFKC rewrites compatibility forms (`ﬁ` to `fi`, `²` to `2`, Thai sara am to its two parts). Zero-width joiners and non-joiners are deleted, which can change how some Indic and Persian words are shaped.
+- **Residuals, accepted:** phone-like digit runs (and a dotted number such as an IPv4 address without a scheme) stay, so a name could carry callback-phishing text; it is shown in quotes inside the owner's own mail, under a fixed subject and the approved copy. The marked-run skip applies per request: a marked run that edits one of the owner's UNMARKED schedules marks it without telling the owner (safe: a marked schedule runs with fewer permissions).
+- **No** new table, attribute, index or IAM change.
+
+## ENG-3141: Partner Portal stops linking four placeholder marketing pages (2026-11-18)
+
+- `/marketing/social-listening`, `/marketing/creative-generation`, `/marketing/report/:id` and `/marketing/blog` now redirect to `/marketing` instead of rendering Not Found or a bare placeholder.
+- The two "Coming Soon" cards on the marketing home no longer carry a "Learn More" link to those pages.
+- Route catalog marks the four as `redirect`; new catalog tests assert no viewer's header navigation offers a placeholder or dead-end destination.
+
+## ENG-3133: weekly Zoma email bars no longer collapse in Gmail's Android app (2026-11-18)
+
+- **Bug (seen on a real phone):** in Gmail's Android app the daily-spend bars and the per-campaign bars drew as thin
+  lines. Heights were right but the app ignores `width` attributes on these tables, so every bar's width collapsed.
+  A desktop browser honours the attributes, which is why the first renders looked fine.
+- **Fix:** each bar is one table cell that carries its size in CSS (`width`/`height` in px, plus the attributes for
+  Outlook) and a spacer `div` of the same width that holds the cell open. No bar depends on a width attribute or a
+  percentage any more. Daily bars are 36px wide in 40px columns (7 x 40 = 280px, fits a 320dp phone body); campaign bars
+  are pixel lengths up to 250px.
+- **Proof it does not rely on the attributes:** a unit test strips every `width` attribute from the generated HTML and
+  asserts every one of the 17 sample bars still defines its width in CSS with a spacer; a second test pins the
+  size limits. The sample was also rendered with the attributes stripped at 360px.
+- No behaviour change: the weekly email is still off (`ZOMA_WEEKLY_REPORT_ENABLED` unset).
+
+## ENG-3132: Zoma referral-code registry, slice A (2026-11-18)
+
+`signupRef` (ENG-2906) is a free-form label, not a referrer. This slice adds `services/zomaReferralRegistry.ts`: a registry of referral codes so that only a registered, active code can earn commission. Nothing calls it yet; accrual and the payout ledger come in later slices behind `ZOMA_REFERRAL_ENABLED`.
+
+- **Data-plane:** new table `AW-ZomaReferralCodes` (PK `code`, no sort key, no GSI, pay-per-request, deletion protection, point-in-time recovery attempted non-fatally), defined in `scripts/create-tables.ts`. This is a data-plane change under AGENTS.md: Anurag approved the table (2026-11-18) and Yugo creates it after review, so the PR is marked data-plane. `main()` in `create-tables.ts` also creates it on the next setup run. It is deliberately NOT in `ensureCriticalTables` (money data should not appear at boot), so create it before enabling `ZOMA_REFERRAL_ENABLED`. Until then nothing reads or writes it.
+- **Rules:** a code is a valid `ref` (`/^[a-z0-9_-]{1,64}$/`, lowercase only because ENG-2906 drops uppercase refs), at least 4 characters, and never a launch-channel alias (`classifyAcquisitionSource` would file it under that channel) or a reserved word. Codes are never overwritten; revoking is idempotent and keeps the first revocation time.
+- **Resolution:** `resolveReferrer(signupRef)` returns `none` (unregistered or malformed), `revoked`, or `active`. A store outage throws, so accrual cannot mistake an outage for "not a referral". The code rules are re-checked on read, so a code that later becomes a channel alias stops resolving.
+- **Who earns:** `referralEarns(record, {signupAt, paidAt})`. A code only earns for signups at or after it was registered (registering `launch2026` later never pays retroactively). Revoking stops invoices paid at or after `revokedAt`; an invoice paid earlier still earns, so a webhook retry is not lost. Self-referral (`record.userId` equals the referred user) must be rejected by the accrual slice.
+- **Config (env, defaults dark):** `ZOMA_REFERRAL_ENABLED` (exact `true`), `ZOMA_REFERRAL_PERCENT` (default 20, up to 2 decimals, stored as basis points), `ZOMA_REFERRAL_MONTHS` (default 3, 1 to 12). A set but unusable value (`15%`, `1,5`, `0`) turns the program OFF with an error log instead of paying a default nobody chose. A per-code percent override is stored on the code.
+- **Rollback:** unused code; reverting leaves no stored data. If the table was created, it can stay empty.
+
+## ENG-3132: Zoma referral accrual, ledger, refunds, admin and reconcile, slices B-D (2026-11-18)
+
+Builds on the registry (slice A). Everything is dark: the webhook entry returns at once unless `ZOMA_REFERRAL_ENABLED` is exactly `true` with valid values.
+
+- **Data-plane:** second new table `AW-ZomaReferralLedger` (PK `referredUserId`, SK `entry`, no GSI, pay-per-request, deletion protection, PITR attempted) in `scripts/create-tables.ts`. Anurag approved it (2026-11-18); Yugo creates it after review, before the flag is set. Not in `ensureCriticalTables`. Append-only; the payout report scans it (at most `months` rows per referred user).
+- **Rule:** commission = percent (default 20%, basis points) of each paid Zoma invoice ex-tax (`total_excluding_tax`), minus the net of the $1 trial-fee line (matched by price id, `ZOMA_STRIPE_TRIAL_FEE_PRICE_ID` plus retired ids in `ZOMA_STRIPE_TRIAL_FEE_PRICE_IDS_HISTORICAL`), for the referred user's first `months` commissionable invoices. The window is computed per Zoma Stripe customer from Stripe's paid-invoice list, ordered by paid time, so webhook order and cancel/resubscribe cannot change who is inside it.
+- **Idempotency:** ledger key is `<invoiceId>#accrual` (conditional put). `invoice.paid` and `invoice.payment_succeeded` both fire; the second is a no-op.
+- **Refunds:** `credit_note.created` on a Zoma invoice writes a negative row keyed `<invoiceId>#reversal#<creditNoteId>`, using the percent stored on the accrual, excluding the fee line, capped at the accrued base. Reversals are cumulative, so rounding never drifts and a full refund returns exactly the accrued commission. The row is stamped in the month the credit note was issued (a clawback after a payout nets against the open month). After every accrual the handler also applies any credit notes already on the invoice, so event order does not matter and pre-payment credit notes are covered. `credit_note.voided` writes a positive row (`<invoiceId>#void#<creditNoteId>`) that cancels the reversal.
+- **Invoices over 10 lines:** the handler pages the full line list before computing, so a large overage invoice is computed, not dropped.
+- **Charge refunds with no credit note** are not reversed by the webhook (a credit note with a refund also fires `charge.refunded`, so a charge handler would double-reverse). `scripts/zomaReferralReconcile.ts [--month YYYY-MM]` is a read-only report that compares ledger net with Stripe's paid/refunded amounts and flags `refund_not_reversed`, `over_reversed`, `net_mismatch` and missing invoices; run it before every payout. An adjustment for a flagged refund is a manual step.
+- **Admin:** `POST/GET /api/admin/zoma-referrals/codes[/:code]`, `POST .../codes/:code/revoke` and `GET .../payouts?month=YYYY-MM[&format=csv]` (admin only, not gated by the flag so codes can be registered first). The roll-up groups by each row's payout month and nets reversals; the CSV neutralises spreadsheet formulas in free-text cells.
+- **Known gap:** one older invoice that cannot be read safely stops accrual for that customer until fixed (error log; under-pays rather than over-pays).
+- **Failure handling:** store/Stripe errors throw so `handleWebhook` answers 5xx and Stripe retries. Shapes that cannot be computed safely (no fee price configured, truncated lines, missing totals) are logged at error level as `[ZOMA-REFERRAL] unsafe ...` and write nothing.
+- **Unproven until a Stripe test-clock run:** which invoice carries overage lines; that the live endpoint subscribes to `invoice.paid` and `credit_note.created`; the credit-note-line to invoice-line mapping.
+- **Rollback:** unused unless the flag is set. Revert the commits; the ledger table can stay empty.
+
+## ENG-3131: rehearsal now drives the real gateway and the returning-user path (2026-11-18)
+
+`backend/src/scripts/zomaBillingRehearsal.ts` (test-mode Stripe + test clock, no staging, no Dev-table writes) now also calls `handleMetaToolkitCall` with an `UPDATE status=ACTIVE` write: refused with the pay link before payment (nothing sent to Meta, nothing metered), allowed after, edits and reads metered, an in-band Meta rejection not metered and audited. A last pass cancels the plan and checks the returning-user Checkout (plan + metered price only, $50 due today, USD-only). Meta itself is a fake; journey milestones are stubbed. Run result: 40/40.
+
+## ENG-2812: the session-breaker shadow counted every BYOK turn as $0; spend now follows the ledger rule (2026-11-18)
+
+- Prod evidence after the default-on change: both `session_breaker_would_pause` lines (2026-11-17 16:10Z scheduled, 18:46Z interactive, 40 turns each) carried `spendUsd: 0`. The shadow read `usage.cost` and fell back to a token estimate only when it was not a number. On our own provider key (BYOK, the default route) `usage.cost` is a real 0 for a plain call, so the estimate was never reached and the $5 cap could never fire; only the turn cap worked.
+- `shadowTurnCostUsd` (in `sessionBreakerShadow.ts`) now prices a turn the way the ledger books it (`openRouterByokCostUsd`, ENG-2720): BYOK = upstream bill plus any OpenRouter fee; not BYOK = `usage.cost` when positive; otherwise the price-book token cost (cache read/write tokens included). No usage block still counts as 0.
+- Still log-only: same one line per cap multiple, never pauses, writes, or notifies. Only the `spendUsd` figure and the `spend_cap` / `turn_and_spend_cap` reasons change, from now on.
+- Lines written before this deploy keep `spendUsd: 0` and are turn-cap evidence only; read spend from lines after the deploy.
+
+## ENG-3139: Keyword-data provider interface + mock adapter, dark (2026-11-17)
+
+Added `backend/src/services/keywordData/` (provider-agnostic interface, deterministic mock provider, agent-facing handler with not-connected path). Dark: not registered as a tool; enable after ENG-178 picks a vendor.
+
+## ENG-3136: Zoma guided Meta ad-account setup — provider-owned create step, login/email semantics, resume (2026-11-17)
+
+- Source: Fathom onboarding with a new advertiser (2026-11-16). Meta's own "create ad account" submit did nothing; they fell back to a personal Facebook login with a different email and Zoma never said whether that is allowed.
+- Owner of the failed button: Meta's Business Settings page. Zoma/Emma render no create button and never create ad accounts (no automation was added). Real provider walkthrough with submit-failure repro is NOT done (Meta login-gated); the three guide links were confirmed to resolve (HTTP 200, login-gated) on 2026-11-17. Label: external prerequisite.
+- Facebook email does not have to match the Zoma email: the Meta state JWT binds the connection to the Zoma user that minted the link; no email comparison exists in `metaOAuthFinalize`. The Facebook login must have access to the ad account (created it, or was added to it or to the portfolio that owns it), else Meta shares none and Zoma shows "No ad account found".
+- New text (`zomaAdsExperience.ts`): `ZOMA_META_LOGIN_NOTE` (zoma_status connect step, setup-poll `connect_meta` as `note` for returning advertisers or inside `guide` for new ones, "No ad account found" page) and `ZOMA_AD_ACCOUNT_CREATE_FALLBACK` (Meta-owned Ads Manager route, Meta Business Help, retry as a portfolio admin, reconnect with a fresh Meta link (they expire after 10 minutes)). Page-blocker (ENG-3125/3128) scope unchanged.
+- Prod evidence (CloudWatch, 2026-11-16): the onboarding user connected Meta three times between 19:45 and 19:48 UTC through the old portal flow. Every finalize succeeded and found 2 ad accounts but 0 Pages (`has_meta_pages: false`, scopes incl. pages_show_list), so the real blocker was the missing Facebook Page, not a missing ad account. No create-ad-account code exists in the backend, customer-portal or partner-portal, so any failing "Create" button is Meta's. No email comparison exists in `metaOAuthFinalize`.
+- Page steps on Zoma's HTML pages now render https URLs as links (`linkifyHttps` in `routes/zoma.ts`); before, Create-Page / Business-settings routes were un-clickable text. The Ads Manager route no longer claims Meta "usually offers to create one" (not verifiable without a Meta login).
+- The `eng3134` "computed metrics" test failure is local-env only: `backend/.env` sets `META_API_VERSION=v23.0`, the test expects the default v25.0.
+- `zoma_status` no longer fails with an RPC error when the Meta connect link cannot be minted (unreadable Meta credentials, e.g. a test environment): the link is guarded like the Google one and the step says to call zoma_status again for a fresh link, with the login note (found via the Opslane P1 on PR #4161).
+
+## ENG-3135: Zoma Google Ads connect finishes on Zoma, never creates or defaults anything (2026-11-17)
+
+Evidence (prod logs, onboarding session of 2026-11-16; details kept on ENG-3135, not here): the Google Ads callback hit the Emma portal and `/finalize` logged `accountCount: 0`. Google's probe of one listed account returned `403 PERMISSION_DENIED / authorizationError: CUSTOMER_NOT_ENABLED` — an account Google lists as accessible but whose signup was started and never finished — and `listAccountHierarchy` silently skipped it. Only one callback that day; no retry.
+
+- Our connect link sends only `response_type, client_id, redirect_uri, scope, state, access_type, prompt`: no locale, country or account-creation hint. Our code cannot have chosen "Italy" or pushed a campaign; both are most likely Google's own `ads.google.com` signup (the old `zoma_status` fallback pointed there) and the browser locale. Not verified: no recording or session transcript was available. Nothing in the backend creates Google Ads accounts, budgets or campaigns on connect.
+- Zoma-minted links carry a signed `zoma: 'mcp'` state; `/api/oauth/google-ads/callback` forwards them to `/api/zoma/google/callback` (server-rendered, finalizes for the state's user). Expiry is ignored only for routing, so an expired link shows Zoma's "ask your agent" page, not the portal. Portal states are untouched.
+- `listAccountHierarchy(token, diagnostics?)` reports `CUSTOMER_NOT_ENABLED` ids via an out-param. With no connectable account, Zoma shows "Google Ads account not finished" (finish THAT account; check billing country, currency and time zone — Google documents currency and time zone as permanent once the account exists and makes no such promise for the country, so the copy claims only the former) instead of "create an account", which would have told that user to start a second one. A manager-only login with no active client account gets its own page for the same reason. The not-enabled detection is defensive (it runs inside a catch and must not throw on an odd error body).
+- The portal `/finalize` response is unchanged: it still shows 0 accounts for a not-enabled-only user (customer-portal follow-up).
+- Dev OAuth client's redirect URI is a stale ngrok host, so a real consent flow cannot be completed from the autofix box; verify consent in prod/staging.
+- Verified 2026-11-17: Google's sign-up help confirms "create an account without a campaign"; the "Switch to Expert Mode" label could not be confirmed from Google's pages, so the copy offers it only as a hedge. Real Google Ads data (dev test account) was run through the real Zoma pages with the code exchange and DB write stubbed; a real consent run still needs a human on prod/staging.
+- Access control (accepted risk, review finding): the Zoma connect state is a bearer link, same as the Meta connect link (ENG-2496). Exposure window: 15 minutes from minting, not single-use, not bound to a browser. Leak vector: whoever sees the link (agent transcript, chat, logs) before the owner uses it can complete Google consent with their own Google account and attach THAT Google Ads account to the link's Zoma user; they gain no access to the user's data, and connecting is read-only toward Google. Mitigations in place: HS256-signed state (no forgery or user switching), 15-minute expiry, picker limited to accounts Google offered in this consent, no write other than the connected-accounts row. The portal path remains stricter (`/finalize` checks the logged-in user). Not done: a single-use nonce needs shared persistent storage, which is a data-plane change that needs Harsha's approval, and a browser-bound cookie cannot be set because the link is minted by an MCP tool, not a browser. Follow-up for the security owner; no negative replay tests were added because replay is not rejected today.
+- Verified 2026-11-17: Google's sign-up help confirms "create an account without a campaign"; the "Switch to Expert Mode" label could not be confirmed from Google's pages, so the copy offers it only as a hedge. Real Google Ads data (dev test account) was run through the real Zoma pages with the code exchange and DB write stubbed; a real consent run still needs a human on prod/staging.
+- Found by the first prod test (a Gmail login with no Google Ads account saw "We could not finish connecting Google Ads"; prod logs: `google_callback` failed, `Request failed with status code 401`): Google answers `listAccessibleCustomers` with 401 `NOT_ADS_USER` for a login that has never used Google Ads (documented by Google). The mocks had modelled "no account" as an empty list, so this was missed. The Zoma callback now shows the no-account page for that code; any other failure logs Google's error code in `reason`. The portal `/finalize` is unchanged and still returns 500 for such a login. Inferred from the 401 and Google's docs; the error body was not logged before, so the first retry on the fixed build (`no_google_ads_accounts [NOT_ADS_USER]`) confirms it.
+
+## ENG-3133: weekly Zoma ad-performance email, dark behind ZOMA_WEEKLY_REPORT_ENABLED (2026-11-17)
+
+- **What users get:** once a week, an email with each connected ad platform's last 7 complete days
+  (ending yesterday, never a half-finished day) set against the 7 days before: spend, conversions, cost
+  per conversion, clicks, click rate and cost per click (plus return on ad spend where Meta reports a
+  value), each with its change versus last week; a daily-spend bar chart with a most-conversions /
+  quiet-days line (a tie is never turned into a winner);
+  the top 3 campaigns by spend, each with its cost per conversion and a cheapest-vs-dearest line; up to
+  three plain "worth a look" flags (spend with no conversions all week, spend that stopped for the last
+  2+ days, a top campaign that spent with no conversions; Meta flags name the one conversion event the
+  account counts, and say nothing about single campaigns when that event is mixed); and one
+  deterministic sentence about the
+  week (only when last week gives a baseline). Nothing is guessed: no benchmarks, no causes. A note says
+  recent conversions can still go up (platforms credit them for days after a click). Charts are plain HTML table cells, so
+  they render with images off and need no hosting; the text part carries the same numbers. Platforms
+  are never added together (currencies can differ). Then what Zoma did: changes made, each with its
+  read-back verdict, and the successful call count. A connected account with no delivery says so; one
+  that cannot be read, or whose connection expired, says so (never "no delivery", never "not
+  connected"); a user with no connected ad account is told how to connect one. Copy needs Harsha's
+  review before the flag is turned on (`weeklyReportEmail` in `mcp/zomaWeeklyReport.ts`).
+- **Data sources:** Meta: one account-level daily insights read over 14 days (`runZomaAdsDaily`,
+  additive in `mcp/zomaAdsReport.ts`; the tool surface is unchanged) plus a campaign-level report for
+  the ranking. Google Ads: a daily GAQL on `customer` and a top-3 GAQL on `campaign`, cost micros
+  converted to currency units. Both platforms omit days with no delivery, so missing days are
+  zero-filled. A failed campaign ranking drops only that block. Every usable ad account of a platform
+  (up to 5, each stored account read once) is read, because Zoma itself picks one by spend (Meta) or
+  refuses as ambiguous (Google): accounts in the same currency are added together (return on ad spend
+  is then dropped), the currency with most accounts is shown, and the rest are counted in a "Not
+  included here" line. "No delivery" is only said when every account was read and none delivered;
+  accounts beyond the limit are "not checked" and never turn a result into "could not read". The Google section appears only while
+  `ZOMA_GOOGLE_ENABLED` is on (the same flag as the Google toolkit).
+- **Who:** every Zoma user (scoreboard list) who is not an internal/test/admin account or a "pal" lead,
+  has not unsubscribed, and made at least one successful call to the Zoma toolkit in the last 7 days
+  (Emma's own MCP calls, which share the event type, are filtered out by `product`). Nobody else.
+  `ZOMA_WEEKLY_REPORT_ONLY_USER_IDS` (comma list) restricts a pass to named users: use it for the first
+  send.
+- **When:** an hourly job (`ZomaWeeklyReport`, first pass 11 minutes after boot) that acts only inside
+  the send window: `ZOMA_WEEKLY_REPORT_WEEKDAY` (default 1 = Monday, UTC) from
+  `ZOMA_WEEKLY_REPORT_HOUR` (default 15, UTC) to the end of that day. A no-op unless
+  `ZOMA_WEEKLY_REPORT_ENABLED=true`. The hour cannot be set earlier than 12:00 UTC (by then every ad
+  account time zone has finished the Sunday the report ends on). `ZOMA_WEEKLY_REPORT_MAX_PER_PASS`
+  (default 200) caps one pass and logs when it is hit. A pass stops after 3 sends in a row fail, so a
+  mail outage cannot burn the week for everyone. Usage for all users is ONE range query per pass, grouped in memory.
+- **Exactly once per user per ISO week, across instances:** a conditional write claims
+  (user, ISO week) BEFORE the send; the email is built before the claim so a build failure cannot burn
+  the week. A failed send is logged and not retried that week. A transient failure reading an ad
+  account skips the user for that pass (nothing claimed, retried next hour); on the last hourly tick of
+  the window (23:00 UTC) it is reported as "could not read" instead. Expired or revoked connections are
+  reported right away.
+- **The claim row is environment-scoped.** It lives in the loop-events table, whose name is the same
+  in every environment while non-production users are clones of production (same user ids), so a
+  non-production claim carries a `nonprod#` prefix and can never block production's send.
+- **Opt-out, scoped to this email only:** `User.zomaWeeklyReportOptOutAt` (new optional attribute, like
+  `dripUnsubscribed` and `slackShipNotifyDisabled`). The users table has point-in-time recovery, the
+  attribute is already on the row the job scans, and it travels with the account. The job checks the scan
+  row, then re-reads the user consistently right before the claim and sends to the address read then;
+  an account that cannot be resolved is not emailed. The link (a token derived from the JWT
+  secret) is opaque: AES-256-GCM over the user id, so no internal id is visible in the link and any
+  change is rejected; `GET /api/zoma/weekly-report/unsubscribe?t=...` shows a
+  confirm button and changes nothing, `POST` sets the attribute with a partial update of that one user
+  (an unknown user creates nothing). The email also carries `List-Unsubscribe` and
+  `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (new optional `headers` argument on
+  `emailService.sendEmail`), and the POST accepts the token from the query string for that one-click
+  request. It does not touch Emma, outreach or any other mail.
+- **Data:** one new optional attribute on the user record; the week claim is a `zoma_billing_funnel`
+  row in the existing MCP usage-event table (new `step` value `weekly_report_claimed`, read with an
+  exact-key consistent GetItem via a new optional `get` on the event store; a new optional
+  `queryByLoopIdTsRangeAll` does the one all-users range read). No new table, index or key. Harsha to
+  confirm this is outside the data-plane gate (the user-record attribute is a model change).
+- **Known limits:** a user who deletes the account and signs up again loses the opt-out (an
+  email-keyed suppression table would fix that; it is a new table, so out of scope here). The candidate
+  list is the scoreboard's Zoma-user list, so a caller whose `products.zoma` flag was never written is
+  not emailed. A write whose own bookkeeping failed is not in the changes count, so the wording says
+  "recorded", not "made". If the mail provider is down for the first three sends of a pass, those three
+  users' week is spent (a missed weekly email was judged cheaper than a duplicate).
+- **Rollback:** leave `ZOMA_WEEKLY_REPORT_ENABLED` unset.
+
+## ENG-3131: Zoma trial paywall: reminder delivery, entitlement and cancel tracking (2026-11-17)
+
+Follow-up on the ENG-3130/3131 billing implementation (still dark behind `ZOMA_BILLING_ENABLED`).
+
+- **Day-3 email delivery.** `emailService.sendEmail` never throws; it returns `sent | suppressed | failed`. The job now acts on that: the subscription's `zoma_trial_reminder_sent_at` marker is written only after a send that was not `failed`, so a failed send is retried on the next hourly pass. A `suppressed` send (non-prod mail guard) is marked done and not counted. Staging needs the tester in `NONPROD_EMAIL_ALLOWLIST` to receive it.
+- **One send across instances.** `isCronEnabled()` is a drain flag, not leader election. Each pass first claims `(subscription, hour)` with a conditional write on the existing MCP usage-event table (`trial_reminder_claimed`); the loser sends nothing. No new table.
+- **Ad performance in the email.** Adds the account-level `zoma_ads_report` summary (Meta) for the trial window when the user has a usable ad account and delivery; otherwise the usage summary alone. Google Ads has no report yet.
+- **Entitlement.** `active` always publishes. `trialing` publishes only when the latest invoice (the $1 fee) is expanded and `paid`; otherwise the refusal and `zoma_status` say payment is pending and no second checkout is minted. The invoice of an `active` plan is not consulted, because Stripe keeps a renewal invoice in draft for about an hour.
+- **Cancel tracking.** Stripe does not substitute the session id into `cancel_url`, so the cancel redirect carries the user id plus an HMAC (`getJwtSecret`). Landing on it records `checkout_canceled` (once per user per hour). `checkout.session.expired` now records `checkout_expired`.
+- **Proven in Stripe test mode (2026-11-17):** `backend/src/scripts/zomaBillingRehearsal.ts` ran 31/31 against a sandbox with a test clock and a hosted Checkout: the $1 line is charged while `trialing`, day-3 reminder, day-7 conversion, overage and webhook claim. Still unproven: a real Meta write through staging, the real webhook endpoint config and API version, live mode.
+- **Review fixes (2 independent passes).** Funnel rows with a `dedupeKey` no longer embed the timestamp in the sort key (it made the conditional write unable to ever see a repeat, which also broke the cancel and reminder dedupe). The Zoma plan Stripe customer is created without an email and Emma's two by-email customer lookups skip customers tagged `zomaBillingUserId`, so Emma can never adopt it. A still-open Zoma Checkout (at least an hour left) is reused instead of minting a second one, so one user cannot buy two plans. A trial the user already cancelled gets no reminder and `zoma_status` says it will not renew. `paywall_shown` is recorded once per hour per surface. Paywall copy now says the card is charged automatically after the trial. `ZOMA_REQUIRE_PAYMENT_METHOD` must stay unset (it still means "card at signup").
+- **Deliberately not changed:** failed in-band results stay unrecorded in `mcp_tool_used` (it is what `zoma_usage`'s "used" count reads, so it has to equal what Stripe bills). A user can still cancel and buy another $1 trial; whether to allow repeat trials is a pricing decision for the founders.
+- **CodeRabbit round.** An older pay link no longer opens once the user has a live plan (it would have started a second subscription), and plan-state selection prefers an entitled subscription over a newer trial whose $1 has not settled. Meter sends are still fire-and-forget with no retry or reconciliation (open, low value at 1 cent per call).
+
+## ENG-3131: second review round on the Zoma trial paywall (2026-11-17)
+
+- **Reminder cannot repeat.** The "sent" marker is now written before the send. If that write fails nothing is sent (retried next hour); a failed send clears the marker so it retries. Before, a failed marker write after a delivered email could resend every hour until the trial ended.
+- **Failed payments never sell a second plan.** A `past_due` or `unpaid` plan now gets "update your card on the existing plan" (portal link when `ZOMA_BILLING_PORTAL_URL` is set) instead of a fresh $1 Checkout.
+- **Copy.** The pending-payment message no longer points at a Checkout that is already closed. The day-3 email and the done page say the card is charged automatically after day 7. A cancelled active plan shows "active until <date>, cancelled, it will not renew" (`cancels_at_period_end`).
+- **Not changed:** a user who cancelled can still buy another $1 trial (founders to decide), and two simultaneous first paywall hits can still open two Checkouts (the live-plan 410 limits the damage).
+
+## ENG-3131: Zoma launch policy: one $1 trial per user, USD-only Checkout, reads-metering copy (2026-11-17)
+
+Zoma launches to everyone at once (no pilot users), so there is no exemption list. Still dark behind `ZOMA_BILLING_ENABLED`.
+
+- **One trial per user.** A user who has held a Zoma plan before (a cancelled or paused one counts; an `incomplete`/`incomplete_expired` one that never started does not) is sold the plan itself: Checkout has the plan and metered price only, no $1 line, no trial, starting today. The refusal and `zoma_status` say "$50/month, charged today". Before, cancelling on day 6 and buying again gave another trial for $1, indefinitely.
+- **USD-only Checkout.** `adaptive_pricing.enabled=false` on the session, because every price in the tool text and email is in dollars (the sandbox Checkout showed INR with a conversion fee). The rehearsal script now asserts it; not yet run against Stripe with this change.
+- **Reads copy.** The paywall says reads and drafts are free until the plan starts, after which every successful call, reads included, counts toward the 5,000 (what ENG-3130 specifies).
+
+## ENG-3130: failed in-band Zoma calls leave an unmetered audit row (2026-11-17)
+
+- A call that reports failure in-band (`success:false`, not a PREVIEW and not a write with a
+  read-back verdict) is still not billed and not counted as usage, but it now writes one
+  `mcp_tool_failed` row (`recordMcpToolFailed`, `services/mcpUsageEventsService.ts`) from the
+  Meta/Google gateway `meter` step. Before this, such a call wrote no row at all, so a failed
+  Meta or Google write attempt left no audit trail.
+- The row carries tool name, platform, auth method, client and session only: no arguments and no
+  error text (they can hold ad copy and ids). Same table and key shape as `mcp_tool_used`.
+- It is not in `MCP_USAGE_EVENT_TYPES` and `getMcpUserUsage` counts only `mcp_tool_used`, so the
+  usage report, `zoma_usage` "used" and the Stripe meter are unchanged. An audit-write error is
+  logged and never fails the call.
+- No database or data-plane change: no table, column or index; one new `eventType` value in the
+  existing event table.
+
+## ENG-2816: schedules a share-link visitor wrote run with the visitor limits; a visitor cannot stop the owner's turn (2026-11-17)
+
+A share link runs the visitor's turn under the OWNER's userId, so a schedule a visitor created or edited (`manage_scheduled_chat`, `submit_scheduled_chat_variables`, `create_schedule_from_template`) was stored as the owner's own and its later runs got the owner's full tool set (reproduced 2026-11-05: a visitor-made schedule ran `save_memory` as the owner).
+
+- **One new optional attribute:** `provenance`, a DynamoDB String Set on `AW-TaskSchedules` items only (no table, index, IAM or template change). Members are the eight tracked content fields a visitor last wrote: `startingMessage`, `keywords`, `requiredFunctionCalls`, `functionCallMinCalls`, `variables`, `variableValues`, `emailNotifications`, `selfImprove` (a visitor switching it on would make the next run's owner-powered reflection turn rewrite the clean prompt from content the visitor planted). Absent on every existing schedule and never backfilled, so existing schedules behave exactly as before. A schedule is "marked" when the set is non-empty. Read it only through `readScheduleProvenance` (`utils/scheduleProvenance.ts`): a Set, an array and absent are fine, an unreadable value reads as marked. The db layer returns it as a sorted array.
+- **Writes:** `updateSchedule` takes the non-stored `provenanceAdd` and puts `ADD` in the SAME `UpdateExpression` as the content. `createSchedule` takes `provenance` (omitted when empty). Marks are only ever added. The whole attribute comes off through `removeAttributes: ['provenance']` (adopt only), which works whatever shape the stored value has.
+- **Who wrote it:** `ctx()` passes `restrictionProfile`, `mcpFetch` signs it into the self-call JWT as `_rp`, `authenticateToken` sets `req.restrictionProfile` only from a verified `_svc` token (a present-but-unknown value reads as the strictest profile). Second signal: an in-process marker per session id (`services/shareVisitorTurnMarker.ts`), set where a share route claims the generation lock and cleared when it is released. A write is a visitor's if EITHER says so; voice has only the claim. A restricted caller cannot use a pre-minted override token to change schedules (it cannot carry the claim).
+- **What a visitor marks:** on create, every tracked field the request carries, and a visitor-created schedule is also stored with `requirePublishApproval: true` (an existing field), so adopting it does not switch on the unattended publishing its visitor-written `requiredFunctionCalls` would otherwise read as authorized under the legacy "never asked" default; the owner turns that OFF, or grants consent, separately. The same hold covers a visitor EDIT: when a visitor write adds a publish-capable tool that was not already required (and the owner stored no consent), `requirePublishApproval: true` is written in that same write; a newly added `slack_send_message` writes `requireSlackApproval: true` (creates and create-from-template too). Only ever set to true, never for owner writes, and not when the visitor adds nothing new, so a pre-existing publishing schedule's settings are left alone. On an edit of an existing schedule, only the fields whose final written value DIFFERS from the stored one (strict deep equality, normalised as the handler normalises, against a consistent read; `selfImprove` compares as a boolean, absent = false), so sending no-op fields cannot degrade an owner's schedule. The visitor's write is also conditioned on the `updatedAt` of that read: if a second writer got in between, nothing is written and the answer is 409 "changed while your edit was being saved ... read it again and retry" (a failure that is not the version keeps its old handling). Whether a request is a visitor's is asked once, before anything is awaited, because the marker goes with the lock. A visitor's update body never writes `requirePublishApproval` or `requireSlackApproval` (neither true nor false: a false would lower an owner's hold, a true would let a visitor switch off an owner schedule's publishing without leaving a mark) and its `fullAutonomy` is ignored; for a visitor those holds are set only by the newly-added-publish-tool / `slack_send_message` rule and by visitor creates. Owner writes are unchanged. A visitor write to a template is refused (403: create, update, delete, submit-for-review; a template has nowhere to carry a mark), but a visitor can USE a template: the schedule it creates is marked in full. The emailed public variables link marks `variableValues` whenever the schedule has any mark.
+- **Enforcement is live, in `executeTool`:** for a tool call in a scheduled run (session `pageIdentifier` `...|scheduleId:<id>`), if profile `share_visitor_schedule` (same block list as `share_visitor`, its own wording) would refuse the tool, the session is read as a record (consistently, no transcript) and the schedule consistently. A schedule that was read and is marked binds everyone, attended or not. "Could not verify" (session unreadable twice, no session, no parseable schedule id, schedule deleted) refuses only a caller that says `isUnattendedRun === true` (every scheduled, test, retry and self-improvement turn does); an attended caller, such as an owner reopening an old "Scheduled: X" session, keeps its tools. A failed schedule READ in a known-scheduled session refuses everyone. The schedule-writing tools get the profile in their context, so a marked run's own `manage_scheduled_chat update` is a visitor write and can only add marks. The schedule read is retried once before a throw counts as unverifiable. Known entry that does not say it is unattended: the approval-inbox resume (`resumeOriginSession`, `isUnattendedRun` undefined), which is therefore left alone when unverifiable; a readable marked schedule is still enforced there. The per-turn Slack and publish directive reads and the mid-run refresher read the schedule consistently.
+- **Marked runs:** refused tool names are dropped from `requiredFunctionCalls` / `functionCallMinCalls` (and recorded on the run result as `skippedRequiredCalls`), retries cap at 3 (not 20), and every "unattended default = authorized" gate treats the schedule as WITHHELD until adopted: publish authorization (withhold reason `visitor_edited`), Slack sends (the directive, the required-call filter and the mid-run revocation notice, which used to default to authorized), and the owner's full-autonomy waiver. The dispatch-time publish gate and the consent guard read the schedule consistently. Editing a marked schedule's publish tools still narrows the STORED grant (`ignoreProvenance` on the resolver, used only by that write).
+- **The only way a mark comes off:** `POST /api/agent-mode/scheduled-chats/:id/adopt-visitor-edits` with `{ expectedContentVersion }`. `GET /scheduled-chats` returns a COMPUTED (never stored) `contentVersion` on every row (a row whose digest cannot be computed simply omits it; the list never fails for it): the first 32 hex characters of the sha256 of a canonical JSON of the eight tracked field values plus the sorted provenance, stable across key order and set order. It replaces `updatedAt` as the token because `updatedAt` moves for non-content reasons (run bookkeeping, cron claim/pause writes, a visitor re-submitting identical values or toggling an active schedule), so a visitor could keep adoption failing forever. Adopt: 400 without a string `expectedContentVersion`; 409 if the freshly read (consistent) schedule's digest differs (a visitor changed content or marks); the REMOVE is conditioned on the `updatedAt` just read, and if that fails the schedule is re-read and the write retried ONLY while the digest still equals the expected one (three attempts, then 409). Portal login only: refuses self-calls, delegates and visitor writes. No edit removes a mark, the owner's included (an owner who adds a third address has not reviewed the visitor's). No MCP tool body can write provenance or reach that route (source-scan test).
+- **Stop route:** `POST /ishare/:id/stop` cancels only for the owner's own login, or when the running turn was started through a share route by a visitor. The share route decides whether the REQUEST is the owner's right after it claims the lock and marks the turn a visitor's only when it is not, so an owner turn that is still starting is never marked (a visitor's stop in that gap is ignored). A non-owner's message preempts a background continuation only if it belongs to a visitor's turn; an owner's own continuation answers it like a held lock (409 SESSION_BUSY, body unchanged). The OWNER logged in on their own share link, and the authenticated /generate path, preempt as before (the owner check is asked only in the failed-claim branch). If the later owner-turn decision says not-owner after the first said owner, the turn is marked then too. An ignored stop answers the same `200 {success:true}`, does not call `markProgressComplete`, and leaves no cancel flag. Until the portal sends the viewer's login on a conversable stop, an owner stopping their OWN turn from their share link is ignored (portal follow-up).
+- **Known gaps (not closed here):** a visitor-written template the owner later uses (or duplicates) is unmarked; approval-inbox and work-plan continuations of a visitor's SHARE session run without the share flag; schedules a visitor made before this shipped cannot be told apart (no backfill); the marker is per process; an attended owner typing inside a marked run's session stays restricted (the transcript carries visitor text) and their edit there is stamped as a visitor edit until adopted; an unmarked schedule that becomes marked sends the owner no notification; a visitor can still toggle, retime, pause or delete the owner's schedules, and `llmModel`, timing, name and description are untracked. The legacy tools `manage_task`, `execute_task` and `manage_schedule` are not offered to a share visitor (they are only in the MCP registry, not bridged into the in-app registry).
+- **Residuals, accepted:** (1) the Slack hold keys on the required-calls list: a visitor prompt that sends to Slack without listing `slack_send_message` is not held after adopt (the owner adopts content they were shown). (2) The variable-link submit by a visitor is unconditioned (no `updatedAt` condition, unlike a visitor edit). (3) The `updatedAt` conditions on a visitor edit and on adopt can give a retryable 409 when run bookkeeping writes the same row between the read and the write.
+
+## ENG-2812: session-breaker shadow is on by default, because prod EB cannot take another env property (2026-11-17)
+
+- `SESSION_BREAKER_SHADOW=true` was tried on prod EB on 2026-11-16 17:33Z. CloudFormation refused the update ("Parameter 'EnvironmentVariables' default value ... length is greater than 4096"): prod has 88 env properties totalling about 4,180 characters. EB rolled back by itself (no instance launched, version label unchanged, health Warning for about a minute, then Green/Ok). Any new prod env flag hits the same wall until properties are freed.
+- `readSessionBreakerShadowConfig` now returns a config unless `SESSION_BREAKER_SHADOW` is `false`, `0` or `off` (trimmed, case-insensitive). Caps are still `SESSION_BREAKER_SHADOW_MAX_TURNS` (40) and `SESSION_BREAKER_SHADOW_MAX_SPEND_USD` ($5). Behaviour is unchanged otherwise: one `session_breaker_would_pause` log line per cap multiple, never pauses, never writes, never notifies; accumulators are in-memory per instance.
+- Turning it off in prod needs an EB env property (which would hit the same cap) or a revert of this change.
+- Read the evidence in CloudWatch (`/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`), filter `session_breaker_would_pause`.
+
+## ENG-3134: Zoma redesign — agent-first onboarding without Emma, pal classification, zoma_ads_report (2026-11-16)
+
+- MCP `initialize` carries `instructions` opening with "Hey, welcome to Zoma."; the first `zoma_status` is that greeting plus the one ads-experience question (no checklist).
+- MCP users' Meta connect link signs `zoma: "mcp"` into the OAuth state; `/api/oauth/meta/callback` forwards it to `/api/zoma/meta/callback`, which finalizes for the state's user on Zoma pages (picker link carries `uid`). The card return is `/api/zoma/done?mcp=1`. Nothing in the Zoma flow points at app.agentweb.pro except the OAuth consent page.
+- Every MCP tool result gets a `Next step:` block (REST: `next_step`), except `zoma_status` and the friend path; shared Meta refusals have "Settings -> Connected accounts" rewritten for Zoma at the transport only (Emma text unchanged).
+- Friend answer = exactly "Thanks for signing up and trying out Zoma."; scoreboard exclusion value is now `pal` (was `not_interested`), `summary.palUsers` added.
+- `zoma_ads_report`: one paged Graph insights read (max 10 pages; larger reports are refused, never partial). ROAS is always purchase value / spend.
+- Production cleanup candidates (4 test rows) and backup were prepared; the delete itself was not run (permission denied) — see the PR.
+
+## ENG-3130/3131: Zoma $50 plan + $1 trial paywall, dark behind ZOMA_BILLING_ENABLED (2026-11-16)
+
+- **Plan:** $50/month, 5,000 successful tool calls included, then 1¢/call. A call is billable only
+  if it succeeded: thrown calls were never metered, and now in-band failures (`success:false`
+  that is not a PREVIEW or a write with a read-back verdict) are not metered either
+  (`isBillableResult`, `mcp/zomaBilling.ts`). This also removes those failures from
+  `mcp_tool_used` analytics.
+- **Paywall:** only writes that make ads live (Meta `UPDATE status=ACTIVE`; Google Ads
+  `status=ENABLED`) need the plan. Gated in `metaToolkitGateway.ts` before dispatch, preview
+  included. Reads, drafts, paused creates, pauses and edits stay free. The refusal carries a pay
+  link the agent relays (`/api/zoma/billing/checkout/<cs_id>` → Stripe Checkout).
+- **No new persistence.** The plan lives on a Zoma-only Stripe customer
+  (`metadata.zomaBillingUserId`, never `metadata.userId` or the user row's
+  `stripe_customer_id`), so the Emma subscription code cannot pick it up. Plan state is read
+  live from Stripe. Funnel events (`zoma_billing_funnel`) are rows in the existing MCP usage-event
+  table. The day-3 reminder marker is subscription metadata (`zoma_trial_reminder_sent_at`).
+- **Webhook:** `handleZomaBillingWebhookEvent` runs first in `stripeController.handleWebhook` and
+  claims any object tagged `metadata.product=zoma_plan` (sessions, subscriptions, and their
+  invoices via `subscription_details.metadata`), so the Emma tier-sync handlers never see them.
+- **Stripe setup:** a Billing Meter (event name `zoma_tool_call`, sum aggregation, payload key
+  `value`, customer key `stripe_customer_id`); a $50/month licensed price; a metered,
+  *graduated* monthly price on that meter with tier 1 = 0–5,000 at $0 and tier 2 = $0.01/unit;
+  a one-time $1 price. Enable `checkout.session.expired` on the webhook endpoint.
+- **Not yet verified against live Stripe:** that the one-time $1 line item is charged at checkout
+  when the subscription starts in trial. Confirm in test mode before turning the flag on.
+
+## ENG-3129: Zoma refuses Meta creates without Page access (2026-11-16)
+
+- Zoma's Meta write toolkit now refuses CAMPAIGN / AD_SET / AD CREATE (`metaToolkitWrites.ts`) and
+  AD_CREATIVE CREATE / BULK_CREATE (`metaToolkitCreatives.ts`) when the stored Page probe says
+  `getMetaPagesAccessState(config) === 'missing'`. The check runs right after the ads_management
+  check and before any preview, money normalization, upload or dispatch, so Meta is never called.
+  Preview and confirm calls are both refused.
+- The refusal (`mcp/metaPageAccessRefusal.ts`) is `getMetaAdsNoPagesMessage` (names the Page when
+  the account's existing ads use one), "nothing was sent to Meta", then numbered steps: grant this
+  Facebook user "Create ads" (Advertiser) access on Page X in Business Settings, reconnect with the
+  one-click link (`buildMetaConnectUrl(userId, 'marketing')`, the link `zoma_status` uses), choose
+  Edit access and select Page X. AD_CREATIVE uses the request's `page_id` as Page X. If the link
+  can't be built, the text says to run `zoma_status` for it; the refusal still happens.
+- Not gated: never-probed (`unknown`) and granted Page access, UPDATE/lifecycle writes, image/video
+  uploads, and every read (ENG-2822: Page access gates create only).
+- `ads_get_errors` (`explainMetaError`) accepts an optional `message`. Code 283, and codes 10 /
+  200–299 whose message names a Page / `page_id` / `pages_*` permission, return the same Page
+  message and fix steps (`page_access: "missing"`) instead of the generic code-200 hint. The
+  experiment-writes refusal now passes Meta's message through to it.
+- `META_BUSINESS_PAGES_SETTINGS_URL` moved to `metaPageAccessRefusal.ts`, re-exported from
+  `zomaOnboarding.ts`.
+
+## ENG-3128: Zoma asks "How familiar are you with ads?" after signup (2026-11-16)
+
+- One directed question, asked before any other setup step, on three surfaces: the device-flow
+  browser page (`POST /api/zoma/ads-experience`), the setup poll (`next_step: "ads_experience"`,
+  answer sent back as `ads_experience` in the poll body), and `zoma_status` (`ads_experience` arg).
+- Answers (`AW-Users.zomaAdsExperience` + `zomaAdsExperienceAt`, written via `userDb.updateUser`):
+  `runs_ads` -> connect ad accounts -> card -> done; `new_to_ads` -> setup guide (Meta Business
+  portfolio, Facebook Page, ad account; Google Ads) then connect; `not_interested` -> thank-you,
+  no further steps, no Zoma token from the poll.
+- `not_interested` users are listed but excluded from the scoreboard summary
+  (`excluded: "not_interested"`) and never due / stalled / needing help in the activation queue.
+- `zoma_status` order changed to ad accounts before the card (the device flow already did this).
+- Users who signed up before this ship have no answer, so their next `zoma_status` / setup poll
+  asks the question once before resuming where they were.
+- Not changed: `zoma_status`'s non-device payment link still returns to the portal settings page
+  (`/settings?zoma=payment_method_added`); the card requirement is paused by default.
+
+## ENG-3127: Zoma auto-selects the active Meta ad account (2026-11-16)
+
+- `backend/src/mcp/metaToolkitGateway.ts`: when several usable Meta ad accounts are connected and the call has no `account_id`, `resolveMetaToolkitAdAccount` probes last-30-day spend (Graph insights) and runs against the one account with strictly highest spend > 0. Cached 10 min per user. A tie or no spend still refuses, and the refusal now lists every account as `name (id)`.
+- `backend/src/mcp/zomaOnboarding.ts`: the ENG-3078 Page step in `zoma_status` now starts with "Reading your Meta campaigns and reports works. Creating new ads is blocked until this is fixed:".
+- Tests: `backend/src/__tests__/eng3127.zomaActiveMetaAccount.test.ts`, updated `eng3078.zomaStatusPageAccess.test.ts`.
+
+## ENG-3123: Pure post-performance analyzer (2026-11-16)
+
+Added `backend/src/services/socialPostPerformance.ts`: pure analysis over getPostsForUser posts (engagement rate, within-platform ranking, quartiles, feature deltas). Not wired anywhere yet; no storage, route, or copy.
+
+## ENG-3120: Daily capture-drift sweep for generated landing pages (2026-11-16)
+
+metaTrackingMonitorCron now runs detectCaptureDrift over every non-archived generated page with a repo and a Meta pixel (GitHub contents GET on main only) and files one lp-capture-drift oncall alert per drifted site, deduped 24h in memory. Read-only; no re-injection.
+
+## ENG-3111: login makes one user read and one user write (2026-11-16)
+
+`POST /api/auth/login` (`backend/src/controllers/auth.ts`) made three DynamoDB round trips in a
+row: a query on `EmailIndex`, then, inside `userDb.updateUser`, a query on `UserIdIndex` to
+recover the email the caller already held, then the update, which also asked for the whole
+updated row back and discarded it.
+
+- The read is now `userDb.getUserByEmailConsistent(email)`: a GetItem on the table's primary
+  key. `EmailIndex` projects all attributes (checked on `AW-Users` and `Dev-AW-Users`), so the
+  record has the same fields. The read is now strongly consistent; the index read was not.
+- The last-login write is now `userDb.recordLogin(email, userId, { lastLoginTime, lastTouch? })`
+  in `backend/src/services/db.ts`: one UpdateItem keyed by email, no read, no returned row. It
+  writes the same two attributes as before.
+- `recordLogin` carries the condition `userId = :userId`. An UpdateItem on a missing key creates
+  the item, so without the condition a login racing an account deletion would leave a stub row.
+  A failed condition is logged by `login` like any other failure of this write, and login still
+  succeeds, as before.
+- No table, index or stored field changed. `updateUser` and `getUserByEmail` are untouched and
+  still used elsewhere.
+- When the last-login write fails there is now one log line ("Error updating last login time")
+  instead of two (the "DynamoDB updateUser error" line came from `updateUser`).
+
+## ENG-3101: LinkedIn write routing no longer substitutes an account with a dead session (2026-11-16)
+
+`routeLinkedInWriteToAccountWithHeadroom` (`backend/src/services/agentMode/linkedInAccountRouting.ts`)
+took the first other account with daily headroom and no invitation cooldown. It never asked
+whether that account's LinkedIn session was alive. In the 2026-11-11 scheduled run five
+`send-invite` calls were routed off a capped account onto one already known to be disconnected
+and were refused as "LinkedIn account disconnected", while four live accounts were available.
+
+- A candidate that passes the cooldown and headroom checks is now probed with
+  `linkedInOutreachService.probeAccountSession` (the 10-minute-cached probe the write preflight
+  uses). `disconnected` skips it and the scan continues. `unknown`, or a probe that throws, does
+  not exclude it.
+- If every other candidate is disconnected the router returns `null`, so the caller gets the
+  existing daily-cap refusal for the account it asked for. No new text.
+- Only a candidate that would otherwise be chosen is probed: never the requested account, never
+  a capped or cooling-down one, none after the pick.
+- The router stays read-only. Each skipped dead candidate is passed to an optional
+  `onDisconnectedCandidate` callback; `backend/src/emma/impl/linkedin.ts` uses it to call
+  `recordUnipileAccountHealth` with the arguments the preflight used when the write was routed
+  onto that account, so the stored flag and the owner alert that follow from it are unchanged.
+- Not in this change: the "disconnected" refusal text still names no account (ENG-3097).
+- Tests: `backend/src/__tests__/linkedInAccountRouting.test.ts`,
+  `backend/src/__tests__/agentModeService.linkedInOutreach.test.ts`.
+
+## ENG-3095: daily domain check now probes landing-page hosts that have no domain record (2026-11-16)
+
+`backend/src/cron/domainReachabilityCron.ts` only probed hosts that have an `AW-CustomDomains`
+row. A deployed page whose stored `agentwebforms.com` host has no row was never probed, and
+`reconcileUnregisteredDomains` deliberately does not create one. Two such pages served an
+expired certificate from August to November 2026 unnoticed.
+
+- `selectRowlessManagedHosts` finds deployed pages whose managed host has no row.
+  `probeRowlessManagedHosts` probes each with the monitor's own `probeDomain`. A failing host is
+  probed a second time in the same run; only two failures in a row count as failing.
+- One new log line per run:
+  `[DomainReachability] rowless-managed-hosts=N failing=M :: page=<id> host=<host> result=ok(200) ; page=<id> host=<host> result=FAILED(suspect CERT_HAS_EXPIRED)`
+- When at least one host fails, one `emailService.sendOncallAlert` per run lists the failing
+  hosts. Internal oncall list only, production only (the helper suppresses it elsewhere).
+- Nothing is written for these hosts: no row, no field, no page change. That also means there is
+  no memory between runs, so a host that stays broken is alerted once every day until its record
+  is fixed.
+- `SweepSummary` gains `rowlessManagedHosts` and `rowlessManagedFailing`.
+- Tests: `backend/src/__tests__/cron.domainReachabilityRowless.test.ts`.
+
+## ENG-3092: no run-wide LinkedIn invite-block notice when a later invite went out on another account (2026-11-16)
+
+- `backend/src/controllers/agentModeController.ts`, `detectLinkedInInviteSendBlock`: a failed send-invite that matches the disconnected, cooldown or pacing pattern no longer produces the run-wide notice if a later send-invite in the same run succeeded on a different account. The session note, the owner email text and the oncall alert all read this one value.
+- Unchanged: a block with no later invite, with only failed later invites, or with a later success on the same account keeps its notice.
+- No new owner-facing text. What the owner is told when one of several accounts is disconnected is ENG-3097.
+- Cause on 2026-11-11 (session 97d98044): 5 invites refused on a disconnected account, 10 sent on a second account, and the owner was told "No invitations can be sent".
+- Tests: `backend/src/__tests__/eng3092.linkedInInviteBlockLaterSuccess.test.ts` (9 cases).
+
+## ENG-3089: fill_form kept failing on a missing field type after the name repair (2026-11-16)
+
+- After #3927 (ENG-2858) repaired a missing `fields[].name`, `playwright_browser_fill_form` kept failing. Read from the loop events: four failures after the merge, three with `fields[0].type` invalid (name present, no type) and one with `selector` in place of `ref`. None was a stale ref or page state.
+- The gateway repair now sets `type: "textbox"` on a field that has a text value and no type. It does not overwrite a type the model sent and does not guess for a value of `true` / `false`, which is a checkbox or radio.
+- A field with no `ref`, or with a missing or unknown type that was not repaired, is rejected before the call with a next-step message (take a snapshot, retry with the ref; or the list of valid types) instead of the Playwright MCP zod dump. `@playwright/mcp` 0.0.70 declares `ref` as a required string, so these calls could not succeed before either.
+- If a defaulted textbox is really a select or checkbox, Playwright's `fill` throws on it. That is a visible error, not a wrong write.
+
+## ENG-3088: failure-cluster "Recurred" comments now need a new failure (2026-11-16)
+
+- The agent-mode failure-cluster loop reads a rolling 7-day window, so a tool whose fix has merged stays over threshold until its old failures age out. Intake posted `Recurred on <date>` every day from the same failures. Checked on ENG-2938: all three `get_ads_thresholds` failures were 11-11 10:04Z to 10:33Z, #3983 merged 11-11 22:10Z, and the two calls after it succeeded. The 11-12 to 11-15 comments were those same three failures.
+- `ClusterIntakeTool` now compares each cluster's failure times with the newest of: the canonical's creation time, and its `Recurred on` / `Reopened` comments. No failure newer than that: no comment and no reopen. Otherwise it posts as before with one more line, `New Since Last Comment: N of M failures`.
+- The baseline is read back from Linear. Nothing new is stored. `failureTimes` sits on the proposal payload as a non-enumerable property because the proposal is JSON-serialised into the learning store and the fix spec; spreading or cloning the payload drops it, and intake then posts as before.
+- Fails open: no timestamps, no canonical, or a comment read error all take the old path.
+- Known gap: a failure recorded in the seconds between a run's event read and its comment is older than that comment, so it is never counted as new. It still counts toward the threshold.
+
+## ENG-3087: staging-env-override.sh matches the staging environment by exact name (2026-11-16)
+
+- `.github/scripts/staging-env-override.sh` used to accept any environment whose name contained "staging". The real backend staging environment is `Agentweb-backend-env-1`, so the script refused the only environment it was written for, and the ENG-2353 kill-switch proof could not run.
+- It now runs only when `EB_ENVIRONMENT_NAME` is exactly `Agentweb-backend-env-1`. It refuses `Agentweb-backend-env-prod-3` with its own message, and refuses every other name. Both names are `readonly` constants, so no caller variable can widen the guard. A rename means editing the constant and the test.
+- `AWS_REGION` now defaults to `us-west-2`. The old default, `us-east-1`, has no Elastic Beanstalk environments, so the script could not have found staging there.
+- `docs/staging-env-overrides.md`: the two names are variables on the GitHub `staging` environment; the lookup is `gh variable get <name> --env staging`. Without `--env` it reports "not found".
+- Tests: `.github/scripts/staging-env-override.test.sh`, 22 checks. `show` was run once against real staging (read-only) and returned no rows: no `LEAD_MAGNET_*` override is set. `set` and `restore` were not run against a real environment.
+
+## ENG-3082: eb-deploy.sh no longer fails a serving release whose version label has not moved (2026-11-16)
+
+- `.github/scripts/eb-deploy.sh`: when the deploy budget runs out with the environment `Updating` on the previous version label, `verify_deployment` now calls `release_serving_while_old_instances_terminate` before failing. It reports success only if all three hold: EB's events show "Deployment succeeded. Terminating old instances and temporary Auto Scaling group." after the last "Environment update is starting." since our update was accepted; at least one instance reports the expected version as `Deployed` with health `Ok`; and each such instance is registered with the load balancer and `healthy` in every target group that lists it. Each read in the check has a 15 s read timeout.
+- The check runs only at the point where the deploy would otherwise fail. It never ends a deploy early.
+- It uses calls the script already makes (`describe-events`, `describe-instances-health`, `describe-environment-resources`, `describe-target-groups`, `describe-target-health`). The instance read adds the `Deployment` attribute to the same API action.
+- Cause on 2026-11-16 (run 43832897163): EB moves the environment's version label only when the old instance is gone, which took 17 minutes; the run had also waited 18 minutes behind an earlier update.
+- Tests: `.github/scripts/eb-deploy.test.sh`, section ENG-3082 (17 checks; 126 in total).
+
+## ENG-3079: client health reports whether the Meta optimisation event is arriving (2026-11-16)
+
+- `assess_client_health` → `ads_layer.meta_connection_health.selected_event` was the literal `'unknown'`. It is now read live for a client with a connected Meta ad account: `readSelectedEventState` in `backend/src/services/clientHealthService.ts` calls the tracking monitor's own `fetchOptimisationInputs` and `evaluateAccountOptimisationCoverage` (`metaOptimisationCoverage.ts`). Nothing is stored.
+- `missing` is the monitor's confirmed case (what it would alert on). `recent` means a pixel reported an optimisation event in the pixel's own window (about 24 hours) and nothing is confirmed missing. Everything else, including a failed or slow read, is `unknown`.
+- The read starts beside the campaign reads and is cut off at `SELECTED_EVENT_READ_TIMEOUT_MS` (8 s).
+- The monitor verdict gained an `arriving` list; the monitor itself does not read it.
+- Not included: the monitor's day-1 detection, which needs the account-level history the health check does not fetch.
+- Tests: `backend/src/__tests__/eng3079.clientHealthSelectedEvent.test.ts`.
+
+## ENG-3078: zoma_status shows a missing Facebook Page as the next step (2026-11-16)
+
+- `backend/src/mcp/zomaOnboarding.ts`: when payment and an ad platform are ready, `getZomaReadiness` now sets `next_step` to the stored Page refusal (`getMetaAdsNoPagesMessage`, same text the ad write gate returns) for any usable Meta account whose `has_meta_pages` is `false`. `zoma_status` therefore no longer prints "All set" for that user.
+- The Meta account summary carries `page_access: 'missing'` only in that case. Granted and never-probed accounts get no new field and the same text as before.
+- Nothing is probed live and nothing is stored. `meta.ready`, `writes_enabled`, `assertZomaWriteReady` and the device-flow poll are unchanged.
+- Tests: `backend/src/__tests__/eng3078.zomaStatusPageAccess.test.ts`.
+
+## ENG-3069: admin read of a managed client's Meta budgets and spend for an exact window (2026-11-16)
+
+- New admin-only, read-only MCP tool `read_client_meta_budgets` and route `GET /api/client-health/:clientEmail/meta-budgets?since&until` (`backend/src/services/clientMetaBudgetsService.ts`). Uses the ENG-3070 helpers `findClientMatches` and `resolveClientMetaAccount` with the same refusals as `read_client_meta_activity`; a failed Meta read is reported as `meta_read_failed`, never as zero spend.
+
+## ENG-3066: unattended scheduled runs get the compact brand block up front (2026-11-16)
+
+`prepareTurnContext` (`backend/src/services/agentModeService.ts`) now adds one system message to a scheduled session's unattended turn: the compact brand block from `brandMessagingContextFromGuidelines`, read through `readBrandGuidelines` (so an org member gets the org's brand). It goes after the conversation and before the unattended publish directive, which stays last (ENG-827). `unattendedBrandContextMessage` in `backend/src/services/brandMessagingContext.ts` builds it and returns an empty string when there are no usable guidelines or the read throws; the run continues either way.
+
+Size: a 264-character lead-in plus at most 1,500 characters of brand block, on every turn of an unattended scheduled run for an account that has brand guidelines, whether or not the run writes outreach. Attended turns, including a scheduled session reopened in chat, are unchanged.
+
+Not covered: unattended runs whose session type is not `scheduled`.
+
+## ENG-3064: LinkedIn Ads updates are read back before they are reported as done (2026-11-16)
+
+Five update paths in `backend/src/services/linkedInAdsService.ts` returned the PARTIAL_UPDATE result as-is: `updateCampaignGroup`, `updateCampaign`, `updateCreativeStatus`, `retagCreativeUtm` (text ad) and `retagPostUtm`. Each now GETs the resource after a successful update and compares the requested fields (`verifyUpdate`). A field that did not land returns `success: false`, `errorType: 'unsupported_field'` and the field list; a failed read returns `errorType: 'read_back_failed'`. `callLinkedInMarketingApi` returns both to the tool as typed failures instead of throwing.
+
+Not verified, with reason: `setConversationAdFirstContent` (LinkedIn documents the first-message field as update-only and its GET example does not return it) and the `targetingCriteria` field of a campaign update (echo shape unconfirmed). Creates and upload steps are exempt as in the Google slice. The list lives in `backend/src/__tests__/eng3064.linkedInAdsReadBack.test.ts`, which fails when a new mutation-shaped export is neither verified nor exempt.
+
+None of this has run against a real LinkedIn ad account; the read endpoints and echo shapes come from LinkedIn's docs and the existing creative/post GETs in the same file. Seen while reading the docs, not changed: `setConversationAdFirstContent` sends `firstContent`, and LinkedIn's current Conversation Ads page names the field `firstMessageContent`.
+
+## ENG-3047: one run per scheduled fire in the due-schedule loop (2026-11-16)
+
+- `runScheduledChats` (`backend/src/controllers/agentModeController.ts`) now passes the due time it
+  and the last run time it read to `scheduleDb.updateScheduleAfterRun` when it advances a schedule
+  to start a run. The write carries a `ConditionExpression` on both (`attribute_not_exists` for a
+  schedule that has never run), so it lands only if the row is still as it was read. The last run
+  time moves on every fire, so putting an old due time back does not let a stale caller through.
+- The loop reads both values from `StatusStartTimeIndex`. That index projects all attributes
+  (checked on the production and dev tables 2026-11-16). If its projection were ever narrowed to
+  exclude `lastRunTime`, every schedule that has run would be refused.
+- A caller whose advance is refused starts nothing, decrements nothing, and reports
+  `already_started` for that schedule. Any other write error is handled as before.
+- `updateScheduleAfterRun` takes the expected value as an optional fifth argument. Every other
+  caller (delayed, waiting-for-variables, retries, the social engagement executor) passes none and
+  keeps the unconditional write.
+- Not behind `AGENT_RUN_STORE`; it applies wherever the due-schedule loop runs. No table, key,
+  index or attribute change. `scheduledIdempotencyKey` still has no production caller.
+- Also corrects a stale comment in `chatBranching.ts` that said the run store is off in production.
+
+## ENG-2988: file access by key, and the public subscriber routes (ENG-2990, ENG-2991) (2026-11-16)
+
+**What was wrong.**
+- `GET /api/files/presign` (`key=` and `url=`), `POST /api/files/presign-batch`, `GET /api/files/content` and `POST /api/files/html` acted on any key of the file bucket for any signed-in user. Reproduced on the test environment with an organisation-less, non-admin user: it could sign, read, and overwrite another account's files (`html` saved over them).
+- `GET /api/tasks/:taskId/subscribers` needs a login but returned the full subscriber records (emails, imported fields, email history, feedback) of any task to any signed-in user.
+- The public `POST /api/tasks/:taskId/subscribers/join` wrote a row for any task id, with no rate limit and no confirmation, and sent a welcome email from the task owner's account to whatever address was typed. The public `POST /api/tasks/:taskId/resubscribe` reversed an opt-out from a task id and an email address alone.
+
+**What changed: files.**
+- `services/storageAccessPolicy.ts`: one policy for the four file routes, run on the exact key that is signed, read or written. Canonicalise (no dot or empty segments, backslash, control characters, over 1024 characters; `?` and `#` only where they were escaped in a URL path; a URL path is decoded once, a stray `%` is taken literally; one leading `s3:` is stripped), then decide by key shape: owner, same-organisation teammate (reads only: `users/<id>/files|brand|remotion`, execution files, task files under the knowledge-base share rule), real admin (not a delegated session, not an in-process tool call), else refused. An execution folder must belong to the task in the key (and if the execution lookup fails the answer is "try again", not a fall-back to the task). An id in a key that cannot be a real id (not letters, digits, `_` or `-`, or over 128 characters) is refused without a database lookup. `users/anon_*` (an anonymous visitor's plan session, which moves to their account at sign-up but keeps the key) is readable by any signed-in user and writable by an admin only.
+- One request may look up at most 10 records that turn out not to exist (users, tasks, executions, sessions, organisations; records that exist do not count): a batch of 50 URLs naming 50 made-up owners would otherwise cost 50 reads. A lookup that throws counts too. Past the limit nothing new is read, a record counts as not found and the request is marked failed, so every rule that falls back when a record is missing (an execution whose row is gone) refuses instead and a refusal is reported as "try again" (one `storage_access_lookup_limit` log line per request). The one side effect: in a batch that has already met ten missing records, a later record that does exist (even a teammate's) is refused as "try again" and silently omitted; one key needs at most four distinct lookups, so single-key calls cannot reach the limit. Answers: 404 "File not found." (the portal words 401/403 as "session may have expired"), omitted in a batch; 403 "You can view this file, but only its owner can change it." when a teammate tries to save over a file they can open; 503 "try again" when the check itself could not run (a lookup threw). Refusals are logged as `storage_access_denied` with the kind of file (a fixed list, nothing caller-chosen), reason and caller, never the key; a failed lookup as `storage_access_lookup_failed`.
+- `/html` authorises the key the upload will really write (`uploadFileToS3WithPath` rewrites odd characters in the file name; `sanitizeS3Filename` is exported from `s3Utils`; a name that rewrites to `..` is refused). Signing uses the decoded key, so names with spaces or non-ASCII characters presign the right object (they signed the wrong one before). The unrouted `viewExternalFile` (an unchecked fetch of any URL, never mounted) is removed. New narrow read `taskDb.getTaskExecutionOwnerById` (owner and task id only) so an execution-file check does not read the whole execution row.
+
+**What changed: subscribers.**
+- List: task owner or admin only.
+- Join (`POST /:taskId/subscribers/join`) is a double opt-in. The address must be a plain, strictly valid address of at most 254 characters (the old pattern backtracked badly: about 1.4 seconds for 20,000 characters, and the body limit is 50 MB). The task must exist. 10 attempts an hour per connection; per task and mailbox one confirmation per 30 minutes and per mailbox (plus-tags, case and Gmail dots folded) 5 an hour across tasks (both answer exactly like a normal sign-up, so the form cannot probe), per task 300, per task owner 600 and in total 3000 an hour (these answer 429 "try again in a little while" so nobody waits for mail that was never sent); the counters are in memory per instance and bounded; a failed send gives the slot back. At most 50 confirmation emails may wait in the shared outgoing mail queue (Resend sends about two a second for the whole app), so a burst cannot delay everyone else's mail for more than about half a minute: the next sign-up gets the same 429. If the task owner's own sender is refused (an unverified domain, a revoked key) the confirmation goes out from the system address instead, naming no task, and a send that fails altogether is logged as `subscriber_join_confirmation_not_sent` (no address). An already-subscribed or opted-out address gets the same 202. Nothing is stored until the person confirms.
+- Confirm: `GET /:taskId/subscribers/confirm?token=` (48 hours) only shows a page with a button (mail scanners and link previews open every link; HEAD changes nothing); `POST` on the same path subscribes (the welcome email follows). The page is sent with `Referrer-Policy: same-origin` and a content-security policy of `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`. **It must not use the API-wide `no-referrer`** (and the confirm path is also exempt from the app-wide origin check in `app.ts`, like the join route: the signed link is the credential, no cookie is sent, and the button then works on any deployment, not only those on the origin list): under that policy a browser labels a form POST `Origin: null` even to the same site, and the app-wide CORS check rejects that with 403, so the button would never work (found in review; the same trap `routes/zoma.ts` documents). `subscriberConfirm.realApp.test.ts` boots the real app and posts with the Origin a browser would send for the page's own policy. A link sent before the person unsubscribed no longer works (compared with the opt-out time); the address is matched to an existing row in any letter case (rows are stored as typed), so the person is not added twice, and the resubscribe of an opted-out row is one conditional update that applies only while the row is still opted out at the time just checked: that reads the task's address list narrowly (email, unsubscribed, unsubscribedAt), shares one read between simultaneous callers, keeps it 10 seconds (at most 200 tasks and 150,000 addresses, least recently used out first, dropped after any add or remove through the owner, admin or auth routes), and re-reads the matching row before deciding (`services/subscriberLookup.ts`); and the insert is conditional so two simultaneous confirmations create one row.
+- Unsubscribe is one atomic conditional update (`softUnsubscribe(..., { onlyIfActive: true })`) and returns a resubscribe token (24 hours) only to the call that really flips the row. An address that has already opted out, or a call that lost a race, gets none (otherwise anyone could mint one and undo the opt-out), and that call also gives the opt-out a new random nonce (`refreshOptOut`, which does not touch `unsubscribedAt`: that stays the record of when the person opted out, and the rule that refuses a confirmation link sent before the opt-out depends on it), which voids any token someone obtained for the earlier opt-out (otherwise whoever unsubscribed an address a moment before the person did could undo the person's own opt-out). If the refresh finds the row put back to subscribed in between, the call unsubscribes it after all (up to three rounds, then 503 "try again"); a refresh that cannot be made is also a 503, never "done", because the earlier token would stay alive. Every opt-out writes a fresh `optOutNonce` on the row. The token names the address exactly as stored (rows are case-sensitive) and that nonce: resubscribe checks both against the row, so a token cannot be replayed after the person opts out again or has been put back, nor carried to another spelling of the address; and the resubscribe itself is one conditional update (`resubscribe(..., { onlyIfOptOutNonce })`), so a re-opt-out between the check and the write is not reversed. The confirm page and its button share a limit of 300 an hour per connection (answered with a plain page and 429, before any database read; a mail gateway opens every link it scans). The public unsubscribe and undo calls are limited to 300 an hour per connection (one counter for both calls and all tasks: a shared office or campus address may hold many people), the status check to 600. The join, confirm and undo routes parse their body with an 8 kb limit, and unsubscribe with 32 kb (its feedback note is cut to 2000 characters by the route, so a long note must not block an opt-out), before any limiter runs, for the path in any letter case and with a trailing slash like the routers: a larger body is answered 413 and any other 4xx body-parser error (bad JSON, too many form fields, a broken gzip body, an unsupported charset) 400, locally, not as a server error, so an anonymous caller cannot make the app buffer the global 50 MB or fill the error reports. The subscriber reads in these routes are strongly consistent. The public status route returns only `{email, unsubscribed}`. Public routes answer 400 for non-text addresses and a generic message on a 500 instead of the database's.
+- Tokens are signed with an HMAC-derived key (not the login secret), HS256 only, bound to purpose, task and lower-cased email.
+- The confirmation email: from the task's own sender the subject carries the task name (one line, 80 characters); from the system address the subject is fixed ("Please confirm your subscription") and the name is bounded in the body; it reports whether it sent. The address pattern also refuses leading, trailing and doubled dots and accepts punycode domains.
+- Customer portal (separate PR, deploy it first): the unsubscribe page keeps the token for the undo and offers it only to the person who has just unsubscribed; the embed snippet shows the server's "check your email" message; a presign 404 opens the file directly, only for an https address of our own bucket (a temporary stopgap so signed-in people viewing a shared chat can still download); the artifact panel says why when a save is refused.
+
+**Mail-relay risk that is only reduced, not removed.** (The in-flight cap of 50 keeps it from slowing other mail by more than about half a minute.) The join form sends mail from the task owner's connected sender (or from AgentWeb's system address) to an address anyone types. The limits above (10 an hour per connection; per address; per mailbox; per task 300, per owner 600, in total 3000 an hour) bound it, but there is no CAPTCHA or signed form token, so a determined attacker with many connections can still use up a task's, an owner's or the whole service's allowance (the form then answers 429 for everyone) or send a bounce trap to an owner's domain. From the system address the task name is not printed at all. Recommended follow-up (a product decision, not made here): a CAPTCHA (for example Cloudflare Turnstile) or a short-lived signed form token on the embed snippet, and an alert on the `subscriber_join_throttled` log line with `cap` of `all` or `owner`.
+
+**What it does not do: it does not make the file bucket private.** `agentweb-user-files` still allows public reads by raw URL (no S3 public access block; `docs/disaster-recovery-investigation.md` item P0-4, skipped in March until the code stopped using raw URLs). An unsigned GET of a fresh upload returned 200 on the test environment. Some keys have no random part (`screenshots/<execution id>/<epoch>.jpeg`, `blog-<ts>-repaired.html`) and can be guessed. Making the bucket private means moving every raw-URL image and link (chat, shares, CRM exports, emails) to signed links and then enabling the block: an access-policy change that needs Harsha. This change is the prerequisite (once the bucket is locked the API door must already check ownership). `/asset/:assetHash` is public by design (email images) and is unchanged.
+
+**Known limits.** The join limit (10 attempts an hour) counts every attempt from a connection across all tasks, so visitors behind one shared address (a campus, an office, a mobile carrier) can be told to try later on an embed form. An opted-out address that asks to subscribe again through the form is sent a confirmation email like anyone else (the form is the stated way back; at most 5 an hour per mailbox): a product decision whether to hold those back. The confirm link travels in the query string, so it appears in access logs; it is valid for 48 hours and the worst a reader can do with it is subscribe that address. The public status and unsubscribe routes still reveal whether an address is subscribed to a task, because the unsubscribe page needs them. The join limits are per backend instance (production runs one). The any-case lookup on confirm scans the task's subscriber partition (a lower-cased key or an index would remove that, and with it the memory and partition-read cost of a large list being read into one process; it needs a table change, which needs Harsha); a task with more than 150,000 subscribers is not cached, so each first-time confirm reads the whole list (bounded by the 300 an hour per-task join cap). A throttle on one mailbox is silent, so someone can keep a victim's mailbox from receiving confirmations for an hour by submitting it for 5 tasks. `/asset/:assetHash` (public, streams any key) is untouched and defeats the policy for anyone who knows it; both it and `emma/impl/misc.ts`'s own key-ownership check need to be brought under the one policy before the bucket is locked, together with the other places that turn caller-influenced bucket URLs into signed links or reads outside it (`emma/impl/mediaVideo.ts`, `emma/impl/adsApis.ts`, `utils/inlineS3Images.ts`, `services/creativeRubricJudge.ts`). A confirmation link is not single-use: re-opening it within 48 hours after the row was deleted by the task owner re-adds that address. Embed snippets already pasted on customer sites keep their old "welcome email" wording but keep working (the join answer is a 2xx). The partner portal's task page lists subscribers with the person's login, so an organisation teammate who is neither the task's owner nor an admin now sees an error there (the customer portal already used the owner-or-admin route). Same-organisation members can read each other's `users/<id>/files/*` and task execution files whatever the share toggles say (before: any signed-in user could). Addresses with non-ASCII characters in the domain (rather than `xn--` form) are refused by the join form. Not in scope: ENG-2961 (an `aw_` key can activate a CRM sequence with an approver string it supplies; needs a signature from the Slack bridge and a secret Harsha provisions).
+
+**Verification.** Backend: new and updated tests in sixteen files; the new tests fail against the old code. Live on the test environment: file access 67 of 67 checks pass on this change and 40 of 59 fail on the previous backend; subscribers 67 of 67, and the confirm button pressed in a real browser (it returned 403 before the fix). Test-environment gotchas: it shares the production file bucket (`AWS_S3_BUCKET` unset) but uses the `Dev-` tables; its Resend key rejects `example.com` addresses; its two test accounts are in one organisation, so a stranger is a delegated session as an organisation-less `@example.invalid` user.
+
+## ENG-2987: enrichment estimate calibration check and paid-email-search measurement (2026-11-16)
+
+Follow-up to the estimate recalibration (#4038, ENG-2720). Adds a read-only check, `scripts/enrichment-estimate-calibration.py`, and its runbook, `docs/enrichment-estimate-calibration-runbook.md`: join prod enrichment run logs to the usage ledger per account and day and compare booked dollars per contact with the estimate's quote. `--since` is required and must be the day after the last pricing or pipeline change (a window that reaches back before a change can mislead: a 14-day window on 2026-11-16 printed DRIFT because it included the 2026-11-03 run, whose 60 paid email searches were booked under the old model name `apollo:full_enrichment`; the script now treats both names as the email search); keep the same `--since` until the data is enough, and run it at least every 14 days because the log group keeps 14 days. Internal accounts (platform admins and anyone on the `agentweb.pro` and `argusoft.com` domains or their subdomains) are left out, and the retune gate needs 100 contacts from at least 3 accounts that each supplied 10 or more. With internal accounts excluded the 2026-11-04 to 2026-11-13 window has only two customers, so the check is still INSUFFICIENT DATA and nothing was retuned.
+
+Measured on 2026-11-16: one customer-fired paid Apollo email search since 2026-11-04 (a Nuerraa user on 2026-11-05, one request in the 2026-11-13 recalibration sample); its placeholder was stamped `completed` with a verified email 2.8 seconds after it was created, which is possibly a real found-email callback but not proof (much faster than every other callback stamp we have, 23 to 52 seconds; anyone with the callback secret could have posted it; we have not seen the payload). 0 of 8 real people given as name and company only fired the search; the 5-person run booked $0.42 (about $0.08 a lead). Decision recorded in the runbook: no cache-aware quote for now (no measured need yet and the quote-time cache key could miss what a run hits; revisit with more customer data).
+
+## ENG-2286: stage 4 deletes the legacy per-user token counter write path and its rollback switches (2026-11-16)
+
+- Removed `incrementUserTokenUsage`, `isLegacyCounterWriteEnabled` and `LEGACY_COUNTER_WRITES_ENV` (`AW_LEGACY_TOKEN_COUNTER_WRITES`) from `tokenUsageService.ts`, plus every caller: `emma/tools.ts` (coding_agent), `codingAgentSubpageService.ts`, `routes/internalUsage.ts` (the batch apply step), and `usageRecorderService.meterUserUsage(Async)`, which now only calls `recordUsage`. The function had been a no-op in prod since stage 3b (PR #3248), so no behaviour changes.
+- Removed `AW_SPEND_LEDGER_LEGACY_FALLBACK` (`SPEND_LEDGER_LEGACY_FALLBACK_ENV`, `isLegacyFallbackEnabled`) from `spendEnforcementBasis.ts`. A missing projection still counts $0 and a failed projection read still fails open with a loud `console.error`.
+- Kept on purpose: the legacy rail for subjects the mode flags leave dark or exclude by tier (`AW_SPEND_LEDGER_ENFORCEMENT`, `..._ACCOUNTS`, `..._EXCLUDE_TIERS`), the opt-in staleness guard, `getUserTokenUsage` and `resolveBillingUserId`. Those are enforcement or read behaviour, not the rollback code.
+- Not touched: the `AW-LlmChargeEvents` table (still written by `usageRecordDb.incrementUsageWithChargeEvent`). `recordLlmChargeEvent` and `applyMonthlyChargeAtomic` now have no production caller; they are kept pending the data-plane decision, and deleting them is a follow-up that needs Harsha for anything touching the table.
+- Also left: `CodingAgentResult.usageTotals` is still returned but no caller reads it now; removing it is a separate cleanup.
+- Tests: deleted `meteringGuard.test.ts` (its only invariant was "who may call `incrementUserTokenUsage`"), the `incrementUserTokenUsage` suites in `tokenUsageService.test.ts`, the fallback-lever tests in `spendEnforcementBasis.test.ts`, and the charge assertions in the coding-agent, `usageRecorderService` and `chatbotService.doubleCharge` tests.
+- Note: the legacy basis is still reachable (dark flags, tier exclusion, the staleness guard) and reads `AW-Users.tokenUsage`, which nothing has written since stage 3b. This PR does not change that: in prod `AW_SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS` is unset, so only the stale-projection fallback applies. The coding agent's turns still count: `codingAgentService` calls `recordUsage` per turn, which writes the ledger and projection admission reads.
+
+## ENG-1139: unit-economics all-in cost targets (2026-11-16)
+
+AC3 comparison is live in `llmUnitEconomicsService`. Target = the tier's LIVE hard LLM threshold (read from `subscription_types` at report time) + a fixed overhead envelope (`TIER_OVERHEAD_ENVELOPE_USD`: Free $2, Starter $13, Pro $30, Super Premium $30). With caps Free $5 / Starter $80 / Pro $200 that is $7 / $93 / $230 / $230; the ticket's $7/$73/$180 table is stale.
+
+- Super Premium has no policy row and enforcement does NOT alias it to Pro (it reports uncapped). Only the target borrows Pro's policy (`TARGET_POLICY_FALLBACK_TIER`); thresholds and the `uncapped_tier` alert are unchanged.
+- Rows and tier aggregates carry `targetAllInUsd`, `varianceUsd`, `overTarget`; `GET /api/admin/usage/unit-economics?month=...&format=csv` is the monthly export (LLM, non-LLM vendor, admitted-work overrun, infrastructure, actual, target, variance).
+- Alerts `tier_over_target` / `account_over_target` are aggregate counts only (no per-user issue). Credits are not added to the target, so top-ups show as variance.
+- Admin-only; a source-scan test pins that no customer-facing file references these.
+- Envelope rationale: the threshold already caps LLM spend, so the fixed envelope budgets what it cannot see (metered vendors, shared infrastructure, support) and scales with plan size. Change an envelope only with a new owner decision. A tier with no policy or no envelope has no target and raises the aggregate `tier_no_target` alert rather than reading as on target.
+
+## ENG-3033: Zoma ads_boost_ig_post, a guarded write created PAUSED (2026-11-15)
+
+- New toolkit tool `ads_boost_ig_post` (`backend/src/mcp/metaToolkitBoost.ts`): turns an existing Instagram post into one campaign (OUTCOME_ENGAGEMENT), one ad set and one ad on the selected ad account. All three are created PAUSED; activation stays a separate `call_meta_marketing_api` UPDATE with its own preview.
+- Uses the shared `zomaWriteGuard`: preview + single-use token, then confirm. The token store is the existing in-process one (no new persistence; the cross-instance residual is ENG-2862).
+- The campaign, ad set and ad go through the same gate and dispatcher as `call_meta_marketing_api` CREATE (`previewToolkitMetaWrite` -> `dispatchToolkitConfirmedMetaWrite`). The only new Graph write is the creative (`AgentModeService.toolkitMetaBoostCreative`, `source_instagram_media_id`).
+- Ownership before any write, and again at confirm: Instagram account on `act_<id>/instagram_accounts`, Page on `act_<id>/promote_pages`, post in `<ig id>/media` (first 1000 posts).
+- `META_TOOLKIT_SPEND_CEILING` applies to the daily budget at preview.
+- A boost that stops part-way returns `status: PARTIAL` with the ids already created (all PAUSED). There is no automatic rollback.
+- Not exercised against live Meta. The ad set shape (`optimization_goal: POST_ENGAGEMENT`, `destination_type: ON_POST`) and the creative shape are from Meta's documentation and are untested against a real account.
+
+## ENG-3014: LinkedIn delete-post action on linkedin_manage_post (2026-11-15)
+
+- `linkedin_manage_post` gains `action=delete_post` (`account_id`, `post_urn`; share and ugcPost URNs; company page and personal). Token is used server-side in `LinkedInAdapter.deletePost` and never returned or logged.
+- Authorship is settled before any write: a stored row naming another author refuses with no LinkedIn call; with no stored row the post's live `author` must equal the account URN. Unreadable authorship fails closed.
+- Success is reported only after a GET readback returns 404. A still-readable post or a failed readback is reported as not confirmed, and the stored row is kept.
+- On verified delete the row is removed from AW-ConnectedAccountPosts by its existing key (`linkedInPostsDb.deletePost`). No table, index or key change.
+- Unattended runs: `delete_post` is on the gated side of both `DISPATCHER_PUBLISHING_ACTIONS` and `ACTION_SCOPED_PUBLISH_TOOLS`, so an approval-required schedule holds it and an ungranted schedule cannot call it. This differs from `delete_tweet`, which is ungated.
+- Rollback: revert the commit. Nothing is persisted that needs cleanup.
+
+## ENG-2724: Stop a late tier write from restoring a paid tier after cancellation (2026-11-15)
+
+`handleSubscriptionUpdated` writes the tier after a Stripe product lookup that can take seconds. If a `customer.subscription.deleted` for the same customer was handled in that window, the late tier write put the canceled customer back on the paid tier (Opslane run 2009, second P1). The tier write is now conditional on the stored `subscription_status` not being `canceled` or `incomplete_expired`, using the existing `condition` option of `userDb.updateUser`, so DynamoDB checks it in the same operation as the write. A refused write is logged and skipped; any other write error still fails the webhook so Stripe retries. No schema, key or stored-shape change.
+
+Not covered: an `updated` event that arrives entirely after the cancellation still rewrites the status first, as it does on main.
+
+## ENG-2724: no metadata tier from ended subscriptions; guarded survivor write (2026-11-15)
+
+- `plan` metadata no longer grants a tier from a subscription whose own status is `canceled` / `incomplete_expired` (admin reconcile and `customer.subscription.updated`). Ended subscriptions keep the env-only Starter/Pro mapping they had before.
+- The survivor write in `handleSubscriptionDeleted` is now a conditional write (stored status not ended). If refused, the webhook errors so Stripe redelivers and the retry re-reads live subscriptions.
+- The survivor path and admin reconcile read the tier from `findBasePlanItem`, so an extra-seat item sorting first no longer hides a Max base plan.
+- Not covered: two `updated` events for a live subscription arriving out of order. There is no event-ordering marker on the user row; adding one is a stored-data change that needs approval.
+
+## ENG-2724: Retry failed surviving-subscription sync instead of canceling paid access (2026-11-14)
+
+When Stripe confirms a surviving active/trialing subscription, errors during its tier lookup or sync now propagate for webhook retry instead of falling through to Free. Existing subscription-list failure behavior is unchanged. Three regressions reproduce the previous swallowed errors and now pass.
+
+Opslane run 2009's concurrent update/deletion race is still unresolved; this change does not claim to fix it. An atomic status/subscription guard is needed for the delayed tier write, not a non-atomic re-read. Any persistence-semantics change remains subject to the data-plane pre-merge approval gate.
+
+## ENG-2724: Stripe metadata resolver review fixes (2026-11-14)
+
+Block the administrator-only Sandbox tier at the existing metadata resolver boundary. Remove raw account-controlled plan values from both unmappable-tier and lookup-failure logs; retain price/subscription identifiers for diagnosis. No persistence contract changes.
+
+Three regressions failed before the fix; 29/29 targeted Stripe tests pass after syncing current main. Backend production build passes. Full typecheck passes with the configured 6GB heap (the default 2GB invocation exhausted its heap).
+
+Execution actor: Yugo (gpt-6.1-sol). Accountable owner: Harsha Vankayalapati. Existing PR #3822 remains subject to exact-head CI/Opslane and remaining review findings; this is not merge approval.
+
+## ENG-2724: Stripe webhook syncs Max/custom-price tiers from plan metadata (2026-10-28)
+
+`resolveSubscriptionTypeForPrice` (backend/src/services/stripeService.ts) falls back to
+subscription → price → expanded product `metadata.plan` when a price is outside the
+Starter/Pro env mapping, accepting it only if `getTierConfig` finds the tier in
+`subscription_types` (Super Premium is never granted from metadata). Used by
+handleSubscriptionUpdated, the subscription-deleted fallback, and the admin reconcile.
+Unmappable prices now log a warning instead of skipping silently.
+
 ## ENG-3076: group-email send builds each recipient message in one place (2026-11-16)
 
 - `buildGroupEmailRecipientMessage` in `backend/src/routes/crm.ts` now builds subject, html, text and List-Unsubscribe headers for both the background mailbox run and the in-request loop. Behavior unchanged; a characterization test asserts both paths produce the identical message.

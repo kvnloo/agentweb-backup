@@ -1,6 +1,0 @@
-## ENG-2812: session-breaker shadow is on by default, because prod EB cannot take another env property (2026-11-17)
-
-- `SESSION_BREAKER_SHADOW=true` was tried on prod EB on 2026-11-16 17:33Z. CloudFormation refused the update ("Parameter 'EnvironmentVariables' default value ... length is greater than 4096"): prod has 88 env properties totalling about 4,180 characters. EB rolled back by itself (no instance launched, version label unchanged, health Warning for about a minute, then Green/Ok). Any new prod env flag hits the same wall until properties are freed.
-- `readSessionBreakerShadowConfig` now returns a config unless `SESSION_BREAKER_SHADOW` is `false`, `0` or `off` (trimmed, case-insensitive). Caps are still `SESSION_BREAKER_SHADOW_MAX_TURNS` (40) and `SESSION_BREAKER_SHADOW_MAX_SPEND_USD` ($5). Behaviour is unchanged otherwise: one `session_breaker_would_pause` log line per cap multiple, never pauses, never writes, never notifies; accumulators are in-memory per instance.
-- Turning it off in prod needs an EB env property (which would hit the same cap) or a revert of this change.
-- Read the evidence in CloudWatch (`/aws/elasticbeanstalk/Agentweb-backend-env-prod-3/var/log/web.stdout.log`), filter `session_breaker_would_pause`.
