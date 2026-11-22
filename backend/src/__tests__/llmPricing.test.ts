@@ -60,9 +60,9 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-11-15',
+      version: '2026-11-22',
       // Sonnet 5.5 cache reads corrected from $0.20/M to the provider's $0.10/M.
-      fingerprint: '669a45de042e3931',
+      fingerprint: '15d9f71ba68a8f19', // Catalog refresh price-book pin.
     });
   });
 });
@@ -273,7 +273,7 @@ describe('llmPricing', () => {
       // at add time (ENG-2293) — not inferred from the registry's human-editable
       // `description` field, which the draft-PR review step explicitly tells
       // reviewers to rewrite before marking a model ready.
-      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7', 'openrouter/anthropic/claude-sonnet-5.5', 'openrouter/deepseek/deepseek-v4-pro-0813', 'openrouter/deepseek/deepseek-v4.1-flash', 'openrouter/google/gemini-3.5-flash-lite', 'openrouter/openai/gpt-6.1-sol', 'openrouter/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash', 'openrouter/anthropic/claude-haiku-5.5']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7', 'openrouter/anthropic/claude-sonnet-5.5', 'openrouter/deepseek/deepseek-v4-pro-0813', 'openrouter/deepseek/deepseek-v4.1-flash', 'openrouter/google/gemini-3.5-flash-lite', 'openrouter/openai/gpt-6.1-sol', 'openrouter/z-ai/glm-5.3', 'openrouter/z-ai/glm-5.3-flash', 'openrouter/anthropic/claude-haiku-5.5', 'openrouter/anthropic/claude-fable-5.2', 'openrouter/deepseek/deepseek-v4.1-flash-1017', 'openrouter/google/gemini-4-carbon', 'openrouter/google/gemini-4-neon', 'openrouter/openai/gpt-6.1-terra', 'openrouter/openai/gpt-6.2-astra', 'openrouter/openai/gpt-6.2-sol', 'openrouter/qwen/qwen4-max']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;
