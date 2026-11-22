@@ -338,7 +338,10 @@ export async function verifyZomaFirstAds(
         best = wrote ? attempt : { ...attempt, outcome: 'already_recorded' };
         break;
       }
-      if (rank.indexOf(attempt.outcome) > rank.indexOf(best.outcome)) best = attempt;
+      const better = rank.indexOf(attempt.outcome) > rank.indexOf(best.outcome);
+      // Same outcome: keep the first result that names the campaign it checked.
+      const namesCampaign = attempt.outcome === best.outcome && !best.campaignId && !!attempt.campaignId;
+      if (better || namesCampaign) best = attempt;
     }
     results.push(best);
   }

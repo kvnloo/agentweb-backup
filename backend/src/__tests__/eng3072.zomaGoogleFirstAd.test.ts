@@ -98,7 +98,10 @@ describe('criterion 3: what is not counted', () => {
 
   it('a Meta create with the same id does not make a Google campaign Zoma-created', async () => {
     const deps = firstAdDeps([{ ...created, platform: 'meta' }, approved], { status: 'ENABLED', impressions: 50 });
-    expect((await verifyZomaFirstAds(deps))[0].outcome).toBe('not_zoma_created');
+    const [result] = await verifyZomaFirstAds(deps);
+    expect(result.outcome).toBe('not_zoma_created');
+    // The admin result names the campaign that was checked.
+    expect(result.campaignId).toBe(CAMPAIGN);
   });
 
   it('a Google update with no approve writeKind (rename, pause, pre-ENG-3072 enable) is not an approval', async () => {
