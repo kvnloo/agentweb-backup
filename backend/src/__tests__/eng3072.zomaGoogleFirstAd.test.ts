@@ -164,6 +164,14 @@ describe('criterion 4: Meta and Google together count once', () => {
     expect(deps.recordFirstAd).toHaveBeenCalledTimes(1);
   });
 
+  it('five older non-Zoma Google approvals do not crowd out a provable Meta first ad', async () => {
+    const foreign = [0, 1, 2, 3, 4].map((i) => gWrite(daysAgo(20 - i), { action: 'UPDATE', writeKind: 'approve', objectId: `customers/${CID}/campaigns/90${i}` }));
+    const deps = firstAdDeps([...foreign, metaCreated, metaApproved], { status: 'ENABLED', impressions: 3 }, { status: 'ACTIVE', impressions: 2 });
+    expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'verified', campaignId: 'c1' });
+    expect(deps.recorded.get('u1').platform).toBe('meta');
+    expect(deps.google!.readCampaign).not.toHaveBeenCalled();
+  });
+
   it('falls through to Google when the earlier Meta campaign never delivered', async () => {
     const deps = firstAdDeps([metaCreated, metaApproved, created, approved], { status: 'ENABLED', impressions: 3 }, { status: 'ACTIVE', impressions: 0 });
     expect((await verifyZomaFirstAds(deps))[0]).toMatchObject({ outcome: 'verified', campaignId: CAMPAIGN });

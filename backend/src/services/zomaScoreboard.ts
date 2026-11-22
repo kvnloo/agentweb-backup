@@ -314,8 +314,16 @@ export async function verifyZomaFirstAds(
       .map((e) => e.objectId as string));
     let best: FirstAdResult = { userId, outcome: 'not_zoma_created' };
     const rank: FirstAdOutcome[] = ['not_zoma_created', 'provider_error', 'no_impressions'];
-    // Oldest approval first: the FIRST successful ad.
-    for (const approval of approvals.sort((a, b) => a.ts.localeCompare(b.ts)).slice(0, MAX_APPROVALS_CHECKED)) {
+    // Oldest approval first: the FIRST successful ad. A campaign-level approval on a campaign this
+    // user never created through Zoma is rejected locally, so it does not use one of the
+    // MAX_APPROVALS_CHECKED provider-checked slots (older foreign approvals must not crowd out a
+    // provable later one).
+    const ordered = approvals.sort((a, b) => a.ts.localeCompare(b.ts));
+    const locallyRejected = (a: ZomaWriteEvent) =>
+      String(a.entityType ?? '').toUpperCase() === 'CAMPAIGN' && !createdOn(platformOf(a)).has(a.objectId as string);
+    const firstRejected = ordered.find(locallyRejected);
+    if (firstRejected) best = { userId, outcome: 'not_zoma_created', campaignId: firstRejected.objectId as string };
+    for (const approval of ordered.filter((a) => !locallyRejected(a)).slice(0, MAX_APPROVALS_CHECKED)) {
       if (deps.now() - now > (opts.timeBudgetMs ?? TIME_BUDGET_MS)) { best = { userId, outcome: 'deferred' }; break; }
       let attempt: FirstAdResult;
       try {
