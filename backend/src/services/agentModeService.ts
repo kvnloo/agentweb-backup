@@ -12,7 +12,8 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -42,7 +43,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { buildIterationLimitReport } from './agentMode/core/iterationLimitReport';
-import { recordSessionBreakerShadowTurn } from './sessionBreakerShadow';
+import { recordSessionBreakerShadowTurn, shadowTurnCostUsd } from './sessionBreakerShadow';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
@@ -106,7 +107,7 @@ import { boundToolsForModel } from '../utils/boundToolsForModel';
 // (orgProfileResolver.ts is a transitive-AWS-SDK-construction trap module)
 // — so the top-level import origin/main reintroduced here is dead in this
 // class and deliberately dropped, not missed.
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, resolveSlackSendAuthorized } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, describeSlackSendState, type SlackSendState } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
@@ -255,6 +256,7 @@ import { getCrmSenders as sharedGetCrmSenders } from '../emma/impl/shared/crmSen
 // ENG-2103 (F2): brand guidelines / market strategy tool cluster, same
 // treatment as leadsImpl above.
 import * as brandMarketStrategyImpl from '../emma/impl/brandMarketStrategy';
+import { unattendedBrandContextMessage } from './brandMessagingContext';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same
 // treatment as leadsImpl above.
 import * as mediaVideoImpl from '../emma/impl/mediaVideo';
@@ -376,7 +378,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_user_funnel_status', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'inspect_client_usage', 'list_all_clients', 'assess_client_health', 'read_client_meta_activity', 'read_client_meta_budgets', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -619,6 +621,7 @@ import {
 } from '../utils/metaConstants';
 import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 import { approvalCardIdentity } from './voice/hotLeadCallApprovalGate';
+import { isAnonymousShareMessage, isServerAuthoredContinuation, withAnonymousShareMarker } from '../utils/anonymousShareProvenance';
 
 
 /**
@@ -2993,7 +2996,8 @@ export class AgentModeService {
     try {
       // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
       // schedule too, so a vanished record withholds rather than publishes.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       const live = resolveSchedulePublishAuthorization(schedule);
       const resolved = narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
       // ENG-1245: attach WHY, read straight off the live schedule record, so the
@@ -3033,19 +3037,21 @@ export class AgentModeService {
    * this function cannot verify (no session, no parseable schedule, a read error)
    * withholds rather than authorizes.
    */
-  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<SlackSendState> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
-    if (!scheduleId) return false;
+    if (!scheduleId) return { authorized: false };
     try {
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
-      return resolveSlackSendAuthorized(schedule);
+      // ENG-2816 (step 3): consistent (a scheduled turn only), so a mark a visitor just wrote is seen by this turn's directive.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      // ENG-2816 (step 3): also WITHHELD for a schedule a share-link visitor wrote into, and says so (see describeSlackSendState).
+      return describeSlackSendState(schedule);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding the ENG-2204 unattended Slack-send override rather than authorizing it unverified:`,
         error
       );
-      return false;
+      return { authorized: false };
     }
   }
   // ENG-2103 (F2): estimateVideoGenerationCost (main's unchanged pre-existing
@@ -3220,7 +3226,7 @@ export class AgentModeService {
         console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
       }
     }
-    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
+    const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests, isInteractiveShare, messageContent);
 
     // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
     let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIdsForDisplay, hasAdminAccess);
@@ -3415,16 +3421,22 @@ export class AgentModeService {
     // so undefined must be excluded, not just false — same strict-true discriminator
     // already used at the Meta-write approval-deck gate below.
     if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+      // ENG-3066: nobody is present to notice outreach written without knowing what the sender
+      // sells, so the compact brand block is given up front instead of depending on the model
+      // choosing to call read_brand_guidelines. Pushed before the publish directive, which stays last.
+      const brandContext = await unattendedBrandContextMessage(() => this.readBrandGuidelines(userId));
+      if (brandContext) messages.push({ role: 'system', content: brandContext });
       // ENG-2204: owner opt-out for the Slack-send override — resolved independently
       // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
       // for why this isn't threaded through publishAuthorizationOverride instead.
-      const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
+      const slackSend = await this.resolveScheduledSlackSendAuthorized(currentSession);
       const publishDirective = getUnattendedExecutionDirective(
         'scheduled',
         isAdmin,
         publishAuthorization.authorized ? 'authorized' : 'withheld',
         publishAuthorization.tools,
-        slackSendAuthorized
+        slackSend.authorized,
+        slackSend.reason
       );
       if (publishDirective) messages.push({ role: 'system', content: publishDirective });
     }
@@ -4414,8 +4426,14 @@ export class AgentModeService {
           costUsd: () => {
             const usage: any = (response as any)?.usage;
             if (!usage) return 0;
-            if (typeof usage.cost === 'number') return usage.cost;
-            return this.estimateCost(llmModel, Number(usage.prompt_tokens) || 0, Number(usage.completion_tokens) || 0);
+            return shadowTurnCostUsd(usage, this.estimateCost(
+              llmModel,
+              Number(usage.prompt_tokens) || 0,
+              Number(usage.completion_tokens) || 0,
+              Number(usage.cache_read_input_tokens) || 0,
+              Number(usage.cache_creation_input_tokens) || 0,
+              usage.cache_creation_by_ttl,
+            ));
           },
         });
 
@@ -6458,7 +6476,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false, ownTurnContent?: string): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6474,12 +6492,37 @@ export class AgentModeService {
       return true;
     });
 
+    // ENG-3164: the stored row of THIS turn's own message (the controller stores it before generating, so it is the last
+    // row), so that who wrote it is read from the `kind` the server stored on it, never from the text. `messageContent`
+    // can carry a suffix the stored row does not (the voice-card prompt suffix), so the caller also hands over the turn's
+    // own content before that suffix. Neither matches (an attachment or a deck answer also changes the text) = not
+    // provably the server's = labelled, which is the safe direction.
+    const lastRow = sessionHistory[sessionHistory.length - 1];
+    const currentTurnRow: ChatMessage | undefined =
+      lastRow?.role === 'user' && (lastRow.content === messageContent || (ownTurnContent !== undefined && lastRow.content === ownTurnContent))
+        ? lastRow
+        : undefined;
+
     // Merge consecutive user messages into one — keeps the 10-message window from dropping
     // the original task when many retry messages ("Please try again...") pile up behind it.
+    // ENG-2227: merging mutates only `.content`, never `.metadata` — if an anonymous ishare
+    // message landed adjacent to a real owner message (the exact retry-pileup shape this merge
+    // exists for), only the FIRST message's metadata survived the merge, silently dropping the
+    // anonymous tag (when it merged INTO an owner message) or mislabeling the owner's own words
+    // as anonymous (when an owner message merged into one). This merge was only ever meant to
+    // collapse retries from the SAME actor, so only merge when both sides share the same
+    // anonymity status — a genuine identity change between two adjacent messages now keeps them
+    // as separate entries, each correctly tagged by the per-message loop below.
     const mergedHistory: ChatMessage[] = [];
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
-      if (last && last.role === 'user' && msg.role === 'user') {
+      const sameAnonymity = isAnonymousShareMessage(last) === isAnonymousShareMessage(msg);
+      // ENG-3164: two visitor-stamped rows are also kept apart when only one of them was written by the server (a
+      // continuation directive next to a visitor's message): the merged row keeps the FIRST row's metadata, so a visitor's
+      // words merged behind a server-written row would read as the server's and lose the label.
+      const sameAuthor = !(isAnonymousShareMessage(last) && isAnonymousShareMessage(msg))
+        || isServerAuthoredContinuation(last) === isServerAuthoredContinuation(msg);
+      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity && sameAuthor) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
         mergedHistory.push({ ...msg });
@@ -6554,6 +6597,24 @@ export class AgentModeService {
           contentStr = String(content);
         }
         content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
+      }
+
+      // ENG-2227: a message submitted via an anonymous ishare link carries no verified
+      // identity — metadata.ishareSender is stored on the message (agentModeController.ts)
+      // but was never surfaced into what the model actually reads, so a claim from an
+      // anonymous viewer looked identical to one from the verified account owner. Fold the
+      // marker into content on every reconstruction (not just the turn it arrived in), the
+      // same way attachments are folded in above, so it survives into later turns.
+      if (msg.role === 'user' && isAnonymousShareMessage(msg) && !isServerAuthoredContinuation(msg as any)) {
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = withAnonymousShareMarker(contentStr);
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -6643,16 +6704,27 @@ export class AgentModeService {
     messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
+    // ENG-2227: this turn's own message is deliberately filtered OUT of sessionHistory above
+    // (the dedupe filter at the top of this function) and reconstructed here as a bare string,
+    // bypassing the per-message loop above entirely — including its anonymous-sender marker.
+    // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
+    // before it's even "history") with zero provenance signal. Apply the same marker here when
+    // this turn itself came through the public ishare endpoint.
+    // ENG-3164: a server-written turn is told by the stored kind of its own row, never by its text (a visitor can open a
+    // message with the server's own continuation line). No stored row found = not provably the server's = labelled.
+    const currentMessageContent = isCurrentTurnAnonymousIshare && !isServerAuthoredContinuation(currentTurnRow)
+      ? withAnonymousShareMarker(messageContent)
+      : messageContent;
     if (screenshotUrl) {
       messages.push({
         role: 'user',
         content: [
-          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'text', text: `${currentMessageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
           { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
         ]
       });
     } else {
-      messages.push({ role: 'user', content: messageContent });
+      messages.push({ role: 'user', content: currentMessageContent });
     }
 
     return messages;
@@ -9932,6 +10004,8 @@ export class AgentModeService {
         ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
         : reason === 'not_granted'
         ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
+        : reason === 'visitor_edited'
+        ? `this schedule was set up or edited through a share link, so ${toolName} cannot publish on the owner's behalf in an unattended run until the owner adopts the schedule.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
     const unblockInstruction =
       reason === 'require_publish_approval'
@@ -9940,6 +10014,8 @@ export class AgentModeService {
         ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
         : reason === 'not_granted'
         ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything. The owner can grant this themselves: open this schedule, make sure the publish tool (e.g. ${toolName}) is selected under Required Actions, check "Publish without my review", then click Update Schedule and confirm — a "Standing publish authorization on" confirmation appears once it is granted, and future runs can post unattended. Saving the schedule alone does NOT grant it; never imply that it does.`
+        : reason === 'visitor_edited'
+        ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF or to use "Publish without my review" — neither lifts this. The owner can adopt the schedule in the portal; a publish grant only takes effect after that.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
@@ -9997,7 +10073,8 @@ export class AgentModeService {
 
     try {
       // resolvePublishAuthorized also returns false for a missing/deleted schedule.
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      // ENG-2816 (step 3): consistent, so a mark a visitor just wrote cannot be missed by a stale replica.
+      const schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
       if (resolvePublishAuthorized(schedule)) return null;
       console.warn(
         `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} is not authorized to publish.`
@@ -10015,6 +10092,98 @@ export class AgentModeService {
 
 
 
+  /**
+   * ENG-2816 (step 3): is this tool call part of a scheduled run whose schedule a share-link visitor set up or edited?
+   *
+   * A visitor acts under the owner's userId, so a schedule they write is stored as the owner's own and its later runs would carry
+   * the owner's full tool set. The schedule's `provenance` (utils/scheduleProvenance.ts) says which content a visitor wrote; this
+   * is the one place every run entry ends up (cron, manual, test, variables submit, resume, retry loop, self-improvement,
+   * approval resume, continuations), so enforcing it here covers them all without carrying a flag through each.
+   *
+   * Two outcomes, both read LIVE (a consistent read of the schedule, not a stamp taken at run start):
+   *  - the profile refuses this tool name and the schedule is marked: refuse, for EVERYONE (attended or not);
+   *  - this tool's self-call reaches a schedule write route (SCHEDULE_WRITE_TOOL_NAMES) and the schedule is marked: hand back the
+   *    profile, so the call carries the claim and the write it makes is itself a visitor write (it adds marks and never takes one
+   *    off: a marked run, such as its own reflection turn, cannot launder the mark).
+   *
+   * UNVERIFIABLE is judged by who is calling. The purpose of failing closed is to stop an UNATTENDED run (nobody is watching it) from
+   * running as the owner when its schedule cannot be shown to be unmarked, so an unverifiable answer refuses only a caller that says
+   * it is unattended (`isUnattendedRun === true`: every scheduled, test, retry and self-improvement turn does). A person typing in a
+   * chat (attended, or a caller that did not say) is never refused merely because something could not be checked: an owner who
+   * reopens an old "Scheduled: X" session after deleting the schedule keeps save_memory, connect_account, manage_scheduled_chat and
+   * their admin tools. The one exception is a failed SCHEDULE read in a session that is known to be a scheduled run: that refuses
+   * everyone (rare, and a transient blip is cheaper than running a visitor's schedule as the owner).
+   *
+   * Only a tool in one of those two sets pays for the reads, and the session is read as a record only (no transcript, no message
+   * migration). Every other tool, every call outside a scheduled session, and every schedule with no `provenance` (every schedule
+   * that predates this change) is untouched.
+   */
+  private async scheduledRunRestriction(
+    toolName: string,
+    sessionId: string,
+    extraContext?: Record<string, any>
+  ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
+    const unrestricted = { refusal: null };
+    if (!sessionId) return unrestricted;
+    // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
+    if (extraContext?.restrictionProfile) return unrestricted;
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    if (!refusedByProfile && !carriesClaim) return unrestricted;
+
+    const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
+    // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSessionRecord(sessionId, true);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we give up (same as the publish gate below).
+      try {
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      } catch (retryError) {
+        console.error(`AgentMode ENG-2816: could not read session ${sessionId} to check schedule provenance for ${toolName}:`, retryError);
+        return whenUnverifiable;
+      }
+    }
+
+    // No session record: for an unattended run that is the deleted-mid-run case (deleting a scheduled session does not cancel its
+    // worker); for anyone else it is just a session id with nothing scheduled behind it.
+    if (!session) return whenUnverifiable;
+    if (classifySessionForPublishGate(session) !== 'scheduled') return unrestricted;
+
+    const scheduleId = extractScheduleId(session.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(`AgentMode ENG-2816: scheduled session ${sessionId} has no parseable scheduleId; cannot check provenance for ${toolName}.`);
+      return whenUnverifiable;
+    }
+
+    let schedule: any;
+    try {
+      schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+    } catch (firstScheduleError) {
+      // One retry absorbs a single throttled read, as the session read above does, before a throw counts as unverifiable.
+      try {
+        schedule = await scheduleDb.getScheduleById(scheduleId, { consistent: true });
+      } catch (scheduleError) {
+        // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
+        console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
+        return unverifiable;
+      }
+    }
+    // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
+    if (!schedule) return whenUnverifiable;
+
+    if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
+
+    if (refusedByProfile) {
+      console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+    }
+    return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
@@ -10022,6 +10191,11 @@ export class AgentModeService {
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
     const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
+    // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
+    if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -15155,11 +15329,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * The last message with role 'user' in the session, or undefined. Used ONLY
    * to verify an "explicitly stated by the user" claim against real transcript
    * text (verifyExplicitStatement) — never to infer or parse an answer.
+   *
+   * ENG-3164: `ownerOnly` is for a caller that treats the text as the ACCOUNT OWNER's own words. A share-link visitor
+   * runs under the owner's userId, so their message is a 'user' row like any other; when the last one is a visitor's
+   * (stamped by the share route) there is no owner statement to verify, so the answer is undefined and the caller
+   * falls back to asking. It does not look further back: the owner restates it, as before.
    */
-  private async getLastUserMessageText(sessionId: string): Promise<string | undefined> {
+  private async getLastUserMessageText(sessionId: string, ownerOnly: boolean = false): Promise<string | undefined> {
     const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') return messages[i].content;
+      if (messages[i].role === 'user') {
+        if (ownerOnly && isAnonymousShareMessage(messages[i])) return undefined;
+        return messages[i].content;
+      }
     }
     return undefined;
   }
@@ -15279,7 +15461,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // genuine-but-unrelated quote could rubber-stamp any objective the model
     // names alongside it.
     if (claimedObjective && AgentModeService.META_OBJECTIVE_VALUES.includes(claimedObjective) && quote) {
-      const lastUserText = await this.getLastUserMessageText(sessionId);
+      // ENG-3164: the objective must be in the OWNER's own words; a share-link visitor's message does not count.
+      const lastUserText = await this.getLastUserMessageText(sessionId, true);
       const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
       if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
         // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN
@@ -18887,7 +19070,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string; duplicateCaptionGuard?: boolean }): Promise<any> {
     return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
@@ -18923,7 +19106,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * this wrapper's class-bound sibling references.
    */
   async linkedinManagePost(userId: string, args: {
-    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics' | 'delete_post';
     account_id: string;
     post_urn?: string;
     commentary?: string;
@@ -18938,7 +19121,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       listLinkedInComments: this.listLinkedInComments.bind(this),
       reactToLinkedInPost: this.reactToLinkedInPost.bind(this),
       getPostAnalytics: this.getPostAnalytics.bind(this),
+      linkedinDeletePost: this.linkedinDeletePost.bind(this),
     });
+  }
+
+  // ENG-3014: delegating wrapper, injected above so it stays spy-observable like its siblings.
+  async linkedinDeletePost(userId: string, accountId: string, postUrn: string, toolContext?: any): Promise<any> {
+    return linkedinImpl.linkedinDeletePost(userId, accountId, postUrn, toolContext);
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/linkedin.ts. Kept as a

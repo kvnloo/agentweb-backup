@@ -4539,7 +4539,8 @@ emmaToolRegistry.register({
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube. LinkedIn: pass either ONE MP4 video (3 seconds to 30 minutes, up to 150 MB; other video formats are refused) or images, never both. The video upload can take a minute or two.'
         },
         in_reply_to_post_id: { type: 'string', description: 'X (Twitter) only. ID of an existing post to reply to; the content is published as a reply in that conversation. Omit for a new standalone post. Rejected for other platforms. Same approval rules as any post.' },
-        save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
+        save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' },
+        confirm_duplicate_caption: { type: 'boolean', description: 'LinkedIn only. Set true only when the user, in a NEW message after the duplicate_caption refusal, confirmed publishing the same caption again. A confirm in the same turn as the refusal, or in a scheduled run, is refused.' }
       },
       required: ['content']
     }
@@ -4547,9 +4548,14 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true || args.in_reply_to_post_id
-      ? [{ ...(args.save_as_draft === true ? { saveAsDraft: true } : {}), ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}) }]
-      : []));
+    // ENG-3015: the interactive tool runs the duplicate-caption guard unless the user confirmed.
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, {
+      ...(args.save_as_draft === true ? { saveAsDraft: true } : {}),
+      ...(args.in_reply_to_post_id ? { inReplyToPostId: String(args.in_reply_to_post_id) } : {}),
+      // The guard always runs; a confirm is honoured only across a user turn (see linkedin.ts).
+      duplicateCaptionGuard: true,
+      ...(args.confirm_duplicate_caption === true ? { confirmDuplicateCaption: true } : {}),
+    });
   }
 });
 
@@ -4557,13 +4563,13 @@ emmaToolRegistry.register({
   name: 'linkedin_manage_post',
   definition: {
     name: 'linkedin_manage_post',
-    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
+    description: 'Manage LinkedIn post interactions using a connected LinkedIn account. Supports reposting, commenting, listing comments, reacting, deleting your own posts, and fetching analytics — all in one tool.\n\nActions:\n- repost: Reshare an existing LinkedIn post, optionally adding your own commentary. Requires post_urn. CRITICAL: Always get explicit user approval before reposting.\n- comment: Create a comment on a post, or a nested reply when parent_comment_urn is provided. Requires post_urn and comment_text. CRITICAL: Always get explicit user approval before commenting.\n- list_comments: Fetch all comments on a post with their URNs (useful for finding parent_comment_urn for replies). Requires post_urn.\n- react: React to a post (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT). Requires post_urn. CRITICAL: Always get explicit user approval before reacting.\n- delete_post: Delete a LinkedIn post that this connected account authored (company page or personal profile). Requires post_urn (urn:li:share:… or urn:li:ugcPost:…). Cannot be undone. CRITICAL: Always get explicit user approval before deleting.\n- get_analytics: Fetch engagement metrics (likes, comments, shares, impressions, clicks) for one or more posts. Requires post_ids array.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics'],
+          enum: ['repost', 'comment', 'list_comments', 'react', 'get_analytics', 'delete_post'],
           description: 'The operation to perform'
         },
         account_id: {
@@ -4572,7 +4578,7 @@ emmaToolRegistry.register({
         },
         post_urn: {
           type: 'string',
-          description: 'LinkedIn post URN — required for repost, comment, list_comments, react (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+          description: 'LinkedIn post URN — required for repost, comment, list_comments, react, delete_post (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
         },
         commentary: {
           type: 'string',
@@ -7653,7 +7659,22 @@ const bridgedToolNames = [
   // had no self-status tool and fell back to assess_client_health (admin lookup
   // by email) — the user-reported "asked me for my email" bug.
   'get_account_status',
+  // ENG-2840: the market strategy tool of the MCP server (competitors merged by name, ICPs by title, nothing removed). Bridged
+  // so a skill that lists it in `toolNames` has a tool to offer in agent mode: it was registered for MCP callers only, so such a
+  // skill silently offered nothing and a call answered "Unknown tool". It is not a foundation tool and is kept out of the
+  // __other_skills__ pool (SKILL_ONLY_TOOL_NAMES in emma/impl/misc.ts), so a session is offered it through a skill that lists it;
+  // Emma's own update_market_strategy is unchanged.
+  'manage_market_strategy',
 ];
+
+/**
+ * Bridged tools that act on one signed-in account's data and must refuse an anonymous (not signed-in) session with the same
+ * deferred refusal Emma's own account tools give. The bridge copies a definition and an execute function, not the MCP handler's
+ * flags, so a tool that needs this names itself here. (None of the other bridged tools' MCP handlers sets the flag today, so
+ * the loop below carrying every handler's flag would change nothing now; naming the tool keeps the change to this tool, and a
+ * handler that sets the flag later does not silently start refusing anonymous in-app sessions.) ENG-2840.
+ */
+const BRIDGED_REQUIRES_USER_ACCOUNT: ReadonlySet<string> = new Set(['manage_market_strategy']);
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
@@ -7673,6 +7694,7 @@ const adminToolNames = [
   'monitor_lead_volume',
   'check_account_tracking_health',
   'read_client_meta_activity',
+  'read_client_meta_budgets',
   'diagnose_leads_at_zero',
   'get_pr_digest',
   'freeze_user_account',
@@ -7740,6 +7762,7 @@ for (const toolName of bridgedToolNames) {
         ? { ...handler.definition, description: selfOnly.description, inputSchema: selfOnly.inputSchema }
         : handler.definition,
       execute,
+      ...(BRIDGED_REQUIRES_USER_ACCOUNT.has(toolName) ? { requiresUserAccount: true } : {}),
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
@@ -9438,7 +9461,7 @@ emmaToolRegistry.register({
     name: 'call_hubspot_api',
     description: `Manage HubSpot marketing assets and data via a single unified tool.
 Use entity_type to select the resource, action to select the operation.
-For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts.
+For CONTACT_LIST GET pass list_id as a top-level string (listId/id/guid and id-bearing query objects are accepted aliases). LIST with a list id reads that list; omit ids to enumerate lists. For CAMPAIGN GET/GET_METRICS pass top-level guid (id is accepted). Use CONTACTS + LIST to list contacts, CONTACTS + SEARCH (created_after/created_before) for contacts with source/UTM attribution fields, and DEALS (read-only) for pipeline data.
 
 ENTITY_TYPE + ACTION MATRIX:
 
@@ -9500,6 +9523,14 @@ ASSET METRICS (CAMPAIGN LIST_ASSETS):
   WORKFLOW → enrolled, active, completed counts
   SOCIAL_BROADCAST → facebook_clicks, linkedin_clicks, twitter_clicks
 
+  CONTACTS     → LIST (cursor?) | SEARCH (created_after?, created_before?, properties[]?, limit?, cursor?)
+               SEARCH returns source/UTM attribution fields (hs_analytics_source*, hs_latest_source*, utm_*, first/recent conversion).
+  DEALS        → (read-only; scope crm.objects.deals.read)
+               LIST_PIPELINES → pipelines with stage ids + labels
+               SEARCH (deal_stage? [stage label like "New Business Meetings" or stage id], pipeline?, created_after?, created_before?, properties[]?, limit?, cursor?)
+               GET_CONTACTS (deal_id) → associated contacts with source/UTM attribution fields
+               Attribution rule: only report a deal as campaign-attributed when an associated contact's UTM/source value
+               actually names the campaign. Never estimate unmatched deals.
   CONTACT_LIST → LIST (query?, cursor?, count?) | GET (list_id) | CREATE (name, processing_type; object_type_id?)
                → ADD_CONTACTS (list_id, record_ids[]) | REMOVE_CONTACTS (list_id, record_ids[])
                → DELETE (list_id)
@@ -9516,7 +9547,16 @@ TYPICAL WORKFLOW:
     inputSchema: {
       type: 'object',
       properties: {
-        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST).' },
+        entity_type:      { type: 'string', enum: ['CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL', 'CONTACT_LIST', 'CONTACTS', 'DEALS'], description: 'HubSpot resource to operate on (CONTACTS supports LIST/SEARCH; DEALS supports LIST_PIPELINES/SEARCH/GET_CONTACTS, read-only).' },
+        deal_stage:       { type: 'string', description: 'DEALS SEARCH: stage label (e.g. "New Business Meetings") or internal stage id.' },
+        pipeline:         { type: 'string', description: 'DEALS SEARCH: pipeline id (from LIST_PIPELINES).' },
+        deal_id:          { type: 'string', description: 'DEALS GET_CONTACTS: deal id.' },
+        created_after:    { type: 'string', description: 'CONTACTS/DEALS SEARCH: inclusive lower bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        created_before:   { type: 'string', description: 'CONTACTS/DEALS SEARCH: exclusive upper bound on createdate (ISO date, epoch seconds, or epoch ms).' },
+        // Untyped on purpose: a write attempt (e.g. DEALS UPDATE with an object) must reach the
+        // handler's read-only refusal instead of failing schema validation; mergeProps ignores non-lists.
+        properties:       { description: 'CONTACTS/DEALS SEARCH, DEALS GET_CONTACTS: extra HubSpot property names to return (string array or comma-separated string).' },
+        limit:            { type: 'integer', description: 'CONTACTS/DEALS SEARCH page size (integer, max 100). HubSpot caps one search query at 10,000 total results; for larger sets split into non-overlapping created_after/created_before ranges and restart paging per range.' },
         action:           { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         // CAMPAIGN
         guid:             { type: 'string', description: 'Campaign guid. Required for CAMPAIGN GET/UPDATE/DELETE/GET_METRICS/LIST_ASSETS/ADD_ASSET/REMOVE_ASSET.' },

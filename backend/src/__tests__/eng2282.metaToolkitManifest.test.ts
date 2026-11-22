@@ -40,7 +40,7 @@ import { META_PAGES_TOOL_NAMES } from '../mcp/metaToolkitPages';
 
 // ENG-2303: the toolkit also advertises toolkit-local Zoma onboarding tools (not registry tools).
 // ENG-2916: read-only account health + learning-phase tools sit between the Meta reads and Zoma onboarding.
-const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions', 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', ...META_EXPERIMENT_WRITE_TOOL_NAMES, 'ads_get_help_article', 'ads_account_get_activity_logs', 'ads_get_errors', ...META_HEALTH_TOOL_NAMES, ...META_CATALOG_TOOL_NAMES, ...META_CATALOG_WRITE_TOOL_NAMES, ...META_EVENT_SOURCE_TOOL_NAMES, ...META_CATALOG_FEED_TOOL_NAMES, ...META_PAGES_TOOL_NAMES, 'ads_boost_ig_post', ...ZOMA_TOOL_NAMES, 'zoma_ads_report'];
+const EXPECTED_TOOLKIT_NAMES = [...META_TOOLKIT_V1_TOOL_NAMES, 'ads_get_datasets', 'ads_get_dataset_details', 'ads_get_dataset_stats', 'ads_pixel_event_read', 'ads_get_customconversions', 'ads_experiment_list_tests', 'ads_experiment_abtest_get_test', 'ads_experiment_lift_get_test', ...META_EXPERIMENT_WRITE_TOOL_NAMES, 'ads_get_help_article', 'ads_account_get_activity_logs', 'ads_get_errors', ...META_HEALTH_TOOL_NAMES, ...META_CATALOG_TOOL_NAMES, ...META_CATALOG_WRITE_TOOL_NAMES, ...META_EVENT_SOURCE_TOOL_NAMES, ...META_CATALOG_FEED_TOOL_NAMES, ...META_PAGES_TOOL_NAMES, 'ads_boost_ig_post', ...ZOMA_TOOL_NAMES, 'zoma_industry_benchmark', 'zoma_ads_report'];
 
 const ctx = { userId: 'user-1', sessionId: 's-1' };
 

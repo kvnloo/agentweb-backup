@@ -25,8 +25,9 @@ import { ZOMA_MCP_SETUP } from './zomaSetupLinks';
 import { getAccountsByUserIdIncludingOrgShared, type ConnectedAccount } from '../services/connectedAccountsDb';
 import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsService';
 import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
+import { META_BUSINESS_PAGES_SETTINGS_URL } from './metaPageAccessRefusal';
 import {
-  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable,
+  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled,
   ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
 } from './zomaProviders';
 
@@ -64,7 +65,7 @@ export interface ZomaMetaAccountSummary {
 export type ZomaMetaPageBlockerReason = 'no_page_exists' | 'page_not_granted' | 'no_advertiser_role';
 
 export const META_CREATE_PAGE_URL = 'https://www.facebook.com/pages/create';
-export const META_BUSINESS_PAGES_SETTINGS_URL = 'https://business.facebook.com/settings/pages';
+export { META_BUSINESS_PAGES_SETTINGS_URL };
 
 export interface ZomaMetaPageBlocker {
   type: 'meta_page_access';
@@ -107,6 +108,17 @@ export interface ZomaReadiness {
     writes_enabled: boolean;
     reason?: 'google_ads_provider_disabled';
   };
+  /**
+   * ENG-3142: present only while ZOMA_X_ADS_ENABLED is on (absent otherwise, so X is never
+   * advertised before the flip).
+   */
+  x_ads?: {
+    available: true;
+    ready: boolean;
+    accounts: Array<{ account_id: string; name?: string; currency?: string }>;
+    link?: string;
+    writes_enabled: boolean;
+  };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
   /**
@@ -142,6 +154,10 @@ export interface ZomaOnboardingDeps {
   buildGoogleAdsConnectUrl?: (userId: string) => Promise<string>;
   /** ENG-2823: defaults to googleToolkitEnabled(). */
   googleEnabled?: () => boolean;
+  /** ENG-3142: defaults to xAdsToolkitEnabled(). */
+  xAdsEnabled?: () => boolean;
+  /** ENG-3142: signed X Ads connect link (routes/xAdsAuth.ts /start). */
+  buildXAdsConnectUrl?: (userId: string) => Promise<string>;
   /** ENG-3134: origin of Zoma's own pages (card return, docs) — the API, never the Emma app. */
   pagesUrl: () => string;
   now: () => number;
@@ -293,6 +309,10 @@ function summarizeGoogle(account: ConnectedAccount): ZomaGoogleAdsAccountSummary
   };
 }
 
+async function defaultXAdsConnectUrl(userId: string): Promise<string> {
+  return (await import('./zomaXAdsConnect')).buildXAdsConnectLink(userId, getBackendUrl());
+}
+
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
   // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
   return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
@@ -417,11 +437,29 @@ export async function getZomaReadiness(
     }
     readiness.google_ads = g;
   }
+  // ENG-3142: X Ads is provider #3, offered only while ZOMA_X_ADS_ENABLED is on.
+  if ((deps.xAdsEnabled ?? xAdsToolkitEnabled)()) {
+    const xAccounts = usableAccounts(allAccounts, X_ADS_PROVIDER, deps.now());
+    const x: NonNullable<ZomaReadiness['x_ads']> = {
+      available: true,
+      ready: xAccounts.length > 0,
+      accounts: xAccounts.map((a) => ({ account_id: String((a.config as any)?.ad_account_id ?? a.account_id), name: a.account_name, currency: (a.config as any)?.currency })),
+      writes_enabled: payment.ready && xAccounts.length > 0,
+    };
+    if (!x.ready && mintLinks) {
+      try {
+        x.link = await (deps.buildXAdsConnectUrl ?? defaultXAdsConnectUrl)(userId);
+      } catch (error) {
+        console.error('[zoma] x ads connect link failed:', error instanceof Error ? error.message : error);
+      }
+    }
+    readiness.x_ads = x;
+  }
   if (mintLinks && deps.getPlan) {
     const plan = await deps.getPlan(userId);
     if (plan) readiness.plan = plan;
   }
-  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
+  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads, readiness.x_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   readiness.docs_url = zomaDocsUrl(deps);
   return readiness;
 }
@@ -435,13 +473,13 @@ export const ZOMA_FIRST_PROMPT =
   'Show my Meta ad spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for the last 7 days.';
 
 /** ENG-3134: the "connected" answer — docs plus a concrete next prompt (zoma_ads_report is Meta-only). */
-export function zomaAllSetText(docsUrl: string, metaConnected = true): string {
+export function zomaAllSetText(docsUrl: string, metaConnected = true, otherLabel = 'Google Ads'): string {
   return [
     'All set. Your ad account is connected to Zoma.',
     `Docs: ${docsUrl}`,
     metaConnected
       ? `Try asking: "${ZOMA_FIRST_PROMPT}" (runs zoma_ads_report).`
-      : 'Try asking: "How did my Google Ads campaigns do over the last 7 days?"',
+      : `Try asking: "How did my ${otherLabel} campaigns do over the last 7 days?"`,
   ].join('\n');
 }
 
@@ -451,11 +489,12 @@ function nextStep(
   payment: ZomaReadiness['payment'],
   meta: ZomaReadiness['meta'],
   googleAds: ZomaReadiness['google_ads'],
+  xAds?: ZomaReadiness['x_ads'],
 ): string | null {
   if (adsExperience === null) return adsExperienceQuestionText('zoma_status { "ads_experience": "<value>" }');
   if (adsExperience === 'not_interested') return ZOMA_NOT_INTERESTED_MESSAGE;
   const google = googleAds.available ? googleAds : undefined;
-  if (!meta.ready && !google?.ready) {
+  if (!meta.ready && !google?.ready && !xAds?.ready) {
     // ENG-3134: the answer leads straight to Meta connect; a new advertiser gets the setup guide
     // after the link (same link once they have an ad account), never instead of it.
     return [
@@ -467,6 +506,11 @@ function nextStep(
         ? [google.link
           ? `Or connect an existing Google Ads account → ${google.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
           : 'Or call zoma_status again for a fresh Google Ads connect link (the link could not be created just now).']
+        : []),
+      ...(xAds
+        ? [xAds.link
+          ? `Or connect an existing X (Twitter) Ads account → ${xAds.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh X Ads connect link (the link could not be created just now).']
         : []),
       'Tell me when it is connected and I will re-check.',
       ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
@@ -505,9 +549,16 @@ export function formatZomaStatus(r: ZomaReadiness): string {
           : r.google_ads.link ? ` → ${r.google_ads.link}` : ''
       }`]
       : []),
+    ...(r.x_ads
+      ? [`  ${box(r.x_ads.ready)} X Ads account connected${
+        r.x_ads.accounts.length
+          ? ` (${r.x_ads.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})`
+          : r.x_ads.link ? ` → ${r.x_ads.link}` : ''
+      }`]
+      : []),
     ...(r.plan ? [formatZomaPlanLine(r.plan, getZomaBillingConfig())] : []),
     '',
-    r.next_step ?? zomaAllSetText(r.docs_url ?? zomaDocsUrl(), r.meta.ready),
+    r.next_step ?? zomaAllSetText(r.docs_url ?? zomaDocsUrl(), r.meta.ready, !r.google_ads.ready && r.x_ads?.ready ? 'X Ads' : 'Google Ads'),
   ];
   return lines.join('\n');
 }
@@ -527,7 +578,7 @@ export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage, goo
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
     // Google writes are listed (and labelled) only while ZOMA_GOOGLE_ENABLED is on.
-    ...u.recentWrites.filter((w) => google || w.platform !== 'google_ads').map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
+    ...u.recentWrites.filter((w) => (google || w.platform !== 'google_ads') && (xAdsToolkitEnabled() || w.platform !== 'x_ads')).map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : w.platform === 'x_ads' ? '[X Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
     ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');
