@@ -38,8 +38,13 @@ function containsBlock(notes: string, block: string): boolean {
 function capNotes(notes: string): string {
   if (notes.length <= MAX_NOTES_CHARS) return notes;
   const blocks = notes.split(NOTES_SEPARATOR);
-  while (blocks.length > 1 && blocks.join(NOTES_SEPARATOR).length > MAX_NOTES_CHARS) blocks.shift();
-  const kept = blocks.join(NOTES_SEPARATOR);
+  let length = notes.length;
+  let first = 0;
+  while (blocks.length - first > 1 && length > MAX_NOTES_CHARS) {
+    length -= blocks[first].length + NOTES_SEPARATOR.length;
+    first++;
+  }
+  const kept = blocks.slice(first).join(NOTES_SEPARATOR);
   return kept.length <= MAX_NOTES_CHARS ? kept : kept.slice(0, MAX_NOTES_CHARS);
 }
 
@@ -49,7 +54,7 @@ export function appendNotes(existing: unknown, incoming: unknown): string {
   const next = str(incoming);
   if (!next) return capNotes(prev);
   if (!prev) return capNotes(next);
-  if (prev === next || containsBlock(prev, next)) return capNotes(prev);
+  if (prev === next || containsBlock(prev, next)) return prev;
   return capNotes(`${prev}${NOTES_SEPARATOR}${next}`);
 }
 
