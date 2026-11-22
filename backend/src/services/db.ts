@@ -10235,9 +10235,10 @@ export const crmDb = {
    * the read and the write; an unconditioned `SET engagements = :whole` would
    * then overwrite that append with the stale array.
    *
-   * The count is checked as well as `updatedAt` because an unconditional append
-   * stamps `updatedAt` from the clock and could, within one millisecond, rewrite
-   * the same value. An append always changes the count.
+   * The full engagements list is checked as well as `updatedAt` because an
+   * unconditional append stamps `updatedAt` from the clock and could, within one
+   * millisecond, rewrite the same value; a concurrent delete can also leave the
+   * count unchanged, so only the whole list proves nothing moved.
    *
    * On a lost race the lead is re-read and `rebuild` runs again on the fresh
    * array. After ENGAGEMENT_REWRITE_MAX_ATTEMPTS lost races the thrown error
@@ -10249,8 +10250,10 @@ export const crmDb = {
     rebuild: (existing: Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) => Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>,
   ) {
     for (let attempt = 1; ; attempt++) {
-      // Get the lead first to ensure it exists
-      const lead = await this.getLeadById(listId, leadId);
+      // Get the lead first to ensure it exists. After a lost race, read strongly
+      // consistent: an eventually consistent read can return the same stale
+      // snapshot again and burn every attempt on a conflict that already settled.
+      const lead = await this.getLeadById(listId, leadId, attempt > 1 ? { consistentRead: true } : undefined);
       if (!lead) {
         throw new Error('Lead not found');
       }
@@ -10286,8 +10289,10 @@ export const crmDb = {
       // Only when a list was read. A row whose `engagements` is absent or not a
       // list is guarded by `updatedAt` alone.
       if (hasEngagementsAttribute) {
-        conditions.push('size(engagements) = :expectedCount');
-        expressionAttributeValues[':expectedCount'] = existingEngagements.length;
+        // Compare the whole stored list, not just its length: a delete plus a
+        // same-millisecond append can leave both updatedAt and the count unchanged.
+        conditions.push('engagements = :expectedEngagements');
+        expressionAttributeValues[':expectedEngagements'] = existingEngagements;
       }
 
       const params = {

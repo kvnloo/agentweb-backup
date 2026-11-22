@@ -96,9 +96,9 @@ describe.each([
     const p = sentParams(update, 0);
     expect(p.ConditionExpression).toContain('attribute_exists(leadId)');
     expect(p.ConditionExpression).toContain('updatedAt = :expectedUpdatedAt');
-    expect(p.ConditionExpression).toContain('size(engagements) = :expectedCount');
+    expect(p.ConditionExpression).toContain('engagements = :expectedEngagements');
     expect(p.ExpressionAttributeValues[':expectedUpdatedAt']).toBe(T0);
-    expect(p.ExpressionAttributeValues[':expectedCount']).toBe(2);
+    expect(p.ExpressionAttributeValues[':expectedEngagements']).toEqual([e1, e2]);
     expect(p.ExpressionAttributeValues[':updatedAt'] > T0).toBe(true);
   });
 
@@ -116,6 +116,11 @@ describe.each([
     expect(written.map((e: any) => e.eventId)).toEqual(survivorIds);
     expect(sentParams(update, 1).ExpressionAttributeValues[':expectedUpdatedAt']).toBe(T1);
     expect(result.engagements.map((e: any) => e.eventId)).toEqual(survivorIds);
+    expect(sentParams(update, 1).ExpressionAttributeValues[':expectedEngagements'].map((e: any) => e.eventId)).toEqual(['e1', 'e2', 'e3']);
+    // The retry read is strongly consistent so it cannot return the stale snapshot again.
+    const gets = mockDocumentClientMethods.get.mock.calls;
+    expect(gets[0][0].ConsistentRead).toBeFalsy();
+    expect(gets[1][0].ConsistentRead).toBe(true);
   });
 
   it('AC1: a race that never settles fails with preconditionFailed and stops retrying', async () => {
