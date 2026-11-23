@@ -453,6 +453,21 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       expect(cookieCalls()).toContain('load_browser_cookies');
     });
 
+    it('a visitor on an OFF link never writes browser state back over the owner\'s saved sessions, even in a chat where the owner already used the browser', async () => {
+      // the owner uses the browser first: their cookies load and the chat is registered for saving after state-changing browser tools
+      await run('playwright_browser_click', undefined, { element: 'x' });
+      expect(cookieCalls()).toEqual(expect.arrayContaining(['load_browser_cookies', 'save_browser_cookies']));
+      dispatch.mockClear();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await run('playwright_browser_click', VISITOR, { element: 'x' });
+      expect(cookieCalls()).toEqual([]); // no save, whatever the visitor did in the page
+      // and on an ON link the save does happen, as it always did
+      dispatch.mockClear();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await run('playwright_browser_click', VISITOR, { element: 'x' });
+      expect(cookieCalls()).toContain('save_browser_cookies');
+    });
+
     it('the OWNER (no restriction profile) is not affected: cookies load, and the link is not even read', async () => {
       await run('playwright_browser_navigate', undefined, { url: 'https://example.com' });
       expect(cookieCalls()).toContain('load_browser_cookies');
