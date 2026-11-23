@@ -28,7 +28,7 @@ app.use('/api/org', (req: any, _res: any, next: any) => {
 }, orgMemoryRoutes);
 const request = supertest(app);
 
-const LIST_READ = { maxRows: 1000, newestFirst: false, omitEmbeddings: true };
+const LIST_READ = { maxRows: 1000, newestFirst: true, omitEmbeddings: true };
 
 describe('GET /api/org/:orgId/memory (ENG-2840 W2-1)', () => {
   beforeEach(() => {
@@ -37,11 +37,23 @@ describe('GET /api/org/:orgId/memory (ENG-2840 W2-1)', () => {
     (orgMemoryDb.getOrgMemories as jest.Mock).mockResolvedValue([{ memoryId: 'm1', content: 'fact' }]);
   });
 
-  it('asks for the list read: up to 1,000 rows, oldest first, no vectors', async () => {
+  it('asks for the list read: the newest rows up to 1,000, no vectors', async () => {
     const res = await request.get('/api/org/org1/memory');
     expect(res.status).toBe(200);
     expect(res.body.memories).toEqual([{ memoryId: 'm1', content: 'fact' }]);
     expect(orgMemoryDb.getOrgMemories).toHaveBeenCalledWith('org1', undefined, undefined, LIST_READ);
+  });
+
+  it('returns the list OLDEST FIRST, the order the screen always had (the read is newest first so the bound drops the oldest)', async () => {
+    (orgMemoryDb.getOrgMemories as jest.Mock).mockResolvedValue([{ memoryId: 'm3' }, { memoryId: 'm2' }, { memoryId: 'm1' }]);
+    const res = await request.get('/api/org/org1/memory');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('returns a category read as read (the category index cannot be ordered by time)', async () => {
+    (orgMemoryDb.getOrgMemories as jest.Mock).mockResolvedValue([{ memoryId: 'a' }, { memoryId: 'b' }]);
+    const res = await request.get('/api/org/org1/memory?category=workflow');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['a', 'b']);
   });
 
   it('forwards the category filter', async () => {

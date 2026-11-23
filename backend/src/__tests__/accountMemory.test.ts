@@ -328,8 +328,22 @@ describe('Memory API Routes', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.memories).toHaveLength(1);
-    // ENG-2840 (W2-1): the list screen reads up to the list bound, oldest first, without the embedding vectors.
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined, undefined, { maxRows: 1000, newestFirst: false, omitEmbeddings: true });
+    // ENG-2840 (W2-1): the list screen reads the newest rows up to the list bound, without the embedding vectors.
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
+  });
+
+  it('GET /api/memory returns the list OLDEST FIRST, the order the screen always had (the read is newest first so the bound drops the oldest)', async () => {
+    const { accountMemoryDb: mockDb } = require('../services/db');
+    mockDb.getUserMemories.mockResolvedValue([{ memoryId: 'm3' }, { memoryId: 'm2' }, { memoryId: 'm1' }]);
+    const res = await request.get('/api/memory');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('GET /api/memory?category= returns the rows as read: a category index cannot be ordered by time', async () => {
+    const { accountMemoryDb: mockDb } = require('../services/db');
+    mockDb.getUserMemories.mockResolvedValue([{ memoryId: 'a' }, { memoryId: 'b' }]);
+    const res = await request.get('/api/memory?category=preference');
+    expect(res.body.memories.map((m: any) => m.memoryId)).toEqual(['a', 'b']);
   });
 
   it('GET /api/memory?category=preference should filter by category', async () => {
@@ -338,7 +352,7 @@ describe('Memory API Routes', () => {
 
     await request.get('/api/memory?category=preference');
 
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference', undefined, { maxRows: 1000, newestFirst: false, omitEmbeddings: true });
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference', undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
   });
 
   it('POST /api/memory should create a memory', async () => {

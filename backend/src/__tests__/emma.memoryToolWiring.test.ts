@@ -28,6 +28,7 @@ jest.mock('../services/skillService', () => ({ skillService: { getPublishedSkill
 
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools';
+import { MEMORY_CATEGORIES } from '../utils/memoryCategories';
 
 const run = (name: string, args: any, context: any = { userId: 'u1', sessionId: 's1' }) => emmaToolRegistry.getTool(name)!.execute(args, context);
 
@@ -46,6 +47,12 @@ describe('the registered memory tools run the shared bodies', () => {
       expect(emmaToolRegistry.getTool(name)).toBeTruthy();
     }
     expect(emmaToolRegistry.getTool('delete_org_memory')!.definition.description).toMatch(/owners and admins/);
+  });
+
+  it('both save tools advertise exactly the shared category list', () => {
+    for (const name of ['save_memory', 'save_org_memory']) {
+      expect(emmaToolRegistry.getTool(name)!.definition.inputSchema.properties.category.enum).toEqual([...MEMORY_CATEGORIES]);
+    }
   });
 
   it('save_memory writes to the ACCOUNT table only', async () => {

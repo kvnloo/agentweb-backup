@@ -115,13 +115,18 @@ describe('saveAccountMemory: the defects fixed in W2-1', () => {
     expect(mockEmbedText).not.toHaveBeenCalled();
   });
 
-  it.each([[42], [{ text: 'x' }], [['a', 'b']], [null], [undefined]])(
+  it.each([[42], [{ text: 'x' }], [['a', 'b']]])(
     'refuses content that is not text (%p) before anything is saved (a throw after saving made a retry save twice)',
     async (content) => {
-      await expect(saveAccountMemory({ content, category: 'insight' }, ctx)).rejects.toThrow(/Content (must be text|is required)/);
+      await expect(saveAccountMemory({ content, category: 'insight' }, ctx)).rejects.toThrow('Content must be text');
       expect(mockAddAccount).not.toHaveBeenCalled();
     },
   );
+
+  it.each([[null], [undefined]])('answers "Content is required", as the database layer always did, when content is missing (%p)', async (content) => {
+    await expect(saveAccountMemory({ content, category: 'insight' }, ctx)).rejects.toThrow('Content is required');
+    expect(mockAddAccount).not.toHaveBeenCalled();
+  });
 
   it('refuses content over 8,000 characters with the length in the message (the limit used to live only in the agent-mode schema)', async () => {
     await expect(saveAccountMemory({ content: 'a'.repeat(8001), category: 'insight' }, ctx)).rejects.toThrow(

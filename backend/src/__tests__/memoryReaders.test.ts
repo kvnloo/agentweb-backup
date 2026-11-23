@@ -55,6 +55,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockDocumentClientMethods.query.mockReset();
   mockDocumentClientMethods.delete.mockReset();
+  mockDocumentClientMethods.update.mockReset();
 });
 
 describe('the bounds', () => {
@@ -77,7 +78,7 @@ describe('accountMemoryDb.getUserMemories follows the cursor', () => {
     expect(calls[1].ExclusiveStartKey).toEqual({ userId: 'u1', memoryId: '01ROW0003' });
   });
 
-  it('reads the prod shape: 277 rows in pages of 56 come back as the newest 200, not the first 56', async () => {
+  it('reads the prod shape: 277 rows in pages of 56 stop after four pages at 200 rows, not at the first 56 (the order is pinned by the order tests)', async () => {
     const pages = [0, 1, 2, 3, 4].map((p) => range(p * 56 + 1, p === 4 ? 53 : 56, accountRow));
     servePages(pages, accountKey);
     const rows = await accountMemoryDb.getUserMemories('u1');
@@ -244,5 +245,169 @@ describe('deleteMemory says whether there was anything to delete', () => {
   it('still refuses to delete a structured learning row', async () => {
     await expect(accountMemoryDb.deleteMemory('u1', 'ads-learning#x')).rejects.toThrow(/learning review/);
     expect(mockDocumentClientMethods.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe('an ascending read jumps over the learning range at the END of the partition', () => {
+  it('uses a > boundary past the last learning id, makes no further call, and returns the ordinary rows (the list routes read this way)', async () => {
+    mockDocumentClientMethods.query.mockImplementation((params: any) => ({
+      promise: async () => (params.KeyConditionExpression.includes('memoryId >')
+        ? { Items: [] }
+        : { Items: range(1, 2, accountRow), LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { newestFirst: false });
+    expect(rows.map((r: Row) => r.memoryId)).toEqual(['01ROW0001', '01ROW0002']);
+    const calls = mockDocumentClientMethods.query.mock.calls.map((c) => c[0]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].KeyConditionExpression).toContain('memoryId >');
+    expect(calls[1].ExpressionAttributeValues[':learningBoundary']).toBe('ads-learning#\uffff');
+    expect(calls[1].ExclusiveStartKey).toBeUndefined();
+    expect(calls[1].ScanIndexForward).toBeUndefined();
+  });
+});
+
+describe('the org reader keeps a limit call as it was', () => {
+  it('a limit call has no direction either (the account reader is pinned the same way)', async () => {
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, 2);
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].ScanIndexForward).toBeUndefined();
+  });
+});
+
+describe('omitEmbeddings does not fetch the vectors: a projection naming every other attribute', () => {
+  const ACCOUNT_ATTRS = ['category', 'content', 'createdAt', 'memoryId', 'sourceSessionId', 'updatedAt', 'userId'];
+  const ORG_ATTRS = ['category', 'content', 'createdAt', 'memoryId', 'orgId', 'sourceUserId', 'updatedAt'];
+  const projectedNames = (call: any) => Object.values(call.ExpressionAttributeNames as Record<string, string>).sort();
+  const expressionUsesEveryName = (call: any) => Object.keys(call.ExpressionAttributeNames).every((k) => call.ProjectionExpression.includes(k));
+
+  it('account: names every stored attribute except embedding, and a default read names none (the prompt loader needs the vectors)', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { omitEmbeddings: true });
+    const call = mockDocumentClientMethods.query.mock.calls[0][0];
+    expect(projectedNames(call)).toEqual(ACCOUNT_ATTRS);
+    expect(expressionUsesEveryName(call)).toBe(true);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1');
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].ProjectionExpression).toBeUndefined();
+  });
+
+  it('org: names every stored attribute except embedding, and a default read names none', async () => {
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, undefined, { omitEmbeddings: true });
+    const call = mockDocumentClientMethods.query.mock.calls[0][0];
+    expect(projectedNames(call)).toEqual(ORG_ATTRS);
+    expect(expressionUsesEveryName(call)).toBe(true);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1');
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].ProjectionExpression).toBeUndefined();
+  });
+
+  it('a category read and a limit call carry the projection too', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', 'preference', undefined, { omitEmbeddings: true });
+    const byCategory = mockDocumentClientMethods.query.mock.calls[0][0];
+    expect(byCategory.IndexName).toBe('UserIdCategoryIndex');
+    expect(projectedNames(byCategory)).toEqual(ACCOUNT_ATTRS);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, 2, { omitEmbeddings: true });
+    expect(projectedNames(mockDocumentClientMethods.query.mock.calls[0][0])).toEqual(ORG_ATTRS);
+  });
+
+  it('the projection survives the learning-range jump (the jump query is built from the same parameters)', async () => {
+    mockDocumentClientMethods.query.mockImplementation((params: any) => ({
+      promise: async () => (params.KeyConditionExpression.includes('memoryId <')
+        ? { Items: range(1, 2, accountRow) }
+        : { Items: [{ memoryId: 'ads-learning#a', content: 'proposal' }], LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { omitEmbeddings: true });
+    const jump = mockDocumentClientMethods.query.mock.calls[1][0];
+    expect(jump.KeyConditionExpression).toContain('memoryId <');
+    expect(projectedNames(jump)).toEqual(ACCOUNT_ATTRS);
+  });
+});
+
+describe('the bound of a read is a whole number of at least 1', () => {
+  it.each([[0], [-5], [Number.NaN], [Number.POSITIVE_INFINITY]])('a maxRows of %p falls back to the default of 200', async (maxRows) => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows });
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(200);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, undefined, { maxRows });
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(200);
+  });
+
+  it('a fractional maxRows is rounded down', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 2.7 });
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(2);
+  });
+});
+
+describe('a read that stops at its bound with more rows stored says so in the log', () => {
+  const morePages = (make: (i: number) => Row, key: (r: Row) => Row) =>
+    mockDocumentClientMethods.query.mockImplementation(() => ({ promise: async () => ({ Items: range(1, 4, make), LastEvaluatedKey: key(make(4)) }) }));
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => warn.mockRestore());
+
+  it('account: one warning when the bound is hit with a cursor still pending', async () => {
+    morePages(accountRow, accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 4 });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/account memory read stopped at its 4-row bound/);
+  });
+
+  it('org: one warning when the bound is hit with a cursor still pending', async () => {
+    morePages(orgRow, orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, undefined, { maxRows: 4 });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/org memory read stopped at its 4-row bound/);
+  });
+
+  it('no warning when the rows ran out, and none for a limit call', async () => {
+    servePages([range(1, 3, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1');
+    morePages(accountRow, accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, 4);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('the org reader fails closed on a malformed row, like the account reader', () => {
+  it('a row without a string content or memoryId is refused', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ orgId: 'o1', memoryId: 'm1' }] }) });
+    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory item/);
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [null] }) });
+    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory item/);
+  });
+});
+
+describe('setMemoryEmbedding never brings a deleted memory back', () => {
+  const conditionalFailure = () => ({ promise: async () => { throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' }); } });
+
+  it('account: the update is conditional on the row existing, and a row deleted meanwhile is ignored', async () => {
+    mockDocumentClientMethods.update.mockReturnValue({ promise: async () => ({}) });
+    await accountMemoryDb.setMemoryEmbedding('u1', 'm1', [1, 2]);
+    expect(mockDocumentClientMethods.update.mock.calls[0][0]).toMatchObject({ Key: { userId: 'u1', memoryId: 'm1' }, ConditionExpression: 'attribute_exists(memoryId)' });
+    mockDocumentClientMethods.update.mockReturnValue(conditionalFailure());
+    await expect(accountMemoryDb.setMemoryEmbedding('u1', 'gone', [1, 2])).resolves.toBeUndefined();
+  });
+
+  it('org: the same', async () => {
+    mockDocumentClientMethods.update.mockReturnValue({ promise: async () => ({}) });
+    await orgMemoryDb.setMemoryEmbedding('o1', 'm1', [1, 2]);
+    expect(mockDocumentClientMethods.update.mock.calls[0][0]).toMatchObject({ Key: { orgId: 'o1', memoryId: 'm1' }, ConditionExpression: 'attribute_exists(memoryId)' });
+    mockDocumentClientMethods.update.mockReturnValue(conditionalFailure());
+    await expect(orgMemoryDb.setMemoryEmbedding('o1', 'gone', [1, 2])).resolves.toBeUndefined();
+  });
+
+  it('any other failure is still thrown', async () => {
+    mockDocumentClientMethods.update.mockReturnValue({ promise: async () => { throw Object.assign(new Error('throttled'), { code: 'ProvisionedThroughputExceededException' }); } });
+    await expect(accountMemoryDb.setMemoryEmbedding('u1', 'm1', [1])).rejects.toThrow('throttled');
+    await expect(orgMemoryDb.setMemoryEmbedding('o1', 'm1', [1])).rejects.toThrow('throttled');
   });
 });
