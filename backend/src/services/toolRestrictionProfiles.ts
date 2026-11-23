@@ -106,7 +106,7 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
  *    `allowedValues` or starts with one of `allowedPrefixes`; EVERY other value, a missing argument and a non-text one is sensitive, so
  *    a write action added tomorrow is refused until someone classifies it. Values are compared trimmed, lower-cased, with `_` as `-`
  *    (the X and LinkedIn dispatchers treat them the same).
- *  - `present`: the call is sensitive when any of these arguments is set (a non-empty text or list, or `true`), because that is what
+ *  - `present`: the call is sensitive when any of these arguments is set (a non-empty text or list, or any other truthy value), because that is what
  *    makes the tool reach someone (calendar attendees, a notification, a document shared with addresses).
  * All the read actions of the tools below are get-, list- or search-... (checked against the action literals in
  * `emma/impl/adsCrmApis.ts`, `adsApis.ts`, `linkedin.ts`, `twitter.ts`); `shareVisitorSensitiveTools.test.ts` pins that against the
@@ -141,11 +141,16 @@ function normaliseActionValue(value: string): string {
   return value.trim().toLowerCase().replace(/_/g, '-');
 }
 
+/** "Set" the way the tools read it: a non-empty list or text, or any other truthy value (a tool that notifies on a truthy flag is reached by `1` or `{}` too). */
 function isSet(value: unknown): boolean {
-  if (value === true) return true;
   if (typeof value === 'string') return value.trim().length > 0;
   if (Array.isArray(value)) return value.length > 0;
-  return false;
+  return Boolean(value);
+}
+
+/** True for a tool that is sensitive whatever its arguments (the whole-tool list). A tool judged by an argument is not: it needs the call. */
+export function isSensitiveWholeTool(toolName: string): boolean {
+  return typeof toolName === 'string' && SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName);
 }
 
 /** True when this call is sensitive (see above). Pure: it does not know about any link, only about the tool and its arguments. */
@@ -195,6 +200,15 @@ function classifyRestrictedTool(toolName: string, adminToolNames: readonly strin
   if (SHARE_VISITOR_BLOCKED_TOOLS.has(toolName)) return 'owner_settings';
   if (toolName === 'connect_account') return 'connect_account';
   return null;
+}
+
+/**
+ * True when the visitor-made-schedule profile refuses this tool because of the ENG-2816 block list (owner settings, memory, Smartlead,
+ * admin tools, connect_account), as opposed to the ENG-3170 sensitive rule. The caller that already has its own answer for publishing
+ * (`agentModeService.blockedByScheduledPublishApproval`) uses this to leave the block-listed tools to this module.
+ */
+export function isRefusedByScheduleBlockList(toolName: string, adminToolNames: readonly string[]): boolean {
+  return classifyRestrictedTool(toolName, adminToolNames) !== null;
 }
 
 const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
