@@ -14,6 +14,17 @@ refusal in `toolDispatch` asks the link through the optional port `shareLinkFull
 Added with it, on the owner's yes: `enable_lead_list_public_access`, `set_landing_page_lead_list`, `deploy_landing_page`, `test_scheduled_chat`,
 and `set_lead_contact_status` (only `active`, which re-enables contact with a lead who opted out, is sensitive).
 
+**Also under Full control (owner, 2026-11-23: "the full capability of the end user themselves").** A link with it ON may answer an approval card that
+carries a write or a locked decision: the share route used to refuse those with 403 for every visitor (ENG-1635/1644) and still does unless a
+consistent read of the link says Full control is ON (unreadable, missing or off keeps the 403). Still different from the customer, on purpose or
+pending the owner's call: admin tools (never lifted), schedules a visitor creates (marked, wait for the owner to adopt them), schedule-template
+writes (refused for a visitor), and a visitor cannot stop the owner's running turn. The dialog shows the Off explanation only when the switch is off
+and the On text (every power listed) only when it is on.
+
+**A separate fix that rides in this PR, as its own commit (owner: "if it's a tiny fix, do it").** `set_lead_contact_status` used `crmDb.updateLead`,
+an upsert, so an id that was already deleted (or mistyped) came back as an empty stub lead. It now reads the lead first (consistent read) and reports a
+missing one as failed, writing nothing.
+
 **What changed.**
 - `interactiveShareMetadata.allowSensitiveActions` (the owner's per-link choice). `utils/interactiveShare.interactiveShareAllowsSensitiveActions`
   is the one place that reads it. An explicit boolean wins. A link made before the setting existed (no choice stored) reads as ON only
