@@ -157,6 +157,27 @@ describe('GET /session/:id/conversable-share (getConversableShareSettings)', () 
   });
 });
 
+describe('a request carrying a visitor\'s restriction claim never changes the owner\'s setting (ENG-3170 review, defence in depth)', () => {
+  // The claim is set only from a verified self-call token of a visitor's turn (middleware/auth.ts); no tool reaches these routes today.
+  const claimed = (over: Record<string, unknown>) => req({ ...over, restrictionProfile: 'share_visitor' });
+
+  it.each(['share_visitor', 'share_visitor_schedule'])('POST create with the %s claim: 403, nothing created, nothing read', async (profile) => {
+    const res = makeRes();
+    await agentModeController.createConversableShare(req({ body: { sessionId: 's1', expirationDays: 7, allowSensitiveActions: true }, restrictionProfile: profile }), res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+  });
+
+  it('PATCH with the claim: 403, nothing written', async () => {
+    const res = makeRes();
+    await agentModeController.updateConversableShareSettings(claimed({ params: { sessionId: 's1' }, body: { allowSensitiveActions: true } }), res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(chatbotDb.setInteractiveShareAllowSensitiveActions).not.toHaveBeenCalled();
+    expect(chatbotDb.getChatSessionRecord).not.toHaveBeenCalled();
+  });
+});
+
 describe('PATCH /session/:id/conversable-share (updateConversableShareSettings)', () => {
   const patch = async (body: unknown, records: unknown[], user: unknown = OWNER) => {
     const read = chatbotDb.getChatSessionRecord as jest.Mock;
