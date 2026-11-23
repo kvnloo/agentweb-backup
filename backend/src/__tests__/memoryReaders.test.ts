@@ -438,6 +438,15 @@ describe('a row without text content (found by Opslane on the second page of an 
     expect(rows.map((r: Row) => r.content)).toEqual(['fact 2', 'fact 3', 'fact 4']);
   });
 
+  it('the skipped row is logged on the exit through the learning-range jump too (an ascending read that fills its bound there)', async () => {
+    mockDocumentClientMethods.query.mockImplementation(() => ({
+      promise: async () => ({ Items: [noContent('01ROW0001'), accountRow(2), accountRow(3)], LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { newestFirst: false, maxRows: 2 });
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 2', 'fact 3']);
+    expect(warn.mock.calls.map((c) => c[0]).filter((m: string) => /skipped 1 row\(s\) without text content, ids 01ROW0001/.test(m))).toHaveLength(1);
+  });
+
   it('no skipped-row warning when every row is readable', async () => {
     servePages([range(1, 3, accountRow)], accountKey);
     await accountMemoryDb.getUserMemories('u1');
