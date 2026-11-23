@@ -105,6 +105,13 @@ describe('ENG-2936 forward-lead submission history', () => {
     expect(hook.mock.calls[0][0].sourceRecordId).toBe('forward-lead:list_123:client:sub-1');
   });
 
+  it('records the declared visitorPageUrl when no attribution or custom-field URL exists', async () => {
+    await post({ notes: 'x', visitorPageUrl: 'https://lp.example.com/pricing?utm_source=a' });
+    await flush();
+    expect(hook.mock.calls[0][0].payload.pageUrl).toBeTruthy();
+    expect(String(hook.mock.calls[0][0].payload.pageUrl)).toContain('lp.example.com/pricing');
+  });
+
   it('distinct submissions without a key get distinct history entries', async () => {
     await post({ notes: 'one' });
     await post({ notes: 'two' });

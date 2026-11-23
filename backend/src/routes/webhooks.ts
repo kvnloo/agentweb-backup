@@ -1383,7 +1383,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           leadId: lead.leadId,
           event: responseBody.event,
           submittedAt: new Date().toISOString(),
-          pageUrl: incomingCustomFields?.page_url || incomingCustomFields?.pageUrl || touch?.landingUrl || null,
+          pageUrl: incomingCustomFields?.page_url || incomingCustomFields?.pageUrl || touch?.landingUrl || pageUrlOf(declaredPageUrl) || null,
           notes: leadData.notes || '',
           fields: {
             firstName: leadData.firstName, lastName: leadData.lastName, phone: leadData.phone,
