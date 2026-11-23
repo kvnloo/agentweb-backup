@@ -251,8 +251,11 @@ describe('chargeBatchMembers', () => {
   });
 
   it('fails closed when what is left is not a number (a key stored with a non-numeric rate): the batch is refused, not looped', () => {
+    // The allowance is large on purpose: with a small one the limiter would block itself part-way through the loop and the answer would
+    // be "refused" either way. Here, a guard that let the batch through would charge all 1,999 members and answer "allowed".
     for (const remaining of [NaN, undefined as any, 'many' as any]) {
-      expect(chargeBatchMembers('unit-d', 5, { allowed: true, remaining, resetInMs: 1 }, batch(2000)).allowed).toBe(false);
+      const result = chargeBatchMembers(`unit-d-${String(remaining)}`, 1_000_000, { allowed: true, remaining, resetInMs: 1 }, batch(2000));
+      expect(result.allowed).toBe(false);
     }
   });
 });
