@@ -375,6 +375,14 @@ describe('a read that stops at its bound with more rows stored says so in the lo
     await accountMemoryDb.getUserMemories('u1', undefined, 4);
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it('org: no warning when the rows ran out below the bound, and none for a limit call', async () => {
+    servePages([range(1, 3, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1');
+    morePages(orgRow, orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, 4);
+    expect(warn).not.toHaveBeenCalled();
+  });
 });
 
 describe('the org reader still returns rows as stored (it never validated them)', () => {
