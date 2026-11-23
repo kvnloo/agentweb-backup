@@ -134,6 +134,12 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       expect(isSensitiveToolCall(tool, { [arg]: '' })).toBe(false);
       expect(isSensitiveToolCall(tool, { [arg]: null })).toBe(false);
     });
+    it('"set" means truthy, the way the tools read it: a flag given as 1 or an object still notifies, 0 and false do not', () => {
+      expect(isSensitiveToolCall('update_gtm_work_item', { notify_user: 1 })).toBe(true);
+      expect(isSensitiveToolCall('update_gtm_work_item', { notify_plan_poc: {} })).toBe(true);
+      expect(isSensitiveToolCall('update_gtm_work_item', { notify_user: 0 })).toBe(false);
+      expect(isSensitiveToolCall('update_gtm_work_item', { notify_user: false })).toBe(false);
+    });
     it('a text value counts as set (a single address given as text)', () => {
       expect(isSensitiveToolCall('create_google_doc', { share_with_emails: 'a@example.com' })).toBe(true);
     });
