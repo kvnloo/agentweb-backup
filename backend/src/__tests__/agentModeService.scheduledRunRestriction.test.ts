@@ -78,6 +78,9 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   };
   const run = (toolName: string, ctx?: Record<string, unknown>, sessionId = 'run-session') =>
     (service as any).executeTool('gpt-4', toolName, argsFor(toolName), 'owner-user-id', sessionId, false, ctx);
+  // with the arguments the test names (the helper above builds minimal valid ones for a tool that has to be dispatched)
+  const runWith = (toolName: string, ctx: Record<string, unknown>, args: unknown) =>
+    (service as any).executeTool('gpt-4', toolName, args, 'owner-user-id', 'run-session', false, ctx);
   const scheduleWith = (provenance: unknown) =>
     getSchedule.mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance } as any);
   const marked = (provenance: unknown = ['startingMessage']) => scheduleWith(provenance);
@@ -120,6 +123,45 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
         }
       }
       expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: refuses a SENSITIVE tool (send or post outside the account, delete data, change ad spend), with the adopt wording', async () => {
+      marked();
+      for (const [tool, args] of [
+        ['slack_send_message', { text: 'hi' }],
+        ['delete_leads', { list_id: 'l', lead_ids: ['a'] }],
+        ['email', { action: 'send' }],
+        ['call_google_ads_api', { action: 'PAUSE' }],
+        ['launch_targeted_audience_campaign', {}],
+      ] as Array<[string, any]>) {
+        await expect(runWith(tool, { isUnattendedRun: true }, args)).rejects.toMatchObject({
+          deniedBy: 'restriction_profile',
+          message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+        });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: still runs the READ side of a tool that also writes, and spends the schedule reads only for a sensitive call', async () => {
+      marked();
+      for (const [tool, args] of [['call_google_ads_api', { action: 'LIST' }], ['email', { action: 'search' }], ['call_hubspot_api', { action: 'GET_STATS' }]] as Array<[string, any]>) {
+        const result = await (service as any).scheduledRunRestriction(tool, 'run-session', { isUnattendedRun: true }, args);
+        expect(result.refusal).toBeNull();
+      }
+      expect(getSession).not.toHaveBeenCalled();
+      expect(getSchedule).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: leaves a PUBLISH call to the publish gate, which answers in its own words (it is not replaced by the general refusal)', async () => {
+      marked();
+      // scheduledRunRestriction itself does not refuse a publish call: blockedByScheduledPublishApproval (ENG-803) withholds it later, with its own text
+      const result = await (service as any).scheduledRunRestriction('post_on_connected_account', 'session-1', { isUnattendedRun: true }, { text: 'x' });
+      expect(result.refusal).toBeNull();
+      const linkedin = await (service as any).scheduledRunRestriction('linkedin_manage_post', 'session-1', { isUnattendedRun: true }, { action: 'repost' });
+      expect(linkedin.refusal).toBeNull();
+      // a tool that is on the block list is still refused by this module, publish or not
+      const blocked = await (service as any).scheduledRunRestriction('save_memory', 'session-1', { isUnattendedRun: true }, {});
+      expect(blocked.refusal).toContain('set up or edited through a share link');
     });
 
     it('uses the scheduled-run wording, never the share_visitor wording ("shared sessions")', async () => {
