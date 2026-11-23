@@ -11818,6 +11818,9 @@ export interface MemoryReadOptions {
   /** Do not fetch the embedding vectors at all (a projection: about 40 of every 45 KB of a row on the wire). Default false: the
    * prompt loader ranks by them. */
   omitEmbeddings?: boolean;
+  /** Strongly consistent read (`ConsistentRead`), so a memory saved a moment ago is in the answer. Applies to a read of the table only:
+   * a category read goes through an index, which cannot be read consistently, and ignores this. Costs twice the read capacity. */
+  consistentRead?: boolean;
 }
 
 /** The bound of a read, as a whole number of at least 1 (a zero or negative bound would send DynamoDB an invalid Limit). */
@@ -12011,6 +12014,7 @@ export const accountMemoryDb = {
           ...(limit ? { Limit: limit } : {}),
           // Newest first only for an unbounded-by-limit table read: the category index sorts by category, not by time.
           ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
+          ...(options.consistentRead ? { ConsistentRead: true } : {}),
         };
 
       // A list read that leaves the vectors out does not fetch them: a projection, not a strip after the read.
@@ -12195,6 +12199,7 @@ export const orgMemoryDb = {
           ExpressionAttributeValues: { ':orgId': orgId },
           ...(limit ? { Limit: limit } : {}),
           ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
+          ...(options.consistentRead ? { ConsistentRead: true } : {}),
         };
 
       const readParams = options.omitEmbeddings ? { ...params, ...withoutEmbeddingsProjection(ORG_MEMORY_LIST_ATTRIBUTES) } : params;

@@ -36,8 +36,12 @@ export const MEMORY_MCP_MAX_ROWS = 200;
 export const LIST_MEMORIES_DEFAULT_LIMIT = 20;
 export const LIST_MEMORIES_MAX_LIMIT = 50;
 
-/** A list read: the newest rows up to the list bound, no embeddings (the same read the Settings screens make). */
-const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: true, omitEmbeddings: true } as const;
+/**
+ * The read these tools make: the newest rows up to the list bound, no embeddings (the Settings screens' read), and STRONGLY CONSISTENT, so
+ * a list made right after a save shows it and two saves of the same text in a row see each other (a table read is eventually consistent
+ * by default). It reads the table, never a category index (an index cannot be read consistently), so a category is filtered here.
+ */
+const TOOL_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: true, omitEmbeddings: true, consistentRead: true } as const;
 
 function callerId(context: any): string {
   const userId = context?.userId || context?.agentUserId;
@@ -69,11 +73,11 @@ export function checkId(tool: string, field: string, value: unknown): string {
 type StoredRow = { memoryId: string; category?: string; content?: string; createdAt?: string; updatedAt?: string };
 
 /** The newest stored rows (no embeddings) of the account or of the org, up to the list bound. */
-async function readStored(scope: 'user' | 'org', ownerId: string, category?: string): Promise<StoredRow[]> {
+async function readStored(scope: 'user' | 'org', ownerId: string): Promise<StoredRow[]> {
   const { accountMemoryDb, orgMemoryDb } = await import('../../services/db');
   const rows = scope === 'org'
-    ? await orgMemoryDb.getOrgMemories(ownerId, category, undefined, LIST_READ)
-    : await accountMemoryDb.getUserMemories(ownerId, category, undefined, LIST_READ);
+    ? await orgMemoryDb.getOrgMemories(ownerId, undefined, undefined, TOOL_READ)
+    : await accountMemoryDb.getUserMemories(ownerId, undefined, undefined, TOOL_READ);
   return rows as StoredRow[];
 }
 
@@ -175,10 +179,10 @@ export async function listMemories(args: unknown, context: any) {
     ownerId = user.orgId;
   }
 
-  const rows = await readStored(scope, ownerId, category);
-  // A category read comes back in the order of its index (by category), not by time: order here, newest first (ids are ULIDs).
+  const rows = await readStored(scope, ownerId);
+  // The category is filtered here (the table read is the consistent one) and the rows ordered newest first (ids are ULIDs).
   const ordered = rows
-    .filter((row) => typeof row.memoryId === 'string')
+    .filter((row) => typeof row.memoryId === 'string' && (category === undefined || row.category === category))
     .sort((a, b) => (a.memoryId < b.memoryId ? 1 : a.memoryId > b.memoryId ? -1 : 0));
   const remaining = cursor === undefined ? ordered : ordered.filter((row) => row.memoryId < cursor!);
   const page = remaining.slice(0, limit);
