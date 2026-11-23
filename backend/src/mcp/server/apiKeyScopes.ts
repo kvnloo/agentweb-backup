@@ -32,8 +32,13 @@ export const API_KEY_SCOPE_SMARTLEAD_READ = 'smartlead:read';
 export const API_KEY_SCOPE_SMARTLEAD_CONTROL = 'smartlead:control';
 /**
  * Org memory writes over MCP (ENG-2840 wave 2, W2-2). Opt-in like the others, and for `aw_` keys only: what an org memory says is put into
- * EVERY member's Emma prompt, so the person who owns the account decides which agent may write it by minting a scoped key. A signed-in
- * OAuth client does not get it. Reading org memory (`list_memories`, scope org) and the user's own memory tools need no opt-in scope.
+ * EVERY member's Emma prompt, so the person who owns the account decides which keys may call `save_org_memory` and `delete_org_memory` by
+ * minting a scoped key. A signed-in OAuth client does not get it. Reading org memory (`list_memories`, scope org) and the user's own
+ * memory tools need no opt-in scope.
+ *
+ * It controls those two TOOLS, not every route to org memory: a key that may start an Emma agent run (`emma_send_message` and the others in
+ * AGENT_EXECUTION_TOOLS) reaches Emma's own org memory tool inside that run, with no scope and no cap, as for `email:read` and the
+ * Smartlead scopes. Keeping those agent-run tools out of an outside agent's allowlist is the control for that.
  */
 export const API_KEY_SCOPE_MEMORY_ORG = 'memory:org';
 export const DEFAULT_API_KEY_SCOPES = [API_KEY_SCOPE_READ, API_KEY_SCOPE_EXECUTE];
@@ -45,6 +50,15 @@ export function effectiveApiKeyScopes(scopes: unknown): string[] {
 export interface ScopeDenial {
   tool: string;
   requiredScope: string;
+}
+
+/**
+ * The tool a JSON-RPC message names, or '' when `params.name` is not text. `String(x)` on a hostile value (an object whose `toString` is not
+ * a function) throws inside an async Express handler, which leaves the request hanging; a name that is not text is simply an unknown tool.
+ */
+function toolNameOf(message: unknown): string {
+  const name = (message as any)?.params?.name;
+  return typeof name === 'string' ? name : '';
 }
 
 type ToolLookup = (name: string) => { readOnly?: boolean; requiredScope?: string; apiKeyOnly?: boolean } | undefined;
@@ -76,7 +90,7 @@ export function findApiKeyOnlyToolCall(body: unknown, lookup: ToolLookup): Scope
   const messages = Array.isArray(body) ? body : [body];
   for (const message of messages) {
     if ((message as any)?.method !== 'tools/call') continue;
-    const tool = String((message as any)?.params?.name ?? '');
+    const tool = toolNameOf(message);
     const requiredScope = lookup(tool)?.requiredScope;
     if (requiredScope && isOptInScope(requiredScope)) return { tool, requiredScope };
   }
@@ -91,7 +105,7 @@ export function findApiKeyOnlyToolCallForNonKey(body: unknown, lookup: ToolLooku
   const messages = Array.isArray(body) ? body : [body];
   for (const message of messages) {
     if ((message as any)?.method !== 'tools/call') continue;
-    const tool = String((message as any)?.params?.name ?? '');
+    const tool = toolNameOf(message);
     const handler = lookup(tool);
     if (handler?.apiKeyOnly) return { tool, requiredScope: handler.requiredScope ?? '' };
   }
@@ -103,7 +117,7 @@ export function findScopeDenial(body: unknown, granted: string[], lookup: ToolLo
   const messages = Array.isArray(body) ? body : [body];
   for (const message of messages) {
     if ((message as any)?.method !== 'tools/call') continue;
-    const tool = String((message as any)?.params?.name ?? '');
+    const tool = toolNameOf(message);
     const requiredScope = requiredScopeForTool(tool, lookup);
     if (!scopeSatisfies(granted, requiredScope)) return { tool, requiredScope };
   }
