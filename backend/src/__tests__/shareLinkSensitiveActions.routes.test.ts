@@ -87,11 +87,27 @@ describe('POST /conversable-share (createConversableShare)', () => {
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ allowSensitiveActions: false }));
   });
 
-  it('a request with no choice on an EXISTING link answers with what that link already was and changes nothing', async () => {
+  it('a request with no choice on an EXISTING link answers with what that link already was (read back, consistently) and changes nothing', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: true })));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: true })));
     const res = await create({ sessionId: 's1', expirationDays: 7 });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ allowSensitiveActions: true }));
+    expect(chatbotDb.getChatSessionRecord).toHaveBeenCalledWith('s1', true);
     expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+  });
+
+  it('a request with no choice, on a full-control link that expired and was REPLACED by an off link, answers what is stored now: OFF', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: true, expiresAt: '2020-01-01T00:00:00.000Z' })));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: false })));
+    const res = await create({ sessionId: 's1', expirationDays: 7 });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ allowSensitiveActions: false }));
+  });
+
+  it('a request with no choice whose read-back fails answers OFF, never a guess', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: true })));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockRejectedValue(new Error('throttled'));
+    const res = await create({ sessionId: 's1', expirationDays: 7 });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ allowSensitiveActions: false }));
   });
 
   it.each([['the text "true"', 'true'], ['the number 1', 1], ['an object', {}], ['null', null]])(

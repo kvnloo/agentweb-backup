@@ -35,7 +35,7 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { isShareVisitorTurn } from './shareVisitorTurnMarker';
 
 /** The restriction profile of the tool call being run, for the calls that tool makes itself (see `executeTool`). */
-const toolCallRestrictionStore = new AsyncLocalStorage<{ restrictionProfile: string }>();
+const toolCallRestrictionStore = new AsyncLocalStorage<{ restrictionProfile: string; withinVisitorCall: boolean }>();
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -10234,11 +10234,14 @@ export class AgentModeService {
    */
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     const own = normalizeRestrictionClaim(extraContext?.restrictionProfile);
-    const inherited = own ? undefined : toolCallRestrictionStore.getStore()?.restrictionProfile;
+    const outer = toolCallRestrictionStore.getStore();
+    const inherited = own ? undefined : outer?.restrictionProfile;
     const context = inherited ? { ...(extraContext ?? {}), restrictionProfile: inherited } : extraContext;
     const profile = own ?? inherited;
     if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
-    return toolCallRestrictionStore.run({ restrictionProfile: profile }, () =>
+    // `withinVisitorCall` stays true for everything nested under a visitor's call, even when a nested call carries a profile of its own.
+    const withinVisitorCall = profile === 'share_visitor' || outer?.withinVisitorCall === true;
+    return toolCallRestrictionStore.run({ restrictionProfile: profile, withinVisitorCall }, () =>
       this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context));
   }
 
@@ -10353,7 +10356,8 @@ export class AgentModeService {
         // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
         // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
         // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
-        const visitorCall = isShareVisitor || isShareVisitorTurn(sessionId);
+        // (and a nested call that carries a profile of its own inside a visitor's scope is still inside that visitor's call)
+        const visitorCall = isShareVisitor || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
         const borrowOwnerLogins = !visitorCall || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);

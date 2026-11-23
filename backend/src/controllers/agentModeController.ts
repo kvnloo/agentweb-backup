@@ -13100,9 +13100,15 @@ export const agentModeController = {
           return res.status(500).json({ error: 'Failed to save the sensitive-actions setting for this link' });
         }
       } else {
-        const priorShare = session.interactiveShareMetadata;
-        const hadActiveLink = Boolean(priorShare?.isActive && priorShare?.token);
-        allowSensitiveActions = hadActiveLink ? interactiveShareAllowsSensitiveActions(priorShare) : false;
+        // An old client that sends no choice: say what the link that is now stored means. It is read back, because the link may have just been
+        // replaced (an expired full-control link is replaced by an off one), so the copy read before the call may no longer be the link.
+        try {
+          const storedNow = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+          allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedNow);
+        } catch (readError) {
+          console.error(`AgentMode ENG-3170: could not read back the share link ${sessionId} to say what it allows:`, readError);
+          allowSensitiveActions = false;
+        }
       }
 
       res.status(200).json({
