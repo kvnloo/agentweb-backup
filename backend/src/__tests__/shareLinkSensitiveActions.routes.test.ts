@@ -133,9 +133,11 @@ describe('GET /session/:id/conversable-share (getConversableShareSettings)', () 
     expect(off.json).toHaveBeenCalledWith({ allowSensitiveActions: false, explicit: true });
   });
 
-  it('says what a link made BEFORE the setting existed means: a timed one is on, a no-expiry one is off, and that it was not chosen', async () => {
-    const timed = await read(session(share({ expiresAt: '2027-01-01T00:00:00.000Z' })));
+  it('says what a link made BEFORE the setting existed means: a share-dialog length is on, a 45-day admin one and a no-expiry one are off, and that it was not chosen', async () => {
+    const timed = await read(session(share({ expiresAt: '2026-11-08T00:00:00.000Z' }))); // shared 2026-11-01, 7 days: the share dialog's length
     expect(timed.json).toHaveBeenCalledWith({ allowSensitiveActions: true, explicit: false });
+    const adminMade = await read(session(share({ expiresAt: '2026-12-16T00:00:00.000Z' }))); // 45 days: the admin Chat History tab's length
+    expect(adminMade.json).toHaveBeenCalledWith({ allowSensitiveActions: false, explicit: false });
     const noExpiry = await read(session(share()));
     expect(noExpiry.json).toHaveBeenCalledWith({ allowSensitiveActions: false, explicit: false });
   });
