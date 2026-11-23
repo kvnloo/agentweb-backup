@@ -169,6 +169,14 @@ describe('a request carrying a visitor\'s restriction claim never changes the ow
     expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
   });
 
+  it('DELETE (stop sharing) with the claim: 403, nothing read, nothing stopped', async () => {
+    const res = makeRes();
+    await agentModeController.stopConversableShare(claimed({ params: { sessionId: 's1' } }), res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+  });
+
   it('PATCH with the claim: 403, nothing written', async () => {
     const res = makeRes();
     await agentModeController.updateConversableShareSettings(claimed({ params: { sessionId: 's1' }, body: { allowSensitiveActions: true } }), res);

@@ -1,5 +1,6 @@
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
+import { markShareVisitorTurn, clearShareVisitorTurn } from '../services/shareVisitorTurnMarker';
 
 /**
  * ENG-3170: executeTool is where every tool call ends (typed chat, live voice, nested calls). A share-link visitor runs under the
@@ -53,7 +54,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
   });
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => { jest.restoreAllMocks(); clearShareVisitorTurn('session-1'); });
 
   const link = (extra: Record<string, unknown>) => ({ sessionId: 'session-1', userId: 'owner-user-id', interactiveShareMetadata: { isActive: true, token: 't', sharedAt: '2026-11-01T00:00:00.000Z', ...extra } }) as any;
   const run = (toolName: string, ctx?: Record<string, unknown>, args: any = {}, sessionId = 'session-1') =>
@@ -424,7 +425,8 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
   });
 
   describe('the owner\'s saved browser sessions are saved logins (ENG-3170 review)', () => {
-    const COOKIE_TOOLS = ['load_browser_cookies', 'save_browser_cookies', 'clear_browser_cookies', 'mark_browser_session_failed'];
+    // the four cookie tools, and the tool that reads a one-time login code out of the owner's mailbox (with a browser, a log-in as the owner)
+    const COOKIE_TOOLS = ['load_browser_cookies', 'save_browser_cookies', 'clear_browser_cookies', 'mark_browser_session_failed', 'read_verification_code'];
     const cookieCalls = () => dispatch.mock.calls.map((c) => c[0]).filter((name: string) => name.includes('cookies'));
 
     it.each(COOKIE_TOOLS)('%s is refused to a visitor on an OFF link and runs on an ON link', async (tool) => {
@@ -466,6 +468,36 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
       await run('playwright_browser_click', VISITOR, { element: 'x' });
       expect(cookieCalls()).toContain('save_browser_cookies');
+    });
+
+    describe('a tool that drives the browser FOR the model calls executeTool without the visitor claim (open_site_signin, solve_captcha, coding_agent)', () => {
+      it('is still the visitor\'s turn: on an OFF link the owner\'s cookies are neither loaded nor written back', async () => {
+        markShareVisitorTurn('session-1'); // a share route holds this chat for a visitor
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await run('playwright_browser_run_code', undefined, { code: 'async (page) => page.url()' }); // the nested call: no context at all
+        await run('playwright_browser_click', undefined, { element: 'x' });
+        expect(cookieCalls()).toEqual([]);
+      });
+
+      it('on an ON link the nested call borrows the owner\'s logins, as before', async () => {
+        markShareVisitorTurn('session-1');
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await run('playwright_browser_run_code', undefined, { code: 'async (page) => page.url()' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+      });
+
+      it('when the owner\'s own turn holds the chat (no marker) the same nested call is the owner\'s: cookies load, the link is not read', async () => {
+        await run('playwright_browser_run_code', undefined, { code: 'async (page) => page.url()' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+        expect(readSession).not.toHaveBeenCalled();
+      });
+
+      it('another chat\'s visitor turn does not make this chat\'s call a visitor\'s', async () => {
+        markShareVisitorTurn('some-other-session');
+        await run('playwright_browser_run_code', undefined, { code: 'async (page) => page.url()' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+        clearShareVisitorTurn('some-other-session');
+      });
     });
 
     it('the OWNER (no restriction profile) is not affected: cookies load, and the link is not even read', async () => {

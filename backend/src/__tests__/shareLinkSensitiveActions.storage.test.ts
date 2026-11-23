@@ -191,12 +191,31 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
     });
 
     it('a no-expiry caller strips ONLY the expiry: a stale copy of the link is never written back over the owner\'s choice', async () => {
-      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z', allowSensitiveActions: true }));
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z', allowSensitiveActions: false }));
       await chatbotDb.createOrReuseInteractiveShare('s1');
       expect(stripSpy).toHaveBeenCalledTimes(1);
       expect(stripSpy).toHaveBeenCalledWith('s1');
       expect(updateSpy).not.toHaveBeenCalled();
       expect(setChoiceSpy).not.toHaveBeenCalled();
+    });
+
+    it('a link whose owner turned on FULL CONTROL keeps the expiry the owner chose: an alert or email that reuses it cannot make it permanent', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z', allowSensitiveActions: true }));
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1'); // an alert: no expiry, no choice
+      await chatbotDb.createOrReuseInteractiveShare('s1', null);
+      expect(url).toContain('conversable=');
+      expect(stripSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(setChoiceSpy).not.toHaveBeenCalled();
+    });
+
+    it('an old link with no stored choice, and an explicit OFF link, are still made permanent by a mailed reuse (the outage fix)', async () => {
+      for (const stored of [{}, { allowSensitiveActions: false }]) {
+        stripSpy.mockClear();
+        getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z', ...stored }));
+        await chatbotDb.createOrReuseInteractiveShare('s1');
+        expect(stripSpy).toHaveBeenCalledTimes(1);
+      }
     });
 
     it('a link made before the setting existed, with a share-dialog lifetime (so it reads as ON), reads as OFF once a mailed or posted reuse has removed the expiry', () => {
@@ -221,6 +240,12 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
 describe('is the link live, and what may a visitor do on it right now (ENG-3170 review)', () => {
   const NOW = Date.parse('2026-11-23T12:00:00.000Z');
   const live = (extra: Record<string, unknown> = {}) => ({ isActive: true, sharedAt: '2026-11-22T12:00:00.000Z', ...extra });
+
+  it('an empty expiry means "never expires", as the route reads it: the link is live', () => {
+    expect(interactiveShareIsLive(live({ expiresAt: '' }), NOW)).toBe(true);
+    expect(interactiveShareIsLive(live({ expiresAt: null }), NOW)).toBe(true);
+    expect(interactiveShareControl(live({ expiresAt: '', allowSensitiveActions: true }), NOW)).toEqual({ sensitive: true, full: true });
+  });
 
   it('live means switched on and not past its expiry; anything unreadable is not live', () => {
     expect(interactiveShareIsLive(live(), NOW)).toBe(true);

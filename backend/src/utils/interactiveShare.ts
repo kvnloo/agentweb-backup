@@ -64,7 +64,8 @@ export function interactiveShareIsLive(
   now: number = Date.now(),
 ): boolean {
   if (!share || typeof share !== 'object' || share.isActive !== true) return false;
-  if (share.expiresAt === undefined || share.expiresAt === null) return true;
+  // No expiry (absent, null or the empty string) means "never expires", exactly as `getInteractiveShareExpiresAt` reads it.
+  if (!share.expiresAt) return true;
   if (typeof share.expiresAt !== 'string') return false;
   const expires = Date.parse(share.expiresAt);
   return Number.isFinite(expires) && expires > now;

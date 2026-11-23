@@ -99,6 +99,8 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'save_browser_cookies',
   'clear_browser_cookies',
   'mark_browser_session_failed',
+  // 5c. one-time login codes and magic links read from the owner's connected mailbox: with a browser, that is a log-in to a site as the owner
+  'read_verification_code',
   // 2. send, post or publish to people or the public outside the account
   'slack_send_message',
   'send_email_from_sender',

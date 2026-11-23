@@ -31,6 +31,7 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { interactiveShareControl } from '../utils/interactiveShare';
+import { isShareVisitorTurn } from './shareVisitorTurnMarker';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -10329,7 +10330,10 @@ export class AgentModeService {
         // ENG-3170: the owner's saved browser sessions are saved logins. A share-link visitor's browser starts from them (and writes its own
         // cookies back over them) only on a link the owner has let run the sensitive tools; otherwise it browses as nobody. A link that
         // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
-        const borrowOwnerLogins = !isShareVisitor || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
+        // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
+        // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
+        const visitorCall = isShareVisitor || isShareVisitorTurn(sessionId);
+        const borrowOwnerLogins = !visitorCall || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
         const toolFailed = result && (result as any).success === false;
