@@ -373,12 +373,37 @@ describe('embedTimeoutMs: a hung embedding does not hold a save forever (ENG-284
     }
   });
 
-  it('every part of a split save gets its own wait', async () => {
+  it('ONE deadline per save: after the first timeout the remaining parts are saved without asking for an embedding or waiting again', async () => {
     mockEmbedText.mockReturnValue(hung());
-    const out = await saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 10 });
+    const started = Date.now();
+    const out = await saveAccountMemory({ content: longText(7000), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 60 });
+    const elapsed = Date.now() - started;
     expect(out).toMatchObject({ success: true, memoryIds: expect.any(Array) });
-    expect(mockAddAccount.mock.calls.length).toBeGreaterThan(1);
+    expect(mockAddAccount.mock.calls.length).toBeGreaterThan(2); // a text of 7,000 characters is at least four parts
     expect(mockAddAccount.mock.calls.every((c) => c[4] === undefined)).toBe(true);
+    expect(mockEmbedText).toHaveBeenCalledTimes(1); // not once per part
+    expect(elapsed).toBeLessThan(60 * 3); // one wait, not one per part
+  });
+
+  it('a part whose embedding arrives in time is embedded; the first part that times out ends the asking', async () => {
+    mockEmbedText.mockResolvedValueOnce(EMBEDDING).mockReturnValueOnce(hung());
+    await saveAccountMemory({ content: longText(7000), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 30 });
+    expect(mockEmbedText).toHaveBeenCalledTimes(2);
+    const embeddings = mockAddAccount.mock.calls.map((c) => c[4]);
+    expect(embeddings[0]).toEqual(EMBEDDING);
+    expect(embeddings.slice(1).every((e) => e === undefined)).toBe(true);
+  });
+
+  it.each([[0], [-5], [NaN], [Infinity], [-Infinity]])('a timeout of %p means no bound: a slow embedding is waited for and used, not dropped', async (ms) => {
+    mockEmbedText.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(EMBEDDING), 40)));
+    await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: ms });
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
+  });
+
+  it('a timeout above the timer limit is held to it instead of firing at once', async () => {
+    mockEmbedText.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(EMBEDDING), 30)));
+    await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 2 ** 31 });
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
   });
 
   it('an abandoned embedding that fails later does not become an unhandled rejection', async () => {
@@ -413,7 +438,7 @@ describe('a split save that fails part-way removes the parts it already wrote (s
     expect(mockDeleteAccount).not.toHaveBeenCalled();
   });
 
-  it('a failure of the embedding step after the first part counts the same', async () => {
+  it('defensive: a throw from the embedding step after the first part (embedText catches everything today) is cleaned up the same way', async () => {
     mockEmbedText.mockResolvedValueOnce(EMBEDDING).mockRejectedValueOnce(new Error('embedding service down'));
     await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('embedding service down');
     expect(mockDeleteAccount).toHaveBeenCalledTimes(1);
@@ -427,6 +452,15 @@ describe('a split save that fails part-way removes the parts it already wrote (s
     await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('write failed');
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/1 could not be removed again: part-1/);
     warn.mockRestore();
+  });
+
+  it('the cleanup is finished BEFORE the error comes out (a retry cannot start while a removal is still pending)', async () => {
+    mockAddAccount.mockReset();
+    mockAddAccount.mockResolvedValueOnce({ memoryId: 'part-1' }).mockRejectedValueOnce(new Error('write failed'));
+    let removed = false;
+    mockDeleteAccount.mockImplementationOnce(() => new Promise((resolve) => setTimeout(() => { removed = true; resolve(true); }, 40)));
+    await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('write failed');
+    expect(removed).toBe(true);
   });
 
   it('a failure on the FIRST part removes nothing, and a save that succeeds removes nothing', async () => {

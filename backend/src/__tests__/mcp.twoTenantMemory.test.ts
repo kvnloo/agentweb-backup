@@ -374,7 +374,7 @@ describe('the cap of 200 and the length limits', () => {
     expect(member.json.message).toMatch(/Only an organization owner or admin can delete organization memories/);
     expect(member.json.message).not.toMatch(/delete_org_memory/);
     const owner = await (await as(TENANT_A.owner, ORG_WRITER)).call('save_org_memory', { content: 'one more', category: 'insight' });
-    expect(owner.json.message).toMatch(/delete_org_memory removes one/);
+    expect(owner.json.message).toMatch(/list_memories with scope "org" finds them, delete_org_memory removes one/);
     // and the way out the owner was shown works: the owner deletes one, the member can save
     expect((await (await as(TENANT_A.owner, ORG_WRITER)).call('delete_org_memory', { memoryId: '00FILL-0000' })).json.success).toBe(true);
     expect((await (await as(TENANT_A.member!, ORG_WRITER)).call('save_org_memory', { content: 'room now', category: 'insight' })).json.success).toBe(true);

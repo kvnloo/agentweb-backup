@@ -581,6 +581,23 @@ describe('the lock is bounded and is its own (second review)', () => {
     }
   });
 
+  it('a long text is ONE wait, not one per part: three parts under a hung embedding service finish after 15 seconds, unembedded', async () => {
+    jest.useFakeTimers();
+    try {
+      (embedText as jest.Mock).mockReturnValue(new Promise(() => {}));
+      const long = ['alpha', 'beta', 'gamma'].map((w) => `${`${w} `.repeat(300)}`.trim()).join('\n\n');
+      const pending = run('save_memory', { content: long, category: 'insight' });
+      await jest.advanceTimersByTimeAsync(15_001);
+      const out = await pending;
+      expect(out).toMatchObject({ success: true, memoryIds: expect.any(Array) });
+      expect(out.memoryIds.length).toBeGreaterThanOrEqual(3);
+      expect(embedText).toHaveBeenCalledTimes(1);
+      expect(db.accountMemoryDb.addMemory.mock.calls.every((c: any[]) => c[4] === undefined)).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('the org save has the same bound', async () => {
     jest.useFakeTimers();
     try {
@@ -612,6 +629,7 @@ describe('the cap message tells the caller what THEY can do (Opslane P1: a membe
     const out = await run('save_org_memory', { content: 'one more', category: 'insight' });
     expect(out).toMatchObject({ success: false, stored: 200, limit: 200 });
     expect(out.message).toMatch(/Only an organization owner or admin can delete organization memories: ask one of them/);
+    expect(out.message).toMatch(/list_memories with scope "org" shows what is stored/);
     expect(out.message).not.toMatch(/delete_org_memory/);
     expect(out.message).toMatch(/Nothing was saved\.$/);
   });
@@ -620,7 +638,7 @@ describe('the cap message tells the caller what THEY can do (Opslane P1: a membe
     db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1', orgRole: role });
     db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(200));
     const out = await run('save_org_memory', { content: 'one more', category: 'insight' });
-    expect(out.message).toMatch(/list_memories finds them, delete_org_memory removes one/);
+    expect(out.message).toMatch(/list_memories with scope "org" finds them, delete_org_memory removes one/);
     expect(out.message).not.toMatch(/Only an organization owner or admin/);
   });
 
