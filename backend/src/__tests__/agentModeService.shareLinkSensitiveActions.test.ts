@@ -470,7 +470,81 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       expect(cookieCalls()).toContain('save_browser_cookies');
     });
 
-    describe('a tool that drives the browser FOR the model calls executeTool without the visitor claim (open_site_signin, solve_captcha, coding_agent)', () => {
+    describe('the restriction travels with the call: a tool that calls executeTool itself (open_site_signin, solve_captcha, coding_agent) makes a nested call with no context', () => {
+      // the REAL shape: chat turns run in a forked worker, so no per-process marker is visible there; the nested call is made from inside the
+      // tool's own call, with no extra context at all
+      const nestedBrowserCallFrom = (outer: string, inner = 'playwright_browser_run_code', innerArgs: any = { code: 'async (page) => page.url()' }) => {
+        const seen: Array<{ tool: string; outcome: string }> = [];
+        dispatch.mockImplementation(async (name: string) => {
+          if (name === outer) {
+            try { await (service as any).executeTool('gpt-4', inner, innerArgs, 'owner-user-id', 'session-1', false, undefined); seen.push({ tool: inner, outcome: 'ran' }); }
+            catch (e: any) { seen.push({ tool: inner, outcome: `refused (${e.deniedBy})` }); }
+          }
+          return { ran: true };
+        });
+        return seen;
+      };
+
+      it('OFF link: the visitor\'s nested browser call does not load the owner\'s cookies (no marker, no claim on the inner call)', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        const seen = nestedBrowserCallFrom('open_site_signin');
+        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        expect(seen).toEqual([{ tool: 'playwright_browser_run_code', outcome: 'ran' }]); // the browser still works
+        expect(cookieCalls()).toEqual([]);
+      });
+
+      it('ON link: the nested call borrows the owner\'s logins, as before', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        nestedBrowserCallFrom('open_site_signin');
+        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+      });
+
+      it('the OWNER\'s own call (no claim anywhere): the nested call loads cookies and the link is never read', async () => {
+        nestedBrowserCallFrom('open_site_signin');
+        await run('open_site_signin', undefined, { site: 'rankai' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+        expect(readSession).not.toHaveBeenCalled();
+      });
+
+      it('a nested call inherits the RESTRICTIONS too: a visitor\'s tool that calls a sensitive tool itself is refused on an OFF link', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        const seen = nestedBrowserCallFrom('open_site_signin', SENSITIVE, { list_id: 'l', lead_ids: ['a'] });
+        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        expect(seen).toEqual([{ tool: SENSITIVE, outcome: 'refused (restriction_profile)' }]);
+      });
+
+      it('the scope ends with the call: the next owner call after a visitor\'s is the owner\'s', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        nestedBrowserCallFrom('open_site_signin');
+        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        expect(cookieCalls()).toEqual([]);
+        dispatch.mockClear();
+        nestedBrowserCallFrom('open_site_signin');
+        await run('open_site_signin', undefined, { site: 'rankai' });
+        expect(cookieCalls()).toContain('load_browser_cookies');
+      });
+
+      it('two calls at once do not leak into each other: a visitor\'s nested call and the owner\'s nested call in another chat, interleaved', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        dispatch.mockImplementation(async (name: string, _args: unknown, ctx: any) => {
+          if (name === 'open_site_signin') {
+            await new Promise((resolve) => setImmediate(resolve)); // let the other call run in between
+            await (service as any).executeTool('gpt-4', 'playwright_browser_run_code', { code: 'x' }, 'owner-user-id', ctx.sessionId, false, undefined);
+          }
+          return { ran: true };
+        });
+        await Promise.all([
+          run('open_site_signin', VISITOR, { site: 'rankai' }, 'session-1'),
+          run('open_site_signin', undefined, { site: 'rankai' }, 'session-owner-2'),
+        ]);
+        // cookies were loaded for the owner's chat and ONLY for it
+        const loadedFor = dispatch.mock.calls.filter((c) => c[0] === 'load_browser_cookies').map((c) => (c[2] as any).sessionId);
+        expect(loadedFor).toEqual(['session-owner-2']);
+      });
+    });
+
+    describe('the visitor-turn marker (main-process signal, kept as a second signal)', () => {
       it('is still the visitor\'s turn: on an OFF link the owner\'s cookies are neither loaded nor written back', async () => {
         markShareVisitorTurn('session-1'); // a share route holds this chat for a visitor
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));

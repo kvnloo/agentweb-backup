@@ -3422,8 +3422,10 @@ export class ChatbotDB {
         TableName: this.tableName,
         Key: { sessionId },
         UpdateExpression: "REMOVE interactiveShareMetadata.expiresAt",
-        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token)",
+        // ...and not off a link the owner turned on FULL CONTROL a moment ago (the caller decided from a copy that may be stale)
+        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token) AND (attribute_not_exists(interactiveShareMetadata.allowSensitiveActions) OR interactiveShareMetadata.allowSensitiveActions <> :on)",
         ExpressionAttributeNames: { "#token": "token" },
+        ExpressionAttributeValues: { ":on": true },
       }).promise();
     } catch (error) {
       console.error("Error removing the expiry from the interactive share:", error);
@@ -4593,8 +4595,15 @@ export class ChatbotDB {
       // wires a falsy value through.
       const hasTimedExpiry = expirationDays != null && expirationDays > 0;
 
+      // ENG-3170: a link whose owner turned on FULL CONTROL keeps the expiry the owner chose (see below), so once that date has passed it is dead
+      // and must not be handed out again by an alert, an email or a Slack post. It is treated as absent: the code below makes a new link
+      // (off, unless the caller says otherwise). Any other expired-but-active link is, as before, made permanent by a no-expiry caller.
+      const storedShare = session.interactiveShareMetadata;
+      const expiredFullControl = storedShare?.allowSensitiveActions === true
+        && !!storedShare.expiresAt && Date.parse(storedShare.expiresAt) <= Date.now();
+
       // Check if there's already an active interactive share
-      if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) {
+      if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && !expiredFullControl) {
         // If this caller wants no timed expiry but the stored token carries one —
         // e.g. an admin review link (45d) or a legacy 7d link — strip it. Links
         // shared out via email/slack/oncall must never expire regardless of who

@@ -209,6 +209,35 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(setChoiceSpy).not.toHaveBeenCalled();
     });
 
+    it('an EXPIRED full-control link is not handed out again: a no-expiry caller gets a NEW link (off, no expiry), not the dead address', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: true }));
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1'); // an alert, an email, a Slack post
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      const written = updateSpy.mock.calls[0][1];
+      expect(written.token).not.toBe('the-token');
+      expect(written.allowSensitiveActions).toBe(false);
+      expect(written.expiresAt).toBeUndefined();
+      expect(url).toContain(`conversable=${written.token}`);
+      expect(url).not.toContain('the-token');
+      expect(stripSpy).not.toHaveBeenCalled();
+    });
+
+    it('the owner\'s dialog making a link again on an expired full-control one gets a new link with the choice and expiry the owner picked', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: true }));
+      await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
+      const written = updateSpy.mock.calls[0][1];
+      expect(written.token).not.toBe('the-token');
+      expect(written.allowSensitiveActions).toBe(true);
+      expect(typeof written.expiresAt).toBe('string');
+    });
+
+    it('a full-control link that has NOT expired is reused as before', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2999-01-01T00:00:00.000Z', allowSensitiveActions: true }));
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1');
+      expect(url).toContain('conversable=the-token');
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
     it('an old link with no stored choice, and an explicit OFF link, are still made permanent by a mailed reuse (the outage fix)', async () => {
       for (const stored of [{}, { allowSensitiveActions: false }]) {
         stripSpy.mockClear();
@@ -309,8 +338,9 @@ describe('the two attribute-level writes, as DynamoDB receives them (a spy on th
     jest.spyOn(dynamodb, 'update').mockImplementation((params: any) => { calls.push(params); return { promise: async () => ({}) } as any; });
     await chatbotDb.removeInteractiveShareExpiry('s1');
     expect(calls[0].UpdateExpression).toBe('REMOVE interactiveShareMetadata.expiresAt');
-    expect(calls[0].ConditionExpression).toBe('attribute_exists(interactiveShareMetadata.#token)');
-    expect(calls[0].ExpressionAttributeValues).toBeUndefined(); // it writes no value: nothing of the choice can be carried along
+    // ...and never off a link the owner turned on FULL CONTROL a moment ago (the caller decided from a copy that may be stale)
+    expect(calls[0].ConditionExpression).toBe('attribute_exists(interactiveShareMetadata.#token) AND (attribute_not_exists(interactiveShareMetadata.allowSensitiveActions) OR interactiveShareMetadata.allowSensitiveActions <> :on)');
+    expect(calls[0].ExpressionAttributeValues).toEqual({ ':on': true }); // the only value is the one the condition compares with; no choice is written
   });
 
   it('a failed write is thrown (the route that made the choice answers 500 rather than showing a switch that is not true)', async () => {
