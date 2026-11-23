@@ -328,7 +328,8 @@ describe('Memory API Routes', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.memories).toHaveLength(1);
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined);
+    // ENG-2840 (W2-1): the list screen reads up to the list bound, oldest first, without the embedding vectors.
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', undefined, undefined, { maxRows: 1000, newestFirst: false, omitEmbeddings: true });
   });
 
   it('GET /api/memory?category=preference should filter by category', async () => {
@@ -337,7 +338,7 @@ describe('Memory API Routes', () => {
 
     await request.get('/api/memory?category=preference');
 
-    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference');
+    expect(mockDb.getUserMemories).toHaveBeenCalledWith('user1', 'preference', undefined, { maxRows: 1000, newestFirst: false, omitEmbeddings: true });
   });
 
   it('POST /api/memory should create a memory', async () => {
