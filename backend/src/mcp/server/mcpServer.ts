@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { createMcpServer } from './mcpServerCore';
 import { agentApiKeyService } from '../../services/agentApiKeyService';
 import { mcpOAuthService } from '../oauth/oauthService';
-import { RateLimiter } from '../../middleware/rateLimiter';
+import { RateLimiter, type RateLimitResult } from '../../middleware/rateLimiter';
 import {
   classifyMcpClient,
   McpAuthMethod,
@@ -29,6 +29,20 @@ import { mcpToolRegistry } from './registry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
+
+/**
+ * A JSON-RPC batch is one HTTP request but N calls, and the limiter counts requests: a batch of 100 calls used to cost one count. After
+ * the request's own count, charge the other N-1 members. A batch that does not fit in what is left is refused whole, before any member
+ * runs (the limiter has already counted the request itself).
+ */
+export function chargeBatchMembers(limiterKey: string, maxPerMinute: number, first: RateLimitResult, body: unknown): RateLimitResult {
+  const extra = (Array.isArray(body) ? body.length : 1) - 1;
+  if (!first.allowed || extra <= 0) return first;
+  if (extra > first.remaining) return { allowed: false, remaining: first.remaining, resetInMs: first.resetInMs };
+  let last = first;
+  for (let i = 0; i < extra; i++) last = mcpRateLimiter.check(limiterKey, maxPerMinute);
+  return last;
+}
 
 // Session timeout in milliseconds (default: 1 hour)
 const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -110,7 +124,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
         });
       }
       // Enforce per-key rate limit
-      const rateLimitResult = mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin);
+      const rateLimitResult = chargeBatchMembers(keyRecord.keyId, keyRecord.rateLimitPerMin, mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin), req.body);
       if (!rateLimitResult.allowed) {
         return res.status(429).json({
           error: "Rate limit exceeded",
@@ -147,7 +161,7 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     if (tokenRecord) {
       const client = await mcpOAuthService.getClient(tokenRecord.clientId).catch(() => null);
       // Rate limit OAuth tokens by userId
-      const rateLimitResult = mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60);
+      const rateLimitResult = chargeBatchMembers(`oauth:${tokenRecord.userId}`, 60, mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60), req.body);
       if (!rateLimitResult.allowed) {
         return res.status(429).json({
           error: "Rate limit exceeded",

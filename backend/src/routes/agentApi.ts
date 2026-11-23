@@ -4,6 +4,7 @@ import { agentApiKeyService } from "../services/agentApiKeyService";
 import {
   API_KEY_SCOPE_EMAIL_READ,
   API_KEY_SCOPE_EXECUTE,
+  API_KEY_SCOPE_MEMORY_ORG,
   API_KEY_SCOPE_READ,
   API_KEY_SCOPE_SMARTLEAD_CONTROL,
   API_KEY_SCOPE_SMARTLEAD_READ,
@@ -15,7 +16,20 @@ const GRANTABLE_API_KEY_SCOPES: readonly string[] = [
   API_KEY_SCOPE_EMAIL_READ,
   API_KEY_SCOPE_SMARTLEAD_READ,
   API_KEY_SCOPE_SMARTLEAD_CONTROL,
+  API_KEY_SCOPE_MEMORY_ORG,
 ];
+
+/** Highest per-minute rate a key may be minted with: ten times the default of 60, far above what any agent has used (prod: 60 and 10). */
+export const MAX_API_KEY_RATE_LIMIT_PER_MIN = 600;
+
+/** `undefined` or `null` means "use the default"; anything else must be a whole number from 1 to the maximum. */
+export function checkRateLimitPerMin(value: unknown): { ok: true; value: number | undefined } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, value: undefined };
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_API_KEY_RATE_LIMIT_PER_MIN) {
+    return { ok: false, error: `rateLimitPerMin must be a whole number from 1 to ${MAX_API_KEY_RATE_LIMIT_PER_MIN} (the default is 60).` };
+  }
+  return { ok: true, value };
+}
 
 const router = Router();
 
@@ -31,6 +45,12 @@ router.post(
 
       if (!keyName) {
         return res.status(400).json({ error: "keyName is required" });
+      }
+
+      // The limiter trusts this number, so a key minted with a huge (or NaN, negative, text) rate would have no limit at all.
+      const rate = checkRateLimitPerMin(rateLimitPerMin);
+      if (!rate.ok) {
+        return res.status(400).json({ error: rate.error });
       }
 
       // Scopes are a closed set: an unknown string would be stored verbatim and
@@ -52,6 +72,12 @@ router.post(
             error: `The '${API_KEY_SCOPE_EMAIL_READ}' scope cannot be granted from a delegated session.`,
           });
         }
+        // Org memory is written into every member's prompt: the account owner grants it, not someone acting for them.
+        if (scopes.includes(API_KEY_SCOPE_MEMORY_ORG) && authReq.delegateInfo?.isDelegated) {
+          return res.status(403).json({
+            error: `The '${API_KEY_SCOPE_MEMORY_ORG}' scope cannot be granted from a delegated session.`,
+          });
+        }
         // Same for the customer's own Smartlead account: the customer grants it, not someone acting for them.
         const smartleadScope = [API_KEY_SCOPE_SMARTLEAD_READ, API_KEY_SCOPE_SMARTLEAD_CONTROL].find((s) => scopes.includes(s));
         if (smartleadScope && authReq.delegateInfo?.isDelegated) {
@@ -69,7 +95,7 @@ router.post(
         authReq.user.userId,
         keyName,
         scopes === undefined ? undefined : Array.from(new Set<string>(scopes)),
-        rateLimitPerMin,
+        rate.value,
         expiresAt
       );
 

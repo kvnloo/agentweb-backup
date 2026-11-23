@@ -30,6 +30,12 @@ export const API_KEY_SCOPE_EMAIL_READ = 'email:read';
  */
 export const API_KEY_SCOPE_SMARTLEAD_READ = 'smartlead:read';
 export const API_KEY_SCOPE_SMARTLEAD_CONTROL = 'smartlead:control';
+/**
+ * Org memory writes over MCP (ENG-2840 wave 2, W2-2). Opt-in like the others, and for `aw_` keys only: what an org memory says is put into
+ * EVERY member's Emma prompt, so the person who owns the account decides which agent may write it by minting a scoped key. A signed-in
+ * OAuth client does not get it. Reading org memory (`list_memories`, scope org) and the user's own memory tools need no opt-in scope.
+ */
+export const API_KEY_SCOPE_MEMORY_ORG = 'memory:org';
 export const DEFAULT_API_KEY_SCOPES = [API_KEY_SCOPE_READ, API_KEY_SCOPE_EXECUTE];
 
 export function effectiveApiKeyScopes(scopes: unknown): string[] {
