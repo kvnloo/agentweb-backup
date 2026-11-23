@@ -381,13 +381,16 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(getSession).not.toHaveBeenCalled();
     });
 
-    it('a caller that already carries a profile (a share visitor\'s own turn) is handled by the existing check, with no extra reads', async () => {
+    it('a caller that already carries a profile (a share visitor\'s own turn) is handled by the existing check, with no schedule reads (ENG-3170: it reads its own link once for a tool that depends on it)', async () => {
       await expect(run('save_memory', { restrictionProfile: 'share_visitor' })).rejects.toMatchObject({
         message: expect.stringContaining('is not available in shared sessions'),
       });
       await run('manage_scheduled_chat', { restrictionProfile: 'share_visitor' });
       expect(dispatch.mock.calls[0][2]).toMatchObject({ restrictionProfile: 'share_visitor' });
-      expect(getSession).not.toHaveBeenCalled();
+      // the one session read is the visitor's link (a consistent read of its own session) for save_memory; manage_scheduled_chat needs none
+      expect(getSession).toHaveBeenCalledTimes(1);
+      expect(getSession).toHaveBeenCalledWith('run-session', true);
+      expect(getSchedule).not.toHaveBeenCalled();
     });
   });
 });

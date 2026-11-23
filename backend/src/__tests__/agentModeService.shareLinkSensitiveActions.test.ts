@@ -128,6 +128,70 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
     });
   });
 
+  describe('FULL CONTROL is everything a customer can do, like before the restrictions (owner, 2026-11-23)', () => {
+    const OWNER_ONLY = ['save_memory', 'delete_memory', 'save_org_memory', 'update_lead_notification_settings', 'provision_hot_lead_call_number', 'start_smartlead_push', 'luma_get_guests', 'connect_account'];
+
+    it('on an ON link a visitor runs the owner-only tools too: memory, owner settings, hot-lead calls, Smartlead, Luma, connect_account', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      for (const tool of OWNER_ONLY) {
+        dispatch.mockClear();
+        await expect(run(tool, VISITOR, {})).resolves.toEqual({ ran: true });
+        expect({ tool, dispatched: dispatch.mock.calls.length }).toEqual({ tool, dispatched: 1 });
+      }
+    });
+
+    it('on an ON link the saved-login tools run as well', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run('get_login_credentials', VISITOR, { domain: 'x.example.com' })).resolves.toEqual({ ran: true });
+      await expect(run('get_test_account', VISITOR, {})).resolves.toEqual({ ran: true });
+    });
+
+    it('on an OFF link every one of them is refused, and nothing is dispatched', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      for (const tool of [...OWNER_ONLY, 'get_login_credentials', 'get_test_account']) {
+        await expect(run(tool, VISITOR, {})).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ADMIN tools are refused on every link, full control or not: a link holder never gets staff powers', async () => {
+      const { ADMIN_SKILL_TOOL_NAMES } = require('../services/agentModeService');
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      for (const tool of ADMIN_SKILL_TOOL_NAMES) {
+        await expect(run(tool, VISITOR, {})).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('a visitor-made schedule keeps the whole block list whatever any link says (there is no link to ask)', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      for (const tool of ['save_memory', 'connect_account', 'get_login_credentials']) {
+        await expect(run(tool, { restrictionProfile: 'share_visitor_schedule', isUnattendedRun: true }, {})).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+    });
+
+    it('the five newest sensitive tools follow the same switch (public lead-list access, landing-page deploy, run-a-schedule-now, do-not-contact)', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      for (const [tool, args] of [
+        ['enable_lead_list_public_access', {}], ['set_landing_page_lead_list', {}], ['deploy_landing_page', {}], ['test_scheduled_chat', {}],
+        ['set_lead_contact_status', { list_id: 'l', lead_ids: ['a'], contact_status: 'active' }],
+      ] as Array<[string, any]>) {
+        await expect(run(tool, VISITOR, args)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+      // restricting outreach is not sensitive: do-not-contact and unsubscribed are allowed
+      await expect(run('set_lead_contact_status', VISITOR, { list_id: 'l', lead_ids: ['a'], contact_status: 'do-not-contact' })).resolves.toEqual({ ran: true });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run('deploy_landing_page', VISITOR, {})).resolves.toEqual({ ran: true });
+      await expect(run('set_lead_contact_status', VISITOR, { list_id: 'l', lead_ids: ['a'], contact_status: 'active' })).resolves.toEqual({ ran: true });
+    });
+
+    it('an unreadable link refuses an owner-only tool too (fail closed), saying nothing was done', async () => {
+      readSession.mockRejectedValue(new Error('throttled'));
+      await expect(run('save_memory', VISITOR, { content: 'x' })).rejects.toMatchObject({ message: expect.stringContaining('could not be verified') });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+
   describe('a link made before the setting existed (nothing stored)', () => {
     it('a link with a share-dialog lifetime (made on purpose by the owner: 7 days here) keeps today\'s behaviour', async () => {
       readSession.mockResolvedValue(link({ expiresAt: '2026-11-08T00:00:00.000Z' })); // shared 2026-11-01
@@ -191,10 +255,11 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       await expect(run(SENSITIVE, { restrictionProfile: 'something-new' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
     });
 
-    it('the ENG-2816 limits are unchanged and need no read: an owner-only tool is refused for a visitor on an ON link', async () => {
-      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+    it('the ENG-2816 limits (owner settings, memory, Smartlead, Luma, connect_account) are unchanged on an OFF link, in their own words', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
       await expect(run('save_memory', VISITOR, { content: 'x' })).rejects.toMatchObject({ message: expect.stringContaining('organization settings or memory') });
-      await expect(run('connect_account', VISITOR)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('connect_account', VISITOR)).rejects.toMatchObject({ message: expect.stringContaining('Account connections are not available in shared sessions') });
+      expect(dispatch).not.toHaveBeenCalled();
     });
   });
 
