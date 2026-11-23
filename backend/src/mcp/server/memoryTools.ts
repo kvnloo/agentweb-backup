@@ -12,7 +12,8 @@
  *  - a cap of 200 stored memories per account and per org on writes made here (Emma's own tools and the Settings routes have no cap, and
  *    an account already above 200 keeps what it has; its saves are refused until it deletes). Rows carry a 17 KB embedding, so 200 rows
  *    is about 3.4 MB per Emma prompt read. Each save runs under a lock for the account (the org when the caller has one), taken in
- *    arrival order, so the check and the write cannot interleave with another save, even inside one JSON-RPC batch. The lock is per
+ *    order (the caller's record is read first, so "order" is approximate to within that read), so the check and the write cannot interleave
+ *    with another save, even inside one JSON-RPC batch. The wait for an embedding while holding it is bounded (MCP_EMBED_TIMEOUT_MS). The lock is per
  *    server process (the same limit as the lead and strategy tools): with several server instances, saves that reach different ones can
  *    each pass the check, so the cap is exact within an instance and approximate across them;
  *  - an exact duplicate (same category, same text; for a split save, every part already stored) is not written again and costs no embedding;
@@ -42,6 +43,9 @@ import { MEMORY_READ_MAX_ROWS_LIST } from '../../utils/memoryReadLimits';
 
 /** Most memories an account (or an org) may hold for a save made through MCP to be accepted. */
 export const MEMORY_MCP_MAX_ROWS = 200;
+/** How long a save waits for an embedding while it holds the account's lock; after that the row is saved without one (see MemoryWriteOptions). */
+export const MCP_EMBED_TIMEOUT_MS = 15_000;
+const WRITE_OPTIONS = { embedTimeoutMs: MCP_EMBED_TIMEOUT_MS } as const;
 export const LIST_MEMORIES_DEFAULT_LIMIT = 20;
 export const LIST_MEMORIES_MAX_LIMIT = 50;
 
@@ -91,7 +95,7 @@ async function readStored(scope: 'user' | 'org', ownerId: string): Promise<Store
 }
 
 /** The caps and the duplicate check that only the MCP path applies, run after the shared guards and before anything is embedded. */
-export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId, content, category, chunkCount }) => {
+export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId, content, category, chunkCount, callerCanDelete }) => {
   const rows = await readStored(scope, ownerId);
   // A duplicate: every part of this save (one part, or each of the parts a long text splits into) is already stored in this category.
   // A retried long save would otherwise write all its parts again, and again, until the cap.
@@ -110,12 +114,16 @@ export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId,
   }
   if (rows.length + chunkCount > MEMORY_MCP_MAX_ROWS) {
     const deleteTool = scope === 'org' ? 'delete_org_memory' : 'delete_memory';
+    // Tell the caller what THEY can do: a plain org member cannot delete org memory (it needs org:configure), so telling them to is a dead end.
+    const wayOut = callerCanDelete
+      ? `Delete memories that are no longer needed first (list_memories finds them, ${deleteTool} removes one), then save again.`
+      : 'Only an organization owner or admin can delete organization memories: ask one of them to remove memories that are no longer needed (list_memories shows what is stored), then save again.';
     return {
       success: false,
       stored: rows.length,
       limit: MEMORY_MCP_MAX_ROWS,
       message: `This ${scope === 'org' ? 'organization has' : 'account has'} ${rows.length} memories stored and the limit for saving through MCP is ${MEMORY_MCP_MAX_ROWS}; `
-        + `this save needs ${chunkCount} more row${chunkCount === 1 ? '' : 's'}. Delete memories that are no longer needed first (list_memories finds them, ${deleteTool} removes one), then save again. Nothing was saved.`,
+        + `this save needs ${chunkCount} more row${chunkCount === 1 ? '' : 's'}. ${wayOut} Nothing was saved.`,
     };
   }
   return undefined;
@@ -124,7 +132,7 @@ export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId,
 /** The whole save (cap and duplicate check, embedding, writes) runs one at a time per account, or per org for a caller who has one. */
 export async function saveMemory(args: unknown, context: any) {
   const input = exactArgs('save_memory', args, ['content', 'category']);
-  return withAccountLock('memory', context, () => memoryImpl.saveAccountMemory(input, context, mcpWriteGate));
+  return withAccountLock('memory', context, () => memoryImpl.saveAccountMemory(input, context, mcpWriteGate, WRITE_OPTIONS));
 }
 
 export async function deleteMemory(args: unknown, context: any) {
@@ -134,7 +142,7 @@ export async function deleteMemory(args: unknown, context: any) {
 
 export async function saveOrgMemory(args: unknown, context: any) {
   const input = exactArgs('save_org_memory', args, ['content', 'category']);
-  return withAccountLock('memory', context, () => memoryImpl.saveOrgMemory(input, context, mcpWriteGate));
+  return withAccountLock('memory', context, () => memoryImpl.saveOrgMemory(input, context, mcpWriteGate, WRITE_OPTIONS));
 }
 
 export async function deleteOrgMemory(args: unknown, context: any) {
