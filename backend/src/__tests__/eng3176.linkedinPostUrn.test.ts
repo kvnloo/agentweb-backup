@@ -15,6 +15,7 @@ describe('normalizeLinkedInPostUrn', () => {
     ['https://www.linkedin.com/feed/update/urn:li:activity:7123456789012/', 'urn:li:activity:7123456789012'],
     ['https://www.linkedin.com/feed/update/urn%3Ali%3AugcPost%3A7123/?utm=x', 'urn:li:ugcPost:7123'],
     ['https://www.linkedin.com/posts/acme_launch-day-activity-7123456789012-AbCd', 'urn:li:activity:7123456789012'],
+    ['https://www.linkedin.com/embed/feed/update/urn:li:share:7123456789012', 'urn:li:share:7123456789012'],
   ])('normalizes %s', (input, expected) => {
     expect(normalizeLinkedInPostUrn(input)).toEqual({ ok: true, urn: expected });
   });

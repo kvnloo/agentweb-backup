@@ -1147,7 +1147,7 @@ export async function linkedinManagePost(
     if (action === 'repost' && normalized.urn.startsWith('urn:li:activity:')) {
       return {
         success: false,
-        message: `Cannot repost ${normalized.urn}: repost needs the post's urn:li:share:<id> or urn:li:ugcPost:<id>, not an activity URN.`,
+        message: `Cannot repost ${normalized.urn}: repost needs the post's urn:li:share:<id> or urn:li:ugcPost:<id>, not an activity URN. LinkedIn does not let an activity URN be reshared. Ask the user for the share or ugcPost URN: on the post, use the ... menu > "Embed this post" and copy the urn:li:share:<id> or urn:li:ugcPost:<id> from the embed code, or send that /embed/feed/update/ link.`,
       };
     }
   }
