@@ -270,3 +270,66 @@ describe('deleteOrgMemory', () => {
     await expect(deleteOrgMemory({ memoryId: '' }, ctx)).rejects.toThrow('memoryId is required');
   });
 });
+
+describe('the optional write gate (ENG-2840 W2-2: the MCP tools add their cap and duplicate check through it)', () => {
+  const gateAnswer = { success: true, saved: false, duplicate: true, memoryId: 'existing' };
+
+  it('is called after the guards and the argument check with what a gate needs, and a returned answer replaces the write and the embedding', async () => {
+    const gate = jest.fn().mockResolvedValue(gateAnswer);
+    const out = await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, gate);
+    expect(out).toEqual(gateAnswer);
+    expect(gate).toHaveBeenCalledWith({ scope: 'user', ownerId: 'u1', content: 'a fact', category: 'insight', chunkCount: 1 });
+    expect(mockEmbedText).not.toHaveBeenCalled();
+    expect(mockAddAccount).not.toHaveBeenCalled();
+  });
+
+  it('a gate that returns nothing lets the save go on exactly as without a gate', async () => {
+    const gate = jest.fn().mockResolvedValue(undefined);
+    const out = await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, gate);
+    expect(out).toMatchObject({ success: true, memoryId: 'm1' });
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
+  });
+
+  it('is told how many rows the save needs (a split save)', async () => {
+    const gate = jest.fn().mockResolvedValue(undefined);
+    await saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx, gate);
+    expect(gate.mock.calls[0][0].chunkCount).toBeGreaterThan(1);
+    expect(mockAddAccount.mock.calls.length).toBe(gate.mock.calls[0][0].chunkCount);
+  });
+
+  it('is NOT reached when memory is off or the arguments are bad (the shared checks come first, in the same order)', async () => {
+    const gate = jest.fn();
+    mockGetUserById.mockResolvedValue({ userId: 'u1', memoryEnabled: false });
+    expect(await saveAccountMemory({ content: 'x', category: 'insight' }, ctx, gate)).toMatchObject({ success: false });
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    await expect(saveAccountMemory({ content: 'x', category: 'nope' }, ctx, gate)).rejects.toThrow(/Invalid category/);
+    await expect(saveAccountMemory({ content: '  ', category: 'insight' }, ctx, gate)).rejects.toThrow(/Content is required/);
+    expect(gate).not.toHaveBeenCalled();
+  });
+
+  it('org: owner id is the caller\'s org, and the org refusals come before the gate', async () => {
+    const gate = jest.fn().mockResolvedValue(undefined);
+    await saveOrgMemory({ content: 'org fact', category: 'workflow' }, ctx, gate);
+    expect(gate).toHaveBeenCalledWith({ scope: 'org', ownerId: 'org1', content: 'org fact', category: 'workflow', chunkCount: 1 });
+    expect(mockAddOrg).toHaveBeenCalledWith('org1', 'workflow', 'org fact', 'u1', EMBEDDING);
+    const refused = jest.fn();
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    expect(await saveOrgMemory({ content: 'x', category: 'insight' }, ctx, refused)).toMatchObject({ success: false });
+    mockGetUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org1', orgMemoryEnabled: false });
+    expect(await saveOrgMemory({ content: 'x', category: 'insight' }, ctx, refused)).toMatchObject({ success: false });
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  it('a gate answer replaces the org write too, and a throwing gate stops the save before anything is embedded', async () => {
+    expect(await saveOrgMemory({ content: 'x', category: 'insight' }, ctx, async () => gateAnswer)).toEqual(gateAnswer);
+    expect(mockAddOrg).not.toHaveBeenCalled();
+    await expect(saveAccountMemory({ content: 'x', category: 'insight' }, ctx, async () => { throw new Error('gate failed'); })).rejects.toThrow('gate failed');
+    expect(mockEmbedText).not.toHaveBeenCalled();
+    expect(mockAddAccount).not.toHaveBeenCalled();
+  });
+
+  it('Emma\'s own call (no gate) is unchanged', async () => {
+    expect(await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx)).toMatchObject({ success: true, memoryId: 'm1' });
+  });
+});

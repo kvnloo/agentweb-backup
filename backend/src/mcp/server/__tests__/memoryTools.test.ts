@@ -1,0 +1,426 @@
+/**
+ * ENG-2840 wave 2 (W2-2): the memory tools over MCP. Unit level: registration and scope gating (the inventory snapshot does not record the
+ * scope or `apiKeyOnly`, so they are pinned here against the real scope functions), argument validation, the cap and duplicate gate, the org
+ * guards and paging. The two-tenant behaviour through the real MCP server is in __tests__/mcp.twoTenantMemory.test.ts.
+ */
+jest.mock('../../../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
+  accountMemoryDb: { getUserMemories: jest.fn(), addMemory: jest.fn(), deleteMemory: jest.fn() },
+  orgMemoryDb: { getOrgMemories: jest.fn(), addMemory: jest.fn(), deleteMemory: jest.fn() },
+}));
+jest.mock('../../../utils/embeddings', () => ({ embedText: jest.fn() }));
+
+import { mcpToolRegistry } from '../registry';
+import { findApiKeyOnlyToolCallForNonKey, findScopeDenial } from '../apiKeyScopes';
+import {
+  checkId, exactArgs, listMemories, LIST_MEMORIES_DEFAULT_LIMIT, LIST_MEMORIES_MAX_LIMIT, MEMORY_MCP_MAX_ROWS,
+} from '../memoryTools';
+import { MEMORY_CATEGORIES } from '../../../utils/memoryCategories';
+import { userDb, orgDb, accountMemoryDb, orgMemoryDb } from '../../../services/db';
+import { embedText } from '../../../utils/embeddings';
+
+const db = { userDb, orgDb, accountMemoryDb, orgMemoryDb } as any;
+const TOOLS = ['save_memory', 'delete_memory', 'list_memories', 'save_org_memory', 'delete_org_memory'] as const;
+const ORG_WRITE = ['save_org_memory', 'delete_org_memory'];
+const ctx = { userId: 'u1', sessionId: 's1' };
+
+const row = (n: number, extra: Record<string, unknown> = {}) => ({
+  memoryId: `01MEM${String(n).padStart(4, '0')}`, category: 'insight', content: `fact ${n}`, createdAt: '2026-01-01', updatedAt: '2026-01-01', ...extra,
+});
+const rows = (count: number, from = 1) => Array.from({ length: count }, (_, k) => row(from + k));
+
+/** Run a registered tool the way the MCP server does and return the parsed JSON of its answer. */
+async function run(name: string, args: unknown, context: any = ctx): Promise<any> {
+  const result = await mcpToolRegistry.getTool(name)!.execute(args, context);
+  return JSON.parse(result.content[0].text);
+}
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  db.userDb.getUserById.mockResolvedValue({ userId: 'u1', memoryEnabled: true, orgId: 'org1', orgRole: 'member' });
+  db.orgDb.getOrgById.mockResolvedValue({ orgId: 'org1', orgMemoryEnabled: true, ownerUserId: 'owner1' });
+  db.accountMemoryDb.getUserMemories.mockResolvedValue([]);
+  db.orgMemoryDb.getOrgMemories.mockResolvedValue([]);
+  db.accountMemoryDb.addMemory.mockImplementation(async (_u: string, _c: string, content: string) => ({ memoryId: `01NEW-${content.length}` }));
+  db.orgMemoryDb.addMemory.mockImplementation(async (_o: string, _c: string, content: string) => ({ memoryId: `01ORG-${content.length}` }));
+  db.accountMemoryDb.deleteMemory.mockResolvedValue(true);
+  db.orgMemoryDb.deleteMemory.mockResolvedValue(true);
+  (embedText as jest.Mock).mockResolvedValue([0.5]);
+});
+
+describe('registration and scope gating', () => {
+  it('registers exactly the five tools, all needing a user account', () => {
+    for (const name of TOOLS) expect(mcpToolRegistry.getTool(name)).toBeDefined();
+    for (const name of TOOLS) expect(mcpToolRegistry.getTool(name)!.requiresUserAccount).toBe(true);
+  });
+
+  it('only list_memories is read-only', () => {
+    expect(TOOLS.filter((n) => mcpToolRegistry.getTool(n)!.readOnly === true)).toEqual(['list_memories']);
+  });
+
+  it('the org write tools need the memory:org scope AND an aw_ key; the user tools need neither', () => {
+    for (const name of ORG_WRITE) {
+      expect(mcpToolRegistry.getTool(name)).toMatchObject({ requiredScope: 'memory:org', apiKeyOnly: true });
+    }
+    for (const name of ['save_memory', 'delete_memory', 'list_memories']) {
+      expect(mcpToolRegistry.getTool(name)!.requiredScope).toBeUndefined();
+      expect(mcpToolRegistry.getTool(name)!.apiKeyOnly).toBeUndefined();
+    }
+  });
+
+  const lookup = (name: string) => mcpToolRegistry.getTool(name);
+  const call = (name: string) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+
+  it('a default key (tools:read + tools:execute) is refused the org write tools, even inside a batch, and may use the rest', () => {
+    const defaults = ['tools:read', 'tools:execute'];
+    for (const name of ORG_WRITE) expect(findScopeDenial(call(name), defaults, lookup)).toMatchObject({ tool: name, requiredScope: 'memory:org' });
+    expect(findScopeDenial([call('list_memories'), call('save_org_memory')], defaults, lookup)).toMatchObject({ tool: 'save_org_memory' });
+    for (const name of ['save_memory', 'delete_memory', 'list_memories']) expect(findScopeDenial(call(name), defaults, lookup)).toBeNull();
+  });
+
+  it('a key holding memory:org may call the org write tools; the scope alone does not let it write user memory', () => {
+    for (const name of ORG_WRITE) expect(findScopeDenial(call(name), ['memory:org'], lookup)).toBeNull();
+    expect(findScopeDenial(call('save_memory'), ['memory:org'], lookup)).toMatchObject({ requiredScope: 'tools:execute' });
+  });
+
+  it('a read-only key may list but not save or delete', () => {
+    const readOnly = ['tools:read'];
+    expect(findScopeDenial(call('list_memories'), readOnly, lookup)).toBeNull();
+    for (const name of ['save_memory', 'delete_memory']) expect(findScopeDenial(call(name), readOnly, lookup)).toMatchObject({ requiredScope: 'tools:execute' });
+  });
+
+  it('an OAuth client (any non-key caller) is refused the org write tools and not the user tools', () => {
+    for (const name of ORG_WRITE) expect(findApiKeyOnlyToolCallForNonKey(call(name), lookup)).toMatchObject({ tool: name });
+    for (const name of ['save_memory', 'delete_memory', 'list_memories']) expect(findApiKeyOnlyToolCallForNonKey(call(name), lookup)).toBeNull();
+    expect(findApiKeyOnlyToolCallForNonKey([call('list_memories'), call('delete_org_memory')], lookup)).toMatchObject({ tool: 'delete_org_memory' });
+  });
+
+  it('the category enum in the schemas is the shared category list', () => {
+    for (const name of ['save_memory', 'save_org_memory', 'list_memories']) {
+      expect(mcpToolRegistry.getTool(name)!.definition.inputSchema.properties.category.enum).toEqual([...MEMORY_CATEGORIES]);
+    }
+  });
+});
+
+describe('argument checks', () => {
+  it('exactArgs: none or an object is fine; anything else, and any key that is not an input, is refused by name', () => {
+    expect(exactArgs('t', undefined, ['a'])).toEqual({});
+    expect(exactArgs('t', null, ['a'])).toEqual({});
+    expect(exactArgs('t', { a: 1 }, ['a'])).toEqual({ a: 1 });
+    expect(() => exactArgs('t', 'text', ['a'])).toThrow(/arguments must be an object/);
+    expect(() => exactArgs('t', [1], ['a'])).toThrow(/arguments must be an object/);
+    expect(() => exactArgs('t', { orgId: 'x' }, ['a'])).toThrow(/"orgId" is not an input of t\. Its inputs are: a\. Nothing was changed\./);
+    expect(() => exactArgs('t', { x: 1, y: 2 }, ['a'])).toThrow(/"x", "y" are not inputs of t/);
+  });
+
+  it('checkId: text with no whitespace or control characters, 1 to 100 long', () => {
+    expect(checkId('t', 'memoryId', '01HZ0000000000000000000000')).toBe('01HZ0000000000000000000000');
+    expect(checkId('t', 'memoryId', 'ads-learning#abc')).toBe('ads-learning#abc');
+    for (const bad of [undefined, null, 7, '', ' a', 'a b', 'a\nb', 'a\u0000b', 'x'.repeat(101), {}]) {
+      expect(() => checkId('t', 'memoryId', bad)).toThrow(/memoryId/);
+    }
+    expect(checkId('t', 'memoryId', 'x'.repeat(100))).toHaveLength(100);
+  });
+});
+
+describe('save_memory', () => {
+  it('saves one memory under the caller, embeds it once, and answers with the id', async () => {
+    const out = await run('save_memory', { content: 'prefers short emails', category: 'preference' });
+    expect(out).toMatchObject({ success: true, memoryId: expect.any(String) });
+    expect(db.accountMemoryDb.addMemory).toHaveBeenCalledWith('u1', 'preference', 'prefers short emails', 's1', [0.5]);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an argument that is not an input BY NAME and touches nothing (an agent that thinks it chose another account is told it did not)', async () => {
+    for (const extra of [{ userId: 'u2' }, { orgId: 'org2' }, { scope: 'org' }]) {
+      await expect(run('save_memory', { content: 'x', category: 'insight', ...extra })).rejects.toThrow(/is not an input of save_memory/);
+    }
+    expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+    expect(embedText).not.toHaveBeenCalled();
+  });
+
+  it('the shared guards still apply (bad category, blank, not text, too long): thrown before any read, embedding or write', async () => {
+    await expect(run('save_memory', { content: 'x', category: 'other' })).rejects.toThrow(/Invalid category: other/);
+    await expect(run('save_memory', { content: '   ', category: 'insight' })).rejects.toThrow(/Content is required/);
+    await expect(run('save_memory', { content: 5, category: 'insight' })).rejects.toThrow(/Content must be text/);
+    await expect(run('save_memory', { content: 'x'.repeat(8001), category: 'insight' })).rejects.toThrow(/8000 characters or less/);
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+    expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(embedText).not.toHaveBeenCalled();
+  });
+
+  it('a user who turned memory off is refused BEFORE the cap or duplicate read (the shared order is kept)', async () => {
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', memoryEnabled: false });
+    const out = await run('save_memory', { content: 'x', category: 'insight' });
+    expect(out).toEqual({ success: false, message: 'Memory is disabled for this account.' });
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+  });
+
+  it('reads what is stored strongly consistently, from the table (no category index), newest first, without vectors', async () => {
+    await run('save_memory', { content: 'x', category: 'insight' });
+    expect(db.accountMemoryDb.getUserMemories).toHaveBeenCalledWith('u1', undefined, undefined, {
+      maxRows: 1000, newestFirst: true, omitEmbeddings: true, consistentRead: true,
+    });
+  });
+
+  it('an exact duplicate (same category, same text, ignoring surrounding whitespace) is not written or embedded again', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(3, { content: 'prefers short emails' }), ...rows(2)]);
+    const out = await run('save_memory', { content: '  prefers short emails \n', category: 'insight' });
+    expect(out).toMatchObject({ success: true, saved: false, duplicate: true, memoryId: '01MEM0003' });
+    expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(embedText).not.toHaveBeenCalled();
+  });
+
+  it('the same text in ANOTHER category is a different memory and is saved', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(3, { content: 'prefers short emails', category: 'preference' })]);
+    const out = await run('save_memory', { content: 'prefers short emails', category: 'insight' });
+    expect(out).toMatchObject({ success: true, memoryId: expect.any(String) });
+    expect(out.saved).toBeUndefined();
+    expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('content that will be split into several rows skips the duplicate check (it is checked per row only when one row)', async () => {
+    const long = 'a'.repeat(2500);
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { content: long })]);
+    const out = await run('save_memory', { content: long, category: 'insight' });
+    expect(out).toMatchObject({ success: true });
+    expect(db.accountMemoryDb.addMemory.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  describe('the cap of 200 stored memories', () => {
+    it('is 200', () => expect(MEMORY_MCP_MAX_ROWS).toBe(200));
+
+    it('refuses a save when 200 are stored, with how many, the limit and how to make room; nothing is written or embedded', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(200));
+      const out = await run('save_memory', { content: 'one more', category: 'insight' });
+      expect(out).toMatchObject({ success: false, stored: 200, limit: 200 });
+      expect(out.message).toMatch(/200 memories stored.*limit.*200.*list_memories.*delete_memory.*Nothing was saved/s);
+      expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+      expect(embedText).not.toHaveBeenCalled();
+    });
+
+    it('allows the 200th and refuses the 201st', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(199));
+      expect(await run('save_memory', { content: 'the 200th', category: 'insight' })).toMatchObject({ success: true });
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(200));
+      expect(await run('save_memory', { content: 'the 201st', category: 'insight' })).toMatchObject({ success: false, stored: 200 });
+    });
+
+    it('counts the rows a split save would need: 199 stored plus a two-row save is refused, 198 plus two is allowed', async () => {
+      const long = 'b'.repeat(2500);
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(199));
+      const refused = await run('save_memory', { content: long, category: 'insight' });
+      expect(refused).toMatchObject({ success: false, stored: 199 });
+      expect(refused.message).toMatch(/needs 2 more rows/);
+      expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(198));
+      expect(await run('save_memory', { content: long, category: 'insight' })).toMatchObject({ success: true });
+      expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(2);
+    });
+
+    it('an account already above the cap keeps its rows and is simply refused further saves', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(277));
+      expect(await run('save_memory', { content: 'more', category: 'insight' })).toMatchObject({ success: false, stored: 277, limit: 200 });
+    });
+
+    it('a duplicate into a full store is answered as a duplicate, not refused for the cap', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue([...rows(199), row(500, { content: 'already here' })]);
+      expect(await run('save_memory', { content: 'already here', category: 'insight' })).toMatchObject({ saved: false, duplicate: true });
+    });
+  });
+
+  it('takes the caller from agentUserId when the context has no userId, and never from an argument', async () => {
+    await run('save_memory', { content: 'x', category: 'insight' }, { agentUserId: 'agent-owner' });
+    expect(db.accountMemoryDb.addMemory.mock.calls[0][0]).toBe('agent-owner');
+    await expect(run('save_memory', { content: 'x', category: 'insight' }, {})).rejects.toThrow(/Authentication required/);
+  });
+});
+
+describe('delete_memory', () => {
+  it('deletes under the caller and answers "deleted"', async () => {
+    expect(await run('delete_memory', { memoryId: '01MEM0001' })).toEqual({ success: true, message: 'Memory 01MEM0001 deleted.' });
+    expect(db.accountMemoryDb.deleteMemory).toHaveBeenCalledWith('u1', '01MEM0001');
+  });
+
+  it('answers "not found" for an id that does not exist, as success false', async () => {
+    db.accountMemoryDb.deleteMemory.mockResolvedValue(false);
+    expect(await run('delete_memory', { memoryId: '01NOPE' })).toMatchObject({ success: false, message: expect.stringMatching(/not found; nothing was deleted/) });
+  });
+
+  it('refuses a missing or malformed id and an argument that is not an input, before the database is touched', async () => {
+    await expect(run('delete_memory', {})).rejects.toThrow(/memoryId is required/);
+    await expect(run('delete_memory', { memoryId: 'a b' })).rejects.toThrow(/not a valid memory id/);
+    await expect(run('delete_memory', { memoryId: '01MEM0001', userId: 'u2' })).rejects.toThrow(/"userId" is not an input of delete_memory/);
+    expect(db.accountMemoryDb.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it('the structured ads-learning refusal of the database layer reaches the agent', async () => {
+    db.accountMemoryDb.deleteMemory.mockRejectedValue(new Error('Structured ads learning must be changed through its review flow.'));
+    await expect(run('delete_memory', { memoryId: 'ads-learning#abc' })).rejects.toThrow(/review flow/);
+  });
+});
+
+describe('save_org_memory and delete_org_memory', () => {
+  it('saves under the caller\'s OWN org (from the user record), never one named in the arguments', async () => {
+    const out = await run('save_org_memory', { content: 'we sell widgets', category: 'insight' });
+    expect(out).toMatchObject({ success: true });
+    expect(db.orgMemoryDb.addMemory).toHaveBeenCalledWith('org1', 'insight', 'we sell widgets', 'u1', [0.5]);
+    await expect(run('save_org_memory', { content: 'x', category: 'insight', orgId: 'org2' })).rejects.toThrow(/"orgId" is not an input of save_org_memory/);
+    expect(db.orgMemoryDb.addMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('the shared org refusals are unchanged: no org, org missing, org memory off', async () => {
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+    expect(await run('save_org_memory', { content: 'x', category: 'insight' })).toEqual({ success: false, message: 'User is not a member of any organization.' });
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    db.orgDb.getOrgById.mockResolvedValue(null);
+    expect(await run('save_org_memory', { content: 'x', category: 'insight' })).toEqual({ success: false, message: 'Organization not found.' });
+    db.orgDb.getOrgById.mockResolvedValue({ orgId: 'org1', orgMemoryEnabled: false });
+    expect(await run('save_org_memory', { content: 'x', category: 'insight' })).toEqual({ success: false, message: 'Organization memory is disabled.' });
+    expect(db.orgMemoryDb.getOrgMemories).not.toHaveBeenCalled();
+    expect(db.orgMemoryDb.addMemory).not.toHaveBeenCalled();
+  });
+
+  it('applies the cap and the duplicate check to the ORG\'s rows, and says org', async () => {
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(200));
+    const full = await run('save_org_memory', { content: 'x', category: 'insight' });
+    expect(full).toMatchObject({ success: false, stored: 200 });
+    expect(full.message).toMatch(/This organization has 200 memories.*delete_org_memory/s);
+    expect(db.orgMemoryDb.getOrgMemories).toHaveBeenCalledWith('org1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true, consistentRead: true });
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue([row(1, { content: 'we sell widgets' })]);
+    expect(await run('save_org_memory', { content: 'we sell widgets', category: 'insight' })).toMatchObject({ saved: false, duplicate: true });
+  });
+
+  it('delete: a member is refused (org:configure), an admin deletes, "not found" is a refusal not a success', async () => {
+    expect(await run('delete_org_memory', { memoryId: '01ORG0001' })).toEqual({ success: false, message: 'Only org owners and admins can delete org memories.' });
+    expect(db.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1', orgRole: 'admin' });
+    expect(await run('delete_org_memory', { memoryId: '01ORG0001' })).toEqual({ success: true, message: 'Org memory 01ORG0001 deleted.' });
+    expect(db.orgMemoryDb.deleteMemory).toHaveBeenCalledWith('org1', '01ORG0001');
+    db.orgMemoryDb.deleteMemory.mockResolvedValue(false);
+    expect(await run('delete_org_memory', { memoryId: '01NOPE' })).toMatchObject({ success: false });
+    await expect(run('delete_org_memory', { memoryId: '01ORG0001', orgId: 'org2' })).rejects.toThrow(/"orgId" is not an input/);
+  });
+});
+
+describe('list_memories', () => {
+  const list = (args: unknown = {}, context: any = ctx) => run('list_memories', args, context);
+
+  it('defaults to the caller\'s own memories, newest first, 20 a page, with only the five public fields', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(30).map((r) => ({ ...r, embedding: [1], sourceSessionId: 's', userId: 'u1' })));
+    const out = await list();
+    expect(out).toMatchObject({ success: true, scope: 'user', count: LIST_MEMORIES_DEFAULT_LIMIT, total: 30, truncated: false });
+    expect(out.memories[0].memoryId).toBe('01MEM0030');
+    expect(out.memories[19].memoryId).toBe('01MEM0011');
+    expect(Object.keys(out.memories[0]).sort()).toEqual(['category', 'content', 'createdAt', 'memoryId', 'updatedAt']);
+    expect(out.nextCursor).toBe('01MEM0011');
+  });
+
+  it('orders newest first whatever order the database returned them in', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(2), row(9), row(5), row(1)]);
+    expect((await list()).memories.map((m: any) => m.memoryId)).toEqual(['01MEM0009', '01MEM0005', '01MEM0002', '01MEM0001']);
+  });
+
+  it('pages by memory id: three pages of 2 over 5 rows cover each row once, then nextCursor is null', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(5));
+    const seen: string[] = [];
+    let cursor: string | null | undefined;
+    for (let page = 0; page < 5; page++) {
+      const out = await list({ limit: 2, ...(cursor ? { cursor } : {}) });
+      seen.push(...out.memories.map((m: any) => m.memoryId));
+      cursor = out.nextCursor;
+      if (cursor === null) break;
+    }
+    expect(seen).toEqual(['01MEM0005', '01MEM0004', '01MEM0003', '01MEM0002', '01MEM0001']);
+    expect(cursor).toBeNull();
+  });
+
+  it('a page that ends exactly at the last row has no nextCursor', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(4));
+    expect((await list({ limit: 4 })).nextCursor).toBeNull();
+    expect((await list({ limit: 3 })).nextCursor).toBe('01MEM0002');
+  });
+
+  it('a cursor can only filter the caller\'s own rows: an id from anywhere else selects nothing it should not', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(3));
+    expect((await list({ cursor: 'ZZZ-someone-elses-id' })).memories.map((m: any) => m.memoryId)).toEqual(['01MEM0003', '01MEM0002', '01MEM0001']);
+    expect((await list({ cursor: '000' })).memories).toEqual([]);
+    expect(db.accountMemoryDb.getUserMemories.mock.calls.every((c: any[]) => c[0] === 'u1')).toBe(true);
+  });
+
+  it('filters a category in code and reads the table (never the category index), consistently', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { category: 'workflow' }), row(2), row(3, { category: 'workflow' })]);
+    const out = await list({ category: 'workflow' });
+    expect(out.memories.map((m: any) => m.memoryId)).toEqual(['01MEM0003', '01MEM0001']);
+    expect(out).toMatchObject({ category: 'workflow', total: 2 });
+    expect(db.accountMemoryDb.getUserMemories).toHaveBeenCalledWith('u1', undefined, undefined, expect.objectContaining({ consistentRead: true }));
+  });
+
+  it('says so when the view is the newest 1,000 and older rows exist', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(1000));
+    expect(await list({ limit: LIST_MEMORIES_MAX_LIMIT })).toMatchObject({ truncated: true, total: 1000, count: 50 });
+  });
+
+  it('org scope reads the caller\'s own org (no argument can name one)', async () => {
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(3));
+    const out = await list({ scope: 'org' });
+    expect(out).toMatchObject({ success: true, scope: 'org', count: 3 });
+    expect(db.orgMemoryDb.getOrgMemories).toHaveBeenCalledWith('org1', undefined, undefined, expect.objectContaining({ consistentRead: true }));
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+    await expect(list({ scope: 'org', orgId: 'org2' })).rejects.toThrow(/"orgId" is not an input of list_memories/);
+  });
+
+  it('a plain member may read org memory (it is what Emma already shows them); a non-member, a missing org and a disabled org get the shared messages', async () => {
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(1));
+    expect(await list({ scope: 'org' })).toMatchObject({ success: true });
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+    expect(await list({ scope: 'org' })).toEqual({ success: false, message: 'User is not a member of any organization.' });
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    db.orgDb.getOrgById.mockResolvedValue(null);
+    expect(await list({ scope: 'org' })).toEqual({ success: false, message: 'Organization not found.' });
+    db.orgDb.getOrgById.mockResolvedValue({ orgId: 'org1', orgMemoryEnabled: false });
+    expect(await list({ scope: 'org' })).toEqual({ success: false, message: 'Organization memory is disabled.' });
+  });
+
+  it('a user who turned memory off gets nothing listed', async () => {
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', memoryEnabled: false });
+    expect(await list()).toEqual({ success: false, message: 'Memory is disabled for this account.' });
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+  });
+
+  it('checks its own arguments: scope, category, limit and cursor, and refuses any other input by name, before any read', async () => {
+    await expect(list({ scope: 'team' })).rejects.toThrow(/scope must be "user".*"org"/);
+    await expect(list({ category: 'other' })).rejects.toThrow(/Invalid category: other/);
+    for (const limit of [0, 51, 1.5, '5', -1, NaN]) await expect(list({ limit })).rejects.toThrow(/limit must be a whole number from 1 to 50/);
+    for (const cursor of [7, '', 'a b', 'x'.repeat(101), 'a\nb']) await expect(list({ cursor })).rejects.toThrow(/cursor is not valid/);
+    await expect(list({ includeEmbeddings: true })).rejects.toThrow(/"includeEmbeddings" is not an input of list_memories/);
+    expect(db.userDb.getUserById).not.toHaveBeenCalled();
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+  });
+
+  it('null for an optional input means "not given"', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(2));
+    expect(await list({ scope: null, category: null, limit: null, cursor: null })).toMatchObject({ scope: 'user', count: 2 });
+  });
+
+  it('is exported for direct use and answers the same as the registered tool', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(2));
+    expect(await listMemories({}, ctx)).toEqual(await list());
+  });
+});
+
+describe('audit line', () => {
+  it('names the tool, the caller and the outcome, never the memory text', async () => {
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    await run('save_memory', { content: 'SECRET-TEXT-123', category: 'insight' }, { userId: 'u1', apiKeyId: 'k1', externalMcp: true });
+    await expect(run('save_memory', { content: 'SECRET-TEXT-456', category: 'nope' })).rejects.toThrow();
+    const lines = info.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => /"event":"mcp_memory".*"tool":"save_memory".*"userId":"u1".*"apiKeyId":"k1".*"external":true.*"outcome":"ok"/.test(l))).toBe(true);
+    expect(lines.some((l) => /"outcome":"error"/.test(l))).toBe(true);
+    expect(lines.join('\n')).not.toMatch(/SECRET-TEXT/);
+    info.mockRestore();
+  });
+});

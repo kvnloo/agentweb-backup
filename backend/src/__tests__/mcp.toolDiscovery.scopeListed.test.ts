@@ -29,3 +29,33 @@ describe('scope-listed tools', () => {
     }
   });
 });
+
+describe('memory:org (ENG-2840 W2-2)', () => {
+  const ORG_TOOLS = ['save_org_memory', 'delete_org_memory', 'list_memories'];
+
+  it('lists the org memory write tools, and list_memories to find an id, for a key holding memory:org', () => {
+    const listed = names(['tools:read', 'tools:execute', 'memory:org']);
+    for (const name of ORG_TOOLS) expect(listed).toContain(name);
+  });
+
+  it('hides them for default keys and non-key callers', () => {
+    for (const scopes of [undefined, ['tools:read', 'tools:execute'], ['tools:read']]) {
+      const listed = names(scopes);
+      for (const name of ORG_TOOLS) expect(listed).not.toContain(name);
+    }
+  });
+
+  it('the user\'s own memory tools are not in tools/list for anyone (progressive disclosure: callable by name, found by search)', () => {
+    for (const scopes of [undefined, ['tools:read', 'tools:execute'], ['tools:read', 'tools:execute', 'memory:org']]) {
+      const listed = names(scopes);
+      expect(listed).not.toContain('save_memory');
+      expect(listed).not.toContain('delete_memory');
+    }
+  });
+
+  it('the scope lists nothing else (the Smartlead and email tools stay hidden from a memory:org key)', () => {
+    const listed = names(['tools:read', 'tools:execute', 'memory:org']);
+    expect(listed).not.toContain('read_email');
+    expect(listed).not.toContain('list_smartlead_campaigns');
+  });
+});
