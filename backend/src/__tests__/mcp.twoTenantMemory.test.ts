@@ -416,3 +416,100 @@ describe('a signed-in OAuth client', () => {
     expect((await oauth.call('save_memory', { content: 'from an OAuth client', category: 'insight' })).json.success).toBe(true);
   });
 });
+
+describe('saves sent at the same moment (a JSON-RPC batch or a retry): the cap and the duplicate check hold', () => {
+  const fillAccount = (owner: string, count: number) => {
+    for (let i = 0; i < count; i++) {
+      fake.seed('AW-AccountMemory', { userId: owner, memoryId: `00FILL-${String(i).padStart(4, '0')}`, category: 'history', content: `filler ${i}`, createdAt: 'x', updatedAt: 'x' });
+    }
+  };
+
+  it('50 different saves at once into an account with 199 stored: one is accepted, 49 refused, 200 stored, 1 embedding billed', async () => {
+    fillAccount(TENANT_A.owner, 196); // 3 seeded + 196
+    const a = await as(TENANT_A.owner);
+    const outs = await Promise.all(Array.from({ length: 50 }, (_, i) => a.call('save_memory', { content: `distinct fact ${i}`, category: 'insight' })));
+    expect(outs.filter((o) => o.json?.success === true)).toHaveLength(1);
+    expect(outs.filter((o) => o.json?.success === false && o.json?.limit === 200)).toHaveLength(49);
+    expect(accountRows(TENANT_A.owner)).toHaveLength(200);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('5 identical saves at once write one row; the other four are answered as duplicates of it', async () => {
+    const a = await as(TENANT_A.owner);
+    const outs = await Promise.all(Array.from({ length: 5 }, () => a.call('save_memory', { content: 'sent five times at once', category: 'insight' })));
+    expect(accountRows(TENANT_A.owner)).toHaveLength(TENANT_A.memories.length + 1);
+    expect(outs.filter((o) => o.json?.duplicate === true)).toHaveLength(4);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('the org owner and a member saving at once into an org with 199 stored share the cap: 200 stored, one refused', async () => {
+    for (let i = 0; i < 197; i++) {
+      fake.seed('AW-OrgMemory', { orgId: TENANT_A.orgId, memoryId: `00FILL-${String(i).padStart(4, '0')}`, category: 'history', content: `filler ${i}`, createdAt: 'x', updatedAt: 'x' });
+    }
+    const owner = await as(TENANT_A.owner, ORG_WRITER);
+    const member = await as(TENANT_A.member!, ORG_WRITER);
+    const outs = await Promise.all([
+      owner.call('save_org_memory', { content: 'owner fact', category: 'insight' }),
+      member.call('save_org_memory', { content: 'member fact', category: 'insight' }),
+    ]);
+    expect(outs.filter((o) => o.json?.success === true)).toHaveLength(1);
+    expect(orgRows(TENANT_A.orgId)).toHaveLength(200);
+  });
+
+  it('another tenant saving at the same moment is not held up or counted', async () => {
+    fillAccount(TENANT_A.owner, 197); // A is full
+    const a = await as(TENANT_A.owner);
+    const b = await as(TENANT_B.owner);
+    const [fromA, fromB] = await Promise.all([
+      a.call('save_memory', { content: 'A is full', category: 'insight' }),
+      b.call('save_memory', { content: 'B is not', category: 'insight' }),
+    ]);
+    expect(fromA.json).toMatchObject({ success: false, stored: 200 });
+    expect(fromB.json).toMatchObject({ success: true });
+  });
+});
+
+describe('a long text that is split, saved twice', () => {
+  it('the second save is a duplicate of all its parts and writes nothing', async () => {
+    const long = `${'alpha '.repeat(300)}`.trim() + '\n\n' + `${'beta '.repeat(300)}`.trim();
+    const a = await as(TENANT_A.owner);
+    const first = await a.call('save_memory', { content: long, category: 'insight' });
+    expect(first.json).toMatchObject({ success: true, memoryIds: expect.any(Array) });
+    expect(first.json.memoryIds).toHaveLength(2);
+    const again = await a.call('save_memory', { content: long, category: 'insight' });
+    expect(again.json).toMatchObject({ success: true, saved: false, duplicate: true, memoryIds: first.json.memoryIds });
+    expect(accountRows(TENANT_A.owner)).toHaveLength(TENANT_A.memories.length + 2);
+    expect(embedText).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('a memory whose text looks like JSON is read back exactly as it was saved', () => {
+  // The public-response sanitizer strips internal id fields from JSON-looking text in tool results. A memory is the caller's own text:
+  // rewriting it would hand an agent back something other than what it saved.
+  const jsonText = '{"apiKeyId":"k-123","note":"hello","nested":{"userId":"u-9","agentUserId":"a-1"}}';
+
+  it('user memory: the save answer and the list carry the text unchanged', async () => {
+    const a = await as(TENANT_A.owner);
+    const saved = await a.call('save_memory', { content: jsonText, category: 'insight' });
+    expect(saved.json.success).toBe(true);
+    expect(saved.text).toContain('apiKeyId');
+    const listed = await a.call('list_memories', {});
+    expect(listed.json.memories[0].content).toBe(jsonText);
+    expect(accountRows(TENANT_A.owner).find((r: any) => r.memoryId === saved.json.memoryId).content).toBe(jsonText);
+  });
+
+  it('org memory: the same, and a member reads it unchanged', async () => {
+    const owner = await as(TENANT_A.owner, ORG_WRITER);
+    const saved = await owner.call('save_org_memory', { content: jsonText, category: 'workflow' });
+    expect(saved.json.success).toBe(true);
+    const listed = await (await as(TENANT_A.member!)).call('list_memories', { scope: 'org' });
+    expect(listed.json.memories[0].content).toBe(jsonText);
+  });
+
+  it('the sanitizer still removes internal ids from the tools it covers (this exemption is only for the memory tools)', async () => {
+    const { shouldSanitizePublicResponse, OWN_CONTENT_TOOL_NAMES } = await import('../mcp/server/publicResponseSanitizer');
+    expect([...OWN_CONTENT_TOOL_NAMES].sort()).toEqual(['delete_memory', 'delete_org_memory', 'list_memories', 'save_memory', 'save_org_memory']);
+    expect(shouldSanitizePublicResponse('manage_leads', {}, { externalMcp: true })).toBe(true);
+    expect(shouldSanitizePublicResponse('list_memories', {}, { externalMcp: true })).toBe(false);
+  });
+});

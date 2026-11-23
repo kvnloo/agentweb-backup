@@ -141,3 +141,23 @@ describe('a signed-in OAuth client', () => {
     expect((await send(oauthApp(), callOf(tool), 'oauth-token')).status).not.toBe(403);
   });
 });
+
+describe('a tool name that is not text (found in review: the request used to hang)', () => {
+  const hostileCall = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: { toString: 'x' }, arguments: {} } };
+
+  it('is answered at once: refused 403 for a read-only key (an unknown tool is a write), passed on for a key that may write', async () => {
+    expect((await send(appFor(['tools:read']), hostileCall)).status).toBe(403);
+    expect((await send(appFor(['tools:read', 'tools:execute']), hostileCall)).status).toBe(200);
+  });
+
+  it('is answered at once for an OAuth client too', async () => {
+    mockValidateKey.mockResolvedValue(null);
+    mockValidateOAuth.mockResolvedValue({ userId: `oauth-user-${++seq}-${Date.now()}`, clientId: 'client-1' });
+    const app = express();
+    app.use(express.json());
+    process.env.MCP_HTTP_ENABLED = 'true';
+    delete process.env.MCP_ACCESS_TOKEN;
+    setupMcpServer(app);
+    expect((await send(app, hostileCall, 'oauth-token')).status).not.toBe(403);
+  });
+});

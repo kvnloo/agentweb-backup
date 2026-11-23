@@ -4,7 +4,7 @@
  * guards and paging. The two-tenant behaviour through the real MCP server is in __tests__/mcp.twoTenantMemory.test.ts.
  */
 jest.mock('../../../services/db', () => ({
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn() },
   orgDb: { getOrgById: jest.fn() },
   accountMemoryDb: { getUserMemories: jest.fn(), addMemory: jest.fn(), deleteMemory: jest.fn() },
   orgMemoryDb: { getOrgMemories: jest.fn(), addMemory: jest.fn(), deleteMemory: jest.fn() },
@@ -39,6 +39,7 @@ async function run(name: string, args: unknown, context: any = ctx): Promise<any
 beforeEach(() => {
   jest.clearAllMocks();
   db.userDb.getUserById.mockResolvedValue({ userId: 'u1', memoryEnabled: true, orgId: 'org1', orgRole: 'member' });
+  db.userDb.getUserByIdConsistent.mockResolvedValue({ userId: 'u1', memoryEnabled: true, orgId: 'org1', orgRole: 'member' });
   db.orgDb.getOrgById.mockResolvedValue({ orgId: 'org1', orgMemoryEnabled: true, ownerUserId: 'owner1' });
   db.accountMemoryDb.getUserMemories.mockResolvedValue([]);
   db.orgMemoryDb.getOrgMemories.mockResolvedValue([]);
@@ -50,7 +51,7 @@ beforeEach(() => {
 });
 
 describe('registration and scope gating', () => {
-  it('registers exactly the five tools, all needing a user account', () => {
+  it('registers the five tools, all needing a user account', () => {
     for (const name of TOOLS) expect(mcpToolRegistry.getTool(name)).toBeDefined();
     for (const name of TOOLS) expect(mcpToolRegistry.getTool(name)!.requiresUserAccount).toBe(true);
   });
@@ -188,12 +189,29 @@ describe('save_memory', () => {
     expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(1);
   });
 
-  it('content that will be split into several rows skips the duplicate check (it is checked per row only when one row)', async () => {
-    const long = 'a'.repeat(2500);
-    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { content: long })]);
-    const out = await run('save_memory', { content: long, category: 'insight' });
-    expect(out).toMatchObject({ success: true });
-    expect(db.accountMemoryDb.addMemory.mock.calls.length).toBeGreaterThan(1);
+  describe('a long text that is split into several rows', () => {
+    // splitMemoryContent cuts a long text at paragraph, line or sentence ends; these two paragraphs each fit one row.
+    const part1 = `${'alpha '.repeat(300)}`.trim();
+    const part2 = `${'beta '.repeat(300)}`.trim();
+    const long = `${part1}\n\n${part2}`;
+
+    it('is not written again when every part is already stored in that category (a retried long save would otherwise double up to the cap)', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { content: part1 }), row(2, { content: part2 }), ...rows(3, 10)]);
+      const out = await run('save_memory', { content: long, category: 'insight' });
+      expect(out).toMatchObject({ success: true, saved: false, duplicate: true, memoryId: '01MEM0001', memoryIds: ['01MEM0001', '01MEM0002'] });
+      expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+      expect(embedText).not.toHaveBeenCalled();
+    });
+
+    it('is written in full when only SOME parts are stored (it cannot be written in part), and when the parts are in another category', async () => {
+      db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { content: part1 })]);
+      expect(await run('save_memory', { content: long, category: 'insight' })).toMatchObject({ success: true });
+      expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(2);
+      db.accountMemoryDb.addMemory.mockClear();
+      db.accountMemoryDb.getUserMemories.mockResolvedValue([row(1, { content: part1, category: 'workflow' }), row(2, { content: part2, category: 'workflow' })]);
+      expect(await run('save_memory', { content: long, category: 'insight' })).toMatchObject({ success: true });
+      expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('the cap of 200 stored memories', () => {
@@ -418,6 +436,16 @@ describe('list_memories', () => {
     expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
   });
 
+  it('a userId argument is refused by name like any other input (the server drops it before a call over MCP, but the tool must not use it either)', async () => {
+    await expect(list({ userId: 'u2' })).rejects.toThrow(/"userId" is not an input of list_memories/);
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+  });
+
+  it('truncated describes the READ (the newest 1,000 stored), not the filtered list: a category with 3 matches in a full read is still truncated', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([...rows(997).map((r) => ({ ...r, category: 'history' })), row(1001, { category: 'workflow' }), row(1002, { category: 'workflow' }), row(1003, { category: 'workflow' })]);
+    expect(await list({ category: 'workflow' })).toMatchObject({ truncated: true, total: 3, count: 3 });
+  });
+
   it('null for an optional input means "not given"', async () => {
     db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(2));
     expect(await list({ scope: null, category: null, limit: null, cursor: null })).toMatchObject({ scope: 'user', count: 2 });
@@ -439,5 +467,96 @@ describe('audit line', () => {
     expect(lines.some((l) => /"outcome":"error"/.test(l))).toBe(true);
     expect(lines.join('\n')).not.toMatch(/SECRET-TEXT/);
     info.mockRestore();
+  });
+});
+
+describe('saves run one at a time per account (the cap and the duplicate check cannot interleave with a write)', () => {
+  /** A stateful store behind the mocks, so a save that is checked before the previous one is written sees the stale rows. */
+  function statefulAccount(initial: number) {
+    const store = rows(initial);
+    let next = 100000;
+    db.accountMemoryDb.getUserMemories.mockImplementation(async () => {
+      await Promise.resolve();
+      return [...store];
+    });
+    db.accountMemoryDb.addMemory.mockImplementation(async (_u: string, category: string, content: string) => {
+      await new Promise((r) => setTimeout(r, 1)); // a real write takes time: the window a lock must cover
+      const memoryId = `01NEW${String(++next)}`;
+      store.push(row(next, { memoryId, category, content }) as any);
+      return { memoryId };
+    });
+    return store;
+  }
+
+  it('50 different saves sent at once into an account with 199 stored: exactly one is accepted, 49 are refused, 200 are stored', async () => {
+    const store = statefulAccount(199);
+    const outs = await Promise.all(Array.from({ length: 50 }, (_, i) => run('save_memory', { content: `distinct fact ${i}`, category: 'insight' })));
+    expect(outs.filter((o) => o.success === true)).toHaveLength(1);
+    expect(outs.filter((o) => o.success === false && o.limit === 200)).toHaveLength(49);
+    expect(store).toHaveLength(200);
+    expect(db.accountMemoryDb.addMemory).toHaveBeenCalledTimes(1);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('5 identical saves sent at once: one row is written and the other four are answered as duplicates', async () => {
+    const store = statefulAccount(0);
+    const outs = await Promise.all(Array.from({ length: 5 }, () => run('save_memory', { content: 'the same fact', category: 'insight' })));
+    expect(store).toHaveLength(1);
+    expect(outs.filter((o) => o.duplicate === true)).toHaveLength(4);
+    expect(outs.filter((o) => o.saved === undefined && o.success === true)).toHaveLength(1);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('two members of the same org saving at once share one lock, so the org cap is exact', async () => {
+    const store = rows(199);
+    db.orgMemoryDb.getOrgMemories.mockImplementation(async () => { await Promise.resolve(); return [...store]; });
+    db.orgMemoryDb.addMemory.mockImplementation(async (_o: string, category: string, content: string) => {
+      await new Promise((r) => setTimeout(r, 1));
+      store.push(row(store.length + 1, { category, content }) as any);
+      return { memoryId: `01ORGNEW${store.length}` };
+    });
+    db.userDb.getUserById.mockImplementation(async (id: string) => ({ userId: id, orgId: 'org1', orgRole: 'member' }));
+    db.userDb.getUserByIdConsistent.mockImplementation(async (id: string) => ({ userId: id, orgId: 'org1', orgRole: 'member' }));
+    const outs = await Promise.all([
+      run('save_org_memory', { content: 'from the first member', category: 'insight' }, { userId: 'member-1' }),
+      run('save_org_memory', { content: 'from the second member', category: 'insight' }, { userId: 'member-2' }),
+    ]);
+    expect(outs.filter((o) => o.success === true)).toHaveLength(1);
+    expect(store).toHaveLength(200);
+  });
+
+  it('accounts that do not share a lock do not wait for each other', async () => {
+    db.userDb.getUserByIdConsistent.mockImplementation(async (id: string) => ({ userId: id, orgId: id === 'a' ? 'org-a' : 'org-b' }));
+    db.userDb.getUserById.mockImplementation(async (id: string) => ({ userId: id, memoryEnabled: true }));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    db.accountMemoryDb.addMemory.mockImplementation(async (userId: string) => {
+      if (userId === 'a') await gate; // account a's write is stuck
+      return { memoryId: `01-${userId}` };
+    });
+    const stuck = run('save_memory', { content: 'a is slow', category: 'insight' }, { userId: 'a' });
+    const free = await run('save_memory', { content: 'b is not', category: 'insight' }, { userId: 'b' });
+    expect(free).toMatchObject({ success: true, memoryId: '01-b' });
+    release();
+    expect(await stuck).toMatchObject({ success: true, memoryId: '01-a' });
+  });
+
+  it('a failed save does not block the next one for the same account', async () => {
+    db.accountMemoryDb.addMemory.mockRejectedValueOnce(new Error('write failed'));
+    await expect(run('save_memory', { content: 'first', category: 'insight' })).rejects.toThrow('write failed');
+    expect(await run('save_memory', { content: 'second', category: 'insight' })).toMatchObject({ success: true });
+  });
+
+  it('if the account cannot be identified for the lock, the save is refused and nothing is read, embedded or written', async () => {
+    db.userDb.getUserByIdConsistent.mockResolvedValue(null);
+    await expect(run('save_memory', { content: 'x', category: 'insight' })).rejects.toThrow(/the account could not be identified, so nothing was changed/);
+    db.userDb.getUserByIdConsistent.mockRejectedValue(new Error('ResourceNotFound on table AW-Users, role arn:aws:iam::1:role/x'));
+    const err = await run('save_org_memory', { content: 'x', category: 'insight' }).catch((e) => e);
+    expect(String(err.message)).toMatch(/the account could not be identified/);
+    expect(String(err.message)).not.toMatch(/AW-Users|arn:aws/);
+    expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
+    expect(db.orgMemoryDb.getOrgMemories).not.toHaveBeenCalled();
+    expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(embedText).not.toHaveBeenCalled();
   });
 });
