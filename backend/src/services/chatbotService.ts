@@ -4599,7 +4599,10 @@ export class ChatbotDB {
         // e.g. an admin review link (45d) or a legacy 7d link — strip it. Links
         // shared out via email/slack/oncall must never expire regardless of who
         // minted the token first.
-        if (!hasTimedExpiry && session.interactiveShareMetadata.expiresAt) {
+        // ENG-3170: not off a link whose owner explicitly turned on FULL CONTROL. The owner chose that expiry for that power (the dialog shows it),
+        // and an alert or email that merely reuses the link must not turn "full control for 7 days" into "full control for ever". Such a
+        // mailed link stops working at the owner's chosen date, as any link the owner made with an expiry does.
+        if (!hasTimedExpiry && session.interactiveShareMetadata.expiresAt && session.interactiveShareMetadata.allowSensitiveActions !== true) {
           // Best-effort: a failed strip must not lose the working ishare link
           // (the outer catch would otherwise downgrade it to a login-required
           // /agent-mode URL). Worst case the link keeps its existing expiry and
