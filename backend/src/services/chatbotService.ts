@@ -241,6 +241,9 @@ export interface ChatSession {
     token?: string;
     sharedAt?: string;
     expiresAt?: string;
+    // ENG-3170: the owner's choice on this link: may a visitor run sensitive actions (see utils/interactiveShare). Absent on links made
+    // before the setting existed; every link minted since carries an explicit boolean.
+    allowSensitiveActions?: boolean;
   };
   workPlan?: {
     title: string;
@@ -3366,7 +3369,7 @@ export class ChatbotDB {
 
   async updateSessionInteractiveShareMetadata(
     sessionId: string,
-    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string }
+    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string; allowSensitiveActions?: boolean }
   ): Promise<ChatSession> {
     const params = {
       TableName: this.tableName,
@@ -4533,7 +4536,11 @@ export class ChatbotDB {
    * 7d link was minted first, a later external send clears its `expiresAt` so the
    * mailed/posted link can never expire.
    */
-  async createOrReuseInteractiveShare(sessionId: string, expirationDays?: number | null): Promise<string> {
+  async createOrReuseInteractiveShare(
+    sessionId: string,
+    expirationDays?: number | null,
+    options?: { allowSensitiveActions?: boolean },
+  ): Promise<string> {
     try {
       // First, get the current session to check if it already has an interactive share
       const session = await this.getChatSession(sessionId);
@@ -4566,6 +4573,20 @@ export class ChatbotDB {
             console.error(`Error stripping expiry from reused interactive share for session ${sessionId}:`, stripError);
           }
         }
+        // ENG-3170: an EXPLICIT choice (only the owner's share dialog passes one) is applied to the link that is already there, because
+        // there is one token per session and "reuse untouched" would otherwise drop the owner's choice. Callers that pass no choice
+        // (emails, Slack posts, alerts) never touch the setting, so sending a report can not switch an owner's "on" back to "off".
+        // A failed write is not swallowed (the owner's choice matters); the route that made the choice re-reads the stored value.
+        if (typeof options?.allowSensitiveActions === 'boolean'
+          && session.interactiveShareMetadata.allowSensitiveActions !== options.allowSensitiveActions) {
+          // `session` was read before the expiry strip above, so an expiry that was just stripped must not be written back.
+          const { expiresAt: existingExpiresAt, ...rest } = session.interactiveShareMetadata;
+          await this.updateSessionInteractiveShareMetadata(sessionId, {
+            ...rest,
+            ...(hasTimedExpiry && existingExpiresAt ? { expiresAt: existingExpiresAt } : {}),
+            allowSensitiveActions: options.allowSensitiveActions,
+          });
+        }
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
         return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${session.interactiveShareMetadata.token}`;
       }
@@ -4575,10 +4596,13 @@ export class ChatbotDB {
       const conversableToken = crypto.randomBytes(32).toString('hex');
 
       // Only write expiresAt when the caller explicitly requested a timed expiry.
-      const interactiveShareMetadata: { isActive: boolean; token: string; sharedAt: string; expiresAt?: string } = {
+      // ENG-3170: every new link stores an explicit choice. Off unless the caller (the owner's share dialog) says so, so a link that is
+      // mailed, posted to Slack or raised in an alert never carries sensitive actions.
+      const interactiveShareMetadata: { isActive: boolean; token: string; sharedAt: string; expiresAt?: string; allowSensitiveActions: boolean } = {
         isActive: true,
         token: conversableToken,
         sharedAt: new Date().toISOString(),
+        allowSensitiveActions: options?.allowSensitiveActions === true,
       };
       if (hasTimedExpiry) {
         interactiveShareMetadata.expiresAt = new Date(Date.now() + (expirationDays as number) * 86400000).toISOString();
