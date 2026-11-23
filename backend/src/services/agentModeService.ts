@@ -10356,7 +10356,7 @@ export class AgentModeService {
         // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
         // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
         // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
-        // (and a nested call that carries a profile of its own inside a visitor's scope is still inside that visitor's call)
+        // A nested call that carries a profile of its own, inside a visitor's scope, is still inside that visitor's call (`withinVisitorCall`).
         const visitorCall = isShareVisitor || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
         const borrowOwnerLogins = !visitorCall || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);

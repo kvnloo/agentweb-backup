@@ -250,8 +250,24 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       recordSpy.mockRejectedValue(new Error('throttled'));
       jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const url = await chatbotDb.createOrReuseInteractiveShare('s1');
+      expect(recordSpy).toHaveBeenCalledWith('s1', true); // it did try to ask again
       expect(updateSpy).toHaveBeenCalledTimes(1);
       expect(url).not.toContain('the-token');
+    });
+
+    it('the extra consistent read is paid ONLY by a full-control link that looks expired: every other reuse (off, legacy, live full-control, expired off) makes none', async () => {
+      for (const stored of [
+        { allowSensitiveActions: false },
+        {},
+        { expiresAt: '2999-01-01T00:00:00.000Z', allowSensitiveActions: true },
+        { expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: false },
+        { expiresAt: '2020-01-01T00:00:00.000Z' },
+      ]) {
+        recordSpy.mockClear();
+        getSessionSpy.mockResolvedValue(existing(stored));
+        await chatbotDb.createOrReuseInteractiveShare('s1');
+        expect({ stored, reads: recordSpy.mock.calls.length }).toEqual({ stored, reads: 0 });
+      }
     });
 
     it('an expiry that cannot be read, on a full-control link, counts as expired (as the liveness check says)', async () => {
