@@ -13497,7 +13497,19 @@ export const agentModeController = {
           (item) => Boolean(item.metaWriteManifestDigest) || item.immutable === true,
         );
         if (hasBlockedItem) {
-          return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          // ENG-3170: FULL CONTROL is everything the customer can do, and the customer can approve a write or a locked decision. So on a
+          // link whose owner turned it on, the visitor may too. Decided from a CONSISTENT read of the link made now (an owner who has just
+          // switched it off is honoured on the next call); anything unreadable, missing or off keeps the refusal.
+          let linkHasFullControl = false;
+          try {
+            const fresh = await chatbotDb.getChatSessionRecord(session.sessionId, true);
+            linkHasFullControl = interactiveShareAllowsSensitiveActions(fresh?.interactiveShareMetadata);
+          } catch {
+            linkHasFullControl = false;
+          }
+          if (!linkHasFullControl) {
+            return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          }
         }
         const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
         if (result.outcome === 'needs_person') {
