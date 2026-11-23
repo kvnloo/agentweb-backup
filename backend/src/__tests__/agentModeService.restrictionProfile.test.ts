@@ -58,8 +58,8 @@ describe('AgentModeService.executeTool restriction profile (ENG-2816)', () => {
   });
 
   it('still runs an ordinary tool for a share visitor (the profile blocks a list, not everything)', async () => {
-    const result = await run('notify_session', { restrictionProfile: 'share_visitor' }, { to: ['r@example.com'], message: 'Report body' });
-    expect(dispatch).toHaveBeenCalledWith('notify_session', expect.anything(), expect.anything());
+    const result = await run('read_brand_guidelines', { restrictionProfile: 'share_visitor' }, {});
+    expect(dispatch).toHaveBeenCalledWith('read_brand_guidelines', expect.anything(), expect.anything());
     expect(result).toEqual({ ran: true });
   });
 
