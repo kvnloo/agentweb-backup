@@ -44,11 +44,13 @@ export type MemoryWriteGate = (request: {
 }) => Promise<Record<string, unknown> | undefined>;
 
 /**
- * Options of a CALLER, like the gate; Emma's own tools pass none and are unchanged.
- * `embedTimeoutMs`: stop waiting for an embedding after this long. The row is then saved without one, exactly as when the embedding fails
- * (the prompt loader embeds a row that has none the next time it reads it). The MCP tools set it because their save runs under a lock for
- * the account, and an embedding call with no timeout (the client's default is ten minutes, twice retried) would hold every other save of
- * that account or org behind it.
+ * Options of a CALLER, like the gate. Emma's own tools pass none: they wait for each embedding as before (they do get the cleanup of a
+ * failed split save, see `writeChunks`).
+ * `embedTimeoutMs`: ONE deadline per save. When the wait for an embedding passes it, that part is saved without one and the remaining parts
+ * of a split save are saved without asking for theirs, exactly as when the embedding service fails (a row without an embedding is embedded
+ * when the prompt loader ranks an account's memories; an account with 20 or fewer rows is injected whole, so nothing is lost). The MCP tools
+ * set it because their save runs under a lock for the account, and an embedding call with no timeout (the client's default is ten minutes,
+ * twice retried) would hold every other save of that account or org behind it. A value that is not a positive finite number means no bound.
  */
 export interface MemoryWriteOptions {
   embedTimeoutMs?: number;
@@ -95,18 +97,25 @@ function previewOf(content: string): string {
   return `"${content.substring(0, 80)}${content.length > 80 ? '...' : ''}"`;
 }
 
-/** The promise's value, or `undefined` once `ms` have passed (no timeout when `ms` is not given). A late answer, or a late failure, is dropped (`Promise.race` has subscribed to both, so a late rejection is handled). */
-function within<T>(promise: Promise<T>, ms?: number): Promise<T | undefined> {
-  if (!ms) return promise;
+const TIMED_OUT = Symbol('timed out');
+/** setTimeout fires at once for a delay above this. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * The promise's value, or TIMED_OUT once `ms` have passed. No bound when `ms` is not a positive finite number. A late answer, or a late
+ * failure, is dropped (`Promise.race` has subscribed to both, so a late rejection is handled).
+ */
+function within<T>(promise: Promise<T>, ms?: number): Promise<T | typeof TIMED_OUT> {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return promise;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); });
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), Math.min(ms, MAX_TIMER_MS)); });
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
 /**
  * Embed each chunk and write it with `write`, in order; returns the new memory ids. Embedding is best effort (a failure saves the row without one).
- * If a write fails after earlier parts of a split save were written, those parts are removed again (best effort) before the error is passed on,
- * so a retry does not write them a second time and no half of a memory is left behind.
+ * If a write fails after earlier parts of a split save were written, those parts are removed again (best effort: only a part whose write was
+ * confirmed is known to us) before the error is passed on, so a retry does not write the confirmed parts a second time.
  */
 async function writeChunks(
   userId: string,
@@ -121,9 +130,15 @@ async function writeChunks(
   // The arguments were checked non-blank, so a split cannot come back empty; if it ever did, saying "saved" would be a lie.
   if (chunks.length === 0) throw new Error('Content is required');
   const memoryIds: string[] = [];
+  let gaveUp = false; // one deadline per save: after the first timeout the remaining parts are saved without asking for an embedding
   try {
     for (const chunk of chunks) {
-      const embedding = (await within(embedText(chunk, { userId, feature: 'embeddings' }), options?.embedTimeoutMs)) ?? undefined;
+      let embedding: number[] | undefined;
+      if (!gaveUp) {
+        const got = await within(embedText(chunk, { userId, feature: 'embeddings' }), options?.embedTimeoutMs);
+        if (got === TIMED_OUT) gaveUp = true;
+        else embedding = got ?? undefined;
+      }
       const memory = await write(chunk, embedding);
       memoryIds.push(String(memory.memoryId));
     }
