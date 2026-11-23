@@ -16,7 +16,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       "- Off: people using your link can still chat with Emma and ask questions, but she won't delete leads, send emails or Slack messages, disconnect accounts, publish, or start or change ad campaigns for them",
       '- On: the link works as it always has, for someone you trust to do these things for you. It applies to everyone who has that link',
       '- You can change the switch at any time from the share dialog, without making a new link',
-      '- Links you made before this change: links with an expiry date keep working as they did. Links with no expiry date, including links created automatically such as those in emails and plan pages, now have the switch off, and you can turn it on from the share dialog',
+      '- Links you made before this change: links you created in the share dialog keep working as they did. Other links, including links created automatically such as those in emails and plan pages, now have the switch off, and you can turn it on from the share dialog',
       '- A schedule set up through a share link needs your approval in the portal before it can run these actions',
       '- Your own messages and actions are unchanged, including when you open your own link while signed in',
     ],

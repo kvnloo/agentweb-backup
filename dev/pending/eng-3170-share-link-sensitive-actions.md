@@ -7,9 +7,11 @@ LinkedIn / X / Instagram / YouTube, publish a blog or landing page, change Googl
 
 **What changed.**
 - `interactiveShareMetadata.allowSensitiveActions` (the owner's per-link choice). `utils/interactiveShare.interactiveShareAllowsSensitiveActions`
-  is the one place that reads it. An explicit boolean wins. A link made before the setting existed with an `expiresAt` (made on purpose in
-  the share dialog) reads as ON; one with no `expiresAt` (auto-made: plan launches, emailed or Slack-posted links) reads as OFF. Nothing
-  readable reads as OFF.
+  is the one place that reads it. An explicit boolean wins. A link made before the setting existed (no choice stored) reads as ON only
+  when its lifetime (`expiresAt` minus `sharedAt`, rounded to days) is one the share dialog offers (1, 3, 7, 14, 30, 90, 365): it was made on
+  purpose by the owner. Every other link reads OFF: no expiry (plan launches, emailed or Slack-posted links, very old links), the 45-day links
+  the admin Chat History tab mints on every conversation staff list (`routes/admin.ts` `ensureIshareLinkForReview`; 890 of the 921 live timed
+  links on 2026-11-23, only 31 were dialog-made), and any lifetime nobody can account for. Nothing readable reads as OFF.
 - `chatbotDb.createOrReuseInteractiveShare(sessionId, days, { allowSensitiveActions })` stores an explicit choice on every NEW link (off unless
   the share dialog says on). An explicit choice is also applied to a link that already exists (one token per session); a caller with no
   choice (email, Slack, alerts) never touches it. The work-plan launch path writes `allowSensitiveActions: false` itself.
@@ -37,8 +39,8 @@ HubSpot call into LIST, an Attio FIND into SEARCH), so a read in a shape the mod
 is sensitive whatever its arguments is settled before repair.
 
 **Known limits.** One token per session: turning the switch on also covers anyone who gets that link in a mailed or posted report (the dialog says
-"applies to everyone who has this link"). A link with an expiry made before the setting existed reads ON until a mailed or posted reuse removes
-the expiry, then OFF. The 45-day admin review links made before this change read ON until they expire. An owner's own unattended run of a
+"applies to everyone who has this link"). A link made in the share dialog before the setting existed reads ON until a mailed or posted reuse removes
+the expiry, then OFF. The admin review links (45 days) read OFF; new ones are minted with an explicit OFF. An owner's own unattended run of a
 sensitive tool now reads its session once (is it a visitor-made schedule?), and refuses when that read keeps failing, as ENG-2816 already does for
 the block-listed tools. `generateConversableResponse`, `scheduleAutoWorkPlanContinuation` and `approvalInboxExecution` start turns with no profile
 (not reachable by a visitor today as far as read; not changed here).
