@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -7718,6 +7718,15 @@ export class AgentModeService {
     socketEmit?: ToolDispatchPorts['socketEmit'];
   }): ToolDispatchPorts {
     return {
+      // ENG-3170: the early refusal of a share-link visitor asks whether the link has full control; any failure to read means no.
+      shareLinkFullControl: async (sessionId: string) => {
+        try {
+          const record = await chatbotDb.getChatSessionRecord(sessionId, true);
+          return interactiveShareAllowsSensitiveActions(record?.interactiveShareMetadata);
+        } catch {
+          return false;
+        }
+      },
       evaluateAgentToolPolicy,
       validateAndRepairToolArgs,
       getToolInputSchema: (toolName: string) => {
@@ -10186,21 +10195,13 @@ export class AgentModeService {
   }
 
   /**
-   * ENG-3170: the share-link visitor half of the sensitive-action rule (a visitor-made schedule has no link and is refused in
-   * `restrictionRefusal`). Only a call under the `share_visitor` profile that is sensitive pays for the read; the owner, an ordinary
-   * session and every other tool are untouched. The read is consistent, so an owner switching a link off takes effect on the next
-   * call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because running a sensitive action
-   * as the owner on an unverified link is the hole this closes.
+   * ENG-3170: did the owner turn on FULL CONTROL for the share link this session belongs to? (A visitor-made schedule has no link and
+   * is judged in `restrictionRefusal`.) Only a call under the `share_visitor` profile to a tool that depends on it pays for the read;
+   * the owner, an ordinary session and every other tool are untouched. The read is consistent, so an owner switching a link off
+   * takes effect on the next call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because
+   * running one of these as the owner on an unverified link is the hole this closes.
    */
-  private async assertShareLinkAllowsSensitiveTool(
-    toolName: string,
-    sensitive: boolean,
-    sessionId: string,
-    extraContext?: Record<string, any>,
-  ): Promise<void> {
-    if (!sensitive) return;
-    if (normalizeRestrictionClaim(extraContext?.restrictionProfile) !== 'share_visitor') return;
-
+  private async readShareLinkFullControl(toolName: string, sessionId: string): Promise<boolean> {
     let session: any;
     if (sessionId) {
       try {
@@ -10215,11 +10216,7 @@ export class AgentModeService {
       }
     }
     if (!session) throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
-
-    if (!interactiveShareAllowsSensitiveActions(session.interactiveShareMetadata)) {
-      console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not allowed sensitive actions on this share link.`);
-      throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
-    }
+    return interactiveShareAllowsSensitiveActions(session.interactiveShareMetadata);
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
@@ -10230,11 +10227,17 @@ export class AgentModeService {
     // ENG-3170: before argument repair only what depends on the tool NAME is judged (the block list, and a tool that is sensitive whatever
     // its arguments). A tool judged by an argument (an email's action, a HubSpot action) is judged below, on the arguments it will run
     // with, so a read that the model spelled in a shape repair understands is not refused for looking like something else.
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true });
+    const isShareVisitor = normalizeRestrictionClaim(extraContext?.restrictionProfile) === 'share_visitor';
+    // A visitor's call to a tool that depends on the link (the sensitive tools, the block list, connect_account) reads the link once.
+    const fullControl = isShareVisitor && isFullControlGatedWholeTool(toolName) ? await this.readShareLinkFullControl(toolName, sessionId) : false;
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true, linkAllowsFullControl: fullControl });
     if (restricted) throw new ToolRestrictionDenied(restricted);
     // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
-    // account) only on a link whose owner allowed it. The link is read here, where every path ends, never taken from the request.
-    await this.assertShareLinkAllowsSensitiveTool(toolName, isSensitiveWholeTool(toolName), sessionId, extraContext);
+    // account, use saved logins) only on a link whose owner turned on full control. Never taken from the request.
+    if (isShareVisitor && isSensitiveWholeTool(toolName) && !fullControl) {
+      console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+      throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+    }
     // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
     // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
     const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, undefined, true);
@@ -10271,10 +10274,13 @@ export class AgentModeService {
     // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
     // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
     // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
-    if (!isSensitiveWholeTool(toolName) && isSensitiveToolCall(toolName, preparedArgs)) {
+    if (!isFullControlGatedWholeTool(toolName) && isSensitiveToolCall(toolName, preparedArgs)) {
       const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
       if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
-      await this.assertShareLinkAllowsSensitiveTool(toolName, true, sessionId, extraContext);
+      if (isShareVisitor && !(await this.readShareLinkFullControl(toolName, sessionId))) {
+        console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+        throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+      }
       const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
       if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
     }
