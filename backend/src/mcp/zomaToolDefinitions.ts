@@ -17,6 +17,17 @@ export function googleToolkitEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return env[ZOMA_GOOGLE_FLAG] === 'true';
 }
 
+/**
+ * ENG-3142: Zoma's X (Twitter) Ads switch. Off (unset or anything but "true", the default): X is
+ * not listed, routed, offered in zoma_status, or reachable through its connect routes. On: the
+ * X Ads provider is advertised alongside Meta (and Google when that flag is on).
+ */
+export const ZOMA_X_ADS_FLAG = 'ZOMA_X_ADS_ENABLED';
+
+export function xAdsToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[ZOMA_X_ADS_FLAG] === 'true';
+}
+
 export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload', 'zoma_custom_audiences'] as const;
 export type ZomaToolName = (typeof ZOMA_TOOL_NAMES)[number];
 

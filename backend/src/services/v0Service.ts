@@ -5300,8 +5300,9 @@ export function buildDomainMapFile(domainMap: Record<string, string> = {}): stri
  * would miss. The middleware already resolved the real path, so it stamps it. Referer is
  * kept only as a fallback for the (rare) request that arrives with no cookie.
  *
- * A page with no configured list FAILS LOUDLY. It must never fall back to "some other
- * list on this site" — silently filing a lead into the wrong list is the failure this
+ * A page with no configured list FAILS LOUDLY on a multi-list site. It must never fall
+ * back to "some other list on this site" (a single-list site has no other list, so it
+ * files there — ENG-3178) — silently filing a lead into the wrong list is the failure this
  * whole design exists to prevent.
  */
 export function buildCaptureRoute(
@@ -5364,7 +5365,11 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
 
     const path = await resolvePagePath();
-    const listId = path ? LIST_BY_PATH[path] : undefined;
+    // ENG-3178: a site with exactly ONE list cannot misfile a lead, so an unresolvable
+    // path (no aw_page cookie and no usable Referer) still files to that list. A site
+    // with several lists keeps failing loudly below — guessing there is the bug.
+    const onlyLists = Object.values(LIST_BY_PATH);
+    const listId = (path ? LIST_BY_PATH[path] : undefined) ?? (onlyLists.length === 1 ? onlyLists[0] : undefined);
     if (!listId) {
       // Fail loudly. Do NOT guess a list: a lead filed into the wrong list is worse than
       // a lead that visibly failed to submit.
