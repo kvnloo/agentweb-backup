@@ -374,15 +374,22 @@ describe('embedTimeoutMs: a hung embedding does not hold a save forever (ENG-284
   });
 
   it('ONE deadline per save: after the first timeout the remaining parts are saved without asking for an embedding or waiting again', async () => {
-    mockEmbedText.mockReturnValue(hung());
-    const started = Date.now();
-    const out = await saveAccountMemory({ content: longText(7000), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 60 });
-    const elapsed = Date.now() - started;
-    expect(out).toMatchObject({ success: true, memoryIds: expect.any(Array) });
-    expect(mockAddAccount.mock.calls.length).toBeGreaterThan(2); // a text of 7,000 characters is at least four parts
-    expect(mockAddAccount.mock.calls.every((c) => c[4] === undefined)).toBe(true);
-    expect(mockEmbedText).toHaveBeenCalledTimes(1); // not once per part
-    expect(elapsed).toBeLessThan(60 * 3); // one wait, not one per part
+    // Fake timers, so the proof is not a wall-clock margin: the clock is advanced past ONE deadline only. A save that waited again for a
+    // second part would still be pending afterwards (no timer would fire for it) and `await save` would never return.
+    jest.useFakeTimers();
+    try {
+      mockEmbedText.mockReturnValue(hung());
+      const save = saveAccountMemory({ content: longText(7000), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 60 });
+      await jest.advanceTimersByTimeAsync(61);
+      const out = await save;
+      expect(out).toMatchObject({ success: true, memoryIds: expect.any(Array) });
+      expect(mockAddAccount.mock.calls.length).toBeGreaterThan(2); // a text of 7,000 characters is at least four parts
+      expect(mockAddAccount.mock.calls.every((c) => c[4] === undefined)).toBe(true);
+      expect(mockEmbedText).toHaveBeenCalledTimes(1); // not once per part
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('a part whose embedding arrives in time is embedded; the first part that times out ends the asking', async () => {
