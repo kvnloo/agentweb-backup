@@ -11,24 +11,33 @@
  *    of save_memory"), never ignored: an agent that believes it chose an org must be told it did not;
  *  - a cap of 200 stored memories per account and per org on writes made here (Emma's own tools and the Settings routes have no cap, and
  *    an account already above 200 keeps what it has; its saves are refused until it deletes). Rows carry a 17 KB embedding, so 200 rows
- *    is about 3.4 MB per Emma prompt read. The cap is a soft bound: two saves at the same moment can overshoot it by one call;
- *  - an exact duplicate (same category, same text) is not written again and costs no embedding;
+ *    is about 3.4 MB per Emma prompt read. Each save runs under a lock for the account (the org when the caller has one), taken in
+ *    arrival order, so the check and the write cannot interleave with another save, even inside one JSON-RPC batch. The lock is per
+ *    server process (the same limit as the lead and strategy tools): with several server instances, saves that reach different ones can
+ *    each pass the check, so the cap is exact within an instance and approximate across them;
+ *  - an exact duplicate (same category, same text; for a split save, every part already stored) is not written again and costs no embedding;
  *  - `list_memories`, new: Emma reads memory by having it put into her prompt, so an agent had no way to learn a memory id.
  *
  * Tools and scopes:
  *  - `save_memory`, `delete_memory`, `list_memories`: the user's own memory. Default scopes (`tools:execute` to write, `tools:read` to list).
  *  - `save_org_memory`, `delete_org_memory`: opt-in scope `memory:org`, `aw_` keys only (`apiKeyOnly`): what an org memory says goes into
- *    EVERY member's Emma prompt, so the account owner chooses which agent may write it by minting a scoped key. A signed-in OAuth client
- *    is refused. Reading org memory (`list_memories` with scope org) needs no opt-in scope: any member may read what Emma already shows them.
+ *    EVERY member's Emma prompt, so the scope decides which keys may call THESE TOOLS. A signed-in OAuth client is refused. Reading org
+ *    memory (`list_memories` with scope org) needs no opt-in scope: any member may read what Emma already shows them.
+ *
+ * What the scope does NOT control: a key that may call `emma_send_message`, `emma_run_marketing_task` or `emma_create_session` starts an
+ * Emma agent run, and that run has Emma's own `save_org_memory`, with no scope check and no cap. That is how `email:read` and the
+ * Smartlead scopes already behave (see AGENT_EXECUTION_TOOLS: an outside agent's allowlist that leaves the agent-run tools out is what
+ * closes it, and that control lives with whoever mints and brokers the key, not in this repo).
  *
  * Nothing here adds a stored attribute, a table or an index. The org is always the caller's own (from the user record).
  */
 import { mcpToolRegistry } from './registry';
 import { jsonResult } from './toolHelpers';
+import { withAccountLock } from './accountLock';
 import { API_KEY_SCOPE_MEMORY_ORG } from './apiKeyScopes';
 import * as memoryImpl from '../../emma/impl/memory';
 import { MEMORY_CATEGORIES, isMemoryCategory } from '../../utils/memoryCategories';
-import { MEMORY_AUTOSPLIT_MAX_CHARS } from '../../utils/memoryContentLimit';
+import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../../utils/memoryContentLimit';
 import { MEMORY_READ_MAX_ROWS_LIST } from '../../utils/memoryReadLimits';
 
 /** Most memories an account (or an org) may hold for a save made through MCP to be accepted. */
@@ -84,18 +93,20 @@ async function readStored(scope: 'user' | 'org', ownerId: string): Promise<Store
 /** The caps and the duplicate check that only the MCP path applies, run after the shared guards and before anything is embedded. */
 export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId, content, category, chunkCount }) => {
   const rows = await readStored(scope, ownerId);
-  if (chunkCount === 1) {
-    const text = content.trim();
-    const same = rows.find((row) => row.category === category && typeof row.content === 'string' && row.content.trim() === text);
-    if (same) {
-      return {
-        success: true,
-        saved: false,
-        duplicate: true,
-        memoryId: same.memoryId,
-        message: `An identical ${category} memory already exists (${same.memoryId}); nothing was saved.`,
-      };
-    }
+  // A duplicate: every part of this save (one part, or each of the parts a long text splits into) is already stored in this category.
+  // A retried long save would otherwise write all its parts again, and again, until the cap.
+  const sameCategory = rows.filter((row) => row.category === category && typeof row.content === 'string');
+  const found = splitMemoryContent(content).map((part) => sameCategory.find((row) => row.content!.trim() === part.trim()));
+  if (found.length > 0 && found.every((row) => row !== undefined)) {
+    const ids = found.map((row) => row!.memoryId);
+    return {
+      success: true,
+      saved: false,
+      duplicate: true,
+      memoryId: ids[0],
+      ...(ids.length > 1 ? { memoryIds: ids } : {}),
+      message: `An identical ${category} memory already exists (${ids.join(', ')}); nothing was saved.`,
+    };
   }
   if (rows.length + chunkCount > MEMORY_MCP_MAX_ROWS) {
     const deleteTool = scope === 'org' ? 'delete_org_memory' : 'delete_memory';
@@ -110,9 +121,10 @@ export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId,
   return undefined;
 };
 
+/** The whole save (cap and duplicate check, embedding, writes) runs one at a time per account, or per org for a caller who has one. */
 export async function saveMemory(args: unknown, context: any) {
   const input = exactArgs('save_memory', args, ['content', 'category']);
-  return memoryImpl.saveAccountMemory(input, context, mcpWriteGate);
+  return withAccountLock('memory', context, () => memoryImpl.saveAccountMemory(input, context, mcpWriteGate));
 }
 
 export async function deleteMemory(args: unknown, context: any) {
@@ -122,7 +134,7 @@ export async function deleteMemory(args: unknown, context: any) {
 
 export async function saveOrgMemory(args: unknown, context: any) {
   const input = exactArgs('save_org_memory', args, ['content', 'category']);
-  return memoryImpl.saveOrgMemory(input, context, mcpWriteGate);
+  return withAccountLock('memory', context, () => memoryImpl.saveOrgMemory(input, context, mcpWriteGate));
 }
 
 export async function deleteOrgMemory(args: unknown, context: any) {
