@@ -1,4 +1,5 @@
 import { AgentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { chatbotDb } from '../services/chatbotService';
 
 // ENG-2816: executeTool is where every tool call ends (typed chat, live voice, nested calls), so the restriction a caller runs
 // under is enforced there, not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so this
@@ -33,6 +34,8 @@ describe('AgentModeService.executeTool restriction profile (ENG-2816)', () => {
     service = new AgentModeService();
     await service.initialize();
     dispatch = jest.spyOn((service as any).toolRegistry, 'execute').mockResolvedValue({ ran: true });
+    // ENG-3170: a visitor's call to an owner-only tool reads its share link (full control on or off); here the link is OFF
+    jest.spyOn(chatbotDb, 'getChatSessionRecord').mockResolvedValue({ sessionId: 'session-1', userId: 'owner-user-id', interactiveShareMetadata: { isActive: true, token: 't', allowSensitiveActions: false } } as any);
   });
 
   const run = (toolName: string, ctx?: Record<string, unknown>, args: any = {}) =>
