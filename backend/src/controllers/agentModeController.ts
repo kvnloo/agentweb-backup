@@ -13180,7 +13180,8 @@ export const agentModeController = {
         return res.status(404).json({ error: 'No interactive share link for this session' });
       }
 
-      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, { ...share, allowSensitiveActions });
+      // Attribute level: only the choice is written, never a copy of the rest of the link read a moment ago.
+      await chatbotDb.setInteractiveShareAllowSensitiveActions(sessionId, allowSensitiveActions);
       console.log(`AgentMode ENG-3170: the owner set sensitive actions ${allowSensitiveActions ? 'ON' : 'OFF'} for share link ${sessionId}`);
 
       const stored = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
