@@ -28,7 +28,7 @@ jest.mock('../services/resendService', () => ({
   resendService: { getReceivedEmailContent: jest.fn(), getDeliveredEmailContent: jest.fn() },
 }));
 
-import { accountMemoryDb, orgMemoryDb } from '../services/db';
+import { accountMemoryDb, orgMemoryDb, ACCOUNT_MEMORY_LIST_ATTRIBUTES, ORG_MEMORY_LIST_ATTRIBUTES } from '../services/db';
 import { MEMORY_READ_MAX_ROWS_LIST, MEMORY_READ_MAX_ROWS_PROMPT } from '../utils/memoryReadLimits';
 
 type Row = Record<string, any>;
@@ -219,10 +219,6 @@ describe('orgMemoryDb.getOrgMemories follows the cursor', () => {
     expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(17);
   });
 
-  it('fails closed on a malformed page', async () => {
-    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: 'nope' }) });
-    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory page/);
-  });
 });
 
 describe('deleteMemory says whether there was anything to delete', () => {
@@ -340,10 +336,14 @@ describe('the bound of a read is a whole number of at least 1', () => {
     expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(200);
   });
 
-  it('a fractional maxRows is rounded down', async () => {
+  it('a fractional maxRows is rounded down, but never below 1', async () => {
     servePages([range(1, 2, accountRow)], accountKey);
     await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 2.7 });
     expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(2);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 0.5 });
+    expect(mockDocumentClientMethods.query.mock.calls[0][0].Limit).toBe(1);
   });
 });
 
@@ -377,12 +377,24 @@ describe('a read that stops at its bound with more rows stored says so in the lo
   });
 });
 
-describe('the org reader fails closed on a malformed row, like the account reader', () => {
-  it('a row without a string content or memoryId is refused', async () => {
-    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ orgId: 'o1', memoryId: 'm1' }] }) });
-    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory item/);
-    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [null] }) });
-    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory item/);
+describe('the org reader still returns rows as stored (it never validated them)', () => {
+  it('a row without content comes back instead of failing the whole list, with a limit call and without', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ orgId: 'o1', memoryId: 'm1' }, orgRow(2)] }) });
+    expect((await orgMemoryDb.getOrgMemories('o1')).map((r: Row) => r.memoryId)).toEqual(['m1', '01ORG0002']);
+    expect((await orgMemoryDb.getOrgMemories('o1', undefined, 5)).map((r: Row) => r.memoryId)).toEqual(['m1', '01ORG0002']);
+  });
+
+  it('a page that is not a list is still refused', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: 'nope' }) });
+    await expect(orgMemoryDb.getOrgMemories('o1')).rejects.toThrow(/Malformed org memory page/);
+  });
+});
+
+describe('the account reader still refuses a row without a string content (unchanged design)', () => {
+  it('fails closed, with or without a limit', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ userId: 'u1', memoryId: 'm1' }] }) });
+    await expect(accountMemoryDb.getUserMemories('u1')).rejects.toThrow(/Malformed account memory item/);
+    await expect(accountMemoryDb.getUserMemories('u1', undefined, 5)).rejects.toThrow(/Malformed account memory item/);
   });
 });
 
@@ -409,5 +421,37 @@ describe('setMemoryEmbedding never brings a deleted memory back', () => {
     mockDocumentClientMethods.update.mockReturnValue({ promise: async () => { throw Object.assign(new Error('throttled'), { code: 'ProvisionedThroughputExceededException' }); } });
     await expect(accountMemoryDb.setMemoryEmbedding('u1', 'm1', [1])).rejects.toThrow('throttled');
     await expect(orgMemoryDb.setMemoryEmbedding('o1', 'm1', [1])).rejects.toThrow('throttled');
+  });
+});
+
+describe('an ascending read that reaches its bound on a page ending in the learning range', () => {
+  it('stops there: it does not ask for a page with Limit 0, and it says it stopped at the bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockDocumentClientMethods.query.mockImplementation(() => ({
+      promise: async () => ({ Items: range(1, 2, accountRow), LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { newestFirst: false, maxRows: 2 });
+    expect(rows).toHaveLength(2);
+    expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(1);
+    expect(mockDocumentClientMethods.query.mock.calls.every((c) => c[0].Limit !== 0)).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/there may be more rows stored/);
+    warn.mockRestore();
+  });
+});
+
+describe('the projection lists cover every attribute the writers store', () => {
+  it('account: a row written by addMemory with every optional argument carries only listed attributes (plus the embedding)', async () => {
+    mockDocumentClientMethods.put.mockReturnValue({ promise: async () => ({}) });
+    await accountMemoryDb.addMemory('u1', 'insight', 'a fact', 'session-1', [0.1, 0.2]);
+    const stored = Object.keys(mockDocumentClientMethods.put.mock.calls[0][0].Item).sort();
+    expect(stored).toEqual([...ACCOUNT_MEMORY_LIST_ATTRIBUTES, 'embedding'].sort());
+  });
+
+  it('org: the same', async () => {
+    mockDocumentClientMethods.put.mockReturnValue({ promise: async () => ({}) });
+    await orgMemoryDb.addMemory('o1', 'insight', 'a fact', 'author-1', [0.1, 0.2]);
+    const stored = Object.keys(mockDocumentClientMethods.put.mock.calls[0][0].Item).sort();
+    expect(stored).toEqual([...ORG_MEMORY_LIST_ATTRIBUTES, 'embedding'].sort());
   });
 });
