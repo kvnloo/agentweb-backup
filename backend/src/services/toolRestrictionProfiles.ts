@@ -94,6 +94,11 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   // 5. hand the owner's saved logins to the model (the tool returns the decrypted password)
   'get_login_credentials',
   'get_test_account',
+  // 5b. the owner's saved browser sessions (the cookie jar the browser tools load automatically): load them into the browser, replace them, wipe them
+  'load_browser_cookies',
+  'save_browser_cookies',
+  'clear_browser_cookies',
+  'mark_browser_session_failed',
   // 2. send, post or publish to people or the public outside the account
   'slack_send_message',
   'send_email_from_sender',
@@ -144,6 +149,8 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'] },
   // setting a lead to do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
   set_lead_contact_status: { kind: 'action', argument: 'contact_status', allowedValues: ['do-not-contact', 'unsubscribed'] },
+  // staging a decision for a TEAM approver is internal; audience 'customer' emails the named address from AgentWeb with the caller's own text and link
+  stage_pending_decision: { kind: 'action', argument: 'audience', allowedValues: ['team'] },
   google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
   google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
   update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc'] },

@@ -59,6 +59,8 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
   const run = (toolName: string, ctx?: Record<string, unknown>, args: any = {}, sessionId = 'session-1') =>
     (service as any).executeTool('gpt-4', toolName, args, 'owner-user-id', sessionId, false, ctx);
   const VISITOR = { restrictionProfile: 'share_visitor' };
+  const ago = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  const ahead = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
 
   describe('a visitor on a link the owner left OFF', () => {
     it('is refused a sensitive tool, nothing is dispatched, and the refusal tells them what to do', async () => {
@@ -194,7 +196,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
 
   describe('a link made before the setting existed (nothing stored)', () => {
     it('a link with a share-dialog lifetime (made on purpose by the owner: 7 days here) keeps today\'s behaviour', async () => {
-      readSession.mockResolvedValue(link({ expiresAt: '2026-11-08T00:00:00.000Z' })); // shared 2026-11-01
+      readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) })); // a 7-day link made yesterday
       await expect(run(SENSITIVE, VISITOR)).resolves.toEqual({ ran: true });
     });
 
@@ -353,6 +355,107 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
 
     it('a call that stays harmless after repair pays no read', async () => {
       await run('google_calendar_create_event', VISITOR, { summary: 'no guests' });
+      expect(readSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a link made before the setting existed gains nothing that every visitor was refused until now (ENG-3170 review)', () => {
+    const legacy7 = () => link({ sharedAt: ago(1), expiresAt: ahead(6) }); // nothing stored, a dialog lifetime: reads "may run the sensitive tools"
+
+    it('keeps the sensitive tools it had, but the owner-only block list and connect_account stay refused in their own words', async () => {
+      readSession.mockResolvedValue(legacy7());
+      await expect(run(SENSITIVE, VISITOR)).resolves.toEqual({ ran: true });
+      await expect(run('save_memory', VISITOR, { content: 'x' })).rejects.toMatchObject({ message: expect.stringContaining('organization settings or memory') });
+      await expect(run('connect_account', VISITOR)).rejects.toMatchObject({ message: expect.stringContaining('Account connections are not available in shared sessions') });
+      await expect(run('start_smartlead_push', VISITOR)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
+    it('an EXPLICIT on is what lifts the block list (the owner chose it)', async () => {
+      readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6), allowSensitiveActions: true }));
+      await expect(run('save_memory', VISITOR, { content: 'x' })).resolves.toEqual({ ran: true });
+    });
+
+    it('the early refusal in the dispatcher asks the same question: a legacy link does not lift the block list there either', async () => {
+      readSession.mockResolvedValue(legacy7());
+      const port = (service as any).buildToolDispatchPorts({ sessionId: 'session-1' } as any).shareLinkFullControl;
+      await expect(port('session-1')).resolves.toBe(false);
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(port('session-1')).resolves.toBe(true);
+    });
+  });
+
+  describe('a link that is no longer live reads OFF for the rest of a turn already running (ENG-3170 review)', () => {
+    it('the owner stopped sharing (isActive false): full control and the sensitive tools are gone', async () => {
+      readSession.mockResolvedValue(link({ isActive: false, allowSensitiveActions: true }));
+      await expect(run(SENSITIVE, VISITOR)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('save_memory', VISITOR, { content: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('the link expired meanwhile: the same', async () => {
+      readSession.mockResolvedValue(link({ expiresAt: ago(0.01), allowSensitiveActions: true }));
+      await expect(run(SENSITIVE, VISITOR)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('a link with a future expiry and full control still works', async () => {
+      readSession.mockResolvedValue(link({ expiresAt: ahead(3), allowSensitiveActions: true }));
+      await expect(run(SENSITIVE, VISITOR)).resolves.toEqual({ ran: true });
+    });
+  });
+
+  describe('staging a decision (stage_pending_decision) can email an outside address, so audience "customer" is sensitive (ENG-3170 review)', () => {
+    const stage = (audience: string) => ({ audience, gateType: audience === 'team' ? 'plan_choice' : 'customer_credential', subjectLabel: 'x', businessImpact: 'y', evidencePacket: {} });
+
+    it('OFF link: a decision for the TEAM is staged as before, one for a customer is refused', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('stage_pending_decision', VISITOR, stage('team'))).resolves.toEqual({ ran: true });
+      dispatch.mockClear();
+      await expect(run('stage_pending_decision', VISITOR, stage('customer'))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('a missing or odd audience counts as sensitive; ON link runs it', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('stage_pending_decision', VISITOR, { ...stage('team'), audience: undefined })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run('stage_pending_decision', VISITOR, stage('customer'))).resolves.toEqual({ ran: true });
+    });
+  });
+
+  describe('the owner\'s saved browser sessions are saved logins (ENG-3170 review)', () => {
+    const COOKIE_TOOLS = ['load_browser_cookies', 'save_browser_cookies', 'clear_browser_cookies', 'mark_browser_session_failed'];
+    const cookieCalls = () => dispatch.mock.calls.map((c) => c[0]).filter((name: string) => name.includes('cookies'));
+
+    it.each(COOKIE_TOOLS)('%s is refused to a visitor on an OFF link and runs on an ON link', async (tool) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, { domain: 'x.com' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run(tool, VISITOR, { domain: 'x.com' })).resolves.toEqual({ ran: true });
+    });
+
+    it('a browser tool for a visitor on an OFF link browses as nobody: the owner\'s cookies are neither loaded nor written back, and the tool still runs', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('playwright_browser_navigate', VISITOR, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
+      expect(dispatch.mock.calls.map((c) => c[0])).toEqual(['playwright_browser_navigate']);
+    });
+
+    it('a link that can not be read counts as off for the browser (and the tool still runs)', async () => {
+      readSession.mockRejectedValue(new Error('throttled'));
+      await expect(run('playwright_browser_navigate', VISITOR, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
+      expect(cookieCalls()).toEqual([]);
+    });
+
+    it('on an ON link the browser starts from the owner\'s saved sessions, as it always did', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await run('playwright_browser_navigate', VISITOR, { url: 'https://example.com' });
+      expect(cookieCalls()).toContain('load_browser_cookies');
+    });
+
+    it('the OWNER (no restriction profile) is not affected: cookies load, and the link is not even read', async () => {
+      await run('playwright_browser_navigate', undefined, { url: 'https://example.com' });
+      expect(cookieCalls()).toContain('load_browser_cookies');
       expect(readSession).not.toHaveBeenCalled();
     });
   });

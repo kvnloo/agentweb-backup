@@ -47,7 +47,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
-import { getInteractiveShareExpiresAt, interactiveShareAllowsSensitiveActions } from '../utils/interactiveShare';
+import { getInteractiveShareExpiresAt, interactiveShareAllowsSensitiveActions, interactiveShareControl } from '../utils/interactiveShare';
 import { buildReportEmail, checkEmailReportAllowed, normalizeRecipient, resolveReportUrl } from '../utils/ishareEmailReport';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -6778,6 +6778,20 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
 
 /**
+ * What Emma is told after an approval deck whose write failed (found live: a write that failed Meta-side validation was silently re-proposed
+ * identically three times, because the per-item `error` was in the outcome JSON but nothing said what to do with it). Used by BOTH the
+ * account owner's route and the share route, so a visitor on a Full-control link who approves a write gets the same behaviour.
+ */
+function deckFailureInstruction(deckOutcomeStatus: string): string {
+  return (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
+    ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
+      'actual failure to the user in plain language, and adjust the params yourself if the error ' +
+      'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
+      'the same write again. Do NOT silently re-propose an identical write that already failed.'
+    : '';
+}
+
+/**
  * ENG-2816 (step 3): is this schedule write a SHARE-LINK VISITOR's?
  *
  * A visitor acts under the owner's userId, so the request looks like the owner's own. Two independent signals say otherwise, and
@@ -11603,12 +11617,7 @@ export const agentModeController = {
         // told Emma what to DO with a failure, so she just retried instead of explaining it
         // to the user or adjusting the params herself. A bare JSON dump relies entirely on
         // the model inferring the right response; make it explicit instead.
-        const failureInstruction = (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
-          ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
-            'actual failure to the user in plain language, and adjust the params yourself if the error ' +
-            'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
-            'the same write again. Do NOT silently re-propose an identical write that already failed.'
-          : '';
+        const failureInstruction = deckFailureInstruction(deckOutcomeStatus);
         const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
           status: deckOutcomeStatus,
           ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
@@ -13030,6 +13039,12 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId, expirationDays: rawExpirationDays, allowSensitiveActions: rawAllowSensitiveActions } = req.body;
 
+      // ENG-3170: the owner's choice about a link is the owner's. A call made by a tool on a visitor's behalf carries a restriction claim and
+      // never reaches it (no tool does today; this keeps it that way).
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
+
       // ENG-1907: no transcript leaves a sandbox account.
       if (isEvaluationUser(user?.userId)) {
         return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
@@ -13163,6 +13178,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId } = req.params;
       const { allowSensitiveActions } = req.body || {};
+
+      // ENG-3170: see createConversableShare: a call carrying a visitor's restriction claim never changes the owner's setting.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
 
       if (isEvaluationUser(user?.userId)) {
         return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
@@ -13503,7 +13523,9 @@ export const agentModeController = {
           let linkHasFullControl = false;
           try {
             const fresh = await chatbotDb.getChatSessionRecord(session.sessionId, true);
-            linkHasFullControl = interactiveShareAllowsSensitiveActions(fresh?.interactiveShareMetadata);
+            // FULL CONTROL proper: an explicit choice on a link that is still live. A link made before the setting existed (read as "may
+            // run the sensitive tools" by its lifetime) never gets this: its visitors were refused this answer before and still are.
+            linkHasFullControl = interactiveShareControl(fresh?.interactiveShareMetadata).full;
           } catch {
             linkHasFullControl = false;
           }
@@ -13532,11 +13554,10 @@ export const agentModeController = {
         const commented = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
-        // Non-write deck (the only kind reachable here — the block above refuses
-        // any write item) — see generateResponse's identical comment for why
-        // 'nothing_approved' is wrong for a pure question deck: submitApprovalDeckAnswers
-        // only ever describes WRITE execution outcomes in `summary`, so a question deck
-        // resolves every non-comment item's actual selection into `selections` instead.
+        // Either kind of deck can reach here: a question deck, or (ENG-3170) a write or locked-decision deck on a link whose owner turned on
+        // Full control. See generateResponse's identical comment for why 'nothing_approved' is wrong for a pure question deck:
+        // submitApprovalDeckAnswers only ever describes WRITE execution outcomes in `summary`, so a question deck resolves every
+        // non-comment item's actual selection into `selections` instead.
         const deckItems = answeredApprovalDeck?.items ?? [];
         const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
         const selections = deckItems
@@ -13555,7 +13576,7 @@ export const agentModeController = {
           ...(selections.length > 0 ? { selections } : {}),
           ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
           ...(commented.length > 0 ? { commented } : {}),
-        })}]`;
+        })}]${deckFailureInstruction(deckOutcomeStatus)}`;
         answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
       }
 

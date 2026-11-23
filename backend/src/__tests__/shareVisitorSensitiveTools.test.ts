@@ -55,6 +55,7 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       'deploy_landing_page', 'enable_lead_list_public_access', 'enable_session_tracking', 'get_login_credentials', 'get_test_account',
       'google_calendar_delete_event',
       'launch_retargeting_campaign', 'launch_targeted_audience_campaign',
+      'clear_browser_cookies', 'load_browser_cookies', 'mark_browser_session_failed', 'save_browser_cookies',
       'notify_session', 'post_on_connected_account', 'publish_blog_article', 'publish_landing_page_changes',
       'regenerate_market_strategy', 'revert_landing_page_publish', 'revoke_linkedin_account',
       'send_email_from_sender', 'send_email_to_lead', 'send_gtm_status_report', 'set_landing_page_lead_list', 'slack_send_message',
@@ -87,10 +88,12 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['manage_scheduled_chat', ['create', 'update', 'toggle'], ['delete']],
       // setting do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
       ['set_lead_contact_status', ['do-not-contact', 'unsubscribed'], ['active']],
+      // a decision for the team is internal; one for a customer emails the named address from AgentWeb with the caller's text and link
+      ['stage_pending_decision', ['team'], ['customer', 'Customer ', 'anyone', '']],
     ];
 
     it.each(mixed)('%s: its reads are allowed and its writes are sensitive', (tool, reads, writes) => {
-      const argument = tool === 'set_lead_contact_status' ? 'contact_status' : 'action';
+      const argument = tool === 'set_lead_contact_status' ? 'contact_status' : tool === 'stage_pending_decision' ? 'audience' : 'action';
       for (const action of reads) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: false });
       for (const action of writes) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: true });
     });
@@ -248,7 +251,7 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   delete_memory: 'on the visitor block list',
   delete_org_memory: 'on the visitor block list',
   // protected another way
-  call_meta_marketing_api: 'every write halts into an approval deck a visitor can not answer (403)',
+  call_meta_marketing_api: 'every write halts into an approval deck; a visitor can answer it only on a link whose owner turned on Full control (the share route answers 403 otherwise)',
   manage_schedule_template: 'visitor writes are refused (ENG-2816)',
   create_schedule_from_template: 'a schedule a visitor creates is provenance-marked and runs under the visitor profile (ENG-2816)',
   submit_scheduled_chat_variables: 'covered by schedule provenance (ENG-2816)',
@@ -268,7 +271,6 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   list_connected_account_posts: 'a read',
   list_connected_accounts: 'a read',
   launch_predefined_work_plan: 'writes the session\'s own work plan',
-  stage_pending_decision: 'raises a decision for the owner or an approver (recipients not confirmed)',
   report_product_issues: 'feedback to AgentWeb',
   enqueue_human_eval: 'an internal AgentWeb queue',
   fathom_route_action_items: 'creates tasks in the owner\'s own Notion or ClickUp (owner decision pending)',
@@ -291,10 +293,32 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   add_characters: 'adds data inside the account',
   update_google_doc: 'edits a document inside the account',
   update_google_sheet: 'edits a sheet inside the account',
+  // ENG-3170 review: found by widening the name pattern to the neutral verbs. Nothing here sends or posts anything; each edits data inside the account.
+  // The first group overwrites what the owner set up (strategy, brand, knowledge base, statuses): whether an OFF link should refuse them is the owner's decision, not made yet.
+  update_brand_guidelines: 'overwrites the owner\'s brand guidelines inside the account (owner decision pending)',
+  update_market_strategy: 'overwrites the owner\'s market strategy inside the account (owner decision pending)',
+  manage_market_strategy: 'edits the owner\'s market strategy inside the account (owner decision pending)',
+  update_knowledge_base_file: 'edits a task\'s knowledge base inside the account (owner decision pending)',
+  configure_lead_statuses: 'replaces a list\'s status stages inside the account (owner decision pending)',
+  update_lead_list: 'edits a list\'s name, filters and status stages inside the account (owner decision pending)',
+  save_test_account: 'stores a test login in the owner\'s own account (owner decision pending)',
+  update_lead: 'edits a lead\'s fields inside the account; it can not set the do-not-contact flag, which is set_lead_contact_status',
+  update_lead_status: 'records a lead\'s pipeline status (and the caller\'s draft) on the lead; sends nothing',
+  update_gtm_phase: 'edits a phase of a GTM plan inside the account',
+  update_gtm_plan: 'edits a GTM plan inside the account',
+  update_book_content: 'edits a book inside the account',
+  update_landing_page_context: 'edits a landing page\'s context inside the account',
+  update_html_file: 'edits a file in the session\'s own workspace',
+  save_file: 'writes a file in the session\'s own workspace',
+  save_work_plan: 'saves a private work plan to the owner\'s library',
+  read_market_strategy: 'a read (the name contains "mark")',
+  load_connected_account_metrics: 'a read of a connected account\'s metrics',
   google_drive: 'creates folders in the owner\'s own drive',
 };
 
-const OUTWARD_NAME = /(send|post|publish|delete|remove|launch|revoke|disconnect|deploy|email|mail|notify|invite|follow|broadcast|share|sms|call_|_dm\b|message|reply|comment|tweet|webhook|outreach|revert)/i;
+// ENG-3170 review: the neutral verbs (clear, load, save, update, configure, manage, mark, stage) are in on purpose: a tool that wipes or replaces the owner's saved
+// logins or settings has no outward-sounding word in its name, and a name-only pattern that misses it forces nobody to look.
+const OUTWARD_NAME = /(send|post|publish|delete|remove|launch|revoke|disconnect|deploy|email|mail|notify|invite|follow|broadcast|share|sms|call_|_dm\b|message|reply|comment|tweet|webhook|outreach|revert|clear|load|save|update|configure|manage|mark|stage)/i;
 
 function schemaOf(tool: any): any {
   const def = tool?.definition ?? {};
