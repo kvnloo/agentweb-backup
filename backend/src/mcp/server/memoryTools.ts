@@ -43,7 +43,7 @@ import { MEMORY_READ_MAX_ROWS_LIST } from '../../utils/memoryReadLimits';
 
 /** Most memories an account (or an org) may hold for a save made through MCP to be accepted. */
 export const MEMORY_MCP_MAX_ROWS = 200;
-/** How long a save waits for an embedding while it holds the account's lock; after that the row is saved without one (see MemoryWriteOptions). */
+/** How long a save waits for an embedding while it holds the account's lock, in total: after that its rows are saved without one (see MemoryWriteOptions). */
 export const MCP_EMBED_TIMEOUT_MS = 15_000;
 const WRITE_OPTIONS = { embedTimeoutMs: MCP_EMBED_TIMEOUT_MS } as const;
 export const LIST_MEMORIES_DEFAULT_LIMIT = 20;
@@ -115,9 +115,10 @@ export const mcpWriteGate: memoryImpl.MemoryWriteGate = async ({ scope, ownerId,
   if (rows.length + chunkCount > MEMORY_MCP_MAX_ROWS) {
     const deleteTool = scope === 'org' ? 'delete_org_memory' : 'delete_memory';
     // Tell the caller what THEY can do: a plain org member cannot delete org memory (it needs org:configure), so telling them to is a dead end.
+    const listCall = scope === 'org' ? 'list_memories with scope "org"' : 'list_memories';
     const wayOut = callerCanDelete
-      ? `Delete memories that are no longer needed first (list_memories finds them, ${deleteTool} removes one), then save again.`
-      : 'Only an organization owner or admin can delete organization memories: ask one of them to remove memories that are no longer needed (list_memories shows what is stored), then save again.';
+      ? `Delete memories that are no longer needed first (${listCall} finds them, ${deleteTool} removes one), then save again.`
+      : `Only an organization owner or admin can delete organization memories: ask one of them to remove memories that are no longer needed (${listCall} shows what is stored), then save again.`;
     return {
       success: false,
       stored: rows.length,
