@@ -1,5 +1,5 @@
 import { chatbotDb } from '../services/chatbotService';
-import { interactiveShareAllowsSensitiveActions, SHARE_DIALOG_LIFETIMES_DAYS } from '../utils/interactiveShare';
+import { interactiveShareAllowsSensitiveActions, interactiveShareControl, interactiveShareIsLive, SHARE_DIALOG_LIFETIMES_DAYS } from '../utils/interactiveShare';
 
 /**
  * ENG-3170: the owner's per-link choice "allow sensitive actions".
@@ -74,10 +74,15 @@ describe('interactiveShareAllowsSensitiveActions (how a stored link reads)', () 
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: {} })).toBe(false);
   });
 
-  it('a non-boolean choice falls back to the lifetime rule rather than being believed', () => {
-    expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: 'true' }))).toBe(true);
-    expect(interactiveShareAllowsSensitiveActions(lived(45, { allowSensitiveActions: 'true' }))).toBe(false);
-    expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: 'true' })).toBe(false);
+  it('a non-boolean choice is never believed AND never falls back to the lifetime rule: something stored that is not a boolean reads OFF', () => {
+    for (const bad of ['true', 'false', 1, 0, {}, [], 'yes']) {
+      expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: bad }))).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions(lived(45, { allowSensitiveActions: bad }))).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: bad })).toBe(false);
+    }
+    // null and undefined are "nothing stored" (an old link): the lifetime rule applies
+    expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: null }))).toBe(true);
+    expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: undefined }))).toBe(true);
   });
 });
 
@@ -168,11 +173,12 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(updateSpy).not.toHaveBeenCalled();
     });
 
-    it('writes nothing when the explicit choice is already what is stored', async () => {
+    it('writes the explicit choice even when the copy it read already says that: the copy is eventually consistent and may be stale', async () => {
       getSessionSpy.mockResolvedValue(existing({ allowSensitiveActions: true }));
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
-      expect(setChoiceSpy).not.toHaveBeenCalled();
-      expect(updateSpy).not.toHaveBeenCalled();
+      expect(setChoiceSpy).toHaveBeenCalledTimes(1);
+      expect(setChoiceSpy).toHaveBeenCalledWith('s1', true);
+      expect(updateSpy).not.toHaveBeenCalled(); // still never a whole-link write
     });
 
     it('a caller with NO choice never touches the setting: an email or alert can not switch an owner\'s "on" back to "off"', async () => {
@@ -209,5 +215,83 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(url).toContain('/agent-mode/s1');
       expect(url).not.toContain('conversable=');
     });
+  });
+});
+
+describe('is the link live, and what may a visitor do on it right now (ENG-3170 review)', () => {
+  const NOW = Date.parse('2026-11-23T12:00:00.000Z');
+  const live = (extra: Record<string, unknown> = {}) => ({ isActive: true, sharedAt: '2026-11-22T12:00:00.000Z', ...extra });
+
+  it('live means switched on and not past its expiry; anything unreadable is not live', () => {
+    expect(interactiveShareIsLive(live(), NOW)).toBe(true);
+    expect(interactiveShareIsLive(live({ expiresAt: '2026-11-24T12:00:00.000Z' }), NOW)).toBe(true);
+    expect(interactiveShareIsLive(live({ expiresAt: '2026-11-23T11:59:59.000Z' }), NOW)).toBe(false);
+    expect(interactiveShareIsLive(live({ expiresAt: '2026-11-23T12:00:00.000Z' }), NOW)).toBe(false); // the instant itself is over
+    expect(interactiveShareIsLive(live({ isActive: false }), NOW)).toBe(false);
+    expect(interactiveShareIsLive({ sharedAt: 'x' }, NOW)).toBe(false);
+    expect(interactiveShareIsLive(live({ expiresAt: 'not a date' }), NOW)).toBe(false);
+    expect(interactiveShareIsLive(live({ expiresAt: 12345 }), NOW)).toBe(false);
+    expect(interactiveShareIsLive(null, NOW)).toBe(false);
+    expect(interactiveShareIsLive(undefined, NOW)).toBe(false);
+  });
+
+  it('an explicit choice on a live link: sensitive and full both follow it', () => {
+    expect(interactiveShareControl(live({ allowSensitiveActions: true }), NOW)).toEqual({ sensitive: true, full: true });
+    expect(interactiveShareControl(live({ allowSensitiveActions: false }), NOW)).toEqual({ sensitive: false, full: false });
+  });
+
+  it('a link made before the setting existed (a dialog lifetime) may run the sensitive tools but never has FULL control', () => {
+    const legacy = live({ sharedAt: '2026-11-22T12:00:00.000Z', expiresAt: '2026-11-29T12:00:00.000Z' }); // 7 days
+    expect(interactiveShareControl(legacy, NOW)).toEqual({ sensitive: true, full: false });
+    // and a legacy link of any other lifetime or none has neither
+    expect(interactiveShareControl(live({ expiresAt: '2027-01-06T12:00:00.000Z' }), NOW)).toEqual({ sensitive: false, full: false });
+    expect(interactiveShareControl(live(), NOW)).toEqual({ sensitive: false, full: false });
+  });
+
+  it('a link that is not live has neither, whatever it says', () => {
+    expect(interactiveShareControl(live({ isActive: false, allowSensitiveActions: true }), NOW)).toEqual({ sensitive: false, full: false });
+    expect(interactiveShareControl(live({ expiresAt: '2026-11-23T11:00:00.000Z', allowSensitiveActions: true }), NOW)).toEqual({ sensitive: false, full: false });
+    expect(interactiveShareControl(null, NOW)).toEqual({ sensitive: false, full: false });
+  });
+
+  it('only the real boolean true is full control', () => {
+    for (const bad of ['true', 1, {}, [], 'yes']) expect(interactiveShareControl(live({ allowSensitiveActions: bad }), NOW).full).toBe(false);
+  });
+});
+
+describe('the two attribute-level writes, as DynamoDB receives them (a spy on the method would pass whatever the expression said)', () => {
+  const calls: any[] = [];
+  beforeEach(() => {
+    calls.length = 0;
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('writes the choice alone, and only onto a link that exists', async () => {
+    const { dynamodb } = require('../services/chatbotService');
+    const spy = jest.spyOn(dynamodb, 'update').mockImplementation((params: any) => { calls.push(params); return { promise: async () => ({}) } as any; });
+    await chatbotDb.setInteractiveShareAllowSensitiveActions('s1', true);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(calls[0].Key).toEqual({ sessionId: 's1' });
+    expect(calls[0].UpdateExpression).toBe('SET interactiveShareMetadata.allowSensitiveActions = :allow');
+    expect(calls[0].ExpressionAttributeValues).toEqual({ ':allow': true });
+    expect(calls[0].ConditionExpression).toBe('attribute_exists(interactiveShareMetadata.#token)');
+    expect(calls[0].ExpressionAttributeNames).toEqual({ '#token': 'token' });
+  });
+
+  it('removes the expiry alone, and only from a link that exists', async () => {
+    const { dynamodb } = require('../services/chatbotService');
+    jest.spyOn(dynamodb, 'update').mockImplementation((params: any) => { calls.push(params); return { promise: async () => ({}) } as any; });
+    await chatbotDb.removeInteractiveShareExpiry('s1');
+    expect(calls[0].UpdateExpression).toBe('REMOVE interactiveShareMetadata.expiresAt');
+    expect(calls[0].ConditionExpression).toBe('attribute_exists(interactiveShareMetadata.#token)');
+    expect(calls[0].ExpressionAttributeValues).toBeUndefined(); // it writes no value: nothing of the choice can be carried along
+  });
+
+  it('a failed write is thrown (the route that made the choice answers 500 rather than showing a switch that is not true)', async () => {
+    const { dynamodb } = require('../services/chatbotService');
+    jest.spyOn(dynamodb, 'update').mockImplementation(() => ({ promise: async () => { throw new Error('ConditionalCheckFailedException'); } }) as any);
+    await expect(chatbotDb.setInteractiveShareAllowSensitiveActions('s1', false)).rejects.toThrow('ConditionalCheckFailed');
+    await expect(chatbotDb.removeInteractiveShareExpiry('s1')).rejects.toThrow('ConditionalCheckFailed');
   });
 });

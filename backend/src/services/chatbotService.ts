@@ -4617,8 +4617,8 @@ export class ChatbotDB {
         // (emails, Slack posts, alerts) never touch the setting, so sending a report can not switch an owner's "on" back to "off".
         // A failed write is not caught here: it goes to the catch below (the login-URL fallback, no share link), and the route that made
         // the choice re-reads the stored value before it answers.
-        if (typeof options?.allowSensitiveActions === 'boolean'
-          && session.interactiveShareMetadata.allowSensitiveActions !== options.allowSensitiveActions) {
+        // The write is unconditional: `session` is an eventually consistent copy, and "it already says that" could be a stale reading.
+        if (typeof options?.allowSensitiveActions === 'boolean') {
           await this.setInteractiveShareAllowSensitiveActions(sessionId, options.allowSensitiveActions);
         }
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';

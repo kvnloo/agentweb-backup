@@ -30,7 +30,7 @@ import OpenAI from 'openai';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
-import { interactiveShareAllowsSensitiveActions } from '../utils/interactiveShare';
+import { interactiveShareControl } from '../utils/interactiveShare';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -7718,11 +7718,12 @@ export class AgentModeService {
     socketEmit?: ToolDispatchPorts['socketEmit'];
   }): ToolDispatchPorts {
     return {
-      // ENG-3170: the early refusal of a share-link visitor asks whether the link has full control; any failure to read means no.
+      // ENG-3170: the early refusal of a share-link visitor asks whether the link has FULL CONTROL (an explicit choice, on a link that is still
+      // live); any failure to read means no.
       shareLinkFullControl: async (sessionId: string) => {
         try {
           const record = await chatbotDb.getChatSessionRecord(sessionId, true);
-          return interactiveShareAllowsSensitiveActions(record?.interactiveShareMetadata);
+          return interactiveShareControl(record?.interactiveShareMetadata).full;
         } catch {
           return false;
         }
@@ -10201,7 +10202,7 @@ export class AgentModeService {
    * takes effect on the next call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because
    * running one of these as the owner on an unverified link is the hole this closes.
    */
-  private async readShareLinkFullControl(toolName: string, sessionId: string): Promise<boolean> {
+  private async readShareLinkControl(toolName: string, sessionId: string): Promise<{ sensitive: boolean; full: boolean }> {
     let session: any;
     if (sessionId) {
       try {
@@ -10216,7 +10217,7 @@ export class AgentModeService {
       }
     }
     if (!session) throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
-    return interactiveShareAllowsSensitiveActions(session.interactiveShareMetadata);
+    return interactiveShareControl(session.interactiveShareMetadata);
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
@@ -10229,12 +10230,12 @@ export class AgentModeService {
     // with, so a read that the model spelled in a shape repair understands is not refused for looking like something else.
     const isShareVisitor = normalizeRestrictionClaim(extraContext?.restrictionProfile) === 'share_visitor';
     // A visitor's call to a tool that depends on the link (the sensitive tools, the block list, connect_account) reads the link once.
-    const fullControl = isShareVisitor && isFullControlGatedWholeTool(toolName) ? await this.readShareLinkFullControl(toolName, sessionId) : false;
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true, linkAllowsFullControl: fullControl });
+    const linkControl = isShareVisitor && isFullControlGatedWholeTool(toolName) ? await this.readShareLinkControl(toolName, sessionId) : { sensitive: false, full: false };
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true, linkAllowsFullControl: linkControl.full });
     if (restricted) throw new ToolRestrictionDenied(restricted);
     // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
     // account, use saved logins) only on a link whose owner turned on full control. Never taken from the request.
-    if (isShareVisitor && isSensitiveWholeTool(toolName) && !fullControl) {
+    if (isShareVisitor && isSensitiveWholeTool(toolName) && !linkControl.sensitive) {
       console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
       throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
     }
@@ -10277,7 +10278,7 @@ export class AgentModeService {
     if (!isFullControlGatedWholeTool(toolName) && isSensitiveToolCall(toolName, preparedArgs)) {
       const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
       if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
-      if (isShareVisitor && !(await this.readShareLinkFullControl(toolName, sessionId))) {
+      if (isShareVisitor && !(await this.readShareLinkControl(toolName, sessionId)).sensitive) {
         console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
         throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
       }
@@ -10325,10 +10326,14 @@ export class AgentModeService {
         const autoDeps = {
           runTool: (name: string, toolArgs: any) => this.toolRegistry.execute(name, toolArgs ?? {}, cookieCtx),
         };
-        await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
+        // ENG-3170: the owner's saved browser sessions are saved logins. A share-link visitor's browser starts from them (and writes its own
+        // cookies back over them) only on a link the owner has let run the sensitive tools; otherwise it browses as nobody. A link that
+        // cannot be read counts as not allowed: the browser tool itself still runs, it just does not borrow the owner's logins.
+        const borrowOwnerLogins = !isShareVisitor || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
+        if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
         const toolFailed = result && (result as any).success === false;
-        if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
+        if (!toolFailed && borrowOwnerLogins && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
         await recordToolReliabilityEvent({
