@@ -81,6 +81,17 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   // with the arguments the test names (the helper above builds minimal valid ones for a tool that has to be dispatched)
   const runWith = (toolName: string, ctx: Record<string, unknown>, args: unknown) =>
     (service as any).executeTool('gpt-4', toolName, args, 'owner-user-id', 'run-session', false, ctx);
+  // arguments that pass the tool's own schema check, so a call to a tool judged by its action reaches the rule (it is judged after repair)
+  const valid = (tool: string, extra: Record<string, unknown>) => {
+    const def = (service as any).toolRegistry.getTool(tool)?.definition ?? {};
+    const schema = def.inputSchema ?? def.function?.parameters ?? def.parameters ?? {};
+    const filled: Record<string, unknown> = {};
+    for (const key of schema.required ?? []) {
+      const prop = (schema.properties ?? {})[key] ?? {};
+      filled[key] = prop.enum ? prop.enum[0] : prop.type === 'array' ? ['x'] : prop.type === 'object' ? {} : prop.type === 'number' ? 1 : prop.type === 'boolean' ? true : 'x';
+    }
+    return { ...filled, ...extra };
+  };
   const scheduleWith = (provenance: unknown) =>
     getSchedule.mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance } as any);
   const marked = (provenance: unknown = ['startingMessage']) => scheduleWith(provenance);
@@ -131,15 +142,29 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
         ['slack_send_message', { text: 'hi' }],
         ['delete_leads', { list_id: 'l', lead_ids: ['a'] }],
         ['email', { action: 'send' }],
-        ['call_google_ads_api', { action: 'PAUSE' }],
+        ['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }],
         ['launch_targeted_audience_campaign', {}],
       ] as Array<[string, any]>) {
-        await expect(runWith(tool, { isUnattendedRun: true }, args)).rejects.toMatchObject({
+        await expect(runWith(tool, { isUnattendedRun: true }, valid(tool, args))).rejects.toMatchObject({
           deniedBy: 'restriction_profile',
           message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
         });
       }
       expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: through executeTool, a marked schedule still RUNS the read side of a tool judged by its action and is refused the write side (the schedule is judged from its stored provenance, not from a profile in the call)', async () => {
+      marked();
+      await expect(runWith('call_google_ads_api', { isUnattendedRun: true }, valid('call_google_ads_api', { action: 'LIST', entity_type: 'CAMPAIGN' }))).resolves.toEqual({ ran: true });
+      await expect(runWith('email', { isUnattendedRun: true }, valid('email', { action: 'search' }))).resolves.toEqual({ ran: true });
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      for (const [tool, extra] of [['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }], ['email', { action: 'send' }]] as Array<[string, Record<string, unknown>]>) {
+        await expect(runWith(tool, { isUnattendedRun: true }, valid(tool, extra))).rejects.toMatchObject({
+          deniedBy: 'restriction_profile',
+          message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+        });
+      }
+      expect(dispatch).toHaveBeenCalledTimes(2);
     });
 
     it('ENG-3170: still runs the READ side of a tool that also writes, and spends the schedule reads only for a sensitive call', async () => {
