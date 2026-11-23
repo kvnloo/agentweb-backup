@@ -58,13 +58,18 @@ export const SHARE_VISITOR_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
 /**
  * ENG-3170: SENSITIVE actions. A share-link visitor runs as the owner, and a few tools are guarded only by a sentence in the prompt or
  * a `confirm` flag the model sets itself, so the visitor is the "user" who confirms. Sensitive means the call can
- *   1. permanently delete the owner's data,
+ *   1. permanently delete or change the owner's data (including re-enabling contact with a lead who opted out, or opening a lead list to
+ *      public submissions),
  *   2. send, post or publish to people or the public outside the account,
- *   3. start, change or stop ad spend, or
- *   4. disconnect or revoke a connected account.
- * Unlike the block list above, whether a visitor may run these is the OWNER's choice per link (`allowSensitiveActions` on the link,
- * see `utils/interactiveShare.interactiveShareAllowsSensitiveActions`): off by default, and nothing is removed for an owner who turns
- * it on. The link's setting is read where the tool runs (`agentModeService.executeTool`); this module only says WHAT is sensitive and
+ *   3. start, change or stop ad spend,
+ *   4. disconnect or revoke a connected account, or
+ *   5. hand the owner's saved logins (passwords) to the model.
+ * Whether a visitor may run these is the OWNER's choice per link (`allowSensitiveActions` on the link, see
+ * `utils/interactiveShare.interactiveShareAllowsSensitiveActions`; customers see it as "Full control"): off by default, and nothing is
+ * removed for an owner who turns it on. Owner decision 2026-11-23: "full control means everything that the customer can do, like it
+ * used to be before any of our changes/restrictions". So Full control also lifts the ENG-2816 block list above (owner settings, hot-lead
+ * calls, Smartlead, Luma, memory) and `connect_account` for that link. ADMIN tools are never lifted: they are not something a customer can
+ * do, and a link holder must never get staff powers. A schedule a visitor set up has no link to ask, so it keeps the whole block list. The link's setting is read where the tool runs (`agentModeService.executeTool`); this module only says WHAT is sensitive and
  * how the refusal reads. A schedule a visitor set up has no link to ask, so it is always refused these (until the owner adopts it).
  *
  * Whole-tool entries are sensitive on every use. A tool that mixes reads and writes through one argument is listed with the argument's
@@ -77,6 +82,8 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'delete_leads',
   'delete_lead_list',
   'delete_leads_by_filter',
+  'enable_lead_list_public_access', // opens the owner's lead list to unauthenticated submissions
+  'set_landing_page_lead_list', // enables public submissions on a list and syncs the repo's capture route
   'delete_gtm_items',
   'delete_character',
   'delete_landing_page',
@@ -84,6 +91,9 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'google_calendar_delete_event', // cannot be undone, and by default tells the attendees
   // 4. disconnect or revoke a connected account
   'revoke_linkedin_account',
+  // 5. hand the owner's saved logins to the model (the tool returns the decrypted password)
+  'get_login_credentials',
+  'get_test_account',
   // 2. send, post or publish to people or the public outside the account
   'slack_send_message',
   'send_email_from_sender',
@@ -93,6 +103,8 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'post_on_connected_account', // LinkedIn, Instagram, YouTube, X
   'publish_blog_article',
   'publish_landing_page_changes', // merges into main and deploys to production
+  'deploy_landing_page',
+  'test_scheduled_chat', // runs one of the owner's saved schedules now and can email its configured recipients
   'revert_landing_page_publish',
   'enable_session_tracking', // commits the tracking tag to the customer's own repo
   // 3. start or change ad spend (Meta writes through call_meta_marketing_api are already behind an approval deck a visitor can not answer)
@@ -130,6 +142,8 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   call_linkedin_marketing_api: { kind: 'action', argument: 'action', allowedValues: ['estimate-reach'], allowedPrefixes: READ_PREFIXES },
   // create and update are handled by schedule provenance (ENG-2816); a toggle is reversible; DELETE removes the owner's schedule
   manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'] },
+  // setting a lead to do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
+  set_lead_contact_status: { kind: 'action', argument: 'contact_status', allowedValues: ['do-not-contact', 'unsubscribed'] },
   google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
   google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
   update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc'] },
@@ -153,6 +167,16 @@ export function isSensitiveWholeTool(toolName: string): boolean {
   return typeof toolName === 'string' && SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName);
 }
 
+/**
+ * True for a tool whose use by a share-link visitor depends on the link's full-control choice whatever its arguments: a whole-tool
+ * sensitive entry, the ENG-2816 block list (owner settings, memory, Smartlead, Luma, hot-lead calls) or `connect_account`. Admin tools
+ * are NOT here: they are refused for a visitor on every link.
+ */
+export function isFullControlGatedWholeTool(toolName: string): boolean {
+  return typeof toolName === 'string'
+    && (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) || SHARE_VISITOR_BLOCKED_TOOLS.has(toolName) || toolName === 'connect_account');
+}
+
 /** True when this call is sensitive (see above). Pure: it does not know about any link, only about the tool and its arguments. */
 export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   if (typeof toolName !== 'string') return false;
@@ -170,19 +194,19 @@ export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   return true;
 }
 
-/** The refusal for a visitor on a link where the owner has not allowed sensitive actions. The share-session eval keys on "is not available in shared sessions". */
+/** The refusal for a visitor on a link where the owner has not turned on full control. The share-session eval keys on "is not available in shared sessions". */
 export function sensitiveActionRefusal(toolName: string): string {
-  return `Tool "${toolName}" can delete data, send or post to people outside the account, change ad spend or disconnect an account, and the owner has not allowed that for this shared link, so it is not available in shared sessions. Tell the person this action is switched off for this link and that the owner can allow it in the share settings, or do it in Agent Mode in their own session.`;
+  return `Tool "${toolName}" can delete or change data, change the owner's settings or memory, connect accounts, send or post to people outside the account, change ad spend, disconnect an account or use saved logins, and the owner has not turned on full control for this shared link, so it is not available in shared sessions. Tell the person this is switched off for this link and that the owner can turn on full control in the share settings, or do it in Agent Mode in their own session.`;
 }
 
 /** Same refusal for a scheduled run of a schedule a visitor set up or edited (there is no link to ask): the owner adopts the schedule to lift it. */
 export function sensitiveActionScheduleRefusal(toolName: string): string {
-  return `Tool "${toolName}" can delete data, send or post to people outside the account, change ad spend or disconnect an account, and is not available in this scheduled run because this schedule was set up or edited through a share link. The owner can adopt the schedule in the portal to lift this limit.`;
+  return `Tool "${toolName}" can delete or change data, change the owner's settings or memory, connect accounts, send or post to people outside the account, change ad spend, disconnect an account or use saved logins, and is not available in this scheduled run because this schedule was set up or edited through a share link. The owner can adopt the schedule in the portal to lift this limit.`;
 }
 
-/** Thrown when the link a visitor's call belongs to could not be read, so it cannot be shown that the owner allowed the action. */
+/** Thrown when the link a visitor's call belongs to could not be read, so it cannot be shown that the owner turned on full control. */
 export function sensitiveActionUnverifiableRefusal(toolName: string): string {
-  return `Tool "${toolName}" was not run: whether the owner allowed sensitive actions on this shared link could not be verified just now, so it was refused rather than assumed safe. Nothing was done. It will work again once the link can be read.`;
+  return `Tool "${toolName}" was not run: whether the owner turned on full control for this shared link could not be verified just now, so it was refused rather than assumed safe. Nothing was done. It will work again once the link can be read.`;
 }
 
 interface RestrictionProfile {
@@ -191,7 +215,7 @@ interface RestrictionProfile {
    * of a tool. With `nameOnly` it answers for the tool NAME alone: only a tool refused whatever its arguments, never one refused for
    * some of its actions (for a caller that has no call in hand, such as which required calls a schedule can be held to).
    */
-  refusal(toolName: string, adminToolNames: readonly string[], args?: unknown, nameOnly?: boolean): string | null;
+  refusal(toolName: string, adminToolNames: readonly string[], args?: unknown, nameOnly?: boolean, linkAllowsFullControl?: boolean): string | null;
 }
 
 /** Which kind of tool a restricted principal is refused, so two profiles can share a block list and differ only in their wording. */
@@ -214,11 +238,15 @@ export function isRefusedByScheduleBlockList(toolName: string, adminToolNames: r
 const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
   share_visitor: {
     // The wording is relied on: the share-session refusal eval keys on "is not available in shared sessions".
-    refusal(toolName, adminToolNames) {
+    refusal(toolName, adminToolNames, _args, _nameOnly, linkAllowsFullControl) {
+      // Admin tools are never lifted: a link holder must not get staff powers, whatever the owner chose.
       if (adminToolNames.includes(toolName)) {
         return `Tool "${toolName}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`;
       }
+      // ENG-3170: on a link whose owner turned on full control the rest of the block list is lifted.
+      if (linkAllowsFullControl === true) return null;
       if (SHARE_VISITOR_BLOCKED_TOOLS.has(toolName)) {
+        // Wording kept byte for byte: the share-session refusal eval depends on it.
         return `Tool "${toolName}" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`;
       }
       if (toolName === 'connect_account') {
@@ -299,11 +327,11 @@ export function restrictionRefusal(
   toolName: string,
   adminToolNames: readonly string[],
   args?: unknown,
-  options?: { nameOnly?: boolean },
+  options?: { nameOnly?: boolean; linkAllowsFullControl?: boolean },
 ): string | null {
   if (profile === undefined || profile === null || profile === false || profile === '') return null;
   // Own keys only: an id such as "constructor" must not resolve to something on Object.prototype.
   const known = typeof profile === 'string' && Object.prototype.hasOwnProperty.call(PROFILES, profile);
   const resolved = known ? PROFILES[profile as RestrictionProfileId] : PROFILES.share_visitor;
-  return resolved.refusal(toolName, adminToolNames, args, options?.nameOnly === true);
+  return resolved.refusal(toolName, adminToolNames, args, options?.nameOnly === true, options?.linkAllowsFullControl === true);
 }
