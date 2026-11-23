@@ -13124,6 +13124,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId } = req.params;
 
+      // ENG-3170: see createConversableShare: whether a link exists is the owner's call; a visitor's claim never reaches it.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
+
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || session.userId !== user.userId) {
