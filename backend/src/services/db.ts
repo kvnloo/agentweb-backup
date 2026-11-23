@@ -11822,14 +11822,21 @@ export interface MemoryReadOptions {
 
 /** The bound of a read, as a whole number of at least 1 (a zero or negative bound would send DynamoDB an invalid Limit). */
 function memoryReadBound(options: MemoryReadOptions): number {
-  const bound = Math.floor(options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT);
-  return Number.isFinite(bound) && bound >= 1 ? bound : MEMORY_READ_MAX_ROWS_PROMPT;
+  const requested = options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT;
+  // Not a number, zero or negative: the default. A fraction rounds down but never below 1.
+  if (!Number.isFinite(requested) || requested <= 0) return MEMORY_READ_MAX_ROWS_PROMPT;
+  return Math.max(1, Math.floor(requested));
+}
+
+/** DynamoDB returns a LastEvaluatedKey whenever the Limit was used up, even when nothing is left, so "stopped at the bound" means "there may be more". */
+function warnReadStoppedAtBound(kind: 'account' | 'org', bound: number, ownerId: unknown): void {
+  console.warn(`[memory] ${kind} memory read stopped at its ${bound}-row bound (there may be more rows stored) (${ownerId})`);
 }
 
 // The attributes a memory row carries (read from every row on prod on 2026-11-23). A list read that omits the embeddings names them
 // all, so it fetches everything the row holds except the 1,536-number vector.
-const ACCOUNT_MEMORY_LIST_ATTRIBUTES = ['userId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceSessionId'] as const;
-const ORG_MEMORY_LIST_ATTRIBUTES = ['orgId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceUserId'] as const;
+export const ACCOUNT_MEMORY_LIST_ATTRIBUTES = ['userId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceSessionId'] as const;
+export const ORG_MEMORY_LIST_ATTRIBUTES = ['orgId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceUserId'] as const;
 
 function withoutEmbeddingsProjection(attributes: readonly string[]): Pick<AWS.DynamoDB.DocumentClient.QueryInput, 'ProjectionExpression' | 'ExpressionAttributeNames'> {
   return {
@@ -11839,7 +11846,7 @@ function withoutEmbeddingsProjection(attributes: readonly string[]): Pick<AWS.Dy
 }
 
 function withoutEmbeddings<T extends Record<string, any>>(rows: T[]): Omit<T, 'embedding'>[] {
-  return rows.map(({ embedding: _embedding, ...rest }) => rest);
+  return rows.map((row) => Object.fromEntries(Object.entries(row).filter(([name]) => name !== 'embedding')) as Omit<T, 'embedding'>);
 }
 
 /** Keep structured ads lessons out of generic relevance injection, without consuming its
@@ -11876,14 +11883,17 @@ async function queryOrdinaryAccountMemories(
         ExpressionAttributeValues: { ...params.ExpressionAttributeValues,
           ':learningBoundary': descending ? 'ads-learning#' : 'ads-learning#\uffff' } };
       cursor = undefined;
-      if (want && rows.length >= want) return rows.slice(0, want);
+      if (want && rows.length >= want) {
+        if (params.Limit === undefined && opts.maxRows) warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
+        return rows.slice(0, want);
+      }
       continue;
     }
     // With a bound (a `limit` or `opts.maxRows`) keep reading until it is reached or the rows run out. Without one, the old rule
     // stands: the first page that holds any ordinary row is the answer.
     if (!cursor || (want ? rows.length >= want : rows.length > 0)) {
       if (cursor && params.Limit === undefined && opts.maxRows) {
-        console.warn(`[memory] account memory read stopped at its ${opts.maxRows}-row bound with more rows stored (${params.ExpressionAttributeValues?.[':userId']})`);
+        warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
       }
       return want ? rows.slice(0, want) : rows;
     }
@@ -11900,15 +11910,11 @@ async function queryOrgMemoryRows(params: AWS.DynamoDB.DocumentClient.QueryInput
   for (let page = 0; page < maxPages; page++) {
     const result = await dynamodb.query({ ...params, ...(cursor ? { ExclusiveStartKey: cursor } : {}), Limit: maxRows - rows.length }).promise();
     if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed org memory page');
-    for (const item of result.Items ?? []) {
-      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
-        throw new Error('Malformed org memory item');
-      }
-      rows.push(item);
-    }
+    // No row validation here: the org reader never had any, and one odd row must not take the whole org list (or every member's prompt) down.
+    rows.push(...(result.Items ?? []));
     cursor = result.LastEvaluatedKey;
     if (!cursor || rows.length >= maxRows) {
-      if (cursor) console.warn(`[memory] org memory read stopped at its ${maxRows}-row bound with more rows stored (${params.ExpressionAttributeValues?.[':orgId']})`);
+      if (cursor) warnReadStoppedAtBound('org', maxRows, params.ExpressionAttributeValues?.[':orgId']);
       return rows.slice(0, maxRows);
     }
   }

@@ -73,7 +73,7 @@ function previewOf(content: string): string {
 async function writeChunks(
   userId: string,
   content: string,
-  write: (chunk: string, embedding: number[] | undefined) => Promise<Record<string, any>>,
+  write: (chunk: string, embedding: number[] | undefined) => Promise<{ memoryId?: unknown }>,
 ): Promise<string[]> {
   const { embedText } = await import('../../utils/embeddings');
   // ENG-2574: content over 2,000 characters is split into rows of at most 2,000 rather than rejected.
@@ -84,7 +84,7 @@ async function writeChunks(
   for (const chunk of chunks) {
     const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
     const memory = await write(chunk, embedding);
-    memoryIds.push(memory.memoryId as string);
+    memoryIds.push(String(memory.memoryId));
   }
   return memoryIds;
 }
