@@ -6874,7 +6874,9 @@ function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls
   const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
   if (!isScheduleMarked(schedule)) return { functionCalls, minCalls, skipped: [] };
   // ADMIN_SKILL_TOOL_NAMES can be absent where a test replaces the whole service module; production always has it.
-  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? []) !== null;
+  // By NAME only (ENG-3170): a tool refused for some of its actions (a Google Ads report is allowed, a campaign change is not) is still
+  // one the run may be held to calling.
+  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? [], undefined, { nameOnly: true }) !== null;
   const kept = withoutRefusedNames(functionCalls, isRefused);
   // `skipped` is what the run was NOT held to, in the schedule's own order, so a "passed" run can say what it skipped.
   return { functionCalls: kept, minCalls: minCallsWithoutRefused(minCalls, isRefused), skipped: functionCalls.filter((name) => !kept.includes(name)) };

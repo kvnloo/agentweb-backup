@@ -55,9 +55,138 @@ export const SHARE_VISITOR_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
   'delete_memory',
 ]);
 
+/**
+ * ENG-3170: SENSITIVE actions. A share-link visitor runs as the owner, and a few tools are guarded only by a sentence in the prompt or
+ * a `confirm` flag the model sets itself, so the visitor is the "user" who confirms. Sensitive means the call can
+ *   1. permanently delete the owner's data,
+ *   2. send, post or publish to people or the public outside the account,
+ *   3. start, change or stop ad spend, or
+ *   4. disconnect or revoke a connected account.
+ * Unlike the block list above, whether a visitor may run these is the OWNER's choice per link (`allowSensitiveActions` on the link,
+ * see `utils/interactiveShare.interactiveShareAllowsSensitiveActions`): off by default, and nothing is removed for an owner who turns
+ * it on. The link's setting is read where the tool runs (`agentModeService.executeTool`); this module only says WHAT is sensitive and
+ * how the refusal reads. A schedule a visitor set up has no link to ask, so it is always refused these (until the owner adopts it).
+ *
+ * Whole-tool entries are sensitive on every use. A tool that mixes reads and writes through one argument is listed with the argument's
+ * READ values; any other value, a missing argument or an unreadable one is sensitive (a new write action must never be allowed by
+ * accident). `__tests__/shareVisitorSensitiveTools.test.ts` pins this list and fails when a registered tool whose name looks outward
+ * facing is neither listed here nor on the reviewed-safe list, so a new tool has to be classified by whoever adds it.
+ */
+export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string>([
+  // 1. permanently delete the owner's data
+  'delete_leads',
+  'delete_lead_list',
+  'delete_leads_by_filter',
+  'delete_gtm_items',
+  'delete_character',
+  'delete_landing_page',
+  'regenerate_market_strategy', // its own description says DESTRUCTIVE: it replaces the competitors and ICPs
+  'google_calendar_delete_event', // cannot be undone, and by default tells the attendees
+  // 4. disconnect or revoke a connected account
+  'revoke_linkedin_account',
+  // 2. send, post or publish to people or the public outside the account
+  'slack_send_message',
+  'send_email_from_sender',
+  'send_email_to_lead',
+  'send_gtm_status_report',
+  'notify_session', // emails any address it is given
+  'post_on_connected_account', // LinkedIn, Instagram, YouTube, X
+  'publish_blog_article',
+  'publish_landing_page_changes', // merges into main and deploys to production
+  'revert_landing_page_publish',
+  'enable_session_tracking', // commits the tracking tag to the customer's own repo
+  // 3. start or change ad spend (Meta writes through call_meta_marketing_api are already behind an approval deck a visitor can not answer)
+  'launch_targeted_audience_campaign',
+  'launch_retargeting_campaign',
+]);
+
+/**
+ * A tool that mixes reads and sensitive writes is judged by one argument.
+ *  - `action`: the argument that says what the call does. A value is allowed (even when sensitive actions are off) when it is in
+ *    `allowedValues` or starts with one of `allowedPrefixes`; EVERY other value, a missing argument and a non-text one is sensitive, so
+ *    a write action added tomorrow is refused until someone classifies it. Values are compared trimmed, lower-cased, with `_` as `-`
+ *    (the X and LinkedIn dispatchers treat them the same).
+ *  - `present`: the call is sensitive when any of these arguments is set (a non-empty text or list, or `true`), because that is what
+ *    makes the tool reach someone (calendar attendees, a notification, a document shared with addresses).
+ * All the read actions of the tools below are get-, list- or search-... (checked against the action literals in
+ * `emma/impl/adsCrmApis.ts`, `adsApis.ts`, `linkedin.ts`, `twitter.ts`); `shareVisitorSensitiveTools.test.ts` pins that against the
+ * live tool schemas.
+ */
+export type SensitiveByArgument =
+  | { kind: 'action'; argument: string; allowedValues?: readonly string[]; allowedPrefixes?: readonly string[] }
+  | { kind: 'present'; arguments: readonly string[] };
+
+const READ_PREFIXES: readonly string[] = ['get', 'list', 'search'];
+
+export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, SensitiveByArgument>> = {
+  email: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // send is the write
+  linkedin_outreach: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // send-invite, send-message, send-inmail, accept/cancel/withdraw invitations
+  linkedin_manage_post: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // repost, comment, react, delete_post
+  twitter_manage_post: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // reply, post_thread, quote_tweet, delete_tweet, like, retweet...
+  twitter_outreach: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // send_dm, follow, block, mute...
+  call_google_ads_api: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // create, update, pause, resume, remove, upload... change spend
+  call_hubspot_api: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // publish, create_broadcast, delete, add/remove contacts...
+  call_attio_api: { kind: 'action', argument: 'action', allowedValues: ['count'], allowedPrefixes: READ_PREFIXES },
+  call_linkedin_marketing_api: { kind: 'action', argument: 'action', allowedValues: ['estimate-reach'], allowedPrefixes: READ_PREFIXES },
+  // create and update are handled by schedule provenance (ENG-2816); a toggle is reversible; DELETE removes the owner's schedule
+  manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'] },
+  google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
+  google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
+  update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc'] },
+  create_google_doc: { kind: 'present', arguments: ['share_with_emails'] },
+  create_google_sheet: { kind: 'present', arguments: ['share_with_emails'] },
+};
+
+function normaliseActionValue(value: string): string {
+  return value.trim().toLowerCase().replace(/_/g, '-');
+}
+
+function isSet(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return false;
+}
+
+/** True when this call is sensitive (see above). Pure: it does not know about any link, only about the tool and its arguments. */
+export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
+  if (typeof toolName !== 'string') return false;
+  if (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName)) return true;
+  // Own keys only: a tool called "constructor" must not read as an entry on Object.prototype.
+  if (!Object.prototype.hasOwnProperty.call(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT, toolName)) return false;
+  const rule = SHARE_VISITOR_SENSITIVE_BY_ARGUMENT[toolName];
+  const record = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  if (rule.kind === 'present') return rule.arguments.some((name) => isSet(record[name]));
+  const raw = record[rule.argument];
+  if (typeof raw !== 'string') return true;
+  const value = normaliseActionValue(raw);
+  if (rule.allowedValues?.includes(value)) return false;
+  if (rule.allowedPrefixes?.some((prefix) => value.startsWith(prefix))) return false;
+  return true;
+}
+
+/** The refusal for a visitor on a link where the owner has not allowed sensitive actions. The share-session eval keys on "is not available in shared sessions". */
+export function sensitiveActionRefusal(toolName: string): string {
+  return `Tool "${toolName}" can delete data, send or post to people outside the account, change ad spend or disconnect an account, and the owner has not allowed that for this shared link, so it is not available in shared sessions. Tell the person this action is switched off for this link and that the owner can allow it in the share settings, or do it in Agent Mode in their own session.`;
+}
+
+/** Same refusal for a scheduled run of a schedule a visitor set up or edited (there is no link to ask): the owner adopts the schedule to lift it. */
+export function sensitiveActionScheduleRefusal(toolName: string): string {
+  return `Tool "${toolName}" can delete data, send or post to people outside the account, change ad spend or disconnect an account, and is not available in this scheduled run because this schedule was set up or edited through a share link. The owner can adopt the schedule in the portal to lift this limit.`;
+}
+
+/** Thrown when the link a visitor's call belongs to could not be read, so it cannot be shown that the owner allowed the action. */
+export function sensitiveActionUnverifiableRefusal(toolName: string): string {
+  return `Tool "${toolName}" was not run: whether the owner allowed sensitive actions on this shared link could not be verified just now, so it was refused rather than assumed safe. Nothing was done. It will work again once the link can be read.`;
+}
+
 interface RestrictionProfile {
-  /** The refusal text for a tool this profile forbids, or null when the profile allows it. */
-  refusal(toolName: string, adminToolNames: readonly string[]): string | null;
+  /**
+   * The refusal text for a tool this profile forbids, or null when the profile allows it. `args` lets a profile refuse only some uses
+   * of a tool. With `nameOnly` it answers for the tool NAME alone: only a tool refused whatever its arguments, never one refused for
+   * some of its actions (for a caller that has no call in hand, such as which required calls a schedule can be held to).
+   */
+  refusal(toolName: string, adminToolNames: readonly string[], args?: unknown, nameOnly?: boolean): string | null;
 }
 
 /** Which kind of tool a restricted principal is refused, so two profiles can share a block list and differ only in their wording. */
@@ -88,9 +217,11 @@ const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
   // names the reason (the schedule, not the chat) and the way out (the owner adopts it), because the person reading this is
   // the owner looking at a scheduled run's result, not a visitor in a shared chat.
   share_visitor_schedule: {
-    refusal(toolName, adminToolNames) {
+    refusal(toolName, adminToolNames, args, nameOnly) {
       const reason = 'because this schedule was set up or edited through a share link';
       const way = 'The owner can adopt the schedule in the portal to lift this limit.';
+      // ENG-3170: no link to ask, so a visitor-made schedule never runs a sensitive action until the owner adopts it.
+      if (nameOnly ? SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) : isSensitiveToolCall(toolName, args)) return sensitiveActionScheduleRefusal(toolName);
       switch (classifyRestrictedTool(toolName, adminToolNames)) {
         case 'admin':
           return `Tool "${toolName}" is not available in this scheduled run ${reason}. ${way}`;
@@ -149,10 +280,16 @@ export class ToolRestrictionDenied extends Error {
  * An unrecognised profile id is treated as the strictest known profile rather than as no restriction: a typo or a stale id
  * must never loosen anything.
  */
-export function restrictionRefusal(profile: unknown, toolName: string, adminToolNames: readonly string[]): string | null {
+export function restrictionRefusal(
+  profile: unknown,
+  toolName: string,
+  adminToolNames: readonly string[],
+  args?: unknown,
+  options?: { nameOnly?: boolean },
+): string | null {
   if (profile === undefined || profile === null || profile === false || profile === '') return null;
   // Own keys only: an id such as "constructor" must not resolve to something on Object.prototype.
   const known = typeof profile === 'string' && Object.prototype.hasOwnProperty.call(PROFILES, profile);
   const resolved = known ? PROFILES[profile as RestrictionProfileId] : PROFILES.share_visitor;
-  return resolved.refusal(toolName, adminToolNames);
+  return resolved.refusal(toolName, adminToolNames, args, options?.nameOnly === true);
 }

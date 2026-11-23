@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -30,6 +30,7 @@ import OpenAI from 'openai';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
+import { interactiveShareAllowsSensitiveActions } from '../utils/interactiveShare';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -10115,13 +10116,14 @@ export class AgentModeService {
   private async scheduledRunRestriction(
     toolName: string,
     sessionId: string,
-    extraContext?: Record<string, any>
+    extraContext?: Record<string, any>,
+    args?: unknown,
   ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
     const unrestricted = { refusal: null };
     if (!sessionId) return unrestricted;
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
     if (extraContext?.restrictionProfile) return unrestricted;
-    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) !== null;
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args) !== null;
     const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
@@ -10173,9 +10175,46 @@ export class AgentModeService {
 
     if (refusedByProfile) {
       console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
-      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES) };
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args) };
     }
     return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
+  }
+
+  /**
+   * ENG-3170: the share-link visitor half of the sensitive-action rule (a visitor-made schedule has no link and is refused in
+   * `restrictionRefusal`). Only a call under the `share_visitor` profile that is sensitive pays for the read; the owner, an ordinary
+   * session and every other tool are untouched. The read is consistent, so an owner switching a link off takes effect on the next
+   * call, and it fails closed: a session that cannot be read (after one retry) or is gone refuses, because running a sensitive action
+   * as the owner on an unverified link is the hole this closes.
+   */
+  private async assertShareLinkAllowsSensitiveTool(
+    toolName: string,
+    args: unknown,
+    sessionId: string,
+    extraContext?: Record<string, any>,
+  ): Promise<void> {
+    if (normalizeRestrictionClaim(extraContext?.restrictionProfile) !== 'share_visitor') return;
+    if (!isSensitiveToolCall(toolName, args)) return;
+
+    let session: any;
+    if (sessionId) {
+      try {
+        session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      } catch (firstError) {
+        try {
+          session = await chatbotDb.getChatSessionRecord(sessionId, true);
+        } catch (retryError) {
+          console.error(`AgentMode ENG-3170: could not read session ${sessionId} to check the share link setting for ${toolName}; refusing:`, retryError);
+          throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+        }
+      }
+    }
+    if (!session) throw new ToolRestrictionDenied(sensitiveActionUnverifiableRefusal(toolName));
+
+    if (!interactiveShareAllowsSensitiveActions(session.interactiveShareMetadata)) {
+      console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not allowed sensitive actions on this share link.`);
+      throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+    }
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
@@ -10183,11 +10222,14 @@ export class AgentModeService {
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
     // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES);
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, args);
     if (restricted) throw new ToolRestrictionDenied(restricted);
+    // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
+    // account) only on a link whose owner allowed it. The link is read here, where every path ends, never taken from the request.
+    await this.assertShareLinkAllowsSensitiveTool(toolName, args, sessionId, extraContext);
     // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
     // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
-    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext);
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, args);
     if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
     if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
@@ -10218,6 +10260,16 @@ export class AgentModeService {
     }
 
     const preparedArgs = contractResult.args;
+    // ENG-3170: argument repair can change what a call does (a nested wrapper is hoisted, an alias renamed), and the publish-approval
+    // check below reads the arguments the tool will actually run with. The sensitive-action rule is the same: when repair turned a call
+    // that looked harmless into a sensitive one, the checks above run again on the prepared arguments.
+    if (!isSensitiveToolCall(toolName, args) && isSensitiveToolCall(toolName, preparedArgs)) {
+      const refusedAfterRepair = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
+      if (refusedAfterRepair) throw new ToolRestrictionDenied(refusedAfterRepair);
+      await this.assertShareLinkAllowsSensitiveTool(toolName, preparedArgs, sessionId, extraContext);
+      const scheduledAfterRepair = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
+      if (scheduledAfterRepair.refusal) throw new ToolRestrictionDenied(scheduledAfterRepair.refusal);
+    }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,
       args: preparedArgs,
