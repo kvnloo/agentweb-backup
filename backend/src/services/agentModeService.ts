@@ -6,7 +6,7 @@ import { applyProviderPolicy, CompareProviderPolicy } from './agentMode/compareP
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
-import { checkMetaDelete, checkMetaUpdate } from './agentMode/metaWriteReadBack';
+import { checkMetaDelete, checkMetaUpdate, withFieldFailure, type MetaWriteFailure } from './agentMode/metaWriteReadBack';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): resolveModelForUser's
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
@@ -13445,7 +13445,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // ENG-3065: name/status are read back; budget and spend_cap keep their own checks below.
       const unlanded = await checkMetaUpdate('campaign', campaignId, normalizedParams,
         () => metaService.getCampaign(accountId, accessToken, campaignId), this.readBackOptions());
-      if (unlanded) return unlanded;
 
       // ENG-2278: budget fields are verified independently of the spend cap.
       const budgetFields = hasBudgetField(normalizedParams)
@@ -13455,7 +13454,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
         )
         : undefined;
-      const withBudget = (r: any) => {
+      const withBudget = (r: any) => withFieldFailure(applyBudget(r), unlanded);
+      const applyBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
         const out: any = {
@@ -13553,12 +13553,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // ENG-3065: name/status/bid fields are read back; budget keeps its own check below.
       const unlanded = await checkMetaUpdate('adSet', adSetId, normalizedParams,
         () => metaService.getAdSet(accessToken, adSetId, accountId), this.readBackOptions());
-      if (unlanded) return unlanded;
       if (!hasBudgetField(normalizedParams)) {
-        return {
+        return withFieldFailure({
           success: true,
           message: `Ad set updated successfully${money.confirmation}`
-        };
+        }, unlanded);
       }
       // ENG-2278: read the ad set back before claiming a budget change took effect.
       const { budget_message, ...verdict } = budgetVerdictFields(
@@ -13566,12 +13565,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         await verifyMetaBudget(() => metaService.getAdSet(accessToken, adSetId), normalizedParams, this.budgetVerifyOptions()),
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
-      return {
+      return withFieldFailure({
         success: verdict.budget_verification === 'CONFIRMED',
         message: verdict.budget_verification === 'CONFIRMED'
           ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
-      };
+      }, unlanded);
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad set:', error);
@@ -13667,17 +13666,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         for (const key of Object.keys(params)) {
           if (key !== 'creative_id') adLevelParams[key] = params[key];
         }
+        // The creative is already attached, so a field failure must not skip the swap check and
+        // lineage stamp below; it is folded into the final result instead.
+        let unlanded: MetaWriteFailure | undefined;
         if (Object.keys(adLevelParams).length > 0) {
           await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
-          const unlanded = await this.checkMetaAdUpdate(accessToken, adId, adLevelParams, accountId);
-          if (unlanded) return unlanded;
+          unlanded = await this.checkMetaAdUpdate(accessToken, adId, adLevelParams, accountId);
         }
 
         // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
         // ad keeps its old creative. Read back the ad to confirm the swap actually took.
         const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId);
         if (!verification.attached) {
-          return {
+          return withFieldFailure({
             success: false,
             message: `Ad ${adId} did not switch to creative ${newCreativeId} — it still references `
               + `${verification.liveCreativeId || 'its previous creative'}. This is usually a transient `
@@ -13685,18 +13686,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             error: 'SWAP_NOT_REFLECTED',
             new_creative_id: newCreativeId,
             live_creative_id: verification.liveCreativeId,
-          };
+          }, unlanded);
         }
 
         await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
         // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
         void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
-        return {
+        return withFieldFailure({
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
           new_creative_id: newCreativeId,
           verified: verification.verified,
-        };
+        }, unlanded);
       }
 
       // Detect if params contain creative content keys that require a creative swap

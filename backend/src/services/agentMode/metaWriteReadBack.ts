@@ -132,3 +132,20 @@ export async function checkMetaDelete(
     `${JSON.stringify(status ?? null)} after ${opts.attempts} read-back(s). Do not report it as deleted.`;
   return { success: false, errorType: 'unsupported_field', fields: ['status'], message: error, error };
 }
+
+/**
+ * Fold a field read-back failure into the outcome of the checks that run after it (budget,
+ * spend cap, creative swap). The write already reached Meta, so those outcomes must still be
+ * reported: the result stays success:false for the field mismatch but keeps every other field.
+ */
+export function withFieldFailure<T extends Record<string, any>>(result: T, failure: MetaWriteFailure | undefined): T | (T & MetaWriteFailure) {
+  if (!failure) return result;
+  const out: any = {
+    ...result,
+    ...failure,
+    success: false,
+    message: result?.message ? `${failure.message} Other checks: ${result.message}` : failure.message,
+  };
+  if (result?.error && result.error !== failure.error) out.other_error = result.error;
+  return out;
+}

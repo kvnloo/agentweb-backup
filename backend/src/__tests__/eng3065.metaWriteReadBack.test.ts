@@ -219,6 +219,20 @@ describe('ENG-3065 at the tool boundary (AgentModeService handlers)', () => {
     expect(r).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['status'] });
   });
 
+  it('campaign update: a name failure still reports the spend-cap verification', async () => {
+    m.getCampaign.mockResolvedValue({ id: 'c1', name: 'Old', spend_cap: '50000' });
+    const r = await service.manageMetaAdsCampaigns('user123', 'UPDATE', '123456789', 'c1', { name: 'New', spend_cap: 500 });
+    expect(r).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['name'], spend_cap_verified: true });
+    expect(r.message).toMatch(/spend cap verified/);
+  });
+
+  it('ad update: a status failure after a creative_id attach still verifies the swap', async () => {
+    m.getAd.mockResolvedValue({ id: 'a1', status: 'ACTIVE', creative: { id: 'cr2' } });
+    const r = await service.updateMetaAdsAd('user123', 'a1', { creative_id: 'cr2', status: 'PAUSED' });
+    expect(r).toMatchObject({ success: false, errorType: 'unsupported_field', fields: ['status'], new_creative_id: 'cr2' });
+    expect(r.message).toMatch(/Swapped in creative cr2/);
+  });
+
   it('ad update: a failing read-back is read_back_failed', async () => {
     m.getAd.mockRejectedValue(new Error('Meta rate limit exceeded'));
     const r = await service.updateMetaAdsAd('user123', 'a1', { name: 'X' });
