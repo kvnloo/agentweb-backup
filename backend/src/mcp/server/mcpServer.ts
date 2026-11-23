@@ -394,7 +394,7 @@ export function setupMcpServer(
     }
 
     // Log all incoming requests
-    console.log(`[MCP-SERVER-DEBUG] POST request - sessionId header: ${sessionId || 'MISSING'}, method: ${req.body?.method || 'unknown'}, has session: ${sessionId ? sessions.has(sessionId) : 'N/A'}`);
+    console.log(`[MCP-SERVER-DEBUG] POST request - sessionId header: ${sessionId || 'MISSING'}, method: ${typeof req.body?.method === 'string' ? req.body.method : 'unknown'}, has session: ${sessionId ? sessions.has(sessionId) : 'N/A'}`);
 
     try {
       let transport: StreamableHTTPServerTransport;
