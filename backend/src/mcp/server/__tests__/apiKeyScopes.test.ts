@@ -64,3 +64,17 @@ describe('a tool name that is not text (ENG-2840 W2-2: found in review, it left 
     expect(findApiKeyOnlyToolCallForNonKey([callNamed({ toString: 'x' }), callNamed('locked')], withLookup)).toMatchObject({ tool: 'locked' });
   });
 });
+
+describe('a tool name that is an array is not read as its first element (second review)', () => {
+  const callNamed = (name: unknown) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+  const lookup = (name: string) => (name === 'locked' ? { requiredScope: 'x:y', apiKeyOnly: true } : undefined);
+
+  it('naming a gated tool inside an array neither gets it checked as that tool nor gets it past the check as another', () => {
+    // As an unknown tool it needs tools:execute (a key with it passes the gate; the SDK then rejects a name that is not text), as a
+    // gated tool it would need x:y. A key that has execute but not x:y must not be refused for "locked" here, nor treated as having it.
+    expect(findScopeDenial(callNamed(['locked']), ['tools:execute'], lookup)).toBeNull();
+    expect(findApiKeyOnlyToolCallForNonKey(callNamed(['locked']), lookup)).toBeNull();
+    expect(findApiKeyOnlyToolCall(callNamed(['locked']), lookup)).toBeNull();
+    expect(findScopeDenial(callNamed(['locked']), ['tools:read'], lookup)).toMatchObject({ requiredScope: 'tools:execute' });
+  });
+});

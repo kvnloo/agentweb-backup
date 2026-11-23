@@ -96,6 +96,7 @@ describe('an aw_ key: the limiter counts the members of a batch that is served',
     const refused = await post(app, batch(3), { session }); // its own request makes 5; it needs 2 more and 1 is left
     expect(refused.status).toBe(429);
     expect(refused.body).toMatchObject({ error: 'Rate limit exceeded', retryAfterMs: expect.any(Number) });
+    expect(refused.body.retryAfterMs).toBeGreaterThan(0); // a real wait (until the oldest count leaves the minute), not 0
     expect((await post(app, call(1), { session })).status).toBe(200); // the 6th
     expect((await post(app, call(2), { session })).status).toBe(429);
   });

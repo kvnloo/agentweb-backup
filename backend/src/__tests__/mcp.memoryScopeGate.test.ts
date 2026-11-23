@@ -161,3 +161,19 @@ describe('a tool name that is not text (found in review: the request used to han
     expect((await send(app, hostileCall, 'oauth-token')).status).not.toBe(403);
   });
 });
+
+describe('a JSON-RPC method that is not text (found in the second review: the debug log line interpolated it and the request hung)', () => {
+  it('is answered at once, for a key and for an OAuth client', async () => {
+    const body = { jsonrpc: '2.0', id: 1, method: { toString: 1 } };
+    const viaKey = await send(appFor(['tools:read', 'tools:execute']), body);
+    expect(viaKey.status).toBeLessThan(600);
+    mockValidateKey.mockResolvedValue(null);
+    mockValidateOAuth.mockResolvedValue({ userId: `oauth-user-${++seq}-${Date.now()}`, clientId: 'client-1' });
+    const app = express();
+    app.use(express.json());
+    process.env.MCP_HTTP_ENABLED = 'true';
+    delete process.env.MCP_ACCESS_TOKEN;
+    setupMcpServer(app);
+    expect((await send(app, body, 'oauth-token')).status).toBeLessThan(600);
+  });
+});

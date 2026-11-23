@@ -14,7 +14,7 @@ jest.mock('../../../utils/embeddings', () => ({ embedText: jest.fn() }));
 import { mcpToolRegistry } from '../registry';
 import { findApiKeyOnlyToolCallForNonKey, findScopeDenial } from '../apiKeyScopes';
 import {
-  checkId, exactArgs, listMemories, LIST_MEMORIES_DEFAULT_LIMIT, LIST_MEMORIES_MAX_LIMIT, MEMORY_MCP_MAX_ROWS,
+  checkId, exactArgs, listMemories, LIST_MEMORIES_DEFAULT_LIMIT, LIST_MEMORIES_MAX_LIMIT, MCP_EMBED_TIMEOUT_MS, MEMORY_MCP_MAX_ROWS,
 } from '../memoryTools';
 import { MEMORY_CATEGORIES } from '../../../utils/memoryCategories';
 import { userDb, orgDb, accountMemoryDb, orgMemoryDb } from '../../../services/db';
@@ -312,7 +312,7 @@ describe('save_org_memory and delete_org_memory', () => {
     db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(200));
     const full = await run('save_org_memory', { content: 'x', category: 'insight' });
     expect(full).toMatchObject({ success: false, stored: 200 });
-    expect(full.message).toMatch(/This organization has 200 memories.*delete_org_memory/s);
+    expect(full.message).toMatch(/This organization has 200 memories.*Only an organization owner or admin can delete/s); // the default test user is a plain member
     expect(db.orgMemoryDb.getOrgMemories).toHaveBeenCalledWith('org1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true, consistentRead: true });
     expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
     db.orgMemoryDb.getOrgMemories.mockResolvedValue([row(1, { content: 'we sell widgets' })]);
@@ -560,3 +560,74 @@ describe('saves run one at a time per account (the cap and the duplicate check c
     expect(embedText).not.toHaveBeenCalled();
   });
 });
+
+describe('the lock is bounded and is its own (second review)', () => {
+  it('a hung embedding is given up on after the MCP timeout, and the save queued behind it then proceeds', async () => {
+    expect(MCP_EMBED_TIMEOUT_MS).toBe(15_000);
+    jest.useFakeTimers();
+    try {
+      (embedText as jest.Mock).mockReturnValueOnce(new Promise(() => {}));
+      const first = run('save_memory', { content: 'slow embedding', category: 'insight' });
+      const second = run('save_memory', { content: 'queued behind it', category: 'insight' });
+      await jest.advanceTimersByTimeAsync(14_000);
+      expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled(); // still waiting, and the second is still queued
+      await jest.advanceTimersByTimeAsync(2_000);
+      await expect(first).resolves.toMatchObject({ success: true });
+      await expect(second).resolves.toMatchObject({ success: true });
+      expect(db.accountMemoryDb.addMemory.mock.calls[0][4]).toBeUndefined(); // the slow one is saved without an embedding
+      expect(db.accountMemoryDb.addMemory.mock.calls[1][4]).toEqual([0.5]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('the org save has the same bound', async () => {
+    jest.useFakeTimers();
+    try {
+      (embedText as jest.Mock).mockReturnValueOnce(new Promise(() => {}));
+      const pending = run('save_org_memory', { content: 'slow org embedding', category: 'insight' });
+      await jest.advanceTimersByTimeAsync(15_001);
+      await expect(pending).resolves.toMatchObject({ success: true });
+      expect(db.orgMemoryDb.addMemory.mock.calls[0][4]).toBeUndefined();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('memory saves have their own lock: a write held under the strategy lock for the same account does not hold a save', async () => {
+    const { withAccountLock } = await import('../accountLock');
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const strategy = withAccountLock('strategy', { userId: 'u1' }, () => held);
+    const out = await run('save_memory', { content: 'not held by the strategy lock', category: 'insight' });
+    expect(out).toMatchObject({ success: true });
+    release();
+    await strategy;
+  });
+});
+
+describe('the cap message tells the caller what THEY can do (Opslane P1: a member was told to delete, and cannot)', () => {
+  it('an org member (cannot delete org memory) is told an owner or admin must make room, and is not told to call delete_org_memory', async () => {
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(200));
+    const out = await run('save_org_memory', { content: 'one more', category: 'insight' });
+    expect(out).toMatchObject({ success: false, stored: 200, limit: 200 });
+    expect(out.message).toMatch(/Only an organization owner or admin can delete organization memories: ask one of them/);
+    expect(out.message).not.toMatch(/delete_org_memory/);
+    expect(out.message).toMatch(/Nothing was saved\.$/);
+  });
+
+  it.each(['admin', 'owner'])('an org %s is told how to delete themselves', async (role) => {
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1', orgRole: role });
+    db.orgMemoryDb.getOrgMemories.mockResolvedValue(rows(200));
+    const out = await run('save_org_memory', { content: 'one more', category: 'insight' });
+    expect(out.message).toMatch(/list_memories finds them, delete_org_memory removes one/);
+    expect(out.message).not.toMatch(/Only an organization owner or admin/);
+  });
+
+  it('a user over the cap on their OWN memory is always told to delete (they can)', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue(rows(200));
+    const out = await run('save_memory', { content: 'one more', category: 'insight' });
+    expect(out.message).toMatch(/list_memories finds them, delete_memory removes one/);
+  });
+});
+

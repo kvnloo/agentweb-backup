@@ -278,7 +278,7 @@ describe('the optional write gate (ENG-2840 W2-2: the MCP tools add their cap an
     const gate = jest.fn().mockResolvedValue(gateAnswer);
     const out = await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, gate);
     expect(out).toEqual(gateAnswer);
-    expect(gate).toHaveBeenCalledWith({ scope: 'user', ownerId: 'u1', content: 'a fact', category: 'insight', chunkCount: 1 });
+    expect(gate).toHaveBeenCalledWith({ scope: 'user', ownerId: 'u1', content: 'a fact', category: 'insight', chunkCount: 1, callerCanDelete: true });
     expect(mockEmbedText).not.toHaveBeenCalled();
     expect(mockAddAccount).not.toHaveBeenCalled();
   });
@@ -310,7 +310,7 @@ describe('the optional write gate (ENG-2840 W2-2: the MCP tools add their cap an
   it('org: owner id is the caller\'s org, and the org refusals come before the gate', async () => {
     const gate = jest.fn().mockResolvedValue(undefined);
     await saveOrgMemory({ content: 'org fact', category: 'workflow' }, ctx, gate);
-    expect(gate).toHaveBeenCalledWith({ scope: 'org', ownerId: 'org1', content: 'org fact', category: 'workflow', chunkCount: 1 });
+    expect(gate).toHaveBeenCalledWith({ scope: 'org', ownerId: 'org1', content: 'org fact', category: 'workflow', chunkCount: 1, callerCanDelete: false });
     expect(mockAddOrg).toHaveBeenCalledWith('org1', 'workflow', 'org fact', 'u1', EMBEDDING);
     const refused = jest.fn();
     mockGetUserById.mockResolvedValue({ userId: 'u1' });
@@ -333,3 +333,128 @@ describe('the optional write gate (ENG-2840 W2-2: the MCP tools add their cap an
     expect(await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx)).toMatchObject({ success: true, memoryId: 'm1' });
   });
 });
+
+describe('embedTimeoutMs: a hung embedding does not hold a save forever (ENG-2840 W2-2, second review)', () => {
+  const hung = () => new Promise<never>(() => {});
+
+  it('with the option, a hung embedding is given up on and the row is saved without one', async () => {
+    mockEmbedText.mockReturnValue(hung());
+    const out = await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 20 });
+    expect(out).toMatchObject({ success: true });
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', undefined);
+  });
+
+  it('the same for the org save', async () => {
+    mockEmbedText.mockReturnValue(hung());
+    expect(await saveOrgMemory({ content: 'org fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 20 })).toMatchObject({ success: true });
+    expect(mockAddOrg).toHaveBeenCalledWith('org1', 'insight', 'org fact', 'u1', undefined);
+  });
+
+  it('an embedding that arrives in time is used, with the option set', async () => {
+    mockEmbedText.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(EMBEDDING), 5)));
+    await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 500 });
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
+  });
+
+  it('without the option nothing changes: Emma\'s own call waits for the embedding as before', async () => {
+    mockEmbedText.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(EMBEDDING), 40)));
+    await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx);
+    expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
+  });
+
+  it('the timer is cleared when the embedding arrives in time (nothing is left to keep the process waiting)', async () => {
+    jest.useFakeTimers();
+    try {
+      mockEmbedText.mockResolvedValue(EMBEDDING);
+      await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 60_000 });
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('every part of a split save gets its own wait', async () => {
+    mockEmbedText.mockReturnValue(hung());
+    const out = await saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 10 });
+    expect(out).toMatchObject({ success: true, memoryIds: expect.any(Array) });
+    expect(mockAddAccount.mock.calls.length).toBeGreaterThan(1);
+    expect(mockAddAccount.mock.calls.every((c) => c[4] === undefined)).toBe(true);
+  });
+
+  it('an abandoned embedding that fails later does not become an unhandled rejection', async () => {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown) => { seen.push(reason); };
+    process.on('unhandledRejection', listener);
+    try {
+      mockEmbedText.mockImplementation(() => new Promise((_resolve, reject) => setTimeout(() => reject(new Error('late failure')), 40)));
+      await saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx, undefined, { embedTimeoutMs: 10 });
+      await new Promise((r) => setTimeout(r, 90));
+      expect(seen).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+  });
+});
+
+describe('a split save that fails part-way removes the parts it already wrote (so a retry does not duplicate them)', () => {
+  it('account: the second write fails, the first part is removed from the caller\'s own account, and the original error comes out', async () => {
+    mockAddAccount.mockReset();
+    mockAddAccount.mockResolvedValueOnce({ memoryId: 'part-1' }).mockRejectedValueOnce(new Error('write failed'));
+    await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('write failed');
+    expect(mockDeleteAccount).toHaveBeenCalledTimes(1);
+    expect(mockDeleteAccount).toHaveBeenCalledWith('u1', 'part-1');
+  });
+
+  it('org: the same, against the org\'s table', async () => {
+    mockAddOrg.mockReset();
+    mockAddOrg.mockResolvedValueOnce({ memoryId: 'org-part-1' }).mockRejectedValueOnce(new Error('write failed'));
+    await expect(saveOrgMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('write failed');
+    expect(mockDeleteOrg).toHaveBeenCalledWith('org1', 'org-part-1');
+    expect(mockDeleteAccount).not.toHaveBeenCalled();
+  });
+
+  it('a failure of the embedding step after the first part counts the same', async () => {
+    mockEmbedText.mockResolvedValueOnce(EMBEDDING).mockRejectedValueOnce(new Error('embedding service down'));
+    await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('embedding service down');
+    expect(mockDeleteAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it('a part that could not be removed is logged by id and does not hide the original error', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockAddAccount.mockReset();
+    mockAddAccount.mockResolvedValueOnce({ memoryId: 'part-1' }).mockRejectedValueOnce(new Error('write failed'));
+    mockDeleteAccount.mockRejectedValueOnce(new Error('delete failed too'));
+    await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('write failed');
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/1 could not be removed again: part-1/);
+    warn.mockRestore();
+  });
+
+  it('a failure on the FIRST part removes nothing, and a save that succeeds removes nothing', async () => {
+    mockAddAccount.mockReset();
+    mockAddAccount.mockRejectedValueOnce(new Error('first write failed'));
+    await expect(saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx)).rejects.toThrow('first write failed');
+    expect(mockDeleteAccount).not.toHaveBeenCalled();
+    mockAddAccount.mockReset();
+    mockAddAccount.mockResolvedValue({ memoryId: 'ok' });
+    await saveAccountMemory({ content: longText(2500), category: 'insight' }, ctx);
+    expect(mockDeleteAccount).not.toHaveBeenCalled();
+  });
+});
+
+describe('the gate is told whether the caller can delete (so a refusal can say who can make room)', () => {
+  const asRole = (orgRole: string) => mockGetUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1', orgRole });
+
+  it.each([['member', false], ['admin', true], ['owner', true]])('org save by a %s: callerCanDelete is %s', async (role, expected) => {
+    asRole(role);
+    const gate = jest.fn().mockResolvedValue(undefined);
+    await saveOrgMemory({ content: 'x', category: 'insight' }, ctx, gate);
+    expect(gate.mock.calls[0][0].callerCanDelete).toBe(expected);
+  });
+
+  it('a user\'s own memory can always be deleted by them', async () => {
+    const gate = jest.fn().mockResolvedValue(undefined);
+    await saveAccountMemory({ content: 'x', category: 'insight' }, ctx, gate);
+    expect(gate.mock.calls[0][0].callerCanDelete).toBe(true);
+  });
+});
+

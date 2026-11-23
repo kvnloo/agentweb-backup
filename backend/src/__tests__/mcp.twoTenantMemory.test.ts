@@ -367,6 +367,19 @@ describe('the cap of 200 and the length limits', () => {
     expect(orgRows(TENANT_A.orgId)).toHaveLength(200);
   });
 
+  it('at the org cap a plain member is told an owner or admin must delete, the owner is told how to delete (Opslane P1)', async () => {
+    fill('AW-OrgMemory', 'orgId', TENANT_A.orgId, 198); // 2 seeded + 198 = 200
+    const member = await (await as(TENANT_A.member!, ORG_WRITER)).call('save_org_memory', { content: 'one more', category: 'insight' });
+    expect(member.json).toMatchObject({ success: false, stored: 200 });
+    expect(member.json.message).toMatch(/Only an organization owner or admin can delete organization memories/);
+    expect(member.json.message).not.toMatch(/delete_org_memory/);
+    const owner = await (await as(TENANT_A.owner, ORG_WRITER)).call('save_org_memory', { content: 'one more', category: 'insight' });
+    expect(owner.json.message).toMatch(/delete_org_memory removes one/);
+    // and the way out the owner was shown works: the owner deletes one, the member can save
+    expect((await (await as(TENANT_A.owner, ORG_WRITER)).call('delete_org_memory', { memoryId: '00FILL-0000' })).json.success).toBe(true);
+    expect((await (await as(TENANT_A.member!, ORG_WRITER)).call('save_org_memory', { content: 'room now', category: 'insight' })).json.success).toBe(true);
+  });
+
   it('a split save counts its rows against the cap', async () => {
     fill('AW-AccountMemory', 'userId', TENANT_A.owner, 196);
     const a = await as(TENANT_A.owner);
@@ -456,7 +469,7 @@ describe('saves sent at the same moment (a JSON-RPC batch or a retry): the cap a
     expect(orgRows(TENANT_A.orgId)).toHaveLength(200);
   });
 
-  it('another tenant saving at the same moment is not held up or counted', async () => {
+  it('another tenant saving at the same moment is not counted against the first tenant\'s cap', async () => {
     fillAccount(TENANT_A.owner, 197); // A is full
     const a = await as(TENANT_A.owner);
     const b = await as(TENANT_B.owner);
