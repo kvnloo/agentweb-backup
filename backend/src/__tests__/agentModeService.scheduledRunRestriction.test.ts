@@ -155,7 +155,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('still runs an ordinary tool, and spends no reads on it', async () => {
       marked();
-      await expect(run('notify_session', { isUnattendedRun: true })).resolves.toEqual({ ran: true });
+      await expect(run('read_brand_guidelines', { isUnattendedRun: true })).resolves.toEqual({ ran: true });
       expect(getSession).not.toHaveBeenCalled();
       expect(getSchedule).not.toHaveBeenCalled();
     });
