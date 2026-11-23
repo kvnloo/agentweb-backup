@@ -9,6 +9,8 @@
  */
 
 const URN_RE = /urn:li:(share|ugcPost|activity):(\d+)/;
+const BARE_URN_RE = /^urn:li:(share|ugcPost|activity):(\d+)$/;
+const LINKEDIN_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*linkedin\.com\/(feed\/update|posts)\//i;
 // Public post URL slug, e.g. linkedin.com/posts/acme_title-activity-7123456789-AbCd
 const ACTIVITY_SLUG_RE = /[-_]activity[-_](\d{6,})(?:[-_/?#]|$)/;
 
@@ -32,11 +34,17 @@ export function normalizeLinkedInPostUrn(raw: unknown): PostUrnResult {
     }
   }
 
-  const urn = value.match(URN_RE);
-  if (urn) return { ok: true, urn: `urn:li:${urn[1]}:${urn[2]}` };
+  const bare = value.match(BARE_URN_RE);
+  if (bare) return { ok: true, urn: `urn:li:${bare[1]}:${bare[2]}` };
 
-  const slug = value.match(ACTIVITY_SLUG_RE);
-  if (slug) return { ok: true, urn: `urn:li:activity:${slug[1]}` };
+  // URLs are only trusted on a linkedin.com post path (feed/update or posts).
+  if (LINKEDIN_URL_RE.test(value)) {
+    const path = value.replace(/[?#].*$/, '');
+    const urn = path.match(new RegExp(URN_RE.source + '(?:/|$)'));
+    if (urn) return { ok: true, urn: `urn:li:${urn[1]}:${urn[2]}` };
+    const slug = path.match(ACTIVITY_SLUG_RE);
+    if (slug) return { ok: true, urn: `urn:li:activity:${slug[1]}` };
+  }
 
   if (/^\d+$/.test(value)) {
     return {

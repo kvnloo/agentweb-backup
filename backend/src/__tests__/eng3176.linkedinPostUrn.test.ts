@@ -65,3 +65,17 @@ describe('linkedinManagePost post_urn normalization', () => {
     expect(deps.linkedinDeletePost).toHaveBeenCalledWith('u1', 'a1', 'raw-id', undefined);
   });
 });
+
+describe('ENG-3176 CodeRabbit follow-up: strict validation', () => {
+  const { normalizeLinkedInPostUrn: n } = require('../emma/impl/linkedinPostUrn');
+  it('rejects URNs with trailing junk', () => {
+    expect(n('urn:li:share:123oops').ok).toBe(false);
+  });
+  it('rejects activity slugs on non-LinkedIn hosts', () => {
+    expect(n('https://example.com/posts/a-activity-7123456789-AbCd').ok).toBe(false);
+  });
+  it('still accepts LinkedIn post URLs', () => {
+    expect(n('https://www.linkedin.com/posts/acme_title-activity-7123456789-AbCd')).toEqual({ ok: true, urn: 'urn:li:activity:7123456789' });
+    expect(n('https://www.linkedin.com/feed/update/urn:li:share:7123456789/')).toEqual({ ok: true, urn: 'urn:li:share:7123456789' });
+  });
+});

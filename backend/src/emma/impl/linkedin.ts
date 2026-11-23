@@ -1143,6 +1143,13 @@ export async function linkedinManagePost(
     const normalized = normalizeLinkedInPostUrn(args.post_urn);
     if (!normalized.ok) return { success: false, message: normalized.message };
     args = { ...args, post_urn: normalized.urn };
+    // reshareContext.parent accepts only share/ugcPost URNs, not activity URNs.
+    if (action === 'repost' && normalized.urn.startsWith('urn:li:activity:')) {
+      return {
+        success: false,
+        message: `Cannot repost ${normalized.urn}: repost needs the post's urn:li:share:<id> or urn:li:ugcPost:<id>, not an activity URN.`,
+      };
+    }
   }
   const requirePostIds = () =>
     !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
