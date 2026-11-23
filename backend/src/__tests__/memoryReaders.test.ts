@@ -413,7 +413,7 @@ describe('a row without text content (found by Opslane on the second page of an 
     expect(warn.mock.calls[0][0]).toMatch(/skipped 2 row\(s\) without text content, ids 01ROW0004, 01ROW0007 \(u1\)/);
   });
 
-  it('is skipped for a list read too (the projection keeps it content-less, so the same rule applies)', async () => {
+  it('is skipped for a list read too (the same read path with the list options)', async () => {
     servePages([[accountRow(1)], [noContent('01ROW0002')]], accountKey);
     const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
     expect(rows.map((r: Row) => r.content)).toEqual(['fact 1']);
@@ -447,6 +447,31 @@ describe('a row without text content (found by Opslane on the second page of an 
     expect(warn.mock.calls.map((c) => c[0]).filter((m: string) => /skipped 1 row\(s\) without text content, ids 01ROW0001/.test(m))).toHaveLength(1);
   });
 
+  it('skipped rows ALONE reaching the bound do not end the read: it goes on and fills the bound with readable rows (normal exit)', async () => {
+    servePages([[noContent('01ROW0001'), noContent('01ROW0002')], [accountRow(3), accountRow(4)]], accountKey);
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 2 });
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 3', 'fact 4']);
+    // The second page is asked for the remainder of the bound minus READABLE rows (2), not minus skipped ones (which would be 0).
+    expect(mockDocumentClientMethods.query.mock.calls.map((c) => c[0].Limit)).toEqual([2, 2]);
+  });
+
+  it('the same on the learning-range jump exit: skipped rows alone reaching the bound do not stop the read', async () => {
+    mockDocumentClientMethods.query.mockImplementation((params: any) => ({
+      promise: async () => (params.KeyConditionExpression.includes('learningBoundary')
+        ? { Items: [accountRow(3), accountRow(4)] }
+        : { Items: [noContent('01ROW0001'), noContent('01ROW0002')], LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { newestFirst: false, maxRows: 2 });
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 3', 'fact 4']);
+  });
+
+  it('the warning counts every skipped row but names at most five ids (it bounds the log line)', async () => {
+    servePages([[...range(1, 7, (i) => noContent(`01ROW000${i}`)), accountRow(8)]], accountKey);
+    await accountMemoryDb.getUserMemories('u1');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/skipped 7 row\(s\) without text content, ids 01ROW0001, 01ROW0002, 01ROW0003, 01ROW0004, 01ROW0005 \(u1\)$/);
+  });
+
   it('no skipped-row warning when every row is readable', async () => {
     servePages([range(1, 3, accountRow)], accountKey);
     await accountMemoryDb.getUserMemories('u1');
@@ -472,14 +497,15 @@ describe('assertMemorySaveable refuses exactly what addMemory refuses, with the 
     ['a blank content', 'insight', '   '],
     ['an empty content', 'insight', ''],
     ['a content over the limit', 'insight', 'x'.repeat(2001)],
+    ['a bad category AND a blank content: the category message wins, as in addMemory (the order is part of the contract)', 'other', '   '],
   ];
   it.each(cases)('%s', async (_name, category, content) => {
     let guard = '';
     try { assertMemorySaveable(category, content); } catch (error: any) { guard = error.message; }
     expect(guard).not.toBe('');
     mockDocumentClientMethods.put.mockReturnValue({ promise: async () => ({}) });
-    await expect(accountMemoryDb.addMemory('u1', category, content)).rejects.toThrow(guard);
-    await expect(orgMemoryDb.addMemory('o1', category, content, 'author')).rejects.toThrow(guard);
+    await expect(accountMemoryDb.addMemory('u1', category, content)).rejects.toMatchObject({ message: guard });
+    await expect(orgMemoryDb.addMemory('o1', category, content, 'author')).rejects.toMatchObject({ message: guard });
     expect(mockDocumentClientMethods.put).not.toHaveBeenCalled();
   });
 
