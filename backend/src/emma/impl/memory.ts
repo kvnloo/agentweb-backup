@@ -28,6 +28,19 @@ export interface MemoryToolContext {
   sessionId?: string;
 }
 
+/**
+ * A check a CALLER adds in front of a save, after the shared guards (memory switched on, org found, arguments valid) and before anything
+ * is embedded or written: the MCP tools use it for their per-account cap and duplicate check. Return a result to answer the call with it
+ * instead of writing; return nothing to go on. Emma's own tools pass none, so their behaviour and order of checks are unchanged.
+ */
+export type MemoryWriteGate = (request: {
+  scope: 'user' | 'org';
+  ownerId: string;
+  content: string;
+  category: MemoryCategory;
+  chunkCount: number;
+}) => Promise<Record<string, unknown> | undefined>;
+
 function callerId(context?: MemoryToolContext): string {
   const userId = context?.userId || context?.agentUserId;
   if (!userId) throw new Error('Authentication required');
@@ -89,7 +102,7 @@ async function writeChunks(
   return memoryIds;
 }
 
-export async function saveAccountMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext) {
+export async function saveAccountMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext, gate?: MemoryWriteGate) {
   const userId = callerId(context);
   const { userDb, accountMemoryDb } = await import('../../services/db');
   const user = await userDb.getUserById(userId);
@@ -97,6 +110,8 @@ export async function saveAccountMemory(args: { content?: unknown; category?: un
     return { success: false, message: 'Memory is disabled for this account.' };
   }
   const { content, category } = checkMemorySaveArgs(args);
+  const early = await gate?.({ scope: 'user', ownerId: userId, content, category, chunkCount: splitMemoryContent(content).length });
+  if (early) return early;
   const memoryIds = await writeChunks(userId, content, (chunk, embedding) =>
     accountMemoryDb.addMemory(userId, category, chunk, context?.sessionId, embedding),
   );
@@ -121,7 +136,7 @@ export async function deleteAccountMemory(args: { memoryId?: unknown }, context?
   return { success: true, message: `Memory ${memoryId} deleted.` };
 }
 
-export async function saveOrgMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext) {
+export async function saveOrgMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext, gate?: MemoryWriteGate) {
   const userId = callerId(context);
   const { userDb, orgDb, orgMemoryDb } = await import('../../services/db');
   const user = await userDb.getUserById(userId);
@@ -137,6 +152,8 @@ export async function saveOrgMemory(args: { content?: unknown; category?: unknow
   }
   const { content, category } = checkMemorySaveArgs(args);
   const orgId = user.orgId;
+  const early = await gate?.({ scope: 'org', ownerId: orgId, content, category, chunkCount: splitMemoryContent(content).length });
+  if (early) return early;
   const memoryIds = await writeChunks(userId, content, (chunk, embedding) =>
     orgMemoryDb.addMemory(orgId, category, chunk, userId, embedding),
   );
