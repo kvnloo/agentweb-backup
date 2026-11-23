@@ -1,5 +1,5 @@
 import { chatbotDb } from '../services/chatbotService';
-import { interactiveShareAllowsSensitiveActions } from '../utils/interactiveShare';
+import { interactiveShareAllowsSensitiveActions, SHARE_DIALOG_LIFETIMES_DAYS } from '../utils/interactiveShare';
 
 /**
  * ENG-3170: the owner's per-link choice "allow sensitive actions".
@@ -8,19 +8,60 @@ import { interactiveShareAllowsSensitiveActions } from '../utils/interactiveShar
  * WRITTEN (every new link stores an explicit choice, off unless the owner's share dialog said otherwise; an explicit choice is
  * applied to a link that is already there; a caller with no choice never touches it).
  */
+/** A link as it was stored before the setting existed: shared on 2026-11-01, living `days` days. */
+const SHARED_AT = '2026-11-01T00:00:00.000Z';
+const lived = (days: number, extra: Record<string, unknown> = {}) => ({
+  sharedAt: SHARED_AT,
+  expiresAt: new Date(Date.parse(SHARED_AT) + days * 86_400_000).toISOString(),
+  ...extra,
+});
+
 describe('interactiveShareAllowsSensitiveActions (how a stored link reads)', () => {
   it('an explicit choice wins, whatever else is on the link', () => {
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: true })).toBe(true);
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: false })).toBe(false);
-    // an explicit off beats an expiry date, an explicit on beats a missing one
-    expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: false, expiresAt: '2027-01-01T00:00:00.000Z' })).toBe(false);
+    // an explicit off beats a dialog lifetime, an explicit on beats a missing one or an admin 45-day one
+    expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: false }))).toBe(false);
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: true })).toBe(true);
+    expect(interactiveShareAllowsSensitiveActions(lived(45, { allowSensitiveActions: true }))).toBe(true);
   });
 
-  it('a link made before the setting existed: a timed (dialog) link keeps working, a no-expiry link is off', () => {
-    expect(interactiveShareAllowsSensitiveActions({ expiresAt: '2027-01-01T00:00:00.000Z' })).toBe(true);
-    expect(interactiveShareAllowsSensitiveActions({})).toBe(false);
-    expect(interactiveShareAllowsSensitiveActions({ expiresAt: '' })).toBe(false);
+  describe('a link made BEFORE the setting existed (no choice stored)', () => {
+    it.each(SHARE_DIALOG_LIFETIMES_DAYS)('made on purpose in the share dialog (%i days): keeps today\'s behaviour (on)', (days) => {
+      expect(interactiveShareAllowsSensitiveActions(lived(days))).toBe(true);
+    });
+
+    it('the lifetimes are exactly the ones the share dialog offers', () => {
+      expect([...SHARE_DIALOG_LIFETIMES_DAYS]).toEqual([1, 3, 7, 14, 30, 90, 365]);
+    });
+
+    it('made by the admin Chat History tab (45 days): OFF. 890 of the 921 live timed links on 2026-11-23 were of this kind', () => {
+      expect(interactiveShareAllowsSensitiveActions(lived(45))).toBe(false);
+    });
+
+    it.each([0, 2, 5, 10, 44, 46, 60, 100, 366, 400])('any other lifetime nobody can account for (%i days) is OFF', (days) => {
+      expect(interactiveShareAllowsSensitiveActions(lived(days))).toBe(false);
+    });
+
+    it('rounds to the nearest whole day (the two timestamps are taken a moment apart), not further', () => {
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: SHARED_AT, expiresAt: new Date(Date.parse(SHARED_AT) + 7 * 86_400_000 + 5_000).toISOString() })).toBe(true);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: SHARED_AT, expiresAt: new Date(Date.parse(SHARED_AT) + 7 * 86_400_000 - 5_000).toISOString() })).toBe(true);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: SHARED_AT, expiresAt: new Date(Date.parse(SHARED_AT) + 7.6 * 86_400_000).toISOString() })).toBe(false);
+    });
+
+    it('a link with no expiry (auto-made plan, emailed or Slack-posted, or very old) is OFF', () => {
+      expect(interactiveShareAllowsSensitiveActions({})).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: SHARED_AT })).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ expiresAt: '' })).toBe(false);
+    });
+
+    it('a link whose dates can not be read or compared is OFF', () => {
+      expect(interactiveShareAllowsSensitiveActions({ expiresAt: '2026-11-08T00:00:00.000Z' })).toBe(false); // no sharedAt
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: 'not a date', expiresAt: '2026-11-08T00:00:00.000Z' })).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: SHARED_AT, expiresAt: 'soon' })).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: 20261101, expiresAt: 20261108 })).toBe(false);
+      expect(interactiveShareAllowsSensitiveActions({ sharedAt: '2026-11-08T00:00:00.000Z', expiresAt: SHARED_AT })).toBe(false); // ends before it starts
+    });
   });
 
   it('nothing readable is off (fails closed)', () => {
@@ -33,8 +74,9 @@ describe('interactiveShareAllowsSensitiveActions (how a stored link reads)', () 
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: {} })).toBe(false);
   });
 
-  it('a non-boolean choice falls back to the expiry rule rather than being believed', () => {
-    expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: 'true', expiresAt: '2027-01-01T00:00:00.000Z' })).toBe(true);
+  it('a non-boolean choice falls back to the lifetime rule rather than being believed', () => {
+    expect(interactiveShareAllowsSensitiveActions(lived(7, { allowSensitiveActions: 'true' }))).toBe(true);
+    expect(interactiveShareAllowsSensitiveActions(lived(45, { allowSensitiveActions: 'true' }))).toBe(false);
     expect(interactiveShareAllowsSensitiveActions({ allowSensitiveActions: 'true' })).toBe(false);
   });
 });
@@ -151,9 +193,9 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(setChoiceSpy).not.toHaveBeenCalled();
     });
 
-    it('a link made before the setting existed, with an expiry (so it reads as ON), reads as OFF once a mailed or posted reuse has removed the expiry', () => {
+    it('a link made before the setting existed, with a share-dialog lifetime (so it reads as ON), reads as OFF once a mailed or posted reuse has removed the expiry', () => {
       // the intended outcome, pinned: a link that was sent out to recipients is not one the owner made on purpose for a delegate
-      const before = { isActive: true, token: 't', expiresAt: '2027-02-01T00:00:00.000Z' };
+      const before = { isActive: true, token: 't', ...lived(7) };
       const { expiresAt: _removed, ...after } = before;
       expect(interactiveShareAllowsSensitiveActions(before as Record<string, unknown>)).toBe(true);
       expect(interactiveShareAllowsSensitiveActions(after as Record<string, unknown>)).toBe(false);

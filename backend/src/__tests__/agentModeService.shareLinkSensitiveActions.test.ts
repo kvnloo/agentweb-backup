@@ -129,9 +129,15 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
   });
 
   describe('a link made before the setting existed (nothing stored)', () => {
-    it('a link with an expiry date (made on purpose in the share dialog) keeps today\'s behaviour', async () => {
-      readSession.mockResolvedValue(link({ expiresAt: '2027-01-01T00:00:00.000Z' }));
+    it('a link with a share-dialog lifetime (made on purpose by the owner: 7 days here) keeps today\'s behaviour', async () => {
+      readSession.mockResolvedValue(link({ expiresAt: '2026-11-08T00:00:00.000Z' })); // shared 2026-11-01
       await expect(run(SENSITIVE, VISITOR)).resolves.toEqual({ ran: true });
+    });
+
+    it('a link with the admin Chat History tab\'s 45-day lifetime (the customer never made it) is OFF', async () => {
+      readSession.mockResolvedValue(link({ expiresAt: '2026-12-16T00:00:00.000Z' }));
+      await expect(run(SENSITIVE, VISITOR)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
     });
 
     it('a link with no expiry (auto-made, mailed or very old) is OFF', async () => {
