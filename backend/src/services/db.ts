@@ -11810,12 +11810,32 @@ export const browserCookieDb = {
 
 // ENG-2840 (W2-1): the bounds are in utils/memoryReadLimits.ts (why a read now follows the cursor, and why these numbers).
 export interface MemoryReadOptions {
-  /** Hard bound on rows returned when no `limit` is given. Default: MEMORY_READ_MAX_ROWS_PROMPT. */
+  /** Hard bound on rows returned. Default: MEMORY_READ_MAX_ROWS_PROMPT. Ignored when a `limit` is passed. */
   maxRows?: number;
-  /** Newest rows first (memory ids are ULIDs). Default true; ignored for a category read, whose index sorts by category. */
+  /** Newest rows first (memory ids are ULIDs). Default true. Ignored when a `limit` is passed (that call keeps its old order), and
+   * for a category read, whose index sorts by category, not by time. */
   newestFirst?: boolean;
-  /** Leave the embedding vectors out of the returned rows. Default false: the prompt loader ranks by them. */
+  /** Do not fetch the embedding vectors at all (a projection: about 40 of every 45 KB of a row on the wire). Default false: the
+   * prompt loader ranks by them. */
   omitEmbeddings?: boolean;
+}
+
+/** The bound of a read, as a whole number of at least 1 (a zero or negative bound would send DynamoDB an invalid Limit). */
+function memoryReadBound(options: MemoryReadOptions): number {
+  const bound = Math.floor(options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT);
+  return Number.isFinite(bound) && bound >= 1 ? bound : MEMORY_READ_MAX_ROWS_PROMPT;
+}
+
+// The attributes a memory row carries (read from every row on prod on 2026-11-23). A list read that omits the embeddings names them
+// all, so it fetches everything the row holds except the 1,536-number vector.
+const ACCOUNT_MEMORY_LIST_ATTRIBUTES = ['userId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceSessionId'] as const;
+const ORG_MEMORY_LIST_ATTRIBUTES = ['orgId', 'memoryId', 'category', 'content', 'createdAt', 'updatedAt', 'sourceUserId'] as const;
+
+function withoutEmbeddingsProjection(attributes: readonly string[]): Pick<AWS.DynamoDB.DocumentClient.QueryInput, 'ProjectionExpression' | 'ExpressionAttributeNames'> {
+  return {
+    ProjectionExpression: attributes.map((_, i) => `#mp${i}`).join(', '),
+    ExpressionAttributeNames: Object.fromEntries(attributes.map((name, i) => [`#mp${i}`, name])),
+  };
 }
 
 function withoutEmbeddings<T extends Record<string, any>>(rows: T[]): Omit<T, 'embedding'>[] {
@@ -11861,7 +11881,12 @@ async function queryOrdinaryAccountMemories(
     }
     // With a bound (a `limit` or `opts.maxRows`) keep reading until it is reached or the rows run out. Without one, the old rule
     // stands: the first page that holds any ordinary row is the answer.
-    if (!cursor || (want ? rows.length >= want : rows.length > 0)) return want ? rows.slice(0, want) : rows;
+    if (!cursor || (want ? rows.length >= want : rows.length > 0)) {
+      if (cursor && params.Limit === undefined && opts.maxRows) {
+        console.warn(`[memory] account memory read stopped at its ${opts.maxRows}-row bound with more rows stored (${params.ExpressionAttributeValues?.[':userId']})`);
+      }
+      return want ? rows.slice(0, want) : rows;
+    }
   }
   throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
 }
@@ -11875,9 +11900,17 @@ async function queryOrgMemoryRows(params: AWS.DynamoDB.DocumentClient.QueryInput
   for (let page = 0; page < maxPages; page++) {
     const result = await dynamodb.query({ ...params, ...(cursor ? { ExclusiveStartKey: cursor } : {}), Limit: maxRows - rows.length }).promise();
     if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed org memory page');
-    rows.push(...(result.Items ?? []));
+    for (const item of result.Items ?? []) {
+      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
+        throw new Error('Malformed org memory item');
+      }
+      rows.push(item);
+    }
     cursor = result.LastEvaluatedKey;
-    if (!cursor || rows.length >= maxRows) return rows.slice(0, maxRows);
+    if (!cursor || rows.length >= maxRows) {
+      if (cursor) console.warn(`[memory] org memory read stopped at its ${maxRows}-row bound with more rows stored (${params.ExpressionAttributeValues?.[':orgId']})`);
+      return rows.slice(0, maxRows);
+    }
   }
   throw new Error('Org memory retrieval exceeded its bounded page budget; incomplete results withheld');
 }
@@ -11959,7 +11992,9 @@ export const accountMemoryDb = {
           ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
         };
 
-      const rows = await queryOrdinaryAccountMemories(params, limit ? {} : { maxRows: options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT });
+      // A list read that leaves the vectors out does not fetch them: a projection, not a strip after the read.
+      const readParams = options.omitEmbeddings ? { ...params, ...withoutEmbeddingsProjection(ACCOUNT_MEMORY_LIST_ATTRIBUTES) } : params;
+      const rows = await queryOrdinaryAccountMemories(readParams, limit ? {} : { maxRows: memoryReadBound(options) });
       return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
@@ -11993,8 +12028,12 @@ export const accountMemoryDb = {
         Key: { userId, memoryId },
         UpdateExpression: 'SET embedding = :e',
         ExpressionAttributeValues: { ':e': embedding },
+        // UpdateItem upserts: without this, a memory deleted while its embedding was being backfilled comes back as a row with no content.
+        ConditionExpression: 'attribute_exists(memoryId)',
       }).promise();
-    } catch (error) {
+    } catch (error: any) {
+      // The memory was deleted in the meantime: there is nothing to backfill.
+      if (error?.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }
@@ -12137,9 +12176,10 @@ export const orgMemoryDb = {
           ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
         };
 
+      const readParams = options.omitEmbeddings ? { ...params, ...withoutEmbeddingsProjection(ORG_MEMORY_LIST_ATTRIBUTES) } : params;
       const rows = limit
-        ? (await dynamodb.query(params).promise()).Items || []
-        : await queryOrgMemoryRows(params, options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT);
+        ? (await dynamodb.query(readParams).promise()).Items || []
+        : await queryOrgMemoryRows(readParams, memoryReadBound(options));
       return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getOrgMemories');
@@ -12173,8 +12213,12 @@ export const orgMemoryDb = {
         Key: { orgId, memoryId },
         UpdateExpression: 'SET embedding = :e',
         ExpressionAttributeValues: { ':e': embedding },
+        // UpdateItem upserts: without this, a memory deleted while its embedding was being backfilled comes back as a row with no content.
+        ConditionExpression: 'attribute_exists(memoryId)',
       }).promise();
-    } catch (error) {
+    } catch (error: any) {
+      // The memory was deleted in the meantime: there is nothing to backfill.
+      if (error?.code === 'ConditionalCheckFailedException') return;
       handleDynamoDbError(error, 'setMemoryEmbedding');
       throw error;
     }

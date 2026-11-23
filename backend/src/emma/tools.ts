@@ -11,6 +11,7 @@ import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { userDb } from '../services/db';
 import { MEMORY_AUTOSPLIT_MAX_CHARS } from '../utils/memoryContentLimit';
+import { MEMORY_CATEGORIES } from '../utils/memoryCategories';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -6809,7 +6810,7 @@ emmaToolRegistry.register({
         },
         category: {
           type: 'string',
-          enum: ['preference', 'history', 'insight', 'workflow'],
+          enum: [...MEMORY_CATEGORIES],
           description: 'Category for the memory fact.'
         }
       },
@@ -6856,7 +6857,7 @@ emmaToolRegistry.register({
         },
         category: {
           type: 'string',
-          enum: ['preference', 'history', 'insight', 'workflow'],
+          enum: [...MEMORY_CATEGORIES],
           description: 'Category for the memory fact.'
         }
       },

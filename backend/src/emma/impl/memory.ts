@@ -35,8 +35,9 @@ function callerId(context?: MemoryToolContext): string {
 }
 
 /**
- * Check a save call's arguments. The messages are the ones `services/db` throws for the same mistake, so a caller sees the same
- * words whether the check happens here or there.
+ * Check a save call's arguments. A bad category and blank or missing content give the same messages `services/db` throws for them, so a
+ * caller sees the same words whether the check happens here or there. Content that is not text (`Content must be text`) and content over
+ * 8,000 characters are new refusals: before, the first threw after saving and the second was stopped only by the agent-mode schema.
  */
 export function checkMemorySaveArgs(args: { content?: unknown; category?: unknown } | undefined): { content: string; category: MemoryCategory } {
   const category = args?.category;
@@ -44,6 +45,7 @@ export function checkMemorySaveArgs(args: { content?: unknown; category?: unknow
     throw new Error(`Invalid category: ${String(category)}. Must be one of: ${MEMORY_CATEGORIES.join(', ')}`);
   }
   const content = args?.content;
+  if (content === undefined || content === null) throw new Error('Content is required');
   if (typeof content !== 'string') throw new Error('Content must be text');
   if (content.trim().length === 0) throw new Error('Content is required');
   const length = memoryContentLength(content);

@@ -4,8 +4,9 @@ import { accountMemoryDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
 import { MEMORY_READ_MAX_ROWS_LIST } from '../utils/memoryReadLimits';
 
-// ENG-2840 (W2-1): what the list screens read: up to the list bound, oldest first (the order the screen always had), without embeddings.
-const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: false, omitEmbeddings: true } as const;
+// ENG-2840 (W2-1): what the list screens read: up to the list bound, the NEWEST rows (the handler returns them oldest first, the order the
+// screen always had), without embeddings. A category read cannot be ordered by time (its index sorts by category) and is returned as read.
+const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: true, omitEmbeddings: true } as const;
 
 const router = express.Router();
 
@@ -45,8 +46,9 @@ router.get('/', async (req, res) => {
     const userId = (req as any).user.userId;
     const category = req.query.category as string | undefined;
     // ENG-2840 (W2-1): the whole list (up to the list bound), oldest first as always, without the embedding vectors the screen never reads.
-    const memories = await accountMemoryDb.getUserMemories(userId, category, undefined, LIST_READ);
-    res.json({ memories });
+    const rows = await accountMemoryDb.getUserMemories(userId, category, undefined, LIST_READ);
+    // The read is newest first so that, past the bound, it is the OLDEST rows that are left out; the screen has always listed oldest first.
+    res.json({ memories: category ? rows : [...rows].reverse() });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch memories' });
   }
