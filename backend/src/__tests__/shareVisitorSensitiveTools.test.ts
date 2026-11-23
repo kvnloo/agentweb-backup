@@ -4,6 +4,7 @@ import {
   SHARE_VISITOR_BLOCKED_TOOLS,
   SHARE_VISITOR_SCHEDULE_PROFILE,
   isSensitiveToolCall,
+  isFullControlGatedWholeTool,
   restrictionRefusal,
   sensitiveActionRefusal,
   sensitiveActionScheduleRefusal,
@@ -51,11 +52,13 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
   it('pins the whole-tool list, so a change to it is a decision made on purpose', () => {
     expect([...SHARE_VISITOR_SENSITIVE_TOOLS].sort()).toEqual([
       'delete_character', 'delete_gtm_items', 'delete_landing_page', 'delete_lead_list', 'delete_leads', 'delete_leads_by_filter',
-      'enable_session_tracking', 'google_calendar_delete_event',
+      'deploy_landing_page', 'enable_lead_list_public_access', 'enable_session_tracking', 'get_login_credentials', 'get_test_account',
+      'google_calendar_delete_event',
       'launch_retargeting_campaign', 'launch_targeted_audience_campaign',
       'notify_session', 'post_on_connected_account', 'publish_blog_article', 'publish_landing_page_changes',
       'regenerate_market_strategy', 'revert_landing_page_publish', 'revoke_linkedin_account',
-      'send_email_from_sender', 'send_email_to_lead', 'send_gtm_status_report', 'slack_send_message',
+      'send_email_from_sender', 'send_email_to_lead', 'send_gtm_status_report', 'set_landing_page_lead_list', 'slack_send_message',
+      'test_scheduled_chat',
     ].sort());
   });
 
@@ -82,11 +85,14 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['call_attio_api', ['SEARCH', 'COUNT', 'LIST', 'GET'], ['ADD_ENTRIES', 'REMOVE_ENTRIES', 'CREATE']],
       ['call_linkedin_marketing_api', ['LIST', 'GET', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH'], ['CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'RETAG_UTM', 'SEND_TEST', 'CREATE_CONTENT', 'SET_FIRST_CONTENT', 'INIT_IMAGE_UPLOAD', 'INIT_VIDEO_UPLOAD', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'FINALIZE_VIDEO']],
       ['manage_scheduled_chat', ['create', 'update', 'toggle'], ['delete']],
+      // setting do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
+      ['set_lead_contact_status', ['do-not-contact', 'unsubscribed'], ['active']],
     ];
 
     it.each(mixed)('%s: its reads are allowed and its writes are sensitive', (tool, reads, writes) => {
-      for (const action of reads) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { action }) }).toEqual({ tool, action, sensitive: false });
-      for (const action of writes) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { action }) }).toEqual({ tool, action, sensitive: true });
+      const argument = tool === 'set_lead_contact_status' ? 'contact_status' : 'action';
+      for (const action of reads) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: false });
+      for (const action of writes) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: true });
     });
 
     it('is not fooled by case, spacing or hyphen versus underscore', () => {
@@ -98,7 +104,8 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
 
     it('a missing, empty, non-text or unknown action is sensitive (fail closed)', () => {
       for (const tool of Object.entries(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT).filter(([, r]) => r.kind === 'action').map(([t]) => t)) {
-        for (const args of [undefined, null, {}, { action: '' }, { action: '   ' }, { action: 7 }, { action: ['list'] }, { action: { x: 1 } }, { action: 'brand-new-action' }, 'list']) {
+        const arg = (SHARE_VISITOR_SENSITIVE_BY_ARGUMENT[tool] as { argument: string }).argument;
+        for (const args of [undefined, null, {}, { [arg]: '' }, { [arg]: '   ' }, { [arg]: 7 }, { [arg]: ['list'] }, { [arg]: { x: 1 } }, { [arg]: 'brand-new-action' }, 'list']) {
           expect({ tool, args, sensitive: isSensitiveToolCall(tool, args) }).toEqual({ tool, args, sensitive: true });
         }
       }
@@ -170,9 +177,50 @@ describe('the restriction profiles and the sensitive rule', () => {
 
   it('the visitor refusal keeps the wording the share-session eval keys on, and tells the person what to do', () => {
     expect(sensitiveActionRefusal('delete_leads')).toContain('is not available in shared sessions');
-    expect(sensitiveActionRefusal('delete_leads')).toContain('owner can allow it in the share settings');
+    expect(sensitiveActionRefusal('delete_leads')).toContain('owner can turn on full control in the share settings');
+    expect(sensitiveActionRefusal('get_login_credentials')).toContain('use saved logins');
     expect(sensitiveActionScheduleRefusal('delete_leads')).toContain('The owner can adopt the schedule in the portal to lift this limit.');
     expect(sensitiveActionUnverifiableRefusal('delete_leads')).toContain('Nothing was done');
+  });
+});
+
+describe('Full control: what depends on the link (owner, 2026-11-23: everything a customer can do, like before the restrictions)', () => {
+  it('the sensitive tools, the whole ENG-2816 block list and connect_account depend on the link', () => {
+    for (const tool of [...SHARE_VISITOR_SENSITIVE_TOOLS, ...SHARE_VISITOR_BLOCKED_TOOLS, 'connect_account']) {
+      expect({ tool, gated: isFullControlGatedWholeTool(tool) }).toEqual({ tool, gated: true });
+    }
+  });
+
+  it('admin tools do NOT depend on the link: they are refused for a visitor whatever the owner chose', () => {
+    for (const tool of ADMIN_SKILL_TOOL_NAMES) expect({ tool, gated: isFullControlGatedWholeTool(tool) }).toEqual({ tool, gated: false });
+  });
+
+  it('ordinary tools and tools judged by an argument are not whole-tool gated', () => {
+    for (const tool of ['read_brand_guidelines', 'list_leads', 'email', 'call_hubspot_api', 'google_calendar_create_event', 'unknown_tool', 'constructor']) {
+      expect({ tool, gated: isFullControlGatedWholeTool(tool) }).toEqual({ tool, gated: false });
+    }
+  });
+
+  it('a link with full control lifts the block list and connect_account, and never an admin tool', () => {
+    for (const tool of [...SHARE_VISITOR_BLOCKED_TOOLS, 'connect_account']) {
+      expect(restrictionRefusal('share_visitor', tool, ADMIN_SKILL_TOOL_NAMES, undefined, { linkAllowsFullControl: false })).not.toBeNull();
+      expect(restrictionRefusal('share_visitor', tool, ADMIN_SKILL_TOOL_NAMES, undefined, { linkAllowsFullControl: true })).toBeNull();
+    }
+    for (const tool of ADMIN_SKILL_TOOL_NAMES) {
+      expect(restrictionRefusal('share_visitor', tool, ADMIN_SKILL_TOOL_NAMES, undefined, { linkAllowsFullControl: true })).not.toBeNull();
+    }
+  });
+
+  it('full control never lifts anything for a schedule a visitor made (there is no link to ask)', () => {
+    for (const tool of [...SHARE_VISITOR_BLOCKED_TOOLS, 'connect_account', ...SHARE_VISITOR_SENSITIVE_TOOLS]) {
+      expect(restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, tool, ADMIN_SKILL_TOOL_NAMES, {}, { linkAllowsFullControl: true })).not.toBeNull();
+    }
+  });
+
+  it('only a real true lifts it: anything else keeps the refusal', () => {
+    for (const value of [undefined, false, 'true', 1, {}] as unknown[]) {
+      expect(restrictionRefusal('share_visitor', 'save_memory', ADMIN_SKILL_TOOL_NAMES, undefined, { linkAllowsFullControl: value as boolean })).not.toBeNull();
+    }
   });
 });
 
@@ -220,21 +268,15 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   list_connected_account_posts: 'a read',
   list_connected_accounts: 'a read',
   launch_predefined_work_plan: 'writes the session\'s own work plan',
-  test_scheduled_chat: 'runs an existing schedule now to its configured recipients (owner decision pending, see the PR)',
   stage_pending_decision: 'raises a decision for the owner or an approver (recipients not confirmed)',
   report_product_issues: 'feedback to AgentWeb',
   enqueue_human_eval: 'an internal AgentWeb queue',
   fathom_route_action_items: 'creates tasks in the owner\'s own Notion or ClickUp (owner decision pending)',
   create_clickup_task: 'a task in the owner\'s own ClickUp (owner decision pending)',
   write_clickup_doc: 'a doc in the owner\'s own ClickUp (owner decision pending)',
-  enable_lead_list_public_access: 'reversible exposure change (owner decision pending)',
-  set_landing_page_lead_list: 'reversible exposure change (owner decision pending)',
   generate_landing_page: 'creates a new site in a private repo (owner decision pending)',
-  deploy_landing_page: 'deploys a page in the owner\'s own project (owner decision pending)',
   duplicate_landing_page: 'copies a page (backend route not confirmed)',
   coding_agent: 'works on a staging branch and a preview (owner decision pending)',
-  get_login_credentials: 'NOT a send or delete, but returns the owner\'s saved passwords: raised separately with the owner',
-  get_test_account: 'returns saved test-account credentials: raised separately with the owner',
   slack_get_recent_messages: 'a read of the owner\'s Slack (privacy, raised separately)',
   slack_get_thread_replies: 'a read of the owner\'s Slack (privacy, raised separately)',
   slack_list_channels: 'a read',
