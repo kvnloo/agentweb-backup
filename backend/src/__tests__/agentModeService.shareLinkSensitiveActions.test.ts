@@ -514,6 +514,18 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
         expect(seen).toEqual([{ tool: SENSITIVE, outcome: 'refused (restriction_profile)' }]);
       });
 
+      it('a nested call that carries a profile of its OWN inside a visitor\'s call is still the visitor\'s for the cookie rule', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        dispatch.mockImplementation(async (name: string) => {
+          if (name === 'open_site_signin') {
+            await (service as any).executeTool('gpt-4', 'playwright_browser_run_code', { code: 'x' }, 'owner-user-id', 'session-1', false, { restrictionProfile: 'share_visitor_schedule' });
+          }
+          return { ran: true };
+        });
+        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        expect(cookieCalls()).toEqual([]);
+      });
+
       it('the scope ends with the call: the next owner call after a visitor\'s is the owner\'s', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
         nestedBrowserCallFrom('open_site_signin');

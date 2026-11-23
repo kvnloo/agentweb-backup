@@ -209,6 +209,10 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(setChoiceSpy).not.toHaveBeenCalled();
     });
 
+    // the consistent re-read made before an expired full-control link is replaced
+    let recordSpy: jest.SpyInstance;
+    beforeEach(() => { recordSpy = jest.spyOn(chatbotDb, 'getChatSessionRecord').mockImplementation(async () => (await (getSessionSpy as unknown as () => Promise<any>)()) as any); });
+
     it('an EXPIRED full-control link is not handed out again: a no-expiry caller gets a NEW link (off, no expiry), not the dead address', async () => {
       getSessionSpy.mockResolvedValue(existing({ expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: true }));
       const url = await chatbotDb.createOrReuseInteractiveShare('s1'); // an alert, an email, a Slack post
@@ -229,6 +233,32 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(written.token).not.toBe('the-token');
       expect(written.allowSensitiveActions).toBe(true);
       expect(typeof written.expiresAt).toBe('string');
+    });
+
+    it('the owner re-shared a moment ago: the copy read first is stale (expired), the consistent re-read shows the owner\'s NEW link, which is reused, not replaced', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: true }));
+      recordSpy.mockResolvedValue({ sessionId: 's1', interactiveShareMetadata: { isActive: true, token: 'owners-new-token', sharedAt: new Date().toISOString(), expiresAt: '2999-01-01T00:00:00.000Z', allowSensitiveActions: true } } as any);
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1'); // an alert 200 ms later
+      expect(recordSpy).toHaveBeenCalledWith('s1', true);
+      expect(url).toContain('conversable=owners-new-token');
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(stripSpy).not.toHaveBeenCalled();
+    });
+
+    it('if the consistent re-read fails the link is still replaced (the copy said expired), and nothing throws', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: '2020-01-01T00:00:00.000Z', allowSensitiveActions: true }));
+      recordSpy.mockRejectedValue(new Error('throttled'));
+      jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1');
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      expect(url).not.toContain('the-token');
+    });
+
+    it('an expiry that cannot be read, on a full-control link, counts as expired (as the liveness check says)', async () => {
+      getSessionSpy.mockResolvedValue(existing({ expiresAt: 'not a date', allowSensitiveActions: true }));
+      const url = await chatbotDb.createOrReuseInteractiveShare('s1');
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      expect(url).not.toContain('the-token');
     });
 
     it('a full-control link that has NOT expired is reused as before', async () => {
