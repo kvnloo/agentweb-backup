@@ -16014,7 +16014,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const allowed = method === 'POST' ? /^\d+(\/(products|product_sets|external_event_sources|owned_product_catalogs|product_feeds|uploads|rules|events))?$/ : /^\d+(\/external_event_sources)?$/;
     if (!allowed.test(path)) throw new Error('Unsupported catalog write path.');
     if (path.endsWith('/events') && !String(params.test_event_code ?? '').trim()) throw new Error('A Conversions API send requires test_event_code.');
-    const { accessToken } = await this.getMetaCredentials(userId, account_id);
+    let accessToken: string;
+    try {
+      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+    } catch (error: any) {
+      // ENG-3060: credential resolution failed before any request reached Meta, so the write
+      // definitely did not happen. Mark it definite so callers report NOT sent, not UNCONFIRMED.
+      const definite: any = new Error(String(error?.message || 'Meta credentials unavailable.'));
+      definite.metaError = null;
+      definite.outcomeUnknown = false;
+      throw definite;
+    }
     const apiVersion = process.env.META_API_VERSION || 'v25.0';
     try {
       const { data } = await axios.request({
