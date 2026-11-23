@@ -31,7 +31,11 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { interactiveShareControl } from '../utils/interactiveShare';
+import { AsyncLocalStorage } from 'async_hooks';
 import { isShareVisitorTurn } from './shareVisitorTurnMarker';
+
+/** The restriction profile of the tool call being run, for the calls that tool makes itself (see `executeTool`). */
+const toolCallRestrictionStore = new AsyncLocalStorage<{ restrictionProfile: string }>();
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -10221,7 +10225,24 @@ export class AgentModeService {
     return interactiveShareControl(session.interactiveShareMetadata);
   }
 
+  /**
+   * ENG-3170: the restriction a tool call runs under reaches the calls that tool makes ITSELF. A tool that drives the browser for the model
+   * (open_site_signin, solve_captcha, coding_agent) calls `executeTool` again for each browser step, with no extra context, so the nested
+   * call used to look like the owner's. Chat turns run in a forked worker, so a per-process marker of "a visitor's turn" cannot see this;
+   * a call-scoped store can, in any process and for voice. A nested call with no restriction of its own inherits the one it was made
+   * from; one that carries its own keeps it.
+   */
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    const own = normalizeRestrictionClaim(extraContext?.restrictionProfile);
+    const inherited = own ? undefined : toolCallRestrictionStore.getStore()?.restrictionProfile;
+    const context = inherited ? { ...(extraContext ?? {}), restrictionProfile: inherited } : extraContext;
+    const profile = own ?? inherited;
+    if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
+    return toolCallRestrictionStore.run({ restrictionProfile: profile }, () =>
+      this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context));
+  }
+
+  private async executeToolUnderProfile(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
     // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
