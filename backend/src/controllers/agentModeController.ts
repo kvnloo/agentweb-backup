@@ -6869,7 +6869,7 @@ function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: str
  * owner pays for up to twenty refused attempts. So for a marked schedule the refused names are dropped from `requiredFunctionCalls`
  * and `functionCallMinCalls`; an unmarked schedule (every schedule that predates this) gets back exactly what it stores.
  */
-function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
+export function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
   const functionCalls: string[] = schedule?.requiredFunctionCalls || [];
   const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
   if (!isScheduleMarked(schedule)) return { functionCalls, minCalls, skipped: [] };
