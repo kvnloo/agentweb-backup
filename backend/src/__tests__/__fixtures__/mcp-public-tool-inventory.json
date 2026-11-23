@@ -346,6 +346,50 @@
     }
   },
   {
+    "name": "delete_memory",
+    "listed": false,
+    "description": "Delete one of the user's own memories by id. Answers \"not found\" when there is no such memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "description": "The memory id (from save_memory or list_memories)."
+        }
+      },
+      "required": [
+        "memoryId"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "delete_org_memory",
+    "listed": false,
+    "description": "Delete one of the organization's memories by id. Only org owners and admins can; answers \"not found\" when there is no such memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "description": "The memory id (from save_memory or list_memories)."
+        }
+      },
+      "required": [
+        "memoryId"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "deploy_landing_page",
     "listed": false,
     "description": "Retry deploying a landing page that failed during deployment. Only use this if generate_landing_page returned a failed status. Do NOT call this after a successful generate — deployment is already included in generate_landing_page.",
@@ -2245,6 +2289,48 @@
     }
   },
   {
+    "name": "list_memories",
+    "listed": false,
+    "description": "List the user's own memories (scope \"user\", the default) or the organization's (scope \"org\"), newest first, a page at a time. Returns id, category, content and dates, never embeddings. Pass nextCursor back as cursor for the next page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "user",
+            "org"
+          ],
+          "description": "\"user\" (default) or \"org\"."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Memories per page, 1 to 50 (default 20)."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "nextCursor from the previous page."
+        }
+      },
+      "required": []
+    },
+    "sideEffect": "read",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
     "name": "list_predefined_work_plans",
     "listed": false,
     "description": "List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template's full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.",
@@ -4011,6 +4097,74 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "save_memory",
+    "listed": false,
+    "description": "Save one fact about the user's own account, for Emma to know in future sessions. Content up to 2,000 characters is one memory; up to 8,000 is split into several. An identical memory is not saved twice, and at most 200 memories can be stored through MCP (delete some to save more).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "The fact. Specific and actionable."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        }
+      },
+      "required": [
+        "content",
+        "category"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
+    }
+  },
+  {
+    "name": "save_org_memory",
+    "listed": false,
+    "description": "Save one fact about the user's organization. Every member's Emma will know it in future sessions, so keep it to what the whole team should know. Same limits as save_memory (at most 200 org memories through MCP).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "The org-wide fact. Specific and actionable."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "preference",
+            "history",
+            "insight",
+            "workflow"
+          ],
+          "description": "preference, history, insight or workflow."
+        }
+      },
+      "required": [
+        "content",
+        "category"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {

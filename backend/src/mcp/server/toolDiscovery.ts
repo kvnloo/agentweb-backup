@@ -56,6 +56,8 @@ const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
   'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status'],
   // A runId comes from get_smartlead_push_status, which needs smartlead:read: agents get both scopes.
   'smartlead:control': ['pause_smartlead_push', 'cancel_smartlead_push'],
+  // An agent that may write org memory needs list_memories (scope org) to find the id of one it wants to delete.
+  'memory:org': ['save_org_memory', 'delete_org_memory', 'list_memories'],
 };
 
 /** What an external client sees in `tools/list`. `grantedScopes` is set only for api_key sessions. */
