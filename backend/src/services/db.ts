@@ -11853,7 +11853,10 @@ function withoutEmbeddings<T extends Record<string, any>>(rows: T[]): Omit<T, 'e
  * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed.
  *
  * `opts.maxRows` bounds a read that has no `limit`: the loop follows the cursor until the rows run out or the bound is reached
- * (it used to return after the first page that held any ordinary row). */
+ * (it used to return after the first page that held any ordinary row). That read now reaches rows far past the first page, so one row
+ * without a text `content` (nothing to show, nothing to rank) is skipped and logged instead of failing the whole list and every prompt.
+ * A read WITH a `limit` still fails closed on it, exactly as before, and an item that is not a row at all (not an object, no string
+ * id) always fails closed. */
 async function queryOrdinaryAccountMemories(
   params: AWS.DynamoDB.DocumentClient.QueryInput,
   opts: { maxRows?: number } = {},
@@ -11862,6 +11865,14 @@ async function queryOrdinaryAccountMemories(
   let query = { ...params };
   let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
   const want = params.Limit ?? opts.maxRows;
+  const skipUnreadable = params.Limit === undefined && Boolean(opts.maxRows);
+  const skipped: string[] = [];
+  const finish = (result: any[]): any[] => {
+    if (skipped.length > 0) {
+      console.warn(`[memory] account memory read skipped ${skipped.length} row(s) without text content, ids ${skipped.slice(0, 5).join(', ')} (${params.ExpressionAttributeValues?.[':userId']})`);
+    }
+    return result;
+  };
   // One page holds 40 or more rows even at the largest row size, so the page budget grows with the bound.
   const maxPages = params.Limit === undefined && opts.maxRows ? Math.max(10, Math.ceil(opts.maxRows / 30) + 10) : 10;
   for (let page = 0; page < maxPages; page++) {
@@ -11869,8 +11880,12 @@ async function queryOrdinaryAccountMemories(
       ...(want ? { Limit: want - rows.length } : {}) }).promise();
     if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed account memory page');
     for (const item of result.Items ?? []) {
-      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
-        throw new Error('Malformed account memory item');
+      // Not a row at all (not an object, no string id): the page itself is wrong, always fail closed.
+      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string') throw new Error('Malformed account memory item');
+      if (typeof item.content !== 'string') {
+        if (!skipUnreadable) throw new Error('Malformed account memory item');
+        skipped.push(item.memoryId);
+        continue;
       }
       if (!item.memoryId.startsWith('ads-learning#')) rows.push(item);
     }
@@ -11885,7 +11900,7 @@ async function queryOrdinaryAccountMemories(
       cursor = undefined;
       if (want && rows.length >= want) {
         if (params.Limit === undefined && opts.maxRows) warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
-        return rows.slice(0, want);
+        return finish(rows.slice(0, want));
       }
       continue;
     }
@@ -11895,7 +11910,7 @@ async function queryOrdinaryAccountMemories(
       if (cursor && params.Limit === undefined && opts.maxRows) {
         warnReadStoppedAtBound('account', opts.maxRows, params.ExpressionAttributeValues?.[':userId']);
       }
-      return want ? rows.slice(0, want) : rows;
+      return finish(want ? rows.slice(0, want) : rows);
     }
   }
   throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');

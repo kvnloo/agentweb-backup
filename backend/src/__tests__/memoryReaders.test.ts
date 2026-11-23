@@ -30,6 +30,7 @@ jest.mock('../services/resendService', () => ({
 
 import { accountMemoryDb, orgMemoryDb, ACCOUNT_MEMORY_LIST_ATTRIBUTES, ORG_MEMORY_LIST_ATTRIBUTES } from '../services/db';
 import { MEMORY_READ_MAX_ROWS_LIST, MEMORY_READ_MAX_ROWS_PROMPT } from '../utils/memoryReadLimits';
+import { assertMemorySaveable } from '../utils/memorySaveGuard';
 
 type Row = Record<string, any>;
 const accountRow = (i: number): Row => ({ userId: 'u1', memoryId: `01ROW${String(i).padStart(4, '0')}`, category: 'insight', content: `fact ${i}`, embedding: [i, i], createdAt: '2026-01-01' });
@@ -164,9 +165,9 @@ describe('accountMemoryDb.getUserMemories follows the cursor', () => {
     expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(10);
   });
 
-  it('still fails closed on a malformed row', async () => {
-    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ memoryId: 5, content: 'x' }] }) });
-    await expect(accountMemoryDb.getUserMemories('u1')).rejects.toThrow(/Malformed account memory item/);
+  it('still fails closed on a page that is not a list', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: 'nope' }) });
+    await expect(accountMemoryDb.getUserMemories('u1')).rejects.toThrow(/Malformed account memory page/);
   });
 });
 
@@ -398,11 +399,85 @@ describe('the org reader still returns rows as stored (it never validated them)'
   });
 });
 
-describe('the account reader still refuses a row without a string content (unchanged design)', () => {
-  it('fails closed, with or without a limit', async () => {
-    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ userId: 'u1', memoryId: 'm1' }] }) });
-    await expect(accountMemoryDb.getUserMemories('u1')).rejects.toThrow(/Malformed account memory item/);
+describe('a row without text content (found by Opslane on the second page of an account with 201 rows)', () => {
+  const noContent = (id: string): Row => ({ userId: 'u1', memoryId: id, category: 'insight', createdAt: '2026-01-01', updatedAt: '2026-01-01' });
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => warn.mockRestore());
+
+  it('is skipped and logged by the read the list screens and the prompt loader make, wherever it sits; every other row is returned', async () => {
+    servePages([range(1, 3, accountRow), [noContent('01ROW0004'), accountRow(5)], [accountRow(6), noContent('01ROW0007')]], accountKey);
+    const rows = await accountMemoryDb.getUserMemories('u1');
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 1', 'fact 2', 'fact 3', 'fact 5', 'fact 6']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/skipped 2 row\(s\) without text content, ids 01ROW0004, 01ROW0007 \(u1\)/);
+  });
+
+  it('is skipped for a list read too (the projection keeps it content-less, so the same rule applies)', async () => {
+    servePages([[accountRow(1)], [noContent('01ROW0002')]], accountKey);
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 1']);
+  });
+
+  it('an item that is not a row at all still fails closed on the unbounded read (not an object, or no string id): the page itself is wrong', async () => {
+    for (const bad of [true, null, 'x', { userId: 'u1', content: 'x' }, { memoryId: 5, content: 'x' }]) {
+      mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [accountRow(1), bad] }) });
+      await expect(accountMemoryDb.getUserMemories('u1')).rejects.toThrow(/Malformed account memory item/);
+    }
+  });
+
+  it('a non-text content is skipped the same way, and a read with only such rows returns an empty list instead of failing', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ userId: 'u1', memoryId: 'm1', content: 7 }] }) });
+    expect(await accountMemoryDb.getUserMemories('u1')).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a skipped row does not count toward the bound: the bound is filled with readable rows', async () => {
+    servePages([[noContent('01ROW0001'), accountRow(2)], [accountRow(3), accountRow(4)]], accountKey);
+    const rows = await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 3 });
+    expect(rows.map((r: Row) => r.content)).toEqual(['fact 2', 'fact 3', 'fact 4']);
+  });
+
+  it('no skipped-row warning when every row is readable', async () => {
+    servePages([range(1, 3, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1');
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a read WITH a limit still fails closed on it, exactly as before (getRecentMemories and a limited getUserMemories)', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [noContent('m1')] }) });
     await expect(accountMemoryDb.getUserMemories('u1', undefined, 5)).rejects.toThrow(/Malformed account memory item/);
+    await expect(accountMemoryDb.getRecentMemories('u1', 5)).rejects.toThrow(/Malformed account memory item/);
+  });
+
+  it('the org reader returns it as stored (it never validated), with or without a limit', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [{ orgId: 'o1', memoryId: 'm1' }] }) });
+    expect(await orgMemoryDb.getOrgMemories('o1')).toHaveLength(1);
+    expect(await orgMemoryDb.getOrgMemories('o1', undefined, 5)).toHaveLength(1);
+  });
+});
+
+describe('assertMemorySaveable refuses exactly what addMemory refuses, with the same message (so a route can refuse BEFORE paying for an embedding)', () => {
+  const cases: Array<[string, string, string]> = [
+    ['an invalid category', 'other', 'a fact'],
+    ['a blank content', 'insight', '   '],
+    ['an empty content', 'insight', ''],
+    ['a content over the limit', 'insight', 'x'.repeat(2001)],
+  ];
+  it.each(cases)('%s', async (_name, category, content) => {
+    let guard = '';
+    try { assertMemorySaveable(category, content); } catch (error: any) { guard = error.message; }
+    expect(guard).not.toBe('');
+    mockDocumentClientMethods.put.mockReturnValue({ promise: async () => ({}) });
+    await expect(accountMemoryDb.addMemory('u1', category, content)).rejects.toThrow(guard);
+    await expect(orgMemoryDb.addMemory('o1', category, content, 'author')).rejects.toThrow(guard);
+    expect(mockDocumentClientMethods.put).not.toHaveBeenCalled();
+  });
+
+  it('accepts what addMemory accepts, every category, 2000 characters exactly', () => {
+    for (const category of ['preference', 'history', 'insight', 'workflow']) {
+      expect(() => assertMemorySaveable(category, 'x'.repeat(2000))).not.toThrow();
+    }
   });
 });
 

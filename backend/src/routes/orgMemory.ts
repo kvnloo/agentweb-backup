@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { orgMemoryDb, orgDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
+import { assertMemorySaveable } from '../utils/memorySaveGuard';
 import { callerCan } from "../services/orgAuthz";
 import { MEMORY_READ_MAX_ROWS_LIST } from '../utils/memoryReadLimits';
 
@@ -105,6 +106,9 @@ router.post('/:orgId/memory', async (req, res) => {
     if (!category || typeof category !== 'string') {
       return res.status(400).json({ error: 'category is required and must be a string' });
     }
+
+    // Refuse what addMemory would refuse BEFORE the embedding is requested (and billed to the caller's cap).
+    assertMemorySaveable(category, content);
 
     // Embed at write time so the memory can later be retrieved by relevance (best-effort).
     const embedding = (await embedText(content, { userId, feature: 'embeddings' })) ?? undefined;
