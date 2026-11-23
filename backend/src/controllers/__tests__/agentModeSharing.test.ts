@@ -303,7 +303,9 @@ describe('AgentMode Sharing Controller', () => {
         shareId: sessionId,
         conversableToken: expect.any(String),
         conversableUrl: expect.stringContaining(`/ishare/${sessionId}?conversable=`),
-        expiresAt: expect.any(String)
+        expiresAt: expect.any(String),
+        // ENG-3170: a new link with no choice made is off
+        allowSensitiveActions: false
       });
     });
 
