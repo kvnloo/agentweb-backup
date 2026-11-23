@@ -4598,9 +4598,23 @@ export class ChatbotDB {
       // ENG-3170: a link whose owner turned on FULL CONTROL keeps the expiry the owner chose (see below), so once that date has passed it is dead
       // and must not be handed out again by an alert, an email or a Slack post. It is treated as absent: the code below makes a new link
       // (off, unless the caller says otherwise). Any other expired-but-active link is, as before, made permanent by a no-expiry caller.
-      const storedShare = session.interactiveShareMetadata;
-      const expiredFullControl = storedShare?.allowSensitiveActions === true
-        && !!storedShare.expiresAt && Date.parse(storedShare.expiresAt) <= Date.now();
+      // (An expiry that cannot be read counts as expired, as it does for the liveness check the visitor routes use.)
+      const isExpiredFullControl = (share: { allowSensitiveActions?: unknown; expiresAt?: unknown } | undefined) =>
+        share?.allowSensitiveActions === true && !!share.expiresAt && !(Date.parse(String(share.expiresAt)) > Date.now());
+      let expiredFullControl = isExpiredFullControl(session.interactiveShareMetadata);
+      if (expiredFullControl) {
+        // The copy read above is eventually consistent, and the owner may have made a new link a moment ago (new token, new expiry). Before the link
+        // is replaced, ask again with a consistent read: if the owner's new link is there, that is the link, and it is reused as it stands.
+        try {
+          const fresh = await this.getChatSessionRecord(sessionId, true);
+          if (fresh?.interactiveShareMetadata) {
+            session.interactiveShareMetadata = fresh.interactiveShareMetadata;
+            expiredFullControl = isExpiredFullControl(fresh.interactiveShareMetadata);
+          }
+        } catch (refreshError) {
+          console.error(`Error re-reading the interactive share for session ${sessionId} before replacing an expired link:`, refreshError);
+        }
+      }
 
       // Check if there's already an active interactive share
       if (session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && !expiredFullControl) {
