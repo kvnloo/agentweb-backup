@@ -173,6 +173,13 @@ describe('save_memory', () => {
     expect(embedText).not.toHaveBeenCalled();
   });
 
+  it('a stored memory with stray whitespace around it still counts as the same text', async () => {
+    db.accountMemoryDb.getUserMemories.mockResolvedValue([row(4, { content: '\n  prefers short emails  ' })]);
+    const out = await run('save_memory', { content: 'prefers short emails', category: 'insight' });
+    expect(out).toMatchObject({ saved: false, duplicate: true, memoryId: '01MEM0004' });
+    expect(db.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+  });
+
   it('the same text in ANOTHER category is a different memory and is saved', async () => {
     db.accountMemoryDb.getUserMemories.mockResolvedValue([row(3, { content: 'prefers short emails', category: 'preference' })]);
     const out = await run('save_memory', { content: 'prefers short emails', category: 'insight' });
@@ -292,6 +299,16 @@ describe('save_org_memory and delete_org_memory', () => {
     expect(db.accountMemoryDb.getUserMemories).not.toHaveBeenCalled();
     db.orgMemoryDb.getOrgMemories.mockResolvedValue([row(1, { content: 'we sell widgets' })]);
     expect(await run('save_org_memory', { content: 'we sell widgets', category: 'insight' })).toMatchObject({ saved: false, duplicate: true });
+  });
+
+  it('delete_org_memory checks its id like delete_memory: missing, malformed or over-long ids are refused before anything is read', async () => {
+    db.userDb.getUserById.mockResolvedValue({ userId: 'u1', orgId: 'org1', orgRole: 'admin' });
+    await expect(run('delete_org_memory', {})).rejects.toThrow(/memoryId is required/);
+    for (const bad of ['a b', 'x'.repeat(101), 'a\nb', 7]) {
+      await expect(run('delete_org_memory', { memoryId: bad })).rejects.toThrow(/memoryId/);
+    }
+    expect(db.userDb.getUserById).not.toHaveBeenCalled();
+    expect(db.orgMemoryDb.deleteMemory).not.toHaveBeenCalled();
   });
 
   it('delete: a member is refused (org:configure), an admin deletes, "not found" is a refusal not a success', async () => {
