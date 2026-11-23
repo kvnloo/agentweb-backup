@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -10118,12 +10118,13 @@ export class AgentModeService {
     sessionId: string,
     extraContext?: Record<string, any>,
     args?: unknown,
+    nameOnly: boolean = false,
   ): Promise<{ refusal: string | null; profile?: RestrictionProfileId }> {
     const unrestricted = { refusal: null };
     if (!sessionId) return unrestricted;
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
     if (extraContext?.restrictionProfile) return unrestricted;
-    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args) !== null;
+    const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) !== null;
     const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
@@ -10174,8 +10175,12 @@ export class AgentModeService {
     if (readScheduleProvenance(schedule.provenance).length === 0) return unrestricted;
 
     if (refusedByProfile) {
+      // ENG-3170: publishing from a visitor-made schedule is already withheld, with its own wording (and the instruction not to send the
+      // owner to a setting that cannot lift it), by blockedByScheduledPublishApproval further down executeTool. A tool that is refused
+      // ONLY by the sensitive rule and is a publish call is left to that answer, so its guidance is not replaced by the general one.
+      if (isExternalContentPublish(toolName, args) && !isRefusedByScheduleBlockList(toolName, ADMIN_SKILL_TOOL_NAMES)) return unrestricted;
       console.warn(`AgentMode ENG-2816: refused ${toolName} in session ${sessionId}: schedule ${scheduleId} carries visitor provenance [${readScheduleProvenance(schedule.provenance).join(', ')}].`);
-      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args) };
+      return { refusal: restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) };
     }
     return { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE };
   }
@@ -10189,12 +10194,12 @@ export class AgentModeService {
    */
   private async assertShareLinkAllowsSensitiveTool(
     toolName: string,
-    args: unknown,
+    sensitive: boolean,
     sessionId: string,
     extraContext?: Record<string, any>,
   ): Promise<void> {
+    if (!sensitive) return;
     if (normalizeRestrictionClaim(extraContext?.restrictionProfile) !== 'share_visitor') return;
-    if (!isSensitiveToolCall(toolName, args)) return;
 
     let session: any;
     if (sessionId) {
@@ -10222,14 +10227,17 @@ export class AgentModeService {
     // ENG-2816: every path that runs a tool ends here (typed chat, live voice, nested calls), so the restriction a caller runs
     // under is enforced here and not only in the typed-chat preflight. A share-link visitor acts under the owner's userId, so
     // nothing downstream can tell them apart from the owner; the context says so, and this is the check that listens.
-    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, args);
+    // ENG-3170: before argument repair only what depends on the tool NAME is judged (the block list, and a tool that is sensitive whatever
+    // its arguments). A tool judged by an argument (an email's action, a HubSpot action) is judged below, on the arguments it will run
+    // with, so a read that the model spelled in a shape repair understands is not refused for looking like something else.
+    const restricted = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, undefined, { nameOnly: true });
     if (restricted) throw new ToolRestrictionDenied(restricted);
     // ENG-3170: a visitor may run a SENSITIVE tool (delete data, send or post outside the account, change ad spend, disconnect an
     // account) only on a link whose owner allowed it. The link is read here, where every path ends, never taken from the request.
-    await this.assertShareLinkAllowsSensitiveTool(toolName, args, sessionId, extraContext);
+    await this.assertShareLinkAllowsSensitiveTool(toolName, isSensitiveWholeTool(toolName), sessionId, extraContext);
     // ENG-2816 (step 3): the same restriction for a scheduled run of a schedule a visitor wrote (see scheduledRunRestriction). The
     // profile it may hand back goes into the tool context, so this call's own self-call to a schedule write route carries it.
-    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, args);
+    const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, undefined, true);
     if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
     if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
@@ -10260,15 +10268,15 @@ export class AgentModeService {
     }
 
     const preparedArgs = contractResult.args;
-    // ENG-3170: argument repair can change what a call does (a nested wrapper is hoisted, an alias renamed), and the publish-approval
-    // check below reads the arguments the tool will actually run with. The sensitive-action rule is the same: when repair turned a call
-    // that looked harmless into a sensitive one, the checks above run again on the prepared arguments.
-    if (!isSensitiveToolCall(toolName, args) && isSensitiveToolCall(toolName, preparedArgs)) {
-      const refusedAfterRepair = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
-      if (refusedAfterRepair) throw new ToolRestrictionDenied(refusedAfterRepair);
-      await this.assertShareLinkAllowsSensitiveTool(toolName, preparedArgs, sessionId, extraContext);
-      const scheduledAfterRepair = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
-      if (scheduledAfterRepair.refusal) throw new ToolRestrictionDenied(scheduledAfterRepair.refusal);
+    // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
+    // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
+    // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
+    if (!isSensitiveWholeTool(toolName) && isSensitiveToolCall(toolName, preparedArgs)) {
+      const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
+      if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
+      await this.assertShareLinkAllowsSensitiveTool(toolName, true, sessionId, extraContext);
+      const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
+      if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
     }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,

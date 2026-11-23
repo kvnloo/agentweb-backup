@@ -3393,6 +3393,44 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-3170: set ONLY the owner's sensitive-actions choice on the link that is already there. Attribute level, not the whole map:
+   * `updateSessionInteractiveShareMetadata` writes back whatever copy its caller read, so a caller holding a copy read a moment ago
+   * (an email or alert that is only reusing the link) could write the previous choice back over the owner's change. The condition
+   * keeps this from creating a half-made link on a session that has none.
+   */
+  async setInteractiveShareAllowSensitiveActions(sessionId: string, allowSensitiveActions: boolean): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "SET interactiveShareMetadata.allowSensitiveActions = :allow",
+        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token)",
+        ExpressionAttributeNames: { "#token": "token" },
+        ExpressionAttributeValues: { ":allow": allowSensitiveActions },
+      }).promise();
+    } catch (error) {
+      console.error("Error setting the sensitive-actions choice on the interactive share:", error);
+      throw error;
+    }
+  }
+
+  /** ENG-3170: remove ONLY the expiry from the existing link (attribute level, for the same reason as above). */
+  async removeInteractiveShareExpiry(sessionId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "REMOVE interactiveShareMetadata.expiresAt",
+        ConditionExpression: "attribute_exists(interactiveShareMetadata.#token)",
+        ExpressionAttributeNames: { "#token": "token" },
+      }).promise();
+    } catch (error) {
+      console.error("Error removing the expiry from the interactive share:", error);
+      throw error;
+    }
+  }
+
   async updateSessionResultEndpointMetadata(
     sessionId: string,
     resultEndpointMetadata: {
@@ -4567,8 +4605,9 @@ export class ChatbotDB {
           // /agent-mode URL). Worst case the link keeps its existing expiry and
           // a later send strips it.
           try {
-            const { expiresAt, ...withoutExpiry } = session.interactiveShareMetadata;
-            await this.updateSessionInteractiveShareMetadata(sessionId, withoutExpiry);
+            // ENG-3170: attribute level, so nothing else on the link (the owner's sensitive-actions choice above all) is written back
+            // from this copy, which may be a moment old.
+            await this.removeInteractiveShareExpiry(sessionId);
           } catch (stripError) {
             console.error(`Error stripping expiry from reused interactive share for session ${sessionId}:`, stripError);
           }
@@ -4576,16 +4615,11 @@ export class ChatbotDB {
         // ENG-3170: an EXPLICIT choice (only the owner's share dialog passes one) is applied to the link that is already there, because
         // there is one token per session and "reuse untouched" would otherwise drop the owner's choice. Callers that pass no choice
         // (emails, Slack posts, alerts) never touch the setting, so sending a report can not switch an owner's "on" back to "off".
-        // A failed write is not swallowed (the owner's choice matters); the route that made the choice re-reads the stored value.
+        // A failed write is not caught here: it goes to the catch below (the login-URL fallback, no share link), and the route that made
+        // the choice re-reads the stored value before it answers.
         if (typeof options?.allowSensitiveActions === 'boolean'
           && session.interactiveShareMetadata.allowSensitiveActions !== options.allowSensitiveActions) {
-          // `session` was read before the expiry strip above, so an expiry that was just stripped must not be written back.
-          const { expiresAt: existingExpiresAt, ...rest } = session.interactiveShareMetadata;
-          await this.updateSessionInteractiveShareMetadata(sessionId, {
-            ...rest,
-            ...(hasTimedExpiry && existingExpiresAt ? { expiresAt: existingExpiresAt } : {}),
-            allowSensitiveActions: options.allowSensitiveActions,
-          });
+          await this.setInteractiveShareAllowSensitiveActions(sessionId, options.allowSensitiveActions);
         }
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
         return `${customerFrontendUrl}/ishare/${sessionId}?conversable=${session.interactiveShareMetadata.token}`;
