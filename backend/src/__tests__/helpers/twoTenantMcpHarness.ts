@@ -33,6 +33,9 @@ export const TWO_TENANT_TABLES: Record<string, TableKeySchema> = {
     // email-index: one (list, email) pair (the duplicate check); EmailLookupIndex: every lead with an address, across lists (do-not-contact inheritance).
     indexes: { 'email-index': { hash: 'listId', range: 'email' }, EmailLookupIndex: { hash: 'email' } },
   },
+  // Wave 2 (W2-2): the memory tools. Account memory is keyed by the user, org memory by the org; ids are ULIDs (they sort by time).
+  'AW-AccountMemory': { hash: 'userId', range: 'memoryId', indexes: { UserIdCategoryIndex: { hash: 'userId', range: 'category' } } },
+  'AW-OrgMemory': { hash: 'orgId', range: 'memoryId', indexes: { OrgIdCategoryIndex: { hash: 'orgId', range: 'category' } } },
 };
 
 export function makeTwoTenantFake(): InMemoryDynamo {
@@ -52,6 +55,9 @@ export interface Tenant {
   overview: string;
   competitor: string;
   icp: string;
+  /** The owner's own account memories, and the org's memories (wave 2). Ids sort oldest to newest like ULIDs, and BEFORE any id minted now (which starts 01M8...), so a fresh save is the newest. */
+  memories: Array<{ memoryId: string; category: string; content: string }>;
+  orgMemories: Array<{ memoryId: string; category: string; content: string }>;
 }
 
 export const TENANT_A: Tenant = {
@@ -69,6 +75,15 @@ export const TENANT_A: Tenant = {
   overview: 'ALPHA sells widgets',
   competitor: 'AlphaRival',
   icp: 'ALPHA ICP',
+  memories: [
+    { memoryId: '00MEM-A-0001', category: 'preference', content: 'ALPHA-MEMORY prefers phone calls' },
+    { memoryId: '00MEM-A-0002', category: 'insight', content: 'ALPHA-MEMORY buys in Q4' },
+    { memoryId: '00MEM-A-0003', category: 'workflow', content: 'ALPHA-MEMORY approves copy on Fridays' },
+  ],
+  orgMemories: [
+    { memoryId: '00ORG-A-0001', category: 'insight', content: 'ALPHA-ORGMEMORY sells widgets to dentists' },
+    { memoryId: '00ORG-A-0002', category: 'workflow', content: 'ALPHA-ORGMEMORY never discounts' },
+  ],
 };
 
 export const TENANT_B: Tenant = {
@@ -85,6 +100,15 @@ export const TENANT_B: Tenant = {
   overview: 'BRAVO sells gadgets',
   competitor: 'BravoRival',
   icp: 'BRAVO ICP',
+  memories: [
+    { memoryId: '00MEM-B-0001', category: 'preference', content: 'BRAVO-MEMORY prefers email' },
+    { memoryId: '00MEM-B-0002', category: 'insight', content: 'BRAVO-MEMORY buys in Q1' },
+    { memoryId: '00MEM-B-0003', category: 'workflow', content: 'BRAVO-MEMORY approves copy on Mondays' },
+  ],
+  orgMemories: [
+    { memoryId: '00ORG-B-0001', category: 'insight', content: 'BRAVO-ORGMEMORY sells gadgets to plumbers' },
+    { memoryId: '00ORG-B-0002', category: 'workflow', content: 'BRAVO-ORGMEMORY discounts in December' },
+  ],
 };
 
 /** Text that belongs to a tenant's data and must never reach another tenant's caller, in ANY outcome (success or refusal). */
@@ -125,6 +149,12 @@ function seedTenant(fake: InMemoryDynamo, t: Tenant): void {
   fake.seed('AW-LeadLists', { listId: t.listId, userId: t.owner, name: t.listName, listType: 'sales', createdAt: NOW, leadCount: t.leads.length });
   for (const lead of t.leads) {
     fake.seed('AW-Leads', { listId: t.listId, leadId: lead.leadId, userId: t.owner, name: lead.name, email: lead.email, status: 'new', createdAt: NOW });
+  }
+  for (const m of t.memories) {
+    fake.seed('AW-AccountMemory', { userId: t.owner, memoryId: m.memoryId, category: m.category, content: m.content, embedding: [0.1, 0.2], createdAt: NOW, updatedAt: NOW, sourceSessionId: 'seed' });
+  }
+  for (const m of t.orgMemories) {
+    fake.seed('AW-OrgMemory', { orgId: t.orgId, memoryId: m.memoryId, category: m.category, content: m.content, embedding: [0.1, 0.2], createdAt: NOW, updatedAt: NOW, sourceUserId: t.owner });
   }
 }
 
@@ -198,17 +228,20 @@ export interface McpCaller {
  * tools:read + tools:execute, like every key created without extra scopes). `createMcpServer` and the tool modules are imported here, not at
  * the top of the file, so the test file's jest.mock calls are in place first.
  */
-export async function connectCaller(userId: string, opts: { scopes?: string[] } = {}): Promise<McpCaller> {
+export async function connectCaller(userId: string, opts: { scopes?: string[]; authMethod?: 'api_key' | 'oauth' } = {}): Promise<McpCaller> {
   const { createMcpServer } = await import('../../mcp/server/mcpServerCore');
   await import('../../mcp/server/apiTools');
-  const server = createMcpServer('two-tenant-harness', {
-    agentUserId: userId,
-    sessionId: `harness-${userId}`,
-    isInternal: false,
-    authMethod: 'api_key',
-    apiKeyId: `key-${userId}`,
-    apiKeyScopes: opts.scopes ?? ['tools:read', 'tools:execute'],
-  });
+  const server = createMcpServer('two-tenant-harness', opts.authMethod === 'oauth'
+    // A signed-in OAuth client: no key, so no scopes of its own.
+    ? { agentUserId: userId, sessionId: `harness-${userId}`, isInternal: false, authMethod: 'oauth' }
+    : {
+      agentUserId: userId,
+      sessionId: `harness-${userId}`,
+      isInternal: false,
+      authMethod: 'api_key',
+      apiKeyId: `key-${userId}`,
+      apiKeyScopes: opts.scopes ?? ['tools:read', 'tools:execute'],
+    });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'two-tenant-harness', version: '1.0.0' });
