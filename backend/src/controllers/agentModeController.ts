@@ -47,7 +47,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
-import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
+import { getInteractiveShareExpiresAt, interactiveShareAllowsSensitiveActions } from '../utils/interactiveShare';
 import { buildReportEmail, checkEmailReportAllowed, normalizeRecipient, resolveReportUrl } from '../utils/ishareEmailReport';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -13026,7 +13026,7 @@ export const agentModeController = {
   async createConversableShare(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, expirationDays: rawExpirationDays } = req.body;
+      const { sessionId, expirationDays: rawExpirationDays, allowSensitiveActions: rawAllowSensitiveActions } = req.body;
 
       // ENG-1907: no transcript leaves a sandbox account.
       if (isEvaluationUser(user?.userId)) {
@@ -13039,6 +13039,10 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // ENG-3170: the owner's choice for this link (sensitive actions on or off). Only a real boolean counts; anything else is "no
+      // choice made": a new link is then off, and an existing link is left as it is.
+      const allowSensitiveActionsChoice = typeof rawAllowSensitiveActions === 'boolean' ? rawAllowSensitiveActions : undefined;
+
       // Validate expirationDays (default 7, max 365)
       const expirationDays = rawExpirationDays != null ? Number(rawExpirationDays) : 7;
       if (!Number.isFinite(expirationDays) || expirationDays < 1 || expirationDays > 365) {
@@ -13046,7 +13050,9 @@ export const agentModeController = {
       }
 
       // Use the common function to create or reuse interactive share
-      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays);
+      const conversableUrl = allowSensitiveActionsChoice === undefined
+        ? await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays)
+        : await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays, { allowSensitiveActions: allowSensitiveActionsChoice });
 
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
@@ -13065,11 +13071,29 @@ export const agentModeController = {
       // per session, so it is intentionally out of scope here.
       const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
 
+      // ENG-3170: answer with what is STORED, not with what was asked for. When the owner made an explicit choice, re-read it (a
+      // consistent read) and say so if it did not persist, instead of showing a switch that is not true. With no choice made, a new
+      // link is off and an existing link is what it already was.
+      let allowSensitiveActions: boolean;
+      if (allowSensitiveActionsChoice !== undefined) {
+        const storedShare = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+        allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedShare);
+        if (allowSensitiveActions !== allowSensitiveActionsChoice) {
+          console.error(`AgentMode ENG-3170: the sensitive-actions choice for share ${sessionId} did not persist (asked ${allowSensitiveActionsChoice}).`);
+          return res.status(500).json({ error: 'Failed to save the sensitive-actions setting for this link' });
+        }
+      } else {
+        const priorShare = session.interactiveShareMetadata;
+        const hadActiveLink = Boolean(priorShare?.isActive && priorShare?.token);
+        allowSensitiveActions = hadActiveLink ? interactiveShareAllowsSensitiveActions(priorShare) : false;
+      }
+
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
         conversableUrl: conversableUrl,
-        expiresAt: expiresAt
+        expiresAt: expiresAt,
+        allowSensitiveActions
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -13102,6 +13126,69 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Stop conversable share error:', error);
       res.status(500).json({ error: 'Failed to stop conversable sharing' });
+    }
+  },
+
+  // ENG-3170: read the owner's sensitive-actions setting for this session's interactive link. The EFFECTIVE value (a link made before
+  // the setting existed has no stored choice; utils/interactiveShare says how it reads), so the share dialog never has to know the rule.
+  async getConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+      res.status(200).json({
+        allowSensitiveActions: interactiveShareAllowsSensitiveActions(share),
+        // Tells the dialog whether the value was chosen by the owner or is a link made before the setting existed.
+        explicit: typeof share.allowSensitiveActions === 'boolean',
+      });
+    } catch (error) {
+      console.error('AgentMode: Get conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to read the share link settings' });
+    }
+  },
+
+  // ENG-3170: the owner changes the sensitive-actions setting on the link that already exists. Owner only (the session must be theirs;
+  // a visitor's token never reaches this route, it needs the owner's login), a real boolean only, and nothing else on the link changes.
+  async updateConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const { allowSensitiveActions } = req.body || {};
+
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+      if (typeof allowSensitiveActions !== 'boolean') {
+        return res.status(400).json({ error: 'allowSensitiveActions must be true or false' });
+      }
+
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+
+      await chatbotDb.updateSessionInteractiveShareMetadata(sessionId, { ...share, allowSensitiveActions });
+      console.log(`AgentMode ENG-3170: the owner set sensitive actions ${allowSensitiveActions ? 'ON' : 'OFF'} for share link ${sessionId}`);
+
+      const stored = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+      if (typeof stored?.allowSensitiveActions !== 'boolean' || stored.allowSensitiveActions !== allowSensitiveActions) {
+        return res.status(500).json({ error: 'Failed to save the setting for this link' });
+      }
+      res.status(200).json({ allowSensitiveActions: stored.allowSensitiveActions, explicit: true });
+    } catch (error) {
+      console.error('AgentMode: Update conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to update the share link settings' });
     }
   },
 
@@ -18034,7 +18121,9 @@ export const agentModeController = {
         const interactiveShareMetadata = {
           isActive: true,
           token: conversableToken,
-          sharedAt: new Date().toISOString()
+          sharedAt: new Date().toISOString(),
+          // ENG-3170: an explicit "off". This link opens the plan page; the owner turns sensitive actions on from the share dialog.
+          allowSensitiveActions: false,
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
         // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
