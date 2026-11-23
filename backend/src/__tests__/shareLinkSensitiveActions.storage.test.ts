@@ -42,10 +42,15 @@ describe('interactiveShareAllowsSensitiveActions (how a stored link reads)', () 
 describe('createOrReuseInteractiveShare (how links are written)', () => {
   let getSessionSpy: jest.SpyInstance;
   let updateSpy: jest.SpyInstance;
+  // an existing link is changed at ATTRIBUTE level (only the choice, only the expiry), never by writing back a copy of the whole link
+  let setChoiceSpy: jest.SpyInstance;
+  let stripSpy: jest.SpyInstance;
 
   beforeEach(() => {
     getSessionSpy = jest.spyOn(chatbotDb, 'getChatSession').mockResolvedValue({ sessionId: 's1', interactiveShareMetadata: undefined } as any);
     updateSpy = jest.spyOn(chatbotDb, 'updateSessionInteractiveShareMetadata').mockResolvedValue({} as any);
+    setChoiceSpy = jest.spyOn(chatbotDb, 'setInteractiveShareAllowSensitiveActions').mockResolvedValue(undefined);
+    stripSpy = jest.spyOn(chatbotDb, 'removeInteractiveShareExpiry').mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -99,28 +104,32 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       expect(url).toContain('/ishare/s1?conversable=the-token');
     });
 
-    it('applies an explicit choice from the dialog to the existing link (one token per session, so reuse must not drop the choice)', async () => {
+    it('applies an explicit choice from the dialog to the existing link, by writing ONLY the choice (one token per session, so reuse must not drop it)', async () => {
       getSessionSpy.mockResolvedValue(existing({ allowSensitiveActions: false }));
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
-      expect(updateSpy).toHaveBeenCalledTimes(1);
-      expect(updateSpy.mock.calls[0][1]).toMatchObject({ isActive: true, token: 'the-token', allowSensitiveActions: true });
+      expect(setChoiceSpy).toHaveBeenCalledTimes(1);
+      expect(setChoiceSpy).toHaveBeenCalledWith('s1', true);
+      expect(updateSpy).not.toHaveBeenCalled();
     });
 
     it('applies an explicit choice to a link made before the setting existed', async () => {
       getSessionSpy.mockResolvedValue(existing());
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: false });
-      expect(updateSpy.mock.calls[0][1]).toMatchObject({ token: 'the-token', allowSensitiveActions: false });
+      expect(setChoiceSpy).toHaveBeenCalledWith('s1', false);
     });
 
-    it('keeps the link\'s own expiry when an explicit choice is applied on a timed request', async () => {
+    it('leaves the link\'s own expiry alone when an explicit choice is applied on a timed request (nothing else is written)', async () => {
       getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z' }));
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
-      expect(updateSpy.mock.calls[0][1]).toMatchObject({ expiresAt: '2027-02-01T00:00:00.000Z', allowSensitiveActions: true });
+      expect(setChoiceSpy).toHaveBeenCalledWith('s1', true);
+      expect(stripSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
     });
 
     it('writes nothing when the explicit choice is already what is stored', async () => {
       getSessionSpy.mockResolvedValue(existing({ allowSensitiveActions: true }));
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
+      expect(setChoiceSpy).not.toHaveBeenCalled();
       expect(updateSpy).not.toHaveBeenCalled();
     });
 
@@ -129,21 +138,30 @@ describe('createOrReuseInteractiveShare (how links are written)', () => {
       await chatbotDb.createOrReuseInteractiveShare('s1');
       await chatbotDb.createOrReuseInteractiveShare('s1', null);
       await chatbotDb.createOrReuseInteractiveShare('s1', 7, {});
+      expect(setChoiceSpy).not.toHaveBeenCalled();
       expect(updateSpy).not.toHaveBeenCalled();
     });
 
-    it('a no-expiry caller still strips the expiry and keeps the stored choice (the strip must not lose it)', async () => {
+    it('a no-expiry caller strips ONLY the expiry: a stale copy of the link is never written back over the owner\'s choice', async () => {
       getSessionSpy.mockResolvedValue(existing({ expiresAt: '2027-02-01T00:00:00.000Z', allowSensitiveActions: true }));
       await chatbotDb.createOrReuseInteractiveShare('s1');
-      expect(updateSpy).toHaveBeenCalledTimes(1);
-      const written = updateSpy.mock.calls[0][1];
-      expect(written).not.toHaveProperty('expiresAt');
-      expect(written.allowSensitiveActions).toBe(true);
+      expect(stripSpy).toHaveBeenCalledTimes(1);
+      expect(stripSpy).toHaveBeenCalledWith('s1');
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(setChoiceSpy).not.toHaveBeenCalled();
+    });
+
+    it('a link made before the setting existed, with an expiry (so it reads as ON), reads as OFF once a mailed or posted reuse has removed the expiry', () => {
+      // the intended outcome, pinned: a link that was sent out to recipients is not one the owner made on purpose for a delegate
+      const before = { isActive: true, token: 't', expiresAt: '2027-02-01T00:00:00.000Z' };
+      const { expiresAt: _removed, ...after } = before;
+      expect(interactiveShareAllowsSensitiveActions(before as Record<string, unknown>)).toBe(true);
+      expect(interactiveShareAllowsSensitiveActions(after as Record<string, unknown>)).toBe(false);
     });
 
     it('a failed write of an explicit choice is not swallowed as success: the caller gets the login fallback, not the share link', async () => {
       getSessionSpy.mockResolvedValue(existing({ allowSensitiveActions: false }));
-      updateSpy.mockRejectedValue(new Error('dynamo down'));
+      setChoiceSpy.mockRejectedValue(new Error('dynamo down'));
       jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const url = await chatbotDb.createOrReuseInteractiveShare('s1', 7, { allowSensitiveActions: true });
       expect(url).toContain('/agent-mode/s1');

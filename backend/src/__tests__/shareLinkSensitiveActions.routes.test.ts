@@ -15,6 +15,7 @@ jest.mock('../services/chatbotService', () => ({
     getChatSessionRecord: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
+    setInteractiveShareAllowSensitiveActions: jest.fn(),
   },
 }));
 jest.mock('../services/agentModeService', () => ({
@@ -41,6 +42,7 @@ beforeEach(() => {
   jest.resetAllMocks();
   (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(URL_WITH_TOKEN);
   (chatbotDb.updateSessionInteractiveShareMetadata as jest.Mock).mockResolvedValue({});
+  (chatbotDb.setInteractiveShareAllowSensitiveActions as jest.Mock).mockResolvedValue(undefined);
   jest.spyOn(console, 'error').mockImplementation(() => undefined);
   jest.spyOn(console, 'log').mockImplementation(() => undefined);
 });
@@ -162,21 +164,20 @@ describe('PATCH /session/:id/conversable-share (updateConversableShareSettings)'
     return res;
   };
 
-  it('turns it ON for the existing link, changes nothing else about the link, and answers with the stored value', async () => {
+  it('turns it ON for the existing link, writing ONLY the choice (never a copy of the rest of the link), and answers with the stored value', async () => {
     const res = await patch(
       { allowSensitiveActions: true },
       [session(share({ expiresAt: '2027-01-01T00:00:00.000Z', allowSensitiveActions: false })), session(share({ expiresAt: '2027-01-01T00:00:00.000Z', allowSensitiveActions: true }))],
     );
-    expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith('s1', {
-      isActive: true, token: 'tok123', sharedAt: '2026-11-01T00:00:00.000Z', expiresAt: '2027-01-01T00:00:00.000Z', allowSensitiveActions: true,
-    });
+    expect(chatbotDb.setInteractiveShareAllowSensitiveActions).toHaveBeenCalledWith('s1', true);
+    expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({ allowSensitiveActions: true, explicit: true });
   });
 
   it('turns it OFF, and can make an explicit choice on a link made before the setting existed', async () => {
     const res = await patch({ allowSensitiveActions: false }, [session(share({ expiresAt: '2027-01-01T00:00:00.000Z' })), session(share({ expiresAt: '2027-01-01T00:00:00.000Z', allowSensitiveActions: false }))]);
-    expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith('s1', expect.objectContaining({ token: 'tok123', allowSensitiveActions: false }));
+    expect(chatbotDb.setInteractiveShareAllowSensitiveActions).toHaveBeenCalledWith('s1', false);
     expect(res.json).toHaveBeenCalledWith({ allowSensitiveActions: false, explicit: true });
   });
 
@@ -185,7 +186,7 @@ describe('PATCH /session/:id/conversable-share (updateConversableShareSettings)'
     async (_label, body) => {
       const res = await patch(body, []);
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+      expect(chatbotDb.setInteractiveShareAllowSensitiveActions).not.toHaveBeenCalled();
     },
   );
 
@@ -194,13 +195,13 @@ describe('PATCH /session/:id/conversable-share (updateConversableShareSettings)'
       const res = await patch({ allowSensitiveActions: true }, [record]);
       expect(res.status).toHaveBeenCalledWith(404);
     }
-    expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+    expect(chatbotDb.setInteractiveShareAllowSensitiveActions).not.toHaveBeenCalled();
   });
 
   it('a sandbox account can not change it', async () => {
     const res = await patch({ allowSensitiveActions: true }, [], { userId: 'eval_test' });
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(chatbotDb.updateSessionInteractiveShareMetadata).not.toHaveBeenCalled();
+    expect(chatbotDb.setInteractiveShareAllowSensitiveActions).not.toHaveBeenCalled();
   });
 
   it('does not claim a change that did not persist', async () => {
@@ -209,7 +210,7 @@ describe('PATCH /session/:id/conversable-share (updateConversableShareSettings)'
   });
 
   it('a failed write is an error', async () => {
-    (chatbotDb.updateSessionInteractiveShareMetadata as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+    (chatbotDb.setInteractiveShareAllowSensitiveActions as jest.Mock).mockRejectedValue(new Error('dynamo down'));
     const res = await patch({ allowSensitiveActions: true }, [session(share({ allowSensitiveActions: false }))]);
     expect(res.status).toHaveBeenCalledWith(500);
   });

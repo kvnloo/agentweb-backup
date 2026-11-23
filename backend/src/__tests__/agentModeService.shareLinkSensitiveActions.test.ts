@@ -193,11 +193,73 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
   });
 
   describe('a schedule a visitor set up (there is no link to ask)', () => {
+    it('is refused the WRITE side of a tool judged by its action, and still runs the READ side', async () => {
+      const ctx = { restrictionProfile: 'share_visitor_schedule', isUnattendedRun: true };
+      await expect(run('call_google_ads_api', ctx, { action: 'LIST' })).resolves.toEqual({ ran: true });
+      await expect(run('call_google_ads_api', ctx, { action: 'PAUSE' })).rejects.toMatchObject({
+        deniedBy: 'restriction_profile',
+        message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+
     it('is refused a sensitive tool whatever any link says, with the adopt wording', async () => {
       readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
       await expect(run(SENSITIVE, { restrictionProfile: 'share_visitor_schedule', isUnattendedRun: true })).rejects.toMatchObject({
         deniedBy: 'restriction_profile',
         message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a tool judged by its action is judged on the arguments it will RUN with (after repair), not on the raw shape', () => {
+    const realRepair = (...a: unknown[]) => (jest.requireActual('../services/agentToolGatewayService').validateAndRepairToolArgs as (...x: unknown[]) => unknown)(...a);
+
+    it('a read the model spelled without an action is not refused for looking like something else once repair has named it LIST', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      mockRepair.mockImplementation(({ args }: { args: any }) => ({ status: 'valid', args: { entity_type: 'RECORDS', action: 'LIST', object_type: 'people', ...(args?.endpoint ? {} : args) }, issues: [], repairs: [] }));
+      await expect(run('call_hubspot_api', VISITOR, { endpoint: '/crm/v3/objects/contacts', method: 'GET' })).resolves.toEqual({ ran: true });
+      expect(readSession).not.toHaveBeenCalled();
+    });
+
+    it('with the REAL repair: a GET-shaped HubSpot call and an Attio FIND are reads, and are not refused on an OFF link', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      mockRepair.mockImplementation(realRepair);
+      for (const [tool, args] of [
+        ['call_hubspot_api', { endpoint: '/crm/v3/objects/contacts', method: 'GET', entity_type: 'RECORDS' }],
+        ['call_attio_api', { action: 'FIND', entity_type: 'RECORDS', query: 'x' }],
+      ] as Array<[string, any]>) {
+        const outcome = await run(tool, VISITOR, args).then((r: unknown) => ({ refused: false, r }), (e: { deniedBy?: string }) => ({ refused: e?.deniedBy === 'restriction_profile' }));
+        expect({ tool, refused: outcome.refused }).toEqual({ tool, refused: false });
+      }
+    });
+
+    it('with the REAL repair: a HubSpot delete is still refused on an OFF link', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      mockRepair.mockImplementation(realRepair);
+      await expect(run('call_hubspot_api', VISITOR, { entity_type: 'CONTACT_LIST', action: 'DELETE', list_id: '1' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('a whole-tool sensitive call is settled BEFORE repair: repair can not be what lets it through', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      mockRepair.mockImplementation(() => { throw new Error('repair must not be reached for a refused tool'); });
+      await expect(run('delete_leads', VISITOR, {})).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+  });
+
+  describe('the owner\'s own unattended run (no profile) calling a sensitive tool', () => {
+    it('is not refused for a visitor reason: its session is read once to see whether it belongs to a visitor-made schedule, and an ordinary session is left alone', async () => {
+      readSession.mockResolvedValue({ sessionId: 'session-1', userId: 'owner-user-id', sessionType: 'agent' } as any);
+      await expect(run('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).resolves.toEqual({ ran: true });
+    });
+
+    it('is refused as "could not be verified" when that read keeps failing (the ENG-2816 rule for unattended runs, now reaching these tools too): nothing is sent', async () => {
+      readSession.mockRejectedValue(new Error('throttled'));
+      await expect(run('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).rejects.toMatchObject({
+        deniedBy: 'restriction_profile',
+        message: expect.stringContaining('could not be verified'),
       });
       expect(dispatch).not.toHaveBeenCalled();
     });
