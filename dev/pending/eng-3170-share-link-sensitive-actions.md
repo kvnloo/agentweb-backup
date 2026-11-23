@@ -1,9 +1,18 @@
-## ENG-3170: a share-link visitor runs sensitive tools only on a link whose owner allowed it (2026-11-23)
+## ENG-3170: a share-link visitor runs sensitive tools only on a link whose owner turned on Full control (2026-11-23)
 
 A share-link visitor runs under the owner's userId. A set of tools was guarded only by a sentence in the tool description or a `confirm`
 flag the model sets itself, so the visitor was the "user" who confirmed: delete leads / a lead list, send email or Slack, post to
 LinkedIn / X / Instagram / YouTube, publish a blog or landing page, change Google / LinkedIn / Meta-audience ad spend, disconnect LinkedIn.
 (`call_meta_marketing_api` writes are not in this set: they already halt into an approval deck a visitor cannot answer.)
+
+**Full control (owner decision, 2026-11-23).** Customers see the switch as "Full control": "everything that the customer can do, like it used to be
+before any of our changes/restrictions". When ON for a link, a visitor on it also gets what ENG-2816 took away (owner settings, hot-lead calls,
+Smartlead, Luma, memory, `connect_account`) and the saved-login tools (`get_login_credentials`, `get_test_account`), on top of the sensitive set.
+ADMIN tools are never lifted (a link holder must not get staff powers). A visitor-made schedule keeps the whole block list (no link to ask).
+The visitor refusal for the ENG-2816 block list keeps its wording byte for byte (a share-session eval depends on it). The early, model-facing
+refusal in `toolDispatch` asks the link through the optional port `shareLinkFullControl`; `executeTool` decides again from a consistent read.
+Added with it, on the owner's yes: `enable_lead_list_public_access`, `set_landing_page_lead_list`, `deploy_landing_page`, `test_scheduled_chat`,
+and `set_lead_contact_status` (only `active`, which re-enables contact with a lead who opted out, is sensitive).
 
 **What changed.**
 - `interactiveShareMetadata.allowSensitiveActions` (the owner's per-link choice). `utils/interactiveShare.interactiveShareAllowsSensitiveActions`
@@ -45,9 +54,9 @@ sensitive tool now reads its session once (is it a visitor-made schedule?), and 
 the block-listed tools. `generateConversableResponse`, `scheduleAutoWorkPlanContinuation` and `approvalInboxExecution` start turns with no profile
 (not reachable by a visitor today as far as read; not changed here).
 
-**Not covered (owner decision pending, listed in the test with the reason):** in-account overwrites; creating or deploying a new landing page;
-public lead-list access; coding_agent; ClickUp / Notion task creation; test_scheduled_chat; reads of saved passwords (`get_login_credentials`,
-`get_test_account`) and of the owner's mailbox or Slack. Passwords are the serious one and are raised separately.
+**Not covered (listed in the test with the reason):** in-account overwrites (`update_market_strategy`, `update_brand_guidelines`); creating a new
+landing page (`generate_landing_page`, `duplicate_landing_page`); `coding_agent`; ClickUp / Notion task creation; reads of the owner's mailbox,
+Slack and X messages.
 
 **Gotcha.** `executeTool`'s `validateAndRepairToolArgs` can hoist a nested wrapper or rename an alias, so the sensitive check is done on the raw
 arguments AND again on the prepared ones (the ENG-803 publish-approval check reads prepared arguments for the same reason).
