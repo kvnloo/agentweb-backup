@@ -34,14 +34,34 @@ const mcpRateLimiter = new RateLimiter();
  * A JSON-RPC batch is one HTTP request but N calls, and the limiter counts requests: a batch of 100 calls used to cost one count. After
  * the request's own count, charge the other N-1 members. A batch that does not fit in what is left is refused whole, before any member
  * runs (the limiter has already counted the request itself).
+ *
+ * Called only when the request is about to be SERVED (`admitBatchMembers`): a batch answered 404 (its session expired), 403 or 503 costs
+ * only its own request, so a client that reconnects after a 404 is not refused for the minute the stale batch would have used.
  */
 export function chargeBatchMembers(limiterKey: string, maxPerMinute: number, first: RateLimitResult, body: unknown): RateLimitResult {
   const extra = (Array.isArray(body) ? body.length : 1) - 1;
   if (!first.allowed || extra <= 0) return first;
-  if (extra > first.remaining) return { allowed: false, remaining: first.remaining, resetInMs: first.resetInMs };
+  // Written so that a `remaining` that is not a number (a key stored with a non-numeric rate) fails closed instead of comparing false.
+  if (!(extra <= first.remaining)) return { allowed: false, remaining: first.remaining, resetInMs: first.resetInMs };
   let last = first;
   for (let i = 0; i < extra; i++) last = mcpRateLimiter.check(limiterKey, maxPerMinute);
   return last;
+}
+
+type McpRateLimitState = { key: string; max: number; first: RateLimitResult };
+
+/**
+ * Charge the other members of a JSON-RPC batch, at the point where the request is about to be handed to a transport. Answers 429 itself and
+ * returns false when the batch does not fit in what the key (or OAuth user) has left; a request without limiter state (internal, anonymous)
+ * is admitted.
+ */
+function admitBatchMembers(req: Request, res: Response): boolean {
+  const limit = (req as any)._mcpRateLimit as McpRateLimitState | undefined;
+  if (!limit) return true;
+  const result = chargeBatchMembers(limit.key, limit.max, limit.first, req.body);
+  if (result.allowed) return true;
+  res.status(429).json({ error: 'Rate limit exceeded', retryAfterMs: result.resetInMs });
+  return false;
 }
 
 // Session timeout in milliseconds (default: 1 hour)
@@ -124,13 +144,16 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
         });
       }
       // Enforce per-key rate limit
-      const rateLimitResult = chargeBatchMembers(keyRecord.keyId, keyRecord.rateLimitPerMin, mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin), req.body);
+      const rateLimitResult = mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin);
       if (!rateLimitResult.allowed) {
         return res.status(429).json({
           error: "Rate limit exceeded",
           retryAfterMs: rateLimitResult.resetInMs,
         });
       }
+
+      // The other members of a batch are charged later, once the request is going to be served (admitBatchMembers).
+      (req as any)._mcpRateLimit = { key: keyRecord.keyId, max: keyRecord.rateLimitPerMin, first: rateLimitResult } satisfies McpRateLimitState;
 
       // Store the userId from the API key on the request for downstream use
       (req as any)._agentApiUserId = keyRecord.userId;
@@ -161,13 +184,14 @@ export async function validateMcpAccessToken(req: Request, res: Response, next: 
     if (tokenRecord) {
       const client = await mcpOAuthService.getClient(tokenRecord.clientId).catch(() => null);
       // Rate limit OAuth tokens by userId
-      const rateLimitResult = chargeBatchMembers(`oauth:${tokenRecord.userId}`, 60, mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60), req.body);
+      const rateLimitResult = mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60);
       if (!rateLimitResult.allowed) {
         return res.status(429).json({
           error: "Rate limit exceeded",
           retryAfterMs: rateLimitResult.resetInMs,
         });
       }
+      (req as any)._mcpRateLimit = { key: `oauth:${tokenRecord.userId}`, max: 60, first: rateLimitResult } satisfies McpRateLimitState;
       (req as any)._agentApiUserId = tokenRecord.userId;
       (req as any)._mcpIsInternal = false;  // External client
       (req as any)._mcpAuthMethod = 'oauth';
@@ -512,6 +536,7 @@ export function setupMcpServer(
 
         if (rehydrated && samePrincipal) {
           console.log(`[MCP-SERVER-DEBUG] Rehydrating cross-instance session ${sessionId}`);
+          if (!admitBatchMembers(req, res)) return;
           await rehydrateAndServe(req, res, sessionId, rehydrated, req.body);
           void sessionStore.touch(sessionId).catch(() => {
             /* best-effort ttl refresh */
@@ -562,7 +587,8 @@ export function setupMcpServer(
         return;
       }
 
-      // Handle the request with existing transport
+      // Handle the request with existing transport. A batch is charged for its other members only now that it will be served.
+      if (!admitBatchMembers(req, res)) return;
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
       console.error('[MCP] Error handling POST request:', error);
