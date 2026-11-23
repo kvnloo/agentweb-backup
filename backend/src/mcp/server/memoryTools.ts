@@ -43,7 +43,7 @@ import { MEMORY_READ_MAX_ROWS_LIST } from '../../utils/memoryReadLimits';
 
 /** Most memories an account (or an org) may hold for a save made through MCP to be accepted. */
 export const MEMORY_MCP_MAX_ROWS = 200;
-/** How long a save waits for an embedding while it holds the account's lock, in total: after that its rows are saved without one (see MemoryWriteOptions). */
+/** How long a save waits for ONE embedding while it holds the account's lock; after the first timeout the rest of that save is written without embeddings (see MemoryWriteOptions). */
 export const MCP_EMBED_TIMEOUT_MS = 15_000;
 const WRITE_OPTIONS = { embedTimeoutMs: MCP_EMBED_TIMEOUT_MS } as const;
 export const LIST_MEMORIES_DEFAULT_LIMIT = 20;

@@ -46,11 +46,13 @@ export type MemoryWriteGate = (request: {
 /**
  * Options of a CALLER, like the gate. Emma's own tools pass none: they wait for each embedding as before (they do get the cleanup of a
  * failed split save, see `writeChunks`).
- * `embedTimeoutMs`: ONE deadline per save. When the wait for an embedding passes it, that part is saved without one and the remaining parts
- * of a split save are saved without asking for theirs, exactly as when the embedding service fails (a row without an embedding is embedded
- * when the prompt loader ranks an account's memories; an account with 20 or fewer rows is injected whole, so nothing is lost). The MCP tools
- * set it because their save runs under a lock for the account, and an embedding call with no timeout (the client's default is ten minutes,
- * twice retried) would hold every other save of that account or org behind it. A value that is not a positive finite number means no bound.
+ * `embedTimeoutMs`: how long to wait for ONE embedding. The first time a wait passes it, that part is saved without an embedding and the
+ * remaining parts of a split save are saved without asking for theirs, exactly as when the embedding service fails (a row without an
+ * embedding is embedded when the prompt loader ranks an account's memories; an account with 20 or fewer rows is injected whole, so nothing
+ * is lost). So a HUNG service costs one wait per save. It is not a budget for the whole save: a service that is slow but answering, each
+ * part just inside the limit, is not cut off and can cost up to the limit per part. The MCP tools set it because their save runs under a
+ * lock for the account, and an embedding call with no timeout (the client's default is ten minutes, twice retried) would hold every other
+ * save of that account or org behind it. A value that is not a positive finite number means no bound.
  */
 export interface MemoryWriteOptions {
   embedTimeoutMs?: number;
@@ -130,7 +132,7 @@ async function writeChunks(
   // The arguments were checked non-blank, so a split cannot come back empty; if it ever did, saying "saved" would be a lie.
   if (chunks.length === 0) throw new Error('Content is required');
   const memoryIds: string[] = [];
-  let gaveUp = false; // one deadline per save: after the first timeout the remaining parts are saved without asking for an embedding
+  let gaveUp = false; // after the first timeout the remaining parts are saved without asking for an embedding
   try {
     for (const chunk of chunks) {
       let embedding: number[] | undefined;
