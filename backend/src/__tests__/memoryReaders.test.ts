@@ -573,3 +573,60 @@ describe('the projection lists cover every attribute the writers store', () => {
     expect(stored).toEqual([...ORG_MEMORY_LIST_ATTRIBUTES, 'embedding'].sort());
   });
 });
+
+describe('consistentRead (ENG-2840 W2-2): a table read is strongly consistent on request, an index read never is', () => {
+  const callParams = () => mockDocumentClientMethods.query.mock.calls.map((c) => c[0]);
+
+  it('account: a table read asks for ConsistentRead, with the projection and the default order too', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { consistentRead: true, omitEmbeddings: true, maxRows: 1000, newestFirst: true });
+    expect(callParams()[0]).toMatchObject({ ConsistentRead: true, ScanIndexForward: false, ProjectionExpression: expect.any(String) });
+  });
+
+  it('account: a category read goes through an index, which cannot be read consistently, so it never sets ConsistentRead', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', 'insight', undefined, { consistentRead: true });
+    expect(callParams()[0].IndexName).toBe('UserIdCategoryIndex');
+    expect(callParams()[0].ConsistentRead).toBeUndefined();
+  });
+
+  it('account: nothing asks for it by default (the prompt loader and the list screens read as before)', async () => {
+    servePages([range(1, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1');
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { maxRows: 1000, newestFirst: true, omitEmbeddings: true });
+    expect(callParams().every((p) => p.ConsistentRead === undefined)).toBe(true);
+  });
+
+  it('account: the learning-range jump query is built from the same parameters, so it stays consistent', async () => {
+    mockDocumentClientMethods.query.mockImplementation((params: any) => ({
+      promise: async () => (params.KeyConditionExpression.includes('learningBoundary')
+        ? { Items: [accountRow(3)] }
+        : { Items: [accountRow(1)], LastEvaluatedKey: { userId: 'u1', memoryId: 'ads-learning#a' } }),
+    }));
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { consistentRead: true, newestFirst: false, maxRows: 5 });
+    expect(callParams()).toHaveLength(2);
+    expect(callParams().every((p) => p.ConsistentRead === true)).toBe(true);
+  });
+
+  it('account: later pages of a long read stay consistent', async () => {
+    servePages([range(1, 3, accountRow), range(4, 2, accountRow)], accountKey);
+    await accountMemoryDb.getUserMemories('u1', undefined, undefined, { consistentRead: true });
+    expect(callParams()).toHaveLength(2);
+    expect(callParams().every((p) => p.ConsistentRead === true)).toBe(true);
+  });
+
+  it('org: the same three rules', async () => {
+    servePages([range(1, 3, orgRow), range(4, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', undefined, undefined, { consistentRead: true, omitEmbeddings: true });
+    expect(callParams().every((p) => p.ConsistentRead === true)).toBe(true);
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1', 'insight', undefined, { consistentRead: true });
+    expect(callParams()[0].IndexName).toBe('OrgIdCategoryIndex');
+    expect(callParams()[0].ConsistentRead).toBeUndefined();
+    mockDocumentClientMethods.query.mockClear();
+    servePages([range(1, 2, orgRow)], orgKey);
+    await orgMemoryDb.getOrgMemories('o1');
+    expect(callParams()[0].ConsistentRead).toBeUndefined();
+  });
+});
