@@ -2,6 +2,10 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { accountMemoryDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
+import { MEMORY_READ_MAX_ROWS_LIST } from '../utils/memoryReadLimits';
+
+// ENG-2840 (W2-1): what the list screens read: up to the list bound, oldest first (the order the screen always had), without embeddings.
+const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: false, omitEmbeddings: true } as const;
 
 const router = express.Router();
 
@@ -40,7 +44,8 @@ router.get('/', async (req, res) => {
   try {
     const userId = (req as any).user.userId;
     const category = req.query.category as string | undefined;
-    const memories = await accountMemoryDb.getUserMemories(userId, category);
+    // ENG-2840 (W2-1): the whole list (up to the list bound), oldest first as always, without the embedding vectors the screen never reads.
+    const memories = await accountMemoryDb.getUserMemories(userId, category, undefined, LIST_READ);
     res.json({ memories });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch memories' });

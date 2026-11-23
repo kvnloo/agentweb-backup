@@ -9,8 +9,8 @@ import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
-import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
-import { MEMORY_AUTOSPLIT_MAX_CHARS, splitMemoryContent } from '../utils/memoryContentLimit';
+import { userDb } from '../services/db';
+import { MEMORY_AUTOSPLIT_MAX_CHARS } from '../utils/memoryContentLimit';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
 import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
@@ -48,6 +48,8 @@ import * as leadsImpl from './impl/leads';
 import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same treatment as booksImpl above.
 import * as mediaVideoImpl from './impl/mediaVideo';
+// ENG-2840 (W2-1): the four memory tool bodies, shared with the MCP memory tools.
+import * as memoryImpl from './impl/memory';
 // ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same treatment as booksImpl above.
 import * as htmlCreationImpl from './impl/htmlCreation';
 // ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as booksImpl above.
@@ -6814,43 +6816,8 @@ emmaToolRegistry.register({
       required: ['content', 'category']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (user?.memoryEnabled === false) {
-      return { success: false, message: 'Memory is disabled for this account.' };
-    }
-
-    // Embed at write time so the memory can later be retrieved by relevance, not just
-    // recency. Best-effort: a failure must not block saving (read path falls back to recency).
-    const { embedText } = await import('../utils/embeddings');
-    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
-    const chunks = splitMemoryContent(String(args.content ?? ''));
-    const memoryIds: string[] = [];
-    for (const chunk of chunks) {
-      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
-      const memory = await accountMemoryDb.addMemory(
-        userId,
-        args.category,
-        chunk,
-        context?.sessionId,
-        embedding
-      );
-      memoryIds.push(memory.memoryId);
-    }
-    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
-    return {
-      success: true,
-      memoryId: memoryIds[0],
-      ...(memoryIds.length > 1 ? { memoryIds } : {}),
-      message: memoryIds.length > 1
-        ? `Saved memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
-        : `Saved memory: ${preview}`
-    };
-  }
+  // ENG-2840 (W2-1): the body lives in emma/impl/memory.ts, shared with the MCP memory tools.
+  execute: (args: any, context?: any) => memoryImpl.saveAccountMemory(args, context),
 });
 
 emmaToolRegistry.register({
@@ -6869,13 +6836,7 @@ emmaToolRegistry.register({
       required: ['memoryId']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    await accountMemoryDb.deleteMemory(userId, args.memoryId);
-    return { success: true, message: `Memory ${args.memoryId} deleted.` };
-  }
+  execute: (args: any, context?: any) => memoryImpl.deleteAccountMemory(args, context),
 });
 
 // ─── Org Memory Tools ────────────────────────────────────────
@@ -6902,57 +6863,14 @@ emmaToolRegistry.register({
       required: ['content', 'category']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb, orgDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (!user?.orgId) {
-      return { success: false, message: 'User is not a member of any organization.' };
-    }
-
-    const org = await orgDb.getOrgById(user.orgId);
-    if (!org) {
-      return { success: false, message: 'Organization not found.' };
-    }
-    if (org.orgMemoryEnabled === false) {
-      return { success: false, message: 'Organization memory is disabled.' };
-    }
-
-    // Embed at write time so the memory can later be retrieved by relevance (best-effort).
-    const { embedText } = await import('../utils/embeddings');
-    // ENG-2574: split oversized content into <=2000-char rows rather than rejecting it.
-    const chunks = splitMemoryContent(String(args.content ?? ''));
-    const memoryIds: string[] = [];
-    for (const chunk of chunks) {
-      const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
-      const memory = await orgMemoryDb.addMemory(
-        user.orgId,
-        args.category,
-        chunk,
-        userId,
-        embedding
-      );
-      memoryIds.push(memory.memoryId);
-    }
-    const preview = `"${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`;
-    return {
-      success: true,
-      memoryId: memoryIds[0],
-      ...(memoryIds.length > 1 ? { memoryIds } : {}),
-      message: memoryIds.length > 1
-        ? `Saved org memory as ${memoryIds.length} parts (content exceeded 2000 characters): ${preview}`
-        : `Saved org memory: ${preview}`
-    };
-  }
+  execute: (args: any, context?: any) => memoryImpl.saveOrgMemory(args, context),
 });
 
 emmaToolRegistry.register({
   name: 'delete_org_memory',
   definition: {
     name: 'delete_org_memory',
-    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners can delete org memories.',
+    description: 'Delete a specific org memory by its ID. Use this when an org-wide fact is no longer accurate or relevant. Only org owners and admins can delete org memories.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6964,27 +6882,7 @@ emmaToolRegistry.register({
       required: ['memoryId']
     }
   },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const { userDb, orgDb } = await import('../services/db');
-    const user = await userDb.getUserById(userId);
-    if (!user?.orgId) {
-      return { success: false, message: 'User is not a member of any organization.' };
-    }
-
-    const org = await orgDb.getOrgById(user.orgId);
-    if (!org) {
-      return { success: false, message: 'Organization not found.' };
-    }
-    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
-      return { success: false, message: 'Only org owners and admins can delete org memories.' };
-    }
-
-    await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
-    return { success: true, message: `Org memory ${args.memoryId} deleted.` };
-  }
+  execute: (args: any, context?: any) => memoryImpl.deleteOrgMemory(args, context),
 });
 
 emmaToolRegistry.register({
@@ -7391,7 +7289,6 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
 // Ensure apiTools has registered its tools before we try to bridge them.
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
-import { can } from "../services/orgAuthz";
 
 // Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
 // for mcpToolRegistry to be available).

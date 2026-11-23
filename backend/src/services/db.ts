@@ -3,6 +3,8 @@ import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { buildAwsHttpOptions } from "../utils/awsHttpOptions";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
+import { MEMORY_CATEGORIES, type MemoryCategory } from '../utils/memoryCategories';
+import { MEMORY_READ_MAX_ROWS_PROMPT } from '../utils/memoryReadLimits';
 import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
@@ -11586,8 +11588,8 @@ export const crmDb = {
 
 // ─── Account Memory ───────────────────────────────────────────────
 
-const VALID_MEMORY_CATEGORIES = ['preference', 'history', 'insight', 'workflow'] as const;
-type MemoryCategory = typeof VALID_MEMORY_CATEGORIES[number];
+// The category list lives in utils/memoryCategories.ts so emma/impl/memory.ts can check it without loading this file.
+const VALID_MEMORY_CATEGORIES = MEMORY_CATEGORIES;
 
 const ACCOUNT_MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
 const ORG_MEMORY_TABLE = `${TABLE_PREFIX}AW-OrgMemory`;
@@ -11806,15 +11808,38 @@ export const browserCookieDb = {
   },
 };
 
+// ENG-2840 (W2-1): the bounds are in utils/memoryReadLimits.ts (why a read now follows the cursor, and why these numbers).
+export interface MemoryReadOptions {
+  /** Hard bound on rows returned when no `limit` is given. Default: MEMORY_READ_MAX_ROWS_PROMPT. */
+  maxRows?: number;
+  /** Newest rows first (memory ids are ULIDs). Default true; ignored for a category read, whose index sorts by category. */
+  newestFirst?: boolean;
+  /** Leave the embedding vectors out of the returned rows. Default false: the prompt loader ranks by them. */
+  omitEmbeddings?: boolean;
+}
+
+function withoutEmbeddings<T extends Record<string, any>>(rows: T[]): Omit<T, 'embedding'>[] {
+  return rows.map(({ embedding: _embedding, ...rest }) => rest);
+}
+
 /** Keep structured ads lessons out of generic relevance injection, without consuming its
- * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed. */
-async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.QueryInput): Promise<any[]> {
+ * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed.
+ *
+ * `opts.maxRows` bounds a read that has no `limit`: the loop follows the cursor until the rows run out or the bound is reached
+ * (it used to return after the first page that held any ordinary row). */
+async function queryOrdinaryAccountMemories(
+  params: AWS.DynamoDB.DocumentClient.QueryInput,
+  opts: { maxRows?: number } = {},
+): Promise<any[]> {
   const rows: any[] = [];
   let query = { ...params };
   let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-  for (let page = 0; page < 10; page++) {
+  const want = params.Limit ?? opts.maxRows;
+  // One page holds 40 or more rows even at the largest row size, so the page budget grows with the bound.
+  const maxPages = params.Limit === undefined && opts.maxRows ? Math.max(10, Math.ceil(opts.maxRows / 30) + 10) : 10;
+  for (let page = 0; page < maxPages; page++) {
     const result = await dynamodb.query({ ...query, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-      ...(params.Limit ? { Limit: params.Limit - rows.length } : {}) }).promise();
+      ...(want ? { Limit: want - rows.length } : {}) }).promise();
     if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed account memory page');
     for (const item of result.Items ?? []) {
       if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
@@ -11831,12 +11856,30 @@ async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.
         ExpressionAttributeValues: { ...params.ExpressionAttributeValues,
           ':learningBoundary': descending ? 'ads-learning#' : 'ads-learning#\uffff' } };
       cursor = undefined;
-      if (params.Limit && rows.length >= params.Limit) return rows.slice(0, params.Limit);
+      if (want && rows.length >= want) return rows.slice(0, want);
       continue;
     }
-    if (!cursor || (params.Limit ? rows.length >= params.Limit : rows.length > 0)) return params.Limit ? rows.slice(0, params.Limit) : rows;
+    // With a bound (a `limit` or `opts.maxRows`) keep reading until it is reached or the rows run out. Without one, the old rule
+    // stands: the first page that holds any ordinary row is the answer.
+    if (!cursor || (want ? rows.length >= want : rows.length > 0)) return want ? rows.slice(0, want) : rows;
   }
   throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
+}
+
+/** Org memory rows (no learning range to skip): follow the cursor until the rows run out or `maxRows` is reached. Fails closed
+ * when the page budget runs out, like the account reader. */
+async function queryOrgMemoryRows(params: AWS.DynamoDB.DocumentClient.QueryInput, maxRows: number): Promise<any[]> {
+  const rows: any[] = [];
+  let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+  const maxPages = Math.max(10, Math.ceil(maxRows / 30) + 10);
+  for (let page = 0; page < maxPages; page++) {
+    const result = await dynamodb.query({ ...params, ...(cursor ? { ExclusiveStartKey: cursor } : {}), Limit: maxRows - rows.length }).promise();
+    if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed org memory page');
+    rows.push(...(result.Items ?? []));
+    cursor = result.LastEvaluatedKey;
+    if (!cursor || rows.length >= maxRows) return rows.slice(0, maxRows);
+  }
+  throw new Error('Org memory retrieval exceeded its bounded page budget; incomplete results withheld');
 }
 
 export const accountMemoryDb = {
@@ -11893,7 +11936,11 @@ export const accountMemoryDb = {
     }
   },
 
-  async getUserMemories(userId: string, category?: string, limit?: number) {
+  /**
+   * A call with a `limit` behaves exactly as before. A call without one now reads up to `options.maxRows` rows (default: the
+   * newest MEMORY_READ_MAX_ROWS_PROMPT) by following the cursor; it used to return one page.
+   */
+  async getUserMemories(userId: string, category?: string, limit?: number, options: MemoryReadOptions = {}) {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = category
         ? {
@@ -11908,9 +11955,12 @@ export const accountMemoryDb = {
           KeyConditionExpression: 'userId = :userId',
           ExpressionAttributeValues: { ':userId': userId },
           ...(limit ? { Limit: limit } : {}),
+          // Newest first only for an unbounded-by-limit table read: the category index sorts by category, not by time.
+          ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
         };
 
-      return await queryOrdinaryAccountMemories(params);
+      const rows = await queryOrdinaryAccountMemories(params, limit ? {} : { maxRows: options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT });
+      return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
       throw error;
@@ -12003,13 +12053,16 @@ export const accountMemoryDb = {
     }
   },
 
-  async deleteMemory(userId: string, memoryId: string) {
+  /** Resolves true when a row was deleted and false when there was no such memory (a delete of a missing id used to look like success). */
+  async deleteMemory(userId: string, memoryId: string): Promise<boolean> {
     if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     try {
-      await dynamodb.delete({
+      const result = await dynamodb.delete({
         TableName: ACCOUNT_MEMORY_TABLE,
         Key: { userId, memoryId },
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      return Boolean(result?.Attributes);
     } catch (error) {
       handleDynamoDbError(error, 'deleteMemory');
       throw error;
@@ -12064,7 +12117,9 @@ export const orgMemoryDb = {
     }
   },
 
-  async getOrgMemories(orgId: string, category?: string, limit?: number) {
+  /** Same contract as accountMemoryDb.getUserMemories: a `limit` call is unchanged; without one, the read follows the cursor up to
+   * `options.maxRows` (default: the newest MEMORY_READ_MAX_ROWS_PROMPT) instead of returning one page. */
+  async getOrgMemories(orgId: string, category?: string, limit?: number, options: MemoryReadOptions = {}) {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = category
         ? {
@@ -12079,10 +12134,13 @@ export const orgMemoryDb = {
           KeyConditionExpression: 'orgId = :orgId',
           ExpressionAttributeValues: { ':orgId': orgId },
           ...(limit ? { Limit: limit } : {}),
+          ...(!limit && (options.newestFirst ?? true) ? { ScanIndexForward: false } : {}),
         };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      const rows = limit
+        ? (await dynamodb.query(params).promise()).Items || []
+        : await queryOrgMemoryRows(params, options.maxRows ?? MEMORY_READ_MAX_ROWS_PROMPT);
+      return options.omitEmbeddings ? withoutEmbeddings(rows) : rows;
     } catch (error) {
       handleDynamoDbError(error, 'getOrgMemories');
       throw error;
@@ -12187,12 +12245,15 @@ export const orgMemoryDb = {
     }
   },
 
-  async deleteMemory(orgId: string, memoryId: string) {
+  /** Resolves true when a row was deleted and false when there was no such org memory. */
+  async deleteMemory(orgId: string, memoryId: string): Promise<boolean> {
     try {
-      await dynamodb.delete({
+      const result = await dynamodb.delete({
         TableName: ORG_MEMORY_TABLE,
         Key: { orgId, memoryId },
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      return Boolean(result?.Attributes);
     } catch (error) {
       handleDynamoDbError(error, 'deleteOrgMemory');
       throw error;

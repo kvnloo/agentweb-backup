@@ -3,6 +3,10 @@ import { authenticateToken } from '../middleware/auth';
 import { orgMemoryDb, orgDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
 import { callerCan } from "../services/orgAuthz";
+import { MEMORY_READ_MAX_ROWS_LIST } from '../utils/memoryReadLimits';
+
+// ENG-2840 (W2-1): what the list screens read: up to the list bound, oldest first (the order the screen always had), without embeddings.
+const LIST_READ = { maxRows: MEMORY_READ_MAX_ROWS_LIST, newestFirst: false, omitEmbeddings: true } as const;
 
 const router = express.Router();
 
@@ -74,7 +78,8 @@ router.get('/:orgId/memory', async (req, res) => {
     if (!member) return res.status(403).json({ error: 'Not a member of this organization' });
 
     const category = req.query.category as string | undefined;
-    const memories = await orgMemoryDb.getOrgMemories(orgId, category);
+    // ENG-2840 (W2-1): the whole list (up to the list bound), oldest first as always, without the embedding vectors the screen never reads.
+    const memories = await orgMemoryDb.getOrgMemories(orgId, category, undefined, LIST_READ);
     res.json({ memories });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch org memories' });
