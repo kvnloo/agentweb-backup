@@ -1788,6 +1788,14 @@ export async function setLeadContactStatus(
 
       for (const leadId of leadIds) {
         try {
+          // `updateLead` is an upsert: for an id that is not in this list (deleted, or mistyped) it would CREATE an empty stub lead that
+          // then shows up in the list. A missing lead is a failure to report, never a lead to create.
+          const existing = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+          if (!existing) {
+            failed++;
+            errors.push(`${leadId}: lead not found in this list`);
+            continue;
+          }
           const updates: any = {
             contactStatus,
             contactStatusUpdatedAt: now,
