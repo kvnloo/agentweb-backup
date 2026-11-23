@@ -373,7 +373,7 @@ describe('embedTimeoutMs: a hung embedding does not hold a save forever (ENG-284
     }
   });
 
-  it('ONE deadline per save: after the first timeout the remaining parts are saved without asking for an embedding or waiting again', async () => {
+  it('after the first timeout the remaining parts are saved without asking for an embedding or waiting again (a hung service costs one wait per save)', async () => {
     // Fake timers, so the proof is not a wall-clock margin: the clock is advanced past ONE deadline only. A save that waited again for a
     // second part would still be pending afterwards (no timer would fire for it) and `await save` would never return.
     jest.useFakeTimers();
@@ -387,6 +387,34 @@ describe('embedTimeoutMs: a hung embedding does not hold a save forever (ENG-284
       expect(mockAddAccount.mock.calls.every((c) => c[4] === undefined)).toBe(true);
       expect(mockEmbedText).toHaveBeenCalledTimes(1); // not once per part
       expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('an embedding that comes back empty (the service failed, null) does NOT end the asking: only a timeout does', async () => {
+    mockEmbedText.mockResolvedValueOnce(null).mockResolvedValue(EMBEDDING);
+    await saveAccountMemory({ content: longText(7000), category: 'insight' }, ctx, undefined, { embedTimeoutMs: 500 });
+    const embeddings = mockAddAccount.mock.calls.map((c) => c[4]);
+    expect(mockEmbedText).toHaveBeenCalledTimes(embeddings.length); // every part still asked
+    expect(embeddings[0]).toBeUndefined();
+    expect(embeddings.slice(1).every((e) => e === EMBEDDING)).toBe(true);
+  });
+
+  it('Emma\'s own call (no options) has no hidden bound: a hung embedding is still waited for after an hour, and the save finishes when it answers', async () => {
+    jest.useFakeTimers();
+    try {
+      let answer!: (value: number[]) => void;
+      mockEmbedText.mockReturnValue(new Promise<number[]>((resolve) => { answer = resolve; }));
+      let settled = false;
+      const save = saveAccountMemory({ content: 'a fact', category: 'insight' }, ctx).then((out) => { settled = true; return out; });
+      await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(settled).toBe(false);
+      expect(jest.getTimerCount()).toBe(0);
+      answer(EMBEDDING);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(await save).toMatchObject({ success: true });
+      expect(mockAddAccount).toHaveBeenCalledWith('u1', 'insight', 'a fact', 's1', EMBEDDING);
     } finally {
       jest.useRealTimers();
     }

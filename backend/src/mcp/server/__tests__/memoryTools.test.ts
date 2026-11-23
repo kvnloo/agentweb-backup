@@ -581,7 +581,7 @@ describe('the lock is bounded and is its own (second review)', () => {
     }
   });
 
-  it('a long text is ONE wait, not one per part: three parts under a hung embedding service finish after 15 seconds, unembedded', async () => {
+  it('a hung embedding service costs ONE wait for a long text, not one per part: three parts finish after 15 seconds, unembedded', async () => {
     jest.useFakeTimers();
     try {
       (embedText as jest.Mock).mockReturnValue(new Promise(() => {}));
