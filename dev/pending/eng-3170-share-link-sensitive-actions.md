@@ -145,3 +145,33 @@ the items of `add_gtm_phase` / `add_gtm_work_items` / `add_gtm_common_items`, an
 such a list decides who the owner's outreach contacts later). `email` search and get (and Slack/X message reads) still read the owner's mailbox, so a login code or
 magic link is findable that way: the one remaining path to "use your saved logins", closing it removes reading the owner's inbox for a visitor on an OFF link.
 `send_for_review` stays (a result-link review flow: the recipient comes from the session's configuration, not from the visitor).
+
+## Third final-review round (2026-11-24, on 8f257cc48): what was closed, what stays
+Closed, each verified in the code:
+- **`email` is sensitive whatever its action.** `search`/`list`/`get` read full message bodies from the owner's mailbox, so a visitor's own (cookie-less) browser can
+  start a "send me a code" or "reset my password" flow on a site the owner has an account on and have Emma read the code or link back: that is
+  `read_verification_code` by another name. The owner can have it back for a visitor by turning Full control on. (This was listed as the owner's call; two blind
+  reviewers independently called it an account-takeover path, so it is closed and the revert is one line: remove `'email'` from `SHARE_VISITOR_SENSITIVE_TOOLS`.)
+  Slack and X message reads and `read_google_doc` stay (privacy of the owner's own messages, not a login).
+- **A session's browser is not shared between the owner and a visitor who may not use the owner's logins.** Browsers are pooled per (owner, chat session) for an hour,
+  and the visitor runs under the owner's id, so a visitor on an OFF link drove the browser the owner had logged in (or read its cookies with `browser_evaluate`).
+  `separateBrowserBetweenActors` releases the session's browser when the actor switches (owner to such a visitor, and back, when the owner's cookies load again).
+  A visitor on a link that allows the sensitive tools is the same actor as the owner.
+- **A schedule a visitor wrote no longer borrows the owner's saved logins.** The browser tools of an UNATTENDED run now ask the schedule's provenance (`scheduledRunRestriction`);
+  a marked schedule's browser steps run without the owner's cookies, and so do steps of a schedule that cannot be read (the browser step still runs; only the logins
+  are withheld). Owner-made schedules, and attended calls, are untouched.
+- **A schedule a visitor wrote may read the Meta ad account but never write to it** (`SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT`): in an unattended run a Meta write
+  is staged as an Approval Desk decision that AgentWeb's own approver can approve, and it is then sent with the owner's token. In a visitor's own chat a Meta write still
+  halts into a deck only the owner can answer, so that flow is unchanged.
+- **`dri` on `add_gtm_phase` and `create_gtm_plan`** (every later report of the plan goes to that address).
+- **The GitHub MCP tools of the owner's own token** (`create_issue`, `push_files`, `merge_pull_request`, ...) are sensitive by name (`SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS`); they exist only
+  at runtime, so the guard test pins their names and that none shadows a tool of ours. Servers an operator adds through the `mcp_servers` setting are NOT covered.
+
+Still allowed, on purpose (disclosed; the owner's to decide): `modify_work_plan` without `autocomplete` keeps an existing `autocomplete: true`, so a visitor who launches an
+autocomplete template and rewrites its steps leaves the owner's next turn to carry them out (this is the visitor-text-in-the-owner's-context class, which the anonymous-viewer
+label of ENG-2227 is for); `generate_image` and `enqueue_human_eval` queue an internal AgentWeb review whose staff reply can write the visitor's prompt into the owner's memory;
+`update_html_file` writes the next `_vN` of a file in a folder taken from the URL (a skipped version number can overwrite the owner's latest); `update_lead` pushes its edits to the
+owner's connected HubSpot or Attio when auto-sync is on; the import notifications of `add_leads_to_list` / `import_leads_from_search` when the owner turned them on;
+`send_for_review` (visitor HTML in the reviewer's email on a result link); `/ishare/:id/email-report` (a fixed AgentWeb report link to any address, rate limited, predates this change);
+Meta image and video uploads; turning Full control on also covers everyone who already holds the link (one token per session) and an `enqueue_human_eval` or `generate_image`
+call by a visitor makes an OFF link permanent (an email path does the same, by design); a running visitor turn is not tied to the link it started on.

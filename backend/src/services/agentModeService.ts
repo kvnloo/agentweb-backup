@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -1292,6 +1292,35 @@ export class AgentModeService {
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
+  // ENG-3170: who last drove this session's browser (in this process, where its pooled browser lives): 'owner' (the owner, or a visitor allowed to use the
+  // owner's logins) or 'visitor' (a visitor who is not). Bounded, oldest first.
+  private browserActorBySession = new Map<string, 'owner' | 'visitor'>();
+  private static readonly BROWSER_ACTOR_MAX_SESSIONS = 1000;
+
+  /**
+   * ENG-3170: a chat session's browser is pooled for the whole session (one hour idle), under the OWNER's id, so a visitor on an OFF link would drive
+   * the same browser the owner logged in (and read its cookies with browser_evaluate). When the person driving it switches between the owner and a
+   * visitor who may not use the owner's logins, the session's browser is released (a fresh one starts with no logins), and the owner's cookies are
+   * loaded again the next time the owner drives it. A visitor whose history is unknown in this process is treated as a switch.
+   */
+  private async separateBrowserBetweenActors(sessionId: string, actor: 'owner' | 'visitor'): Promise<void> {
+    const last = this.browserActorBySession.get(sessionId);
+    if (last !== actor && (last !== undefined || actor === 'visitor')) {
+      try {
+        await this.mcpClientService.releaseSessionClients(sessionId);
+      } catch (releaseError) {
+        console.warn(`AgentMode ENG-3170: could not release the browser of session ${sessionId} between the owner and a visitor:`, releaseError);
+      }
+      this.browserCookieAutoState.sessions.delete(sessionId);
+    }
+    this.browserActorBySession.delete(sessionId);
+    this.browserActorBySession.set(sessionId, actor);
+    while (this.browserActorBySession.size > AgentModeService.BROWSER_ACTOR_MAX_SESSIONS) {
+      const oldest = this.browserActorBySession.keys().next().value;
+      if (oldest === undefined) break;
+      this.browserActorBySession.delete(oldest);
+    }
+  }
   // ENG-2103 (F2): driveServiceAccountEmail moved to a module-level singleton
   // in emma/impl/shared/googleDriveAccess.ts (the same "pure cache" treatment
   // as F1's runFundingStore) — getGoogleDriveClient/getGoogleDriveServiceAccountEmail
@@ -10140,12 +10169,18 @@ export class AgentModeService {
     // A caller that already carries a profile (a share visitor's own turn) was handled by the check just above.
     if (extraContext?.restrictionProfile) return unrestricted;
     const refusedByProfile = restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, toolName, ADMIN_SKILL_TOOL_NAMES, args, { nameOnly }) !== null;
-    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    // ENG-3170: a browser tool of an UNATTENDED run is asked too, because the browser starts from the owner's saved logins: a schedule a visitor wrote
+    // must not borrow them. Only the cookie rule listens (browser tools are not refused by this profile), so a schedule that cannot be read still gets its
+    // browser step, just without the owner's logins.
+    const browserOfUnattendedRun = extraContext?.isUnattendedRun === true && isBrowserAutomationTool(toolName);
+    const carriesClaim = SCHEDULE_WRITE_TOOL_NAMES.has(toolName) || browserOfUnattendedRun;
     if (!refusedByProfile && !carriesClaim) return unrestricted;
 
     const unverifiable = { refusal: scheduleProvenanceUnverifiableRefusal(toolName) };
     // What "could not be verified" means for THIS caller: refused if it is an unattended run, otherwise left alone.
-    const whenUnverifiable = extraContext?.isUnattendedRun === true ? unverifiable : unrestricted;
+    const browserOnly = browserOfUnattendedRun && !refusedByProfile && !SCHEDULE_WRITE_TOOL_NAMES.has(toolName);
+    const withoutOwnerLogins = { refusal: null, profile: SHARE_VISITOR_SCHEDULE_PROFILE as RestrictionProfileId };
+    const whenUnverifiable = extraContext?.isUnattendedRun === true ? (browserOnly ? withoutOwnerLogins : unverifiable) : unrestricted;
 
     let session: any;
     try {
@@ -10181,7 +10216,7 @@ export class AgentModeService {
       } catch (scheduleError) {
         // A scheduled session whose schedule cannot be READ: refuse whoever is calling, rather than run an unknown schedule as the owner.
         console.error(`AgentMode ENG-2816: could not read schedule ${scheduleId} to check provenance for ${toolName}; refusing rather than assuming it is unmarked:`, scheduleError);
-        return unverifiable;
+        return browserOnly ? withoutOwnerLogins : unverifiable;
       }
     }
     // A deleted schedule: an unattended run cannot be shown to be the owner's; an owner reopening the old session is not a run.
@@ -10300,15 +10335,22 @@ export class AgentModeService {
     // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
     // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
     // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
-    if (!isFullControlGatedWholeTool(toolName) && isSensitiveToolCall(toolName, preparedArgs)) {
-      const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
-      if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
-      if (isShareVisitor && !(await this.readShareLinkControl(toolName, sessionId)).sensitive) {
-        console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
-        throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+    if (!isFullControlGatedWholeTool(toolName)) {
+      const sensitiveCall = isSensitiveToolCall(toolName, preparedArgs);
+      // A Meta write is sensitive only in a run of a schedule a visitor wrote (an unattended run stages it for an approver who is not the owner):
+      // in a visitor's own chat it halts into a deck only the owner can answer, so the link is not asked about it.
+      if (sensitiveCall || isSensitiveInVisitorScheduleCall(toolName, preparedArgs)) {
+        if (sensitiveCall) {
+          const refusedByArgument = restrictionRefusal(extraContext?.restrictionProfile, toolName, ADMIN_SKILL_TOOL_NAMES, preparedArgs);
+          if (refusedByArgument) throw new ToolRestrictionDenied(refusedByArgument);
+          if (isShareVisitor && !(await this.readShareLinkControl(toolName, sessionId)).sensitive) {
+            console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: the owner has not turned on full control for this share link.`);
+            throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+          }
+        }
+        const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
+        if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
       }
-      const scheduledByArgument = await this.scheduledRunRestriction(toolName, sessionId, extraContext, preparedArgs);
-      if (scheduledByArgument.refusal) throw new ToolRestrictionDenied(scheduledByArgument.refusal);
     }
     const policyDecision = evaluateAgentToolPolicy({
       toolName,
@@ -10357,8 +10399,12 @@ export class AgentModeService {
         // "Visitor" is decided from the TURN as well as from the caller's claim: a tool that drives the browser for the model (open_site_signin,
         // solve_captcha, coding_agent) calls executeTool without forwarding the claim, and that nested call is still the visitor's turn.
         // A nested call that carries a profile of its own, inside a visitor's scope, is still inside that visitor's call (`withinVisitorCall`).
-        const visitorCall = isShareVisitor || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
-        const borrowOwnerLogins = !visitorCall || await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false);
+        // A scheduled run of a schedule a visitor wrote (scheduledRunRestriction hands back its profile for a browser tool of an unattended run) has no
+        // link to ask: it never borrows the owner's logins until the owner adopts the schedule.
+        const visitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+        const visitorCall = isShareVisitor || visitorSchedule || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
+        const borrowOwnerLogins = !visitorCall || (!visitorSchedule && await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false));
+        await this.separateBrowserBetweenActors(sessionId, borrowOwnerLogins ? 'owner' : 'visitor');
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
         const toolFailed = result && (result as any).success === false;

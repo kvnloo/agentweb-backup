@@ -103,7 +103,6 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
       for (const [tool, args] of [
         ['read_brand_guidelines', {}],
-        ['email', { action: 'search', query: 'x' }],
         ['linkedin_outreach', { action: 'search-people', keywords: 'x' }],
         ['call_google_ads_api', { action: 'LIST' }],
         ['call_hubspot_api', { action: 'GET_STATS' }],
@@ -117,7 +116,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
 
     it('pays no read for a call that is not sensitive', async () => {
       await run('read_brand_guidelines', VISITOR);
-      await run('email', VISITOR, { action: 'list' });
+      await run('linkedin_outreach', VISITOR, { action: 'list-connections' });
       expect(readSession).not.toHaveBeenCalled();
     });
   });
@@ -517,6 +516,92 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       await expect(run(tool, VISITOR, harmless)).resolves.toEqual({ ran: true });
       readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
       await expect(run(tool, VISITOR, risky)).resolves.toEqual({ ran: true });
+    });
+
+    it.each([['search', { account_id: 'a', query: 'sign in code' }], ['list', { account_id: 'a' }], ['get', { account_id: 'a', message_ids: ['m1'] }], ['send', { account_id: 'a', to: 'x@example.com', subject: 's', body: 'b' }]])(
+      'OFF link: email %s is refused (search and get read login codes and reset links out of the owner\'s mailbox); ON link runs it', async (action, rest) => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run('email', VISITOR, { action, ...rest })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        expect(dispatch).not.toHaveBeenCalled();
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await expect(run('email', VISITOR, { action, ...rest })).resolves.toEqual({ ran: true });
+      });
+
+    it('the owner\'s own email calls are untouched', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('email', undefined, { action: 'search', account_id: 'a', query: 'x' })).resolves.toEqual({ ran: true });
+    });
+
+    it.each(['create_issue', 'push_files', 'merge_pull_request', 'create_or_update_file', 'create_pull_request', 'fork_repository'])(
+      'OFF link: the owner\'s GitHub MCP write tool %s is refused, a read is not; ON link runs it', async (tool) => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run(tool, VISITOR, { owner: 'o', repo: 'r' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        await expect(run('get_file_contents', VISITOR, { owner: 'o', repo: 'r', path: 'p' })).resolves.toEqual({ ran: true });
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await expect(run(tool, VISITOR, { owner: 'o', repo: 'r' })).resolves.toEqual({ ran: true });
+      });
+
+    it.each([
+      ['add_gtm_phase', { plan_id: 'p', title: 't', dri: 'someone@example.com' }, { plan_id: 'p', title: 't' }],
+      ['create_gtm_plan', { title: 't', dri: 'someone@example.com' }, { title: 't' }],
+    ])('OFF link: %s names no contact address (every later report goes to it), and runs without one', async (tool, risky, plain) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, risky)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run(tool, VISITOR, plain)).resolves.toEqual({ ran: true });
+    });
+
+    describe('a session\'s browser is released when the person driving it switches between the owner and a visitor who may not use the owner\'s logins', () => {
+      let release: jest.Mock;
+      beforeEach(() => {
+        release = jest.fn().mockResolvedValue(undefined);
+        (service as any).mcpClientService = { ...((service as any).mcpClientService ?? {}), releaseSessionClients: release };
+      });
+      const browser = (ctx?: Record<string, unknown>, sessionId = 'session-1') => run('playwright_browser_run_code', ctx, { code: 'x' }, sessionId);
+
+      it('owner, then an OFF-link visitor: released once before the visitor\'s step; the visitor\'s next step does not release again', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(undefined);
+        expect(release).not.toHaveBeenCalled();
+        await browser(VISITOR);
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(release).toHaveBeenCalledWith('session-1');
+        await browser(VISITOR);
+        expect(release).toHaveBeenCalledTimes(1);
+      });
+
+      it('then the owner again: released again, and the owner\'s cookies are loaded again', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(undefined);
+        const loads = () => dispatch.mock.calls.map((c) => c[0]).filter((name: string) => name === 'load_browser_cookies').length;
+        const first = loads();
+        expect(first).toBeGreaterThan(0);
+        await browser(VISITOR);
+        await browser(undefined);
+        expect(release).toHaveBeenCalledTimes(2);
+        expect(loads()).toBe(first + 1);
+      });
+
+      it('a visitor whose history is unknown in this process is treated as a switch (released)', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser(VISITOR);
+        expect(release).toHaveBeenCalledTimes(1);
+      });
+
+      it('a visitor on a link that allows the owner\'s logins is the same actor as the owner: nothing is released between them', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await browser(undefined);
+        await browser(VISITOR);
+        await browser(undefined);
+        expect(release).not.toHaveBeenCalled();
+      });
+
+      it('another session\'s browser is not touched, and a failing release never stops the browser step', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        release.mockRejectedValue(new Error('boom'));
+        await browser(undefined, 'session-other');
+        await expect(browser(VISITOR, 'session-1')).resolves.toEqual({ ran: true });
+        expect(release.mock.calls.map((c) => c[0])).toEqual(['session-1']);
+      });
     });
 
     it('OFF link: a schedule update that re-times or re-models a schedule, or names recipients, is refused; one that only changes the prompt runs', async () => {

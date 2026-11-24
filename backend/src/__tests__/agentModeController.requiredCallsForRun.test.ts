@@ -26,12 +26,13 @@ describe('requiredCallsForRun', () => {
     expect(out.functionCalls).not.toContain('slack_send_message');
     expect(out.functionCalls).not.toContain('delete_leads');
     expect(out.functionCalls).not.toContain('save_memory');
-    expect(out.skipped).toEqual(['slack_send_message', 'delete_leads', 'save_memory']);
+    expect(out.functionCalls).not.toContain('email'); // refused whatever its action since the third final review (search and get read login codes)
+    expect(out.skipped).toEqual(['slack_send_message', 'delete_leads', 'save_memory', 'email']);
     expect(out.minCalls).toEqual({ call_google_ads_api: 3, read_brand_guidelines: 1 });
   });
 
   it('a marked schedule keeps a tool that is refused only for some actions, and every ordinary tool', () => {
     const out = requiredCallsForRun({ ...MARKED, requiredFunctionCalls: required, functionCallMinCalls: minCalls });
-    expect(out.functionCalls).toEqual(['call_google_ads_api', 'email', 'manage_scheduled_chat', 'read_brand_guidelines']);
+    expect(out.functionCalls).toEqual(['call_google_ads_api', 'manage_scheduled_chat', 'read_brand_guidelines']);
   });
 });
