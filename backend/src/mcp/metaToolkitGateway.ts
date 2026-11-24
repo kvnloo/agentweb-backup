@@ -610,6 +610,8 @@ async function runAuthenticatedMetaToolkitCall(caller: MetaToolkitCaller, reques
     if (li.isLinkedInAdsToolkitTool(request.toolName)) {
       const liWrite = li.isLinkedInAdsToolkitWrite(request.toolName);
       li.refuseLinkedInWriteWhenNotOffered(request.toolName); // read mode: refused before the scope check and the paywall
+      // Shape before anything coerces an argument: a non-string action is refused here, not stringified by the paywall below.
+      li.assertLinkedInAdsToolkitCall(request.toolName, request.args ?? {});
       assertMetaToolkitScope(caller, request.toolName, liWrite);
       if (liWrite && isZomaPublishWrite('linkedin_ads', request.args)) await assertPublishAllowed('linkedin_ads');
       const recordWrite = deps.recordWrite ?? recordMcpWriteExecuted;

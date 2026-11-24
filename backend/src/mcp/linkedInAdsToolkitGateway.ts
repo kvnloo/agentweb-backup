@@ -29,7 +29,7 @@ import { LINKEDIN_WRITES_NOT_AVAILABLE, linkedInThrottledResult, type LinkedInAd
 import { LINKEDIN_ADS_PROVIDER, resolveProviderAccount } from './zomaProviders';
 import { linkedInAdsWritesEnabled } from './zomaToolDefinitions';
 
-export { isLinkedInAdsToolkitTool, isLinkedInAdsToolkitWrite };
+export { assertLinkedInAdsToolkitCall, isLinkedInAdsToolkitTool, isLinkedInAdsToolkitWrite };
 
 /** Per-user calls per minute against LinkedIn, all of Zoma's LinkedIn tools together; writes have their own, lower, limit. */
 export const LINKEDIN_ADS_CALLS_PER_MINUTE = 30;

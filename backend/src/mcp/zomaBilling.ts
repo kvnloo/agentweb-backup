@@ -124,6 +124,15 @@ export function isBillableResult(result: unknown): boolean {
   return r.status === 'PREVIEW' || typeof r.verification === 'string';
 }
 
+/** String(value) that cannot throw: {"toString":1} makes String() raise a TypeError, which would surface as a 500. */
+function safeText(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Writes that make ads live: Meta status → ACTIVE (CREATE and COPY are always PAUSED),
  * Google Ads status → ENABLED on CREATE or UPDATE, X and LinkedIn ACTIVATE (their creates are never live). Everything else — reads, drafts, paused
@@ -132,7 +141,7 @@ export function isBillableResult(result: unknown): boolean {
 export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
   if (platform === 'x_ads') return String(args?.action) === 'ACTIVATE'; // ENG-3142: creates are always PAUSED; String() like the validator (action ["ACTIVATE"] still activates)
-  if (platform === 'linkedin_ads') return String(args?.action) === 'ACTIVATE'; // creates are always DRAFT; String() like the validator
+  if (platform === 'linkedin_ads') return safeText(args?.action) === 'ACTIVATE'; // creates are always DRAFT; coerced like the validator, but never throws
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
 
