@@ -20,4 +20,4 @@ All platform email (about 30 call sites in 12 source files: support, webhooks, a
 
 **Next, in their own PRs:** an opt-in `gtm:email` key scope that lets MCP agents send these emails, with a recipient cap per call, an hourly budget per key and an audit line.
 
-Tests: `src/__tests__/resendService.lanes.test.ts` (20), additions in `gtmPlanNotificationService.test.ts`; the existing queue, retry, error and guard tests pass unchanged.
+Tests: `src/__tests__/resendService.lanes.test.ts` (21), additions in `gtmPlanNotificationService.test.ts`; the existing queue, retry, error and guard tests pass unchanged.
