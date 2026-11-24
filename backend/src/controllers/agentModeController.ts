@@ -13075,18 +13075,11 @@ export const agentModeController = {
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
-      // KNOWN LIMITATION: this echoes the requested window, not the stored value.
-      // createOrReuseInteractiveShare REUSES an existing active share untouched,
-      // so when one already exists this expiresAt can differ from what's actually
-      // in the DB — most notably, re-sharing a session that already has a
-      // no-expiry token (e.g. one first minted by a machine/email path) shows an
-      // "Expires" date in the UI while the link is in fact permanent. This is a
-      // display mismatch only: it grants no extra access (the token was already
-      // live) and is reversible. Changing an active share's expiry requires
-      // revoke (stopConversableShare) + reshare. A true fix needs per-purpose
-      // tokens (see the on-demand-minting redesign) rather than one shared token
-      // per session, so it is intentionally out of scope here.
-      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
+      // ENG-3170: answer with what is STORED, expiry included. createOrReuseInteractiveShare REUSES an existing live link, so the link that now
+      // exists may have a different expiry from the one asked for (most notably a link first made by an email or alert path, which never
+      // expires). That used to be a display mismatch that granted no extra access; with the Full control switch it would show "Expires
+      // tomorrow" on a permanent link that now has full control, so the dialog is told the truth (a link with no expiry has no `expiresAt`).
+      let storedExpiresAt: string | undefined;
 
       // ENG-3170: answer with what is STORED, not with what was asked for. When the owner made an explicit choice, re-read it (a
       // consistent read) and say so if it did not persist, instead of showing a switch that is not true. With no choice made, a new
@@ -13095,6 +13088,7 @@ export const agentModeController = {
       if (allowSensitiveActionsChoice !== undefined) {
         const storedShare = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
         allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedShare);
+        storedExpiresAt = typeof storedShare?.expiresAt === 'string' && storedShare.expiresAt ? storedShare.expiresAt : undefined;
         if (allowSensitiveActions !== allowSensitiveActionsChoice) {
           console.error(`AgentMode ENG-3170: the sensitive-actions choice for share ${sessionId} did not persist (asked ${allowSensitiveActionsChoice}).`);
           return res.status(500).json({ error: 'Failed to save the sensitive-actions setting for this link' });
@@ -13105,6 +13099,7 @@ export const agentModeController = {
         try {
           const storedNow = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
           allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedNow);
+          storedExpiresAt = typeof storedNow?.expiresAt === 'string' && storedNow.expiresAt ? storedNow.expiresAt : undefined;
         } catch (readError) {
           console.error(`AgentMode ENG-3170: could not read back the share link ${sessionId} to say what it allows:`, readError);
           allowSensitiveActions = false;
@@ -13115,7 +13110,7 @@ export const agentModeController = {
         shareId: sessionId,
         conversableToken: conversableToken,
         conversableUrl: conversableUrl,
-        expiresAt: expiresAt,
+        ...(storedExpiresAt ? { expiresAt: storedExpiresAt } : {}),
         allowSensitiveActions
       });
     } catch (error) {

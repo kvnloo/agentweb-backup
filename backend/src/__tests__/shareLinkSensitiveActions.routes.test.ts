@@ -63,6 +63,36 @@ describe('POST /conversable-share (createConversableShare)', () => {
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ conversableToken: 'tok123', allowSensitiveActions: true }));
   });
 
+  it('answers with the STORED expiry: a permanent link that was reused is not shown as expiring (final review)', async () => {
+    // a link first made by an email or alert path never expires; the owner asks for 7 days + Full control from a dialog that did not know that
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(undefined));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: true })));
+    const res = await create({ sessionId: 's1', expirationDays: 7, allowSensitiveActions: true });
+    const body = (res.json as jest.Mock).mock.calls[0][0];
+    expect(body).toEqual(expect.objectContaining({ conversableToken: 'tok123', allowSensitiveActions: true }));
+    expect(body).not.toHaveProperty('expiresAt');
+  });
+
+  it('answers with the stored expiry when there is one (it is what the link really has, not what was asked for)', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(undefined));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: false, expiresAt: '2026-12-30T00:00:00.000Z' })));
+    const res = await create({ sessionId: 's1', expirationDays: 1, allowSensitiveActions: false });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ expiresAt: '2026-12-30T00:00:00.000Z' }));
+    // and the same for a request that sends no choice
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ expiresAt: '2026-12-30T00:00:00.000Z' })));
+    const res2 = await create({ sessionId: 's1', expirationDays: 1 });
+    expect(res2.json).toHaveBeenCalledWith(expect.objectContaining({ expiresAt: '2026-12-30T00:00:00.000Z' }));
+  });
+
+  it('a read-back that fails says nothing about the expiry rather than guessing one', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(undefined));
+    (chatbotDb.getChatSessionRecord as jest.Mock).mockRejectedValue(new Error('boom'));
+    const res = await create({ sessionId: 's1', expirationDays: 7 });
+    const body = (res.json as jest.Mock).mock.calls[0][0];
+    expect(body).toEqual(expect.objectContaining({ allowSensitiveActions: false }));
+    expect(body).not.toHaveProperty('expiresAt');
+  });
+
   it('passes an explicit OFF too', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(session(undefined));
     (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue(session(share({ allowSensitiveActions: false })));

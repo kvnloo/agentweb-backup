@@ -24,7 +24,7 @@ and the On text (every power listed) only when it is on.
 **Review round 2 (two independent reviews of the final code, 2026-11-23).** Fixed in this PR:
 - A link made before the setting existed keeps exactly what it had (the sensitive tools) and gains nothing that was refused to every visitor until now: the owner-only block list, `connect_account` and answering approval cards need an EXPLICIT stored `true` (`interactiveShareControl(...).full`). The dialog still shows such a link as ON; turning the switch off and on once makes it full control.
 - A link that is no longer live (stopped, expired) reads OFF for the rest of a turn already running. A stored choice that is not a boolean reads OFF (it no longer falls to the lifetime rule).
-- `stage_pending_decision` with `audience` other than `team` is sensitive: it emails the named address from AgentWeb with the caller's own text and link.
+- `stage_pending_decision` was first made sensitive for `audience` other than `team` (it emails the named address from AgentWeb with the caller's own text and link); the final review made it sensitive whatever the audience, see the last section.
 - The owner's saved browser sessions are saved logins: `load_/save_/clear_browser_cookies` and `mark_browser_session_failed` are sensitive tools, and a browser tool run for a visitor no longer loads the owner's cookies (or writes the visitor's back over them) unless the link allows the sensitive tools.
 - Third review round (two more independent reviews, of the fixes): both found that tools which drive the browser for the model (`open_site_signin`, `solve_captcha`, `coding_agent`) call `executeTool` WITHOUT the visitor claim, so the browser branch's "is this a visitor" test never saw one. A first fix asked the in-process visitor-turn marker (`isShareVisitorTurn`), but chat turns run in a FORKED WORKER, where that marker is never set (both reviewers of that fix found it; the unit tests could not, as they run in one process). The real fix is call-scoped: `executeTool` runs a call that carries a restriction inside a Node `AsyncLocalStorage` scope, and a nested call with no restriction of its own inherits it (so it also gets the block list and the sensitive rule, not only the cookie rule). It works in any process and for voice. The marker stays as a second signal in the main process. `read_verification_code` (a one-time login code or magic link read from the owner's mailbox: with a browser, a log-in as the owner) is a sensitive tool. A link whose owner turned on Full control keeps the expiry the owner chose when an alert or email reuses it (it used to be stripped, turning "full control for 7 days" into "for ever"); an old link and an OFF link are still made permanent by a mailed reuse. An empty `expiresAt` reads as "never expires" in the liveness check, as in the route. The stop (DELETE) route refuses a visitor claim like POST and PATCH. Portal: create and stop handlers are guarded against the owner switching chats mid-request.
 - The share route gives the same "a write failed: read the error, do not re-propose it" instruction the owner's route gives, from one shared helper.
@@ -75,11 +75,47 @@ is sensitive whatever its arguments is settled before repair.
 the expiry, then OFF. The admin review links (45 days) read OFF; new ones are minted with an explicit OFF. An owner's own unattended run of a
 sensitive tool now reads its session once (is it a visitor-made schedule?), and refuses when that read keeps failing, as ENG-2816 already does for
 the block-listed tools. `generateConversableResponse`, `scheduleAutoWorkPlanContinuation` and `approvalInboxExecution` start turns with no profile
-(not reachable by a visitor today as far as read; not changed here).
+(not reachable by a visitor directly as far as read; not changed here). They are reachable INDIRECTLY through a decision a visitor stages: see "Final review" below, which closes that.
 
-**Not covered (listed in the test with the reason):** in-account overwrites (`update_market_strategy`, `update_brand_guidelines`); creating a new
-landing page (`generate_landing_page`, `duplicate_landing_page`); `coding_agent`; ClickUp / Notion task creation; reads of the owner's mailbox,
-Slack and X messages.
+**Not covered (listed in the test with the reason):** creating a new landing page (`generate_landing_page`, `duplicate_landing_page`);
+`coding_agent`; ClickUp / Notion task creation; lead field edits (`update_lead`, `update_lead_status`); reads of the owner's mailbox, Slack and X messages.
+(In-account overwrites of brand guidelines, market strategy, the knowledge base, status stages, list settings and a saved test login ARE covered since the
+final review below.)
 
 **Gotcha.** `executeTool`'s `validateAndRepairToolArgs` can hoist a nested wrapper or rename an alias, so a tool judged by an argument is judged on the
 PREPARED arguments (a tool judged by name is settled before repair; the ENG-803 publish-approval check reads prepared arguments for the same reason).
+
+## Final review (2026-11-24, on the rebased head; one full-context and one blind reviewer, read-only)
+Two reviewers found these; each was verified in the code by reading it, and all are fixed in this PR with tests:
+- **Resuming a schedule.** `manage_scheduled_chat` with action `toggle` was allowed on an OFF link, and the toggle route (`toggleScheduledChatStatus`) neither
+  checks nor writes a visitor mark, so a visitor could resume one of the owner's PAUSED schedules, which then ran, unrestricted, as the owner (it can email or
+  post). Now a toggle is allowed only with `status: 'paused'` (a new `alsoRequire` on the by-argument rule); resuming, an unknown, a missing or a non-text status
+  is sensitive. Judged after argument repair like the other rules.
+- **The old agent-engine task tools** (`create_task_from_prompt`, `create_task_from_template`, `create_revision`) create a task under the owner's account with
+  `useSharedBrowser: false`; the agent engine then fetches the owner's own saved logins and loads the owner's cookies. Their names carry no outward verb, so the
+  guard test never forced a decision. Now sensitive.
+- **`stage_pending_decision` is sensitive whatever the audience.** When a team approver settles a decision, `approvalInboxExecution.resumeOriginSession`
+  resumes the ORIGIN session as a full owner turn (no restriction), with the visitor's messages still in view. (The earlier note that this was "not reachable
+  by a visitor" was wrong.)
+- **The create-link reply tells the truth about the expiry.** `createConversableShare` answered with the REQUESTED expiry although `createOrReuseInteractiveShare`
+  reuses an existing live link. A link first made by an email or alert path never expires, so an owner who chose "7 days + Full control" from a dialog that had
+  not seen it was shown "Expires ..." on a permanent link that now had full control. The reply now carries the STORED `expiresAt`, and none when the link has none
+  (the dialog only shows an expiry when there is one). The PATCH route still turns the switch on for a link that never expires: the dialog then shows no expiry.
+- **What the approved wording promises.** The OFF text says Emma "won't ... change your settings or Emma's memory". Seven tools overwrite what the owner set up
+  inside the account and were left allowed "pending the owner's decision": `update_brand_guidelines`, `update_market_strategy`, `manage_market_strategy` (its
+  `update` action; `read` stays allowed), `update_knowledge_base_file`, `configure_lead_statuses`, `update_lead_list`, `save_test_account`. They are sensitive now,
+  so the wording is true for them (reads such as `read_market_strategy` and `read_brand_guidelines` are unchanged; lead field edits stay allowed). To allow them
+  again on OFF links, move those names back to the reviewed-not-sensitive list in `shareVisitorSensitiveTools.test.ts` and out of `SHARE_VISITOR_SENSITIVE_TOOLS`.
+
+Known limits added by this review (not fixed here, disclosed):
+- **A running turn is not tied to the link it started on.** `readShareLinkControl` and the approval-card gate read the session's CURRENT link. If the owner stops
+  link A and, while a visitor's turn on A is still running, creates link B with Full control, that turn's next tool call sees B's setting. Closing it means
+  carrying the admitted link's token in the tool context (through the forked chat worker and voice) and requiring a match; it needs an owner to stop one link and
+  start a Full-control one inside one turn.
+- A link made in the share dialog before the setting existed, whose expiry a later email or alert removed, now reads OFF (the release note says dialog links keep
+  working "as they did").
+- The system's own result emails of a schedule a visitor created go to the recipients on that schedule (reported by the blind reviewer, not verified here; the
+  schedule-recipient guard is ENG-1904's, not this change's).
+- The setting is written to the link that is current when the write happens (a background job minting a new link in between could be switched on); conditioning the
+  write on the token that was read would close it.
+

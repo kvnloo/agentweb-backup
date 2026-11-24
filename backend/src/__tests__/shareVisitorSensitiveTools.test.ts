@@ -60,6 +60,10 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       'regenerate_market_strategy', 'revert_landing_page_publish', 'revoke_linkedin_account',
       'send_email_from_sender', 'send_email_to_lead', 'send_gtm_status_report', 'set_landing_page_lead_list', 'slack_send_message',
       'test_scheduled_chat',
+      // ENG-3170 final review: the old agent-engine task tools (they read the owner's saved logins in a real browser), the decision a team
+      // approver settles (it resumes the session as a full owner turn), and what the owner set up inside the account
+      'create_revision', 'create_task_from_prompt', 'create_task_from_template', 'stage_pending_decision',
+      'configure_lead_statuses', 'save_test_account', 'update_brand_guidelines', 'update_knowledge_base_file', 'update_lead_list', 'update_market_strategy',
     ].sort());
   });
 
@@ -85,15 +89,16 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['call_hubspot_api', ['LIST', 'GET', 'SEARCH', 'GET_STATS', 'GET_METRICS', 'GET_PERFORMANCE', 'GET_CONTACTS', 'GET_FORM_FIELDS', 'GET_SUBMISSIONS', 'LIST_ASSETS', 'LIST_BROADCASTS', 'LIST_CHANNELS', 'LIST_PIPELINES', 'LIST_SUBSCRIPTION_TYPES'], ['CREATE', 'UPDATE', 'DELETE', 'CLONE', 'PUBLISH', 'UNPUBLISH', 'ADD_ASSET', 'REMOVE_ASSET', 'ADD_CONTACTS', 'REMOVE_CONTACTS', 'ENABLE', 'DISABLE', 'SUBMIT', 'CREATE_BROADCAST', 'DELETE_BROADCAST']],
       ['call_attio_api', ['SEARCH', 'COUNT', 'LIST', 'GET'], ['ADD_ENTRIES', 'REMOVE_ENTRIES', 'CREATE']],
       ['call_linkedin_marketing_api', ['LIST', 'GET', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH'], ['CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'RETAG_UTM', 'SEND_TEST', 'CREATE_CONTENT', 'SET_FIRST_CONTENT', 'INIT_IMAGE_UPLOAD', 'INIT_VIDEO_UPLOAD', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'FINALIZE_VIDEO']],
-      ['manage_scheduled_chat', ['create', 'update', 'toggle'], ['delete']],
+      // a toggle is judged with its status (see the next describe): on its own it reads as sensitive
+      ['manage_scheduled_chat', ['create', 'update'], ['delete', 'toggle']],
+      // read is free, any update replaces the owner's business overview and merges competitors and ICPs
+      ['manage_market_strategy', ['read', ' Read '], ['update', 'replace', 'delete']],
       // setting do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
       ['set_lead_contact_status', ['do-not-contact', 'unsubscribed'], ['active']],
-      // a decision for the team is internal; one for a customer emails the named address from AgentWeb with the caller's text and link
-      ['stage_pending_decision', ['team'], ['customer', 'Customer ', 'anyone', '']],
     ];
 
     it.each(mixed)('%s: its reads are allowed and its writes are sensitive', (tool, reads, writes) => {
-      const argument = tool === 'set_lead_contact_status' ? 'contact_status' : tool === 'stage_pending_decision' ? 'audience' : 'action';
+      const argument = tool === 'set_lead_contact_status' ? 'contact_status' : 'action';
       for (const action of reads) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: false });
       for (const action of writes) expect({ tool, action, sensitive: isSensitiveToolCall(tool, { [argument]: action }) }).toEqual({ tool, action, sensitive: true });
     });
@@ -123,6 +128,30 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       expect(isSensitiveToolCall('call_hubspot_api', { action: 'forget_contacts' })).toBe(true);
       expect(isSensitiveToolCall('call_hubspot_api', { action: 'budget_update' })).toBe(true);
       expect(isSensitiveToolCall('call_hubspot_api', { action: 'targets' })).toBe(true);
+    });
+  });
+
+  describe('a schedule toggle may PAUSE but not RESUME (ENG-3170 final review)', () => {
+    // A toggle writes no visitor mark, so resuming one of the owner's paused schedules would let it run again, unrestricted, as the owner.
+    const toggle = (status: unknown) => isSensitiveToolCall('manage_scheduled_chat', { action: 'toggle', schedule_id: 's1', status });
+    it('pausing is allowed, in any case or spacing', () => {
+      for (const status of ['paused', 'PAUSED', ' Paused ']) expect({ status, sensitive: toggle(status) }).toEqual({ status, sensitive: false });
+    });
+    it('resuming, an unknown, a missing or a non-text status is sensitive (fail closed)', () => {
+      for (const status of ['active', 'ACTIVE', 'resumed', '', '   ', undefined, null, 1, true, ['paused'], { x: 'paused' }]) {
+        expect({ status, sensitive: toggle(status) }).toEqual({ status, sensitive: true });
+      }
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'toggle' })).toBe(true);
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'toggle', status: 'paused', schedule_id: 's1' })).toBe(false);
+    });
+    it('create and update keep their own rule (provenance), and a status on them changes nothing', () => {
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'create', status: 'active' })).toBe(false);
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'update', status: 'active' })).toBe(false);
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'delete', status: 'paused' })).toBe(true);
+    });
+    it('an action named like an Object.prototype key does not read as an extra requirement', () => {
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: 'constructor', status: 'paused' })).toBe(true);
+      expect(isSensitiveToolCall('manage_scheduled_chat', { action: '__proto__', status: 'paused' })).toBe(true);
     });
   });
 
@@ -293,14 +322,8 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   update_google_doc: 'edits a document inside the account',
   update_google_sheet: 'edits a sheet inside the account',
   // ENG-3170 review: found by widening the name pattern to the neutral verbs. Nothing here sends or posts anything; each edits data inside the account.
-  // The first group overwrites what the owner set up (strategy, brand, knowledge base, statuses): whether an OFF link should refuse them is the owner's decision, not made yet.
-  update_brand_guidelines: 'overwrites the owner\'s brand guidelines inside the account (owner decision pending)',
-  update_market_strategy: 'overwrites the owner\'s market strategy inside the account (owner decision pending)',
-  manage_market_strategy: 'edits the owner\'s market strategy inside the account (owner decision pending)',
-  update_knowledge_base_file: 'edits a task\'s knowledge base inside the account (owner decision pending)',
-  configure_lead_statuses: 'replaces a list\'s status stages inside the account (owner decision pending)',
-  update_lead_list: 'edits a list\'s name, filters and status stages inside the account (owner decision pending)',
-  save_test_account: 'stores a test login in the owner\'s own account (owner decision pending)',
+  // (The tools that overwrite what the owner set up inside the account, brand guidelines, market strategy, knowledge base, status stages, list settings and a saved test
+  // login, are NOT here any more: the approved wording says an OFF link cannot "change your settings or Emma's memory", so they are on the sensitive list.)
   update_lead: 'edits a lead\'s fields inside the account; it can not set the do-not-contact flag, which is set_lead_contact_status',
   update_lead_status: 'records a lead\'s pipeline status (and the caller\'s draft) on the lead; sends nothing',
   update_gtm_phase: 'edits a phase of a GTM plan inside the account',
@@ -343,17 +366,23 @@ describe('the sensitive list against the real tool registry', () => {
     const problems: string[] = [];
     for (const [name, rule] of Object.entries(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT)) {
       const props = schemaOf(tools.get(name))?.properties ?? {};
-      const wanted = rule.kind === 'action' ? [rule.argument] : [...rule.arguments];
+      const wanted = rule.kind === 'action' ? [rule.argument, ...Object.values(rule.alsoRequire ?? {}).map((extra) => extra.argument)] : [...rule.arguments];
       for (const arg of wanted) if (!(arg in props)) problems.push(`${name}.${arg}`);
     }
     expect(problems).toEqual([]);
+  });
+
+  it('the status a toggle is allowed with is a value the tool really accepts, and "active" is another one (the one that is refused)', () => {
+    const status = schemaOf(tools.get('manage_scheduled_chat'))?.properties?.status?.enum;
+    expect(status).toEqual(expect.arrayContaining(['paused', 'active']));
   });
 
   it('every action a tool\'s schema declares is classified the way this list says (a new action must be looked at)', () => {
     const expectedWrites: Record<string, string[]> = {
       email: ['send'],
       linkedin_manage_post: ['repost', 'comment', 'react', 'delete_post'],
-      manage_scheduled_chat: ['delete'],
+      manage_scheduled_chat: ['delete', 'toggle'], // a toggle is allowed only to pause, so on its own (no status) it counts as sensitive
+      manage_market_strategy: ['update'],
       call_attio_api: ['ADD_ENTRIES', 'REMOVE_ENTRIES', 'CREATE'],
     };
     const problems: string[] = [];

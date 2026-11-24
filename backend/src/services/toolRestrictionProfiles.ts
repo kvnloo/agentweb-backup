@@ -101,7 +101,20 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'mark_browser_session_failed',
   // 5c. one-time login codes and magic links read from the owner's connected mailbox: with a browser, that is a log-in to a site as the owner
   'read_verification_code',
+  // 5d. the OLD agent-engine task tools: the task runs under the owner's account in a real browser and reads the owner's own saved logins and
+  // cookies there (`useSharedBrowser: false`), which the OFF rule refuses for the browser tools themselves
+  'create_task_from_prompt',
+  'create_task_from_template',
+  'create_revision',
+  // 6. what the owner set up inside the account (the approved wording: "change your settings or Emma's memory"): overwrite it
+  'update_brand_guidelines',
+  'update_market_strategy', // manage_market_strategy (read or update) is judged by its action, below
+  'update_knowledge_base_file',
+  'configure_lead_statuses',
+  'update_lead_list', // name, filters and status stages
+  'save_test_account', // stores a login in the owner's account
   // 2. send, post or publish to people or the public outside the account
+  'stage_pending_decision', // a decision a team approver settles RESUMES this session as a full owner turn (approvalInboxExecution.resumeOriginSession), with the visitor's messages in view; audience customer also emails any address
   'slack_send_message',
   'send_email_from_sender',
   'send_email_to_lead',
@@ -132,7 +145,17 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
  * live tool schemas.
  */
 export type SensitiveByArgument =
-  | { kind: 'action'; argument: string; allowedValues?: readonly string[]; allowedPrefixes?: readonly string[] }
+  | {
+      kind: 'action';
+      argument: string;
+      allowedValues?: readonly string[];
+      allowedPrefixes?: readonly string[];
+      /**
+       * An allowed `action` value that is only allowed with another argument at one of these values (compared the same way). Anything else,
+       * a missing or a non-text argument included, makes that call sensitive. Used for a toggle that is safe to PAUSE but not to resume.
+       */
+      alsoRequire?: Readonly<Record<string, { argument: string; allowedValues: readonly string[] }>>;
+    }
   | { kind: 'present'; arguments: readonly string[] };
 
 const READ_PREFIXES: readonly string[] = ['get', 'list', 'search'];
@@ -147,12 +170,13 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   call_hubspot_api: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // publish, create_broadcast, delete, add/remove contacts...
   call_attio_api: { kind: 'action', argument: 'action', allowedValues: ['count'], allowedPrefixes: READ_PREFIXES },
   call_linkedin_marketing_api: { kind: 'action', argument: 'action', allowedValues: ['estimate-reach'], allowedPrefixes: READ_PREFIXES },
-  // create and update are handled by schedule provenance (ENG-2816); a toggle is reversible; DELETE removes the owner's schedule
-  manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'] },
+  // create and update are handled by schedule provenance (ENG-2816). A toggle writes no visitor mark, so RESUMING a paused schedule of the
+  // owner's would let it run again, unrestricted, as the owner (it can email or post): only pausing is allowed. DELETE removes the owner's schedule.
+  manage_scheduled_chat: { kind: 'action', argument: 'action', allowedValues: ['create', 'update', 'toggle'], alsoRequire: { toggle: { argument: 'status', allowedValues: ['paused'] } } },
+  // The market strategy tool reads and updates through one argument; its update replaces the owner's business overview and merges competitors and ICPs.
+  manage_market_strategy: { kind: 'action', argument: 'action', allowedValues: ['read'] },
   // setting a lead to do-not-contact or unsubscribed only restricts outreach; 'active' clears the flag and allows contact again
   set_lead_contact_status: { kind: 'action', argument: 'contact_status', allowedValues: ['do-not-contact', 'unsubscribed'] },
-  // staging a decision for a TEAM approver is internal; audience 'customer' emails the named address from AgentWeb with the caller's own text and link
-  stage_pending_decision: { kind: 'action', argument: 'audience', allowedValues: ['team'] },
   google_calendar_create_event: { kind: 'present', arguments: ['attendees'] },
   google_calendar_update_event: { kind: 'present', arguments: ['attendees'] },
   update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc'] },
@@ -198,7 +222,12 @@ export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   const raw = record[rule.argument];
   if (typeof raw !== 'string') return true;
   const value = normaliseActionValue(raw);
-  if (rule.allowedValues?.includes(value)) return false;
+  if (rule.allowedValues?.includes(value)) {
+    const extra = Object.prototype.hasOwnProperty.call(rule.alsoRequire ?? {}, value) ? rule.alsoRequire?.[value] : undefined;
+    if (!extra) return false;
+    const other = record[extra.argument];
+    return !(typeof other === 'string' && extra.allowedValues.includes(normaliseActionValue(other)));
+  }
   if (rule.allowedPrefixes?.some((prefix) => value.startsWith(prefix))) return false;
   return true;
 }
