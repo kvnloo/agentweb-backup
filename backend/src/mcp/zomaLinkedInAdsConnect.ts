@@ -31,11 +31,9 @@ import type { LinkedInAdsAccountChoice, LinkedInAdsConnectResult, LinkedInAdsFin
 
 type PageStep = Extract<BrowserStep, { kind: 'page' }>;
 
-/** "mvarma@argusoft.com" → "m***@argusoft.com"; null when it is not an address. */
-export function maskEmail(email: unknown): string | null {
-  const match = typeof email === 'string' ? /^([^@\s])[^@\s]*@([^@\s]+)$/.exec(email.trim()) : null;
-  return match ? `${match[1]}***@${match[2]}` : null;
-}
+/** A usable email address, trimmed; null when there is none. */
+const plainEmail = (email: unknown): string | null =>
+  (typeof email === 'string' && /^[^@\s]+@[^@\s]+$/.test(email.trim()) ? email.trim() : null);
 
 export interface ZomaLinkedInAdsDeps {
   links: ZomaLinkCodec;
@@ -129,25 +127,35 @@ async function failedPage(userId: string, deps: ZomaLinkedInAdsDeps, { status, t
   };
 }
 
-const connectedPage = (count: number, keptCount = 0): PageStep => ({
-  kind: 'page',
-  status: 200,
-  title: 'LinkedIn Ads connected',
-  message: count === 0
-    ? `Your LinkedIn Ads ${keptCount === 1 ? 'account was' : 'accounts were'} already connected with wider access than this connection, so nothing was replaced and nothing changed. ${ZOMA_BACK_TO_AGENT}`
-    : `Your LinkedIn Ads ${count === 1 ? 'account is' : 'accounts are'} connected to Zoma. ${keptCount ? `${keptCount} more ${keptCount === 1 ? 'was' : 'were'} already connected with wider access and was left as it was. ` : ''}${NOTHING_CHANGED} ${ZOMA_BACK_TO_AGENT}`,
-  done: true,
-});
-
-/** Whose Zoma account the link connects, shown on the confirm page so a link someone else sent cannot go unnoticed. */
-async function whoseAccount(userId: string, deps: ZomaLinkedInAdsDeps): Promise<string> {
-  let masked: string | null = null;
-  try {
-    masked = maskEmail(await deps.getUserEmail?.(userId));
-  } catch {
-    masked = null;
+const connectedPage = (savedCount: number, keptCount = 0, replacedCount = 0): PageStep => {
+  const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+  const parts: string[] = [];
+  const fresh = savedCount - replacedCount;
+  if (fresh > 0) parts.push(`Your LinkedIn Ads ${plural(fresh, 'account is', 'accounts are')} connected to Zoma.`);
+  if (replacedCount > 0) {
+    parts.push(
+      `The earlier connection for ${replacedCount} ${plural(replacedCount, 'account', 'accounts')} had expired or been revoked and could not be used, so this new connection replaced it. `
+      + 'It may hold fewer permissions than the earlier one (for example organization posting); to get those back, connect again and approve every permission LinkedIn asks for.',
+    );
   }
-  return masked ? `the Zoma account ${masked}` : 'the Zoma account that asked for this link';
+  if (keptCount > 0) {
+    parts.push(`${keptCount} ${plural(keptCount, 'account was', 'accounts were')} already connected with wider access that still works, so ${plural(keptCount, 'it was', 'they were')} left exactly as ${plural(keptCount, 'it was', 'they were')}.`);
+  }
+  return { kind: 'page', status: 200, title: 'LinkedIn Ads connected', message: `${parts.join(' ')} ${NOTHING_CHANGED} ${ZOMA_BACK_TO_AGENT}`, done: true };
+};
+
+/**
+ * The FULL email of the Zoma account the link connects, shown on the confirm page so a link someone else sent cannot
+ * look right to the person who opens it (a masked address matches every account that starts with the same letter at
+ * the same domain). The link is already a secret bearer link, so showing the address to its holder discloses nothing
+ * new. null when the account has no usable email or it cannot be read: the page then does not proceed.
+ */
+async function accountEmail(userId: string, deps: ZomaLinkedInAdsDeps): Promise<string | null> {
+  try {
+    return plainEmail(await deps.getUserEmail?.(userId));
+  } catch {
+    return null;
+  }
 }
 
 /** GET /api/zoma/linkedin/callback — finalized server-side for the signed state's user. */
@@ -175,6 +183,14 @@ export async function completeLinkedInAdsConnect(
     });
   }
 
+  // Whose account this connects must be nameable on the confirm page. Without an email it cannot be, so do not proceed
+  // (and do not exchange the OAuth code): the generic invalid-link page.
+  const email = await accountEmail(userId, deps);
+  if (!email) {
+    logZomaSetup({ userId, step: 'linkedin_callback', outcome: 'rejected', reason: 'no_account_email' });
+    return EXPIRED;
+  }
+
   let result: LinkedInAdsFinalizeResult;
   try {
     result = await deps.finalize(userId, params.code);
@@ -189,12 +205,19 @@ export async function completeLinkedInAdsConnect(
 
   if (result.listFailed) {
     // Nothing could be read from LinkedIn: that is not "no ad account", so no create-an-account steps.
-    logZomaSetup({ userId, step: 'linkedin_callback', outcome: 'failed', reason: 'ad_account_list_failed' });
-    return failedPage(userId, deps, {
-      status: 502,
-      title: 'LinkedIn Ads not connected',
-      message: 'We could not read your LinkedIn ad accounts from LinkedIn just now, so nothing was connected. This is usually temporary. Please try again.',
-    });
+    const denied = result.listStatus === 401 || result.listStatus === 403;
+    logZomaSetup({ userId, step: 'linkedin_callback', outcome: 'failed', reason: denied ? `ad_account_list_denied_${result.listStatus}` : 'ad_account_list_failed' });
+    return failedPage(userId, deps, denied
+      ? {
+        status: 403,
+        title: 'LinkedIn Ads not connected',
+        message: 'LinkedIn would not share your ad accounts with Zoma, which usually means the access Zoma asked for was not approved. Nothing was connected. Connect again and approve every permission LinkedIn asks for.',
+      }
+      : {
+        status: 502,
+        title: 'LinkedIn Ads not connected',
+        message: 'We could not read your LinkedIn ad accounts from LinkedIn just now, so nothing was connected. This is usually temporary. Please try again.',
+      });
   }
   const accounts = result.adAccounts.filter(isConnectable).map((a) => ({
     account_id: String(a.id),
@@ -223,7 +246,7 @@ export async function completeLinkedInAdsConnect(
     { purpose: 'pick_linkedin_account', zoma: ZOMA_MCP_SETUP, uid: userId, tokenSessionId: result.tokenSessionId, linkedinAccounts: accounts },
     600, // the parked token session lives 10 minutes
   );
-  return picker(token, accounts, await whoseAccount(userId, deps));
+  return picker(token, accounts, `the Zoma account ${email}`);
 }
 
 function pickMessage(who: string, extra?: string): string {
@@ -258,8 +281,8 @@ async function connectAccounts(
     logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'rejected', reason: result.reason });
     return failedPage(userId, deps, { status: 400, title: 'LinkedIn Ads not connected', message: 'This connection expired before it finished. (If it already said "LinkedIn Ads connected", you are already done.)' });
   }
-  logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'ok', reason: `${result.accounts.length}_ad_accounts${result.kept.length ? `_${result.kept.length}_kept` : ''}` });
-  return connectedPage(result.accounts.length, result.kept.length);
+  logZomaSetup({ userId, step: 'linkedin_connect', outcome: 'ok', reason: `${result.accounts.length}_ad_accounts${result.kept.length ? `_${result.kept.length}_kept` : ''}${result.replaced.length ? `_${result.replaced.length}_replaced_dead` : ''}` });
+  return connectedPage(result.accounts.length, result.kept.length, result.replaced.length);
 }
 
 /** POST /api/zoma/linkedin/select — only accounts LinkedIn offered (carried in the signed picker link) can be chosen. */
@@ -278,6 +301,10 @@ export async function selectLinkedInAdsAccounts(
   }
   const wanted = new Set((Array.isArray(params.account_id) ? params.account_id : [params.account_id]).filter((v): v is string => typeof v === 'string'));
   const chosen = claims.linkedinAccounts.filter((a) => wanted.has(a.account_id));
-  if (chosen.length === 0) return picker(params.t as string, claims.linkedinAccounts, await whoseAccount(claims.uid, deps), 'Choose at least one LinkedIn ad account.');
+  if (chosen.length === 0) {
+    const email = await accountEmail(claims.uid, deps);
+    if (!email) return { ...EXPIRED, message: `This page has expired. ${ZOMA_BACK_TO_AGENT}` };
+    return picker(params.t as string, claims.linkedinAccounts, `the Zoma account ${email}`, 'Choose at least one LinkedIn ad account.');
+  }
   return connectAccounts(claims.uid, claims.tokenSessionId, chosen, deps);
 }
