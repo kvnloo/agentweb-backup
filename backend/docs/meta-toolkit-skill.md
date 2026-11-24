@@ -127,8 +127,8 @@ If a result says `TERMS_NOT_ACCEPTED`, give the user `terms_url` (Meta's Custom 
 - **Assets:** `ASSET UPLOAD` runs without a preview, because an asset can't spend until something uses it. Use `asset_type` IMAGE or LOGO with `data` set to an https image URL or the `file_url` from `zoma_prepare_upload`, TEXT with the text as `data`, or VIDEO with a YouTube video id. It returns the asset resource name.
 - **Performance Max, end to end:** (1) upload the logo (`LOGO`), the square and landscape images (`IMAGE`); (2) `BUDGET CREATE`; (3) `CAMPAIGN CREATE` with `type: PERFORMANCE_MAX`, `brand_business_name` (≤25 characters) and `brand_logo_asset_resource_name`; (4) `ASSET_GROUP CREATE` with `name`, `campaign_resource_name`, `final_url`, 3–15 `headlines` (≤30), 1–5 `long_headlines` (≤90), 2–5 `descriptions` (≤90, at least one ≤60), `square_image_assets`, `landscape_image_assets`, and optionally `logo_assets` / `video_assets`; (5) `ASSET_GROUP UPDATE status: ENABLED`, then `CAMPAIGN UPDATE status: ENABLED`, each with its own approval.
 <!-- zoma-google:end -->
-
 <!-- zoma-linkedin:start -->
+
 ## LinkedIn Ads (when enabled for the account)
 `linkedin_ads_read` reads the connected LinkedIn ad account and changes nothing: `LIST_ACCOUNTS`, `LIST_CAMPAIGN_GROUPS`, `LIST_CAMPAIGNS` (optionally one `campaign_group_id`), `LIST_CREATIVES` (`campaign_id`), `LIST_TARGETING_FACETS`, `SEARCH_TARGETING_ENTITIES` (`facet_urn`, `query`), `ESTIMATE_AUDIENCE` (`targeting_include`) and `GET_ANALYTICS` (`pivot`, `start_date`, `end_date`; LinkedIn's adAnalytics). Money is in the account currency in major units.
 - **What works for which ad account:** reporting (`GET_ANALYTICS`) works for every connected ad account. For an ad account LinkedIn has not enabled for the Zoma app yet, the other reads can come back as `ad_account_not_enabled`: say so plainly, and offer reporting instead. Never guess at the missing data.
