@@ -179,6 +179,23 @@ describe('the hourly budget', () => {
   });
 });
 
+describe('what a refusal says: the account, not a key', () => {
+  it('the budget, the cooldown and the capacity refusals all speak of the account, because every key of an account shares them', () => {
+    const { limiter } = limiterAt();
+    ok(limiter.reserve('acct-1', 'fp', 50));
+    const budget = limiter.reserve('acct-1', 'fp-2', 1);
+    expect(!budget.ok && budget.message).toContain('This account has already sent');
+    expect(!budget.ok && budget.message).toContain('all of its API keys together');
+    const cooldown = limiterAt().limiter;
+    ok(cooldown.reserve('acct-2', 'fp', 1));
+    expect(!cooldown.reserve('acct-2', 'fp', 1).ok && (cooldown.reserve('acct-2', 'fp', 1) as any).message).toContain('from this account');
+    const full = limiterAt().limiter;
+    for (let i = 0; i < 1000; i++) ok(full.reserve(`acct-${i}`, 'fp', 1));
+    const capacity = full.reserve('acct-new', 'fp', 1);
+    expect(!capacity.ok && capacity.message).toContain('Too many accounts');
+  });
+});
+
 describe('release: the route refused before sending anything', () => {
   it('gives the whole reservation back and lets the same report be retried at once', () => {
     const { limiter } = limiterAt();

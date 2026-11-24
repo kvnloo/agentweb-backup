@@ -167,9 +167,12 @@ describe('sendGtmStatusReport: one call', () => {
     mockFetch.mockResolvedValue({ success: true, sent: 3 }); // sent without failed
     await sendGtmStatusReport({ plan_id: 'p3', notify_phase_pocs: true }, context, limiter);
     expect(limiter.used('account:user-1')).toBe(30);
+    mockFetch.mockResolvedValue({ success: true, sent: 1, failed: -1 }); // a negative count is not a count: it must not give reservation back
+    await sendGtmStatusReport({ plan_id: 'p3b', notify_phase_pocs: true }, context, limiter);
+    expect(limiter.used('account:user-1')).toBe(40);
     mockFetch.mockResolvedValue({ success: true, sent: Number.NaN, failed: Number.NaN }); // NaN must never reach the budget
     await sendGtmStatusReport({ plan_id: 'p4', notify_phase_pocs: true }, context, limiter);
-    expect(limiter.used('account:user-1')).toBe(40);
+    expect(limiter.used('account:user-1')).toBe(50);
   });
 
   it('refuses a report identical to one from the same key within 10 minutes, and does not call the route', async () => {
@@ -263,6 +266,14 @@ describe('sendGtmStatusReport: one call', () => {
       expect(limiter.used('account:user-1')).toBe(1);
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('identical report');
       expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([500, 503, 504])('a %s is ambiguous like a 502: the reservation and the cooldown are kept', async (status) => {
+      const limiter = new GtmEmailLimiter();
+      mockFetch.mockRejectedValue(new Error(`API error (${status}): upstream trouble`));
+      await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow(`API error (${status})`);
+      expect(limiter.used('account:user-1')).toBe(1);
+      await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('identical report');
     });
 
     it('a failure that is not an HTTP answer (a timeout, a broken connection) is ambiguous too', async () => {
@@ -364,6 +375,12 @@ describe('the audit line', () => {
     mockFetch.mockRejectedValue(new Error('API error (404): GTM Plan not found'));
     await expect(sendGtmStatusReport(args, context, new GtmEmailLimiter())).rejects.toThrow();
     expect(auditLines()[0]).toMatchObject({ outcome: 'error', status: 404, planId: 'plan-1' });
+  });
+
+  it('bounds the error text it records to 200 characters, so a hostile or huge error cannot flood the log', async () => {
+    mockFetch.mockRejectedValue(new Error(`API error (500): ${'x'.repeat(500)}`));
+    await expect(sendGtmStatusReport(args, context, new GtmEmailLimiter())).rejects.toThrow();
+    expect(auditLines()[0].error).toHaveLength(200);
   });
 
   it('records an invalid call too, so a probing agent leaves a trace', async () => {

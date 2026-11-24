@@ -648,6 +648,44 @@ describe('GTM Plan Notification Service', () => {
       }
     });
 
+    it('a contact written as a list counts as the people in it, not as one entry (the portal stores contacts as written)', async () => {
+      for (const dri of ['a@x.test, b@x.test, c@x.test', 'a@x.test;b@x.test;c@x.test', 'a@x.test b@x.test c@x.test', ['a@x.test', 'b@x.test', 'c@x.test'] as any]) {
+        (mockResendService.sendSystemEmail as jest.Mock).mockClear();
+        const over = await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 2 });
+        expect(over).toEqual({ recipients: 3, sent: 0, failed: 0, overCap: 2 });
+        expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+      }
+    });
+
+    it('thirty addresses in one contact are thirty people against a cap of 10', async () => {
+      const dri = Array.from({ length: 30 }, (_, i) => `u${i}@x.test`).join(',');
+      const over = await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 10 });
+      expect(over).toEqual({ recipients: 30, sent: 0, failed: 0, overCap: 10 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('a list that fits under the cap still sends, as one entry, exactly as before; and with no cap nothing changes', async () => {
+      const dri = 'a@x.test, b@x.test';
+      expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true, maxRecipients: 2 })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+      expect(await sendPlanStatusReport({ ...wide, dri }, { notifyPlanPoc: true })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('people in a list add up across contacts: a list in the plan contact plus phase contacts', async () => {
+      const over = await sendPlanStatusReport({ ...wide, dri: 'a@x.test, b@x.test' }, { notifyPlanPoc: true, notifyPhasePocs: true, maxRecipients: 13 }); // 2 + 12 phase contacts = 14
+      expect(over).toEqual({ recipients: 14, sent: 0, failed: 0, overCap: 13 });
+    });
+
+    it('an entry with no @ counts as one person, never as zero', async () => {
+      const over = await sendPlanStatusReport({ ...wide, dri: 'not-an-address' }, { notifyPlanPoc: true, maxRecipients: 0 });
+      expect(over).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
+    });
+
+    it('a phase report counts people in a list too', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@x.test,b@x.test,c@x.test', status: 'in_progress', workItems: [] }] };
+      const over = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPhasePoc: true, maxRecipients: 2 });
+      expect(over).toEqual({ recipients: 3, sent: 0, failed: 0, overCap: 2 });
+    });
+
     it('a report to nobody is still "nobody" (recipients 0), not over any cap', async () => {
       const result = await sendPlanStatusReport({ ...wide, dri: undefined }, { notifyPlanPoc: true, maxRecipients: 0 });
       expect(result).toEqual({ recipients: 0, sent: 0, failed: 0 });
