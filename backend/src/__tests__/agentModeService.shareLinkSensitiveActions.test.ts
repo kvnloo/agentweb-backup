@@ -551,119 +551,50 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       await expect(run(tool, VISITOR, plain)).resolves.toEqual({ ran: true });
     });
 
-    describe('a session\'s browser is released when the person driving it switches between the owner and a visitor who may not use the owner\'s logins', () => {
-      let release: jest.Mock;
-      beforeEach(() => {
-        release = jest.fn().mockResolvedValue(undefined);
-        (service as any).mcpClientService = { ...((service as any).mcpClientService ?? {}), releaseSessionClients: release };
-      });
+    describe('a visitor who may not use the owner\'s logins has a BROWSER of their own (a chat session\'s browser is pooled under the owner\'s id and kept for an hour)', () => {
       const browser = (ctx?: Record<string, unknown>, sessionId = 'session-1') => run('playwright_browser_run_code', ctx, { code: 'x' }, sessionId);
+      const poolOf = (toolName = 'playwright_browser_run_code') => dispatch.mock.calls.filter((c) => c[0] === toolName).map((c) => c[2].browserPoolSessionId);
 
-      it('owner, then an OFF-link visitor: released once before the visitor\'s step; the visitor\'s next step does not release again', async () => {
+      it('OFF link: the visitor\'s browser step is pooled under `<session>::visitor`; the owner\'s own step keeps the chat session\'s pool', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
         await browser(undefined);
-        expect(release).not.toHaveBeenCalled();
         await browser(VISITOR);
-        expect(release).toHaveBeenCalledTimes(1);
-        expect(release).toHaveBeenCalledWith('session-1', { force: true });
-        await browser(VISITOR);
-        expect(release).toHaveBeenCalledTimes(1);
+        expect(poolOf()).toEqual([undefined, 'session-1::visitor']);
       });
 
-      it('then the owner again: released again, and the owner\'s cookies are loaded again', async () => {
+      it('the pool is the session\'s own: another session\'s visitor gets another pool', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(undefined);
-        const loads = () => dispatch.mock.calls.map((c) => c[0]).filter((name: string) => name === 'load_browser_cookies').length;
-        const first = loads();
-        expect(first).toBeGreaterThan(0);
-        await browser(VISITOR);
-        await browser(undefined);
-        expect(release).toHaveBeenCalledTimes(2);
-        expect(loads()).toBe(first + 1);
-      });
-
-      it('a visitor whose history is unknown in this process is treated as a switch (released)', async () => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(VISITOR);
-        expect(release).toHaveBeenCalledTimes(1);
-      });
-
-      it('a visitor on a link that allows the owner\'s logins is the same actor as the owner: nothing is released between them', async () => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
-        await browser(undefined);
-        await browser(VISITOR);
-        await browser(undefined);
-        expect(release).not.toHaveBeenCalled();
-      });
-
-      it('two steps at once are handled one at a time per session: a visitor\'s step waits for the owner\'s switch to finish, then switches again', async () => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(VISITOR); // the visitor drives first
-        release.mockClear();
-        const order: string[] = [];
-        let finishFirst: () => void = () => undefined;
-        release.mockImplementationOnce(() => new Promise((resolve) => { order.push('owner switch starts'); finishFirst = () => { order.push('owner switch done'); resolve({ released: 1, skippedInFlight: 0 }); }; }));
-        release.mockImplementationOnce(async () => { order.push('visitor switch'); return { released: 1, skippedInFlight: 0 }; });
-        const ownerStep = browser(undefined).then(() => order.push('owner step ran'));
-        await new Promise((resolve) => setImmediate(resolve));
-        const visitorStep = browser(VISITOR).then(() => order.push('visitor step ran'));
-        await new Promise((resolve) => setImmediate(resolve));
-        expect(order).toEqual(['owner switch starts']); // the visitor\'s switch is queued behind it
-        finishFirst();
-        await Promise.all([ownerStep, visitorStep]);
-        expect(order.slice(0, 3)).toEqual(['owner switch starts', 'owner switch done', 'visitor switch']);
-        expect(release).toHaveBeenCalledTimes(2);
-      });
-
-      it('the actor map forgets an owner entry before a visitor\'s (a forgotten visitor entry would not release a visitor\'s browser)', async () => {
-        const map: Map<string, 'owner' | 'visitor'> = (service as any).browserActorBySession;
-        for (let i = 0; i < 999; i++) map.set(`filler-${i}`, 'visitor');
-        map.set('the-owner-one', 'owner');
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(VISITOR, 'one-more');
-        expect(map.has('the-owner-one')).toBe(false);
-        expect(map.has('filler-0')).toBe(true);
-        expect(map.size).toBe(1000);
-      });
-
-      it('another session\'s browser is not touched', async () => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(undefined, 'session-other');
         await browser(VISITOR, 'session-1');
-        expect(release.mock.calls.map((c) => c[0])).toEqual(['session-1']);
+        await browser(VISITOR, 'session-2');
+        expect(poolOf()).toEqual(['session-1::visitor', 'session-2::visitor']);
       });
 
-      it('the release is FORCED (a call the other person left running must not survive the hand-over)', async () => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(undefined);
+      it('a link that allows the sensitive tools (ON, or a legacy dialog link) shares the owner\'s browser: the same trust, the same pool', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
         await browser(VISITOR);
-        expect(release).toHaveBeenCalledWith('session-1', { force: true });
+        readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) }));
+        await browser(VISITOR);
+        expect(poolOf()).toEqual([undefined, undefined]);
       });
 
-      it.each([
-        ['a call is still running on the pool and the release skipped it', () => release.mockResolvedValue({ released: 0, skippedInFlight: 1 })],
-        ['the release threw', () => release.mockRejectedValue(new Error('boom'))],
-      ])('when %s: the step is NOT run, nothing is recorded, and the next call tries again', async (_label, arrange) => {
-        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(undefined);
-        dispatch.mockClear();
-        arrange();
-        const result = await browser(VISITOR);
-        expect(result).toMatchObject({ success: false, error: expect.stringContaining('could not be reset') });
-        expect(dispatch).not.toHaveBeenCalled();
-        release.mockResolvedValue({ released: 1, skippedInFlight: 0 });
+      it('a link that cannot be read counts as not allowed: the visitor\'s own pool, and the step still runs', async () => {
+        readSession.mockRejectedValue(new Error('throttled'));
         await expect(browser(VISITOR)).resolves.toEqual({ ran: true });
-        expect(release).toHaveBeenCalledTimes(2);
+        expect(poolOf()).toEqual(['session-1::visitor']);
       });
 
-      it('the same in the other direction: if the visitor\'s browser cannot be released, the owner\'s step is not run and no cookies are loaded', async () => {
+      it('the owner\'s cookies are never loaded for the visitor\'s browser, and the owner\'s are loaded for the owner\'s', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        await browser(undefined);
         await browser(VISITOR);
-        dispatch.mockClear();
-        release.mockResolvedValue({ released: 0, skippedInFlight: 1 });
-        await expect(browser(undefined)).resolves.toMatchObject({ success: false });
-        expect(dispatch.mock.calls.map((c) => c[0])).toEqual([]);
+        expect(dispatch.mock.calls.map((c) => c[0]).filter((n: string) => n.includes('cookies'))).toEqual([]);
+        await browser(undefined);
+        expect(dispatch.mock.calls.map((c) => c[0]).filter((n: string) => n.includes('cookies')).length).toBeGreaterThan(0);
+      });
+
+      it('a caller cannot choose the pool: whatever the context says, a visitor on an OFF link gets `<session>::visitor`', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await browser({ ...VISITOR, browserPoolSessionId: 'session-1' });
+        expect(poolOf()).toEqual(['session-1::visitor']);
       });
     });
 

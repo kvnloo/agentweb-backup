@@ -153,7 +153,7 @@ Closed, each verified in the code:
   `read_verification_code` by another name. The owner can have it back for a visitor by turning Full control on. (This was listed as the owner's call; two blind
   reviewers independently called it an account-takeover path, so it is closed and the revert is one line: remove `'email'` from `SHARE_VISITOR_SENSITIVE_TOOLS`.)
   Slack and X message reads and `read_google_doc` stay (privacy of the owner's own messages, not a login).
-- **A session's browser is not shared between the owner and a visitor who may not use the owner's logins.** Browsers are pooled per (owner, chat session) for an hour,
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **A session's browser is not shared between the owner and a visitor who may not use the owner's logins.** Browsers are pooled per (owner, chat session) for an hour,
   and the visitor runs under the owner's id, so a visitor on an OFF link drove the browser the owner had logged in (or read its cookies with `browser_evaluate`).
   `separateBrowserBetweenActors` releases the session's browser when the actor switches (owner to such a visitor, and back, when the owner's cookies load again).
   A visitor on a link that allows the sensitive tools is the same actor as the owner.
@@ -177,7 +177,7 @@ Meta image and video uploads; turning Full control on also covers everyone who a
 call by a visitor makes an OFF link permanent (an email path does the same, by design); a running visitor turn is not tied to the link it started on.
 
 ## Fourth final-review round (2026-11-24, on 70bee57cf): the hand-over is forced and verified, a schedule that emails others is not editable from an OFF link
-- **The browser hand-over could fail silently.** `releaseSessionClients` skips a pool with a call still running (`inFlight > 0`) and returned nothing, so
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **The browser hand-over could fail silently.** `releaseSessionClients` skips a pool with a call still running (`inFlight > 0`) and returned nothing, so
   `separateBrowserBetweenActors` recorded the switch and went on to load the owner's cookies into a browser a visitor's still-running code controlled (a timed-out
   request keeps running for up to an hour; a visitor can also end their own turn). Now the release is FORCED on a switch (`{ force: true }`, it returns
   `{ released, skippedInFlight }`), and when it did not happen (a pool was skipped, or it threw) nothing is recorded and the browser step is not run: the caller answers with
@@ -192,7 +192,7 @@ Not changed: a nested `solve_captcha` inside a marked schedule is judged as the 
 schedule's own session now has Meta writes refused until they adopt the schedule, like the other sensitive tools there.
 
 ## Fifth final-review round (2026-11-24, on 0b464e28e)
-- **A forced release was undone by the browser tool's own retry.** A browser tool call retries (twice, after 2 s) on any error, and a call still running when the session's
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* **A forced release was undone by the browser tool's own retry.** A browser tool call retries (twice, after 2 s) on any error, and a call still running when the session's
   browser is force-released fails with exactly such an error, so it reconnected to a NEW pool under the same key and ran the same code in the browser the next person had
   just logged in (code that outlives the call, like a background cookie reader, then reads the owner's cookies). `McpClientService` now counts the forced releases of a
   chat session (`sessionEpoch`); a call remembers the epoch it started in and does not retry into a later one (both retry loops), and answers that the browser was reset.
@@ -203,7 +203,19 @@ schedule's own session now has Meta writes refused until they adopt the schedule
 - The recipients check reads every stored format of the list (a list, a bare address, a JSON list in text: `normalizeEmailList`) and does not count the owner's own address
   as "other people" (new schedules default to it, so before this an OFF-link visitor could edit almost no schedule, their own included); an unreadable owner address counts every
   recipient as someone else.
-- The browser hand-over is serialized per session (a visitor's step cannot read the actor while the owner's switch is still releasing), and when the actor map is full an
+- *(Superseded by the sixth-round design at the end of this note: the browser is no longer shared, so there is no hand-over.)* The browser hand-over is serialized per session (a visitor's step cannot read the actor while the owner's switch is still releasing), and when the actor map is full an
   OWNER entry is forgotten before a visitor's.
 Still allowed on purpose (disclosed): a `dri` nested inside the `phases` / `items` of `create_gtm_plan`, `add_gtm_phase` and `add_gtm_work_items` (the top-level `dri` is covered);
 voice does not check a link's expiry (`liveVoiceSocket.ts` checks `isActive` only; predates this change); the PATCH route turns Full control on for a link without showing its expiry.
+
+
+## The browser: a visitor who may not use the owner's logins has a browser of their own (sixth round; replaces the hand-over of rounds 3 to 5)
+Rounds 3 to 5 tried to share one pooled browser between the owner and a visitor and hand it over safely (release it when the actor changes, force the release, verify it,
+stop a force-closed call from retrying into the new browser, serialize the switch). Each fix left a window: the sixth round's full-context review reproduced a race
+(a visitor's call starting between the owner's switch and the owner's cookie load) in a simulation, and a call that is still running at the switch cannot be told from one that
+is about to start. The hand-over and everything it needed (the actor map, the lock, the forced release, the epoch) are REMOVED. Instead, a visitor who may not use the owner's
+logins (an OFF link, a link that cannot be read, or a run of a schedule a visitor wrote) gets a browser pool of their own: `executeTool` passes
+`ToolContext.browserPoolSessionId = <session>::visitor` for the browser call and `McpClientService` pools under it (both execute loops, the per-user discovery loop included),
+so there is nothing to hand over: the owner's cookies are never loaded into that browser, and the visitor's calls never touch the owner's. `releaseSessionClients` releases
+`<owner>::<session>::visitor` with the session. A visitor on a link that allows the sensitive tools (ON, or a legacy dialog link) is the same trust as the owner and keeps sharing the
+owner's browser. Left as a limit: a visitor call that started while the link was ON keeps running in the owner's browser if the owner turns the link OFF during that single call.

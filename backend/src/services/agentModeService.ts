@@ -1293,59 +1293,6 @@ export class AgentModeService {
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
-  // ENG-3170: who last drove this session's browser (in this process, where its pooled browser lives): 'owner' (the owner, or a visitor allowed to use the
-  // owner's logins) or 'visitor' (a visitor who is not). Bounded, oldest first.
-  private browserActorBySession = new Map<string, 'owner' | 'visitor'>();
-  private static readonly BROWSER_ACTOR_MAX_SESSIONS = 1000;
-
-  /**
-   * ENG-3170: a chat session's browser is pooled for the whole session (one hour idle), under the OWNER's id, so a visitor on an OFF link would drive
-   * the same browser the owner logged in (and read its cookies with browser_evaluate). When the person driving it switches between the owner and a
-   * visitor who may not use the owner's logins, the session's browser is released (a fresh one starts with no logins), and the owner's cookies are
-   * loaded again the next time the owner drives it. A visitor whose history is unknown in this process is treated as a switch.
-   */
-  /** One hand-over at a time per session: a visitor's step must not read the actor while the owner's switch is still releasing the browser (and the reverse). */
-  private browserHandoverTail = new Map<string, Promise<unknown>>();
-  private async separateBrowserBetweenActors(sessionId: string, actor: 'owner' | 'visitor'): Promise<boolean> {
-    const previous = this.browserHandoverTail.get(sessionId) ?? Promise.resolve();
-    const mine = previous.catch(() => undefined).then(() => this.separateBrowserBetweenActorsNow(sessionId, actor));
-    this.browserHandoverTail.set(sessionId, mine);
-    try {
-      return await mine;
-    } finally {
-      if (this.browserHandoverTail.get(sessionId) === mine) this.browserHandoverTail.delete(sessionId);
-    }
-  }
-
-  private async separateBrowserBetweenActorsNow(sessionId: string, actor: 'owner' | 'visitor'): Promise<boolean> {
-    const last = this.browserActorBySession.get(sessionId);
-    if (last !== actor && (last !== undefined || actor === 'visitor')) {
-      // FORCED: a call the other person left running on the session's browser (a timed-out request keeps running; a visitor can also end their own turn)
-      // must not survive the hand-over, or it keeps controlling a browser the new person logs in. If the browser could not be released, nothing is
-      // recorded and the step is not run: the caller answers with an error and the next call tries again.
-      let released = false;
-      try {
-        const result = await this.mcpClientService.releaseSessionClients(sessionId, { force: true });
-        released = !result || result.skippedInFlight === 0;
-      } catch (releaseError) {
-        console.warn(`AgentMode ENG-3170: could not release the browser of session ${sessionId} between the owner and a visitor:`, releaseError);
-      }
-      if (!released) return false;
-      this.browserCookieAutoState.sessions.delete(sessionId);
-    }
-    this.browserActorBySession.delete(sessionId);
-    this.browserActorBySession.set(sessionId, actor);
-    // Oldest first, but an OWNER entry before a visitor's: a session whose visitor entry is forgotten would not release the visitor's browser when the owner
-    // next drives it.
-    while (this.browserActorBySession.size > AgentModeService.BROWSER_ACTOR_MAX_SESSIONS) {
-      let victim: string | undefined;
-      for (const [id, who] of this.browserActorBySession) { if (who === 'owner') { victim = id; break; } }
-      if (victim === undefined) victim = this.browserActorBySession.keys().next().value;
-      if (victim === undefined) break;
-      this.browserActorBySession.delete(victim);
-    }
-    return true;
-  }
   // ENG-2103 (F2): driveServiceAccountEmail moved to a module-level singleton
   // in emma/impl/shared/googleDriveAccess.ts (the same "pure cache" treatment
   // as F1's runFundingStore) — getGoogleDriveClient/getGoogleDriveServiceAccountEmail
@@ -10495,14 +10442,12 @@ export class AgentModeService {
         const visitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
         const visitorCall = isShareVisitor || visitorSchedule || isShareVisitorTurn(sessionId) || toolCallRestrictionStore.getStore()?.withinVisitorCall === true;
         const borrowOwnerLogins = !visitorCall || (!visitorSchedule && await this.readShareLinkControl(toolName, sessionId).then((c) => c.sensitive, () => false));
-        if (!(await this.separateBrowserBetweenActors(sessionId, borrowOwnerLogins ? 'owner' : 'visitor'))) {
-          return {
-            success: false,
-            error: 'This chat\'s browser could not be reset just now (it is shared between the account owner and people using a shared link, and a step of the other person is still running). The step was not run and nothing was done. Please try again in a moment.',
-          };
-        }
+        // A visitor who may not use the owner's logins also gets a BROWSER of their own. A chat session's browser is pooled for the whole session (an hour idle)
+        // under the owner's id, so a shared one would be driven by the visitor with the cookies the owner's turn loaded (browser_evaluate can read them), and
+        // any hand-over between the two has a window. Their own pool (`<session>::visitor`) has no owner's logins in it, ever, and nothing to hand over.
+        const browserCtx = borrowOwnerLogins ? cookieCtx : { ...cookieCtx, browserPoolSessionId: `${sessionId}::visitor` };
         if (borrowOwnerLogins) await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
-        const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
+        const result = await this.toolRegistry.execute(toolName, preparedArgs, browserCtx);
         const toolFailed = result && (result as any).success === false;
         if (!toolFailed && borrowOwnerLogins && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
