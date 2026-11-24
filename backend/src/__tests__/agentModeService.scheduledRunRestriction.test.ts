@@ -412,6 +412,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(loads()).toBeGreaterThan(0);
       const browserCall = dispatch.mock.calls.find((c) => c[0] === BROWSER)!;
       expect(browserCall[2]).not.toHaveProperty('restrictionProfile');
+      expect(browserCall[2]).not.toHaveProperty('browserPoolSessionId'); // the owner's own schedule keeps the session's browser
     });
 
     it('a MARKED schedule: the browser step still runs, but it borrows no logins (and says why in its profile)', async () => {
@@ -419,7 +420,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       await expect(runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' })).resolves.toEqual({ ran: true });
       expect(names()).toContain(BROWSER);
       expect(loads()).toBe(0);
-      expect(dispatch.mock.calls.find((c) => c[0] === BROWSER)![2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule' });
+      expect(dispatch.mock.calls.find((c) => c[0] === BROWSER)![2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', browserPoolSessionId: 'run-session::visitor' });
     });
 
     it('a schedule that cannot be read: the browser step still runs, without the owner\'s logins (a blip must not run a visitor\'s schedule as the owner)', async () => {
