@@ -67,12 +67,14 @@ jest.mock('../services/emailService', () => ({}));
 jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
+    sendSystemEmail: jest.fn(),
   },
 }));
 jest.mock('../services/workflowDb', () => ({}));
 jest.mock('../services/chatbotService', () => ({}));
 
 const { DynamoDB } = require('aws-sdk');
+const { resendService } = require('../services/resendService');
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 
 const app = express();
@@ -848,9 +850,25 @@ describe('Admin GTM Plans Update Endpoints', () => {
   });
 
   describe('Status Report Endpoints', () => {
+    // These run the REAL report code and the real route; only the database and the mail service are doubles. (They used to mock the
+    // notification service with jest.doMock after the route was imported, which replaced nothing, and the mail mock had no
+    // sendSystemEmail, so every send failed while the route answered "sent successfully".)
     let mockGet: jest.Mock;
-    let mockSendPhaseStatusReport: jest.Mock;
-    let mockSendPlanStatusReport: jest.Mock;
+    const sendSystemEmail = resendService.sendSystemEmail as jest.Mock;
+
+    const reportPlan = {
+      planId: 'plan-1',
+      userId: 'user-1',
+      title: 'Test Plan',
+      dri: 'plan-poc@example.com',
+      phases: [
+        { id: 'phase-1', title: 'Test Phase', status: 'in_progress', dri: 'phase-poc@example.com', workItems: [{ id: 'item-1', title: 'Test Item', status: 'pending', dri: 'item-poc@example.com' }] },
+        { id: 'phase-2', title: 'Phase 2', status: 'completed', dri: 'phase2-poc@example.com', workItems: [] },
+      ],
+    };
+    const planIs = (item: any) => mockGet.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: item }) });
+    const phaseUrl = '/api/admin/gtm-plans/plan-1/phases/phase-1/send-status-report';
+    const planUrl = '/api/admin/gtm-plans/plan-1/send-status-report';
 
     beforeEach(() => {
       jest.clearAllMocks();
@@ -860,61 +878,102 @@ describe('Admin GTM Plans Update Endpoints', () => {
         get: mockGet,
       }));
 
-      // Mock the notification service functions
-      mockSendPhaseStatusReport = jest.fn().mockResolvedValue(undefined);
-      mockSendPlanStatusReport = jest.fn().mockResolvedValue(undefined);
-
-      jest.doMock('../services/gtmPlanNotificationService', () => ({
-        sendGTMPlanUpdateNotifications: jest.fn(),
-        sendPhaseStatusReport: mockSendPhaseStatusReport,
-        sendPlanStatusReport: mockSendPlanStatusReport,
-      }));
+      sendSystemEmail.mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue(undefined as any);
     });
 
     describe('POST /api/admin/gtm-plans/:planId/phases/:phaseId/send-status-report', () => {
-      it('should send a phase status report successfully', async () => {
-        const mockPlan = {
-          planId: 'plan-1',
-          userId: 'user-1',
-          title: 'Test Plan',
-          phases: [
-            {
-              id: 'phase-1',
-              title: 'Test Phase',
-              status: 'in_progress',
-              dri: 'phase-poc@example.com',
-              workItems: [
-                {
-                  id: 'item-1',
-                  title: 'Test Item',
-                  status: 'pending',
-                  dri: 'item-poc@example.com',
-                },
-              ],
-            },
-          ],
-        };
-
-        mockGet.mockReturnValue({
-          promise: jest.fn().mockResolvedValue({
-            Item: mockPlan,
-          }),
-        });
+      it('answers with what was sent: one recipient chosen, one email accepted', async () => {
+        planIs(reportPlan);
 
         const response = await request(app)
-          .post('/api/admin/gtm-plans/plan-1/phases/phase-1/send-status-report')
-          .send({
-            notifications: {
-              notifyUser: true,
-              notifyPlanPoc: false,
-              notifyPhasePoc: true,
-            },
-            message: 'Custom status report message',
-          })
+          .post(phaseUrl)
+          .send({ notifications: { notifyPhasePoc: true }, message: 'Custom status report message' })
           .expect(200);
 
+        expect(response.body).toEqual({
+          success: true,
+          message: 'The phase status report for "Test Phase" was sent successfully to 1 recipient.',
+          sent: 1,
+          failed: 0,
+          suppressed: 0,
+        });
+        expect(sendSystemEmail).toHaveBeenCalledTimes(1);
+        expect(sendSystemEmail.mock.calls[0][0].to).toBe('phase-poc@example.com');
+      });
+
+      it('puts the custom message into the email (html and plain text)', async () => {
+        planIs(reportPlan);
+
+        await request(app).post(phaseUrl).send({ notifications: { notifyPhasePoc: true }, message: 'Custom status report message' }).expect(200);
+
+        const email = sendSystemEmail.mock.calls[0][0];
+        expect(email.html).toContain('Custom status report message');
+        expect(email.text).toContain('Custom status report message');
+      });
+
+      it('emails the account owner when that option is chosen', async () => {
+        planIs(reportPlan);
+        mockUserDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyUser: true } }).expect(200);
+
+        expect(mockUserDb.getUserById).toHaveBeenCalledWith('user-1');
+        expect(sendSystemEmail.mock.calls.map((call) => call[0].to)).toEqual(['owner@example.com']);
+        expect(response.body).toMatchObject({ sent: 1, failed: 0 });
+      });
+
+      it('answers 500 in the old shape when the plan cannot be read', async () => {
+        mockGet.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('boom')) });
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyPhasePoc: true } }).expect(500);
+
+        expect(response.body).toEqual({ success: false, message: 'Error sending phase status report', error: 'boom' });
+        expect(sendSystemEmail).not.toHaveBeenCalled();
+      });
+
+      it('answers 400 and emails nobody when no recipient option is chosen', async () => {
+        planIs(reportPlan);
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyUser: false } }).expect(400);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toMatch(/was not sent: nobody was chosen to receive it/);
+        expect(response.body.error).toMatch(/Nothing was emailed/);
+        expect(sendSystemEmail).not.toHaveBeenCalled();
+      });
+
+      it('answers 502 and not "sent" when the mail service refuses every email', async () => {
+        planIs(reportPlan);
+        sendSystemEmail.mockRejectedValue(new Error('Resend is down'));
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyPhasePoc: true, notifyPlanPoc: true } }).expect(502);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toMatch(/refused all 2 emails/);
+        expect(response.body.error).toMatch(/Nothing was delivered/);
+        expect(sendSystemEmail).toHaveBeenCalledTimes(2);
+      });
+
+      it('answers 200 with the exact counts when one email is refused and the other accepted', async () => {
+        planIs(reportPlan);
+        sendSystemEmail.mockResolvedValueOnce({ id: 'ok-1' }).mockRejectedValueOnce(new Error('bad address'));
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyPhasePoc: true, notifyPlanPoc: true } }).expect(200);
+
         expect(response.body.success).toBe(true);
-        expect(response.body.message).toBe('Phase status report sent successfully');
+        expect(response.body.message).toBe('The phase status report for "Test Phase" was sent to 1 of 2 recipients; 1 could not be sent.');
+        expect(response.body).toMatchObject({ sent: 1, failed: 1, suppressed: 0 });
+      });
+
+      it('does not call an email the non-production guard held back "sent"', async () => {
+        planIs(reportPlan);
+        sendSystemEmail.mockResolvedValue({ id: 'nonprod-suppressed', suppressed: true });
+
+        const response = await request(app).post(phaseUrl).send({ notifications: { notifyPhasePoc: true } }).expect(200);
+
+        expect(response.body.message).toMatch(/was NOT delivered: this environment's email guard held back 1 email/);
+        expect(response.body).toMatchObject({ sent: 0, failed: 0, suppressed: 1 });
       });
 
       it('should return 404 if plan is not found', async () => {
@@ -969,50 +1028,72 @@ describe('Admin GTM Plans Update Endpoints', () => {
     });
 
     describe('POST /api/admin/gtm-plans/:planId/send-status-report', () => {
-      it('should send a plan status report successfully', async () => {
-        const mockPlan = {
-          planId: 'plan-1',
-          userId: 'user-1',
-          title: 'Test Plan',
-          dri: 'plan-poc@example.com',
-          phases: [
-            {
-              id: 'phase-1',
-              title: 'Phase 1',
-              status: 'in_progress',
-              dri: 'phase1-poc@example.com',
-              workItems: [],
-            },
-            {
-              id: 'phase-2',
-              title: 'Phase 2',
-              status: 'completed',
-              dri: 'phase2-poc@example.com',
-              workItems: [],
-            },
-          ],
-        };
-
-        mockGet.mockReturnValue({
-          promise: jest.fn().mockResolvedValue({
-            Item: mockPlan,
-          }),
-        });
+      it('answers with what was sent: three distinct contacts chosen, three emails accepted', async () => {
+        planIs(reportPlan);
 
         const response = await request(app)
-          .post('/api/admin/gtm-plans/plan-1/send-status-report')
-          .send({
-            notifications: {
-              notifyUser: true,
-              notifyPlanPoc: true,
-              notifyPhasePocs: true,
-            },
-            message: 'Overall plan status report',
-          })
+          .post(planUrl)
+          .send({ notifications: { notifyPlanPoc: true, notifyPhasePocs: true }, message: 'Overall plan status report' })
           .expect(200);
 
-        expect(response.body.success).toBe(true);
-        expect(response.body.message).toBe('Plan status report sent successfully');
+        expect(response.body).toEqual({
+          success: true,
+          message: 'The plan status report for "Test Plan" was sent successfully to 3 recipients.',
+          sent: 3,
+          failed: 0,
+          suppressed: 0,
+        });
+        expect(sendSystemEmail.mock.calls.map((call) => call[0].to).sort()).toEqual(['phase-poc@example.com', 'phase2-poc@example.com', 'plan-poc@example.com']);
+      });
+
+      it('puts the custom message into the email (html and plain text)', async () => {
+        planIs(reportPlan);
+
+        await request(app).post(planUrl).send({ notifications: { notifyPlanPoc: true }, message: 'Overall plan status report' }).expect(200);
+
+        const email = sendSystemEmail.mock.calls[0][0];
+        expect(email.html).toContain('Overall plan status report');
+        expect(email.text).toContain('Overall plan status report');
+      });
+
+      it('answers 500 in the old shape when the plan cannot be read', async () => {
+        mockGet.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('boom')) });
+
+        const response = await request(app).post(planUrl).send({ notifications: { notifyPlanPoc: true } }).expect(500);
+
+        expect(response.body).toEqual({ success: false, message: 'Error sending plan status report', error: 'boom' });
+        expect(sendSystemEmail).not.toHaveBeenCalled();
+      });
+
+      it('answers 400 and emails nobody when no recipient option is chosen (it used to answer "sent successfully")', async () => {
+        planIs({ planId: 'plan-1', userId: 'user-1', title: 'Test Plan', phases: [] });
+
+        const response = await request(app).post(planUrl).send({}).expect(400);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toMatch(/was not sent: nobody was chosen to receive it/);
+        expect(sendSystemEmail).not.toHaveBeenCalled();
+      });
+
+      it('answers 502 and not "sent" when the mail service refuses every email', async () => {
+        planIs(reportPlan);
+        sendSystemEmail.mockRejectedValue(new Error('Resend is down'));
+
+        const response = await request(app).post(planUrl).send({ notifications: { notifyPlanPoc: true, notifyPhasePocs: true } }).expect(502);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toMatch(/refused all 3 emails/);
+        expect(sendSystemEmail).toHaveBeenCalledTimes(3);
+      });
+
+      it('answers 200 with the exact counts when some emails are refused', async () => {
+        planIs(reportPlan);
+        sendSystemEmail.mockResolvedValueOnce({ id: 'ok-1' }).mockRejectedValueOnce(new Error('bad address')).mockResolvedValueOnce({ id: 'ok-3' });
+
+        const response = await request(app).post(planUrl).send({ notifications: { notifyPlanPoc: true, notifyPhasePocs: true } }).expect(200);
+
+        expect(response.body.message).toBe('The plan status report for "Test Plan" was sent to 2 of 3 recipients; 1 could not be sent.');
+        expect(response.body).toMatchObject({ sent: 2, failed: 1, suppressed: 0 });
       });
 
       it('should return 404 if plan is not found', async () => {
@@ -1033,27 +1114,6 @@ describe('Admin GTM Plans Update Endpoints', () => {
         expect(response.body.error).toBe('GTM Plan not found');
       });
 
-      it('should handle missing notification options gracefully', async () => {
-        const mockPlan = {
-          planId: 'plan-1',
-          userId: 'user-1',
-          title: 'Test Plan',
-          phases: [],
-        };
-
-        mockGet.mockReturnValue({
-          promise: jest.fn().mockResolvedValue({
-            Item: mockPlan,
-          }),
-        });
-
-        const response = await request(app)
-          .post('/api/admin/gtm-plans/plan-1/send-status-report')
-          .send({})
-          .expect(200);
-
-        expect(response.body.success).toBe(true);
-      });
     });
   });
 });
