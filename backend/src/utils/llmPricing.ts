@@ -28,7 +28,7 @@ import { GEMINI_OMNI_VIDEO_MODEL, omniClipDurations } from '../services/videoMod
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-11-15";
+export const LLM_PRICE_BOOK_VERSION = "2026-11-24";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -146,6 +146,15 @@ const GEMINI_3_8_FLASH_PRICE: ModelPrice = { ...withDerivedCache(0.75, 3.75), ca
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  "openrouter/anthropic/claude-fable-5.2": {"inPerM":8,"outPerM":40,"cacheReadPerM":0.2,"cacheWritePerM":10},
+  "openrouter/deepseek/deepseek-v4.1-flash-1017": {"inPerM":0.03,"outPerM":0.2,"cacheReadPerM":0.001},
+  "openrouter/google/gemini-4-carbon": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":0.1875},
+  "openrouter/google/gemini-4-neon": {"inPerM":3,"outPerM":15,"cacheReadPerM":0.15,"cacheWritePerM":0.0833333333333333},
+  "openrouter/openai/gpt-6.1-terra": {"inPerM":1,"outPerM":5,"cacheReadPerM":0.05,"cacheWritePerM":1.25},
+  "openrouter/openai/gpt-6.2-astra": {"inPerM":8,"outPerM":40,"cacheReadPerM":0.4,"cacheWritePerM":10},
+  "openrouter/openai/gpt-6.2-sol": {"inPerM":2,"outPerM":10,"cacheReadPerM":0.1,"cacheWritePerM":2.5},
+  "openrouter/qwen/qwen4-max": {"inPerM":1.425,"outPerM":4.275,"cacheReadPerM":0.07125,"cacheWritePerM":1.78125},
+
   "openrouter/anthropic/claude-haiku-5.5": {"inPerM":0.1,"outPerM":0.5,"cacheReadPerM":0.01,"cacheWritePerM":0.125},
 
   // Cache read $0.10/1M per OpenRouter's record (input_cache_read 0.0000001), 5% of input like Opus 5.5 —
