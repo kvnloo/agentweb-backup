@@ -47,7 +47,7 @@ import {
 } from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { sessionActiveRunGuard } from '../services/agentMode/sessionActiveRunGuardInstance';
-import { getInteractiveShareExpiresAt } from '../utils/interactiveShare';
+import { getInteractiveShareExpiresAt, interactiveShareAllowsSensitiveActions, interactiveShareControl } from '../utils/interactiveShare';
 import { buildReportEmail, checkEmailReportAllowed, normalizeRecipient, resolveReportUrl } from '../utils/ishareEmailReport';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -6778,6 +6778,20 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 const ENTITLEMENT_RETRY_DELAYS_MS = [1000, 2000];
 
 /**
+ * What Emma is told after an approval deck whose write failed (found live: a write that failed Meta-side validation was silently re-proposed
+ * identically three times, because the per-item `error` was in the outcome JSON but nothing said what to do with it). Used by BOTH the
+ * account owner's route and the share route, so a visitor on a Full-control link who approves a write gets the same behaviour.
+ */
+function deckFailureInstruction(deckOutcomeStatus: string): string {
+  return (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
+    ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
+      'actual failure to the user in plain language, and adjust the params yourself if the error ' +
+      'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
+      'the same write again. Do NOT silently re-propose an identical write that already failed.'
+    : '';
+}
+
+/**
  * ENG-2816 (step 3): is this schedule write a SHARE-LINK VISITOR's?
  *
  * A visitor acts under the owner's userId, so the request looks like the owner's own. Two independent signals say otherwise, and
@@ -6869,12 +6883,14 @@ function notifyOwnerOfFirstVisitorMark(req: Request, schedule: { scheduleId: str
  * owner pays for up to twenty refused attempts. So for a marked schedule the refused names are dropped from `requiredFunctionCalls`
  * and `functionCallMinCalls`; an unmarked schedule (every schedule that predates this) gets back exactly what it stores.
  */
-function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
+export function requiredCallsForRun(schedule: any): { functionCalls: string[]; minCalls: Record<string, number>; skipped: string[] } {
   const functionCalls: string[] = schedule?.requiredFunctionCalls || [];
   const minCalls: Record<string, number> = schedule?.functionCallMinCalls || {};
   if (!isScheduleMarked(schedule)) return { functionCalls, minCalls, skipped: [] };
   // ADMIN_SKILL_TOOL_NAMES can be absent where a test replaces the whole service module; production always has it.
-  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? []) !== null;
+  // By NAME only (ENG-3170): a tool refused for some of its actions (a Google Ads report is allowed, a campaign change is not) is still
+  // one the run may be held to calling.
+  const isRefused = (name: string) => restrictionRefusal(SHARE_VISITOR_SCHEDULE_PROFILE, name, ADMIN_SKILL_TOOL_NAMES ?? [], undefined, { nameOnly: true }) !== null;
   const kept = withoutRefusedNames(functionCalls, isRefused);
   // `skipped` is what the run was NOT held to, in the schedule's own order, so a "passed" run can say what it skipped.
   return { functionCalls: kept, minCalls: minCallsWithoutRefused(minCalls, isRefused), skipped: functionCalls.filter((name) => !kept.includes(name)) };
@@ -11601,12 +11617,7 @@ export const agentModeController = {
         // told Emma what to DO with a failure, so she just retried instead of explaining it
         // to the user or adjusting the params herself. A bare JSON dump relies entirely on
         // the model inferring the right response; make it explicit instead.
-        const failureInstruction = (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
-          ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
-            'actual failure to the user in plain language, and adjust the params yourself if the error ' +
-            'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
-            'the same write again. Do NOT silently re-propose an identical write that already failed.'
-          : '';
+        const failureInstruction = deckFailureInstruction(deckOutcomeStatus);
         const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
           status: deckOutcomeStatus,
           ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
@@ -13026,7 +13037,13 @@ export const agentModeController = {
   async createConversableShare(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, expirationDays: rawExpirationDays } = req.body;
+      const { sessionId, expirationDays: rawExpirationDays, allowSensitiveActions: rawAllowSensitiveActions } = req.body;
+
+      // ENG-3170: the owner's choice about a link is the owner's. A call made by a tool on a visitor's behalf carries a restriction claim and
+      // never reaches it (no tool does today; this keeps it that way).
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
 
       // ENG-1907: no transcript leaves a sandbox account.
       if (isEvaluationUser(user?.userId)) {
@@ -13039,6 +13056,10 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // ENG-3170: the owner's choice for this link (sensitive actions on or off). Only a real boolean counts; anything else is "no
+      // choice made": a new link is then off, and an existing link is left as it is.
+      const allowSensitiveActionsChoice = typeof rawAllowSensitiveActions === 'boolean' ? rawAllowSensitiveActions : undefined;
+
       // Validate expirationDays (default 7, max 365)
       const expirationDays = rawExpirationDays != null ? Number(rawExpirationDays) : 7;
       if (!Number.isFinite(expirationDays) || expirationDays < 1 || expirationDays > 365) {
@@ -13046,30 +13067,51 @@ export const agentModeController = {
       }
 
       // Use the common function to create or reuse interactive share
-      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays);
+      const conversableUrl = allowSensitiveActionsChoice === undefined
+        ? await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays)
+        : await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays, { allowSensitiveActions: allowSensitiveActionsChoice });
 
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
-      // KNOWN LIMITATION: this echoes the requested window, not the stored value.
-      // createOrReuseInteractiveShare REUSES an existing active share untouched,
-      // so when one already exists this expiresAt can differ from what's actually
-      // in the DB — most notably, re-sharing a session that already has a
-      // no-expiry token (e.g. one first minted by a machine/email path) shows an
-      // "Expires" date in the UI while the link is in fact permanent. This is a
-      // display mismatch only: it grants no extra access (the token was already
-      // live) and is reversible. Changing an active share's expiry requires
-      // revoke (stopConversableShare) + reshare. A true fix needs per-purpose
-      // tokens (see the on-demand-minting redesign) rather than one shared token
-      // per session, so it is intentionally out of scope here.
-      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
+      // ENG-3170: answer with what is STORED, expiry included. createOrReuseInteractiveShare REUSES an existing live link, so the link that now
+      // exists may have a different expiry from the one asked for (most notably a link first made by an email or alert path, which never
+      // expires). That used to be a display mismatch that granted no extra access; with the Full control switch it would show "Expires
+      // tomorrow" on a permanent link that now has full control, so the dialog is told the truth (a link with no expiry has no `expiresAt`).
+      let storedExpiresAt: string | undefined;
+
+      // ENG-3170: answer with what is STORED, not with what was asked for. When the owner made an explicit choice, re-read it (a
+      // consistent read) and say so if it did not persist, instead of showing a switch that is not true. With no choice made, a new
+      // link is off and an existing link is what it already was.
+      let allowSensitiveActions: boolean;
+      if (allowSensitiveActionsChoice !== undefined) {
+        const storedShare = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+        allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedShare);
+        storedExpiresAt = typeof storedShare?.expiresAt === 'string' && storedShare.expiresAt ? storedShare.expiresAt : undefined;
+        if (allowSensitiveActions !== allowSensitiveActionsChoice) {
+          console.error(`AgentMode ENG-3170: the sensitive-actions choice for share ${sessionId} did not persist (asked ${allowSensitiveActionsChoice}).`);
+          return res.status(500).json({ error: 'Failed to save the sensitive-actions setting for this link' });
+        }
+      } else {
+        // An old client that sends no choice: say what the link that is now stored means. It is read back, because the link may have just been
+        // replaced (an expired full-control link is replaced by an off one), so the copy read before the call may no longer be the link.
+        try {
+          const storedNow = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+          allowSensitiveActions = interactiveShareAllowsSensitiveActions(storedNow);
+          storedExpiresAt = typeof storedNow?.expiresAt === 'string' && storedNow.expiresAt ? storedNow.expiresAt : undefined;
+        } catch (readError) {
+          console.error(`AgentMode ENG-3170: could not read back the share link ${sessionId} to say what it allows:`, readError);
+          allowSensitiveActions = false;
+        }
+      }
 
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
         conversableUrl: conversableUrl,
-        expiresAt: expiresAt
+        ...(storedExpiresAt ? { expiresAt: storedExpiresAt } : {}),
+        allowSensitiveActions
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -13082,6 +13124,11 @@ export const agentModeController = {
     try {
       const user = req.user as User;
       const { sessionId } = req.params;
+
+      // ENG-3170: see createConversableShare: whether a link exists is the owner's call; a visitor's claim never reaches it.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
 
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
@@ -13102,6 +13149,75 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Stop conversable share error:', error);
       res.status(500).json({ error: 'Failed to stop conversable sharing' });
+    }
+  },
+
+  // ENG-3170: read the owner's sensitive-actions setting for this session's interactive link. The EFFECTIVE value (a link made before
+  // the setting existed has no stored choice; utils/interactiveShare says how it reads), so the share dialog never has to know the rule.
+  async getConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+      res.status(200).json({
+        allowSensitiveActions: interactiveShareAllowsSensitiveActions(share),
+        // Tells the dialog whether the value was chosen by the owner or is a link made before the setting existed.
+        explicit: typeof share.allowSensitiveActions === 'boolean',
+      });
+    } catch (error) {
+      console.error('AgentMode: Get conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to read the share link settings' });
+    }
+  },
+
+  // ENG-3170: the owner changes the sensitive-actions setting on the link that already exists. Owner only (the session must be theirs;
+  // a visitor's token never reaches this route, it needs the owner's login), a real boolean only, and nothing else on the link changes.
+  async updateConversableShareSettings(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { sessionId } = req.params;
+      const { allowSensitiveActions } = req.body || {};
+
+      // ENG-3170: see createConversableShare: a call carrying a visitor's restriction claim never changes the owner's setting.
+      if ((req as AuthenticatedRequest).restrictionProfile) {
+        return res.status(403).json({ error: 'This is not available in shared sessions. The account owner can change it from the share dialog.' });
+      }
+
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+      if (typeof allowSensitiveActions !== 'boolean') {
+        return res.status(400).json({ error: 'allowSensitiveActions must be true or false' });
+      }
+
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      if (!session || session.userId !== user.userId) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      const share = session.interactiveShareMetadata;
+      if (!share?.isActive) {
+        return res.status(404).json({ error: 'No interactive share link for this session' });
+      }
+
+      // Attribute level: only the choice is written, never a copy of the rest of the link read a moment ago.
+      await chatbotDb.setInteractiveShareAllowSensitiveActions(sessionId, allowSensitiveActions);
+      console.log(`AgentMode ENG-3170: the owner set sensitive actions ${allowSensitiveActions ? 'ON' : 'OFF'} for share link ${sessionId}`);
+
+      const stored = (await chatbotDb.getChatSessionRecord(sessionId, true))?.interactiveShareMetadata;
+      if (typeof stored?.allowSensitiveActions !== 'boolean' || stored.allowSensitiveActions !== allowSensitiveActions) {
+        return res.status(500).json({ error: 'Failed to save the setting for this link' });
+      }
+      res.status(200).json({ allowSensitiveActions: stored.allowSensitiveActions, explicit: true });
+    } catch (error) {
+      console.error('AgentMode: Update conversable share settings error:', error);
+      res.status(500).json({ error: 'Failed to update the share link settings' });
     }
   },
 
@@ -13407,7 +13523,21 @@ export const agentModeController = {
           (item) => Boolean(item.metaWriteManifestDigest) || item.immutable === true,
         );
         if (hasBlockedItem) {
-          return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          // ENG-3170: FULL CONTROL is everything the customer can do, and the customer can approve a write or a locked decision. So on a
+          // link whose owner turned it on, the visitor may too. Decided from a CONSISTENT read of the link made now (an owner who has just
+          // switched it off is honoured on the next call); anything unreadable, missing or off keeps the refusal.
+          let linkHasFullControl = false;
+          try {
+            const fresh = await chatbotDb.getChatSessionRecord(session.sessionId, true);
+            // FULL CONTROL proper: an explicit choice on a link that is still live. A link made before the setting existed (read as "may
+            // run the sensitive tools" by its lifetime) never gets this: its visitors were refused this answer before and still are.
+            linkHasFullControl = interactiveShareControl(fresh?.interactiveShareMetadata).full;
+          } catch {
+            linkHasFullControl = false;
+          }
+          if (!linkHasFullControl) {
+            return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+          }
         }
         const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
         if (result.outcome === 'needs_person') {
@@ -13430,11 +13560,10 @@ export const agentModeController = {
         const commented = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
-        // Non-write deck (the only kind reachable here — the block above refuses
-        // any write item) — see generateResponse's identical comment for why
-        // 'nothing_approved' is wrong for a pure question deck: submitApprovalDeckAnswers
-        // only ever describes WRITE execution outcomes in `summary`, so a question deck
-        // resolves every non-comment item's actual selection into `selections` instead.
+        // Either kind of deck can reach here: a question deck, or (ENG-3170) a write or locked-decision deck on a link whose owner turned on
+        // Full control. See generateResponse's identical comment for why 'nothing_approved' is wrong for a pure question deck:
+        // submitApprovalDeckAnswers only ever describes WRITE execution outcomes in `summary`, so a question deck resolves every
+        // non-comment item's actual selection into `selections` instead.
         const deckItems = answeredApprovalDeck?.items ?? [];
         const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
         const selections = deckItems
@@ -13453,7 +13582,7 @@ export const agentModeController = {
           ...(selections.length > 0 ? { selections } : {}),
           ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
           ...(commented.length > 0 ? { commented } : {}),
-        })}]`;
+        })}]${deckFailureInstruction(deckOutcomeStatus)}`;
         answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
       }
 
@@ -18034,7 +18163,9 @@ export const agentModeController = {
         const interactiveShareMetadata = {
           isActive: true,
           token: conversableToken,
-          sharedAt: new Date().toISOString()
+          sharedAt: new Date().toISOString(),
+          // ENG-3170: an explicit "off". This link opens the plan page; the owner turns sensitive actions on from the share dialog.
+          allowSensitiveActions: false,
         };
         await chatbotDb.updateSessionInteractiveShareMetadata(session.sessionId, interactiveShareMetadata);
         // ENG-2773: stamp the winner only once the session is fully built, so a duplicate never
