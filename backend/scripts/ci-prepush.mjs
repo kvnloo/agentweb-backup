@@ -308,8 +308,10 @@ if (!existsSync(bin('tsc')) || !existsSync(bin('jest'))) {
 }
 
 // (a) type-check — the ONLY thing that type-checks __tests__ (ts-jest here is isolatedModules)
+// The heap is a ceiling, not a reservation. A full backend type-check measured about 6.7 GB of heap (`tsc --extendedDiagnostics`,
+// 12.8k files) on 2026-11-24, which crashed at the old 6144 MB cap even on a clean origin/main (exit 134), so every push failed here.
 run('tsc --noEmit (backend)', process.execPath,
-  ['--max-old-space-size=6144', path.join(backend, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit', '-p', path.join(backend, 'tsconfig.json')],
+  ['--max-old-space-size=10240', path.join(backend, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit', '-p', path.join(backend, 'tsconfig.json')],
   { cwd: backend, budgetMs: TSC_BUDGET_MS });
 
 // (b) targeted jest

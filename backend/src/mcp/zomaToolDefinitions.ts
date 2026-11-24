@@ -28,6 +28,41 @@ export function xAdsToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return env[ZOMA_X_ADS_FLAG] === 'true';
 }
 
+/**
+ * Zoma's LinkedIn Ads switch (provider #4). One env var, three states (strict, case-sensitive):
+ *   - unset, or anything but "read" / "true" (the default): OFF. LinkedIn Ads is not listed, routed,
+ *     offered in zoma_status, or reachable through its connect pages and routes, and every other
+ *     Zoma surface behaves exactly as it did before LinkedIn existed.
+ *   - "read": READ MODE. linkedin_ads_read, the Zoma connect pages, the zoma_status block and
+ *     reporting are on. linkedin_ads_write is not listed, not routed and refused at call time.
+ *     Consent asks only for the read scopes (plus any scope the user's existing LinkedIn connection
+ *     already holds and the Ads scope list still names, so a reconnect never narrows it; rw_ads only if
+ *     that connection already holds it). (LinkedIn's Standard tier is what lets creating and editing work
+ *     for customer accounts; until then only reading is offered.)
+ *   - "true": FULL. Read mode plus linkedin_ads_write (and the write consent scope).
+ * A single variable on purpose: the production environment is near its size limit.
+ */
+export const ZOMA_LINKEDIN_ADS_FLAG = 'ZOMA_LINKEDIN_ADS_ENABLED';
+
+export type LinkedInAdsMode = 'off' | 'read' | 'full';
+
+export function linkedInAdsMode(env: NodeJS.ProcessEnv = process.env): LinkedInAdsMode {
+  const value = env[ZOMA_LINKEDIN_ADS_FLAG];
+  if (value === 'true') return 'full';
+  if (value === 'read') return 'read';
+  return 'off';
+}
+
+/** LinkedIn Ads is offered at all: read mode or full. */
+export function linkedInAdsToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return linkedInAdsMode(env) !== 'off';
+}
+
+/** LinkedIn Ads writes are offered: full mode only (the value "true"). */
+export function linkedInAdsWritesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return linkedInAdsMode(env) === 'full';
+}
+
 export const ZOMA_TOOL_NAMES = ['zoma_status', 'zoma_usage', 'zoma_prepare_upload', 'zoma_custom_audiences'] as const;
 export type ZomaToolName = (typeof ZOMA_TOOL_NAMES)[number];
 

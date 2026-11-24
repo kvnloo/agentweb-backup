@@ -124,14 +124,26 @@ export function isBillableResult(result: unknown): boolean {
   return r.status === 'PREVIEW' || typeof r.verification === 'string';
 }
 
+/** String(value) that cannot throw: {"toString":1} makes String() raise a TypeError, which would surface as a 500. */
+function safeText(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return '';
+  }
+}
+
 /**
- * Writes that make ads live: Meta status → ACTIVE (CREATE and COPY are always PAUSED), and
- * Google Ads status → ENABLED on CREATE or UPDATE. Everything else — reads, drafts, paused
+ * Writes that make ads live: Meta status → ACTIVE (CREATE and COPY are always PAUSED),
+ * Google Ads status → ENABLED on CREATE or UPDATE, X and LinkedIn ACTIVATE (their creates are never live). Everything else — reads, drafts, paused
  * creates, pauses, edits — stays free.
  */
-export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads', args: any): boolean {
+export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
-  if (platform === 'x_ads') return args?.action === 'ACTIVATE'; // ENG-3142: creates are always PAUSED
+  // ENG-3142: creates are always PAUSED. The X write validator coerces `action` with String(), so the paywall
+  // must classify the same coerced value: a non-string action (e.g. ["ACTIVATE"]) must not skip it.
+  if (platform === 'x_ads') return String(args?.action ?? '') === 'ACTIVATE';
+  if (platform === 'linkedin_ads') return safeText(args?.action) === 'ACTIVATE'; // creates are always DRAFT; coerced like the validator, but never throws
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
 

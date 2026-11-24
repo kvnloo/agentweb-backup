@@ -258,6 +258,7 @@ import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGu
 import { withTimeoutOrReject } from './shared/withTimeoutOrReject';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import type { AgentModeService } from '../../services/agentModeService';
+import { normalizeLinkedInPostUrn } from './linkedinPostUrn';
 // F2 fresh-eyes review round 1: `resolveAccessibleAccount` is called from two
 // sibling functions in this same module (`listLinkedInComments`,
 // `reactToLinkedInPost`). Per the cluster-10 lesson, a direct call to a
@@ -1135,6 +1136,29 @@ export async function linkedinManagePost(
 
   const requirePostUrn = (a: string) =>
     !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
+  // ENG-3176: comment/list_comments/react/repost build a /rest/socialActions/{urn}
+  // path. A URL or bare id there fails as "Syntax exception in path variables", so
+  // normalize to a URN, or return a validation message the model can act on.
+  if (args.post_urn && ['repost', 'comment', 'list_comments', 'react'].includes(action)) {
+    const normalized = normalizeLinkedInPostUrn(args.post_urn);
+    // Log both outcomes so a run can see which URN the socialActions call used,
+    // or that a validation error was returned without calling LinkedIn.
+    console.log('[AgentMode] linkedinManagePost post_urn normalized:', {
+      action,
+      input: args.post_urn,
+      ok: normalized.ok,
+      postUrn: normalized.ok ? normalized.urn : undefined,
+    });
+    if (!normalized.ok) return { success: false, message: normalized.message };
+    args = { ...args, post_urn: normalized.urn };
+    // reshareContext.parent accepts only share/ugcPost URNs, not activity URNs.
+    if (action === 'repost' && normalized.urn.startsWith('urn:li:activity:')) {
+      return {
+        success: false,
+        message: `Cannot repost ${normalized.urn}: repost needs the post's urn:li:share:<id> or urn:li:ugcPost:<id>, not an activity URN. LinkedIn does not let an activity URN be reshared. Ask the user for the share or ugcPost URN: on the post, use the ... menu > "Embed this post" and copy the urn:li:share:<id> or urn:li:ugcPost:<id> from the embed code, or send that /embed/feed/update/ link.`,
+      };
+    }
+  }
   const requirePostIds = () =>
     !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
   const requireCommentText = () =>
