@@ -140,7 +140,9 @@ function safeText(value: unknown): string {
  */
 export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
-  if (platform === 'x_ads') return String(args?.action) === 'ACTIVATE'; // ENG-3142: creates are always PAUSED; String() like the validator (action ["ACTIVATE"] still activates)
+  // ENG-3142: creates are always PAUSED. The X write validator coerces `action` with String(), so the paywall
+  // must classify the same coerced value: a non-string action (e.g. ["ACTIVATE"]) must not skip it.
+  if (platform === 'x_ads') return String(args?.action ?? '') === 'ACTIVATE';
   if (platform === 'linkedin_ads') return safeText(args?.action) === 'ACTIVATE'; // creates are always DRAFT; coerced like the validator, but never throws
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
