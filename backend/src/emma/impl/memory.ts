@@ -28,6 +28,36 @@ export interface MemoryToolContext {
   sessionId?: string;
 }
 
+/**
+ * A check a CALLER adds in front of a save, after the shared guards (memory switched on, org found, arguments valid) and before anything
+ * is embedded or written: the MCP tools use it for their per-account cap and duplicate check. Return a result to answer the call with it
+ * instead of writing; return nothing to go on. Emma's own tools pass none, so their behaviour and order of checks are unchanged.
+ */
+export type MemoryWriteGate = (request: {
+  scope: 'user' | 'org';
+  ownerId: string;
+  content: string;
+  category: MemoryCategory;
+  chunkCount: number;
+  /** Whether the caller may delete memories of this scope (always for the user's own; owners and admins only for the org's), so a refusal can say who can make room. */
+  callerCanDelete: boolean;
+}) => Promise<Record<string, unknown> | undefined>;
+
+/**
+ * Options of a CALLER, like the gate. Emma's own tools pass none: they wait for each embedding as before (they do get the cleanup of a
+ * failed split save, see `writeChunks`).
+ * `embedTimeoutMs`: how long to wait for ONE embedding. The first time a wait passes it, that part is saved without an embedding and the
+ * remaining parts of a split save are saved without asking for theirs, exactly as when the embedding service fails (a row without an
+ * embedding is embedded when the prompt loader ranks an account's memories; an account with 20 or fewer rows is injected whole, so nothing
+ * is lost). So a HUNG service costs one wait per save. It is not a budget for the whole save: a service that is slow but answering, each
+ * part just inside the limit, is not cut off and can cost up to the limit per part. The MCP tools set it because their save runs under a
+ * lock for the account, and an embedding call with no timeout (the client's default is ten minutes, twice retried) would hold every other
+ * save of that account or org behind it. A value that is not a positive finite number means no bound.
+ */
+export interface MemoryWriteOptions {
+  embedTimeoutMs?: number;
+}
+
 function callerId(context?: MemoryToolContext): string {
   const userId = context?.userId || context?.agentUserId;
   if (!userId) throw new Error('Authentication required');
@@ -69,11 +99,32 @@ function previewOf(content: string): string {
   return `"${content.substring(0, 80)}${content.length > 80 ? '...' : ''}"`;
 }
 
-/** Embed each chunk and write it with `write`, in order; returns the new memory ids. Embedding is best effort (a failure saves the row without one). */
+const TIMED_OUT = Symbol('timed out');
+/** setTimeout fires at once for a delay above this. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * The promise's value, or TIMED_OUT once `ms` have passed. No bound when `ms` is not a positive finite number. A late answer, or a late
+ * failure, is dropped (`Promise.race` has subscribed to both, so a late rejection is handled).
+ */
+function within<T>(promise: Promise<T>, ms?: number): Promise<T | typeof TIMED_OUT> {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), Math.min(ms, MAX_TIMER_MS)); });
+  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+/**
+ * Embed each chunk and write it with `write`, in order; returns the new memory ids. Embedding is best effort (a failure saves the row without one).
+ * If a write fails after earlier parts of a split save were written, those parts are removed again (best effort: only a part whose write was
+ * confirmed is known to us) before the error is passed on, so a retry does not write the confirmed parts a second time.
+ */
 async function writeChunks(
   userId: string,
   content: string,
   write: (chunk: string, embedding: number[] | undefined) => Promise<{ memoryId?: unknown }>,
+  remove: (memoryId: string) => Promise<unknown>,
+  options?: MemoryWriteOptions,
 ): Promise<string[]> {
   const { embedText } = await import('../../utils/embeddings');
   // ENG-2574: content over 2,000 characters is split into rows of at most 2,000 rather than rejected.
@@ -81,15 +132,30 @@ async function writeChunks(
   // The arguments were checked non-blank, so a split cannot come back empty; if it ever did, saying "saved" would be a lie.
   if (chunks.length === 0) throw new Error('Content is required');
   const memoryIds: string[] = [];
-  for (const chunk of chunks) {
-    const embedding = (await embedText(chunk, { userId, feature: 'embeddings' })) ?? undefined;
-    const memory = await write(chunk, embedding);
-    memoryIds.push(String(memory.memoryId));
+  let gaveUp = false; // after the first timeout the remaining parts are saved without asking for an embedding
+  try {
+    for (const chunk of chunks) {
+      let embedding: number[] | undefined;
+      if (!gaveUp) {
+        const got = await within(embedText(chunk, { userId, feature: 'embeddings' }), options?.embedTimeoutMs);
+        if (got === TIMED_OUT) gaveUp = true;
+        else embedding = got ?? undefined;
+      }
+      const memory = await write(chunk, embedding);
+      memoryIds.push(String(memory.memoryId));
+    }
+  } catch (error) {
+    if (memoryIds.length > 0) {
+      const results = await Promise.allSettled(memoryIds.map((id) => remove(id)));
+      const stuck = memoryIds.filter((_, i) => results[i].status === 'rejected');
+      if (stuck.length > 0) console.warn(`[memory] a split save failed after ${memoryIds.length} part(s) were written; ${stuck.length} could not be removed again: ${stuck.join(', ')}`);
+    }
+    throw error;
   }
   return memoryIds;
 }
 
-export async function saveAccountMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext) {
+export async function saveAccountMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext, gate?: MemoryWriteGate, options?: MemoryWriteOptions) {
   const userId = callerId(context);
   const { userDb, accountMemoryDb } = await import('../../services/db');
   const user = await userDb.getUserById(userId);
@@ -97,8 +163,14 @@ export async function saveAccountMemory(args: { content?: unknown; category?: un
     return { success: false, message: 'Memory is disabled for this account.' };
   }
   const { content, category } = checkMemorySaveArgs(args);
-  const memoryIds = await writeChunks(userId, content, (chunk, embedding) =>
-    accountMemoryDb.addMemory(userId, category, chunk, context?.sessionId, embedding),
+  const early = await gate?.({ scope: 'user', ownerId: userId, content, category, chunkCount: splitMemoryContent(content).length, callerCanDelete: true });
+  if (early) return early;
+  const memoryIds = await writeChunks(
+    userId,
+    content,
+    (chunk, embedding) => accountMemoryDb.addMemory(userId, category, chunk, context?.sessionId, embedding),
+    (memoryId) => accountMemoryDb.deleteMemory(userId, memoryId),
+    options,
   );
   const preview = previewOf(content);
   return {
@@ -121,7 +193,7 @@ export async function deleteAccountMemory(args: { memoryId?: unknown }, context?
   return { success: true, message: `Memory ${memoryId} deleted.` };
 }
 
-export async function saveOrgMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext) {
+export async function saveOrgMemory(args: { content?: unknown; category?: unknown }, context?: MemoryToolContext, gate?: MemoryWriteGate, options?: MemoryWriteOptions) {
   const userId = callerId(context);
   const { userDb, orgDb, orgMemoryDb } = await import('../../services/db');
   const user = await userDb.getUserById(userId);
@@ -137,8 +209,15 @@ export async function saveOrgMemory(args: { content?: unknown; category?: unknow
   }
   const { content, category } = checkMemorySaveArgs(args);
   const orgId = user.orgId;
-  const memoryIds = await writeChunks(userId, content, (chunk, embedding) =>
-    orgMemoryDb.addMemory(orgId, category, chunk, userId, embedding),
+  const callerCanDelete = can({ userId, orgId, orgRole: user.orgRole }, org, 'org:configure');
+  const early = await gate?.({ scope: 'org', ownerId: orgId, content, category, chunkCount: splitMemoryContent(content).length, callerCanDelete });
+  if (early) return early;
+  const memoryIds = await writeChunks(
+    userId,
+    content,
+    (chunk, embedding) => orgMemoryDb.addMemory(orgId, category, chunk, userId, embedding),
+    (memoryId) => orgMemoryDb.deleteMemory(orgId, memoryId),
+    options,
   );
   const preview = previewOf(content);
   return {

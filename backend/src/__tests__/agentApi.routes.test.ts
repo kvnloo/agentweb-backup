@@ -33,7 +33,7 @@ jest.mock('../services/agentApiKeyService', () => ({
   },
 }));
 
-import agentApiRoutes from '../routes/agentApi';
+import agentApiRoutes, { checkRateLimitPerMin, MAX_API_KEY_RATE_LIMIT_PER_MIN } from '../routes/agentApi';
 
 const app = express();
 app.use(express.json());
@@ -171,6 +171,84 @@ describe('Agent API Routes', () => {
       const res = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read', scope] });
       expect(res.status).toBe(403);
       expect(res.body.error).toContain(scope);
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/v1/agent/api-keys memory:org scope (ENG-2840 W2-2)', () => {
+    beforeEach(() => {
+      mockGenerateKey.mockResolvedValue({ rawKey: 'aw_key', keyRecord: { keyId: 'k', keyName: 'K', status: 'active' } });
+    });
+
+    it('grants memory:org on a regular session, next to the default scopes, deduped', async () => {
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'Hermes', scopes: ['tools:read', 'tools:execute', 'memory:org', 'memory:org'] });
+      expect(res.status).toBe(201);
+      expect(mockGenerateKey).toHaveBeenCalledWith('test-user-id', 'Hermes', ['tools:read', 'tools:execute', 'memory:org'], undefined, undefined);
+    });
+
+    it('refuses memory:org from a delegated (admin-as-customer) session with 403 and creates no key', async () => {
+      const delegated = express();
+      delegated.use(express.json());
+      delegated.use((req: any, _res, next) => {
+        req.delegateInfo = { adminUserId: 'admin-1', adminEmail: 'a@x.com', isDelegated: true };
+        next();
+      });
+      delegated.use('/api/v1/agent', agentApiRoutes);
+      const res = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read', 'memory:org'] });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain('memory:org');
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+      // A delegated session may still mint a key without it.
+      const ok = await request(delegated).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read'] });
+      expect(ok.status).toBe(201);
+    });
+
+    it('is not a default scope: a key minted without scopes does not get it', async () => {
+      await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K' });
+      expect(mockGenerateKey.mock.calls[0][2]).toBeUndefined();
+    });
+  });
+
+  describe('POST /api/v1/agent/api-keys rateLimitPerMin validation (ENG-2840 W2-2)', () => {
+    beforeEach(() => {
+      mockGenerateKey.mockResolvedValue({ rawKey: 'aw_key', keyRecord: { keyId: 'k', keyName: 'K', status: 'active' } });
+    });
+
+    it('the highest rate a key may be minted with is 600', () => expect(MAX_API_KEY_RATE_LIMIT_PER_MIN).toBe(600));
+
+    it.each([1, 10, 60, 120, 600])('accepts %d and passes it on unchanged', async (rate) => {
+      const res = await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', rateLimitPerMin: rate });
+      expect(res.status).toBe(201);
+      expect(mockGenerateKey.mock.calls[0][3]).toBe(rate);
+    });
+
+    it.each([[0], [-1], [601], [1000000], [1.5], ['60'], [true], [[60]], [{}], [1e308]])('rejects %j with 400 and creates no key', async (rate) => {
+      const res = await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', rateLimitPerMin: rate });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/rateLimitPerMin must be a whole number from 1 to 600/);
+      expect(mockGenerateKey).not.toHaveBeenCalled();
+    });
+
+    it('a missing or null rate means the default: the service gets undefined', async () => {
+      await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K' });
+      await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', rateLimitPerMin: null });
+      expect(mockGenerateKey.mock.calls.map((c) => c[3])).toEqual([undefined, undefined]);
+    });
+
+    it('checkRateLimitPerMin: NaN and Infinity (which JSON cannot carry, but a caller in process can) are refused', () => {
+      expect(checkRateLimitPerMin(NaN)).toMatchObject({ ok: false });
+      expect(checkRateLimitPerMin(Infinity)).toMatchObject({ ok: false });
+      expect(checkRateLimitPerMin(-Infinity)).toMatchObject({ ok: false });
+      expect(checkRateLimitPerMin(undefined)).toEqual({ ok: true, value: undefined });
+      expect(checkRateLimitPerMin(null)).toEqual({ ok: true, value: undefined });
+      expect(checkRateLimitPerMin(600)).toEqual({ ok: true, value: 600 });
+    });
+
+    it('the rate is checked before a scope problem is reported or anything is created', async () => {
+      const res = await request(app).post('/api/v1/agent/api-keys').send({ keyName: 'K', scopes: ['tools:read'], rateLimitPerMin: 99999 });
+      expect(res.status).toBe(400);
       expect(mockGenerateKey).not.toHaveBeenCalled();
     });
   });

@@ -19,6 +19,7 @@ import './readEmailTool';
 // Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
 import './smartleadTools';
 import './conversionSummaryTool';
+import './memoryTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
