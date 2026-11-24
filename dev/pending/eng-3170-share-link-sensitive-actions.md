@@ -219,3 +219,17 @@ logins (an OFF link, a link that cannot be read, or a run of a schedule a visito
 so there is nothing to hand over: the owner's cookies are never loaded into that browser, and the visitor's calls never touch the owner's. `releaseSessionClients` releases
 `<owner>::<session>::visitor` with the session. A visitor on a link that allows the sensitive tools (ON, or a legacy dialog link) is the same trust as the owner and keeps sharing the
 owner's browser. Left as a limit: a visitor call that started while the link was ON keeps running in the owner's browser if the owner turns the link OFF during that single call.
+
+## Seventh final-review round (2026-11-24, on 6335a379b): the tool that runs the caller's code on the server
+The Playwright tool `browser_run_code` (exposed as `playwright_browser_run_code`) runs a snippet in Node's `vm` on the SERVER, with the live Playwright `page` object passed in
+(`playwright-core/lib/tools/backend/runCode.js`). Node's documentation says `vm` is not a security boundary: code in it reaches the host `process` through the `page` object
+(checked locally: `page.constructor.constructor('return process')()` from inside the sandbox returns the real `process` and its environment), and `McpClientService` starts the
+browser server as a child process with `{ ...process.env }` (`mcpClientService.ts`, the stdio transport), so the backend's own environment, signing secrets included, is within reach.
+Whether production starts it that way is set in the `mcp_servers` setting and was NOT verified. This exists on main for every customer and has nothing to do with this change; it
+matters here because an OFF link allowed the tool, which made every sentence of the promise hollow for a visitor who writes code.
+Closed for visitors: a visitor who may not run the sensitive tools (OFF link, unreadable link, a run of a schedule a visitor wrote) may not call `*browser_run_code` THEMSELVES
+(`isServerSideBrowserCodeTool`). A call a tool makes itself with fixed code (`solve_captcha`) is not the visitor writing code and still runs: a call is "nested" when another
+restricted call is on the stack (`nestedInRestrictedCall`, set in `executeTool` from the call-scoped store, never taken from the caller's context). ON and legacy links keep it, as the
+owner has it. `browser_evaluate` runs inside the page and is not affected (the sandbox-account policy of ENG-1907 already denies the whole browser class, `browser_run_code` included).
+NOT fixed here, and not a ticket I opened: the tool is still callable by any signed-in customer in their own chat, and the browser process still inherits the backend's environment.
+That is a platform security issue for Harsha and Yugo (start the browser server with a scrubbed environment, isolate it, and treat the tool as running arbitrary code).

@@ -312,6 +312,17 @@ function isSet(value: unknown): boolean {
   return Boolean(value);
 }
 
+/**
+ * ENG-3170: the Playwright tool that runs a snippet of code (`browser_run_code`, exposed as `playwright_browser_run_code`) runs it on the SERVER, in Node's
+ * `vm` with the live `page` object passed in, and the Node documentation says `vm` is not a security boundary: code in it reaches `process` (and with it the
+ * environment of the browser server process, which `mcpClientService` starts with the backend's own environment, signing secrets included). So a visitor
+ * who may not run the sensitive tools may not call it THEMSELVES. A tool that makes this call on the visitor's behalf with fixed code (`solve_captcha`) is
+ * not the visitor writing code, and is let through (see `nestedInRestrictedCall`). `browser_evaluate` runs inside the page and is not affected.
+ */
+export function isServerSideBrowserCodeTool(toolName: string): boolean {
+  return typeof toolName === 'string' && /(^|_)browser_run_code$/.test(toolName);
+}
+
 /** True for a tool that is sensitive whatever its arguments (the whole-tool list). A tool judged by an argument is not: it needs the call. */
 export function isSensitiveWholeTool(toolName: string): boolean {
   return typeof toolName === 'string' && (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) || SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS.has(toolName));
