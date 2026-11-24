@@ -38,6 +38,7 @@ Calls that worked, or appeared to, and are refused now (each with a message that
 - Not a refusal but a change in the routes: deleting a phase or a work item now sets the plan's `updatedAt` (it did not), and a write that keeps losing to others answers 409 instead of silently overwriting.
 - `send_status_report` and every notify argument, including a guessed `notifications` object (see the decision below). The old `send_status_report` never sent anything over MCP; the guessed `notifications` object on `update_work_item` did.
 - `get_common_items` no longer asks for a `plan_id` in its schema; one is still accepted and ignored. A title is stored trimmed.
+- `null` clears an optional text, date or contact, the same as an empty string (agents send it to clear a field and the old tool passed it through to the route). A required title still refuses it.
 
 ### Decision (Manan): emailing from an outside agent's key is held back
 
