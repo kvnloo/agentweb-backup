@@ -66,7 +66,9 @@ function idArg(tool: string, field: string, value: unknown): string {
 
 /** Text within a bound. Empty is allowed (it clears the field on an update) unless the field is required. */
 function textArg(tool: string, field: string, value: unknown, max: number, opts: { required?: boolean } = {}): string {
-  if (typeof value !== 'string') fail(tool, `${field} must be text.`);
+  // null means "none", the same as an empty string (agents send it to clear a field, and the old tool passed it through to the route)
+  if (value === null) value = '';
+  if (typeof value !== 'string') fail(tool, `${field} must be text, or an empty string to clear it.`);
   const text = value as string;
   if (text.length > max) fail(tool, `${field} is too long (${text.length} characters; the most is ${max}).`);
   if (opts.required && text.trim() === '') fail(tool, `${field} is required and cannot be empty.`);
@@ -87,6 +89,7 @@ function emailArg(tool: string, field: string, value: unknown): string {
 
 /** YYYY-MM-DD that is a real calendar day, or `''` to clear. The report emails split the date on "-". */
 function dateArg(tool: string, field: string, value: unknown): string {
+  if (value === null) value = '';
   if (typeof value !== 'string') fail(tool, `${field} must be text written YYYY-MM-DD, or an empty string to remove it.`);
   const text = value as string;
   if (text === '') return text;
@@ -371,7 +374,7 @@ mcpToolRegistry.register({
       + 'update_work_item: plan_id, phase_id, work_item_id and at least one of title, description, status (pending, in_progress, completed, skipped), notes, dri, due_date. '
       + 'delete_work_item: plan_id, phase_id, work_item_id. get_common_items: nothing (a plan_id is accepted and ignored). add_common_items: plan_id, items (up to 50, from get_common_items: each a title and optionally a description), and exactly one of target_phase_id or new_phase_name. '
       + 'Nothing here emails anyone: status reports and update notifications are sent from the portal. '
-      + 'Dates are YYYY-MM-DD; dri is an email address; an empty string clears description, notes, dri or due_date. A phase\'s and a plan\'s status follow their work items and cannot be set.',
+      + 'Dates are YYYY-MM-DD; dri is an email address; an empty string (or null) clears description, notes, dri or due_date. A phase\'s and a plan\'s status follow their work items and cannot be set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -383,7 +386,7 @@ mcpToolRegistry.register({
         name: { type: 'string', description: 'Old spelling of title' },
         description: { type: 'string', description: `Description, at most ${GTM_MAX_TEXT_CHARS} characters; an empty string clears it` },
         status: { type: 'string', enum: [...GTM_WORK_ITEM_STATUSES], description: 'Work item status (update_work_item only)' },
-        notes: { type: 'string', description: 'Work item notes (update_work_item); an empty string clears them' },
+        notes: { type: 'string', description: 'Work item notes (update_work_item); an empty string (or null) clears them' },
         dri: { type: 'string', description: 'Email address of the contact; an empty string removes it' },
         due_date: { type: 'string', description: 'Due date YYYY-MM-DD; an empty string removes it' },
         work_items: { type: 'array', maxItems: GTM_MAX_BATCH_ITEMS, items: { type: 'object' }, description: 'Items to add (add_work_items): title, description, dri, due_date' },
