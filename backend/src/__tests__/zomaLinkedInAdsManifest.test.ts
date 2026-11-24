@@ -93,6 +93,13 @@ describe('manifest: limits, annotations, surface', () => {
     expect(() => assertLinkedInAdsToolkitCall('linkedin_ads_write', { entity_type: 'CAMPAIGN', action: 'CREATE', intended_status: 'ACTIVE' })).toThrow(/always created as DRAFT/);
     expect(() => assertLinkedInAdsToolkitCall('other_tool', {})).toThrow(/not part of the LinkedIn Ads toolkit/);
     expect(() => assertLinkedInAdsToolkitCall('linkedin_ads_read', [])).toThrow(/must be an object/);
+    for (const action of [['LIST_CAMPAIGNS'], { toString: () => 'LIST_CAMPAIGNS' }, 7, null, undefined]) {
+      expect(() => assertLinkedInAdsToolkitCall('linkedin_ads_read', { action })).toThrow(/action must be a string/);
+    }
+    for (const action of [['ACTIVATE'], { toString: () => 'ACTIVATE' }, 7, null]) {
+      expect(() => assertLinkedInAdsToolkitCall('linkedin_ads_write', { entity_type: 'CAMPAIGN', action })).toThrow(/action must be a string/);
+    }
+    expect(() => assertLinkedInAdsToolkitCall('linkedin_ads_write', { entity_type: ['CAMPAIGN'], action: 'PAUSE' })).toThrow(/entity_type must be a string/);
   });
 
   it('ids and targeting are validated before they can reach a URL', () => {

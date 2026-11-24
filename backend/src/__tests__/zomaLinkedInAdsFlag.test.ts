@@ -30,6 +30,7 @@ jest.mock('../services/linkedInAdsService', () => ({
 
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
+import { ZomaNotReadyError } from '../mcp/zomaErrors';
 import { formatZomaStatus, getZomaReadiness } from '../mcp/zomaOnboarding';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
@@ -207,7 +208,7 @@ describe('flag "read": reads on, writes not listed, not routable, refused', () =
     expect(names).not.toContain('linkedin_ads_write');
   });
 
-  it('linkedin_ads_write is refused at call time, before any account lookup, scope check or LinkedIn call', async () => {
+  it('linkedin_ads_write is refused at call time, before any account lookup or LinkedIn call', async () => {
     const deps = gatewayDeps([liAccount()]);
     const args = { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '77' };
     await expect(call(deps, 'linkedin_ads_write', args)).rejects.toThrow(LINKEDIN_WRITES_NOT_AVAILABLE);
@@ -216,6 +217,21 @@ describe('flag "read": reads on, writes not listed, not routable, refused', () =
     expect(deps.recordUsage).not.toHaveBeenCalled();
     expect(deps.recordWrite).not.toHaveBeenCalled();
     expectLinkedInNeverCalled();
+  });
+
+  it('the refusal comes BEFORE the API-key scope check and BEFORE the paywall: an unpaid, read-only key gets the not-offered answer, no Stripe link, no funnel row', async () => {
+    const paywall = jest.fn().mockRejectedValue(new ZomaNotReadyError('Start your Zoma plan: https://pay.example/checkout'));
+    const deps = gatewayDeps([liAccount()], {
+      validateApiKey: jest.fn().mockResolvedValue({ userId: 'u-flag', keyId: 'k1', scopes: ['tools:read'] }),
+      assertPublishAllowed: paywall,
+    });
+    // ACTIVATE is the paywalled action; the key has no tools:execute. Either would answer first if the order were wrong.
+    const error: any = await call(deps, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '77' }).catch((e) => e);
+    expect(error).toBeInstanceOf(MetaToolkitRefusal);
+    expect(error.message).toBe(LINKEDIN_WRITES_NOT_AVAILABLE);
+    expect(error.message).not.toMatch(/scope|checkout|plan/i);
+    expect(paywall).not.toHaveBeenCalled();
+    expect(deps.recordUsage).not.toHaveBeenCalled();
   });
 
   it('a read runs on the caller\'s account with the stored token, metered once as linkedin_ads, and no token is returned', async () => {
@@ -275,6 +291,25 @@ describe('flag "true": both tools', () => {
     await expect(call(deps, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action: 'DELETE' }))
       .rejects.toThrow('CAMPAIGN DELETE is not part of the LinkedIn Ads toolkit surface.');
     expect(deps.execute).not.toHaveBeenCalled();
+  });
+
+  it('an array action cannot dodge the paywall (same coercion as the validator), and is refused as a non-string action', async () => {
+    const paywall = jest.fn().mockRejectedValue(new ZomaNotReadyError('Start your Zoma plan.'));
+    const blocked = gatewayDeps([liAccount()], { assertPublishAllowed: paywall });
+    for (const action of ['ACTIVATE', ['ACTIVATE']]) {
+      await expect(call(blocked, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action, campaign_id: '77' })).rejects.toThrow(MetaToolkitRefusal);
+    }
+    expect(paywall).toHaveBeenCalledTimes(2);
+    expect(paywall).toHaveBeenCalledWith('u-flag', { platform: 'linkedin_ads', toolName: 'linkedin_ads_write' });
+    // With the paywall out of the way the shape check still refuses it; nothing is looked up or sent.
+    const open = gatewayDeps([liAccount()], { assertPublishAllowed: jest.fn().mockResolvedValue(undefined) });
+    for (const action of [['ACTIVATE'], { 0: 'ACTIVATE' }, 7]) {
+      await expect(call(open, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action, campaign_id: '77' })).rejects.toThrow(/action must be a string/);
+    }
+    await expect(call(open, 'linkedin_ads_read', { action: ['LIST_CAMPAIGNS'] })).rejects.toThrow(/action must be a string/);
+    await expect(call(open, 'linkedin_ads_write', { entity_type: ['CAMPAIGN'], action: 'PAUSE', campaign_id: '77' })).rejects.toThrow(/entity_type must be a string/);
+    expect(open.listAccounts).not.toHaveBeenCalled();
+    expectLinkedInNeverCalled();
   });
 
   it('zoma_status: writes follow payment and a connected account that has the write consent', async () => {
