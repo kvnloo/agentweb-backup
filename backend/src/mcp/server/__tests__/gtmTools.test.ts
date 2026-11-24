@@ -41,6 +41,23 @@ describe('manage_gtm_plan: the request each action builds', () => {
     }
   });
 
+  it('null means none, the same as an empty string, for optional text, dates and contacts (agents send it to clear a field)', () => {
+    expect(itemRequests({ action: 'update_work_item', plan_id: 'p', phase_id: 'ph', work_item_id: 'i', notes: null })[0].body).toEqual({ notes: '' });
+    expect(itemRequests({ action: 'update_work_item', plan_id: 'p', phase_id: 'ph', work_item_id: 'i', description: null, dri: null, due_date: null })[0].body)
+      .toEqual({ description: '', dri: '', dueDate: '' });
+    expect(planRequest({ action: 'update', plan_id: 'p', description: null, dri: null, due_date: null }).body).toEqual({ description: '', dri: '', dueDate: '' });
+    expect(itemRequests({ action: 'update_phase', plan_id: 'p', phase_id: 'ph', description: null })[0].body).toEqual({ description: '' });
+    expect(itemRequests({ action: 'add_work_items', plan_id: 'p', phase_id: 'ph', work_items: [{ title: 'A', description: null, due_date: null }] })[0].body)
+      .toEqual({ title: 'A', description: '', dueDate: '' });
+  });
+
+  it('null is not a title, and a value that is neither text nor null still says how to clear a field', () => {
+    expect(() => planRequest({ action: 'create', title: null })).toThrow('title is required and cannot be empty');
+    expect(() => itemRequests({ action: 'add_phase', plan_id: 'p', title: null })).toThrow('title is required and cannot be empty');
+    expect(() => itemRequests({ action: 'update_work_item', plan_id: 'p', phase_id: 'ph', work_item_id: 'i', notes: 5 })).toThrow('notes must be text, or an empty string to clear it');
+    expect(() => planRequest({ action: 'update', plan_id: 'p', due_date: 5 })).toThrow('due_date must be text written YYYY-MM-DD, or an empty string to remove it');
+  });
+
   it('a title is sent trimmed', () => {
     expect(planRequest({ action: 'create', title: '  Q1 launch  ' }).body).toEqual({ title: 'Q1 launch' });
     expect(itemRequests({ action: 'add_phase', plan_id: 'p', name: '  Launch ' })[0].body).toEqual({ title: 'Launch' });

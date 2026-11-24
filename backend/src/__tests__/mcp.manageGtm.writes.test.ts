@@ -244,6 +244,15 @@ describe('manage_gtm_items: work items', () => {
     expect(sendMail).not.toHaveBeenCalled();
   });
 
+  it('null clears a work item\'s notes and contact, as it did before the tool validated its input', async () => {
+    const base = { action: 'update_work_item', phase_id: 'plan-a1-ph1', work_item_id: 'plan-a1-it1' };
+    expect((await items(owner, { ...base, notes: 'five booked', dri: 'pm@alpha.test' })).isError).toBe(false);
+    expect(phaseOf('plan-a1', 'plan-a1-ph1').workItems[0]).toMatchObject({ notes: 'five booked', dri: 'pm@alpha.test' });
+    const cleared = await items(owner, { ...base, notes: null, dri: null });
+    expect(cleared.isError).toBe(false);
+    expect(phaseOf('plan-a1', 'plan-a1-ph1').workItems[0]).toMatchObject({ notes: null, dri: null });
+  });
+
   it('completing the only item completes its phase (derived status), and marking it done sets completedAt', async () => {
     const r = await items(owner, { action: 'update_work_item', phase_id: 'plan-a1-ph1', work_item_id: 'plan-a1-it1', status: 'completed' });
     expect(r.isError).toBe(false);
