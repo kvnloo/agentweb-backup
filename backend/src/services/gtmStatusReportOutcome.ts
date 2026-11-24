@@ -6,14 +6,16 @@
 /**
  * `recipients` is how many distinct addresses the chosen options resolved to (0 when no option was chosen, or the chosen contacts are
  * not set on the plan), `sent` how many emails the mail service accepted, `failed` how many it refused, `suppressed` (set
- * only when above 0) how many the non-production email guard resolved without delivering. A caller that answers "sent" without reading
- * this reports a send that never happened.
+ * only when above 0) how many the non-production email guard resolved without delivering, `overCap` (set only when the caller capped the
+ * recipients and the report would have gone to more people) the cap, in which case nothing was sent. A caller that answers "sent" without
+ * reading this reports a send that never happened.
  */
 export interface StatusReportResult {
   recipients: number;
   sent: number;
   failed: number;
   suppressed?: number;
+  overCap?: number;
 }
 
 /**
@@ -21,6 +23,13 @@ export interface StatusReportResult {
  * "sent successfully" is only ever said about a send that happened. One wording for the route and for Emma's tool.
  */
 export function describeStatusReport(result: StatusReportResult, subject: string): { ok: boolean; httpStatus: number; message: string } {
+  if (result.overCap !== undefined) {
+    return {
+      ok: false,
+      httpStatus: 400,
+      message: `The ${subject} was not sent: it would go to ${result.recipients} people and one call may email at most ${result.overCap}. Nothing was emailed. Choose fewer contacts.`,
+    };
+  }
   if (result.recipients === 0) {
     return {
       ok: false,

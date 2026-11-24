@@ -26,6 +26,16 @@ interface StatusReportNotificationOptions {
   notifyPhasePoc?: boolean;   // For phase reports
   notifyPhasePocs?: boolean;  // For plan reports (all phase PoCs)
   message?: string;
+  /**
+   * ENG-2840: the most distinct people one call may email. When the chosen options resolve to more, NOTHING is sent and the result says so
+   * (`overCap`). Set by the MCP tool for outside agents (10); the portal and Emma set none.
+   */
+  maxRecipients?: number;
+}
+
+/** True when a report to `count` people exceeds the caller's cap. A cap that is not a finite number is no cap. */
+function exceedsRecipientCap(count: number, cap: unknown): cap is number {
+  return typeof cap === 'number' && Number.isFinite(cap) && cap >= 0 && count > cap;
 }
 
 interface GTMPlan {
@@ -297,6 +307,11 @@ export async function sendPhaseStatusReport(
     if (uniqueRecipients.length === 0) {
       return result;
     }
+    // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
+    if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+      result.overCap = notifications.maxRecipients;
+      return result;
+    }
 
     // Get optional message from notifications
     const customMessage = notifications.message && notifications.message.trim()
@@ -522,6 +537,11 @@ export async function sendPlanStatusReport(
 
     result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
+      return result;
+    }
+    // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
+    if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+      result.overCap = notifications.maxRecipients;
       return result;
     }
 
