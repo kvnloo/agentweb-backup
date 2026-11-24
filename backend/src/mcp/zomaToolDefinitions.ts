@@ -35,8 +35,10 @@ export function xAdsToolkitEnabled(env: NodeJS.ProcessEnv = process.env): boolea
  *     Zoma surface behaves exactly as it did before LinkedIn existed.
  *   - "read": READ MODE. linkedin_ads_read, the Zoma connect pages, the zoma_status block and
  *     reporting are on. linkedin_ads_write is not listed, not routed and refused at call time.
- *     Consent asks only for the read scopes. (LinkedIn's Standard tier is what lets creating and
- *     editing work for customer accounts; until then only reading is offered.)
+ *     Consent asks only for the read scopes (plus any scope the user's existing LinkedIn connection
+ *     already holds and the Ads scope list still names, so a reconnect never narrows it; rw_ads only if
+ *     that connection already holds it). (LinkedIn's Standard tier is what lets creating and editing work
+ *     for customer accounts; until then only reading is offered.)
  *   - "true": FULL. Read mode plus linkedin_ads_write (and the write consent scope).
  * A single variable on purpose: the production environment is near its size limit.
  */

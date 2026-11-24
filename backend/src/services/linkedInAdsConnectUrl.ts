@@ -28,18 +28,22 @@ export const ZOMA_LINKEDIN_WRITE_SCOPES: readonly string[] = ['rw_ads'];
 export const zomaLinkedInScopes = (writes: boolean): string[] => [...ZOMA_LINKEDIN_READ_SCOPES, ...(writes ? ZOMA_LINKEDIN_WRITE_SCOPES : [])];
 
 /**
- * What a Zoma link asks for: the mode's scopes PLUS every scope already stored on the user's existing
- * linkedin_ads connections. A reconnect replaces a connection's config wholesale, so asking for less than
- * it holds (the portal asks for the organization-social scopes) would narrow it.
+ * What a Zoma link asks for: the mode's scopes PLUS the scopes already stored on the user's existing linkedin_ads
+ * connections, so a reconnect never asks for (and so never records) less than a connection holds: a reconnect
+ * replaces a connection's config wholesale. Only stored scopes that are STILL in the configured Ads scope list
+ * (config/integrations.ts) are carried: a scope LinkedIn or AgentWeb has dropped is not requested forever.
+ * Read mode never asks for rw_ads on its own: it appears only if the user's existing connection already holds it.
+ * (A usable existing connection that already holds what the mode needs gets no link at all: see zomaOnboarding.ts.)
  */
 export async function zomaLinkedInConsentScopes(userId: string, writes: boolean): Promise<string[]> {
   const { getAccountsByUserId } = await import('./connectedAccountsDb');
   let stored: string[] = [];
   try {
+    const configured = new Set((await getLinkedInAdsConfig()).scopes);
     stored = (await getAccountsByUserId(userId))
       .filter((a) => a.platform === 'linkedin_ads')
       .flatMap((a) => ((a.config as any)?.scopes as unknown[]) ?? [])
-      .filter((scope): scope is string => typeof scope === 'string' && /^[A-Za-z_]{2,60}$/.test(scope));
+      .filter((scope): scope is string => typeof scope === 'string' && /^[A-Za-z_]{2,60}$/.test(scope) && configured.has(scope));
   } catch {
     // Reading the stored scopes is best effort; the mode's scopes are still asked for.
   }

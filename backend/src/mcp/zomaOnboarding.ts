@@ -27,8 +27,8 @@ import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsSe
 import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { META_BUSINESS_PAGES_SETTINGS_URL } from './metaPageAccessRefusal';
 import {
-  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, LINKEDIN_ADS_PROVIDER, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled, META_PROVIDER,
-  metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled, ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
+  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, LINKEDIN_ADS_PROVIDER, LINKEDIN_READ_SCOPES_NEEDED, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled,
+  linkedInConnectionHolds, LINKEDIN_WRITE_SCOPE_NEEDED, META_PROVIDER, metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled, ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
 } from './zomaProviders';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
@@ -489,14 +489,17 @@ export async function getZomaReadiness(
   if ((deps.linkedInAdsEnabled ?? linkedInAdsToolkitEnabled)()) {
     const liAccounts = usableAccounts(allAccounts, LINKEDIN_ADS_PROVIDER, deps.now());
     const writesOn = (deps.linkedInWritesEnabled ?? linkedInAdsWritesEnabled)();
-    // A connection made in read mode asked only for the read scopes: it cannot change anything until it is reconnected.
-    const canChange = liAccounts.some((a) => !Array.isArray((a.config as any)?.scopes) || (a.config as any).scopes.includes('rw_ads'));
+    // An existing usable connection that already holds what the mode needs IS the connection: it is reported as
+    // ready and no connect link is minted for it. A link is offered only when nothing usable holds the read scopes,
+    // or (full mode) when the connection lacks the write consent.
+    const readReady = liAccounts.filter((a) => linkedInConnectionHolds(a, LINKEDIN_READ_SCOPES_NEEDED));
+    const canChange = liAccounts.some((a) => linkedInConnectionHolds(a, [...LINKEDIN_READ_SCOPES_NEEDED, LINKEDIN_WRITE_SCOPE_NEEDED]));
     const li: NonNullable<ZomaReadiness['linkedin_ads']> = {
       available: true,
-      ready: liAccounts.length > 0,
+      ready: readReady.length > 0,
       accounts: liAccounts.map((a) => ({ account_id: a.account_id, name: a.account_name, currency: (a.config as any)?.currency })),
       writes_enabled: writesOn && payment.ready && canChange,
-      ...(!writesOn ? { reason: 'linkedin_standard_tier_pending' as const } : liAccounts.length > 0 && !canChange ? { reason: 'linkedin_reconnect_for_changes' as const } : {}),
+      ...(!writesOn ? { reason: 'linkedin_standard_tier_pending' as const } : readReady.length > 0 && !canChange ? { reason: 'linkedin_reconnect_for_changes' as const } : {}),
     };
     if (mintLinks && (!li.ready || li.reason === 'linkedin_reconnect_for_changes')) {
       try {

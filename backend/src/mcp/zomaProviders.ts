@@ -118,6 +118,17 @@ export function linkedInAdsConnectionIsUsable(account: ConnectedAccount, now: nu
   return !(typeof cfg.token_expires_at === 'number' && cfg.token_expires_at < now);
 }
 
+/** What a LinkedIn connection must hold for Zoma's reads (accounts, campaigns, creatives, targeting, adAnalytics). */
+export const LINKEDIN_READ_SCOPES_NEEDED: readonly string[] = ['r_ads', 'r_ads_reporting'];
+/** What changing anything needs on top of that. */
+export const LINKEDIN_WRITE_SCOPE_NEEDED = 'rw_ads';
+
+/** True when the stored connection holds every scope in `needed`; a connection that never recorded its scopes is not judged. */
+export function linkedInConnectionHolds(account: ConnectedAccount, needed: readonly string[]): boolean {
+  const scopes = (account.config as any)?.scopes;
+  return !Array.isArray(scopes) || needed.every((scope) => scopes.includes(scope));
+}
+
 export const LINKEDIN_ADS_PROVIDER: ZomaProvider = {
   platform: 'linkedin_ads',
   label: 'LinkedIn Ads',
