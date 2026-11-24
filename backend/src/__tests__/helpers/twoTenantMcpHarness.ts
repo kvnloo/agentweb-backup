@@ -36,6 +36,9 @@ export const TWO_TENANT_TABLES: Record<string, TableKeySchema> = {
   // Wave 2 (W2-2): the memory tools. Account memory is keyed by the user, org memory by the org; ids are ULIDs (they sort by time).
   'AW-AccountMemory': { hash: 'userId', range: 'memoryId', indexes: { UserIdCategoryIndex: { hash: 'userId', range: 'category' } } },
   'AW-OrgMemory': { hash: 'orgId', range: 'memoryId', indexes: { OrgIdCategoryIndex: { hash: 'orgId', range: 'category' } } },
+  // Wave 2 (W2-4): the GTM plan tools. A plan is one row keyed by planId (phases and work items live inside it); the common items are a setting.
+  'AW-GTMPlan': { hash: 'planId' },
+  'AW-Settings': { hash: 'settingName' },
 };
 
 export function makeTwoTenantFake(): InMemoryDynamo {
