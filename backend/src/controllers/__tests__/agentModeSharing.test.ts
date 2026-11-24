@@ -6,6 +6,7 @@ import { chatbotDb } from '../../services/chatbotService';
 jest.mock('../../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     updateSessionShareMetadata: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
     addMessageToSession: jest.fn(),
@@ -287,6 +288,12 @@ describe('AgentMode Sharing Controller', () => {
       (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
         `http://localhost:5174/ishare/${sessionId}?conversable=test-token`
       );
+      // ENG-3170 final review: the reply carries what the link STORES, read back consistently
+      const storedExpiry = new Date(Date.now() + 7 * 86400000).toISOString();
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({
+        ...mockSession,
+        interactiveShareMetadata: { isActive: true, token: 'test-token', sharedAt: new Date().toISOString(), expiresAt: storedExpiry, allowSensitiveActions: false } // a NEW link made with no choice is stored OFF
+      });
 
       const req = mockRequest({
         body: { sessionId },
@@ -303,7 +310,7 @@ describe('AgentMode Sharing Controller', () => {
         shareId: sessionId,
         conversableToken: expect.any(String),
         conversableUrl: expect.stringContaining(`/ishare/${sessionId}?conversable=`),
-        expiresAt: expect.any(String),
+        expiresAt: storedExpiry,
         // ENG-3170: a new link with no choice made is off
         allowSensitiveActions: false
       });

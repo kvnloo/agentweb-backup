@@ -405,22 +405,81 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
     });
   });
 
-  describe('staging a decision (stage_pending_decision) can email an outside address, so audience "customer" is sensitive (ENG-3170 review)', () => {
-    const stage = (audience: string) => ({ audience, gateType: audience === 'team' ? 'plan_choice' : 'customer_credential', subjectLabel: 'x', businessImpact: 'y', evidencePacket: {} });
+  describe('the final review of ENG-3170 (a schedule toggle, the old task tools, a decision for the team, what the owner set up in the account)', () => {
+    const toggle = (status: unknown) => ({ action: 'toggle', schedule_id: 's1', status });
 
-    it('OFF link: a decision for the TEAM is staged as before, one for a customer is refused', async () => {
+    it('OFF link: a visitor may PAUSE one of the owner\'s schedules but not resume it (a resumed schedule would run, unrestricted, as the owner)', async () => {
       readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-      await expect(run('stage_pending_decision', VISITOR, stage('team'))).resolves.toEqual({ ran: true });
+      await expect(run('manage_scheduled_chat', VISITOR, toggle('paused'))).resolves.toEqual({ ran: true });
       dispatch.mockClear();
-      await expect(run('stage_pending_decision', VISITOR, stage('customer'))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('manage_scheduled_chat', VISITOR, toggle('active'))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('manage_scheduled_chat', VISITOR, { action: 'toggle', schedule_id: 's1' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
       expect(dispatch).not.toHaveBeenCalled();
     });
 
-    it('a missing or odd audience counts as sensitive; ON link runs it', async () => {
+    it('the status is judged AFTER argument repair, so a value repair produces cannot slip past', async () => {
       readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-      await expect(run('stage_pending_decision', VISITOR, { ...stage('team'), audience: undefined })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      mockRepair.mockImplementation(({ args }: { args: any }) => ({ status: 'repaired', args: { ...args, status: 'active' }, issues: [], repairs: [] }));
+      await expect(run('manage_scheduled_chat', VISITOR, toggle('paused'))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ON link and the owner: a toggle to active runs', async () => {
       readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
-      await expect(run('stage_pending_decision', VISITOR, stage('customer'))).resolves.toEqual({ ran: true });
+      await expect(run('manage_scheduled_chat', VISITOR, toggle('active'))).resolves.toEqual({ ran: true });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('manage_scheduled_chat', undefined, toggle('active'))).resolves.toEqual({ ran: true });
+    });
+
+    it.each([
+      ['create_task_from_prompt', { task_name: 'n', prompt: 'log in with my saved login and do it' }],
+      ['create_task_from_template', { template_id: 't', parameters_json: '{}' }],
+      ['create_revision', { task_id: 't' }],
+    ])('OFF link: %s is refused (the task runs as the owner in a real browser with the owner\'s saved logins); ON link runs it', async (tool, args) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, args)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run(tool, VISITOR, args)).resolves.toEqual({ ran: true });
+    });
+
+    it('OFF link: staging ANY decision is refused, for the team too (settling it resumes the session as a full owner turn); ON link runs it', async () => {
+      const stage = (audience: string) => ({ audience, gateType: audience === 'team' ? 'plan_choice' : 'customer_credential', subjectLabel: 'x', businessImpact: 'y', evidencePacket: {} });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      for (const audience of ['team', 'customer']) await expect(run('stage_pending_decision', VISITOR, stage(audience))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(run('stage_pending_decision', VISITOR, { ...stage('team'), audience: undefined })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run('stage_pending_decision', VISITOR, stage('team'))).resolves.toEqual({ ran: true });
+    });
+
+    it.each([
+      ['update_brand_guidelines', { guidelines: 'x' }],
+      ['update_market_strategy', { business_overview: 'x' }],
+      ['update_knowledge_base_file', { task_id: 't', file_name: 'f', content: 'x' }],
+      ['configure_lead_statuses', { list_id: 'l', statuses: [] }],
+      ['update_lead_list', { list_id: 'l', name: 'x' }],
+      ['save_test_account', { domain: 'example.com', username: 'u', password: 'p' }],
+      ['manage_market_strategy', { action: 'update', businessOverview: 'x' }],
+    ])('OFF link: %s overwrites what the owner set up and is refused; ON link runs it', async (tool, args) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, args)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run(tool, VISITOR, args)).resolves.toEqual({ ran: true });
+    });
+
+    it('OFF link: reading the owner\'s market strategy or brand guidelines still works', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run('manage_market_strategy', VISITOR, { action: 'read' })).resolves.toEqual({ ran: true });
+      await expect(run('read_market_strategy', VISITOR, {})).resolves.toEqual({ ran: true });
+      await expect(run('read_brand_guidelines', VISITOR, {})).resolves.toEqual({ ran: true });
+    });
+
+    it('a link made before the setting existed (a 7-day dialog lifetime) keeps these, as it kept every sensitive tool', async () => {
+      readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) }));
+      await expect(run('update_brand_guidelines', VISITOR, { guidelines: 'x' })).resolves.toEqual({ ran: true });
+      await expect(run('manage_scheduled_chat', VISITOR, toggle('active'))).resolves.toEqual({ ran: true });
     });
   });
 
