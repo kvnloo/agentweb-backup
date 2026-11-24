@@ -63,6 +63,15 @@ export interface LinkedInAdsToolkitGatewayDeps {
 const defaultWrite = async (userId: string, args: any, session: LinkedInAdsSession) =>
   (await import('./linkedInAdsToolkitWrites')).executeLinkedInAdsWrite(userId, args, session);
 
+/**
+ * Read mode: the write tool is not offered. metaToolkitGateway calls this first, BEFORE the API-key
+ * scope check and the paywall, so a user who is not offered the tool can neither trigger a Stripe link
+ * nor leave a funnel row for it.
+ */
+export function refuseLinkedInWriteWhenNotOffered(toolName: string, writesEnabled: () => boolean = linkedInAdsWritesEnabled): void {
+  if (isLinkedInAdsToolkitWrite(toolName) && !writesEnabled()) throw new MetaToolkitRefusal(LINKEDIN_WRITES_NOT_AVAILABLE);
+}
+
 export async function handleLinkedInAdsToolkitCall(
   caller: LinkedInAdsToolkitCaller,
   request: { toolName: string; args?: any; sessionId?: string; userAgent?: string },
