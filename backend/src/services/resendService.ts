@@ -235,12 +235,15 @@ class ResendService {
 
     try {
       while (this.queuedCount() > 0) {
+        // Wait out the pacing gap BEFORE choosing the next email, so mail that arrives during the gap is considered: a
+        // password reset that arrives in the 500 ms after a send goes ahead of waiting bulk mail, not behind a bulk email
+        // that was already chosen. Nothing leaves the queues except here, so there is still an email to take afterwards.
+        await this.waitForRateLimitWindow();
         const queueItem = this.takeNextQueued();
         if (!queueItem) {
           continue;
         }
 
-        await this.waitForRateLimitWindow();
         const recipient = Array.isArray(queueItem.params.to) ? queueItem.params.to.join(', ') : queueItem.params.to;
         console.log(`Processing Resend queue item #${queueItem.id} (lane=${queueItem.lane}) for: ${recipient} (remaining: ${this.queuedCount()})`);
 
@@ -273,8 +276,9 @@ class ResendService {
   /**
    * ENG-2840: pick the next email. Transactional first; but while a bulk email waits, every BULK_SLOT_EVERY-th send is
    * the oldest bulk one, so a steady stream of transactional mail cannot starve bulk mail forever. The streak counts only
-   * transactional sends made WHILE a bulk email waits, so a bulk email never jumps ahead of transactional mail that
-   * arrived before it merely because transactional mail was busy earlier.
+   * transactional sends made WHILE a bulk email waits: a bulk email that arrives behind a long transactional backlog
+   * waits for BULK_SLOT_EVERY more transactional sends (not for the whole backlog), and it is never served early just
+   * because transactional mail was busy before it arrived.
    */
   private takeNextQueued(): QueuedEmailSend | undefined {
     if (this.bulkQueue.length === 0) {
@@ -397,6 +401,9 @@ class ResendService {
    * Failure contract (ENG-164): REJECTS on any failure — init failure,
    * non-retryable API error, or exhausted retries. Never resolves `null`
    * for a failed send; a resolved promise means Resend accepted the email.
+   *
+   * ENG-2840: a `lane: 'bulk'` send also rejects, at once and with `EmailQueueFullError`, when the bulk lane already has
+   * its maximum number of emails waiting. Nothing was queued or sent in that case.
    */
   async sendEmail(params: ResendSendParams) {
     // ENG-1215: the single chokepoint every send funnels through — this method,
