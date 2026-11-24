@@ -24,6 +24,30 @@ export interface ReceivedEmailAuthentication {
 }
 
 /**
+ * ENG-2840: which line an email waits in. Every email shares ONE paced queue (2 a second), so without lanes a burst of
+ * automated mail (a GTM status report to many contacts) makes a password reset or a support reply wait behind all of it.
+ *
+ *  - `transactional` (the default for every caller that says nothing): mail a person is waiting for. Always served first.
+ *    Not bounded, exactly as before this change.
+ *  - `bulk`: automated or agent-triggered mail nobody is waiting on. Served after the transactional lane (with a guaranteed
+ *    slot, see BULK_SLOT_EVERY) and bounded: a full lane rejects at once instead of growing without limit.
+ */
+export type EmailLane = 'transactional' | 'bulk';
+
+/** Thrown, at once, when the bulk lane is full. Nothing was queued and nothing was sent. */
+export class EmailQueueFullError extends Error {
+  readonly code = 'EMAIL_QUEUE_FULL';
+
+  constructor(
+    readonly lane: EmailLane,
+    readonly limit: number,
+  ) {
+    super(`The ${lane} email queue is full (${limit} waiting). Nothing was sent. Try again in a minute.`);
+    this.name = 'EmailQueueFullError';
+  }
+}
+
+/**
  * Parameters for a Resend send.
  *
  * Deliberately NOT the same shape as emailProviderService's SendEmailParams, and no longer
@@ -50,10 +74,13 @@ interface ResendSendParams {
   replyTo?: string;
   /** ENG-2367: extra headers (e.g. List-Unsubscribe). */
   headers?: Record<string, string>;
+  /** ENG-2840: the line this email waits in. Absent = `transactional`. Never sent to Resend. */
+  lane?: EmailLane;
 }
 
 interface QueuedEmailSend {
   id: number;
+  lane: EmailLane;
   params: ResendSendParams;
   resolve: (value: any) => void;
   reject: (error: any) => void;
@@ -65,7 +92,14 @@ class ResendService {
   private readonly MAX_RETRIES = 3;
   private readonly BASE_DELAY = 1000; // 1 second base delay
   private readonly MIN_SEND_INTERVAL_MS = 500; // 2 requests/sec
+  /** The transactional lane (the queue every email used before lanes existed). */
   private sendQueue: QueuedEmailSend[] = [];
+  /** ENG-2840: the bulk lane. Bounded: at most BULK_QUEUE_LIMIT waiting. */
+  private bulkQueue: QueuedEmailSend[] = [];
+  private readonly BULK_QUEUE_LIMIT = 100;
+  /** While a bulk email waits, after this many transactional sends in a row the next send is a bulk one (bulk never starves). */
+  private readonly BULK_SLOT_EVERY = 10;
+  private transactionalStreak = 0;
   private isQueueWorkerRunning = false;
   private lastSendAt = 0;
   private queueItemId = 0;
@@ -200,15 +234,15 @@ class ResendService {
     console.log('Resend queue worker started');
 
     try {
-      while (this.sendQueue.length > 0) {
-        const queueItem = this.sendQueue.shift();
+      while (this.queuedCount() > 0) {
+        const queueItem = this.takeNextQueued();
         if (!queueItem) {
           continue;
         }
 
         await this.waitForRateLimitWindow();
         const recipient = Array.isArray(queueItem.params.to) ? queueItem.params.to.join(', ') : queueItem.params.to;
-        console.log(`Processing Resend queue item #${queueItem.id} for: ${recipient} (remaining: ${this.sendQueue.length})`);
+        console.log(`Processing Resend queue item #${queueItem.id} (lane=${queueItem.lane}) for: ${recipient} (remaining: ${this.queuedCount()})`);
 
         // A failed send rejects its own promise; it must never kill the queue
         // worker — later queued emails still get processed.
@@ -226,22 +260,54 @@ class ResendService {
       console.log('Resend queue worker idle');
 
       // Handle race where a new item is enqueued while worker is shutting down.
-      if (this.sendQueue.length > 0) {
+      if (this.queuedCount() > 0) {
         void this.processSendQueue();
       }
     }
   }
 
+  private queuedCount(): number {
+    return this.sendQueue.length + this.bulkQueue.length;
+  }
+
+  /**
+   * ENG-2840: pick the next email. Transactional first; but while a bulk email waits, every BULK_SLOT_EVERY-th send is
+   * the oldest bulk one, so a steady stream of transactional mail cannot starve bulk mail forever. The streak counts only
+   * transactional sends made WHILE a bulk email waits, so a bulk email never jumps ahead of transactional mail that
+   * arrived before it merely because transactional mail was busy earlier.
+   */
+  private takeNextQueued(): QueuedEmailSend | undefined {
+    if (this.bulkQueue.length === 0) {
+      this.transactionalStreak = 0;
+      return this.sendQueue.shift();
+    }
+    if (this.sendQueue.length === 0 || this.transactionalStreak >= this.BULK_SLOT_EVERY) {
+      this.transactionalStreak = 0;
+      return this.bulkQueue.shift();
+    }
+    this.transactionalStreak += 1;
+    return this.sendQueue.shift();
+  }
+
   private enqueueSend(params: ResendSendParams): Promise<any> {
+    const lane: EmailLane = params.lane === 'bulk' ? 'bulk' : 'transactional';
+
+    // A full bulk lane refuses at once: nothing is queued, so nothing waits, and memory stays bounded.
+    if (lane === 'bulk' && this.bulkQueue.length >= this.BULK_QUEUE_LIMIT) {
+      console.warn(`[resend-queue] Refused a bulk email: the bulk lane is full (${this.BULK_QUEUE_LIMIT} waiting).`);
+      return Promise.reject(new EmailQueueFullError('bulk', this.BULK_QUEUE_LIMIT));
+    }
+
     return new Promise((resolve, reject) => {
       const queueItem: QueuedEmailSend = {
         id: ++this.queueItemId,
+        lane,
         params,
         resolve,
         reject
       };
-      this.sendQueue.push(queueItem);
-      console.log(`Queued Resend email #${queueItem.id}. Queue size: ${this.sendQueue.length}`);
+      (lane === 'bulk' ? this.bulkQueue : this.sendQueue).push(queueItem);
+      console.log(`Queued Resend email #${queueItem.id} (lane=${lane}). Queue size: ${this.sendQueue.length} transactional, ${this.bulkQueue.length} bulk`);
       void this.processSendQueue();
     });
   }
@@ -385,13 +451,16 @@ class ResendService {
     subject,
     html,
     text,
-    inReplyTo
+    inReplyTo,
+    lane
   }: {
     to: string | string[];
     subject: string;
     html?: string;
     text?: string;
     inReplyTo?: string;
+    /** ENG-2840: `bulk` for automated mail nobody is waiting on; absent = transactional. */
+    lane?: EmailLane;
   }) {
     const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
     return this.sendEmail({
@@ -400,7 +469,8 @@ class ResendService {
       subject,
       html,
       text,
-      inReplyTo
+      inReplyTo,
+      lane
     });
   }
 
