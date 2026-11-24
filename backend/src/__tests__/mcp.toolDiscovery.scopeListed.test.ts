@@ -123,6 +123,13 @@ describe('gtm:email (ENG-2840, emailing GTM reports over MCP)', () => {
     }
   });
 
+  it('no other opt-in scope lists it: a key holding only memory:org, email:read or a Smartlead scope is not offered a tool it would be refused', () => {
+    for (const scope of ['memory:org', 'email:read', 'smartlead:read', 'smartlead:control']) {
+      expect(names(['tools:read', 'tools:execute', scope])).not.toContain('send_gtm_status_report');
+      expect(names([scope])).not.toContain('send_gtm_status_report');
+    }
+  });
+
   it('the scope lists only that tool (the org memory, Smartlead and mailbox tools stay hidden from a gtm:email key)', () => {
     const listed = names(['tools:read', 'tools:execute', 'gtm:email']);
     for (const hidden of ['save_org_memory', 'delete_org_memory', 'read_email', 'list_smartlead_campaigns']) expect(listed).not.toContain(hidden);

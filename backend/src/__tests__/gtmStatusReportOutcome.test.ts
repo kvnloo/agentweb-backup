@@ -26,6 +26,21 @@ describe('describeStatusReport', () => {
     expect(describeStatusReport({ recipients: 1, sent: 0, failed: 0, overCap: 0 }, 'x').ok).toBe(false);
   });
 
+  it('refuses with 400 and names how many contacts hold a list of addresses, singular and plural', () => {
+    expect(describeStatusReport({ recipients: 1, sent: 0, failed: 0, multiAddressContacts: 1 }, 'plan status report')).toEqual({
+      ok: false,
+      httpStatus: 400,
+      message: 'The plan status report was not sent: 1 contact on the plan holds more than one email address, and a report sent this way goes to one address per contact. Nothing was emailed. Put a single address in each contact.',
+    });
+    const two = describeStatusReport({ recipients: 3, sent: 0, failed: 0, multiAddressContacts: 2 }, 'phase status report');
+    expect(two.httpStatus).toBe(400);
+    expect(two.message).toContain('2 contacts on the plan hold more than one email address');
+  });
+
+  it('a list contact is a 400 (nothing happened), never the 502 "refused all" answer its zero counts would give', () => {
+    expect(describeStatusReport({ recipients: 1, sent: 0, failed: 0, multiAddressContacts: 1 }, 'x').httpStatus).toBe(400);
+  });
+
   it('refuses with 502 when the mail service refused every email', () => {
     const outcome = describeStatusReport({ recipients: 2, sent: 0, failed: 2 }, 'phase status report');
     expect(outcome).toEqual({

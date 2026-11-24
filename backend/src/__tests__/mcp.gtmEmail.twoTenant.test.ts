@@ -260,6 +260,28 @@ describe('one mailbox is one person, and a title cannot add a header', () => {
   });
 });
 
+describe('a contact that holds a list of addresses', () => {
+  it('is refused on the real route before anything is sent, and gives the reservation back so the same report can be retried once the contact is fixed', async () => {
+    const row = fake.items('AW-GTMPlan').find((x: any) => x.planId === 'plan-a1');
+    row.dri = 'boss@alpha.test, rival@elsewhere.test';
+    const args = { plan_id: 'plan-a1', notify_plan_poc: true, message: fresh() };
+    const usedBefore = gtmEmailLimiter.used(`account:${TENANT_A.owner}`);
+
+    const refused = await ownerA.call('send_gtm_status_report', args);
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain('API error (400)');
+    expect(refused.text).toContain('1 contact on the plan holds more than one email address');
+    expect(refused.text).toContain('Nothing was emailed');
+    expect(sendMail).not.toHaveBeenCalled();
+    expect(gtmEmailLimiter.used(`account:${TENANT_A.owner}`)).toBe(usedBefore);
+
+    row.dri = 'boss@alpha.test';
+    const retry = await ownerA.call('send_gtm_status_report', args);
+    expect(retry.isError).toBe(false);
+    expect(sentTo()).toEqual(['boss@alpha.test']);
+  });
+});
+
 describe('what the tool itself refuses, before the route is reached', () => {
   it('an id that is not a real id (a dot path, a slash) is refused before any limit is taken, so it cannot burn the hour', async () => {
     const usedBefore = gtmEmailLimiter.used(`account:${TENANT_A.owner}`); // earlier tests in this file have spent some of the hour
