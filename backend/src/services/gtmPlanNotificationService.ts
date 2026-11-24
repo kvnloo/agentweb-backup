@@ -1,5 +1,7 @@
 import { resendService } from './resendService';
 import { userDb } from './db';
+import type { StatusReportResult } from './gtmStatusReportOutcome';
+import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
 
 interface NotificationOptions {
   notifyUser?: boolean;
@@ -239,10 +241,12 @@ export async function sendPhaseStatusReport(
   phaseId: string,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePoc)) {
-    return;
+    return result;
   }
 
   try {
@@ -250,7 +254,7 @@ export async function sendPhaseStatusReport(
 
     if (!phase) {
       console.error("Phase not found for status report");
-      return;
+      return result;
     }
 
     const recipients: string[] = [];
@@ -278,8 +282,9 @@ export async function sendPhaseStatusReport(
     // Remove duplicates
     const uniqueRecipients = Array.from(new Set(recipients));
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
     }
 
     // Get optional message from notifications
@@ -431,21 +436,27 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send phase status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending phase status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }
 
 /**
@@ -458,10 +469,12 @@ export async function sendPlanStatusReport(
   plan: GTMPlan,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePocs)) {
-    return;
+    return result;
   }
 
   try {
@@ -494,8 +507,9 @@ export async function sendPlanStatusReport(
     // Remove duplicates
     const uniqueRecipients = Array.from(new Set(recipients));
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
     }
 
     // Get optional message from notifications
@@ -704,19 +718,25 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send plan status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending plan status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { describeStatusReport } from "../services/gtmStatusReportOutcome";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { settingsService } from "../services/settingsService";
 import { chatbotDb } from "../services/chatbotService";
@@ -641,6 +642,105 @@ router.post("/:planId/phases", authenticateToken, async (req, res) => {
   }
 });
 
+// Update a phase's own fields (title, description, DRI, due date). Its status is derived from its work items, so it is not settable here.
+router.put("/:planId/phases/:phaseId", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId } = req.params;
+    const { title, description, dri, dueDate } = req.body ?? {};
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (title === undefined && description === undefined && dri === undefined && dueDate === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: "Nothing to update: send at least one of title, description, dri, dueDate",
+      });
+    }
+
+    if (title !== undefined && (typeof title !== "string" || title.trim() === "")) {
+      return res.status(400).json({
+        success: false,
+        error: "Phase title cannot be empty",
+      });
+    }
+
+    for (const [field, value] of [["description", description], ["dri", dri], ["dueDate", dueDate]] as const) {
+      if (value !== undefined && value !== null && typeof value !== "string") {
+        return res.status(400).json({
+          success: false,
+          error: `${field} must be text`,
+        });
+      }
+    }
+
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const phases = getResult.Item.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    phases[phaseIndex] = {
+      ...phase,
+      ...(title !== undefined && { title: title.trim() }),
+      ...(description !== undefined && { description: description || null }),
+      ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate && String(dueDate).trim() !== "" ? String(dueDate).trim() : null }),
+    };
+
+    const result = await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":phases": phases,
+          ":updatedAt": new Date().toISOString(),
+        },
+        ReturnValues: "ALL_NEW",
+      })
+      .promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Phase updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating phase:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
 // Create a new work item in a phase
 router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req, res) => {
   try {
@@ -1036,17 +1136,24 @@ router.post("/:planId/phases/:phaseId/send-status-report", authenticateToken, as
       });
     }
 
-    // Send status report
-    await sendPhaseStatusReport(
+    // Send status report, and answer for what happened (the service no longer hides a send that did not occur)
+    const result = await sendPhaseStatusReport(
       plan as any,
       phaseId,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, "phase status report");
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Phase status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending phase status report:", error);
@@ -1097,16 +1204,23 @@ router.post("/:planId/send-status-report", authenticateToken, async (req, res) =
       });
     }
 
-    // Send status report
-    await sendPlanStatusReport(
+    // Send status report, and answer for what happened (the service no longer hides a send that did not occur)
+    const result = await sendPlanStatusReport(
       plan as any,
       { ...notifications, message },
       process.env.CUSTOMER_FRONTEND_URL
     );
+    const outcome = describeStatusReport(result, "plan status report");
+    if (!outcome.ok) {
+      return res.status(outcome.httpStatus).json({ success: false, error: outcome.message });
+    }
 
     return res.json({
       success: true,
-      message: "Plan status report sent successfully",
+      message: outcome.message,
+      sent: result.sent,
+      failed: result.failed,
+      suppressed: result.suppressed ?? 0,
     });
   } catch (error: any) {
     console.error("Error sending plan status report:", error);
