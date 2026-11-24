@@ -707,6 +707,18 @@ describe('GTM Plan Notification Service', () => {
       expect(over).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
     });
 
+    it('a phase report without a cap still sends a list contact as one message, exactly as before', async () => {
+      const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@x.test, b@x.test', status: 'in_progress', workItems: [] }] };
+      expect(await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPhasePoc: true })).toEqual({ recipients: 1, sent: 1, failed: 0 });
+    });
+
+    it('a phase report that has a list contact AND would reach too many people says it is a list (the list rule comes first)', async () => {
+      const phasePlan: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'phase-a', title: 'A', dri: 'c@x.test', status: 'in_progress', workItems: [] }] };
+      const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 1 });
+      expect(result).toMatchObject({ multiAddressContacts: 1 });
+      expect(result.overCap).toBeUndefined();
+    });
+
     it('a phase report counts every list contact: the plan contact and the phase contact, 2', async () => {
       const phasePlan: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'phase-a', title: 'A', dri: 'c@x.test;d@x.test', status: 'in_progress', workItems: [] }] };
       const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 10 });
