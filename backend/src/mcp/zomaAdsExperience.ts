@@ -13,17 +13,26 @@
  * `zomaAdsExperience` (+ `zomaAdsExperienceAt`). Every link here is Meta's or Google's own
  * page — never the Emma app.
  */
-import { googleToolkitEnabled } from './zomaToolDefinitions';
+import { googleToolkitEnabled, linkedInAdsToolkitEnabled } from './zomaToolDefinitions';
 
 export const ZOMA_ADS_EXPERIENCE_VALUES = ['runs_ads', 'new_to_ads', 'not_interested'] as const;
 export type ZomaAdsExperience = (typeof ZOMA_ADS_EXPERIENCE_VALUES)[number];
 
 export const ZOMA_ADS_EXPERIENCE_QUESTION = 'How familiar are you with ads?';
 
-/** The answer options; Google is named only while ZOMA_GOOGLE_ENABLED is on. */
-export function zomaAdsExperienceOptions(google: boolean = googleToolkitEnabled()): ReadonlyArray<{ value: ZomaAdsExperience; label: string }> {
+/** "Meta", "Meta or Google", "Meta, Google or LinkedIn": a platform is named only while its flag is on. */
+const platformNames = (google: boolean, linkedin: boolean): string => {
+  const names = ['Meta', ...(google ? ['Google'] : []), ...(linkedin ? ['LinkedIn'] : [])];
+  return names.length < 3 ? names.join(' or ') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+};
+
+/** The answer options; Google is named only while ZOMA_GOOGLE_ENABLED is on, LinkedIn while ZOMA_LINKEDIN_ADS_ENABLED is read/true. */
+export function zomaAdsExperienceOptions(
+  google: boolean = googleToolkitEnabled(),
+  linkedin: boolean = linkedInAdsToolkitEnabled(),
+): ReadonlyArray<{ value: ZomaAdsExperience; label: string }> {
   return [
-    { value: 'runs_ads', label: `I already run ads / use the ${google ? 'Meta or Google' : 'Meta'} MCP` },
+    { value: 'runs_ads', label: `I already run ads / use the ${platformNames(google, linkedin)} MCP` },
     { value: 'new_to_ads', label: "I'm interested in ads but have never run them" },
     { value: 'not_interested', label: 'Not interested, just a friend' },
   ];
@@ -75,15 +84,26 @@ export const ZOMA_META_LOGIN_NOTE =
 export const ZOMA_AD_ACCOUNT_CREATE_FALLBACK =
   'If Meta\'s "Create ad account" button does nothing or shows an error, that is Meta\'s page, not Zoma — Zoma cannot create the account for you. Reload and retry as an admin of the Business portfolio, or try Ads Manager (https://adsmanager.facebook.com) with the same Facebook login; if it still fails, report it to Meta (https://www.facebook.com/business/help) with the exact message. Once the account exists, get a fresh Meta connect link (links expire after 10 minutes; ask your agent for a new one) and open it.';
 
-/** Ad-account setup for someone who has never run ads, in the order they need it (Google steps only while enabled). */
-export function zomaNewToAdsSteps(google: boolean = googleToolkitEnabled()): readonly string[] {
+/**
+ * LinkedIn: ad accounts are created on LinkedIn's own site (Zoma never creates one), and need a LinkedIn Page for the business.
+ * Shown only while the LinkedIn flag is read/true.
+ */
+export const ZOMA_LINKEDIN_NEW_ACCOUNT_STEP =
+  'LinkedIn (optional): create a LinkedIn ad account yourself in Campaign Manager at https://www.linkedin.com/campaignmanager (it needs a LinkedIn Page for your business). Zoma never creates the account or a campaign for you.';
+
+/** Ad-account setup for someone who has never run ads, in the order they need it (Google and LinkedIn steps only while enabled). */
+export function zomaNewToAdsSteps(
+  google: boolean = googleToolkitEnabled(),
+  linkedin: boolean = linkedInAdsToolkitEnabled(),
+): readonly string[] {
   return [
     'Meta: create a Business portfolio at https://business.facebook.com/overview (use the Facebook login you want to manage ads with, and keep using that same login below).',
     'Meta: create a Facebook Page for your business at https://www.facebook.com/pages/create — Meta ads run from a Page.',
     'Meta: in Business settings → Accounts → Ad accounts, create an ad account and set its currency and time zone (https://business.facebook.com/settings/ad-accounts).',
     ZOMA_AD_ACCOUNT_CREATE_FALLBACK,
     ...(google ? ZOMA_GOOGLE_NEW_ACCOUNT_STEPS.map((s, i) => (i === 0 ? `Google (optional): ${s}` : s)) : []),
-    `Then connect ${google ? 'those ad accounts' : 'that ad account'} to Zoma. ${ZOMA_META_LOGIN_NOTE}`,
+    ...(linkedin ? [ZOMA_LINKEDIN_NEW_ACCOUNT_STEP] : []),
+    `Then connect ${google || linkedin ? 'those ad accounts' : 'that ad account'} to Zoma. ${ZOMA_META_LOGIN_NOTE}`,
   ];
 }
 
