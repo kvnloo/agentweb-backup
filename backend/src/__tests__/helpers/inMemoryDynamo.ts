@@ -547,8 +547,13 @@ export class InMemoryDynamo {
       delete(params: any) {
         return {
           promise: async () => {
-            self.store(params.TableName).delete(keyOf(self.schema(params.TableName), params.Key));
-            return {};
+            const store = self.store(params.TableName);
+            const key = keyOf(self.schema(params.TableName), params.Key);
+            const old = store.get(key);
+            store.delete(key);
+            // ReturnValues: 'ALL_OLD' answers with the item that was deleted, and with nothing when there was none: how a caller learns
+            // whether a delete found a row.
+            return params.ReturnValues === 'ALL_OLD' && old ? { Attributes: { ...old } } : {};
           },
         };
       }

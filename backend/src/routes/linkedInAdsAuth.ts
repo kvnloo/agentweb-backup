@@ -1,45 +1,23 @@
 import express from 'express';
-import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
-import { createAccount } from '../services/connectedAccountsDb';
 import { redactAccountSecrets } from '../utils/accountSecretRedaction';
-import { listAdAccounts } from '../services/linkedInAdsService';
+import { connectLinkedInAdsAccounts, finalizeLinkedInAdsOAuth } from '../services/linkedInAdsOAuthFinalize';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { ZOMA_LINKEDIN_CALLBACK_PATH } from '../mcp/zomaSetupLinks';
+import { linkedInAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-
-/**
- * ENG-1644 gap-closing: linkedin_ads was a live platform with zero
- * auto-resolve wiring — a customer_credential decision for a LinkedIn Ads
- * reconnect could never resolve on its own, no matter what the customer
- * did. Same pattern as metaAuth.ts/linkedinAuth.ts's identical helper:
- * safeAutoResolveCredentialDecision itself never throws, but the import
- * statement can — own try/catch so that can't abort this response. The
- * wrapper's own logic lives once in approvalInboxCustomerNotify.ts, not
- * duplicated per file (review fix — this local copy was flagged as
- * duplicated 3x across this file, metaAuth.ts, and linkedinAuth.ts by 4
- * independent review passes).
- */
-async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
-  try {
-    const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
-    await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
-  } catch (err: any) {
-    console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
-  }
-}
 
 interface StatePayload {
   userId: string;
   nonce: string;
+  zoma?: string;
 }
 
 const generateState = (userId: string): string => {
@@ -71,49 +49,27 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   }
 };
 
-// ── Token session store (server-side, one-time use) ──────────────────────────
-
-interface TokenSession {
-  tokens: {
-    access_token: string;
-    refresh_token?: string;
-    expires_in: number;
-    scopes: string[];
-    personUrn?: string;
-  };
-  userId: string;
-  expires: number;
-  adAccountRefs: { [accountId: string]: string }; // accountId → organization URN (reference field)
-}
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
+/**
+ * A Zoma connect link carries `zoma` in its SIGNED state. The claim is read only from a payload whose
+ * signature verified (never from a query parameter), exactly like routes/googleAdsAuth.ts. Expiry is
+ * not enforced here on purpose: a user who lingers past the 15-minute state must still land on Zoma's
+ * "expired, ask your agent" page, and the Zoma handler (mcp/zomaLinkedInAdsConnect.ts) re-verifies the
+ * signature AND the expiry and binds the user. A tampered or unsigned state is not a Zoma state.
+ */
+const isZomaState = (state: string): boolean => {
+  try {
+    const decoded = jwt.verify(state, getJwtSecret(), { ignoreExpiration: true }) as StatePayload;
+    return typeof decoded.zoma === 'string' && decoded.zoma.length > 0;
+  } catch {
+    return false;
   }
-}, SESSION_CLEANUP_INTERVAL_MS);
-
-const storeTokenSession = (
-  userId: string,
-  tokens: TokenSession['tokens'],
-  adAccountRefs: TokenSession['adAccountRefs']
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS, adAccountRefs });
-  return sessionId;
 };
 
-const retrieveTokenSession = (sessionId: string, userId: string): TokenSession | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return session;
-};
+/**
+ * A failed token exchange is an AxiosError, whose config carries client_secret and the OAuth code in
+ * its params. Log a short message only, never the error object.
+ */
+const safeErrorText = (error: unknown): string => (error instanceof Error ? error.message : 'unknown error').slice(0, 300);
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -141,6 +97,17 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 router.get('/callback', async (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+  // A connect link minted for a Zoma agent (signed state carrying `zoma`) finishes on Zoma's own pages
+  // for the state's user, never in the AgentWeb portal. Same registered redirect URI, so no LinkedIn
+  // app change. Only while LinkedIn Ads is on for Zoma: otherwise this route is exactly the portal's.
+  if (linkedInAdsToolkitEnabled() && typeof state === 'string' && isZomaState(state)) {
+    const forward = new URLSearchParams();
+    for (const [key, value] of [['code', code], ['state', state], ['error', error]] as const) {
+      if (typeof value === 'string') forward.set(key, value);
+    }
+    return res.redirect(302, `${ZOMA_LINKEDIN_CALLBACK_PATH}?${forward.toString()}`);
+  }
 
   if (error) {
     return res.redirect(`${frontendUrl}/oauth/linkedin-ads/callback?error=linkedin_ads_access_denied&details=${error}`);
@@ -173,63 +140,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const config = await getLinkedInAdsConfig();
-
-    // Exchange code for tokens
-    const tokenResponse = await axios.post(config.tokenUrl, null, {
-      params: {
-        grant_type: 'authorization_code',
-        code,
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        redirect_uri: config.redirectUri,
-      },
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
-
-    const { access_token, refresh_token, expires_in } = tokenResponse.data as {
-      access_token: string;
-      refresh_token?: string;
-      expires_in: number;
-    };
-
-    // Fetch the authenticated person's LinkedIn member ID (r_basicprofile scope)
-    let personUrn: string | undefined;
-    try {
-      const meResp = await axios.get<{ id?: string }>('https://api.linkedin.com/v2/me', {
-        headers: { Authorization: `Bearer ${access_token}` },
-      });
-      const memberId = meResp.data?.id;
-      if (memberId) personUrn = `urn:li:person:${memberId}`;
-    } catch (e) {
-      console.warn('[LinkedIn Ads OAuth] Could not fetch /v2/me (person URN):', e);
-    }
-
-    // Fetch the user's ad accounts so they can pick one
-    const accountsResult = await listAdAccounts(access_token);
-    const adAccounts = (accountsResult.data?.elements || []).map((acc: any) => ({
-      ...acc,
-      id: String(acc.id), // LinkedIn returns numeric IDs; normalize to string for frontend
-    }));
-
-    // Build accountId → organization URN map from the reference field on each ad account
-    const adAccountRefs: { [accountId: string]: string } = {};
-    for (const acc of adAccounts) {
-      if (acc.reference) adAccountRefs[String(acc.id)] = acc.reference;
-    }
-
-    // Store tokens server-side, return session ID
-    const tokenSessionId = storeTokenSession(userId, {
-      access_token,
-      refresh_token,
-      expires_in,
-      scopes: config.scopes,
-      personUrn,
-    }, adAccountRefs);
-
+    const { adAccounts, tokenSessionId } = await finalizeLinkedInAdsOAuth({ userId, code });
     res.json({ success: true, adAccounts, tokenSessionId });
   } catch (error: any) {
-    console.error('[LinkedIn Ads OAuth] Finalize error:', error);
+    console.error('[LinkedIn Ads OAuth] Finalize error:', safeErrorText(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to finalize LinkedIn Ads connection', ...(details && { details }) });
   }
@@ -248,36 +162,19 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId or adAccountId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
-  const { tokens } = session;
-  const organizationUrn = session.adAccountRefs?.[String(adAccountId)];
-
   try {
-    const account = await createAccount(userId, 'linkedin_ads', {
-      account_id: adAccountId,
-      account_name: adAccountName || adAccountId,
-      config: {
-        account_type: 'ad_account',
-        currency: currency || 'USD',
-        status: status || 'ACTIVE',
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        token_expires_at: Date.now() + tokens.expires_in * 1000,
-        scopes: tokens.scopes,
-        ...(organizationUrn && { organization_urn: organizationUrn }),
-        ...(tokens.personUrn && { person_urn: tokens.personUrn }),
-      },
+    const result = await connectLinkedInAdsAccounts({
+      userId,
+      tokenSessionId,
+      accounts: [{ adAccountId, adAccountName, currency, status }],
     });
+    if (!result.ok) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
 
-    await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
-
-    res.json({ success: true, account: redactAccountSecrets(account) });
+    res.json({ success: true, account: redactAccountSecrets(result.accounts[0]) });
   } catch (error: any) {
-    console.error('[LinkedIn Ads OAuth] Connect error:', error);
+    console.error('[LinkedIn Ads OAuth] Connect error:', safeErrorText(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to connect LinkedIn Ads account', ...(details && { details }) });
   }
