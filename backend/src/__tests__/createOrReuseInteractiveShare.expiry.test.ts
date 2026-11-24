@@ -10,6 +10,8 @@ import { chatbotDb } from '../services/chatbotService';
 describe('createOrReuseInteractiveShare - expiry policy', () => {
   let getSessionSpy: jest.SpyInstance;
   let updateSpy: jest.SpyInstance;
+  // ENG-3170: the strip removes ONLY the expiry (attribute level), so a stale copy of the link is never written back
+  let stripSpy: jest.SpyInstance;
 
   beforeEach(() => {
     // No existing active share -> force the create branch.
@@ -19,6 +21,7 @@ describe('createOrReuseInteractiveShare - expiry policy', () => {
     updateSpy = jest
       .spyOn(chatbotDb, 'updateSessionInteractiveShareMetadata')
       .mockResolvedValue({} as any);
+    stripSpy = jest.spyOn(chatbotDb, 'removeInteractiveShareExpiry').mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -60,8 +63,9 @@ describe('createOrReuseInteractiveShare - expiry policy', () => {
 
     await chatbotDb.createOrReuseInteractiveShare('s1', 0);
 
-    expect(updateSpy).toHaveBeenCalledTimes(1);
-    expect(updateSpy.mock.calls[0][1]).not.toHaveProperty('expiresAt');
+    expect(stripSpy).toHaveBeenCalledTimes(1);
+    expect(stripSpy).toHaveBeenCalledWith('s1');
+    expect(updateSpy).not.toHaveBeenCalled(); // never a whole-map write from this copy
   });
 
   it('writes a ~N-day expiresAt when expirationDays is provided (human dropdown)', async () => {
@@ -103,11 +107,10 @@ describe('createOrReuseInteractiveShare - expiry policy', () => {
     const url = await chatbotDb.createOrReuseInteractiveShare('s1');
 
     expect(url).toContain('conversable=shared-token');
-    expect(updateSpy).toHaveBeenCalledTimes(1);
-    const written = updateSpy.mock.calls[0][1];
-    expect(written.token).toBe('shared-token');
-    expect(written.sharedAt).toBe('2026-06-01T00:00:00.000Z');
-    expect(written).not.toHaveProperty('expiresAt');
+    expect(stripSpy).toHaveBeenCalledTimes(1);
+    expect(stripSpy).toHaveBeenCalledWith('s1');
+    // only the expiry is removed: nothing else on the link (token, date, the owner's sensitive-actions choice) is rewritten
+    expect(updateSpy).not.toHaveBeenCalled();
   });
 
   it('still returns the working /ishare link if the strip write fails (best-effort)', async () => {
@@ -117,11 +120,11 @@ describe('createOrReuseInteractiveShare - expiry policy', () => {
       sessionId: 's1',
       interactiveShareMetadata: { isActive: true, token: 'shared-token', expiresAt: '2026-07-16T00:00:00.000Z' },
     } as any);
-    updateSpy.mockRejectedValue(new Error('dynamo down'));
+    stripSpy.mockRejectedValue(new Error('dynamo down'));
 
     const url = await chatbotDb.createOrReuseInteractiveShare('s1');
 
-    expect(updateSpy).toHaveBeenCalledTimes(1); // strip attempted
+    expect(stripSpy).toHaveBeenCalledTimes(1); // strip attempted
     expect(url).toContain('/ishare/');
     expect(url).toContain('conversable=shared-token');
     expect(url).not.toContain('/agent-mode/');

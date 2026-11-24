@@ -135,6 +135,17 @@ describe("selectRowlessManagedHosts", () => {
       selectRowlessManagedHosts([ROW], [{ ...PAGE_EXPIRED, id: "sandbox", userId: "eval_abc" }, PAGE_ANSWERS])
     ).toEqual([{ pageId: "page-answers", host: "answers.agentwebforms.com" }]);
   });
+
+  it("leaves out an archived page even though its status still reads deployed (ENG-3144)", () => {
+    // Page 438047a2 was archived in May 2026 with status left at "deployed"; its stale host
+    // had no Vercel alias, so the monitor alerted on it daily as an expired certificate.
+    expect(
+      selectRowlessManagedHosts(
+        [ROW],
+        [{ ...PAGE_EXPIRED, id: "archived", archived: true }, PAGE_ANSWERS]
+      )
+    ).toEqual([{ pageId: "page-answers", host: "answers.agentwebforms.com" }]);
+  });
 });
 
 describe("runDomainReachabilitySweep, row-less managed hosts (ENG-3095)", () => {

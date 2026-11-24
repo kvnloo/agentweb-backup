@@ -99,6 +99,15 @@ export function stripInternalIds(value: any, depth = 0, toolName = ''): any {
   return visit(value, depth);
 }
 
+/**
+ * Tools whose answer is the caller's OWN stored text (ENG-2840 W2-2: the memory tools). Their answers carry the memory id and the text the
+ * caller saved or may already read in Settings, and no identifier of ours. Rewriting JSON-looking text in them would hand an agent back
+ * something other than what it saved (a memory that is a JSON object with an `apiKeyId` field comes back without that field).
+ */
+export const OWN_CONTENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'save_memory', 'delete_memory', 'list_memories', 'save_org_memory', 'delete_org_memory',
+]);
+
 export function shouldSanitizePublicResponse(
   toolName: string,
   toolArgs: Record<string, unknown> | undefined,
@@ -106,6 +115,7 @@ export function shouldSanitizePublicResponse(
 ): boolean {
   if (!context.externalMcp) return false;
   if (ADMIN_TOOL_NAMES.has(toolName)) return false;
+  if (OWN_CONTENT_TOOL_NAMES.has(toolName)) return false;
   // `client_id` marks an admin acting for a client, whose answers keep their internal ids. The argument alone proves nothing: any caller can
   // add it to any tool (most tools ignore it), so it switches sanitising off only when the caller really is an admin.
   if (toolArgs && (toolArgs.client_id || toolArgs.clientId) && context.callerIsAdmin === true) return false;

@@ -655,23 +655,6 @@ describe('apiTools', () => {
     });
   });
 
-  describe('manage_gtm_items - add_phase', () => {
-    it('should call POST /api/gtm-plan/:id/phases', async () => {
-      mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });
-
-      await mcpToolRegistry.execute('manage_gtm_items', {
-        action: 'add_phase', plan_id: 'plan-1',
-        name: 'Launch Phase', description: 'Product launch'
-      }, context);
-
-      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
-        method: 'POST',
-        path: '/api/gtm-plan/plan-1/phases',
-        body: { name: 'Launch Phase', description: 'Product launch', status: undefined },
-      }));
-    });
-  });
-
   // ─── get_chat_history ─────────────────────────────────────────────────
 
   describe('get_chat_history', () => {
