@@ -8,7 +8,7 @@ import {
   restrictionRefusal,
   sensitiveActionRefusal,
   sensitiveActionScheduleRefusal,
-  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isServerSideBrowserCodeTool } from '../services/toolRestrictionProfiles';
+  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isServerSideBrowserCodeTool, browserCallTouchesServerFiles } from '../services/toolRestrictionProfiles';
 import { AgentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 
 /**
@@ -244,6 +244,15 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
   describe('the tool that runs the caller\'s code on the server', () => {
     it.each(['playwright_browser_run_code', 'browser_run_code', 'x_browser_run_code'])('%s is it', (name) => expect(isServerSideBrowserCodeTool(name)).toBe(true));
     it.each(['playwright_browser_evaluate', 'playwright_browser_navigate', 'browser_run_code_later', 'run_code', 'mark_browser_session_failed', 'constructor', '', undefined as any, 7 as any])('%p is not', (name) => expect(isServerSideBrowserCodeTool(name)).toBe(false));
+  });
+
+  describe('a browser call that names a file on the server (filename: written to; paths: uploaded from)', () => {
+    it.each([[{ filename: 'dist/server.js' }], [{ filename: 'x.png' }], [{ paths: ['/etc/hostname'] }], [{ paths: '/x' }], [{ function: '() => 1', filename: 'a.json' }]])('%j touches server files', (args) => {
+      expect(browserCallTouchesServerFiles(args)).toBe(true);
+    });
+    it.each([[{ filename: '' }], [{ filename: '   ' }], [{ paths: [] }], [{}], [{ url: 'https://example.com' }], [undefined], [null], ['filename'], [7]])('%j does not', (args) => {
+      expect(browserCallTouchesServerFiles(args as any)).toBe(false);
+    });
   });
 
   describe('a tool that reaches someone only when an argument is set', () => {

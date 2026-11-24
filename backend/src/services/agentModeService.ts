@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, browserCallTouchesServerFiles, sensitiveActionScheduleRefusal, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { normalizeEmailList } from '../utils/validation';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
@@ -10301,7 +10301,9 @@ export class AgentModeService {
     // A call made while another restricted call is running is NESTED (a tool acting for the visitor with code of its own, such as solve_captcha); a call the
     // model or the visitor makes directly is not. Set here and never taken from the caller's context.
     const nested = outer !== undefined;
-    const context = profile ? { ...(extraContext ?? {}), ...(inherited ? { restrictionProfile: inherited } : {}), nestedInRestrictedCall: nested } : extraContext;
+    // The flag is never taken from the caller: with no profile it is dropped, with one it is set from the call stack.
+    const { nestedInRestrictedCall: _callerClaim, ...callerContext } = (extraContext ?? {}) as Record<string, any>;
+    const context = profile ? { ...callerContext, ...(inherited ? { restrictionProfile: inherited } : {}), nestedInRestrictedCall: nested } : (extraContext ? callerContext : extraContext);
     if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
     // `withinVisitorCall` stays true for everything nested under a visitor's call, even when a nested call carries a profile of its own.
     const withinVisitorCall = profile === 'share_visitor' || outer?.withinVisitorCall === true;
@@ -10341,7 +10343,7 @@ export class AgentModeService {
         const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
         if (!linkAllows) {
           console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it runs the caller's code on the server, and the owner has not turned on full control.`);
-          throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+          throw new ToolRestrictionDenied(inVisitorSchedule ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
         }
       }
     }
@@ -10373,6 +10375,17 @@ export class AgentModeService {
     }
 
     const preparedArgs = contractResult.args;
+    // ENG-3170: a direct browser call by a visitor who may not run the sensitive tools may not name a file to write or to upload (see browserCallTouchesServerFiles).
+    if (isBrowserAutomationTool(toolName) && extraContext?.nestedInRestrictedCall !== true && (browserCallTouchesServerFiles(preparedArgs) || browserCallTouchesServerFiles(args))) {
+      const inVisitorScheduleNow = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorScheduleNow) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it names a file on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(inVisitorScheduleNow ? sensitiveActionScheduleRefusal(toolName) : sensitiveActionRefusal(toolName));
+        }
+      }
+    }
     // ENG-3170: a tool judged by an argument is judged here, on the arguments the tool will actually run with (repair hoists a nested
     // wrapper, renames an alias, turns a GET shape into an action), as the publish-approval check below does. The checks above ran by
     // name; for a sensitive call they run again with the arguments. A tool that is sensitive whatever its arguments was settled above.
