@@ -209,6 +209,29 @@ describe('ENG-2840 — email lanes', () => {
       expect(order).toEqual(['hold', ...t(1, 10), 'b1', ...t(11, 20), 'b2', ...t(21, 25)]);
     });
 
+    it('the oldest bulk email is served within eleven sends even while new bulk mail keeps arriving', async () => {
+      const { resendService } = await load();
+      const arrivals: Promise<unknown>[] = [];
+      mockResendSend.mockImplementation(async (options: any) => {
+        order.push(options.subject);
+        if (options.subject === 'hold') await new Promise<void>((resolve) => (release = resolve));
+        // every transactional send is followed by a NEW bulk email arriving while the worker is mid-run
+        if (/^t\d+$/.test(options.subject)) arrivals.push(resendService.sendEmail(email(`new-${options.subject}`, 'bulk')));
+        return { data: { id: options.subject }, error: null };
+      });
+
+      const sends = [resendService.sendEmail(email('hold'))];
+      await until(() => order.includes('hold'), 'the held send to start');
+      for (let n = 1; n <= 30; n++) sends.push(resendService.sendEmail(email(`t${n}`)));
+      sends.push(resendService.sendEmail(email('b1', 'bulk')));
+      release();
+      await Promise.all(sends);
+      await Promise.all(arrivals);
+
+      // hold, then ten transactional sends, then the oldest bulk email: new bulk arrivals do not push it back
+      expect(order.indexOf('b1')).toBe(11);
+    });
+
     it('with no transactional mail waiting, bulk mail goes straight out (the lane never idles the worker)', async () => {
       const { resendService } = await load();
 
