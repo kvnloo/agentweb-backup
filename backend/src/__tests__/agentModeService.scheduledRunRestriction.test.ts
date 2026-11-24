@@ -402,13 +402,28 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   });
 
   describe('ENG-3170 (final reviews): the browser of a scheduled run, and Meta writes', () => {
-    const BROWSER = 'playwright_browser_run_code';
+    const BROWSER = 'playwright_browser_navigate'; // (browser_run_code runs the caller's code on the server: a visitor-made schedule is refused it, see below)
+    const RUN_CODE = 'playwright_browser_run_code';
+
+    it('a run of a MARKED schedule may not call the tool that runs the caller\'s code on the server; the owner\'s own schedule may; an unreadable schedule may not', async () => {
+      // one session per case: the answer to "is this schedule marked" is kept for a minute per session
+      const inSession = (sessionId: string) => (service as any).executeTool('gpt-4', RUN_CODE, { code: 'x' }, 'owner-user-id', sessionId, false, { isUnattendedRun: true });
+      marked();
+      await expect(inSession('run-marked')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      scheduleWith(undefined);
+      await expect(inSession('run-owners-own')).resolves.toEqual({ ran: true });
+      dispatch.mockClear();
+      getSchedule.mockReset().mockRejectedValue(new Error('throttled'));
+      await expect(inSession('run-unreadable')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
     const names = () => dispatch.mock.calls.map((c) => c[0] as string);
     const loads = () => names().filter((n) => n === 'load_browser_cookies').length;
 
     it('an UNMARKED schedule keeps its logins: the owner\'s saved cookies are loaded for its browser step, no profile is added', async () => {
       scheduleWith(undefined);
-      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
       expect(loads()).toBeGreaterThan(0);
       const browserCall = dispatch.mock.calls.find((c) => c[0] === BROWSER)!;
       expect(browserCall[2]).not.toHaveProperty('restrictionProfile');
@@ -417,7 +432,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('a MARKED schedule: the browser step still runs, but it borrows no logins (and says why in its profile)', async () => {
       marked();
-      await expect(runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' })).resolves.toEqual({ ran: true });
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
       expect(names()).toContain(BROWSER);
       expect(loads()).toBe(0);
       expect(dispatch.mock.calls.find((c) => c[0] === BROWSER)![2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', browserPoolSessionId: 'run-session::visitor' });
@@ -425,31 +440,31 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('a schedule that cannot be read: the browser step still runs, without the owner\'s logins (a blip must not run a visitor\'s schedule as the owner)', async () => {
       getSchedule.mockRejectedValue(new Error('throttled'));
-      await expect(runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' })).resolves.toEqual({ ran: true });
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
       expect(names()).toContain(BROWSER);
       expect(loads()).toBe(0);
     });
 
     it('an ATTENDED browser step is untouched: nothing about the schedule is read, the owner\'s logins load', async () => {
       marked();
-      await runWith(BROWSER, {}, { code: 'x' });
+      await runWith(BROWSER, {}, { url: 'https://example.com' });
       expect(getSchedule).not.toHaveBeenCalled();
       expect(loads()).toBeGreaterThan(0);
     });
 
     it('a run makes many browser steps: the schedule is read ONCE for them (a settled answer is kept for a minute)', async () => {
       scheduleWith(undefined);
-      for (let i = 0; i < 5; i++) await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      for (let i = 0; i < 5; i++) await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
       expect(getSchedule).toHaveBeenCalledTimes(1);
       expect(loads()).toBeGreaterThan(0);
     });
 
     it('an answer that could not be settled (the schedule could not be read) is NOT kept: the next browser step asks again', async () => {
       getSchedule.mockRejectedValue(new Error('throttled'));
-      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
       const afterFirst = getSchedule.mock.calls.length;
       getSchedule.mockReset().mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id' } as any);
-      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
       expect(afterFirst).toBe(2);
       expect(getSchedule).toHaveBeenCalledTimes(1);
       expect(loads()).toBeGreaterThan(0);
@@ -457,9 +472,9 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('the kept answer is per session: another run asks for itself, and a schedule-write or sensitive call is never answered from it', async () => {
       scheduleWith(undefined);
-      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
       marked();
-      await (service as any).executeTool('gpt-4', BROWSER, { code: 'x' }, 'owner-user-id', 'other-run-session', false, { isUnattendedRun: true });
+      await (service as any).executeTool('gpt-4', BROWSER, { url: 'https://example.com' }, 'owner-user-id', 'other-run-session', false, { isUnattendedRun: true });
       expect(dispatch.mock.calls.filter((c) => c[0] === BROWSER).map((c) => c[2].restrictionProfile)).toEqual([undefined, 'share_visitor_schedule']);
       await expect(runWith('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
     });

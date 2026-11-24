@@ -551,9 +551,54 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       await expect(run(tool, VISITOR, plain)).resolves.toEqual({ ran: true });
     });
 
+    describe('the tool that runs the caller\'s code ON THE SERVER (browser_run_code: Node\'s vm is not a security boundary, and the browser server inherits the backend\'s environment)', () => {
+      const RUN_CODE = ['playwright_browser_run_code', 'browser_run_code'];
+
+      it.each(RUN_CODE)('OFF link: a visitor may not call %s themselves; the browser tools that run in the page are fine', async (tool) => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run(tool, VISITOR, { code: 'async (page) => 1' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+        expect(dispatch).not.toHaveBeenCalled();
+        for (const inPage of ['playwright_browser_evaluate', 'playwright_browser_navigate', 'playwright_browser_snapshot', 'playwright_browser_click']) {
+          await expect(run(inPage, VISITOR, {})).resolves.toEqual({ ran: true });
+        }
+      });
+
+      it('a link that cannot be read counts as not allowed', async () => {
+        readSession.mockRejectedValue(new Error('throttled'));
+        await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      });
+
+      it('ON link, a legacy dialog link and the owner keep it', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+        await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).resolves.toEqual({ ran: true });
+        readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) }));
+        await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).resolves.toEqual({ ran: true });
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run('playwright_browser_run_code', undefined, { code: 'x' })).resolves.toEqual({ ran: true });
+      });
+
+      it('a call a tool makes ITSELF with code of its own (solve_captcha) is not the visitor writing code: it still runs on an OFF link, and a direct call after it is still refused', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        (service as any).toolRegistry.register({
+          name: 'qa_nested_run_code',
+          definition: { name: 'qa_nested_run_code', description: 'test only', inputSchema: { type: 'object', properties: {} } },
+          execute: async (_args: unknown, ctx: any) => ctx.service.executeTool(ctx.llmModel, 'playwright_browser_run_code', { code: 'fixed code of the tool' }, ctx.userId, ctx.sessionId),
+        });
+        dispatch.mockRestore();
+        dispatch = jest.spyOn((service as any).toolRegistry, 'execute').mockImplementation((async (name: string, args: any, ctx: any) => (name === 'qa_nested_run_code' ? (service as any).toolRegistry.getTool(name).execute(args, ctx) : { ran: true, name })) as any);
+        await expect(run('qa_nested_run_code', VISITOR, {})).resolves.toEqual({ ran: true, name: 'playwright_browser_run_code' });
+        await expect(run('playwright_browser_run_code', VISITOR, { code: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      });
+
+      it('a caller cannot mark its own call as nested: the flag comes from the call stack, never from the context', async () => {
+        readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+        await expect(run('playwright_browser_run_code', { ...VISITOR, nestedInRestrictedCall: true }, { code: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      });
+    });
+
     describe('a visitor who may not use the owner\'s logins has a BROWSER of their own (a chat session\'s browser is pooled under the owner\'s id and kept for an hour)', () => {
-      const browser = (ctx?: Record<string, unknown>, sessionId = 'session-1') => run('playwright_browser_run_code', ctx, { code: 'x' }, sessionId);
-      const poolOf = (toolName = 'playwright_browser_run_code') => dispatch.mock.calls.filter((c) => c[0] === toolName).map((c) => c[2].browserPoolSessionId);
+      const browser = (ctx?: Record<string, unknown>, sessionId = 'session-1') => run('playwright_browser_navigate', ctx, { url: 'https://example.com' }, sessionId);
+      const poolOf = (toolName = 'playwright_browser_navigate') => dispatch.mock.calls.filter((c) => c[0] === toolName).map((c) => c[2].browserPoolSessionId);
 
       it('OFF link: the visitor\'s browser step is pooled under `<session>::visitor`; the owner\'s own step keeps the chat session\'s pool', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));

@@ -8,7 +8,7 @@ import {
   restrictionRefusal,
   sensitiveActionRefusal,
   sensitiveActionScheduleRefusal,
-  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget } from '../services/toolRestrictionProfiles';
+  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isServerSideBrowserCodeTool } from '../services/toolRestrictionProfiles';
 import { AgentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 
 /**
@@ -239,6 +239,11 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       expect(scheduleContentEditTarget('get_leads', { action: 'update', schedule_id: 's1' })).toBeNull();
       expect(scheduleContentEditTarget('manage_scheduled_chat', undefined)).toBeNull();
     });
+  });
+
+  describe('the tool that runs the caller\'s code on the server', () => {
+    it.each(['playwright_browser_run_code', 'browser_run_code', 'x_browser_run_code'])('%s is it', (name) => expect(isServerSideBrowserCodeTool(name)).toBe(true));
+    it.each(['playwright_browser_evaluate', 'playwright_browser_navigate', 'browser_run_code_later', 'run_code', 'mark_browser_session_failed', 'constructor', '', undefined as any, 7 as any])('%p is not', (name) => expect(isServerSideBrowserCodeTool(name)).toBe(false));
   });
 
   describe('a tool that reaches someone only when an argument is set', () => {

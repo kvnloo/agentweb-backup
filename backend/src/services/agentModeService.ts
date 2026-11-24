@@ -12,7 +12,7 @@ import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassi
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser, shouldOfferEvaluationWorkspace } from './evaluationPolicy';
-import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
+import { restrictionRefusal, ToolRestrictionDenied, SHARE_VISITOR_SCHEDULE_PROFILE, scheduleProvenanceUnverifiableRefusal, isSensitiveToolCall, isSensitiveInVisitorScheduleCall, isServerSideBrowserCodeTool, scheduleContentEditTarget, isSensitiveWholeTool, isFullControlGatedWholeTool, isRefusedByScheduleBlockList, sensitiveActionRefusal, sensitiveActionUnverifiableRefusal, normalizeRestrictionClaim, type RestrictionProfileId } from './toolRestrictionProfiles';
 import { readScheduleProvenance, SCHEDULE_WRITE_TOOL_NAMES } from '../utils/scheduleProvenance';
 import { normalizeEmailList } from '../utils/validation';
 import { applyEvaluationWorkspaceListing } from './agentMode/evaluationWorkspaceListing';
@@ -10297,8 +10297,11 @@ export class AgentModeService {
     const own = normalizeRestrictionClaim(extraContext?.restrictionProfile);
     const outer = toolCallRestrictionStore.getStore();
     const inherited = own ? undefined : outer?.restrictionProfile;
-    const context = inherited ? { ...(extraContext ?? {}), restrictionProfile: inherited } : extraContext;
     const profile = own ?? inherited;
+    // A call made while another restricted call is running is NESTED (a tool acting for the visitor with code of its own, such as solve_captcha); a call the
+    // model or the visitor makes directly is not. Set here and never taken from the caller's context.
+    const nested = outer !== undefined;
+    const context = profile ? { ...(extraContext ?? {}), ...(inherited ? { restrictionProfile: inherited } : {}), nestedInRestrictedCall: nested } : extraContext;
     if (!profile) return this.executeToolUnderProfile(llmModel, toolName, args, userId, sessionId, mockMode, context);
     // `withinVisitorCall` stays true for everything nested under a visitor's call, even when a nested call carries a profile of its own.
     const withinVisitorCall = profile === 'share_visitor' || outer?.withinVisitorCall === true;
@@ -10330,6 +10333,18 @@ export class AgentModeService {
     const scheduledRun = await this.scheduledRunRestriction(toolName, sessionId, extraContext, undefined, true);
     if (scheduledRun.refusal) throw new ToolRestrictionDenied(scheduledRun.refusal);
     if (scheduledRun.profile) extraContext = { ...extraContext, restrictionProfile: scheduledRun.profile };
+    // ENG-3170: a visitor who may not run the sensitive tools may not call the tool that runs their code on the server (see isServerSideBrowserCodeTool). A
+    // nested call by a tool with fixed code is allowed; a link that allows the sensitive tools (ON, legacy dialog link) keeps it, as the owner has it.
+    if (isServerSideBrowserCodeTool(toolName) && extraContext?.nestedInRestrictedCall !== true) {
+      const inVisitorSchedule = normalizeRestrictionClaim(extraContext?.restrictionProfile) === SHARE_VISITOR_SCHEDULE_PROFILE;
+      if (isShareVisitor || inVisitorSchedule) {
+        const linkAllows = isShareVisitor && await this.readShareLinkControl(toolName, sessionId).then((control) => control.sensitive, () => false);
+        if (!linkAllows) {
+          console.warn(`AgentMode ENG-3170: refused ${toolName} in session ${sessionId}: it runs the caller's code on the server, and the owner has not turned on full control.`);
+          throw new ToolRestrictionDenied(sensitiveActionRefusal(toolName));
+        }
+      }
+    }
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
