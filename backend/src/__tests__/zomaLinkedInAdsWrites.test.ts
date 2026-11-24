@@ -29,8 +29,8 @@ jest.mock('../mcp/zomaOnboarding', () => ({
 
 import * as realService from '../services/linkedInAdsService';
 import {
-  amountToMicros, ceilingForCurrency, executeLinkedInAdsWrite, linkedInSpendCeilingFromEnv, validateLinkedInAdsWriteShape,
-  type LinkedInAdsWriteDeps,
+  amountToMicros, ceilingForCurrency, DEFAULT_LINKEDIN_SPEND_CEILING, defaultLinkedInAdsWriteDeps, executeLinkedInAdsWrite,
+  linkedInSpendCeilingFromEnv, validateLinkedInAdsWriteShape, type LinkedInAdsWriteDeps,
 } from '../mcp/linkedInAdsToolkitWrites';
 import { handleLinkedInAdsToolkitCall, LINKEDIN_ADS_CALLS_PER_MINUTE } from '../mcp/linkedInAdsToolkitGateway';
 import { LINKEDIN_WRITE_NOT_ENABLED, LINKEDIN_WRITES_NOT_AVAILABLE, type LinkedInAdsSession } from '../mcp/linkedInAdsCall';
@@ -107,6 +107,8 @@ function fakeLinkedIn() {
       if (p.status) c.status = p.status;
       if (p.name) c.name = p.name;
       if (p.daily_budget_amount) c.dailyBudget = money(p.daily_budget_amount, p.daily_budget_currency);
+      if (p.total_budget_amount) c.totalBudget = money(p.total_budget_amount, p.total_budget_currency);
+      if (p.unit_cost_amount) c.unitCost = money(p.unit_cost_amount, p.unit_cost_currency);
       if (p.run_schedule_start) c.runSchedule = { start: p.run_schedule_start, ...(p.run_schedule_end ? { end: p.run_schedule_end } : {}) };
       return ok({});
     }),
@@ -336,12 +338,55 @@ describe('spend ceiling (LINKEDIN_ADS_TOOLKIT_SPEND_CEILING, keyed by currency, 
   const ceiling = (value: unknown) => () => linkedInSpendCeilingFromEnv(typeof value === 'string' ? value : JSON.stringify(value));
   const usd100 = { USD: { maxDailyBudget: 100_000_000 } };
 
-  it('unset or empty means no ceiling, like GOOGLE_TOOLKIT_SPEND_CEILING; nothing new is required', async () => {
-    expect(linkedInSpendCeilingFromEnv(undefined)).toBeNull();
-    expect(linkedInSpendCeilingFromEnv('')).toBeNull();
-    expect(ceilingForCurrency(null, 'USD')).toEqual({ policy: null });
-    const { result } = await twoStep({ ...CAMPAIGN_CREATE, daily_budget: 100000 }, deps(fakeLinkedIn(), { spendCeiling: () => linkedInSpendCeilingFromEnv(undefined) }));
-    expect(result.verification).toBe('CONFIRMED');
+  it('unset or empty is the built-in default (USD only, 50.00 a day, 2x), never "no limit"; nothing new is required', async () => {
+    expect(linkedInSpendCeilingFromEnv(undefined)).toBe(DEFAULT_LINKEDIN_SPEND_CEILING);
+    expect(linkedInSpendCeilingFromEnv('')).toBe(DEFAULT_LINKEDIN_SPEND_CEILING);
+    expect(DEFAULT_LINKEDIN_SPEND_CEILING).toEqual({ byCurrency: { USD: { maxDailyBudget: 50_000_000, maxChangeRatio: 2 } } });
+    // the real deps read the env var at call time
+    const saved = process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING;
+    delete process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING;
+    expect(defaultLinkedInAdsWriteDeps.spendCeiling()).toBe(DEFAULT_LINKEDIN_SPEND_CEILING);
+    process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING = '{"EUR":{"maxDailyBudget":1000000}}';
+    expect(defaultLinkedInAdsWriteDeps.spendCeiling()).toEqual({ byCurrency: { EUR: { maxDailyBudget: 1_000_000 } } });
+    if (saved === undefined) delete process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING; else process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING = saved;
+  });
+
+  it('with the env var unset the default blocks a 51 USD daily budget and lets 50 through', async () => {
+    const unset = () => linkedInSpendCeilingFromEnv(undefined);
+    const li = fakeLinkedIn();
+    await expect(executeLinkedInAdsWrite('u1', { ...CAMPAIGN_CREATE, daily_budget: 51 }, session(), deps(li, { spendCeiling: unset }))).rejects.toThrow(/exceeds this account's max daily budget of 50000000/);
+    expect(li.mutations()).toBe(0);
+    expect((await twoStep({ ...CAMPAIGN_CREATE, daily_budget: 50 }, deps(li, { spendCeiling: unset }))).result.verification).toBe('CONFIRMED');
+    // and what an ACTIVATE unlocks: the live campaign at 80.00/day is over the default
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11' }, session(), deps(li, { spendCeiling: unset }))).resolves.toMatchObject({ status: 'PREVIEW' });
+    li.campaigns['11'].dailyBudget = money('80.00');
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11' }, session(), deps(li, { spendCeiling: unset }))).rejects.toThrow(/Activating would start spend/);
+  });
+
+  it('with the env var unset a non-USD account is refused (the default covers USD only); the env var replaces the default', async () => {
+    const unset = () => linkedInSpendCeilingFromEnv(undefined);
+    const li = fakeLinkedIn();
+    await expect(executeLinkedInAdsWrite('u1', CAMPAIGN_CREATE, session({ currency: 'EUR' }), deps(li, { spendCeiling: unset }))).rejects.toThrow(/does not cover EUR.*\(it covers USD\)/);
+    expect(li.mutations()).toBe(0);
+    const eurOnly = () => linkedInSpendCeilingFromEnv('{"EUR":{"maxDailyBudget":100000000}}');
+    expect((await twoStep(CAMPAIGN_CREATE, deps(li, { spendCeiling: eurOnly }), session({ currency: 'EUR' }))).result.verification).toBe('CONFIRMED');
+    await expect(executeLinkedInAdsWrite('u1', CAMPAIGN_CREATE, session({ currency: 'USD' }), deps(li, { spendCeiling: eurOnly }))).rejects.toThrow(/does not cover USD.*\(it covers EUR\)/);
+  });
+
+  it('maxChangeRatio: raising a live campaign, a total budget or a group total beyond the ratio is refused (the stored budgets are the prior)', async () => {
+    const ratio = ceiling({ USD: { maxChangeRatio: 2 } });
+    const li = fakeLinkedIn();
+    li.campaigns['11'].totalBudget = money('1000.00');
+    const d = () => deps(li, { spendCeiling: ratio });
+    // daily: campaign 12 is ACTIVE at 80.00
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '12', daily_budget: 200 }, session(), d())).rejects.toThrow(/max single-change ratio of 2x/);
+    expect((await twoStep({ entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '12', daily_budget: 160 }, d())).result.verification).toBe('CONFIRMED');
+    // total on a campaign (1000.00 stored)
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '11', total_budget: 2500 }, session(), d())).rejects.toThrow(/lifetime_budget change 1000000000 -> 2500000000/);
+    expect((await twoStep({ entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '11', total_budget: 2000 }, d())).result.verification).toBe('CONFIRMED');
+    // total on a group (500.00 stored)
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN_GROUP', action: 'UPDATE', campaign_group_id: '7', total_budget: 1500 }, session(), d())).rejects.toThrow(/max single-change ratio of 2x/);
+    expect((await twoStep({ entity_type: 'CAMPAIGN_GROUP', action: 'UPDATE', campaign_group_id: '7', total_budget: 1000 }, d())).result.verification).toBe('CONFIRMED');
   });
 
   it('a daily budget above the account currency\'s ceiling is refused with nothing sent; one at or under it passes', async () => {
@@ -540,6 +585,124 @@ describe('LinkedIn refusing the write', () => {
     await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'PAUSE', campaign_id: '12', confirm: true, preview_token: preview.preview_token }, session({ freshToken: true, sleep }), deps(li2)))
       .rejects.toThrow(/needs to be reconnected.*Nothing was changed/);
     expect(li2.api.updateCampaign).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('the ceiling compares money in the account\'s own currency', () => {
+  const usdCeiling = () => linkedInSpendCeilingFromEnv('{"USD":{"maxDailyBudget":1000000000,"maxChangeRatio":10}}');
+  const d = (li: ReturnType<typeof fakeLinkedIn>) => deps(li, { spendCeiling: usdCeiling });
+
+  it('an ACTIVATE whose budget is in another currency, or in none, is refused before the ceiling is applied', async () => {
+    for (const code of ['EUR', undefined]) {
+      const li = fakeLinkedIn();
+      li.campaigns['11'].dailyBudget = { amount: '10.00', currencyCode: code };
+      await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11' }, session(), d(li))).rejects.toThrow(/cannot be checked against the spend ceiling/);
+      // group: one of its live campaigns; creative: its campaign
+      const g = fakeLinkedIn();
+      g.campaigns['12'].dailyBudget = { amount: '10.00', currencyCode: code };
+      g.groups['7'].status = 'PAUSED';
+      await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN_GROUP', action: 'ACTIVATE', campaign_group_id: '7' }, session(), d(g))).rejects.toThrow(/cannot be checked against the spend ceiling/);
+      const c = fakeLinkedIn();
+      c.campaigns['11'].dailyBudget = { amount: '10.00', currencyCode: code };
+      await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CREATIVE', action: 'ACTIVATE', creative_id: '21' }, session(), d(c))).rejects.toThrow(/cannot be checked against the spend ceiling/);
+      expect(li.mutations() + g.mutations() + c.mutations()).toBe(0);
+    }
+  });
+
+  it('an update compared against a stored budget in another currency is refused; the same currency (any letter case) passes', async () => {
+    const li = fakeLinkedIn();
+    li.campaigns['12'].dailyBudget = money('80.00', 'EUR');
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '12', daily_budget: 90 }, session(), d(li))).rejects.toThrow(/in EUR, but this ad account's currency is USD/);
+    li.campaigns['12'].dailyBudget = money('80.00', 'USD');
+    expect((await twoStep({ entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '12', daily_budget: 90 }, d(li))).result.verification).toBe('CONFIRMED');
+  });
+});
+
+describe('a 401 on the service\'s own read-back after an update is not "nothing was changed"', () => {
+  it('is UNCONFIRMED, is not retried (no second POST) and does not claim nothing changed', async () => {
+    const li = fakeLinkedIn();
+    const sleep = jest.fn().mockResolvedValue(undefined);
+    li.api.updateCampaign.mockResolvedValue(fail(401, 'read_back_failed: LinkedIn accepted the update but the read-back request failed', { errorType: 'read_back_failed' }));
+    const { result } = await twoStep({ entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11' }, deps(li), session({ freshToken: true, sleep }));
+    expect(result).toMatchObject({ success: false, verification: 'UNCONFIRMED' });
+    expect(result.message).toMatch(/accepted by LinkedIn but the read-back request failed/);
+    expect(result.message).not.toMatch(/nothing was changed|reconnect/i);
+    expect(li.api.updateCampaign).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('while a 401 on the update itself is still a reconnect refusal (and is the only one retried)', async () => {
+    const li = fakeLinkedIn();
+    li.api.updateCampaign.mockResolvedValue(fail(401, 'revoked'));
+    const preview: any = await executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11' }, session(), deps(li));
+    await expect(executeLinkedInAdsWrite('u1', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11', confirm: true, preview_token: preview.preview_token }, session(), deps(li))).rejects.toThrow(/needs to be reconnected.*Nothing was changed/);
+  });
+});
+
+describe('the preview echoes every value that will be sent', () => {
+  const preview = async (li: ReturnType<typeof fakeLinkedIn>, args: any) => ((await executeLinkedInAdsWrite('u1', args, session(), deps(li))) as any).preview as string;
+  const seededCreative = () => {
+    const li = fakeLinkedIn();
+    li.creatives['21'].content = { textAd: { headline: 'Seed headline', description: 'Seed description', landingPage: 'https://seed.example/lp?utm_source=linkedin', image: 'urn:li:image:SEEDIMG' } };
+    return li;
+  };
+  const cases: Array<{ name: string; li?: () => ReturnType<typeof fakeLinkedIn>; args: any; values: string[] }> = [
+    { name: 'CAMPAIGN_GROUP CREATE', args: { ...GROUP_CREATE, end_time: '2027-03-01T00:00:00Z' }, values: ['Q4', '2026-12-01T09:00:00Z', '2027-03-01T00:00:00Z', '1000'] },
+    {
+      name: 'CAMPAIGN CREATE',
+      args: {
+        ...CAMPAIGN_CREATE, total_budget: 900, end_time: '2027-01-01T00:00:00Z',
+        targeting_exclude: [{ facet_urn: 'urn:li:adTargetingFacet:seniorities', values: ['urn:li:seniority:2', 'urn:li:seniority:3'] }],
+      },
+      values: [
+        '7', 'Launch', 'Brand', 'SPONSORED_UPDATES', 'WEBSITE_VISIT', 'CPC', '7.5', '40', '900', '2026-12-01T09:00:00Z', '2027-01-01T00:00:00Z', 'US', 'en',
+        'NOT_POLITICAL', 'urn:li:adTargetingFacet:locations', 'urn:li:geo:103644278', 'urn:li:adTargetingFacet:seniorities', 'urn:li:seniority:2', 'urn:li:seniority:3',
+      ],
+    },
+    { name: 'CREATIVE CREATE (post)', args: CREATIVE_CREATE, values: ['11', 'Search', 'urn:li:share:7000000001'] },
+    {
+      name: 'CREATIVE CREATE (text ad)',
+      args: { ...CREATIVE_CREATE, post_urn: undefined, headline: 'Hello there', description: 'A longer description', landing_page: 'https://example.com/lp?x=1', image_urn: 'urn:li:image:C4E10AQabc' },
+      values: ['11', 'Hello there', 'A longer description', 'https://example.com/lp?x=1', 'urn:li:image:C4E10AQabc'],
+    },
+    { name: 'CAMPAIGN_GROUP UPDATE', args: { entity_type: 'CAMPAIGN_GROUP', action: 'UPDATE', campaign_group_id: '7', name: 'Renamed group', total_budget: 450 }, values: ['7', 'Launch', 'Renamed group', '450'] },
+    {
+      name: 'CAMPAIGN UPDATE',
+      args: { entity_type: 'CAMPAIGN', action: 'UPDATE', campaign_id: '11', name: 'Renamed', daily_budget: 45, total_budget: 700, unit_cost: 6.25, start_time: '2026-12-20T09:00:00Z', end_time: '2027-02-01T00:00:00Z' },
+      values: ['11', 'Search', 'Renamed', '45', '700', '6.25', '2026-12-20T09:00:00Z', '2027-02-01T00:00:00Z'],
+    },
+    { name: 'CAMPAIGN_GROUP PAUSE', args: { entity_type: 'CAMPAIGN_GROUP', action: 'PAUSE', campaign_group_id: '7' }, values: ['7', 'Launch', 'PAUSED'] },
+    { name: 'CAMPAIGN_GROUP ACTIVATE', args: { entity_type: 'CAMPAIGN_GROUP', action: 'ACTIVATE', campaign_group_id: '7' }, values: ['7', 'Launch', 'ACTIVE', 'Search', 'Live one', '80.00'] },
+    { name: 'CAMPAIGN PAUSE', args: { entity_type: 'CAMPAIGN', action: 'PAUSE', campaign_id: '12' }, values: ['12', 'Live one', 'PAUSED'] },
+    { name: 'CAMPAIGN ACTIVATE', args: { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '11', start_time: '2026-12-15T09:00:00Z' }, values: ['11', 'Search', 'ACTIVE', '2026-12-15T09:00:00Z', '50.00'] },
+    {
+      name: 'CREATIVE PAUSE', li: seededCreative, args: { entity_type: 'CREATIVE', action: 'PAUSE', creative_id: '21' },
+      values: ['21', 'PAUSED', 'Seed headline', 'Seed description', 'https://seed.example/lp?utm_source=linkedin', 'urn:li:image:SEEDIMG'],
+    },
+    {
+      name: 'CREATIVE ACTIVATE (shows what goes live)', li: seededCreative, args: { entity_type: 'CREATIVE', action: 'ACTIVATE', creative_id: '21' },
+      values: ['21', 'ACTIVE', 'Seed headline', 'Seed description', 'https://seed.example/lp?utm_source=linkedin', 'urn:li:image:SEEDIMG', 'Search'],
+    },
+  ];
+
+  it.each(cases)('$name: each submitted value is in the preview', async ({ li, args, values }) => {
+    const text = await preview((li ?? fakeLinkedIn)(), args);
+    for (const value of values) expect(text).toContain(value);
+  });
+
+  it('a creative that references a post shows the post on ACTIVATE', async () => {
+    const li = fakeLinkedIn();
+    li.creatives['21'].content = { reference: 'urn:li:share:555' };
+    expect(await preview(li, { entity_type: 'CREATIVE', action: 'ACTIVATE', creative_id: '21' })).toContain('urn:li:share:555');
+  });
+
+  it('the token is bound to what the preview showed: a creative whose content changed since cannot be activated with the old token', async () => {
+    const li = seededCreative();
+    const args = { entity_type: 'CREATIVE', action: 'ACTIVATE', creative_id: '21' };
+    const first: any = await executeLinkedInAdsWrite('u1', args, session(), deps(li));
+    li.creatives['21'].content.textAd.landingPage = 'https://evil.example/phish';
+    await expect(executeLinkedInAdsWrite('u1', { ...args, confirm: true, preview_token: first.preview_token }, session(), deps(li))).rejects.toThrow(/does not match these arguments/);
+    expect(li.mutations()).toBe(0);
   });
 });
 
