@@ -45,9 +45,10 @@ import { listAdAccounts } from '../services/linkedInAdsService';
 import { getJwtSecret } from '../config/jwt';
 import { rateLimiter } from '../middleware/rateLimiter';
 import {
-  completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, maskEmail, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps,
+  completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps,
 } from '../mcp/zomaLinkedInAdsConnect';
-import { finalizeLinkedInAdsOAuth } from '../services/linkedInAdsOAuthFinalize';
+import { connectLinkedInAdsAccounts, finalizeLinkedInAdsOAuth } from '../services/linkedInAdsOAuthFinalize';
+import type { LinkedInTokenDeps } from '../services/linkedInAdsCredentials';
 import { defaultZomaLinkCodec, ZOMA_LINKEDIN_CALLBACK_PATH, ZOMA_LINKEDIN_SELECT_PATH, ZOMA_MCP_SETUP } from '../mcp/zomaSetupLinks';
 import { ZOMA_BACK_TO_AGENT } from '../mcp/zomaDeviceFlow';
 
@@ -167,7 +168,7 @@ describe('the Zoma pages: user bound from the verified state, invalid links get 
       tokenSessionId: 'sess1', listFailed: false,
       adAccounts: [{ id: '5001', name: 'Acme', currency: 'EUR', status: 'ACTIVE' }],
     }),
-    connect: jest.fn().mockResolvedValue({ ok: true, accounts: [{}], kept: [] }),
+    connect: jest.fn().mockResolvedValue({ ok: true, accounts: [{}], kept: [], replaced: [] }),
     mintLink: jest.fn().mockResolvedValue('https://www.linkedin.com/oauth/v2/authorization?state=retry'),
     getUserEmail: jest.fn().mockResolvedValue('mvarma@argusoft.com'),
     enabled: () => true,
@@ -201,15 +202,15 @@ describe('the Zoma pages: user bound from the verified state, invalid links get 
     expect(d.connect).not.toHaveBeenCalled();
   });
 
-  it('even a single ad account is never connected on arrival: the page names the Zoma account (masked) and waits for an explicit Connect', async () => {
+  it('even a single ad account is never connected on arrival: the page names the Zoma account (full email) and waits for an explicit Connect', async () => {
     const d = deps();
     const step: any = await completeLinkedInAdsConnect({ code: 'the-code', state: zomaState('user-42') }, d);
     expect(d.finalize).toHaveBeenCalledWith('user-42', 'the-code');
     expect(d.connect).not.toHaveBeenCalled();
     expect(step).toMatchObject({ kind: 'pick_account', action: ZOMA_LINKEDIN_SELECT_PATH, submitLabel: 'Connect' });
     expect(step.accounts).toEqual([{ account_id: '5001', name: 'Acme', currency: 'EUR' }]);
-    expect(step.message).toContain('the Zoma account m***@argusoft.com');
-    expect(step.message).not.toContain('mvarma');
+    expect(step.message).toContain('the Zoma account mvarma@argusoft.com');
+    expect(step.message).not.toContain('***');
     expect(step.message).toMatch(/Only continue if that is your Zoma account/);
     expect(d.getUserEmail).toHaveBeenCalledWith('user-42');
     // The click is what connects, for the user named in the signed picker link, and nobody else.
@@ -219,25 +220,43 @@ describe('the Zoma pages: user bound from the verified state, invalid links get 
     expect(done.message).toContain('no campaign was created and nothing was spent');
   });
 
-  it('with no email on file the page still names which account, and never invents one; masking keeps the first letter and the domain only', async () => {
-    const step: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('u9') }, deps({ getUserEmail: jest.fn().mockResolvedValue(undefined) }));
-    expect(step.kind).toBe('pick_account');
-    expect(step.message).toContain('the Zoma account that asked for this link');
-    const broken: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('u9') }, deps({ getUserEmail: jest.fn().mockRejectedValue(new Error('db down')) }));
-    expect(broken.kind).toBe('pick_account');
-    expect(maskEmail('mvarma@argusoft.com')).toBe('m***@argusoft.com');
-    expect(maskEmail('a@b.co')).toBe('a***@b.co');
-    for (const bad of ['', 'nope', '@x.com', 'a b@x.com', undefined, 42]) expect(maskEmail(bad)).toBeNull();
+  it('two different accounts that a mask would have shown identically get two different pages (the full address is shown)', async () => {
+    const emails: Record<string, string> = { 'user-a': 'mvarma@argusoft.com', 'user-b': 'mmarcos@argusoft.com' };
+    const d = deps({ getUserEmail: jest.fn(async (id: string) => emails[id]) });
+    const a: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('user-a') }, d);
+    const b: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('user-b') }, d);
+    expect(a.message).toContain('mvarma@argusoft.com');
+    expect(b.message).toContain('mmarcos@argusoft.com');
+    expect(a.message).not.toBe(b.message);
+    // the old shape ("m***@argusoft.com") would have been the same for both
+    expect(`${a.message}${b.message}`).not.toMatch(/\*\*\*/);
   });
 
-  it('the shared page shows the masked account and an explicit Connect button, not the generic Continue', async () => {
+  it('an account with no usable email is not connected at all: the generic invalid-link page, and the OAuth code is never exchanged', async () => {
+    for (const getUserEmail of [jest.fn().mockResolvedValue(undefined), jest.fn().mockResolvedValue(''), jest.fn().mockResolvedValue('not-an-address'), jest.fn().mockRejectedValue(new Error('db down')), undefined]) {
+      const d = deps({ getUserEmail: getUserEmail as any });
+      const step: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('u9') }, d);
+      expect(step).toMatchObject({ kind: 'page', status: 400, title: 'Zoma setup' });
+      expect(step.message).toContain('LinkedIn Ads connection link is invalid or has expired');
+      expect(d.finalize).not.toHaveBeenCalled();
+      expect(d.connect).not.toHaveBeenCalled();
+    }
+    // and a picker link whose account lost its email cannot be used either
+    const ok = deps();
+    const picker: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState('u9') }, ok);
+    const gone = deps({ getUserEmail: jest.fn().mockResolvedValue(undefined) });
+    expect(await selectLinkedInAdsAccounts({ t: picker.token, account_id: 'not-offered' }, gone)).toMatchObject({ kind: 'page', status: 400 });
+  });
+
+  it('the shared page shows the Zoma account\'s full email and an explicit Connect button, not the generic Continue', async () => {
     const d = deps();
     const app = express();
     app.use(express.urlencoded({ extended: false }));
     app.use('/api/zoma', createZomaRouter(undefined, undefined, undefined, d));
     const res = await request(app).get('/api/zoma/linkedin/callback').query({ code: 'c', state: zomaState('user-5') });
     expect(res.status).toBe(200);
-    expect(res.text).toContain('m***@argusoft.com');
+    expect(res.text).toContain('mvarma@argusoft.com');
+    expect(res.text).not.toContain('m***');
     expect(res.text).toMatch(/<button type="submit">Connect<\/button>/);
     expect(res.text).not.toMatch(/<button type="submit">Continue<\/button>/);
     expect(res.text).toContain('action="/api/zoma/linkedin/select"');
@@ -388,11 +407,42 @@ describe('a failed ad account list is not "you have no ad account"', () => {
     expect(await finalizeLinkedInAdsOAuth({ userId: 'u1', code: 'c' })).toMatchObject({ adAccounts: [], listFailed: false });
   });
 
+  it('LinkedIn answering 401/403 (access not approved) is told differently from a temporary failure', async () => {
+    const page = (listStatus?: number) => completeLinkedInAdsConnect({ code: 'c', state: zomaState() }, {
+      ...defaultZomaLinkedInAdsDeps,
+      finalize: jest.fn().mockResolvedValue({ tokenSessionId: 's', adAccounts: [], listFailed: true, listStatus }),
+      mintLink: jest.fn().mockResolvedValue('https://www.linkedin.com/oauth/v2/authorization?state=retry'),
+      getUserEmail: jest.fn().mockResolvedValue('a@b.co'),
+      enabled: () => true,
+    }) as Promise<any>;
+    for (const status of [401, 403]) {
+      const step = await page(status);
+      expect(step).toMatchObject({ status: 403, retryUrl: expect.any(String) });
+      expect(step.message).toMatch(/access Zoma asked for was not approved/);
+      expect(step.message).toMatch(/approve every permission/);
+      expect(step.message).not.toMatch(/temporary/);
+    }
+    for (const status of [429, 500, 503, undefined]) {
+      const step = await page(status);
+      expect(step).toMatchObject({ status: 502, retryUrl: expect.any(String) });
+      expect(step.message).toMatch(/usually temporary/);
+      expect(step.message).not.toMatch(/not approved/);
+    }
+  });
+
+  it('the service passes LinkedIn\'s status along (and only when the list failed)', async () => {
+    (listAdAccounts as jest.Mock).mockResolvedValue({ success: false, status: 403, error: 'denied' });
+    expect(await finalizeLinkedInAdsOAuth({ userId: 'u1', code: 'c' })).toMatchObject({ listFailed: true, listStatus: 403 });
+    (listAdAccounts as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
+    expect(await finalizeLinkedInAdsOAuth({ userId: 'u1', code: 'c' })).not.toHaveProperty('listStatus');
+  });
+
   it('the Zoma page says it could not read the accounts and offers a retry, never the create-an-account steps', async () => {
     const d: ZomaLinkedInAdsDeps = {
       ...defaultZomaLinkedInAdsDeps,
       finalize: jest.fn().mockResolvedValue({ tokenSessionId: 's', adAccounts: [], listFailed: true }),
       mintLink: jest.fn().mockResolvedValue('https://www.linkedin.com/oauth/v2/authorization?state=retry'),
+      getUserEmail: jest.fn().mockResolvedValue('a@b.co'),
       enabled: () => true,
     };
     const step: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState() }, d);
@@ -407,7 +457,7 @@ describe('a Zoma reconnect never narrows an existing connection', () => {
   const PORTAL_SCOPES = ['r_basicprofile', 'r_ads', 'rw_ads', 'r_ads_reporting', 'r_organization_social', 'w_organization_social'];
   const portalRow = (over: Record<string, unknown> = {}) => ({
     platform: 'linkedin_ads', account_id: '5001', account_name: 'Acme',
-    config: { account_type: 'ad_account', currency: 'EUR', status: 'ACTIVE', access_token: 'PORTAL-ACCESS', refresh_token: 'PORTAL-REFRESH', scopes: PORTAL_SCOPES, ...over },
+    config: { account_type: 'ad_account', currency: 'EUR', status: 'ACTIVE', access_token: 'PORTAL-ACCESS', refresh_token: 'PORTAL-REFRESH', token_expires_at: Date.now() + 40 * 86400000, scopes: PORTAL_SCOPES, ...over },
   });
   const scopesOf = (url: string) => new URL(url).searchParams.get('scope')!.split(' ');
 
@@ -422,6 +472,34 @@ describe('a Zoma reconnect never narrows an existing connection', () => {
     expect(scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1')).sort()).toEqual(['r_ads', 'r_ads_reporting', 'r_basicprofile']);
     (getAccountsByUserId as jest.Mock).mockRejectedValue(new Error('db down'));
     expect(scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1')).sort()).toEqual(['r_ads', 'r_ads_reporting', 'r_basicprofile']);
+  });
+
+  it('carries over only stored scopes the configured Ads list still names (a stale scope is never requested forever)', async () => {
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ scopes: [...PORTAL_SCOPES, 'r_legacy_scope', 'w_member_social'] })]);
+    process.env.ZOMA_LINKEDIN_ADS_ENABLED = 'read';
+    const asked = scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1'));
+    expect(asked).not.toContain('r_legacy_scope');
+    expect(asked).not.toContain('w_member_social');
+    expect([...asked].sort()).toEqual([...PORTAL_SCOPES].sort());
+  });
+
+  it('read mode never asks for rw_ads on its own: only a connection that already holds it carries it', async () => {
+    process.env.ZOMA_LINKEDIN_ADS_ENABLED = 'read';
+    const withoutWrite = PORTAL_SCOPES.filter((scope) => scope !== 'rw_ads');
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ scopes: withoutWrite })]);
+    const asked = scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1'));
+    expect(asked).not.toContain('rw_ads');
+    expect(asked).toEqual(expect.arrayContaining(['r_organization_social', 'w_organization_social']));
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([]);
+    expect(scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1'))).not.toContain('rw_ads');
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow()]); // this one holds rw_ads
+    expect(scopesOf(await defaultZomaLinkedInAdsDeps.mintLink('u1'))).toContain('rw_ads');
+    // and what is recorded for a read-mode connect is never wider than what was asked for
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ scopes: withoutWrite })]);
+    mockAxiosPost.mockResolvedValue({ data: { access_token: 'a', refresh_token: 'r', expires_in: 3600 } });
+    const finalized = await defaultZomaLinkedInAdsDeps.finalize('u1', 'c');
+    await defaultZomaLinkedInAdsDeps.connect('u1', finalized.tokenSessionId, [{ adAccountId: '9999', adAccountName: 'Other', currency: 'USD', status: 'ACTIVE' }]);
+    expect((createAccount as jest.Mock).mock.calls.at(-1)![2].config.scopes).not.toContain('rw_ads');
   });
 
   it('stores the scopes LinkedIn actually granted when it says so, otherwise the requested set', async () => {
@@ -449,8 +527,69 @@ describe('a Zoma reconnect never narrows an existing connection', () => {
     const step: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState() }, { ...d, finalize: jest.fn().mockResolvedValue({ tokenSessionId: 's', listFailed: false, adAccounts: [{ id: '5001', name: 'Acme', currency: 'EUR', status: 'ACTIVE' }] }) });
     const done: any = await selectLinkedInAdsAccounts({ t: step.token, account_id: '5001' }, d);
     expect(done).toMatchObject({ kind: 'page', status: 200, done: true });
-    expect(done.message).toMatch(/already connected with wider access.*nothing was replaced/);
+    expect(done.message).toMatch(/already connected with wider access that still works.*left exactly as it was/);
     expect(done.message).not.toMatch(/is connected to Zoma/);
+  });
+
+  describe('a "kept" row must still work: a dead one is replaced, not hidden', () => {
+    const narrowGrant = async () => {
+      process.env.ZOMA_LINKEDIN_ADS_ENABLED = 'read';
+      mockAxiosPost.mockResolvedValue({ data: { access_token: 'ZOMA-ACCESS', refresh_token: 'ZOMA-REFRESH', expires_in: 3600, scope: 'r_ads,r_ads_reporting,r_basicprofile' } });
+      return defaultZomaLinkedInAdsDeps.finalize('u1', 'c');
+    };
+    const choice = [{ adAccountId: '5001', adAccountName: 'Acme', currency: 'EUR', status: 'ACTIVE' }];
+    const tokenDeps = (over: Partial<LinkedInTokenDeps> = {}): LinkedInTokenDeps => ({
+      now: () => Date.now(),
+      loadOAuthConfig: jest.fn().mockResolvedValue({ clientId: 'cid', clientSecret: 'CLIENT-SECRET' }),
+      refresh: jest.fn().mockResolvedValue({ access_token: 'renewed', refresh_token: 'renewed-rt', expires_in: 5183944 }),
+      saveTokens: jest.fn().mockResolvedValue(undefined),
+      ...over,
+    });
+
+    it('a dead portal row (expired, no refresh token) with wider scopes is replaced by the narrower new grant, and the page says so', async () => {
+      (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ token_expires_at: Date.now() - 86400000, refresh_token: undefined })]);
+      const finalized = await narrowGrant();
+      const result: any = await connectLinkedInAdsAccounts({ userId: 'u1', tokenSessionId: finalized.tokenSessionId, accounts: choice, keepWiderExisting: true, tokenDeps: tokenDeps() });
+      expect(result).toMatchObject({ ok: true, kept: [], replaced: ['5001'] });
+      expect(createAccount).toHaveBeenCalledTimes(1);
+      expect((createAccount as jest.Mock).mock.calls[0][2]).toMatchObject({ account_id: '5001', config: { access_token: 'ZOMA-ACCESS', scopes: ['r_ads', 'r_ads_reporting', 'r_basicprofile'] } });
+      const d: ZomaLinkedInAdsDeps = { ...defaultZomaLinkedInAdsDeps, connect: jest.fn().mockResolvedValue(result), enabled: () => true, getUserEmail: jest.fn().mockResolvedValue('a@b.co') };
+      const step: any = await completeLinkedInAdsConnect({ code: 'c', state: zomaState() }, { ...d, finalize: jest.fn().mockResolvedValue({ tokenSessionId: 's', listFailed: false, adAccounts: [{ id: '5001', name: 'Acme', currency: 'EUR', status: 'ACTIVE' }] }) });
+      const done: any = await selectLinkedInAdsAccounts({ t: step.token, account_id: '5001' }, d);
+      expect(done).toMatchObject({ kind: 'page', status: 200, done: true });
+      expect(done.message).toMatch(/had expired or been revoked and could not be used, so this new connection replaced it/);
+      expect(done.message).toMatch(/fewer permissions/);
+      expect(done.message).not.toMatch(/left exactly as/);
+    });
+
+    it('a row whose token expired but whose refresh succeeds still works: it is kept (and its refreshed tokens saved)', async () => {
+      (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ token_expires_at: Date.now() - 1000 })]);
+      const finalized = await narrowGrant();
+      const deps = tokenDeps();
+      const result: any = await connectLinkedInAdsAccounts({ userId: 'u1', tokenSessionId: finalized.tokenSessionId, accounts: choice, keepWiderExisting: true, tokenDeps: deps });
+      expect(result).toMatchObject({ ok: true, accounts: [], kept: ['5001'], replaced: [] });
+      expect(deps.refresh).toHaveBeenCalledTimes(1);
+      expect(deps.saveTokens).toHaveBeenCalledTimes(1);
+      expect(createAccount).not.toHaveBeenCalled();
+    });
+
+    it('a row whose refresh is rejected is dead and replaced; an unreachable LinkedIn is no answer either way, so nothing is written', async () => {
+      (getAccountsByUserId as jest.Mock).mockResolvedValue([portalRow({ token_expires_at: Date.now() - 1000 })]);
+      jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      let finalized = await narrowGrant();
+      const rejected = Object.assign(new Error('Request failed with status code 400'), { response: { status: 400 } });
+      const dead: any = await connectLinkedInAdsAccounts({
+        userId: 'u1', tokenSessionId: finalized.tokenSessionId, accounts: choice, keepWiderExisting: true, tokenDeps: tokenDeps({ refresh: jest.fn().mockRejectedValue(rejected) }),
+      });
+      expect(dead).toMatchObject({ ok: true, kept: [], replaced: ['5001'] });
+      expect(createAccount).toHaveBeenCalledTimes(1);
+      (createAccount as jest.Mock).mockClear();
+      finalized = await narrowGrant();
+      await expect(connectLinkedInAdsAccounts({
+        userId: 'u1', tokenSessionId: finalized.tokenSessionId, accounts: choice, keepWiderExisting: true, tokenDeps: tokenDeps({ refresh: jest.fn().mockRejectedValue(new Error('ECONNRESET')) }),
+      })).rejects.toMatchObject({ kind: 'temporary' });
+      expect(createAccount).not.toHaveBeenCalled();
+    });
   });
 
   it('a grant that covers everything the row holds replaces it (the reconnect is allowed to refresh the token); another account is unaffected', async () => {

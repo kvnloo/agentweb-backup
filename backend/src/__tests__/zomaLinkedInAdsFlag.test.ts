@@ -276,6 +276,23 @@ describe('flag "read": reads on, writes not listed, not routable, refused', () =
     expect(JSON.stringify(r)).not.toMatch(/LI-ACCESS-SECRET|LI-REFRESH-SECRET/);
   });
 
+  it('an existing usable connection that already holds the read scopes is the connection: ready, and no connect link is minted', async () => {
+    const deps = onboardingDeps([liAccount()]); // a portal-style row: every scope, live token
+    const r: any = await getZomaReadiness('u1', deps);
+    expect(r.linkedin_ads).toMatchObject({ available: true, ready: true, accounts: [{ account_id: '5001' }] });
+    expect(r.linkedin_ads).not.toHaveProperty('link');
+    expect(deps.buildLinkedInAdsConnectUrl).not.toHaveBeenCalled();
+    // a row that cannot read reports (r_ads_reporting is missing) is not what the mode needs: it is offered a link
+    const partial = onboardingDeps([liAccount({ scopes: ['r_ads'] })]);
+    const p: any = await getZomaReadiness('u1', partial);
+    expect(p.linkedin_ads).toMatchObject({ ready: false, link: expect.stringContaining('linkedin.com') });
+    expect(partial.buildLinkedInAdsConnectUrl).toHaveBeenCalledTimes(1);
+    // a row that never recorded its scopes is not judged
+    const unknown = onboardingDeps([liAccount({ scopes: undefined })]);
+    expect(((await getZomaReadiness('u1', unknown)) as any).linkedin_ads).toMatchObject({ ready: true });
+    expect(unknown.buildLinkedInAdsConnectUrl).not.toHaveBeenCalled();
+  });
+
   it('zoma_status with no LinkedIn connection mints the connect link and offers it', async () => {
     const deps = onboardingDeps([]);
     const r: any = await getZomaReadiness('u1', deps);
