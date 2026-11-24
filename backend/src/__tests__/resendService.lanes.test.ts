@@ -1,10 +1,10 @@
 /**
  * ENG-2840 — two lanes in the shared email queue.
  *
- * Every platform email waits in ONE paced queue. Without lanes a burst of automated mail (a GTM status report to many
- * contacts, sent by an agent over MCP) makes a password reset wait behind all of it. These tests pin the behaviour that
- * removes that: transactional mail is served first, bulk mail is bounded and never starves, and a caller that says nothing
- * behaves exactly as before.
+ * Every platform email waits in ONE paced queue. One GTM report sends one email at a time, but when several senders overlap
+ * (several reports at once, or later several outside agents over MCP) a password reset could wait behind all of their mail.
+ * These tests pin the behaviour that prevents that: transactional mail is served first, bulk mail is bounded and never
+ * starves, and a caller that says nothing behaves exactly as before.
  *
  * Every test holds one send "in flight" (the held first email) so the rest queue up, then releases it and reads the order
  * in which Resend was called. The pacing delay is set to 0 so the order is the only thing measured.

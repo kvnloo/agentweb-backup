@@ -517,8 +517,8 @@ describe('GTM Plan Notification Service', () => {
     });
   });
 
-  // ENG-2840 PR A: automated mail nobody is waiting on goes in the bulk lane of the shared email queue, so a burst of reports can
-  // never delay a password reset or a support reply. A full bulk lane refuses at once; that is one failed recipient, never a throw.
+  // ENG-2840 PR A: automated mail can wait a few seconds, so the GTM emails go in the bulk lane of the shared email queue: several
+  // reports at once can never delay a password reset or a support reply. A full bulk lane refuses at once; that is one failed recipient, never a throw.
   describe('Emails wait in the bulk lane', () => {
     const plan: any = {
       planId: 'plan-l', userId: 'user-1', title: 'Lane Plan', status: 'in_progress', dri: 'plan-poc@example.com',

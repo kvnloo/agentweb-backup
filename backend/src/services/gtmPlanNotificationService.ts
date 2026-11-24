@@ -226,7 +226,7 @@ This is an automated notification from AgentWeb.
           subject,
           html,
           text,
-          // ENG-2840: automated mail nobody is waiting on waits behind password resets and support replies
+          // ENG-2840: automated mail can wait a few seconds, so it queues behind password resets and support replies, not the other way round
           lane: 'bulk',
         });
       } catch (emailError: any) {

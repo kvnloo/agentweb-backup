@@ -24,12 +24,13 @@ export interface ReceivedEmailAuthentication {
 }
 
 /**
- * ENG-2840: which line an email waits in. Every email shares ONE paced queue (2 a second), so without lanes a burst of
- * automated mail (a GTM status report to many contacts) makes a password reset or a support reply wait behind all of it.
+ * ENG-2840: which line an email waits in. Every email shares ONE paced queue (2 a second). One GTM report sends one email at
+ * a time, so on its own it holds a single slot; but when several senders overlap (several reports at once, later several
+ * outside agents each emailing many contacts) a password reset or a support reply could wait behind all of their mail.
  *
  *  - `transactional` (the default for every caller that says nothing): mail a person is waiting for. Always served first.
  *    Not bounded, exactly as before this change.
- *  - `bulk`: automated or agent-triggered mail nobody is waiting on. Served after the transactional lane (with a guaranteed
+ *  - `bulk`: automated or agent-triggered mail that can wait a few seconds. Served after the transactional lane (with a guaranteed
  *    slot, see BULK_SLOT_EVERY) and bounded: a full lane rejects at once instead of growing without limit.
  */
 export type EmailLane = 'transactional' | 'bulk';
@@ -466,7 +467,7 @@ class ResendService {
     html?: string;
     text?: string;
     inReplyTo?: string;
-    /** ENG-2840: `bulk` for automated mail nobody is waiting on; absent = transactional. */
+    /** ENG-2840: `bulk` for automated mail that can wait a few seconds; absent = transactional. */
     lane?: EmailLane;
   }) {
     const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
