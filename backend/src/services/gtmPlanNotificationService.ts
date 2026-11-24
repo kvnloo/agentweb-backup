@@ -226,6 +226,8 @@ This is an automated notification from AgentWeb.
           subject,
           html,
           text,
+          // ENG-2840: automated mail can wait a few seconds, so it queues behind password resets and support replies, not the other way round
+          lane: 'bulk',
         });
       } catch (emailError: any) {
         console.error(`Failed to send notification to ${recipient}:`, emailError);
@@ -450,6 +452,8 @@ This is an automated status report from AgentWeb.
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
         // outside production the email guard resolves a send it held back: that is not a delivery
         if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
@@ -732,6 +736,8 @@ This is an automated status report from AgentWeb.
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
         // outside production the email guard resolves a send it held back: that is not a delivery
         if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;

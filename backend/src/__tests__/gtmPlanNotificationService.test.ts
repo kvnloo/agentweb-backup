@@ -517,6 +517,58 @@ describe('GTM Plan Notification Service', () => {
     });
   });
 
+  // ENG-2840 PR A: automated mail can wait a few seconds, so the GTM emails go in the bulk lane of the shared email queue: several
+  // reports at once can never delay a password reset or a support reply. A full bulk lane refuses at once; that is one failed recipient, never a throw.
+  describe('Emails wait in the bulk lane', () => {
+    const plan: any = {
+      planId: 'plan-l', userId: 'user-1', title: 'Lane Plan', status: 'in_progress', dri: 'plan-poc@example.com',
+      phases: [
+        { id: 'phase-a', title: 'A', dri: 'a-poc@example.com', status: 'in_progress', workItems: [] },
+        { id: 'phase-b', title: 'B', dri: 'b-poc@example.com', status: 'in_progress', workItems: [] },
+      ],
+    };
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+    });
+
+    const lanesOfEverySend = () => (mockResendService.sendSystemEmail as jest.Mock).mock.calls.map((call) => call[0].lane);
+
+    it('work item update notifications use the bulk lane, one send per recipient', async () => {
+      await sendGTMPlanUpdateNotifications(mockPlan, 'phase-1', 'item-1', { dueDate: '2024-12-31' }, {
+        notifyUser: true, notifyItemPoc: true, notifyPhasePoc: true, notifyPlanPoc: true,
+      });
+      expect(lanesOfEverySend()).toEqual(['bulk', 'bulk', 'bulk', 'bulk']);
+    });
+
+    it('a phase status report uses the bulk lane for every recipient', async () => {
+      await sendPhaseStatusReport(plan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true });
+      expect(lanesOfEverySend()).toEqual(['bulk', 'bulk', 'bulk']);
+    });
+
+    it('a plan status report uses the bulk lane for every recipient', async () => {
+      await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true });
+      expect(lanesOfEverySend()).toEqual(['bulk', 'bulk', 'bulk', 'bulk']);
+    });
+
+    it('a full bulk lane is counted as failed recipients, reported honestly, and never thrown (phase and plan report)', async () => {
+      const full: any = new Error('The bulk email queue is full (100 waiting). Nothing was sent. Try again in a minute.');
+      full.code = 'EMAIL_QUEUE_FULL';
+      (mockResendService.sendSystemEmail as jest.Mock).mockRejectedValue(full);
+
+      expect(await sendPhaseStatusReport(plan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true }))
+        .toEqual({ recipients: 3, sent: 0, failed: 3 });
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 4, sent: 0, failed: 4 });
+    });
+
+    it('a full bulk lane does not stop the update notifications from returning (they never throw)', async () => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockRejectedValue(Object.assign(new Error('queue full'), { code: 'EMAIL_QUEUE_FULL' }));
+      await expect(sendGTMPlanUpdateNotifications(mockPlan, 'phase-1', 'item-1', { dueDate: '2024-12-31' }, { notifyUser: true })).resolves.toBeUndefined();
+    });
+  });
+
   // ENG-2840 W2-4: the three emails put plan, phase and work item text and the optional message into HTML. That text is written by people
   // and by outside agents; it must arrive as text, never as markup or a link from AgentWeb's system sender.
   describe('Email HTML escapes what a caller wrote', () => {
