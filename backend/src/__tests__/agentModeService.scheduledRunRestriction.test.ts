@@ -229,11 +229,18 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('hands the profile to a schedule-writing tool, so its own write carries the claim (a marked run cannot lift or launder)', async () => {
       marked();
-      for (const tool of ['manage_scheduled_chat', 'submit_scheduled_chat_variables', 'create_schedule_from_template', 'manage_schedule_template']) {
+      for (const tool of ['manage_scheduled_chat', 'submit_scheduled_chat_variables', 'manage_schedule_template']) {
         dispatch.mockClear();
         await run(tool, { isUnattendedRun: true });
         expect(dispatch.mock.calls[0][2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', isUnattendedRun: true });
       }
+    });
+
+    it('a marked run is refused create_schedule_from_template outright (the new schedule would inherit the template\'s recipients)', async () => {
+      marked();
+      dispatch.mockClear();
+      await expect(run('create_schedule_from_template', { isUnattendedRun: true })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
     });
 
     it('does not mutate the caller\'s (frozen) tool context, as live voice passes one', async () => {
@@ -454,6 +461,26 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       await (service as any).executeTool('gpt-4', BROWSER, { code: 'x' }, 'owner-user-id', 'other-run-session', false, { isUnattendedRun: true });
       expect(dispatch.mock.calls.filter((c) => c[0] === BROWSER).map((c) => c[2].restrictionProfile)).toEqual([undefined, 'share_visitor_schedule']);
       await expect(runWith('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
+    it('a run of a visitor-made schedule may not edit ANOTHER schedule that emails other people (it has no link that could allow it)', async () => {
+      marked();
+      const OTHER = 'schedule-of-the-owner';
+      getSchedule.mockImplementation(async (id: string) => (id === OTHER
+        ? ({ scheduleId: OTHER, userId: 'owner-user-id', emailNotifications: ['client@example.com'] } as any)
+        : ({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance: ['startingMessage'], emailNotifications: [] } as any)));
+      const edit = { action: 'update', schedule_id: OTHER, starting_message: 'new prompt' };
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(runWith('submit_scheduled_chat_variables', { isUnattendedRun: true }, { schedule_id: OTHER, variable_values: {} })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('...and it still edits a schedule that emails nobody else, and an UNMARKED schedule (the owner\'s own) edits anything as before', async () => {
+      marked();
+      getSchedule.mockImplementation(async (id: string) => ({ scheduleId: id, userId: 'owner-user-id', provenance: id === SCHEDULE_ID ? ['startingMessage'] : undefined, emailNotifications: [] } as any));
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, { action: 'update', schedule_id: 'another', starting_message: 'p' })).resolves.toEqual({ ran: true });
+      getSchedule.mockImplementation(async (id: string) => ({ scheduleId: id, userId: 'owner-user-id', emailNotifications: ['client@example.com'] } as any));
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, { action: 'update', schedule_id: 'another', starting_message: 'p' })).resolves.toEqual({ ran: true });
     });
 
     it('Meta: a MARKED schedule may read the ad account but not write to it (an unattended write is staged for an approver who is not the owner)', async () => {

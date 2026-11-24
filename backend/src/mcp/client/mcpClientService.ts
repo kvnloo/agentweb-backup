@@ -985,7 +985,12 @@ export class McpClientService {
             execute: async (args: any, context: ToolContext) => {
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
+              const startEpoch = this.sessionEpoch(context.sessionId);
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                if (attempt > 1 && this.sessionEpoch(context.sessionId) !== startEpoch) {
+                  lastError = new Error('The browser for this chat was reset because the person driving it changed, so this step was not retried.');
+                  break;
+                }
                 let sessionClient: Client | undefined;
                 try {
                   const toolArgs = { ...args };
@@ -1095,7 +1100,25 @@ export class McpClientService {
    * bare session id must also release its compound pools — otherwise this
    * no-ops for exactly the per-session browser processes it exists to reclaim.
    */
+  /**
+   * ENG-3170: counts the FORCED releases of a chat session's browser. A browser tool call retries on a connection error (the browser died), and a call that is
+   * still running when the session's browser is force-released (the person driving it changed) fails with exactly that error: its retry would reconnect to a NEW
+   * pool and run the same code in the browser the next person has just logged in. A call remembers the epoch it started in and does not retry into a later one.
+   */
+  private sessionEpochs = new Map<string, number>();
+  private sessionEpoch(chatSessionId: string): number { return this.sessionEpochs.get(chatSessionId) ?? 0; }
+  private bumpSessionEpoch(chatSessionId: string): void {
+    this.sessionEpochs.delete(chatSessionId);
+    this.sessionEpochs.set(chatSessionId, Date.now() * 1000 + (this.sessionEpochs.size % 1000));
+    while (this.sessionEpochs.size > 10_000) {
+      const oldest = this.sessionEpochs.keys().next().value;
+      if (oldest === undefined) break;
+      this.sessionEpochs.delete(oldest);
+    }
+  }
+
   async releaseSessionClients(chatSessionId: string, options?: { force?: boolean }): Promise<{ released: number; skippedInFlight: number }> {
+    if (options?.force === true) this.bumpSessionEpoch(chatSessionId);
     const suffix = `::${chatSessionId}`;
     const poolKeys = Array.from(this.sessionClientPools.keys()).filter(
       key => key === chatSessionId || key.endsWith(suffix)
@@ -1637,7 +1660,12 @@ export class McpClientService {
         execute: async (args: any, context: ToolContext) => {
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
+          const startEpoch = this.sessionEpoch(context.sessionId);
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (attempt > 1 && this.sessionEpoch(context.sessionId) !== startEpoch) {
+              lastError = new Error('The browser for this chat was reset because the person driving it changed, so this step was not retried.');
+              break;
+            }
             let sessionClient: Client | undefined;
             try {
               // Conditionally inject technical parameters if server is internal
