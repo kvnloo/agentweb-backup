@@ -45,7 +45,7 @@ export const API_KEY_SCOPE_MEMORY_ORG = 'memory:org';
  * Emailing GTM status reports over MCP (ENG-2840 wave 2, W2-4 follow-up). Opt-in like the others, and for `aw_` keys only: a report goes out
  * from AgentWeb's system sender to the contacts on a plan, so the person who owns the account decides which keys may send one by minting a
  * scoped key. A signed-in OAuth client does not get it, and a delegated (admin-as-customer) session cannot grant it. `send_gtm_status_report`
- * is bounded on top of the scope: at most 10 people a call, about 50 emails an hour per key, no identical report within 10 minutes, and an
+ * is bounded on top of the scope: at most 10 people a call, about 50 emails an hour per account (all of its keys together), no identical report within 10 minutes, and an
  * audit line per attempt that never holds the message or an address (mcp/server/gtmEmailTool.ts).
  *
  * It controls that TOOL, not every route to a GTM email: a key that may start an Emma run (`emma_send_message` and the others in

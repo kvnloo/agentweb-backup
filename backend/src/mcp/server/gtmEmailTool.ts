@@ -16,12 +16,15 @@
  * (`manage_gtm_plan update dri`, which needs only `tools:execute`): a key that holds `gtm:email` can email any address it puts on a plan it
  * owns, with up to 2,000 characters of its own text. The account owner grants the scope knowing that; the audit line is how it is seen.
  *
- * It calls the portal routes through `mcpFetch`, as the other GTM tools do, so the plan's owner check and the delegation and restriction
- * claims stay on the route; a key can email only the people on ITS OWN user's plans. A POST self-call is never retried, so a network
- * blip cannot send a report twice.
+ * It calls the portal routes through `mcpFetch`, as the other GTM tools do, so the plan owner check stays on the route (the two report routes
+ * read no delegation or restriction claim: an `aw_` key is never a share-link visitor); a key can email only the people on ITS OWN user's
+ * plans. A POST self-call is never retried, so a network blip cannot send a report twice.
  *
  * Every attempt writes one audit line (`mcp_gtm_email`): who (user, key), which plan and phase, which people were chosen, the outcome and the
- * counts. Never the message and never an address.
+ * counts. Never the message and never an address. `userId` is always the account that owns the plan and the key. `apiKeyId` is the key that
+ * OPENED the MCP session: a second key of the same user that reuses that session id is checked on its own scopes (per request) but logged under
+ * the opener's id, as every MCP tool's audit line is (mcpServer.ts builds a session's context once). Binding sessions to keys is a change to
+ * the session layer for every tool and is not made here.
  *
  * Update-time notifications (`notify_*` on `update_work_item`) are NOT offered: update the item, then send a report.
  */

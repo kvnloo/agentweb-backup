@@ -74,7 +74,7 @@ export class GtmEmailLimiter {
       if (this.keys.size >= MAX_TRACKED_KEYS) this.sweep(now);
       if (this.keys.size >= MAX_TRACKED_KEYS) {
         // Never evict a key that is being counted (that would reset its limits): refuse until one of them goes quiet.
-        return { ok: false, reason: 'capacity', retryAfterMs: 60_000, message: 'Too many API keys are emailing right now. Nothing was emailed. Try again in about a minute.' };
+        return { ok: false, reason: 'capacity', retryAfterMs: 60_000, message: 'Too many accounts are emailing right now. Nothing was emailed. Try again in about a minute.' };
       }
       state = { entries: [], cooldowns: new Map() };
       this.keys.set(keyId, state);
@@ -86,7 +86,7 @@ export class GtmEmailLimiter {
       const retryAfterMs = GTM_EMAIL_COOLDOWN_MS - (now - last);
       return {
         ok: false, reason: 'cooldown', retryAfterMs,
-        message: `An identical report (same plan, phase, people chosen and message) was started from this API key less than ${minutes(GTM_EMAIL_COOLDOWN_MS)} minutes ago. Nothing was emailed. To send it again, change the message or wait about ${minutes(retryAfterMs)} minutes.`,
+        message: `An identical report (same plan, phase, people chosen and message) was started from this account less than ${minutes(GTM_EMAIL_COOLDOWN_MS)} minutes ago. Nothing was emailed. To send it again, change the message or wait about ${minutes(retryAfterMs)} minutes.`,
       };
     }
 
@@ -101,7 +101,7 @@ export class GtmEmailLimiter {
       }
       return {
         ok: false, reason: 'budget', retryAfterMs: Math.max(0, retryAfterMs),
-        message: `This API key has already sent, or has in flight, ${used} of the ${GTM_EMAIL_HOURLY_BUDGET} emails it may send in an hour, and this report could send up to ${amount} more. Nothing was emailed. Try again in about ${minutes(retryAfterMs)} minutes.`,
+        message: `This account has already sent, or has in flight, ${used} of the ${GTM_EMAIL_HOURLY_BUDGET} emails it may send in an hour (all of its API keys together), and this report could send up to ${amount} more. Nothing was emailed. Try again in about ${minutes(retryAfterMs)} minutes.`,
       };
     }
 
