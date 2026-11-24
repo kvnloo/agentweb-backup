@@ -131,7 +131,9 @@ export function isBillableResult(result: unknown): boolean {
  */
 export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
-  if (platform === 'x_ads') return args?.action === 'ACTIVATE'; // ENG-3142: creates are always PAUSED
+  // ENG-3142: creates are always PAUSED. The X write validator coerces `action` with String(), so the paywall
+  // must classify the same coerced value: a non-string action (e.g. ["ACTIVATE"]) must not skip it.
+  if (platform === 'x_ads') return String(args?.action ?? '') === 'ACTIVATE';
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
 
