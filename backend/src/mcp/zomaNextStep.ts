@@ -23,6 +23,9 @@ const SETUP_NEXT = 'Call zoma_status: it returns the exact fix (with a link if o
 
 /** Next step after a refused / failed call, from its message. */
 export function zomaErrorNextStep(message: string): string {
+  if (/Multiple LinkedIn Ads accounts/i.test(message)) {
+    return 'Ask the user which LinkedIn ad account to use, then retry with account_id set to it.';
+  }
   if (/Multiple (Meta ad accounts|Google Ads accounts)/i.test(message)) {
     return googleToolkitEnabled()
       ? 'Ask the user which account to use, then retry with account_id (Meta) or customer_id (Google) set to it.'

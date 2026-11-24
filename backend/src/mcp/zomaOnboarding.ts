@@ -27,8 +27,8 @@ import { getMcpUserUsage, type McpUserUsage } from '../services/mcpUsageEventsSe
 import { getAccessiblePageIds, getMetaAdsNoPagesMessage, getMetaPagesAccessState } from '../utils/metaAdsScope';
 import { META_BUSINESS_PAGES_SETTINGS_URL } from './metaPageAccessRefusal';
 import {
-  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, META_PROVIDER, metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled,
-  ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
+  GOOGLE_ADS_PROVIDER, googleToolkitEnabled, LINKEDIN_ADS_PROVIDER, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled, META_PROVIDER,
+  metaConnectionIsUsable, X_ADS_PROVIDER, xAdsToolkitEnabled, ZOMA_PROVIDERS, type ZomaPlatform, type ZomaProvider,
 } from './zomaProviders';
 
 import { type ZomaToolName } from './zomaToolDefinitions';
@@ -119,6 +119,22 @@ export interface ZomaReadiness {
     link?: string;
     writes_enabled: boolean;
   };
+  /**
+   * Present only while ZOMA_LINKEDIN_ADS_ENABLED is "read" or "true" (absent otherwise, so LinkedIn is
+   * never advertised before the flip). Read mode: reading and reporting work, `writes_enabled` is false
+   * with reason `linkedin_standard_tier_pending` (creating or editing needs LinkedIn Standard-tier
+   * approval, and then only works on ad accounts LinkedIn has enabled for the app). Full mode:
+   * `writes_enabled` follows the other providers (payment on file and a connected account), plus the
+   * write consent (rw_ads); a connection made in read mode needs a reconnect (`linkedin_reconnect_for_changes`).
+   */
+  linkedin_ads?: {
+    available: true;
+    ready: boolean;
+    accounts: Array<{ account_id: string; name?: string; currency?: string }>;
+    link?: string;
+    writes_enabled: boolean;
+    reason?: 'linkedin_standard_tier_pending' | 'linkedin_reconnect_for_changes';
+  };
   /** Meta writes (unchanged meaning). Google writes are google_ads.writes_enabled. */
   writes_enabled: boolean;
   /**
@@ -158,6 +174,12 @@ export interface ZomaOnboardingDeps {
   xAdsEnabled?: () => boolean;
   /** ENG-3142: signed X Ads connect link (routes/xAdsAuth.ts /start). */
   buildXAdsConnectUrl?: (userId: string) => Promise<string>;
+  /** LinkedIn Ads is on for Zoma (read or full); defaults to linkedInAdsToolkitEnabled(). */
+  linkedInAdsEnabled?: () => boolean;
+  /** LinkedIn Ads writes are on (full mode only); defaults to linkedInAdsWritesEnabled(). */
+  linkedInWritesEnabled?: () => boolean;
+  /** LinkedIn Ads connect link; defaults to the signed-state consent URL (services/linkedInAdsConnectUrl.ts). */
+  buildLinkedInAdsConnectUrl?: (userId: string) => Promise<string>;
   /** ENG-3134: origin of Zoma's own pages (card return, docs) — the API, never the Emma app. */
   pagesUrl: () => string;
   now: () => number;
@@ -313,6 +335,13 @@ async function defaultXAdsConnectUrl(userId: string): Promise<string> {
   return (await import('./zomaXAdsConnect')).buildXAdsConnectLink(userId, getBackendUrl());
 }
 
+async function defaultLinkedInAdsConnectUrl(userId: string): Promise<string> {
+  // Same pattern as Google: the state carries `zoma`, so the callback finishes on Zoma's pages for this user.
+  // Consent asks only for the scopes of the current mode (read: no write scope).
+  const { buildLinkedInAdsConnectUrl, zomaLinkedInScopes } = await import('../services/linkedInAdsConnectUrl');
+  return buildLinkedInAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP }, zomaLinkedInScopes(linkedInAdsWritesEnabled()));
+}
+
 async function defaultGoogleAdsConnectUrl(userId: string): Promise<string> {
   // ENG-3135: state carries `zoma` so the callback finishes on Zoma's pages for this user, not the Emma portal.
   return (await import('../services/googleAdsConnectUrl')).buildGoogleAdsConnectUrl(userId, { zoma: ZOMA_MCP_SETUP });
@@ -455,11 +484,33 @@ export async function getZomaReadiness(
     }
     readiness.x_ads = x;
   }
+  // LinkedIn Ads is provider #4, offered only while ZOMA_LINKEDIN_ADS_ENABLED is "read" or "true".
+  if ((deps.linkedInAdsEnabled ?? linkedInAdsToolkitEnabled)()) {
+    const liAccounts = usableAccounts(allAccounts, LINKEDIN_ADS_PROVIDER, deps.now());
+    const writesOn = (deps.linkedInWritesEnabled ?? linkedInAdsWritesEnabled)();
+    // A connection made in read mode asked only for the read scopes: it cannot change anything until it is reconnected.
+    const canChange = liAccounts.some((a) => !Array.isArray((a.config as any)?.scopes) || (a.config as any).scopes.includes('rw_ads'));
+    const li: NonNullable<ZomaReadiness['linkedin_ads']> = {
+      available: true,
+      ready: liAccounts.length > 0,
+      accounts: liAccounts.map((a) => ({ account_id: a.account_id, name: a.account_name, currency: (a.config as any)?.currency })),
+      writes_enabled: writesOn && payment.ready && canChange,
+      ...(!writesOn ? { reason: 'linkedin_standard_tier_pending' as const } : liAccounts.length > 0 && !canChange ? { reason: 'linkedin_reconnect_for_changes' as const } : {}),
+    };
+    if (mintLinks && (!li.ready || li.reason === 'linkedin_reconnect_for_changes')) {
+      try {
+        li.link = await (deps.buildLinkedInAdsConnectUrl ?? defaultLinkedInAdsConnectUrl)(userId);
+      } catch (error) {
+        console.error('[zoma] linkedin ads connect link failed:', error instanceof Error ? error.message : error);
+      }
+    }
+    readiness.linkedin_ads = li;
+  }
   if (mintLinks && deps.getPlan) {
     const plan = await deps.getPlan(userId);
     if (plan) readiness.plan = plan;
   }
-  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads, readiness.x_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
+  readiness.next_step = nextStep(adsExperience, payment, meta, readiness.google_ads, readiness.x_ads, readiness.linkedin_ads) ?? (blocker ? formatMetaPageBlocker(blocker) : null);
   readiness.docs_url = zomaDocsUrl(deps);
   return readiness;
 }
@@ -490,11 +541,12 @@ function nextStep(
   meta: ZomaReadiness['meta'],
   googleAds: ZomaReadiness['google_ads'],
   xAds?: ZomaReadiness['x_ads'],
+  linkedInAds?: ZomaReadiness['linkedin_ads'],
 ): string | null {
   if (adsExperience === null) return adsExperienceQuestionText('zoma_status { "ads_experience": "<value>" }');
   if (adsExperience === 'not_interested') return ZOMA_NOT_INTERESTED_MESSAGE;
   const google = googleAds.available ? googleAds : undefined;
-  if (!meta.ready && !google?.ready && !xAds?.ready) {
+  if (!meta.ready && !google?.ready && !xAds?.ready && !linkedInAds?.ready) {
     // ENG-3134: the answer leads straight to Meta connect; a new advertiser gets the setup guide
     // after the link (same link once they have an ad account), never instead of it.
     return [
@@ -512,6 +564,11 @@ function nextStep(
           ? `Or connect an existing X (Twitter) Ads account → ${xAds.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
           : 'Or call zoma_status again for a fresh X Ads connect link (the link could not be created just now).']
         : []),
+      ...(linkedInAds
+        ? [linkedInAds.link
+          ? `Or connect an existing LinkedIn Ads account → ${linkedInAds.link} (connecting only reads your accounts: it creates no campaign and spends nothing)`
+          : 'Or call zoma_status again for a fresh LinkedIn Ads connect link (the link could not be created just now).']
+        : []),
       'Tell me when it is connected and I will re-check.',
       ...(adsExperience === 'new_to_ads' ? ['', newToAdsGuideText()] : [ZOMA_META_LOGIN_NOTE]),
     ].join('\n');
@@ -525,6 +582,17 @@ function nextStep(
     ].join('\n');
   }
   return null;
+}
+
+/** Honest about what LinkedIn lets Zoma do: reporting is confirmed for every ad account; changes need LinkedIn's approval per account. */
+function linkedInAdsStatusNote(li: NonNullable<ZomaReadiness['linkedin_ads']>): string {
+  if (li.reason === 'linkedin_standard_tier_pending') {
+    return 'Reading and reporting work. Creating or editing needs LinkedIn Standard-tier approval and only works on accounts LinkedIn has enabled for the app.';
+  }
+  if (li.reason === 'linkedin_reconnect_for_changes') {
+    return `Reading and reporting work. This connection was made without permission to change ads: reconnect LinkedIn Ads${li.link ? ` → ${li.link}` : ''}. Even then, changes only work on accounts LinkedIn has enabled for the app.`;
+  }
+  return 'Reading and reporting work. Creating or editing only works on ad accounts LinkedIn has enabled for the app; for any other it says so and changes nothing.';
 }
 
 export function formatZomaStatus(r: ZomaReadiness): string {
@@ -556,9 +624,23 @@ export function formatZomaStatus(r: ZomaReadiness): string {
           : r.x_ads.link ? ` → ${r.x_ads.link}` : ''
       }`]
       : []),
+    ...(r.linkedin_ads
+      ? [
+        `  ${box(r.linkedin_ads.ready)} LinkedIn Ads account connected${
+          r.linkedin_ads.accounts.length
+            ? ` (${r.linkedin_ads.accounts.map((a) => `${a.account_id}${a.currency ? `, ${a.currency}` : ''}`).join('; ')})`
+            : r.linkedin_ads.link ? ` → ${r.linkedin_ads.link}` : ''
+        }`,
+        ...(r.linkedin_ads.ready ? [`      ${linkedInAdsStatusNote(r.linkedin_ads)}`] : []),
+      ]
+      : []),
     ...(r.plan ? [formatZomaPlanLine(r.plan, getZomaBillingConfig())] : []),
     '',
-    r.next_step ?? zomaAllSetText(r.docs_url ?? zomaDocsUrl(), r.meta.ready, !r.google_ads.ready && r.x_ads?.ready ? 'X Ads' : 'Google Ads'),
+    r.next_step ?? zomaAllSetText(
+      r.docs_url ?? zomaDocsUrl(),
+      r.meta.ready,
+      r.google_ads.ready ? 'Google Ads' : r.x_ads?.ready ? 'X Ads' : r.linkedin_ads?.ready ? 'LinkedIn Ads' : 'Google Ads',
+    ),
   ];
   return lines.join('\n');
 }
@@ -578,7 +660,7 @@ export function formatZomaUsage(u: McpUserUsage, billing?: ZomaBillingUsage, goo
     `  Tool calls: ${u.toolCalls}`,
     `  Writes sent to Meta: ${u.writes.total} (confirmed ${u.writes.confirmed}, mismatch ${u.writes.mismatch}, unconfirmed ${u.writes.unconfirmed})`,
     // Google writes are listed (and labelled) only while ZOMA_GOOGLE_ENABLED is on.
-    ...u.recentWrites.filter((w) => (google || w.platform !== 'google_ads') && (xAdsToolkitEnabled() || w.platform !== 'x_ads')).map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : w.platform === 'x_ads' ? '[X Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
+    ...u.recentWrites.filter((w) => (google || w.platform !== 'google_ads') && (xAdsToolkitEnabled() || w.platform !== 'x_ads') && (linkedInAdsToolkitEnabled() || w.platform !== 'linkedin_ads')).map((w) => `  • ${w.ts.slice(0, 16).replace('T', ' ')}  ${w.platform === 'google_ads' ? '[Google Ads] ' : w.platform === 'x_ads' ? '[X Ads] ' : w.platform === 'linkedin_ads' ? '[LinkedIn Ads] ' : ''}${w.action ?? ''} ${w.entityType ?? ''}${w.objectId ? ` ${w.objectId}` : ''} → ${w.verification ?? 'unknown'}`),
     ...(billing ? formatZomaBillingUsage(billing) : ['Billing is not enabled yet; usage is only recorded.']),
   ];
   return lines.join('\n');
