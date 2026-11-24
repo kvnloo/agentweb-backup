@@ -124,6 +124,18 @@ describe('the hourly budget', () => {
     expect(limiter.used('key-1')).toBe(0);
   });
 
+  it('a number that is not finite leaves the whole reservation in place: NaN must never switch the budget off', () => {
+    const { limiter } = limiterAt();
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, undefined as any, null as any, '3' as any, {} as any]) {
+      const ticket = ok(limiter.reserve('key-nan', `fp-${String(bad)}`, 7));
+      limiter.settle(ticket, bad);
+      expect(Number.isNaN(limiter.used('key-nan'))).toBe(false);
+    }
+    // seven reservations of 7 are all still counted in full, so even 2 more does not fit, as it must not
+    expect(limiter.used('key-nan')).toBe(49);
+    expect(limiter.reserve('key-nan', 'fp-more', 2).ok).toBe(false);
+  });
+
   it('settle floors a fraction and keeps a reservation that is smaller', () => {
     const { limiter } = limiterAt();
     const ticket = ok(limiter.reserve('key-1', 'fp-1', 5));
@@ -208,6 +220,30 @@ describe('memory is bounded', () => {
     // a key that is already tracked is not affected, and cannot be reset by the flood
     expect(limiter.reserve('key-0', 'fp-other', 1).ok).toBe(true);
     expect(limiter.reserve('key-0', 'fp', 1).ok).toBe(false); // still in its cooldown
+  });
+
+  it('refused calls do not hold capacity: 1,000 keys whose only call sent nothing (released) leave room for a new key at once', () => {
+    const { limiter } = limiterAt();
+    for (let i = 0; i < 1000; i++) limiter.release(ok(limiter.reserve(`key-${i}`, 'fp', 1))); // each was refused by the route with a 4xx
+    expect(limiter.reserve('key-new', 'fp', 1).ok).toBe(true);
+  });
+
+  it('a call settled to 0 is dropped, so entries cannot pile up on one key', () => {
+    const { limiter } = limiterAt();
+    for (let i = 0; i < 2000; i++) limiter.settle(ok(limiter.reserve('key-1', `fp-${i}`, 1)), 0);
+    expect((limiter as any).keys.get('key-1').entries.length).toBeLessThanOrEqual(1);
+    expect(limiter.used('key-1')).toBe(0);
+  });
+
+  it('keys with counted emails are never forgotten to make room, even after their cooldowns have ended', () => {
+    const { limiter, advance } = limiterAt();
+    for (let i = 0; i < 1000; i++) ok(limiter.reserve(`key-${i}`, 'fp', 1));
+    advance(11 * MINUTE); // every cooldown is over; every counted email is still inside the hour
+    const refused = limiter.reserve('key-new', 'fp', 1);
+    expect(refused.ok).toBe(false);
+    expect(!refused.ok && refused.reason).toBe('capacity');
+    expect(limiter.used('key-0')).toBe(1); // nobody's count was reset by the flood
+    expect(limiter.used('key-999')).toBe(1);
   });
 
   it('forgets keys that have gone quiet, so capacity comes back', () => {

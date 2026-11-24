@@ -60,9 +60,16 @@ describe('gtmEmailRequest: the request a call builds', () => {
     expect(r.path).toBe('/api/gtm-plan/p/send-status-report');
   });
 
-  it('ids are written into the path escaped', () => {
-    const r = gtmEmailRequest({ plan_id: 'a/b?c', phase_id: 'x#y', notify_phase_poc: true });
-    expect(r.path).toBe('/api/gtm-plan/a%2Fb%3Fc/phases/x%23y/send-status-report');
+  it('real ids (letters, digits, hyphens, underscores) go into the path as they are', () => {
+    const r = gtmEmailRequest({ plan_id: 'plan-1795531782561-37a7kb4i6', phase_id: 'phase_1795544281613-p4b3yqomz', notify_phase_poc: true });
+    expect(r.path).toBe('/api/gtm-plan/plan-1795531782561-37a7kb4i6/phases/phase_1795544281613-p4b3yqomz/send-status-report');
+  });
+
+  it('anything that is not a real id is refused before any limit is taken: dots, slashes, query marks, spaces, unicode', () => {
+    for (const id of ['.', '..', '../x', 'a/b', 'a?b', 'a#b', 'a%2Fb', 'a b', 'plan\u00e9', 'a\u200bb', 'x'.repeat(201)]) {
+      expect(() => gtmEmailRequest({ plan_id: id, notify_user: true })).toThrow(/plan_id is not a valid id|plan_id is required/);
+      expect(() => gtmEmailRequest({ plan_id: 'p', phase_id: id, notify_user: true })).toThrow(/phase_id is not a valid id|phase_id is required/);
+    }
   });
 
   it('a message that is only spaces is no message; a message at the limit is kept; one over is refused', () => {
@@ -146,17 +153,23 @@ describe('sendGtmStatusReport: one call', () => {
     const limiter = new GtmEmailLimiter();
     mockFetch.mockResolvedValue(answer(2, 1, 1));
     await sendGtmStatusReport({ plan_id: 'p', notify_phase_pocs: true }, context, limiter); // reserved 10
-    expect(limiter.used('key-1')).toBe(4);
+    expect(limiter.used('account:user-1')).toBe(4);
   });
 
   it('keeps the whole reservation when the route did not say what it sent (the cautious reading)', async () => {
     const limiter = new GtmEmailLimiter();
     mockFetch.mockResolvedValue({ success: true, message: 'ok' });
     await sendGtmStatusReport({ plan_id: 'p', notify_phase_pocs: true }, context, limiter);
-    expect(limiter.used('key-1')).toBe(10);
+    expect(limiter.used('account:user-1')).toBe(10);
     mockFetch.mockResolvedValue({ success: true, sent: 'many', failed: -1 });
     await sendGtmStatusReport({ plan_id: 'p2', notify_phase_pocs: true }, context, limiter);
-    expect(limiter.used('key-1')).toBe(20);
+    expect(limiter.used('account:user-1')).toBe(20);
+    mockFetch.mockResolvedValue({ success: true, sent: 3 }); // sent without failed
+    await sendGtmStatusReport({ plan_id: 'p3', notify_phase_pocs: true }, context, limiter);
+    expect(limiter.used('account:user-1')).toBe(30);
+    mockFetch.mockResolvedValue({ success: true, sent: Number.NaN, failed: Number.NaN }); // NaN must never reach the budget
+    await sendGtmStatusReport({ plan_id: 'p4', notify_phase_pocs: true }, context, limiter);
+    expect(limiter.used('account:user-1')).toBe(40);
   });
 
   it('refuses a report identical to one from the same key within 10 minutes, and does not call the route', async () => {
@@ -190,22 +203,39 @@ describe('sendGtmStatusReport: one call', () => {
     await expect(sendGtmStatusReport({ plan_id: 'plan-50', notify_user: true }, context, limiter)).rejects.toThrow('50 of the 50 emails');
   });
 
-  it('each key has its own hour and its own cooldown', async () => {
+  it('is counted per ACCOUNT: every key of one user shares the hour and the cooldown, so minting more keys buys no more email', async () => {
+    const limiter = new GtmEmailLimiter();
+    mockFetch.mockResolvedValue(answer(10));
+    for (let i = 0; i < 5; i++) await sendGtmStatusReport({ plan_id: `plan-${i}`, notify_phase_pocs: true }, { ...context, apiKeyId: `key-${i % 2}` }, limiter); // 5 x 10 across two keys
+    expect(limiter.used('account:user-1')).toBe(50);
+    await expect(sendGtmStatusReport({ plan_id: 'plan-x', notify_phase_pocs: true }, { ...context, apiKeyId: 'key-third' }, limiter)).rejects.toThrow('50 of the 50 emails');
+    expect(mockFetch).toHaveBeenCalledTimes(5);
+  });
+
+  it('an identical report from a second key of the same account is held by the cooldown too', async () => {
     const limiter = new GtmEmailLimiter();
     mockFetch.mockResolvedValue(answer(1));
     await sendGtmStatusReport(args, { ...context, apiKeyId: 'key-1' }, limiter);
-    await sendGtmStatusReport(args, { ...context, apiKeyId: 'key-2' }, limiter);
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    await expect(sendGtmStatusReport(args, { ...context, apiKeyId: 'key-2' }, limiter)).rejects.toThrow('identical report');
   });
 
-  it('a caller with no key id is counted per user, not all together', async () => {
+  it('different accounts have their own hour and their own cooldown', async () => {
     const limiter = new GtmEmailLimiter();
     mockFetch.mockResolvedValue(answer(1));
-    await sendGtmStatusReport(args, { userId: 'user-1' }, limiter);
-    await sendGtmStatusReport(args, { userId: 'user-2' }, limiter);
-    expect(limiter.used('user:user-1')).toBe(1);
-    expect(limiter.used('user:user-2')).toBe(1);
-    await expect(sendGtmStatusReport(args, { userId: 'user-1' }, limiter)).rejects.toThrow('identical report');
+    await sendGtmStatusReport(args, { ...context, userId: 'user-1' }, limiter);
+    await sendGtmStatusReport(args, { ...context, userId: 'user-2' }, limiter);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(limiter.used('account:user-1')).toBe(1);
+    expect(limiter.used('account:user-2')).toBe(1);
+  });
+
+  it('a caller with no user id is counted by its key, and one with neither is counted together as unknown', async () => {
+    const limiter = new GtmEmailLimiter();
+    mockFetch.mockResolvedValue(answer(1));
+    await sendGtmStatusReport(args, { apiKeyId: 'key-9' }, limiter);
+    await sendGtmStatusReport(args, {}, limiter);
+    expect(limiter.used('key:key-9')).toBe(1);
+    expect(limiter.used('unknown')).toBe(1);
   });
 
   describe('when the route answers with an error', () => {
@@ -213,7 +243,7 @@ describe('sendGtmStatusReport: one call', () => {
       const limiter = new GtmEmailLimiter();
       mockFetch.mockRejectedValueOnce(new Error('API error (400): The phase status report was not sent: it would go to 12 people and one call may email at most 10. Nothing was emailed.'));
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('API error (400)');
-      expect(limiter.used('key-1')).toBe(0);
+      expect(limiter.used('account:user-1')).toBe(0);
 
       mockFetch.mockResolvedValueOnce(answer(1)); // the same report, retried at once, after fixing the plan
       await expect(sendGtmStatusReport(args, context, limiter)).resolves.toEqual(answer(1));
@@ -223,14 +253,14 @@ describe('sendGtmStatusReport: one call', () => {
       const limiter = new GtmEmailLimiter();
       mockFetch.mockRejectedValueOnce(new Error(`API error (${status}): nope`));
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow(`API error (${status})`);
-      expect(limiter.used('key-1')).toBe(0);
+      expect(limiter.used('account:user-1')).toBe(0);
     });
 
     it('a 5xx is ambiguous (the mail service may have taken some): the reservation and the cooldown are kept', async () => {
       const limiter = new GtmEmailLimiter();
       mockFetch.mockRejectedValue(new Error('API error (502): The phase status report could not be sent: the mail service refused all 1 email'));
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('API error (502)');
-      expect(limiter.used('key-1')).toBe(1);
+      expect(limiter.used('account:user-1')).toBe(1);
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('identical report');
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
@@ -239,7 +269,15 @@ describe('sendGtmStatusReport: one call', () => {
       const limiter = new GtmEmailLimiter();
       mockFetch.mockRejectedValue(new Error('MCP self-call POST /api/gtm-plan/plan-1/phases/phase-1/send-status-report failed after 1 attempt(s) [correlationId=x]: ECONNRESET'));
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('ECONNRESET');
-      expect(limiter.used('key-1')).toBe(1);
+      expect(limiter.used('account:user-1')).toBe(1);
+      await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('identical report');
+    });
+
+    it('an error that only MENTIONS an HTTP status in its text is not an HTTP answer: the reservation is kept', async () => {
+      const limiter = new GtmEmailLimiter();
+      mockFetch.mockRejectedValue(new Error('MCP self-call failed after 1 attempt(s): upstream said API error (400) while the socket closed'));
+      await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('upstream said');
+      expect(limiter.used('account:user-1')).toBe(1);
       await expect(sendGtmStatusReport(args, context, limiter)).rejects.toThrow('identical report');
     });
 
@@ -255,7 +293,23 @@ describe('sendGtmStatusReport: one call', () => {
     const limiter = new GtmEmailLimiter();
     await expect(sendGtmStatusReport({ plan_id: 'p' }, context, limiter)).rejects.toThrow('choose who gets the report');
     expect(mockFetch).not.toHaveBeenCalled();
-    expect(limiter.used('key-1')).toBe(0);
+    expect(limiter.used('account:user-1')).toBe(0);
+  });
+
+  it('an id that is not a real id burns nothing: five calls with plan_id ".." leave the whole hour for real reports', async () => {
+    const limiter = new GtmEmailLimiter();
+    mockFetch.mockResolvedValue(answer(1));
+    for (let i = 0; i < 5; i++) await expect(sendGtmStatusReport({ plan_id: '..', notify_phase_pocs: true }, context, limiter)).rejects.toThrow('plan_id is not a valid id');
+    expect(limiter.used('account:user-1')).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
+    await expect(sendGtmStatusReport({ plan_id: 'plan-real', notify_phase_pocs: true }, context, limiter)).resolves.toEqual(answer(1));
+  });
+
+  it('every refusal of the tool says "Nothing was emailed", including an unknown argument and a bad id (the shared checks say "changed")', () => {
+    for (const input of [{ plan_id: 'p', notify_user: true, to: 'a@b.io' }, { plan_id: 'a b', notify_user: true }, { plan_id: '', notify_user: true }, { plan_id: 'p', phase_id: '', notify_user: true }]) {
+      expect(() => gtmEmailRequest(input)).toThrow(/Nothing was emailed\.$/);
+      expect(() => gtmEmailRequest(input)).not.toThrow(/Nothing was changed/);
+    }
   });
 });
 
@@ -271,6 +325,12 @@ describe('the audit line', () => {
       outcome: 'ok', kind: 'phase', planId: 'plan-9', phaseId: 'phase-9', flags: ['notify_user', 'notify_phase_poc'],
       sent: 2, failed: 1, suppressed: 0,
     });
+  });
+
+  it('names every person chosen in a plan report, including every phase contact', async () => {
+    mockFetch.mockResolvedValue(answer(3));
+    await sendGtmStatusReport({ plan_id: 'plan-9', notify_user: true, notify_plan_poc: true, notify_phase_pocs: true }, context, new GtmEmailLimiter());
+    expect(auditLines()[0]).toMatchObject({ kind: 'plan', flags: ['notify_user', 'notify_plan_poc', 'notify_phase_pocs'] });
   });
 
   it('never holds the message, and never an address, in any outcome', async () => {
@@ -329,7 +389,8 @@ describe('the tool as registered', () => {
     expect(d).toContain('gtm:email');
     expect(d).toContain('nobody is emailed by default');
     expect(d).toContain('at most 10 people per call');
-    expect(d).toContain('about 50 emails an hour per key');
+    expect(d).toContain('about 50 emails an hour per account');
+    expect(d).toContain('whatever addresses are on the plan');
     expect(d).toContain('10 minutes');
     expect(d).toContain('2000 characters');
   });

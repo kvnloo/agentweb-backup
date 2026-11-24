@@ -169,7 +169,7 @@ describe('the recipient cap, on the real route', () => {
     seedPlan(TENANT_A, 'plan-a-fix', 'ALPHA', Array.from({ length: 11 }, (_, i) => phaseWithContact('plan-a-fix', i + 1, 'ALPHA')));
     const args = { plan_id: 'plan-a-fix', notify_phase_pocs: true, message: fresh() };
     expect((await ownerA.call('send_gtm_status_report', args)).isError).toBe(true);
-    const usedAfterRefusal = gtmEmailLimiter.used(`key-${TENANT_A.owner}`);
+    const usedAfterRefusal = gtmEmailLimiter.used(`account:${TENANT_A.owner}`);
 
     // one phase contact is removed; the identical request now fits
     const row = fake.items('AW-GTMPlan').find((p: any) => p.planId === 'plan-a-fix');
@@ -177,7 +177,7 @@ describe('the recipient cap, on the real route', () => {
     const again = await ownerA.call('send_gtm_status_report', args);
     expect(again.isError).toBe(false);
     expect(again.json).toMatchObject({ sent: 10 });
-    expect(usedAfterRefusal).toBeLessThanOrEqual(gtmEmailLimiter.used(`key-${TENANT_A.owner}`));
+    expect(usedAfterRefusal).toBeLessThanOrEqual(gtmEmailLimiter.used(`account:${TENANT_A.owner}`));
   });
 });
 
@@ -233,14 +233,45 @@ describe('one tenant can never email another tenant\'s people', () => {
     expect(sendMail).not.toHaveBeenCalled();
   });
 
-  it('the keys are counted apart: tenant A spending its limit does not touch tenant B', async () => {
-    expect(gtmEmailLimiter.used(`key-${TENANT_B.owner}`)).toBe(0);
+  it('accounts are counted apart: tenant A spending its limit does not touch tenant B', async () => {
+    expect(gtmEmailLimiter.used(`account:${TENANT_B.owner}`)).toBe(0);
     await ownerA.call('send_gtm_status_report', { plan_id: 'plan-a1', phase_id: 'plan-a1-ph1', notify_phase_poc: true, message: fresh() });
-    expect(gtmEmailLimiter.used(`key-${TENANT_B.owner}`)).toBe(0);
+    expect(gtmEmailLimiter.used(`account:${TENANT_B.owner}`)).toBe(0);
+  });
+});
+
+describe('one mailbox is one person, and a title cannot add a header', () => {
+  it('a mailbox written in two cases on a plan gets one email, and counts once against the cap', async () => {
+    seedPlan(TENANT_A, 'plan-a-case', 'ALPHA', [
+      { id: 'plan-a-case-ph1', title: 'One', description: null, dri: 'Shared@Alpha.test', dueDate: null, status: 'in_progress', workItems: [] },
+      { id: 'plan-a-case-ph2', title: 'Two', description: null, dri: 'shared@alpha.test', dueDate: null, status: 'in_progress', workItems: [] },
+    ]);
+    const r = await ownerA.call('send_gtm_status_report', { plan_id: 'plan-a-case', notify_phase_pocs: true, message: fresh() });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({ sent: 1, failed: 0 });
+    expect(sentTo()).toEqual(['Shared@Alpha.test']);
+  });
+
+  it('a plan title with a line break reaches the email subject as one line', async () => {
+    const row = fake.items('AW-GTMPlan').find((x: any) => x.planId === 'plan-a1');
+    row.title = 'Hello\r\nBcc: attacker@evil.test';
+    await ownerA.call('send_gtm_status_report', { plan_id: 'plan-a1', notify_plan_poc: true, message: fresh() });
+    expect(sendMail.mock.calls[0][0].subject).toBe('GTM Plan Status Report: Hello Bcc: attacker@evil.test');
   });
 });
 
 describe('what the tool itself refuses, before the route is reached', () => {
+  it('an id that is not a real id (a dot path, a slash) is refused before any limit is taken, so it cannot burn the hour', async () => {
+    const usedBefore = gtmEmailLimiter.used(`account:${TENANT_A.owner}`); // earlier tests in this file have spent some of the hour
+    for (const plan_id of ['..', '.', '../../x', 'a/b']) {
+      const r = await ownerA.call('send_gtm_status_report', { plan_id, notify_phase_pocs: true, message: fresh() });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain('plan_id is not a valid id');
+    }
+    expect(gtmEmailLimiter.used(`account:${TENANT_A.owner}`)).toBe(usedBefore);
+    expect(sendMail).not.toHaveBeenCalled();
+  });
+
   it('nobody chosen, a wrong choice, an unknown argument: refused, nothing sent, nothing changed', async () => {
     const before = snapshot();
     for (const args of [
@@ -278,7 +309,7 @@ describe('the limits, on the real route', () => {
   });
 
   it('a key that has used its hour is refused, and nothing more is sent', async () => {
-    const key = `key-${TENANT_B.owner}`;
+    const key = `account:${TENANT_B.owner}`;
     seedPlan(TENANT_B, 'plan-b-ten', 'BRAVO', Array.from({ length: 10 }, (_, i) => phaseWithContact('plan-b-ten', i + 1, 'BRAVO')));
     for (let i = 0; i < 5; i++) {
       const r = await ownerB.call('send_gtm_status_report', { plan_id: 'plan-b-ten', notify_phase_pocs: true, message: fresh() });
