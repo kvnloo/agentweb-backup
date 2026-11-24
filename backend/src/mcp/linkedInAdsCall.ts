@@ -139,13 +139,17 @@ export async function callLinkedIn<T extends LinkedInCallResult>(
   fn: (accessToken: string) => Promise<T>,
   opts: { unauthorized?: 'throw' | 'return'; changedNothing?: boolean } = {},
 ): Promise<T> {
+  // A failure with an errorType is the service's own update read-back (verifyUpdate) talking: the update POST
+  // already SUCCEEDED and it is the follow-up GET that was answered 401. That is not a rejected write: it is
+  // never retried (a second POST) and never told to the customer as "nothing was changed".
+  const writeRejected = (r: T) => !r.success && r.status === 401 && r.errorType === undefined;
   let result = await fn(session.accessToken);
-  if (!result.success && result.status === 401 && session.freshToken) {
+  if (writeRejected(result) && session.freshToken) {
     console.warn('[linkedin-ads-toolkit] 401 on a freshly minted token; retrying once');
     await (session.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(session.authRetryDelayMs ?? LINKEDIN_AUTH_RETRY_DELAY_MS);
     result = await fn(session.accessToken);
   }
-  if (!result.success && result.status === 401 && (opts.unauthorized ?? 'throw') === 'throw') {
+  if (writeRejected(result) && (opts.unauthorized ?? 'throw') === 'throw') {
     throw new MetaToolkitRefusal(linkedInReconnectMessage(opts.changedNothing ?? false));
   }
   return result;
