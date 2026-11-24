@@ -14,7 +14,8 @@
 import axios from 'axios';
 import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
-import { createAccount, getAccountsByUserId } from './connectedAccountsDb';
+import { createAccount, getAccountsByUserId, type ConnectedAccount } from './connectedAccountsDb';
+import { getFreshLinkedInAdsToken, LinkedInConnectionError, type LinkedInTokenDeps } from './linkedInAdsCredentials';
 import { listAdAccounts } from './linkedInAdsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -87,6 +88,8 @@ export interface LinkedInAdsFinalizeResult {
    * route ignores this flag and answers exactly as before.
    */
   listFailed: boolean;
+  /** With listFailed: LinkedIn's HTTP status (401/403 mean the access was not granted); undefined when there was no response. */
+  listStatus?: number;
 }
 
 /** LinkedIn's token response names the granted scopes in `scope`, comma (or space) separated. */
@@ -160,7 +163,22 @@ export async function finalizeLinkedInAdsOAuth(params: { userId: string; code: s
     personUrn,
   }, adAccountRefs);
 
-  return { adAccounts, tokenSessionId, listFailed };
+  return { adAccounts, tokenSessionId, listFailed, ...(listFailed ? { listStatus: accountsResult.status } : {}) };
+}
+
+/**
+ * Does a stored connection still work? Its access token is good, or a refresh succeeds (the refreshed tokens are
+ * saved, as for any Zoma call). A connection that can no longer be renewed is dead. A transient failure (LinkedIn
+ * unreachable) is not an answer either way, so it propagates and the connect is retried rather than guessed.
+ */
+async function storedConnectionWorks(userId: string, row: ConnectedAccount, tokenDeps?: LinkedInTokenDeps): Promise<boolean> {
+  try {
+    await getFreshLinkedInAdsToken(userId, row, tokenDeps);
+    return true;
+  } catch (error) {
+    if (error instanceof LinkedInConnectionError && error.kind === 'reconnect') return false;
+    throw error;
+  }
 }
 
 export interface LinkedInAdsAccountChoice {
@@ -171,7 +189,14 @@ export interface LinkedInAdsAccountChoice {
 }
 
 export type LinkedInAdsConnectResult =
-  | { ok: true; accounts: any[]; /** Ad account ids left as they were because the stored connection holds more scopes. */ kept: string[] }
+  | {
+      ok: true;
+      accounts: any[];
+      /** Ad account ids left as they were: the stored connection holds more scopes AND its token still works. */
+      kept: string[];
+      /** Ad account ids whose stored connection held more scopes but was dead (expired or revoked): the new grant replaced it. */
+      replaced: string[];
+    }
   | { ok: false; reason: 'invalid_session' };
 
 /**
@@ -190,6 +215,8 @@ export async function connectLinkedInAdsAccounts(params: {
    * as it is and reported in `kept`. The portal does not set it and behaves as before.
    */
   keepWiderExisting?: boolean;
+  /** Test hook: how a stored connection is checked for life (its token refresh); defaults to the real thing. */
+  tokenDeps?: LinkedInTokenDeps;
 }): Promise<LinkedInAdsConnectResult> {
   const { userId, tokenSessionId } = params;
   const session = retrieveTokenSession(tokenSessionId, userId);
@@ -198,13 +225,19 @@ export async function connectLinkedInAdsAccounts(params: {
   const { tokens } = session;
   const saved: any[] = [];
   const kept: string[] = [];
+  const replaced: string[] = [];
   const existingRows = params.keepWiderExisting ? await getAccountsByUserId(userId) : [];
   for (const choice of params.accounts) {
     const held = existingRows.find((a) => a.platform === 'linkedin_ads' && String(a.account_id) === String(choice.adAccountId));
     const heldScopes: unknown = (held?.config as any)?.scopes;
-    if (Array.isArray(heldScopes) && heldScopes.some((scope) => typeof scope === 'string' && !tokens.scopes.includes(scope))) {
-      kept.push(choice.adAccountId);
-      continue;
+    if (held && Array.isArray(heldScopes) && heldScopes.some((scope) => typeof scope === 'string' && !tokens.scopes.includes(scope))) {
+      // The stored row is wider. Keeping it is only right while it still WORKS: a dead row (expired, revoked, no
+      // refresh token) kept in place would hide a connection that cannot be used behind "already connected".
+      if (await storedConnectionWorks(userId, held, params.tokenDeps)) {
+        kept.push(choice.adAccountId);
+        continue;
+      }
+      replaced.push(choice.adAccountId);
     }
     const organizationUrn = session.adAccountRefs?.[String(choice.adAccountId)];
     const account = await createAccount(userId, 'linkedin_ads', {
@@ -225,5 +258,5 @@ export async function connectLinkedInAdsAccounts(params: {
     await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', choice.adAccountId);
     saved.push(account);
   }
-  return { ok: true, accounts: saved, kept };
+  return { ok: true, accounts: saved, kept, replaced };
 }
