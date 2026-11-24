@@ -131,7 +131,7 @@ export function isBillableResult(result: unknown): boolean {
  */
 export function isZomaPublishWrite(platform: 'meta' | 'google_ads' | 'x_ads' | 'linkedin_ads', args: any): boolean {
   if (platform === 'google_ads') return args?.status === 'ENABLED';
-  if (platform === 'x_ads') return args?.action === 'ACTIVATE'; // ENG-3142: creates are always PAUSED
+  if (platform === 'x_ads') return String(args?.action) === 'ACTIVATE'; // ENG-3142: creates are always PAUSED; String() like the validator (action ["ACTIVATE"] still activates)
   if (platform === 'linkedin_ads') return args?.action === 'ACTIVATE'; // creates are always DRAFT
   return String(args?.action ?? '').toUpperCase() === 'UPDATE' && args?.params?.status === 'ACTIVE';
 }
