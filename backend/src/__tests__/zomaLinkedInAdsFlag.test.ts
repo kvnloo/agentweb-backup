@@ -31,6 +31,7 @@ jest.mock('../services/linkedInAdsService', () => ({
 import { handleMetaToolkitCall, type MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
 import { MetaToolkitRefusal } from '../mcp/metaToolkitErrors';
 import { ZomaNotReadyError } from '../mcp/zomaErrors';
+import { isZomaPublishWrite } from '../mcp/zomaBilling';
 import { formatZomaStatus, getZomaReadiness } from '../mcp/zomaOnboarding';
 import { getMetaToolkitManifest } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
@@ -306,6 +307,7 @@ describe('flag "read": reads on, writes not listed, not routable, refused', () =
     expect(served).toContain('## LinkedIn Ads (when enabled for the account)');
     expect(served).toContain('linkedin_ads_read');
     expect(served).not.toContain('linkedin_ads_write');
+    expect(served).not.toMatch(/safety limit|\$1,500/);
     expect(served).not.toContain('zoma-linkedin');
   });
 });
@@ -327,23 +329,42 @@ describe('flag "true": both tools', () => {
     expect(deps.execute).not.toHaveBeenCalled();
   });
 
-  it('an array action cannot dodge the paywall (same coercion as the validator), and is refused as a non-string action', async () => {
+  it('an array action cannot dodge the paywall: it is refused as a non-string action BEFORE the paywall, while the string ACTIVATE still meets the paywall', async () => {
     const paywall = jest.fn().mockRejectedValue(new ZomaNotReadyError('Start your Zoma plan.'));
     const blocked = gatewayDeps([liAccount()], { assertPublishAllowed: paywall });
-    for (const action of ['ACTIVATE', ['ACTIVATE']]) {
-      await expect(call(blocked, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action, campaign_id: '77' })).rejects.toThrow(MetaToolkitRefusal);
-    }
-    expect(paywall).toHaveBeenCalledTimes(2);
+    await expect(call(blocked, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action: 'ACTIVATE', campaign_id: '77' })).rejects.toThrow(MetaToolkitRefusal);
+    expect(paywall).toHaveBeenCalledTimes(1);
     expect(paywall).toHaveBeenCalledWith('u-flag', { platform: 'linkedin_ads', toolName: 'linkedin_ads_write' });
-    // With the paywall out of the way the shape check still refuses it; nothing is looked up or sent.
-    const open = gatewayDeps([liAccount()], { assertPublishAllowed: jest.fn().mockResolvedValue(undefined) });
+    // the array never reaches it (a shape error answers first); and with the paywall open it is still refused: nothing is looked up or sent
     for (const action of [['ACTIVATE'], { 0: 'ACTIVATE' }, 7]) {
-      await expect(call(open, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action, campaign_id: '77' })).rejects.toThrow(/action must be a string/);
+      await expect(call(blocked, 'linkedin_ads_write', { entity_type: 'CAMPAIGN', action, campaign_id: '77' })).rejects.toThrow(/action must be a string/);
     }
+    expect(paywall).toHaveBeenCalledTimes(1);
+    const open = gatewayDeps([liAccount()], { assertPublishAllowed: jest.fn().mockResolvedValue(undefined) });
     await expect(call(open, 'linkedin_ads_read', { action: ['LIST_CAMPAIGNS'] })).rejects.toThrow(/action must be a string/);
     await expect(call(open, 'linkedin_ads_write', { entity_type: ['CAMPAIGN'], action: 'PAUSE', campaign_id: '77' })).rejects.toThrow(/entity_type must be a string/);
     expect(open.listAccounts).not.toHaveBeenCalled();
     expectLinkedInNeverCalled();
+    // and the predicate itself still reads an array the way the validator would, should one ever reach it
+    expect(isZomaPublishWrite('linkedin_ads', { action: ['ACTIVATE'] })).toBe(true);
+  });
+
+  it('a non-string action whose toString throws is a refusal, never a 500: nothing stringifies it before the shape check', async () => {
+    const paywall = jest.fn().mockResolvedValue(undefined);
+    const deps = gatewayDeps([liAccount()], { assertPublishAllowed: paywall });
+    for (const action of [{ toString: 1 }, { toString: () => { throw new Error('boom'); } }, Object.create(null), [{ toString: 1 }]]) {
+      for (const tool of ['linkedin_ads_write', 'linkedin_ads_read']) {
+        const error: any = await call(deps, tool, { entity_type: 'CAMPAIGN', action, campaign_id: '77' }).catch((e) => e);
+        expect(error).toBeInstanceOf(MetaToolkitRefusal);
+        expect(error.message).toMatch(/action must be a string/);
+      }
+    }
+    expect(paywall).not.toHaveBeenCalled();
+    expect(deps.listAccounts).not.toHaveBeenCalled();
+    // and the paywall predicate itself never throws on such a value
+    expect(isZomaPublishWrite('linkedin_ads', { action: { toString: 1 } })).toBe(false);
+    expect(isZomaPublishWrite('linkedin_ads', { action: Object.create(null) })).toBe(false);
+    expect(isZomaPublishWrite('linkedin_ads', { action: ['ACTIVATE'] })).toBe(true);
   });
 
   it('zoma_status: writes follow payment and a connected account that has the write consent', async () => {
@@ -356,9 +377,11 @@ describe('flag "true": both tools', () => {
     expect(formatZomaStatus(readOnlyConsent)).toContain('reconnect LinkedIn Ads');
   });
 
-  it('the guide serves the part about changes too', () => {
+  it('the guide serves the part about changes too, including the default safety limit', () => {
     const served = zomaSkillDoc(doc);
     expect(served).toContain('linkedin_ads_write');
+    expect(served).toMatch(/safety limit \(USD accounts only for now\).*daily budget is at most \$50.*at most 2x.*lowering a budget is always allowed.*at most \$1,500/);
+    expect(served).toContain('support@agentweb.pro');
     expect(served).not.toContain('zoma-linkedin');
     expect(zomaMcpInstructions()).toContain('Meta (and LinkedIn)');
   });
