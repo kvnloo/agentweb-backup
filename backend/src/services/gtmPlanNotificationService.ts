@@ -16,11 +16,13 @@ const esc = (value: unknown): string => escapeText(String(value ?? ''));
 const oneLine = (value: unknown): string => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
 
 /**
- * How many people one contact entry stands for. Contacts (`dri`) are stored as written, with no validation in the portal, so an entry can be
- * "a@x.com, b@x.com" or a list; the cap counts the people in it, not the entry. An entry with no "@" counts as one.
+ * How many email addresses one contact entry holds. Contacts (`dri`) are stored as written, with no validation in the portal, so an entry
+ * can be "a@x.com, b@x.com", a list, or use separators such as a fullwidth comma or a zero-width space. Separators are any whitespace,
+ * comma or semicolon (ASCII or fullwidth) and the invisible characters; only the parts that contain an "@" are addresses, so
+ * "Jane Doe <jane@x.com>" is one. An entry with no "@" counts as one.
  */
-function peopleIn(entry: string): number {
-  return Math.max(1, String(entry).split(/[\s,;]+/).filter((part) => part.includes('@')).length);
+function addressesIn(entry: string): number {
+  return Math.max(1, String(entry).split(/[\s,;\uff0c\uff1b\u3001\u200b-\u200f\u2028\u2029\u2060\ufeff]+/).filter((part) => part.includes('@')).length);
 }
 
 /** Distinct people: the same mailbox written in another case is one person, and gets one email. The first spelling is kept. */
@@ -54,9 +56,14 @@ interface StatusReportNotificationOptions {
   maxRecipients?: number;
 }
 
-/** True when a report to `count` people exceeds the caller's cap. A cap that is not a finite number is no cap. */
+/** A cap that is not a finite, non-negative number is no cap. */
+function capIsSet(cap: unknown): cap is number {
+  return typeof cap === 'number' && Number.isFinite(cap) && cap >= 0;
+}
+
+/** True when a report to `count` people exceeds the caller's cap. */
 function exceedsRecipientCap(count: number, cap: unknown): cap is number {
-  return typeof cap === 'number' && Number.isFinite(cap) && cap >= 0 && count > cap;
+  return capIsSet(cap) && count > cap;
 }
 
 interface GTMPlan {
@@ -328,12 +335,19 @@ export async function sendPhaseStatusReport(
     if (uniqueRecipients.length === 0) {
       return result;
     }
-    // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
-    const people = uniqueRecipients.reduce((sum, entry) => sum + peopleIn(entry), 0);
-    if (exceedsRecipientCap(people, notifications.maxRecipients)) {
-      result.recipients = people;
-      result.overCap = notifications.maxRecipients;
-      return result;
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
@@ -562,12 +576,19 @@ export async function sendPlanStatusReport(
     if (uniqueRecipients.length === 0) {
       return result;
     }
-    // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
-    const people = uniqueRecipients.reduce((sum, entry) => sum + peopleIn(entry), 0);
-    if (exceedsRecipientCap(people, notifications.maxRecipients)) {
-      result.recipients = people;
-      result.overCap = notifications.maxRecipients;
-      return result;
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
