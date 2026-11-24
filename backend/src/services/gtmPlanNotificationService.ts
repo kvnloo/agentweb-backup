@@ -12,6 +12,19 @@ import { escapeHtml as escapeText } from '../emma/impl/shared/htmlEscaping';
  */
 const esc = (value: unknown): string => escapeText(String(value ?? ''));
 
+/** A single header-safe line: a title written with a line break must not be able to add a header to the email it names. */
+const oneLine = (value: unknown): string => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
+
+/** Distinct people: the same mailbox written in another case is one person, and gets one email. The first spelling is kept. */
+function distinctRecipients(addresses: string[]): string[] {
+  const seen = new Map<string, string>();
+  for (const address of addresses) {
+    const clean = String(address).trim();
+    if (clean !== '' && !seen.has(clean.toLowerCase())) seen.set(clean.toLowerCase(), clean);
+  }
+  return Array.from(seen.values());
+}
+
 interface NotificationOptions {
   notifyUser?: boolean;
   notifyItemPoc?: boolean;
@@ -134,7 +147,7 @@ export async function sendGTMPlanUpdateNotifications(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     if (uniqueRecipients.length === 0) {
       return;
@@ -182,7 +195,7 @@ export async function sendGTMPlanUpdateNotifications(
     // Get customer portal URL
     const gtmPlanUrl = `${customerFrontendUrl}/gtm-plan`;
 
-    const subject = `GTM Plan Update: ${plan.title}`;
+    const subject = `GTM Plan Update: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Update Notification</h2>
@@ -301,7 +314,7 @@ export async function sendPhaseStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
@@ -361,7 +374,7 @@ export async function sendPhaseStatusReport(
       `;
     }).join('');
 
-    const subject = `GTM Plan Phase Status Report: ${phase.title}`;
+    const subject = `GTM Plan Phase Status Report: ${oneLine(phase.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <h2 style="color: #333;">Phase Status Report</h2>
@@ -533,7 +546,7 @@ export async function sendPlanStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
@@ -648,7 +661,7 @@ export async function sendPlanStatusReport(
       `;
     }).join('');
 
-    const subject = `GTM Plan Status Report: ${plan.title}`;
+    const subject = `GTM Plan Status Report: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Status Report</h2>
