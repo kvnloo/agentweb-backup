@@ -172,6 +172,21 @@ describe('ENG-2840 — email lanes', () => {
       expect(order).toEqual(['hold', 'txn-1', 'bulk-1']);
     });
 
+    it('the bound counts bulk mail only: a backlog of transactional mail never makes bulk mail fail', async () => {
+      const { resendService } = await load();
+      (resendService as any).BULK_QUEUE_LIMIT = 2;
+
+      const held = resendService.sendEmail(email('hold'));
+      await until(() => order.includes('hold'), 'the held send to start');
+      const backlog = [1, 2, 3].map((n) => resendService.sendEmail(email(`txn-${n}`))); // 3 waiting, more than the bulk limit
+      const bulk = [1, 2].map((n) => resendService.sendEmail(email(`bulk-${n}`, 'bulk'))); // both accepted
+      await expect(resendService.sendEmail(email('bulk-3', 'bulk'))).rejects.toMatchObject({ code: 'EMAIL_QUEUE_FULL' });
+
+      release();
+      await Promise.all([held, ...backlog, ...bulk]);
+      expect(order).toEqual(['hold', 'txn-1', 'txn-2', 'txn-3', 'bulk-1', 'bulk-2']);
+    });
+
     it('the limit is 100 waiting', async () => {
       const { resendService } = await load();
       expect((resendService as any).BULK_QUEUE_LIMIT).toBe(100);
@@ -183,10 +198,10 @@ describe('ENG-2840 — email lanes', () => {
       const { resendService } = await load();
 
       const sends = [resendService.sendEmail(email('hold'))];
+      await until(() => order.includes('hold'), 'the held send to start'); // the worker is busy and both lanes are empty
       for (let n = 1; n <= 25; n++) sends.push(resendService.sendEmail(email(`t${n}`)));
       sends.push(resendService.sendEmail(email('b1', 'bulk')));
       sends.push(resendService.sendEmail(email('b2', 'bulk')));
-      await until(() => order.includes('hold'), 'the held send to start');
       release();
       await Promise.all(sends);
 
@@ -205,6 +220,23 @@ describe('ENG-2840 — email lanes', () => {
       expect(order).toEqual(['hold', 'b1', 'b2']);
     });
 
+    it('selection: a bulk email taken because no transactional mail waits starts the count again', async () => {
+      const { resendService } = await load();
+      const svc = resendService as any;
+      const item = (id: string, lane: Lane) => ({ id, lane, params: {}, resolve: () => undefined, reject: () => undefined });
+
+      svc.transactionalStreak = 7; // seven transactional sends were made while a bulk email waited
+      svc.bulkQueue.push(item('b1', 'bulk'));
+      expect(svc.takeNextQueued().id).toBe('b1'); // no transactional mail waits, so the bulk email goes
+      expect(svc.transactionalStreak).toBe(0);
+
+      for (let n = 1; n <= 12; n++) svc.sendQueue.push(item(`t${n}`, 'transactional'));
+      svc.bulkQueue.push(item('b2', 'bulk'));
+      const picked: string[] = [];
+      for (let n = 0; n < 11; n++) picked.push(svc.takeNextQueued().id);
+      expect(picked).toEqual([...Array.from({ length: 10 }, (_, i) => `t${i + 1}`), 'b2']); // a full ten, not three
+    });
+
     it('selection: transactional sends made before any bulk mail was waiting do not let a late bulk email jump the queue', async () => {
       const { resendService } = await load();
       const svc = resendService as any;
@@ -220,6 +252,21 @@ describe('ENG-2840 — email lanes', () => {
       const next: string[] = [];
       for (let n = 0; n < 11; n++) next.push(svc.takeNextQueued().id);
       expect(next).toEqual([...Array.from({ length: 10 }, (_, i) => `t${i + 13}`), 'late-bulk']);
+    });
+  });
+
+  describe('the pacing gap', () => {
+    it('mail that arrives while the worker waits out the gap after a send goes ahead of bulk mail already waiting', async () => {
+      const { resendService } = await load();
+      (resendService as any).MIN_SEND_INTERVAL_MS = 80;
+
+      const first = resendService.sendEmail(email('A'));
+      const bulk = resendService.sendEmail(email('B', 'bulk'));
+      await first; // A is sent; the worker now waits out the 80 ms gap before it chooses what to send next
+      const late = resendService.sendEmail(email('T')); // arrives during the gap
+      await Promise.all([bulk, late]);
+
+      expect(order).toEqual(['A', 'T', 'B']);
     });
   });
 
@@ -286,6 +333,27 @@ describe('ENG-2840 — email lanes', () => {
       expect(lines).toContain('Processing Resend queue item #1 (lane=bulk) for: first-bulk@example.com (remaining: 0)');
       expect(lines).toContain('Queued Resend email #2 (lane=transactional). Queue size: 1 transactional, 0 bulk');
       expect(lines).toContain('Processing Resend queue item #2 (lane=transactional) for: second-plain@example.com (remaining: 0)');
+    });
+
+    it('the "remaining" count in the processing line includes both lanes', async () => {
+      const { resendService } = await load();
+      const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+      let lines: string[] = [];
+      try {
+        const held = resendService.sendEmail(email('hold'));
+        const bulk = resendService.sendEmail(email('bulk-1', 'bulk'));
+        const transactional = resendService.sendEmail(email('txn-1'));
+        await until(() => order.includes('hold'), 'the held send to start');
+        release();
+        await Promise.all([held, bulk, transactional]);
+        lines = log.mock.calls.map((call) => String(call[0]));
+      } finally {
+        log.mockRestore();
+      }
+
+      // txn-1 is sent while bulk-1 still waits: one email remains, and it is in the OTHER lane
+      expect(lines).toContain('Processing Resend queue item #3 (lane=transactional) for: txn-1@example.com (remaining: 1)');
+      expect(lines).toContain('Processing Resend queue item #2 (lane=bulk) for: bulk-1@example.com (remaining: 0)');
     });
 
     it('sendSystemEmail passes the lane through, and passes nothing when no lane is given', async () => {
