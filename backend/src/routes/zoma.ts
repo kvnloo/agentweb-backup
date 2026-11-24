@@ -12,6 +12,8 @@
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
  *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
  *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
+ *   GET  /api/zoma/linkedin/callback  LinkedIn Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/linkedin-ads/callback); 404 unless ZOMA_LINKEDIN_ADS_ENABLED is read/true
+ *   POST /api/zoma/linkedin/select    server-rendered LinkedIn ad account picker submit (same gate)
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
  *   POST /api/zoma/token/revoke       Authorization: Bearer zoma_... -> revoked (idempotent)
@@ -40,6 +42,7 @@ import {
   type ZomaDeviceFlowDeps,
 } from '../mcp/zomaDeviceFlow';
 import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
+import { completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps } from '../mcp/zomaLinkedInAdsConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
 import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 import { recordWeeklyReportOptOut, verifyUnsubscribeToken } from '../mcp/zomaWeeklyReport';
@@ -172,6 +175,7 @@ export function createZomaRouter(
   deps: ZomaDeviceFlowDeps = defaultZomaDeviceFlowDeps,
   googleDeps: ZomaGoogleDeps = defaultZomaGoogleDeps,
   billingDeps?: Parameters<typeof openZomaCheckout>[1],
+  linkedInDeps: ZomaLinkedInAdsDeps = defaultZomaLinkedInAdsDeps,
 ): Router {
   const router = Router();
 
@@ -250,6 +254,23 @@ export function createZomaRouter(
       return renderStep(res, await selectGoogleAccounts({ t: req.body?.t, account_id: req.body?.account_id }, googleDeps), req);
     } catch (error) {
       return failPage(res, 'google_connect', error);
+    }
+  });
+
+  router.get('/linkedin/callback', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      const q = req.query;
+      return renderStep(res, await completeLinkedInAdsConnect({ code: q.code, state: q.state, error: q.error }, linkedInDeps));
+    } catch (error) {
+      return failPage(res, 'linkedin_callback', error);
+    }
+  });
+
+  router.post('/linkedin/select', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+    try {
+      return renderStep(res, await selectLinkedInAdsAccounts({ t: req.body?.t, account_id: req.body?.account_id }, linkedInDeps), req);
+    } catch (error) {
+      return failPage(res, 'linkedin_connect', error);
     }
   });
 
