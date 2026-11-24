@@ -12,7 +12,7 @@
  *   POST /api/zoma/meta/select        server-rendered ad-account picker submit
  *   GET  /api/zoma/google/callback    ENG-3135 Google Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/google-ads/callback)
  *   POST /api/zoma/google/select      server-rendered Google Ads account picker submit
- *   GET  /api/zoma/linkedin/callback  LinkedIn Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/linkedin-ads/callback); 404 unless ZOMA_LINKEDIN_ADS_ENABLED is read/true
+ *   GET  /api/zoma/linkedin/callback  LinkedIn Ads OAuth result for an MCP user's zoma_status link (forwarded by /api/oauth/linkedin-ads/callback); not routed (falls through like an unknown route) unless ZOMA_LINKEDIN_ADS_ENABLED is read/true
  *   POST /api/zoma/linkedin/select    server-rendered LinkedIn ad account picker submit (same gate)
  *   GET  /api/zoma/continue           resume the journey from a signed link
  *   GET  /api/zoma/done               Stripe Checkout success/cancel return -> "You're set" (?mcp=1: zoma_status card link)
@@ -44,6 +44,7 @@ import {
 import { completeGoogleConnect, defaultZomaGoogleDeps, selectGoogleAccounts, type ZomaGoogleDeps } from '../mcp/zomaGoogleConnect';
 import { completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps } from '../mcp/zomaLinkedInAdsConnect';
 import { logZomaSetup } from '../mcp/zomaSetupLog';
+import { linkedInAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { openZomaCheckout, recordZomaCheckoutCanceled } from '../mcp/zomaBilling';
 import { recordWeeklyReportOptOut, verifyUnsubscribeToken } from '../mcp/zomaWeeklyReport';
 import { MEASUREMENT_UNSUBSCRIBE_CONTEXT, stopAllReportSchedules } from '../mcp/zomaReportSchedule';
@@ -257,7 +258,12 @@ export function createZomaRouter(
     }
   });
 
-  router.get('/linkedin/callback', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+  // LinkedIn off (ZOMA_LINKEDIN_ADS_ENABLED not read/true): these routes do not exist. Fall through BEFORE the
+  // shared throttle so an off deployment answers like any unknown route and a probe uses none of its bucket.
+  const linkedInOffered = (_req: Request, _res: Response, next: NextFunction) =>
+    ((linkedInDeps.enabled ?? linkedInAdsToolkitEnabled)() ? next() : next('route'));
+
+  router.get('/linkedin/callback', linkedInOffered, throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       const q = req.query;
       return renderStep(res, await completeLinkedInAdsConnect({ code: q.code, state: q.state, error: q.error }, linkedInDeps));
@@ -266,7 +272,7 @@ export function createZomaRouter(
     }
   });
 
-  router.post('/linkedin/select', throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
+  router.post('/linkedin/select', linkedInOffered, throttle('activate', ZOMA_ACTIVATE_MAX_PER_MINUTE), async (req: Request, res: Response) => {
     try {
       return renderStep(res, await selectLinkedInAdsAccounts({ t: req.body?.t, account_id: req.body?.account_id }, linkedInDeps), req);
     } catch (error) {
