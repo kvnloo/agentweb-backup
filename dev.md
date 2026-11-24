@@ -1,3 +1,99 @@
+## ENG-2840: memory tools on the MCP server (save, delete, list; org writes behind a new scope), plus a mint-time rate check and batch counting (2026-11-23)
+
+Wave 2, slice 2. Outside agents (the Hermes agents) can now keep Emma's memory over MCP. No table, index, stored attribute or migration changes.
+
+### What an agent gets
+
+- `save_memory`, `delete_memory`, `list_memories`: the user's own memory. Default scopes (`tools:execute` to write, `tools:read` to list); a signed-in OAuth client may use them too.
+- `save_org_memory`, `delete_org_memory`: the organization's memory, which goes into EVERY member's Emma prompt. They need the new opt-in scope `memory:org` and an `aw_` key (`apiKeyOnly`): an OAuth client is refused, and `tools:execute` does not imply the scope. A delegated (admin-as-customer) session cannot mint a key with it. Any org member's key may write; owners and admins (`org:configure`) may delete.
+- Reading org memory needs no opt-in scope: `list_memories` with `scope: "org"` shows a member what Emma already shows them. A key that holds `memory:org` is offered `list_memories` in `tools/list` only when it can also call it (`tools:read` or `tools:execute`).
+- The tools run in process on the shared module from W2-1, so the guards are Emma's: identity from the key (never an argument), memory switched off, no org, org memory off, the role check on delete, content over 2,000 characters split and over 8,000 refused, ads-learning rows never deleted or listed.
+
+### What the MCP path adds (Emma's own tools and the Settings routes are unchanged, except that Emma's save tools also get the cleanup of a failed split save, below)
+
+- The MCP path validates nothing against the input schema, so each handler checks its own arguments. An argument that is not an input of the tool is refused by name ("orgId is not an input of save_org_memory"), never ignored. (The server itself drops `userId`, `sessionId` and `llmModel` before any tool sees them, so those run as the caller.)
+- A cap of 200 stored memories per account and per org on saves made through MCP. A split save counts its rows. An account already above 200 (the largest on prod stores 277) keeps everything and is refused new saves until it deletes. The refusal says what the caller can do: a plain org member cannot delete org memory (`org:configure`), so they are told an owner or admin must make room, and an owner, an admin or a user with their own memory is told how to delete.
+- Each save runs under a lock for the account (the org when the caller has one), in order (approximately: the caller's record is read before the save is queued), so the check and the write cannot interleave with another save, **including the members of one JSON-RPC batch and a retry sent at the same moment**. The lock is per server process (the same limit as the lead and strategy tools): with several server instances, saves that reach different ones can each pass the check, so the cap is exact within an instance and approximate across them. The wait for an embedding while holding the lock is bounded to 15 seconds per embedding. The first time a wait times out, that part is saved without an embedding and the remaining parts of a long text are saved without asking for theirs (as when the embedding service fails; the prompt loader embeds a row that has none when it ranks an account's memories, and an account with 20 or fewer rows is injected whole, so nothing is lost). A hung embedding service therefore holds the lock for about 15 seconds plus the writes. It is not a budget for the whole save: a service that is slow but still answering, each part just inside 15 seconds, is not cut off and can hold the lock for up to about 15 seconds per part (a text of 8,000 characters is up to seven or eight parts).
+- An exact duplicate (same category, same text, ignoring surrounding whitespace; for a long text that is split, every part already stored) is not written again and costs no embedding; the answer says `saved: false, duplicate: true` and names the existing id(s).
+- `list_memories` (new): newest first, 20 a page (1 to 50), `nextCursor` back as `cursor`. The page is cut from the bounded newest-1,000 read the Settings screens make, by memory id, so a cursor can only ever select rows of the caller's own account or org. Never returns embeddings; says `truncated` when the newest-1,000 read was full (older rows exist). Both the list and the cap/duplicate check read the table strongly consistently (new `consistentRead` option on the two memory readers), so a list right after a save shows it and two identical saves in a row see each other; a category is filtered in code because an index cannot be read consistently.
+- The public-response sanitizer, which strips internal id fields from JSON-looking text in tool results for outside callers, does not touch these five tools: a memory is the caller's own text, and a memory that is a JSON object with an `apiKeyId` field must come back as saved.
+
+### Two small fixes that ride along
+
+- `POST /api/agent/api-keys` validated nothing about `rateLimitPerMin`, and the limiter trusts it: a key minted with a huge, negative or text rate had no effective limit (and `null` was stored, which blocked the key permanently). It must now be a whole number from 1 to 600 (missing or null means the default 60). Nothing existing changes: prod has 66 keys, 61 at 60 and 5 at 10. A broker that mints with a string, a fraction or a rate outside 1 to 600 now gets a 400.
+- The limiter counted HTTP requests, so a JSON-RPC batch of 100 calls cost one count. The other members are now charged, for aw_ keys and OAuth users alike, **when the batch is about to be served**: a batch that does not fit in what is left is refused whole (429) before any member runs, while a batch answered 404 (expired session), 403 or 503 costs only its own request, so a client that reconnects after a 404 is not refused. Clients that send batches larger than their allowance (more than 60 for an OAuth user, more than 10 for the five prod keys at 10 a minute) will now see a 429 where before they were not counted.
+- A split (long) save that fails part-way now removes the parts whose write was confirmed (best effort, logged by id if one cannot be removed, and finished before the error is passed on), so a retry does not write them a second time. A write that was applied but whose answer was lost is not known to us and can leave one orphan part. This is in the shared module, so Emma's own save tools get it too.
+- A JSON-RPC `method` that is not text made a debug log line throw inside the async handler and left the request hanging (any authenticated key could do it); it is guarded.
+- A tool name in a `tools/call` that is not text (an object with a hostile `toString`) made the scope check throw inside an async handler and left the request hanging; it is now an unknown tool (a write), as for any name no tool has.
+
+### What `memory:org` does and does not control
+
+It decides which KEYS may call `save_org_memory` and `delete_org_memory`. It is not a wall around org memory: a key that may call `emma_send_message`, `emma_run_marketing_task` or `emma_create_session` starts an Emma agent run, and that run has Emma's own `save_org_memory`, with no scope check and no cap (Emma's default foundation tools). That is how `email:read` and the Smartlead scopes already behave; keeping the agent-run tools (`AGENT_EXECUTION_TOOLS`) out of an outside agent's allowlist is the control, and it lives with whoever mints and brokers the key, not in this repo.
+
+### Limits, stated
+
+- Org memory is written into every member's prompt: a key holding `memory:org` can put text in front of every member's Emma. The scope is opt-in and key-only, and the cap of 200 bounds how much.
+- A signed-in OAuth client (including third-party marketplace apps) can write the user's own memory, which Emma reads into her prompt: that is the documented plan decision, and a persistent channel for text. Provenance on a row is only `sourceSessionId` (account) or `sourceUserId` (org).
+- Each save and each `list_memories` reads up to the newest 1,000 rows strongly consistently (about 17 KB each; on the largest prod account, 277 rows, about 4.7 MB). Both memory tables are pay-per-request, so that costs read units, not capacity.
+- Outside this repo: the key broker must request `memory:org` when it mints for an agent that writes org memory; the customer portal's key form cannot grant it today.
+- Memory is never deleted by age: TTL is off on both tables, and no source attribute is stored (no `source: 'mcp'` on rows; that would be a persisted-model change).
+- Rollback is a revert of the PR (code only).
+
+## ENG-2840: memory readers return every memory up to a bound instead of one page, and the memory tool bodies move to one shared module (2026-11-23)
+
+Wave 2, slice W2-1. No new tool and no new route; it repairs what Emma and the Settings memory screens read, and it moves the four memory tool bodies (`save_memory`, `delete_memory`, `save_org_memory`, `delete_org_memory`) into `backend/src/emma/impl/memory.ts` so the MCP memory tools of the next slice can share one set of guards.
+
+### The bug this fixes
+
+A memory row carries a 1,536-number embedding, about 17 KB, and one DynamoDB query page holds at most 1 MB, so one page is 56 to 60 rows. `accountMemoryDb.getUserMemories` returned after the first page that held any ordinary row, and `orgMemoryDb.getOrgMemories` was one unpaged query. Memory ids are ULIDs and the query reads oldest first, so an account with more memories than one page showed only its OLDEST 56 or so, to Emma's prompt and to the Settings memory screen alike. On 2026-11-23 that was 14 of the 52 accounts with memories (and one org); the largest account stores 277 and its page returned 56. Every memory saved after the first page was invisible.
+
+### What changed
+
+- `getUserMemories` and `getOrgMemories` take a fourth argument, `options: { maxRows?, newestFirst?, omitEmbeddings? }`. A call with a `limit` behaves exactly as before. A call without one follows the cursor until the rows run out or `maxRows` is reached.
+  - The prompt loader (`agentModeService`) is unchanged and gets the defaults: the **newest 200** rows (`MEMORY_READ_MAX_ROWS_PROMPT`), embeddings included because it ranks by them.
+  - `GET /api/memory` and `GET /api/org/:orgId/memory` read the **newest** rows up to **1,000** and return them **oldest first** as before (so the screen order does not change; if an account ever held more than 1,000, it is the oldest that are left out, never the newest). They do **not fetch the embedding vectors at all**: the read names every other attribute (a DynamoDB projection, checked against the real service on the account table and the category index of both tables). The portal never reads the vectors; they were about 40 of every 45 KB of a row on the wire. A category-filtered list is returned as read, because its index sorts by category, not by time.
+  - A read that stops at its bound logs a `[memory] ... stopped at its N-row bound (there may be more rows stored)` warning (DynamoDB returns a cursor whenever the limit was used up, even when nothing is left, so an account with exactly the bound's number of rows logs it too).
+  - `maxRows` and `newestFirst` are ignored when a `limit` is passed (that call keeps its old behaviour and order).
+- The account reader's page budget grows with the bound (ten pages for a `limit` call, as before). It still fails closed rather than return a partial answer. The org reader still does not validate rows (it never did; one odd row must not take the whole org list or every member's prompt down), and the account reader still fails closed on an item that is not a row at all (not an object, or no string id), on a page that is not a list, and on any row when the read has a `limit` (`getRecentMemories` and limited callers are exactly as before). The one change: the read without a `limit` (the prompt loader and the list screens) now reaches rows far past the first page, so a row that has an id but no text `content` (nothing to show or rank) is skipped and logged (`[memory] account memory read skipped N row(s) without text content, ids ...`) instead of failing the whole list and every prompt for that account. A bound that is not a number, zero or negative falls back to the default; a fraction rounds down, never below 1. (Checked on prod on 2026-11-23: no row in either memory table lacks a string `content` or `memoryId`.)
+- `setMemoryEmbedding` (both tables) is now conditional on the row existing and ignores a row deleted in the meantime. It was an unconditional upsert: a memory deleted while its embedding was being backfilled came back as a row with no content, which makes the account reader refuse the whole list.
+- `deleteMemory` (both tables) resolves `true` when a row was deleted and `false` when there was none. A delete of a missing id used to answer "deleted".
+- The memory category list moved to `utils/memoryCategories.ts`, one source for the database layer and the new module.
+
+### Tool defects fixed on the way (all in `emma/impl/memory.ts`)
+
+- An invalid category used to be embedded, and the embedding billed to the caller's cap, before the database layer refused it. The arguments are now checked first.
+- Whitespace-only content over 2,000 characters split into nothing and answered `success: true` with no row saved. It is now refused ("Content is required"). A call with no arguments object at all now answers `Invalid category: undefined` instead of a `TypeError`.
+- Content that was not text threw after the earlier rows were saved, so a retry saved them twice. It is now refused before anything is written.
+- The 8,000-character limit was enforced only by the agent-mode tool schema. It is enforced in the shared module too, so a caller that skips that schema cannot write a larger memory.
+- `delete_memory` / `delete_org_memory` of an id that does not exist now answer `success: false` ("not found; nothing was deleted").
+- The `delete_org_memory` description said only owners can delete; owners and admins can (`org:configure`). The description now says so.
+
+### Save routes and the embedding bill
+
+- `POST /api/memory` and `POST /api/org/:orgId/memory` embedded the text, billed to the caller's cap, before `addMemory` refused an invalid category, a blank content or a content over 2,000 characters. They now run the same checks, with the same messages and the same 400, before the embedding is requested (`utils/memorySaveGuard.ts`; a test pins that its messages equal `addMemory`'s). A valid save is unchanged.
+
+### What an end user sees
+
+- Emma: for an account past one page, her memory context now includes the newer memories as well (still the top 20 by relevance, as before). Nothing changes for an account with 56 or fewer memories.
+- Settings, memory and org memory tabs: an account past one page sees all its memories (up to 1,000) instead of the first ~56. The tabs have no pagination, so it is one longer list. The response is much smaller per row because the vectors are gone.
+- Emma's save and delete memory tools: the same answers, except the edge cases above, which are now errors or a "not found" instead of a false success.
+- No cap on how many memories an account may save is added here (the MCP write cap belongs to the next slice).
+- Unchanged on purpose: `DELETE /api/memory/:id` and `DELETE /api/org/:orgId/memory/:id` still answer success for an id that does not exist (the portal behaves as today); only the Emma tools say "not found".
+
+### Limits, stated
+
+- The prompt loader reads at most the newest 200 rows. An account above that keeps its memories, but Emma ranks among the newest 200 only: for the largest account today (277 rows) facts 1 to 77 stay out of her prompt, where before 221 of 277 did (the old reader returned one page of 56 rows, measured on prod). It costs about four sequential queries per agent turn for that account, against one before. The Settings list reads up to 1,000.
+- A 200-row read for the prompt is about 3.4 MB stored and about 9 MB of DynamoDB JSON on the wire for an account with an embedding on every row (about 45 KB of JSON per row; the largest account today is 277 rows). It was up to one page before. The parse and unmarshal (about 100 ms each at 200 rows, measured with the aws-sdk v2 converter on synthetic rows) run in the forked generation worker (the main generation path), not on the API event loop, and the loader reads once per turn. The Settings lists no longer fetch the vectors, so they stay small. Only 16 of 2,411 rows lacked an embedding on 2026-11-23, so the backfill the loader does for them stays negligible.
+- A read through an eventually consistent index can lag a save made a moment earlier; the tools answer with the saved ids.
+- Rollback is a revert of the PR (code only; no data, schema or index changed).
+
+## ENG-3102: merge-evidence.sh treats Opslane "didn't verify this commit" as an abstention (2026-11-16)
+
+- `.github/scripts/merge-evidence.sh` pass 4: the closed list of Opslane `neutral` abstention titles gains a fourth entry, "Opslane didn't verify this commit". Opslane posts it when it did not run on a head at all (a daily limit, the plan, or a setup change) and says the check does not block. Before, that title failed the gate, and the check-run cannot be re-requested, so only a new push could clear it (#4134).
+- The match is still app slug + check name + `neutral` + exact title. An Opslane `failure`, or a `neutral` with any other title, still blocks. A dropped run is not counted as evidence.
+- Consequence: a head can now pass the gate with no Opslane run on it. To undo, remove the title from `OPSLANE_NOOP_TITLES`.
+- Tests: four cases in `.github/scripts/merge-evidence.test.sh` built from the #4134 check-run.
+
 ## ENG-3148: Policy-blocked tool errors carry gate detail (2026-11-22)
 
 `toolResultError` now appends a blocked result's `formattedContent` (e.g. set_work_plan_status naming the missing calls per step) to the model-visible error. Prod session e68025bf burned 13/40 steps on blind set_work_plan_status retries and hit the iteration limit. iterationLimitStopResult semantics unchanged.
