@@ -158,6 +158,8 @@ export const DETERMINISTIC_TOOLS: readonly string[] = Object.freeze([
   'search_knowledge_base',
   'search_leads',
   'send_email',
+  // Emails a GTM status report: a deterministic report builder behind the opt-in gtm:email key scope (gtmEmailTool.ts); it never runs the agent.
+  'send_gtm_status_report',
   'set_landing_page_lead_list',
   'share_landing_page_with_org',
   'update_knowledge_base_file_content',

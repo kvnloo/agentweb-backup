@@ -12,6 +12,29 @@ import { escapeHtml as escapeText } from '../emma/impl/shared/htmlEscaping';
  */
 const esc = (value: unknown): string => escapeText(String(value ?? ''));
 
+/** A single header-safe line: a title written with a line break must not be able to add a header to the email it names. */
+const oneLine = (value: unknown): string => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
+
+/**
+ * How many email addresses one contact entry holds. Contacts (`dri`) are stored as written, with no validation in the portal, so an entry
+ * can be "a@x.com, b@x.com", a list, or use separators such as a fullwidth comma or a zero-width space. Separators are any whitespace,
+ * comma or semicolon (ASCII or fullwidth) and the invisible characters; only the parts that contain an "@" are addresses, so
+ * "Jane Doe <jane@x.com>" is one. An entry with no "@" counts as one.
+ */
+function addressesIn(entry: string): number {
+  return Math.max(1, String(entry).split(/[\s,;\uff0c\uff1b\u3001\u200b-\u200f\u2028\u2029\u2060\ufeff]+/).filter((part) => part.includes('@')).length);
+}
+
+/** Distinct people: the same mailbox written in another case is one person, and gets one email. The first spelling is kept. */
+function distinctRecipients(addresses: string[]): string[] {
+  const seen = new Map<string, string>();
+  for (const address of addresses) {
+    const clean = String(address).trim();
+    if (clean !== '' && !seen.has(clean.toLowerCase())) seen.set(clean.toLowerCase(), clean);
+  }
+  return Array.from(seen.values());
+}
+
 interface NotificationOptions {
   notifyUser?: boolean;
   notifyItemPoc?: boolean;
@@ -26,6 +49,21 @@ interface StatusReportNotificationOptions {
   notifyPhasePoc?: boolean;   // For phase reports
   notifyPhasePocs?: boolean;  // For plan reports (all phase PoCs)
   message?: string;
+  /**
+   * ENG-2840: the most distinct people one call may email. When the chosen options resolve to more, NOTHING is sent and the result says so
+   * (`overCap`). Set by the MCP tool for outside agents (10); the portal and Emma set none.
+   */
+  maxRecipients?: number;
+}
+
+/** A cap that is not a finite, non-negative number is no cap. */
+function capIsSet(cap: unknown): cap is number {
+  return typeof cap === 'number' && Number.isFinite(cap) && cap >= 0;
+}
+
+/** True when a report to `count` people exceeds the caller's cap. */
+function exceedsRecipientCap(count: number, cap: unknown): cap is number {
+  return capIsSet(cap) && count > cap;
 }
 
 interface GTMPlan {
@@ -124,7 +162,7 @@ export async function sendGTMPlanUpdateNotifications(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     if (uniqueRecipients.length === 0) {
       return;
@@ -172,7 +210,7 @@ export async function sendGTMPlanUpdateNotifications(
     // Get customer portal URL
     const gtmPlanUrl = `${customerFrontendUrl}/gtm-plan`;
 
-    const subject = `GTM Plan Update: ${plan.title}`;
+    const subject = `GTM Plan Update: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Update Notification</h2>
@@ -291,11 +329,25 @@ export async function sendPhaseStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
       return result;
+    }
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
@@ -346,7 +398,7 @@ export async function sendPhaseStatusReport(
       `;
     }).join('');
 
-    const subject = `GTM Plan Phase Status Report: ${phase.title}`;
+    const subject = `GTM Plan Phase Status Report: ${oneLine(phase.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <h2 style="color: #333;">Phase Status Report</h2>
@@ -518,11 +570,25 @@ export async function sendPlanStatusReport(
     }
 
     // Remove duplicates
-    const uniqueRecipients = Array.from(new Set(recipients));
+    const uniqueRecipients = distinctRecipients(recipients);
 
     result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
       return result;
+    }
+    // With a cap (the MCP tool sets one) every contact must be ONE address: a contact holding a list would be a single send to several people,
+    // past both the cap and the hourly budget, which counts sends. Refuse before sending anything, so a cap is a promise about the whole
+    // report and never a partial send.
+    if (capIsSet(notifications.maxRecipients)) {
+      const lists = uniqueRecipients.filter((entry) => addressesIn(entry) > 1).length;
+      if (lists > 0) {
+        result.multiAddressContacts = lists;
+        return result;
+      }
+      if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+        result.overCap = notifications.maxRecipients;
+        return result;
+      }
     }
 
     // Get optional message from notifications
@@ -628,7 +694,7 @@ export async function sendPlanStatusReport(
       `;
     }).join('');
 
-    const subject = `GTM Plan Status Report: ${plan.title}`;
+    const subject = `GTM Plan Status Report: ${oneLine(plan.title)}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Status Report</h2>

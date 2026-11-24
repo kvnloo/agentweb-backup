@@ -2736,7 +2736,7 @@
   {
     "name": "manage_gtm_items",
     "listed": false,
-    "description": "Manage the phases and work items of a GTM plan. Each action takes only its own inputs; any other argument is refused by name. add_phase: plan_id, title (required), description, dri, due_date. update_phase: plan_id, phase_id and at least one of title, description, dri, due_date. delete_phase: plan_id, phase_id. add_work_items: plan_id, phase_id, work_items (1 to 20 objects, each with title and optionally description, dri, due_date); they are added one after the other. update_work_item: plan_id, phase_id, work_item_id and at least one of title, description, status (pending, in_progress, completed, skipped), notes, dri, due_date. delete_work_item: plan_id, phase_id, work_item_id. get_common_items: nothing (a plan_id is accepted and ignored). add_common_items: plan_id, items (up to 50, from get_common_items: each a title and optionally a description), and exactly one of target_phase_id or new_phase_name. Nothing here emails anyone: status reports and update notifications are sent from the portal. Dates are YYYY-MM-DD; dri is an email address; an empty string (or null) clears description, notes, dri or due_date. A phase's and a plan's status follow their work items and cannot be set.",
+    "description": "Manage the phases and work items of a GTM plan. Each action takes only its own inputs; any other argument is refused by name. add_phase: plan_id, title (required), description, dri, due_date. update_phase: plan_id, phase_id and at least one of title, description, dri, due_date. delete_phase: plan_id, phase_id. add_work_items: plan_id, phase_id, work_items (1 to 20 objects, each with title and optionally description, dri, due_date); they are added one after the other. update_work_item: plan_id, phase_id, work_item_id and at least one of title, description, status (pending, in_progress, completed, skipped), notes, dri, due_date. delete_work_item: plan_id, phase_id, work_item_id. get_common_items: nothing (a plan_id is accepted and ignored). add_common_items: plan_id, items (up to 50, from get_common_items: each a title and optionally a description), and exactly one of target_phase_id or new_phase_name. Nothing here emails anyone: to email a status report use send_gtm_status_report (it needs an API key with the gtm:email scope). Dates are YYYY-MM-DD; dri is an email address; an empty string (or null) clears description, notes, dri or due_date. A phase's and a plan's status follow their work items and cannot be set.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4259,6 +4259,53 @@
     "gating": {
       "internalOnly": false,
       "requiresUserAccount": false
+    }
+  },
+  {
+    "name": "send_gtm_status_report",
+    "listed": false,
+    "description": "Email a status report for one phase or for a whole GTM plan to the people you choose. Needs an API key with the gtm:email scope. plan_id (required). phase_id: send it for a phase report, leave it out for a whole-plan report. Choose who gets it by setting at least one of notify_user (the account owner), notify_plan_poc (the plan contact), notify_phase_poc (a phase report: that phase's contact), notify_phase_pocs (a plan report: every phase contact) to true; nobody is emailed by default. message: an optional note, at most 2000 characters. Limits: at most 10 people per call (a report that would reach more sends nothing), about 50 emails an hour per account (all your keys together), and the same report is not sent twice within 10 minutes. The email goes from AgentWeb to whatever addresses are on the plan, including contacts set with manage_gtm_plan, so check them first with manage_gtm_plan get. The answer says how many emails were accepted and how many failed. Any other argument is refused by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": {
+          "type": "string",
+          "description": "Plan id; list_gtm_plans returns them"
+        },
+        "phase_id": {
+          "type": "string",
+          "description": "Send it for a phase report; leave it out for a whole-plan report"
+        },
+        "notify_user": {
+          "type": "boolean",
+          "description": "Email the account owner"
+        },
+        "notify_plan_poc": {
+          "type": "boolean",
+          "description": "Email the plan contact (the plan dri)"
+        },
+        "notify_phase_poc": {
+          "type": "boolean",
+          "description": "Phase report only: email that phase's contact"
+        },
+        "notify_phase_pocs": {
+          "type": "boolean",
+          "description": "Plan report only: email every phase contact"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Optional note shown in the report, at most 2000 characters"
+        }
+      },
+      "required": [
+        "plan_id"
+      ]
+    },
+    "sideEffect": "write",
+    "gating": {
+      "internalOnly": false,
+      "requiresUserAccount": true
     }
   },
   {

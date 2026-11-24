@@ -126,6 +126,7 @@ export const MCP_TOOL_SIDE_EFFECTS: Readonly<Record<string, McpToolSideEffect>> 
   save_org_memory: 'write',
   search_knowledge_base: 'write',
   search_leads: 'write',
+  send_gtm_status_report: 'write',
   set_landing_page_lead_list: 'write',
   share_landing_page_with_org: 'write',
   submit_scheduled_chat_variables: 'write',
