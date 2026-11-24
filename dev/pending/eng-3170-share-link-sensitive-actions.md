@@ -119,3 +119,29 @@ Known limits added by this review (not fixed here, disclosed):
 - The setting is written to the link that is current when the write happens (a background job minting a new link in between could be switched on); conditioning the
   write on the token that was read would close it.
 
+## The exhaustive pass over every registered tool (2026-11-24), and the closed-world guard
+The final review found siblings of the same classes each round (a tool whose name carries no outward verb but which runs a task as the owner, publishes a page,
+re-times a schedule, replaces a Google doc...). So the whole registry (281 tools) was judged once, each by reading its implementation (two independent
+read-only reviewers, half each), against the approved OFF wording. Added to the sensitive list (whole tool): `create_image_task_from_prompt`, `generate_landing_page`
+(deploys a LIVE page, opens a lead list to public submissions, locks the site mode), `duplicate_landing_page`, `create_skill`, `save_work_plan`,
+`attach_knowledge_base_files`, `create_knowledge_base`, `create_html_template`, `create_book_outline`, `update_google_doc`, `update_google_sheet`,
+`report_product_issues` (a PUBLIC Featurebase post as the owner), `write_clickup_doc`, `create_clickup_task`, `coding_agent` (pushes to the owner's public preview, which the
+next publish ships), `list_test_accounts`, `open_site_signin`. Judged by argument: `dri` on the GTM plan, phase and work-item updates (every later report goes to that
+address), `email_notifications` on `create_schedule_from_template` and on `manage_scheduled_chat` create and update (provenance restricts the tools of a run,
+not who receives its emailed result), `autocomplete` on `create_work_plan` and `modify_work_plan`, `trigger_run` on `submit_scheduled_chat_variables` (runs the
+owner's schedule now, paused or not, with no mark), and for a schedule `update`, the timing and model fields (`schedule_frequency`, `frequency_interval_days`,
+`next_run_time`, `timezone`, `run_count`, `llm_model`, `backup_model`, `daily_digest`: timing is untracked by the provenance on purpose, so re-timing the owner's own
+schedule leaves no mark). A new `forbidWhenSet` on the by-argument rule expresses the last two.
+
+**The guard is closed-world now.** `shareVisitorSensitiveTools.test.ts` fails for ANY registered tool that is not: sensitive, sensitive by argument, blocked, admin,
+listed with a reason in `REVIEWED_NOT_SENSITIVE` (mutating, judged safe) or `REVIEWED_READ_ONLY` (named so that its read-ness is not obvious), or named like a read
+(`get_`, `list_`, `read_`, `search_`, ...). Before, only names containing an outward verb forced a decision, which is why each round found one more. What this still
+cannot catch: a new tool that is NAMED like a read but writes, and tools registered at runtime from the `mcp_servers` setting (the test runs without it).
+
+Judgement calls left allowed on an OFF link (each overwrites or adds data inside the account and none is a delete, a send or a publish; the owner's to decide):
+`update_lead`, `update_lead_status` and `update_email_draft_for_lead` (a lead's fields and draft, blanking included), `update_book_content`,
+`generate_book_content`, `update_landing_page_context`, `enrich_leads_execute` and `enrich_lead_custom` with `overwrite_policy: always_overwrite`, a `dri` set inside
+the items of `add_gtm_phase` / `add_gtm_work_items` / `add_gtm_common_items`, and lead lists that feed an automated outreach schedule (anything a visitor adds to
+such a list decides who the owner's outreach contacts later). `email` search and get (and Slack/X message reads) still read the owner's mailbox, so a login code or
+magic link is findable that way: the one remaining path to "use your saved logins", closing it removes reading the owner's inbox for a visitor on an OFF link.
+`send_for_review` stays (a result-link review flow: the recipient comes from the session's configuration, not from the visitor).

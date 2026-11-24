@@ -64,6 +64,10 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       // approver settles (it resumes the session as a full owner turn), and what the owner set up inside the account
       'create_revision', 'create_task_from_prompt', 'create_task_from_template', 'stage_pending_decision',
       'configure_lead_statuses', 'save_test_account', 'update_brand_guidelines', 'update_knowledge_base_file', 'update_lead_list', 'update_market_strategy',
+      // the exhaustive pass over every registered tool (2026-11-24)
+      'create_image_task_from_prompt', 'generate_landing_page', 'duplicate_landing_page', 'create_skill', 'save_work_plan',
+      'attach_knowledge_base_files', 'create_knowledge_base', 'create_html_template', 'create_book_outline', 'update_google_doc', 'update_google_sheet',
+      'report_product_issues', 'write_clickup_doc', 'create_clickup_task', 'coding_agent', 'list_test_accounts', 'open_site_signin',
     ].sort());
   });
 
@@ -155,6 +159,27 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
     });
   });
 
+  describe('a schedule create or update may not name recipients or re-time/re-model a schedule (exhaustive pass, 2026-11-24)', () => {
+    // timing and the model are not tracked by the schedule provenance on purpose, and the recipients of a run's emailed result are not restricted by the
+    // visitor mark (it restricts the tools a run may use), so on the owner's own schedule these would make it run now / far more often / mail an outside address
+    const call = (action: string, extra: Record<string, unknown>) => isSensitiveToolCall('manage_scheduled_chat', { action, schedule_id: 's1', ...extra });
+    it('an update that carries only provenance-tracked content is allowed', () => {
+      expect(call('update', { starting_message: 'new prompt' })).toBe(false);
+      expect(call('update', { schedule_name: 'n', description: 'd', keywords: ['k'], self_improve: true, email_notifications: [] })).toBe(false);
+    });
+    it.each(['schedule_frequency', 'frequency_interval_days', 'next_run_time', 'timezone', 'run_count', 'llm_model', 'backup_model', 'daily_digest'])(
+      'an update that sets %s is sensitive', (field) => {
+        expect(call('update', { [field]: field === 'run_count' ? -1 : field === 'daily_digest' ? true : 'x' })).toBe(true);
+        expect(call('update', { [field]: field === 'run_count' ? -1 : field === 'daily_digest' ? true : 'x', starting_message: 'p' })).toBe(true);
+      });
+    it('naming recipients is sensitive on create and on update, clearing them is not', () => {
+      expect(call('create', { email_notifications: ['someone@example.com'] })).toBe(true);
+      expect(call('update', { email_notifications: ['someone@example.com'] })).toBe(true);
+      expect(call('create', { email_notifications: [] })).toBe(false);
+      expect(call('create', { schedule_name: 'n', starting_message: 'm', schedule_frequency: 'daily' })).toBe(false);
+    });
+  });
+
   describe('a tool that reaches someone only when an argument is set', () => {
     it.each([
       ['google_calendar_create_event', 'attendees', ['a@example.com'], []],
@@ -165,6 +190,14 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['update_gtm_work_item', 'notify_plan_poc', true, false],
       ['create_google_doc', 'share_with_emails', ['a@example.com'], []],
       ['create_google_sheet', 'share_with_emails', ['a@example.com'], []],
+      // the exhaustive pass (2026-11-24): a recipient a visitor names, a run-now flag, an unattended plan
+      ['update_gtm_work_item', 'dri', 'someone@example.com', ''],
+      ['update_gtm_plan', 'dri', 'someone@example.com', ''],
+      ['update_gtm_phase', 'dri', 'someone@example.com', ''],
+      ['create_schedule_from_template', 'email_notifications', ['someone@example.com'], []],
+      ['submit_scheduled_chat_variables', 'trigger_run', true, false],
+      ['create_work_plan', 'autocomplete', true, false],
+      ['modify_work_plan', 'autocomplete', true, false],
     ])('%s is sensitive with %s set, and not otherwise', (tool, arg, set, unset) => {
       expect(isSensitiveToolCall(tool, { [arg]: set })).toBe(true);
       expect(isSensitiveToolCall(tool, { [arg]: unset })).toBe(false);
@@ -282,31 +315,23 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   // protected another way
   call_meta_marketing_api: 'every write halts into an approval deck; a visitor can answer it only on a link whose owner turned on Full control (the share route answers 403 otherwise)',
   manage_schedule_template: 'visitor writes are refused (ENG-2816)',
-  create_schedule_from_template: 'a schedule a visitor creates is provenance-marked and runs under the visitor profile (ENG-2816)',
-  submit_scheduled_chat_variables: 'covered by schedule provenance (ENG-2816)',
   // internal: nothing leaves the account, or nothing is lost
   find_or_lookup_email: 'a lookup',
-  update_email_draft_for_lead: 'edits a draft inside the account',
+  update_email_draft_for_lead: 'overwrites a lead\'s email DRAFT inside the account (no history); sending it is send_email_to_lead, which is sensitive',
   get_temp_email: 'a throwaway inbox for sign-ups',
   create_social_media_posts: 'builds an HTML file of posts; nothing is posted',
-  get_deployment_status: 'a read',
+  get_deployment_status: 'a status read that updates a status field',
   get_leads_needing_followup: 'a read',
   create_lead_list: 'adds data inside the account',
-  add_leads_to_list: 'adds data inside the account',
+  add_leads_to_list: 'adds leads inside the account; a merge overwrites an existing lead\'s fields (same kind of edit as update_lead)',
   remove_image_background: 'image editing',
   remove_c2pa_from_image: 'image editing',
-  send_for_review: 'sends to the owner\'s configured reviewer, and a result-link flow for an outside recipient relies on it',
+  send_for_review: 'the result-link review flow: the recipient comes from the session\'s own configuration (the visitor does not choose it), and a result-link flow for an outside recipient relies on it',
   list_connected_account_posts: 'a read',
   list_connected_accounts: 'a read',
   launch_predefined_work_plan: 'writes the session\'s own work plan',
-  report_product_issues: 'feedback to AgentWeb',
-  enqueue_human_eval: 'an internal AgentWeb queue',
-  fathom_route_action_items: 'creates tasks in the owner\'s own Notion or ClickUp (owner decision pending)',
-  create_clickup_task: 'a task in the owner\'s own ClickUp (owner decision pending)',
-  write_clickup_doc: 'a doc in the owner\'s own ClickUp (owner decision pending)',
-  generate_landing_page: 'creates a new site in a private repo (owner decision pending)',
-  duplicate_landing_page: 'copies a page (backend route not confirmed)',
-  coding_agent: 'works on a staging branch and a preview (owner decision pending)',
+  enqueue_human_eval: 'AgentWeb\'s own review queue: the visitor\'s text and the owner\'s email go to AgentWeb\'s internal Slack channel, not to the owner\'s contacts (generate_image posts the same way)',
+  fathom_route_action_items: 'a stub that creates nothing today (services/meetingIntakeService.ts); it writes to AgentWeb\'s own boards, so it becomes sensitive if it is ever wired up',
   slack_get_recent_messages: 'a read of the owner\'s Slack (privacy, raised separately)',
   slack_get_thread_replies: 'a read of the owner\'s Slack (privacy, raised separately)',
   slack_list_channels: 'a read',
@@ -319,24 +344,65 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   create_blog_article: 'creates a draft inside the account',
   create_character: 'adds data inside the account',
   add_characters: 'adds data inside the account',
-  update_google_doc: 'edits a document inside the account',
-  update_google_sheet: 'edits a sheet inside the account',
   // ENG-3170 review: found by widening the name pattern to the neutral verbs. Nothing here sends or posts anything; each edits data inside the account.
   // (The tools that overwrite what the owner set up inside the account, brand guidelines, market strategy, knowledge base, status stages, list settings and a saved test
   // login, are NOT here any more: the approved wording says an OFF link cannot "change your settings or Emma's memory", so they are on the sensitive list.)
-  update_lead: 'edits a lead\'s fields inside the account; it can not set the do-not-contact flag, which is set_lead_contact_status',
-  update_lead_status: 'records a lead\'s pipeline status (and the caller\'s draft) on the lead; sends nothing',
-  update_gtm_phase: 'edits a phase of a GTM plan inside the account',
-  update_gtm_plan: 'edits a GTM plan inside the account',
-  update_book_content: 'edits a book inside the account',
-  update_landing_page_context: 'edits a landing page\'s context inside the account',
+  update_lead: 'edits a lead\'s fields inside the account, blanking included (judgement call, owner\'s to make); it can not set the do-not-contact flag, which is set_lead_contact_status',
+  update_lead_status: 'records a lead\'s pipeline status and the draft on the lead; sends nothing',
+  update_book_content: 'find-and-replace edits to a book inside the account, no history (judgement call, owner\'s to make)',
+  update_landing_page_context: 'overwrites the owner\'s note about a landing page inside the account (judgement call, owner\'s to make)',
   update_html_file: 'edits a file in the session\'s own workspace',
   save_file: 'writes a file in the session\'s own workspace',
-  save_work_plan: 'saves a private work plan to the owner\'s library',
+  // The exhaustive pass over every registered tool (2026-11-24). Mutating, and judged NOT to break the promise (each verified in the code):
+  add_gtm_common_items: 'database writes only, no notification (a `dri` set inside items is a known limit: the update tools and the work-item tool carry the rule)',
+  add_gtm_phase: 'database write only, no notification (see add_gtm_common_items)',
+  add_gtm_work_items: 'database write only, no notification (see add_gtm_common_items)',
+  create_gtm_plan: 'database write only, no notification',
+  add_lead_engagement: 'writes one custom.* event on a lead',
+  assign_lead: 'a label on the lead; the previous value is logged; it grants no access',
+  compose_video: 'output is saved to AgentWeb storage and returned to the chat',
+  convert_to_pdf: 'output is saved to AgentWeb storage and returned to the chat',
+  create_html_file: 'a new file in the session\'s own workspace',
+  create_html_from_template: 'a new file in the session\'s own workspace, from an existing template',
+  create_book: 'a new private record inside the account',
+  generate_book_content: 'rewrites one chapter of a book, using the existing text (same kind of edit as update_book_content)',
+  generate_image: 'output is saved and returned to the chat (it also posts to AgentWeb\'s internal eval channel, like enqueue_human_eval)',
+  generate_video: 'output is saved and returned to the chat',
+  generate_voiceover: 'output is saved and returned to the chat',
+  mux_video_with_audio: 'a new file in AgentWeb storage, nothing published',
+  materialize_knowledge_base_asset: 'a new file in AgentWeb storage, nothing published',
+  repair_blog_article: 'a new file in AgentWeb storage, nothing published',
+  enrich_lead_custom: 'enrichment into the lead; with overwrite_policy always_overwrite it replaces existing values (judgement call, owner\'s to make; preview writes nothing)',
+  enrich_leads_execute: 'enrichment into the leads; with overwrite_policy always_overwrite it replaces existing values (judgement call, owner\'s to make; preview writes nothing)',
+  import_leads_from_search: 'adds leads inside the account (the import notification is off by default); searches with the owner\'s own LinkedIn account',
+  install_skills: 'adds skills to THIS session only; the subscription checks still apply',
+  log_contact_event: 'adds one entry to a contact\'s timeline, duplicates removed',
+  present_question_deck: 'puts a question deck in this session; the visitor answers it',
+  promote_to_deal: 'an internal deal record',
+  rotate_primary: 'an internal deal record, reversible',
+  recommend_predefined_work_plan: 'a proposal card in this session only',
+  set_work_plan_status: 'changes this session\'s own plan status; the plan\'s tool calls are still checked one by one',
+  solve_captcha: 'spends the owner\'s captcha credits; the browser steps it makes inherit the visitor\'s limits',
+  ask_user_question: 'writes a question card to the session only',
   read_market_strategy: 'a read (the name contains "mark")',
   load_connected_account_metrics: 'a read of a connected account\'s metrics',
   google_drive: 'creates folders in the owner\'s own drive',
 };
+
+// Tools that do not change anything (judged in the 2026-11-24 per-tool pass by reading the implementation) and whose names do not say so.
+const REVIEWED_READ_ONLY: Record<string, string> = {
+  account_summary: 'a read', ask_crm: 'a question answered from the CRM', audit_ad_utm_coverage: 'an audit, a read',
+  enrich_leads_preview: 'a preview, writes nothing', fathom_get_meetings: 'a read', fathom_get_onboarding_context: 'a read', fathom_get_transcript: 'a read',
+  google_calendar_get_event: 'a read', google_calendar_list_calendars: 'a read', google_calendar_list_events: 'a read',
+  google_search_web: 'a web search', you_search_news: 'a web search', you_search_web: 'a web search',
+  jev_decide: 'a decision returned to the model', navigate_to: 'a no-op that tells the UI where to go',
+  perform_data_analysis: 'an analysis in a sandbox, returned to the chat', perform_deep_research: 'research returned to the chat',
+  request_user_captcha_solution: 'asks the person in the chat', resolve_skill: 'a lookup', run_local_agent_task: 'a retired stub that always fails',
+  scan_website_links: 'a read of a public site', wait_seconds: 'a pause',
+};
+
+// A tool whose name starts like this is a read (a name pattern; a new tool named like a read but doing more is the one thing this test cannot catch).
+const READ_NAME = /^(get|list|read|search|find|check|lookup|fetch|query|view|inspect|analy[sz]e|describe|count|summari[sz]e|preview|explain|validate|detect|estimate|compare|calculate)_/;
 
 // ENG-3170 review: the neutral verbs (clear, load, save, update, configure, manage, mark, stage) are in on purpose: a tool that wipes or replaces the owner's saved
 // logins or settings has no outward-sounding word in its name, and a name-only pattern that misses it forces nobody to look.
@@ -366,7 +432,9 @@ describe('the sensitive list against the real tool registry', () => {
     const problems: string[] = [];
     for (const [name, rule] of Object.entries(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT)) {
       const props = schemaOf(tools.get(name))?.properties ?? {};
-      const wanted = rule.kind === 'action' ? [rule.argument, ...Object.values(rule.alsoRequire ?? {}).map((extra) => extra.argument)] : [...rule.arguments];
+      const wanted = rule.kind === 'action'
+        ? [rule.argument, ...Object.values(rule.alsoRequire ?? {}).map((extra) => extra.argument), ...Object.values(rule.forbidWhenSet ?? {}).flat()]
+        : [...rule.arguments];
       for (const arg of wanted) if (!(arg in props)) problems.push(`${name}.${arg}`);
     }
     expect(problems).toEqual([]);
@@ -410,6 +478,23 @@ describe('the sensitive list against the real tool registry', () => {
       .filter((name) => !SHARE_VISITOR_BLOCKED_TOOLS.has(name) && !ADMIN_SKILL_TOOL_NAMES.includes(name))
       .sort();
     expect(unclassified).toEqual([]);
+  });
+
+  it('CLOSED WORLD: every registered tool is classified: sensitive, sensitive by argument, blocked, admin, reviewed with a reason, or named like a read', () => {
+    const unclassified = [...tools.keys()]
+      .filter((name) => name !== 'connect_account') // refused for a visitor by its own rule
+      .filter((name) => !SHARE_VISITOR_SENSITIVE_TOOLS.has(name) && !(name in SHARE_VISITOR_SENSITIVE_BY_ARGUMENT))
+      .filter((name) => !SHARE_VISITOR_BLOCKED_TOOLS.has(name) && !ADMIN_SKILL_TOOL_NAMES.includes(name))
+      .filter((name) => !(name in REVIEWED_NOT_SENSITIVE) && !(name in REVIEWED_READ_ONLY))
+      .filter((name) => !READ_NAME.test(name))
+      .sort();
+    expect(unclassified).toEqual([]);
+  });
+
+  it('the read-only list has no stale names and no name that is also classified elsewhere', () => {
+    const stale = Object.keys(REVIEWED_READ_ONLY).filter((name) => !tools.has(name));
+    const both = Object.keys(REVIEWED_READ_ONLY).filter((name) => SHARE_VISITOR_SENSITIVE_TOOLS.has(name) || name in SHARE_VISITOR_SENSITIVE_BY_ARGUMENT || name in REVIEWED_NOT_SENSITIVE);
+    expect({ stale, both }).toEqual({ stale: [], both: [] });
   });
 
   it('the reviewed-not-sensitive list has no stale names and no name that is also in the sensitive list', () => {

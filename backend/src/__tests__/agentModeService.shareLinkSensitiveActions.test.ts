@@ -476,6 +476,64 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       await expect(run('read_brand_guidelines', VISITOR, {})).resolves.toEqual({ ran: true });
     });
 
+    it.each([
+      ['create_image_task_from_prompt', { task_name: 'n', prompt: 'p' }],
+      ['generate_landing_page', { prompt: 'a page' }],
+      ['duplicate_landing_page', { page_id: 'p' }],
+      ['create_skill', { name: 'n', systemPrompt: 'p' }],
+      ['save_work_plan', { title: 't', steps: [] }],
+      ['attach_knowledge_base_files', { task_id: 't', file_urls: [] }],
+      ['create_knowledge_base', { name: 'n' }],
+      ['create_html_template', { template_name: 'n', html_content: '<p/>' }],
+      ['create_book_outline', { book_id: 'b', sections: [] }],
+      ['update_google_doc', { document_id: 'd', content: 'x' }],
+      ['update_google_sheet', { spreadsheet_id: 's', range: 'A1', values: [['x']] }],
+      ['report_product_issues', { issues: [{ type: 'feature_request', title: 't', description: 'd' }] }],
+      ['write_clickup_doc', { title: 't', content: 'c' }],
+      ['create_clickup_task', { list_id: 'l', name: 'n' }],
+      ['coding_agent', { instruction: 'edit the page' }],
+      ['list_test_accounts', {}],
+      ['open_site_signin', { url: 'https://example.com' }],
+    ])('exhaustive pass, OFF link: %s is refused; ON link runs it', async (tool, args) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, args)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run(tool, VISITOR, args)).resolves.toEqual({ ran: true });
+    });
+
+    it.each([
+      ['update_gtm_plan', { plan_id: 'p', dri: 'someone@example.com' }, { plan_id: 'p', title: 't' }],
+      ['update_gtm_phase', { phase_id: 'p', dri: 'someone@example.com' }, { phase_id: 'p', title: 't' }],
+      ['update_gtm_work_item', { item_id: 'i', dri: 'someone@example.com' }, { item_id: 'i', title: 't' }],
+      ['create_schedule_from_template', { template_id: 't', email_notifications: ['someone@example.com'] }, { template_id: 't' }],
+      ['submit_scheduled_chat_variables', { schedule_id: 's', variable_values: {}, trigger_run: true }, { schedule_id: 's', variable_values: {} }],
+      ['create_work_plan', { title: 't', steps: [], autocomplete: true }, { title: 't', steps: [] }],
+      ['modify_work_plan', { steps: [], autocomplete: true }, { steps: [] }],
+    ])('exhaustive pass, OFF link: %s is refused with the argument that reaches someone or runs unattended, and runs without it', async (tool, risky, harmless) => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      await expect(run(tool, VISITOR, risky)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      await expect(run(tool, VISITOR, harmless)).resolves.toEqual({ ran: true });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run(tool, VISITOR, risky)).resolves.toEqual({ ran: true });
+    });
+
+    it('OFF link: a schedule update that re-times or re-models a schedule, or names recipients, is refused; one that only changes the prompt runs', async () => {
+      readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
+      const upd = (extra: Record<string, unknown>) => ({ action: 'update', schedule_id: 's1', ...extra });
+      for (const extra of [{ next_run_time: '2026-12-01T09:00:00Z' }, { schedule_frequency: 'hourly' }, { run_count: -1 }, { llm_model: 'x' }, { email_notifications: ['someone@example.com'] }]) {
+        await expect(run('manage_scheduled_chat', VISITOR, upd(extra))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      }
+      await expect(run('manage_scheduled_chat', VISITOR, { action: 'create', schedule_name: 'n', starting_message: 'm', schedule_frequency: 'daily', email_notifications: ['someone@example.com'] }))
+        .rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      await expect(run('manage_scheduled_chat', VISITOR, upd({ starting_message: 'new prompt' }))).resolves.toEqual({ ran: true });
+      await expect(run('manage_scheduled_chat', VISITOR, { action: 'create', schedule_name: 'n', starting_message: 'm', schedule_frequency: 'daily' })).resolves.toEqual({ ran: true });
+      readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
+      await expect(run('manage_scheduled_chat', VISITOR, upd({ next_run_time: '2026-12-01T09:00:00Z' }))).resolves.toEqual({ ran: true });
+    });
+
     it('a link made before the setting existed (a 7-day dialog lifetime) keeps these, as it kept every sensitive tool', async () => {
       readSession.mockResolvedValue(link({ sharedAt: ago(1), expiresAt: ahead(6) }));
       await expect(run('update_brand_guidelines', VISITOR, { guidelines: 'x' })).resolves.toEqual({ ran: true });
@@ -529,7 +587,7 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
       expect(cookieCalls()).toContain('save_browser_cookies');
     });
 
-    describe('the restriction travels with the call: a tool that calls executeTool itself (open_site_signin, solve_captcha, coding_agent) makes a nested call with no context', () => {
+    describe('the restriction travels with the call: a tool that calls executeTool itself (solve_captcha; open_site_signin and coding_agent too, but those are sensitive now and refused on an OFF link before they get that far) makes a nested call with no context', () => {
       // the REAL shape: chat turns run in a forked worker, so no per-process marker is visible there; the nested call is made from inside the
       // tool's own call, with no extra context at all
       const nestedBrowserCallFrom = (outer: string, inner = 'playwright_browser_run_code', innerArgs: any = { code: 'async (page) => page.url()' }) => {
@@ -546,68 +604,68 @@ describe('AgentModeService.executeTool: sensitive actions on a share link (ENG-3
 
       it('OFF link: the visitor\'s nested browser call does not load the owner\'s cookies (no marker, no claim on the inner call)', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        const seen = nestedBrowserCallFrom('open_site_signin');
-        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        const seen = nestedBrowserCallFrom('solve_captcha');
+        await run('solve_captcha', VISITOR, { url: 'https://example.com' });
         expect(seen).toEqual([{ tool: 'playwright_browser_run_code', outcome: 'ran' }]); // the browser still works
         expect(cookieCalls()).toEqual([]);
       });
 
       it('ON link: the nested call borrows the owner\'s logins, as before', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: true }));
-        nestedBrowserCallFrom('open_site_signin');
-        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        nestedBrowserCallFrom('solve_captcha');
+        await run('solve_captcha', VISITOR, { url: 'https://example.com' });
         expect(cookieCalls()).toContain('load_browser_cookies');
       });
 
       it('the OWNER\'s own call (no claim anywhere): the nested call loads cookies and the link is never read', async () => {
-        nestedBrowserCallFrom('open_site_signin');
-        await run('open_site_signin', undefined, { site: 'rankai' });
+        nestedBrowserCallFrom('solve_captcha');
+        await run('solve_captcha', undefined, { url: 'https://example.com' });
         expect(cookieCalls()).toContain('load_browser_cookies');
         expect(readSession).not.toHaveBeenCalled();
       });
 
       it('a nested call inherits the RESTRICTIONS too: a visitor\'s tool that calls a sensitive tool itself is refused on an OFF link', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        const seen = nestedBrowserCallFrom('open_site_signin', SENSITIVE, { list_id: 'l', lead_ids: ['a'] });
-        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        const seen = nestedBrowserCallFrom('solve_captcha', SENSITIVE, { list_id: 'l', lead_ids: ['a'] });
+        await run('solve_captcha', VISITOR, { url: 'https://example.com' });
         expect(seen).toEqual([{ tool: SENSITIVE, outcome: 'refused (restriction_profile)' }]);
       });
 
       it('a nested call that carries a profile of its OWN inside a visitor\'s call is still the visitor\'s for the cookie rule', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
         dispatch.mockImplementation(async (name: string) => {
-          if (name === 'open_site_signin') {
+          if (name === 'solve_captcha') {
             await (service as any).executeTool('gpt-4', 'playwright_browser_run_code', { code: 'x' }, 'owner-user-id', 'session-1', false, { restrictionProfile: 'share_visitor_schedule' });
           }
           return { ran: true };
         });
-        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        await run('solve_captcha', VISITOR, { url: 'https://example.com' });
         expect(cookieCalls()).toEqual([]);
       });
 
       it('the scope ends with the call: the next owner call after a visitor\'s is the owner\'s', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
-        nestedBrowserCallFrom('open_site_signin');
-        await run('open_site_signin', VISITOR, { site: 'rankai' });
+        nestedBrowserCallFrom('solve_captcha');
+        await run('solve_captcha', VISITOR, { url: 'https://example.com' });
         expect(cookieCalls()).toEqual([]);
         dispatch.mockClear();
-        nestedBrowserCallFrom('open_site_signin');
-        await run('open_site_signin', undefined, { site: 'rankai' });
+        nestedBrowserCallFrom('solve_captcha');
+        await run('solve_captcha', undefined, { url: 'https://example.com' });
         expect(cookieCalls()).toContain('load_browser_cookies');
       });
 
       it('two calls at once do not leak into each other: a visitor\'s nested call and the owner\'s nested call in another chat, interleaved', async () => {
         readSession.mockResolvedValue(link({ allowSensitiveActions: false }));
         dispatch.mockImplementation(async (name: string, _args: unknown, ctx: any) => {
-          if (name === 'open_site_signin') {
+          if (name === 'solve_captcha') {
             await new Promise((resolve) => setImmediate(resolve)); // let the other call run in between
             await (service as any).executeTool('gpt-4', 'playwright_browser_run_code', { code: 'x' }, 'owner-user-id', ctx.sessionId, false, undefined);
           }
           return { ran: true };
         });
         await Promise.all([
-          run('open_site_signin', VISITOR, { site: 'rankai' }, 'session-1'),
-          run('open_site_signin', undefined, { site: 'rankai' }, 'session-owner-2'),
+          run('solve_captcha', VISITOR, { url: 'https://example.com' }, 'session-1'),
+          run('solve_captcha', undefined, { url: 'https://example.com' }, 'session-owner-2'),
         ]);
         // cookies were loaded for the owner's chat and ONLY for it
         const loadedFor = dispatch.mock.calls.filter((c) => c[0] === 'load_browser_cookies').map((c) => (c[2] as any).sessionId);
