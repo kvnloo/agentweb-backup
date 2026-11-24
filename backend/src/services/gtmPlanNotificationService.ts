@@ -1,5 +1,16 @@
 import { resendService } from './resendService';
 import { userDb } from './db';
+import type { StatusReportResult } from './gtmStatusReportOutcome';
+import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
+import { escapeHtml as escapeText } from '../emma/impl/shared/htmlEscaping';
+
+/**
+ * Escapes text a person (or an agent) wrote before it goes into the HTML part of an email. Plan, phase and work item titles, descriptions,
+ * notes, contacts, statuses and the optional message are all caller text; without this a title such as `<a href="https://x">reset your
+ * password</a>` arrives as a live link in a message from AgentWeb's system sender. The plain-text part of each email is not HTML and is left as written.
+ * The escaping itself is the shared helper's (emma/impl/shared/htmlEscaping.ts); this only makes it total (null and undefined are empty text).
+ */
+const esc = (value: unknown): string => escapeText(String(value ?? ''));
 
 interface NotificationOptions {
   notifyUser?: boolean;
@@ -166,23 +177,23 @@ export async function sendGTMPlanUpdateNotifications(
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #333;">GTM Plan Update Notification</h2>
         <p>Hello,</p>
-        <p>This is to notify you that a work item in the GTM Plan "<strong>${plan.title}</strong>" has been updated.</p>
+        <p>This is to notify you that a work item in the GTM Plan "<strong>${esc(plan.title)}</strong>" has been updated.</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          ${phase ? `<p style="margin: 5px 0;"><strong>Phase:</strong> ${phase.title}</p>` : ''}
-          ${workItem ? `<p style="margin: 5px 0;"><strong>Work Item:</strong> ${workItem.title}</p>` : ''}
-          <p style="margin: 5px 0;"><strong>Change:</strong> ${changeText}</p>
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          ${phase ? `<p style="margin: 5px 0;"><strong>Phase:</strong> ${esc(phase.title)}</p>` : ''}
+          ${workItem ? `<p style="margin: 5px 0;"><strong>Work Item:</strong> ${esc(workItem.title)}</p>` : ''}
+          <p style="margin: 5px 0;"><strong>Change:</strong> ${esc(changeText)}</p>
         </div>
         ${updatedNotes ? `
         <div style="background-color: #fff9e6; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #f57c00;">Updated Notes:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${updatedNotes.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(updatedNotes).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Additional Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
         <div style="text-align: center; margin: 30px 0;">
@@ -215,6 +226,8 @@ This is an automated notification from AgentWeb.
           subject,
           html,
           text,
+          // ENG-2840: automated mail can wait a few seconds, so it queues behind password resets and support replies, not the other way round
+          lane: 'bulk',
         });
       } catch (emailError: any) {
         console.error(`Failed to send notification to ${recipient}:`, emailError);
@@ -239,10 +252,12 @@ export async function sendPhaseStatusReport(
   phaseId: string,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePoc)) {
-    return;
+    return result;
   }
 
   try {
@@ -250,7 +265,7 @@ export async function sendPhaseStatusReport(
 
     if (!phase) {
       console.error("Phase not found for status report");
-      return;
+      return result;
     }
 
     const recipients: string[] = [];
@@ -278,8 +293,9 @@ export async function sendPhaseStatusReport(
     // Remove duplicates
     const uniqueRecipients = Array.from(new Set(recipients));
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
     }
 
     // Get optional message from notifications
@@ -316,16 +332,16 @@ export async function sendPhaseStatusReport(
 
       return `
         <tr>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.title)}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${esc(item.description)}</div>` : ''}</td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
             <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
-              ${item.status}
+              ${esc(item.status)}
             </span>
             ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
           </td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.dri || '-')}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${esc(item.notes || '-')}</td>
         </tr>
       `;
     }).join('');
@@ -338,15 +354,15 @@ export async function sendPhaseStatusReport(
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
-        <p>This is a status report for the phase "<strong>${phase.title}</strong>" in the GTM Plan "<strong>${plan.title}</strong>".</p>
+        <p>This is a status report for the phase "<strong>${esc(phase.title)}</strong>" in the GTM Plan "<strong>${esc(plan.title)}</strong>".</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          <p style="margin: 5px 0;"><strong>Phase:</strong> ${phase.title}</p>
-          <p style="margin: 5px 0;"><strong>Phase Status:</strong> ${phase.status}</p>
-          ${phase.dri ? `<p style="margin: 5px 0;"><strong>Phase PoC:</strong> ${phase.dri}</p>` : ''}
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          <p style="margin: 5px 0;"><strong>Phase:</strong> ${esc(phase.title)}</p>
+          <p style="margin: 5px 0;"><strong>Phase Status:</strong> ${esc(phase.status)}</p>
+          ${phase.dri ? `<p style="margin: 5px 0;"><strong>Phase PoC:</strong> ${esc(phase.dri)}</p>` : ''}
           ${phase.dueDate ? `<p style="margin: 5px 0;"><strong>Phase Due Date:</strong> ${(() => {
             const [year, month, day] = phase.dueDate.split('-').map(Number);
             const dueDateObj = new Date(year, month - 1, day);
@@ -431,21 +447,29 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send phase status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending phase status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }
 
 /**
@@ -458,10 +482,12 @@ export async function sendPlanStatusReport(
   plan: GTMPlan,
   notifications: StatusReportNotificationOptions,
   customerFrontendUrl: string = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'
-): Promise<void> {
+): Promise<StatusReportResult> {
+  const result: StatusReportResult = { recipients: 0, sent: 0, failed: 0 };
+
   // Check if any notifications are requested
   if (!notifications || (!notifications.notifyUser && !notifications.notifyPlanPoc && !notifications.notifyPhasePocs)) {
-    return;
+    return result;
   }
 
   try {
@@ -494,8 +520,9 @@ export async function sendPlanStatusReport(
     // Remove duplicates
     const uniqueRecipients = Array.from(new Set(recipients));
 
+    result.recipients = uniqueRecipients.length;
     if (uniqueRecipients.length === 0) {
-      return;
+      return result;
     }
 
     // Get optional message from notifications
@@ -536,16 +563,16 @@ export async function sendPlanStatusReport(
 
         return `
           <tr>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${esc(item.title)}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${esc(item.description)}</div>` : ''}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
               <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
-                ${item.status}
+                ${esc(item.status)}
               </span>
               ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
             </td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${esc(item.dri || '-')}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${esc(item.notes || '-')}</td>
           </tr>
         `;
       }).join('');
@@ -566,14 +593,14 @@ export async function sendPlanStatusReport(
         <div style="margin-bottom: 30px;">
           <div style="background-color: #f5f5f5; padding: 12px; border-radius: 5px; margin-bottom: 10px;">
             <h4 style="margin: 0; color: #333;">
-              ${phase.title}
+              ${esc(phase.title)}
               <span style="background-color: ${phaseStatusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin-left: 10px;">
-                ${phase.status}
+                ${esc(phase.status)}
               </span>
             </h4>
             ${phase.dri || phase.dueDate ? `
             <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">
-              ${phase.dri ? `PoC: ${phase.dri}` : ''}
+              ${phase.dri ? `PoC: ${esc(phase.dri)}` : ''}
               ${phase.dri && phase.dueDate ? ' | ' : ''}
               ${phase.dueDate ? `Due Date: ${phaseDueDateText}` : ''}
             </p>
@@ -609,14 +636,14 @@ export async function sendPlanStatusReport(
         ${customMessage ? `
         <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
           <p style="margin: 0; font-weight: 600; color: #1976d2;">Message:</p>
-          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+          <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${esc(customMessage).replace(/\n/g, '<br>')}</p>
         </div>
         ` : ''}
-        <p>This is a comprehensive status report for the GTM Plan "<strong>${plan.title}</strong>".</p>
+        <p>This is a comprehensive status report for the GTM Plan "<strong>${esc(plan.title)}</strong>".</p>
         <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
-          <p style="margin: 0;"><strong>Plan:</strong> ${plan.title}</p>
-          <p style="margin: 5px 0;"><strong>Plan Status:</strong> ${plan.status}</p>
-          ${plan.dri ? `<p style="margin: 5px 0;"><strong>Plan PoC:</strong> ${plan.dri}</p>` : ''}
+          <p style="margin: 0;"><strong>Plan:</strong> ${esc(plan.title)}</p>
+          <p style="margin: 5px 0;"><strong>Plan Status:</strong> ${esc(plan.status)}</p>
+          ${plan.dri ? `<p style="margin: 5px 0;"><strong>Plan PoC:</strong> ${esc(plan.dri)}</p>` : ''}
           ${plan.dueDate ? `<p style="margin: 5px 0;"><strong>Plan Due Date:</strong> ${(() => {
             const [year, month, day] = plan.dueDate.split('-').map(Number);
             const dueDateObj = new Date(year, month - 1, day);
@@ -704,19 +731,27 @@ This is an automated status report from AgentWeb.
     // Send emails to all recipients using system email
     for (const recipient of uniqueRecipients) {
       try {
-        await resendService.sendSystemEmail({
+        const delivery = await resendService.sendSystemEmail({
           to: recipient,
           subject,
           html,
           text,
+          // ENG-2840: bulk lane, see the work item update above
+          lane: 'bulk',
         });
+        // outside production the email guard resolves a send it held back: that is not a delivery
+        if (isSuppressedSendResult(delivery)) result.suppressed = (result.suppressed ?? 0) + 1;
+        else result.sent += 1;
       } catch (emailError: any) {
         console.error(`Failed to send plan status report to ${recipient}:`, emailError);
-        // Don't fail the entire request if email fails
+        // Don't fail the entire request if email fails: the caller reads `failed`
+        result.failed += 1;
       }
     }
   } catch (statusReportError: any) {
     console.error("Error sending plan status report:", statusReportError);
-    // Don't throw error, just log it
+    // Don't throw error, just log it: whatever was not sent is counted as failed
+    result.failed = result.recipients - result.sent - (result.suppressed ?? 0);
   }
+  return result;
 }

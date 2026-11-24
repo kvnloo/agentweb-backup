@@ -56,6 +56,7 @@ const SCOPE_LISTED_TOOL_NAMES: Record<string, string[]> = {
   'smartlead:read': ['list_smartlead_campaigns', 'get_smartlead_campaign_stats', 'preview_smartlead_push', 'get_smartlead_push_status'],
   // A runId comes from get_smartlead_push_status, which needs smartlead:read: agents get both scopes.
   'smartlead:control': ['pause_smartlead_push', 'cancel_smartlead_push'],
+  'memory:org': ['save_org_memory', 'delete_org_memory'],
 };
 
 /** What an external client sees in `tools/list`. `grantedScopes` is set only for api_key sessions. */
@@ -63,6 +64,11 @@ export function getListedToolDefinitions(grantedScopes?: string[]): any[] {
   const listed = new Set(listedToolNames());
   for (const scope of grantedScopes ?? []) {
     for (const name of SCOPE_LISTED_TOOL_NAMES[scope] ?? []) listed.add(name);
+  }
+  // An agent that may write org memory needs list_memories (scope org) to find the id of one it wants to delete. list_memories is a read, so
+  // it is offered only to a key that can call it (tools:read or tools:execute): a memory:org-only key would be offered it and then refused.
+  if ((grantedScopes ?? []).includes('memory:org') && (grantedScopes ?? []).some(s => s === 'tools:read' || s === 'tools:execute')) {
+    listed.add('list_memories');
   }
   // A Smartlead agent needs a listId for a preview: list_lead_lists (a read) is listed with smartlead:read only when the key can call it.
   if ((grantedScopes ?? []).includes('smartlead:read') && (grantedScopes ?? []).some(s => s === 'tools:read' || s === 'tools:execute')) {

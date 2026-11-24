@@ -19,6 +19,8 @@ import './readEmailTool';
 // Smartlead for outside agents (aw_ keys with smartlead:read / smartlead:control only).
 import './smartleadTools';
 import './conversionSummaryTool';
+import './memoryTools';
+import './gtmTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 import { SCHEDULED_CHATS_DEFAULT_LIMIT, SCHEDULED_CHATS_MAX_LIMIT } from '../../utils/scheduledChatsPage';
@@ -1801,148 +1803,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
-  name: 'manage_gtm_plan',
-  definition: {
-    name: 'manage_gtm_plan',
-    description: 'Create, read, update, or delete a GTM plan. Use action: "create", "get", "update", or "delete".',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['create', 'get', 'update', 'delete'], description: 'CRUD action' },
-        plan_id: { type: 'string', description: 'Plan ID (required for get/update/delete)' },
-        title: { type: 'string', description: 'Plan title (create/update)' },
-        description: { type: 'string', description: 'Plan description (create/update)' },
-        goals: { type: 'array', items: { type: 'string' }, description: 'Plan goals (create/update)' },
-        target_audience: { type: 'string', description: 'Target audience (create/update)' },
-        timeline: { type: 'string', description: 'Timeline (create/update)' },
-        budget: { type: 'string', description: 'Budget (create/update)' },
-        status: { type: 'string', description: 'Plan status (update)' }
-      },
-      required: ['action']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const c = ctx(context);
-    switch (args.action) {
-      case 'create': {
-        const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'POST', path: '/api/gtm-plan', context: c, body });
-        return jsonResult(data);
-      }
-      case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
-        return jsonResult(data);
-      }
-      case 'update': {
-        const { action, plan_id, ...body } = args;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}`, context: c, body });
-        return jsonResult(data);
-      }
-      case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(args.plan_id)}`, context: c });
-        return jsonResult(data);
-      }
-      default:
-        return jsonResult({ error: `Unknown action: ${args.action}` });
-    }
-  }
-});
-
-mcpToolRegistry.register({
-  name: 'manage_gtm_items',
-  definition: {
-    name: 'manage_gtm_items',
-    description: 'Manage GTM plan phases and work items. Use action: "add_phase", "update_phase", "delete_phase", "add_work_items", "update_work_item", "delete_work_item", "get_common_items", "add_common_items", or "send_status_report".',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: 'Action to perform' },
-        plan_id: { type: 'string', description: 'Plan ID' },
-        phase_id: { type: 'string', description: 'Phase ID' },
-        work_item_id: { type: 'string', description: 'Work item ID' },
-        name: { type: 'string', description: 'Phase/item name' },
-        description: { type: 'string', description: 'Description' },
-        status: { type: 'string', description: 'Status' },
-        work_items: { type: 'array', description: 'Array of work item objects' },
-        items: { type: 'array', description: 'Common items to add' },
-        target_phase_id: { type: 'string', description: 'Target phase for common items' },
-        new_phase_name: { type: 'string', description: 'New phase name for common items' },
-        include_summary: { type: 'boolean', description: 'Include summary in status report' },
-        include_details: { type: 'boolean', description: 'Include details in status report' }
-      },
-      required: ['action', 'plan_id']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const c = ctx(context);
-    const { plan_id, phase_id, work_item_id } = args;
-    switch (args.action) {
-      case 'add_phase': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases`, context: c,
-          body: { name: args.name, description: args.description, status: args.status }
-        });
-        return jsonResult(data);
-      }
-      case 'update_phase': {
-        const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c,
-          body: { name: args.name, description: args.description, status: args.status }
-        });
-        return jsonResult(data);
-      }
-      case 'delete_phase': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}`, context: c });
-        return jsonResult(data);
-      }
-      case 'add_work_items': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items`, context: c,
-          body: { workItems: args.work_items }
-        });
-        return jsonResult(data);
-      }
-      case 'update_work_item': {
-        const { action: _a, plan_id: _p, phase_id: _ph, work_item_id: _w, ...updates } = args;
-        const data = await mcpFetch({
-          method: 'PUT', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c,
-          body: updates
-        });
-        return jsonResult(data);
-      }
-      case 'delete_work_item': {
-        const data = await mcpFetch({
-          method: 'DELETE', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/work-items/${encodeURIComponent(work_item_id)}`, context: c
-        });
-        return jsonResult(data);
-      }
-      case 'get_common_items': {
-        const data = await mcpFetch({ method: 'GET', path: '/api/gtm-plan/common-items', context: c });
-        return jsonResult(data);
-      }
-      case 'add_common_items': {
-        const data = await mcpFetch({
-          method: 'POST', path: `/api/gtm-plan/${encodeURIComponent(plan_id)}/add-common-items`, context: c,
-          body: { items: args.items, targetPhaseId: args.target_phase_id, newPhaseName: args.new_phase_name }
-        });
-        return jsonResult(data);
-      }
-      case 'send_status_report': {
-        const path = phase_id
-          ? `/api/gtm-plan/${encodeURIComponent(plan_id)}/phases/${encodeURIComponent(phase_id)}/send-status-report`
-          : `/api/gtm-plan/${encodeURIComponent(plan_id)}/send-status-report`;
-        const data = await mcpFetch({
-          method: 'POST', path, context: c,
-          body: { includeSummary: args.include_summary, includeDetails: args.include_details }
-        });
-        return jsonResult(data);
-      }
-      default:
-        return jsonResult({ error: `Unknown action: ${args.action}` });
-    }
-  }
-});
+// manage_gtm_plan and manage_gtm_items live in ./gtmTools (ENG-2840 W2-4).
 
 // ─── Knowledge Base ─────────────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@ import { Request, Response } from 'express';
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
   }
@@ -137,6 +138,13 @@ describe('Interactive Share Expiration', () => {
       (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue(
         'http://localhost:5174/ishare/session-1?conversable=abc123'
       );
+      // ENG-3170 final review: the reply carries what the link STORES (the new link's expiry is 14 days from now), read back consistently
+      const stored = new Date(Date.now() + 14 * 86400000).toISOString();
+      (chatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({
+        sessionId: 'session-1',
+        userId: 'user-1',
+        interactiveShareMetadata: { isActive: true, token: 'abc123', sharedAt: new Date().toISOString(), expiresAt: stored },
+      });
 
       const req = mockRequest({
         body: { sessionId: 'session-1', expirationDays: 14 },
@@ -146,7 +154,7 @@ describe('Interactive Share Expiration', () => {
       await agentModeController.createConversableShare(req, res);
 
       const responseData = (res.json as jest.Mock).mock.calls[0][0];
-      expect(responseData).toHaveProperty('expiresAt');
+      expect(responseData).toHaveProperty('expiresAt', stored);
       // Verify the expiration is approximately 14 days from now
       const expiresAt = new Date(responseData.expiresAt);
       const expectedExpiry = new Date(Date.now() + 14 * 86400000);

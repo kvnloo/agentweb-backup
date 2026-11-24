@@ -20,6 +20,7 @@ jest.mock('../services/evaluationPolicy', () => ({ enforceEvaluationTool: jest.f
 import { authenticateMetaToolkitCaller, handleMetaToolkitCall, MetaToolkitAuthError, MetaToolkitGatewayDeps } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
 import { getGoogleToolkitManifest } from '../mcp/googleToolkitManifest';
+import { getLinkedInAdsToolkitManifest } from '../mcp/linkedInAdsToolkitManifest';
 import { annotateToolkitTools, READ_ONLY_TOOLKIT_TOOLS } from '../mcp/toolkitToolAnnotations';
 import {
   DATABRICKS_READ_ONLY_MESSAGE,
@@ -254,7 +255,7 @@ describe('ENG-2747 gateway enforcement', () => {
 });
 
 describe('ENG-2747 Databricks tools/list view', () => {
-  const all = annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest()]);
+  const all = annotateToolkitTools([...getMetaToolkitManifest(), ...getGoogleToolkitManifest(), ...getLinkedInAdsToolkitManifest(true)]);
   const view = databricksToolView(all);
 
   it('shows only tools the caller may call', () => {
@@ -267,6 +268,14 @@ describe('ENG-2747 Databricks tools/list view', () => {
       expect(names).not.toContain(hidden);
     }
     expect(names).toContain('list_meta_ads_campaigns');
+  });
+
+  it('shows the LinkedIn Ads read tool and hides its write tool (and refuses it as a call)', () => {
+    const names = view.map((t) => t.name);
+    expect(names).toContain('linkedin_ads_read');
+    expect(names).not.toContain('linkedin_ads_write');
+    expect(isDatabricksAllowedCall('linkedin_ads_read', { action: 'LIST_CAMPAIGNS' })).toBe(true);
+    expect(isDatabricksAllowedCall('linkedin_ads_write', { entity_type: 'CAMPAIGN', action: 'PAUSE' })).toBe(false);
   });
 
   it('narrows call_meta_marketing_api to read actions and drops confirm/preview_token, without mutating the source', () => {

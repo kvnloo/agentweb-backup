@@ -78,6 +78,20 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
   };
   const run = (toolName: string, ctx?: Record<string, unknown>, sessionId = 'run-session') =>
     (service as any).executeTool('gpt-4', toolName, argsFor(toolName), 'owner-user-id', sessionId, false, ctx);
+  // with the arguments the test names (the helper above builds minimal valid ones for a tool that has to be dispatched)
+  const runWith = (toolName: string, ctx: Record<string, unknown>, args: unknown) =>
+    (service as any).executeTool('gpt-4', toolName, args, 'owner-user-id', 'run-session', false, ctx);
+  // arguments that pass the tool's own schema check, so a call to a tool judged by its action reaches the rule (it is judged after repair)
+  const valid = (tool: string, extra: Record<string, unknown>) => {
+    const def = (service as any).toolRegistry.getTool(tool)?.definition ?? {};
+    const schema = def.inputSchema ?? def.function?.parameters ?? def.parameters ?? {};
+    const filled: Record<string, unknown> = {};
+    for (const key of schema.required ?? []) {
+      const prop = (schema.properties ?? {})[key] ?? {};
+      filled[key] = prop.enum ? prop.enum[0] : prop.type === 'array' ? ['x'] : prop.type === 'object' ? {} : prop.type === 'number' ? 1 : prop.type === 'boolean' ? true : 'x';
+    }
+    return { ...filled, ...extra };
+  };
   const scheduleWith = (provenance: unknown) =>
     getSchedule.mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance } as any);
   const marked = (provenance: unknown = ['startingMessage']) => scheduleWith(provenance);
@@ -122,6 +136,59 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(dispatch).not.toHaveBeenCalled();
     });
 
+    it('ENG-3170: refuses a SENSITIVE tool (send or post outside the account, delete data, change ad spend), with the adopt wording', async () => {
+      marked();
+      for (const [tool, args] of [
+        ['slack_send_message', { text: 'hi' }],
+        ['delete_leads', { list_id: 'l', lead_ids: ['a'] }],
+        ['email', { action: 'send' }],
+        ['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }],
+        ['launch_targeted_audience_campaign', {}],
+      ] as Array<[string, any]>) {
+        await expect(runWith(tool, { isUnattendedRun: true }, valid(tool, args))).rejects.toMatchObject({
+          deniedBy: 'restriction_profile',
+          message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+        });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: through executeTool, a marked schedule still RUNS the read side of a tool judged by its action and is refused the write side (the schedule is judged from its stored provenance, not from a profile in the call)', async () => {
+      marked();
+      await expect(runWith('call_google_ads_api', { isUnattendedRun: true }, valid('call_google_ads_api', { action: 'LIST', entity_type: 'CAMPAIGN' }))).resolves.toEqual({ ran: true });
+      await expect(runWith('linkedin_outreach', { isUnattendedRun: true }, valid('linkedin_outreach', { action: 'search-people' }))).resolves.toEqual({ ran: true });
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      for (const [tool, extra] of [['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }], ['linkedin_outreach', { action: 'send-invite' }]] as Array<[string, Record<string, unknown>]>) {
+        await expect(runWith(tool, { isUnattendedRun: true }, valid(tool, extra))).rejects.toMatchObject({
+          deniedBy: 'restriction_profile',
+          message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
+        });
+      }
+      expect(dispatch).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-3170: still runs the READ side of a tool that also writes, and spends the schedule reads only for a sensitive call', async () => {
+      marked();
+      for (const [tool, args] of [['call_google_ads_api', { action: 'LIST' }], ['linkedin_outreach', { action: 'search-people' }], ['call_hubspot_api', { action: 'GET_STATS' }]] as Array<[string, any]>) {
+        const result = await (service as any).scheduledRunRestriction(tool, 'run-session', { isUnattendedRun: true }, args);
+        expect(result.refusal).toBeNull();
+      }
+      expect(getSession).not.toHaveBeenCalled();
+      expect(getSchedule).not.toHaveBeenCalled();
+    });
+
+    it('ENG-3170: leaves a PUBLISH call to the publish gate, which answers in its own words (it is not replaced by the general refusal)', async () => {
+      marked();
+      // scheduledRunRestriction itself does not refuse a publish call: blockedByScheduledPublishApproval (ENG-803) withholds it later, with its own text
+      const result = await (service as any).scheduledRunRestriction('post_on_connected_account', 'session-1', { isUnattendedRun: true }, { text: 'x' });
+      expect(result.refusal).toBeNull();
+      const linkedin = await (service as any).scheduledRunRestriction('linkedin_manage_post', 'session-1', { isUnattendedRun: true }, { action: 'repost' });
+      expect(linkedin.refusal).toBeNull();
+      // a tool that is on the block list is still refused by this module, publish or not
+      const blocked = await (service as any).scheduledRunRestriction('save_memory', 'session-1', { isUnattendedRun: true }, {});
+      expect(blocked.refusal).toContain('set up or edited through a share link');
+    });
+
     it('uses the scheduled-run wording, never the share_visitor wording ("shared sessions")', async () => {
       marked();
       const error: Error = await run('save_memory').then(() => { throw new Error('expected a refusal'); }, (e: Error) => e);
@@ -155,18 +222,25 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('still runs an ordinary tool, and spends no reads on it', async () => {
       marked();
-      await expect(run('notify_session', { isUnattendedRun: true })).resolves.toEqual({ ran: true });
+      await expect(run('read_brand_guidelines', { isUnattendedRun: true })).resolves.toEqual({ ran: true });
       expect(getSession).not.toHaveBeenCalled();
       expect(getSchedule).not.toHaveBeenCalled();
     });
 
     it('hands the profile to a schedule-writing tool, so its own write carries the claim (a marked run cannot lift or launder)', async () => {
       marked();
-      for (const tool of ['manage_scheduled_chat', 'submit_scheduled_chat_variables', 'create_schedule_from_template', 'manage_schedule_template']) {
+      for (const tool of ['manage_scheduled_chat', 'submit_scheduled_chat_variables', 'manage_schedule_template']) {
         dispatch.mockClear();
         await run(tool, { isUnattendedRun: true });
         expect(dispatch.mock.calls[0][2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', isUnattendedRun: true });
       }
+    });
+
+    it('a marked run is refused create_schedule_from_template outright (the new schedule would inherit the template\'s recipients)', async () => {
+      marked();
+      dispatch.mockClear();
+      await expect(run('create_schedule_from_template', { isUnattendedRun: true })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
     });
 
     it('does not mutate the caller\'s (frozen) tool context, as live voice passes one', async () => {
@@ -314,13 +388,151 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(getSession).not.toHaveBeenCalled();
     });
 
-    it('a caller that already carries a profile (a share visitor\'s own turn) is handled by the existing check, with no extra reads', async () => {
+    it('a caller that already carries a profile (a share visitor\'s own turn) is handled by the existing check, with no schedule reads (ENG-3170: it reads its own link once for a tool that depends on it)', async () => {
       await expect(run('save_memory', { restrictionProfile: 'share_visitor' })).rejects.toMatchObject({
         message: expect.stringContaining('is not available in shared sessions'),
       });
       await run('manage_scheduled_chat', { restrictionProfile: 'share_visitor' });
       expect(dispatch.mock.calls[0][2]).toMatchObject({ restrictionProfile: 'share_visitor' });
-      expect(getSession).not.toHaveBeenCalled();
+      // the one session read is the visitor's link (a consistent read of its own session) for save_memory; manage_scheduled_chat needs none
+      expect(getSession).toHaveBeenCalledTimes(1);
+      expect(getSession).toHaveBeenCalledWith('run-session', true);
+      expect(getSchedule).not.toHaveBeenCalled();
     });
   });
+
+  describe('ENG-3170 (final reviews): the browser of a scheduled run, and Meta writes', () => {
+    const BROWSER = 'playwright_browser_navigate'; // (browser_run_code runs the caller's code on the server: a visitor-made schedule is refused it, see below)
+    const RUN_CODE = 'playwright_browser_run_code';
+
+    it('in a run of a MARKED schedule the refusal says "adopt the schedule" (not the link settings), and a caller cannot claim its call is nested', async () => {
+      marked();
+      const inSession = (sessionId: string, tool: string, args: unknown, ctx: Record<string, unknown> = {}) =>
+        (service as any).executeTool('gpt-4', tool, args, 'owner-user-id', sessionId, false, { isUnattendedRun: true, ...ctx });
+      await expect(inSession('sched-a', 'playwright_browser_run_code', { code: 'x' })).rejects.toMatchObject({ message: expect.stringContaining('adopt the schedule') });
+      await expect(inSession('sched-b', 'playwright_browser_evaluate', { function: '() => 1', filename: 'dist/server.js' })).rejects.toMatchObject({ message: expect.stringContaining('adopt the schedule') });
+      // a context that CLAIMS its call is nested does not make it so
+      await expect(inSession('sched-c', 'playwright_browser_run_code', { code: 'x' }, { nestedInRestrictedCall: true })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      // the same call without a file runs (in the schedule's own browser)
+      await expect(inSession('sched-d', 'playwright_browser_evaluate', { function: '() => 1' })).resolves.toEqual({ ran: true });
+    });
+
+    it('a run of a MARKED schedule may not call the tool that runs the caller\'s code on the server; the owner\'s own schedule may; an unreadable schedule may not', async () => {
+      // one session per case: the answer to "is this schedule marked" is kept for a minute per session
+      const inSession = (sessionId: string) => (service as any).executeTool('gpt-4', RUN_CODE, { code: 'x' }, 'owner-user-id', sessionId, false, { isUnattendedRun: true });
+      marked();
+      await expect(inSession('run-marked')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+      scheduleWith(undefined);
+      await expect(inSession('run-owners-own')).resolves.toEqual({ ran: true });
+      dispatch.mockClear();
+      getSchedule.mockReset().mockRejectedValue(new Error('throttled'));
+      await expect(inSession('run-unreadable')).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
+    const names = () => dispatch.mock.calls.map((c) => c[0] as string);
+    const loads = () => names().filter((n) => n === 'load_browser_cookies').length;
+
+    it('an UNMARKED schedule keeps its logins: the owner\'s saved cookies are loaded for its browser step, no profile is added', async () => {
+      scheduleWith(undefined);
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
+      expect(loads()).toBeGreaterThan(0);
+      const browserCall = dispatch.mock.calls.find((c) => c[0] === BROWSER)!;
+      expect(browserCall[2]).not.toHaveProperty('restrictionProfile');
+      expect(browserCall[2]).not.toHaveProperty('browserPoolSessionId'); // the owner's own schedule keeps the session's browser
+    });
+
+    it('a MARKED schedule: the browser step still runs, but it borrows no logins (and says why in its profile)', async () => {
+      marked();
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
+      expect(names()).toContain(BROWSER);
+      expect(loads()).toBe(0);
+      expect(dispatch.mock.calls.find((c) => c[0] === BROWSER)![2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule', browserPoolSessionId: 'run-session::visitor' });
+    });
+
+    it('a schedule that cannot be read: the browser step still runs, without the owner\'s logins (a blip must not run a visitor\'s schedule as the owner)', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' })).resolves.toEqual({ ran: true });
+      expect(names()).toContain(BROWSER);
+      expect(loads()).toBe(0);
+    });
+
+    it('an ATTENDED browser step is untouched: nothing about the schedule is read, the owner\'s logins load', async () => {
+      marked();
+      await runWith(BROWSER, {}, { url: 'https://example.com' });
+      expect(getSchedule).not.toHaveBeenCalled();
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('a run makes many browser steps: the schedule is read ONCE for them (a settled answer is kept for a minute)', async () => {
+      scheduleWith(undefined);
+      for (let i = 0; i < 5; i++) await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
+      expect(getSchedule).toHaveBeenCalledTimes(1);
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('an answer that could not be settled (the schedule could not be read) is NOT kept: the next browser step asks again', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
+      const afterFirst = getSchedule.mock.calls.length;
+      getSchedule.mockReset().mockResolvedValue({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id' } as any);
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
+      expect(afterFirst).toBe(2);
+      expect(getSchedule).toHaveBeenCalledTimes(1);
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('the kept answer is per session: another run asks for itself, and a schedule-write or sensitive call is never answered from it', async () => {
+      scheduleWith(undefined);
+      await runWith(BROWSER, { isUnattendedRun: true }, { url: 'https://example.com' });
+      marked();
+      await (service as any).executeTool('gpt-4', BROWSER, { url: 'https://example.com' }, 'owner-user-id', 'other-run-session', false, { isUnattendedRun: true });
+      expect(dispatch.mock.calls.filter((c) => c[0] === BROWSER).map((c) => c[2].restrictionProfile)).toEqual([undefined, 'share_visitor_schedule']);
+      await expect(runWith('slack_send_message', { isUnattendedRun: true }, { text: 'x' })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+    });
+
+    it('a run of a visitor-made schedule may not edit ANOTHER schedule that emails other people (it has no link that could allow it)', async () => {
+      marked();
+      const OTHER = 'schedule-of-the-owner';
+      getSchedule.mockImplementation(async (id: string) => (id === OTHER
+        ? ({ scheduleId: OTHER, userId: 'owner-user-id', emailNotifications: ['client@example.com'] } as any)
+        : ({ scheduleId: SCHEDULE_ID, userId: 'owner-user-id', provenance: ['startingMessage'], emailNotifications: [] } as any)));
+      const edit = { action: 'update', schedule_id: OTHER, starting_message: 'new prompt' };
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, edit)).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(runWith('submit_scheduled_chat_variables', { isUnattendedRun: true }, { schedule_id: OTHER, variable_values: {} })).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('...and it still edits a schedule that emails nobody else, and an UNMARKED schedule (the owner\'s own) edits anything as before', async () => {
+      marked();
+      getSchedule.mockImplementation(async (id: string) => ({ scheduleId: id, userId: 'owner-user-id', provenance: id === SCHEDULE_ID ? ['startingMessage'] : undefined, emailNotifications: [] } as any));
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, { action: 'update', schedule_id: 'another', starting_message: 'p' })).resolves.toEqual({ ran: true });
+      getSchedule.mockImplementation(async (id: string) => ({ scheduleId: id, userId: 'owner-user-id', emailNotifications: ['client@example.com'] } as any));
+      await expect(runWith('manage_scheduled_chat', { isUnattendedRun: true }, { action: 'update', schedule_id: 'another', starting_message: 'p' })).resolves.toEqual({ ran: true });
+    });
+
+    it('Meta: a MARKED schedule may read the ad account but not write to it (an unattended write is staged for an approver who is not the owner)', async () => {
+      marked();
+      const meta = (action: string) => runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action }));
+      await expect(meta('LIST')).resolves.toEqual({ ran: true });
+      await expect(meta('GET')).resolves.toEqual({ ran: true });
+      dispatch.mockClear();
+      for (const action of ['CREATE', 'UPDATE', 'PAUSE', 'ARCHIVE', 'COPY', 'RETAG_UTM']) {
+        await expect(meta(action)).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('set up or edited through a share link') });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('Meta: an UNMARKED schedule (the owner\'s own) writes exactly as before; a visitor\'s own chat is not asked about it either', async () => {
+      scheduleWith(undefined);
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'CREATE' }))).resolves.toEqual({ ran: true });
+    });
+
+    it('Meta: a schedule that cannot be read refuses the WRITE of an unattended run (rather than assume it is the owner\'s)', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'CREATE' }))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'LIST' }))).resolves.toEqual({ ran: true });
+    });
+  });
+
 });

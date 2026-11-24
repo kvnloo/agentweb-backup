@@ -16,7 +16,7 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
-import { googleToolkitEnabled, xAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
+import { googleToolkitEnabled, linkedInAdsToolkitEnabled, linkedInAdsWritesEnabled, xAdsToolkitEnabled } from '../mcp/zomaToolDefinitions';
 import { annotateToolkitTools } from '../mcp/toolkitToolAnnotations';
 import { databricksToolView } from '../mcp/zomaDatabricksReadOnly';
 import { rateLimiter } from '../middleware/rateLimiter';
@@ -60,6 +60,12 @@ export function toolkitManifest(measurementReports: boolean) {
     const { getXAdsToolkitManifest } = require('../mcp/xAdsToolkitManifest') as typeof import('../mcp/xAdsToolkitManifest');
     tools.push(...getXAdsToolkitManifest());
   }
+  // LinkedIn Ads tools only while ZOMA_LINKEDIN_ADS_ENABLED is on.
+  if (linkedInAdsToolkitEnabled()) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getLinkedInAdsToolkitManifest } = require('../mcp/linkedInAdsToolkitManifest') as typeof import('../mcp/linkedInAdsToolkitManifest');
+    tools.push(...getLinkedInAdsToolkitManifest());
+  }
   return annotateToolkitTools(tools);
 }
 
@@ -75,8 +81,24 @@ async function toolsFor(caller: { userId: string; databricksOrigin?: boolean }) 
 /** The Google section of the agent guide (between zoma-google markers) is served only while ZOMA_GOOGLE_ENABLED is on. */
 const GOOGLE_DOC_SECTION = /<!-- zoma-google:start -->[\s\S]*?<!-- zoma-google:end -->\n?/g;
 const GOOGLE_DOC_MARKERS = /<!-- zoma-google:(start|end) -->\n?/g;
-export function zomaSkillDoc(doc: string, google: boolean = googleToolkitEnabled()): string {
-  return google ? doc.replace(GOOGLE_DOC_MARKERS, '') : doc.replace(GOOGLE_DOC_SECTION, '');
+/**
+ * The LinkedIn Ads section (between zoma-linkedin markers) is served only while ZOMA_LINKEDIN_ADS_ENABLED is "read" or
+ * "true"; the part of it about changes (between zoma-linkedin-writes markers) only while it is "true".
+ */
+const LINKEDIN_WRITES_DOC_SECTION = /<!-- zoma-linkedin-writes:start -->[\s\S]*?<!-- zoma-linkedin-writes:end -->\n?/g;
+const LINKEDIN_WRITES_DOC_MARKERS = /<!-- zoma-linkedin-writes:(start|end) -->\n?/g;
+const LINKEDIN_DOC_SECTION = /<!-- zoma-linkedin:start -->[\s\S]*?<!-- zoma-linkedin:end -->\n?/g;
+const LINKEDIN_DOC_MARKERS = /<!-- zoma-linkedin:(start|end) -->\n?/g;
+export function zomaSkillDoc(
+  doc: string,
+  google: boolean = googleToolkitEnabled(),
+  linkedin: boolean = linkedInAdsToolkitEnabled(),
+  linkedinWrites: boolean = linkedInAdsWritesEnabled(),
+): string {
+  const withGoogle = google ? doc.replace(GOOGLE_DOC_MARKERS, '') : doc.replace(GOOGLE_DOC_SECTION, '');
+  if (!linkedin) return withGoogle.replace(LINKEDIN_DOC_SECTION, '');
+  const withWrites = linkedinWrites ? withGoogle.replace(LINKEDIN_WRITES_DOC_MARKERS, '') : withGoogle.replace(LINKEDIN_WRITES_DOC_SECTION, '');
+  return withWrites.replace(LINKEDIN_DOC_MARKERS, '');
 }
 
 const router = Router();
@@ -164,9 +186,10 @@ function toolResultContent(result: unknown, nextStep: string | null) {
  * ENG-3134: MCP `instructions` (shown to the agent on connect). The first thing the user hears is
  * the welcome, then one question; zoma_status records the answer and returns the Meta connect link.
  */
-export function zomaMcpInstructions(google: boolean = googleToolkitEnabled()): string {
+export function zomaMcpInstructions(google: boolean = googleToolkitEnabled(), linkedin: boolean = linkedInAdsToolkitEnabled()): string {
+  const others = [google ? 'Google' : '', linkedin ? 'LinkedIn' : ''].filter(Boolean);
   return [
-    `${ZOMA_WELCOME} Zoma lets you run the user's ${google ? 'Meta (and Google)' : 'Meta'} ads safely from this chat.`,
+    `${ZOMA_WELCOME} Zoma lets you run the user's ${others.length ? `Meta (and ${others.join(' and ')})` : 'Meta'} ads safely from this chat.`,
     `On first connect, greet the user with exactly "${ZOMA_WELCOME}" and ask one question: "${ZOMA_ADS_EXPERIENCE_QUESTION}". ` +
       'Call zoma_status to get the answer options, then call zoma_status again with ads_experience set to their answer; it returns the next step (usually the Meta connect link). Relay it as given.',
     'Once an ad account is connected, zoma_ads_report answers spend, impressions, clicks, CTR, CPC, conversions and ROAS by campaign for any date range. ' +
