@@ -423,4 +423,186 @@ describe('GTM Plan Notification Service', () => {
       expect(callArgs.subject).toBe('GTM Plan Update: Test Plan');
     });
   });
+
+  // ENG-2840 W2-4: the report functions used to return nothing, so the routes answered "sent" for a report that went to nobody.
+  describe('Status report results', () => {
+    const plan: any = {
+      planId: 'plan-r', userId: 'user-1', title: 'Result Plan', status: 'in_progress',
+      dri: 'plan-poc@example.com',
+      phases: [
+        { id: 'phase-a', title: 'A', dri: 'a-poc@example.com', status: 'in_progress', workItems: [] },
+        { id: 'phase-b', title: 'B', status: 'in_progress', workItems: [] },
+      ],
+    };
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+    });
+
+    it('returns zeros and sends nothing when no recipient option is chosen (phase and plan)', async () => {
+      expect(await sendPhaseStatusReport(plan, 'phase-a', {})).toEqual({ recipients: 0, sent: 0, failed: 0 });
+      expect(await sendPlanStatusReport(plan, { message: 'hello' })).toEqual({ recipients: 0, sent: 0, failed: 0 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('returns recipients 0 when the chosen contact is not set on the plan', async () => {
+      expect(await sendPhaseStatusReport(plan, 'phase-b', { notifyPhasePoc: true })).toEqual({ recipients: 0, sent: 0, failed: 0 });
+      expect(await sendPlanStatusReport({ ...plan, dri: undefined, phases: [plan.phases[1]] }, { notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 0, sent: 0, failed: 0 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
+    it('returns zeros for a phase that is not in the plan', async () => {
+      expect(await sendPhaseStatusReport(plan, 'phase-zzz', { notifyUser: true })).toEqual({ recipients: 0, sent: 0, failed: 0 });
+    });
+
+    it('counts every accepted email, with a duplicate address counted once', async () => {
+      const samePoc = { ...plan, dri: 'a-poc@example.com' };
+      expect(await sendPhaseStatusReport(samePoc, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true }))
+        .toEqual({ recipients: 2, sent: 2, failed: 0 });
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
+    });
+
+    it('counts every accepted email (plan report)', async () => {
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 3, sent: 3, failed: 0 });
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(3);
+    });
+
+    it('a send the non-production email guard resolved without delivering is counted as suppressed, not as sent (both reports)', async () => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockResolvedValue({ id: 'nonprod-suppressed', suppressed: true });
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true }))
+        .toEqual({ recipients: 2, sent: 0, failed: 0, suppressed: 2 });
+      expect(await sendPhaseStatusReport(plan, 'phase-a', { notifyPhasePoc: true }))
+        .toEqual({ recipients: 1, sent: 0, failed: 0, suppressed: 1 });
+      // more than one recipient: the count accumulates in both reports
+      expect(await sendPhaseStatusReport(plan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true }))
+        .toEqual({ recipients: 3, sent: 0, failed: 0, suppressed: 3 });
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 3, sent: 0, failed: 0, suppressed: 3 });
+    });
+
+    it('a mixed result is counted exactly: one delivered, one held back, one refused', async () => {
+      (mockResendService.sendSystemEmail as jest.Mock)
+        .mockResolvedValueOnce({ id: 'ok-1' })
+        .mockResolvedValueOnce({ id: 'nonprod-suppressed', suppressed: true })
+        .mockRejectedValueOnce(new Error('bad address'));
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 3, sent: 1, failed: 1, suppressed: 1 });
+    });
+
+    it('counts a refusal by the mail service as failed, not as sent (plan report)', async () => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockRejectedValue(new Error('Resend is down'));
+      expect(await sendPlanStatusReport(plan, { notifyUser: true, notifyPlanPoc: true, notifyPhasePocs: true }))
+        .toEqual({ recipients: 3, sent: 0, failed: 3 });
+    });
+
+    it('counts a partial send: one address refused, the others accepted (phase report)', async () => {
+      (mockResendService.sendSystemEmail as jest.Mock)
+        .mockResolvedValueOnce({ id: 'ok-1' })
+        .mockRejectedValueOnce(new Error('bad address'))
+        .mockResolvedValueOnce({ id: 'ok-3' });
+      expect(await sendPhaseStatusReport(plan, 'phase-a', { notifyUser: true, notifyPlanPoc: true, notifyPhasePoc: true }))
+        .toEqual({ recipients: 3, sent: 2, failed: 1 });
+    });
+
+    it('counts the unsent as failed when the report cannot be built at all', async () => {
+      // a phase whose work item list is not an array breaks the template after the recipients were resolved
+      const broken: any = { ...plan, phases: [{ id: 'phase-a', title: 'A', dri: 'a-poc@example.com', status: 'in_progress', workItems: 'not-a-list' }] };
+      const result = await sendPhaseStatusReport(broken, 'phase-a', { notifyPhasePoc: true });
+      expect(result.recipients).toBe(1);
+      expect(result.sent).toBe(0);
+      expect(result.failed).toBe(1);
+    });
+  });
+
+  // ENG-2840 W2-4: the three emails put plan, phase and work item text and the optional message into HTML. That text is written by people
+  // and by outside agents; it must arrive as text, never as markup or a link from AgentWeb's system sender.
+  describe('Email HTML escapes what a caller wrote', () => {
+    // every field carries its own marker, so a field that is not escaped fails by name
+    const hostile = (tag: string) => `<i>${tag}</i> & "q" 'a'`;
+    const escaped = (tag: string) => `&lt;i&gt;${tag}&lt;/i&gt; &amp; &quot;q&quot; &#39;a&#39;`;
+    const rawIn = (html: string, tag: string) => html.includes(`<i>${tag}</i>`);
+
+    const plan: any = {
+      planId: 'plan-x', userId: 'user-1', title: hostile('PLANTITLE'), status: hostile('PLANSTATUS'), dri: hostile('PLANDRI'),
+      phases: [{
+        id: 'phase-x', title: hostile('PHASETITLE'), status: hostile('PHASESTATUS'), dri: hostile('PHASEDRI'),
+        workItems: [{
+          id: 'item-x', title: hostile('ITEMTITLE'), description: hostile('ITEMDESC'), status: hostile('ITEMSTATUS'), dri: hostile('ITEMDRI'), notes: hostile('ITEMNOTES'),
+        }],
+      }],
+    };
+    const MESSAGE = '<a href="https://evil.test/reset">Reset your password</a>\nsecond line';
+
+    beforeEach(() => {
+      (mockResendService.sendSystemEmail as jest.Mock).mockReset().mockResolvedValue({ id: 'email-1' });
+      mockUserDb.getUserById.mockReset().mockResolvedValue({ userId: 'user-1', email: 'owner@example.com' } as any);
+    });
+    const sent = () => (mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0];
+
+    const expectEscaped = (html: string, tags: string[]) => {
+      for (const tag of tags) {
+        expect(rawIn(html, tag)).toBe(false);
+        expect(html).toContain(escaped(tag));
+      }
+      expect(html).not.toContain('<a href="https://evil.test/reset">');
+      expect(html).toContain('&lt;a href=&quot;https://evil.test/reset&quot;&gt;Reset your password&lt;/a&gt;<br>second line');
+    };
+
+    it('plan status report: every field and the message are escaped in the HTML, the plain text is left as written', async () => {
+      await sendPlanStatusReport(plan, { notifyUser: true, message: MESSAGE });
+      const { html, text } = sent();
+      expectEscaped(html, ['PLANTITLE', 'PLANSTATUS', 'PLANDRI', 'PHASETITLE', 'PHASESTATUS', 'PHASEDRI', 'ITEMTITLE', 'ITEMDESC', 'ITEMSTATUS', 'ITEMDRI', 'ITEMNOTES']);
+      expect(text).toContain(hostile('PLANTITLE'));
+      expect(text).toContain(MESSAGE);
+      // the email's own markup is untouched
+      expect(html).toContain('<strong>Plan:</strong>');
+    });
+
+    it('phase status report: every field and the message are escaped in the HTML, the plain text is left as written', async () => {
+      await sendPhaseStatusReport(plan, 'phase-x', { notifyUser: true, message: MESSAGE });
+      const { html, text } = sent();
+      expectEscaped(html, ['PLANTITLE', 'PHASETITLE', 'PHASESTATUS', 'PHASEDRI', 'ITEMTITLE', 'ITEMDESC', 'ITEMSTATUS', 'ITEMDRI', 'ITEMNOTES']);
+      expect(text).toContain(hostile('PHASETITLE'));
+      expect(text).toContain(MESSAGE);
+      expect(html).toContain('<strong>Phase:</strong>');
+    });
+
+    it('work item update email: plan, phase, item, the change, the notes and the message are escaped in the HTML', async () => {
+      await sendGTMPlanUpdateNotifications(
+        plan, 'phase-x', 'item-x',
+        { status: hostile('NEWSTATUS'), notes: hostile('ITEMNOTES'), dri: hostile('NEWDRI') } as any,
+        { notifyUser: true, message: MESSAGE },
+      );
+      const { html, text, subject } = sent();
+      expectEscaped(html, ['PLANTITLE', 'PHASETITLE', 'ITEMTITLE', 'NEWSTATUS', 'NEWDRI', 'ITEMNOTES']);
+      expect(text).toContain(MESSAGE);
+      expect(subject).toBe(`GTM Plan Update: ${plan.title}`);
+    });
+
+    it('a missing or null field renders as nothing, never as the words undefined or null', async () => {
+      await sendPlanStatusReport({
+        planId: 'p', userId: 'user-1', title: 'Plain plan', status: undefined, dri: 'lead@example.com',
+        phases: [{ id: 'ph', title: 'Plain phase', status: null, dri: 'a@example.com', workItems: [{ id: 'i', title: 'Plain item', status: undefined, description: null, notes: undefined }] }],
+      } as any, { notifyUser: true });
+      const { html } = sent();
+      expect(html).toContain('Plain plan');
+      expect(html).not.toMatch(/undefined|null/);
+    });
+
+    it('ordinary text is unchanged by the escaping (no stray entities in a normal email)', async () => {
+      await sendPlanStatusReport({
+        planId: 'p', userId: 'user-1', title: 'Q1 launch plan', status: 'in_progress', dri: 'lead@example.com',
+        phases: [{ id: 'ph', title: 'Research', status: 'in_progress', dri: 'a@example.com', workItems: [{ id: 'i', title: 'Interview buyers', status: 'pending', notes: 'five booked' }] }],
+      } as any, { notifyUser: true, message: 'Weekly update' });
+      const { html } = sent();
+      expect(html).toContain('Q1 launch plan');
+      expect(html).toContain('lead@example.com');
+      expect(html).toContain('Interview buyers');
+      expect(html).toContain('Weekly update');
+      expect(html).not.toMatch(/&(amp|lt|gt|quot|#39);/);
+    });
+  });
 });

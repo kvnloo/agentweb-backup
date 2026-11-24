@@ -999,15 +999,25 @@ export async function sendGTMStatusReport(
       }
 
       const { sendPhaseStatusReport } = await import('../../services/gtmPlanNotificationService');
-      await sendPhaseStatusReport(plan as any, phaseId, notifications, process.env.CUSTOMER_FRONTEND_URL);
+      const { describeStatusReport } = await import('../../services/gtmStatusReportOutcome');
+      const report = await sendPhaseStatusReport(plan as any, phaseId, notifications, process.env.CUSTOMER_FRONTEND_URL);
+      const outcome = describeStatusReport(report, `phase status report for "${phase.title}"`);
+      if (!outcome.ok) {
+        return { success: false, message: outcome.message, error: outcome.message };
+      }
 
-      return { success: true, message: `Phase status report for "${phase.title}" sent successfully` };
+      return { success: true, message: outcome.message };
     } else {
       // Plan-level report
       const { sendPlanStatusReport } = await import('../../services/gtmPlanNotificationService');
-      await sendPlanStatusReport(plan as any, notifications, process.env.CUSTOMER_FRONTEND_URL);
+      const { describeStatusReport } = await import('../../services/gtmStatusReportOutcome');
+      const report = await sendPlanStatusReport(plan as any, notifications, process.env.CUSTOMER_FRONTEND_URL);
+      const outcome = describeStatusReport(report, `plan status report for "${plan.title}"`);
+      if (!outcome.ok) {
+        return { success: false, message: outcome.message, error: outcome.message };
+      }
 
-      return { success: true, message: `Plan status report for "${plan.title}" sent successfully` };
+      return { success: true, message: outcome.message };
     }
   } catch (error) {
     console.error('AgentMode: Error sending GTM status report:', error);
