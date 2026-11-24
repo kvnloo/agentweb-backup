@@ -79,6 +79,26 @@ export function linkifyHttps(text: string): string {
 // submit continues on to Stripe Checkout (or back to Meta), so that page allows those hops.
 const PICKER_FORM_ACTION = "'self' https://checkout.stripe.com https://www.facebook.com";
 
+// One stylesheet for every Zoma browser step (code entry, the ads question, account pickers, result pages).
+// Inline only: the CSP below allows inline styles and nothing external. Palette matches the Zoma weekly email.
+const ZOMA_PAGE_CSS =
+  `*{box-sizing:border-box}` +
+  `body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.25rem;background:#f6f8fa;color:#202124;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.55}` +
+  `main{width:100%;max-width:30rem;background:#fff;border:1px solid #dadce0;border-radius:12px;padding:2rem 1.75rem;box-shadow:0 1px 3px rgba(60,64,67,.1)}` +
+  `.brand{margin:0 0 1.25rem;font-size:.8rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#5f6368}` +
+  `h1{margin:0 0 .5rem;font-size:1.45rem;line-height:1.25}p{margin:.5rem 0;color:#3c4043}small{color:#5f6368}a{color:#1a73e8}` +
+  `ol{padding-left:1.25rem;color:#3c4043}li{margin:.35rem 0}form{margin:1rem 0 0}` +
+  `label{display:flex;align-items:flex-start;gap:.7rem;margin:.55rem 0;padding:.8rem .9rem;border:1px solid #dadce0;border-radius:8px;cursor:pointer}` +
+  `label:hover{border-color:#80868b}label:focus-within{outline:2px solid #1a73e8;outline-offset:1px}` +
+  `input[type=checkbox]{flex:none;width:1.1rem;height:1.1rem;margin:.2rem 0 0;accent-color:#202124}` +
+  `input.code{display:block;width:100%;margin:0 0 .75rem;padding:.65rem .75rem;border:1px solid #dadce0;border-radius:8px;font:inherit;font-size:1.25rem;letter-spacing:.15em;text-transform:uppercase}` +
+  `input.code:focus{outline:2px solid #1a73e8;border-color:transparent}` +
+  `button,a.button{display:inline-block;padding:.65rem 1.25rem;border:0;border-radius:8px;background:#202124;color:#fff;font:inherit;font-weight:600;text-decoration:none;cursor:pointer}` +
+  `button:hover,a.button:hover{background:#3c4043}a.button{margin-top:.5rem}` +
+  `button.choice{display:block;width:100%;margin:.55rem 0;padding:.9rem 1rem;border:1px solid #dadce0;background:#fff;color:#202124;font-weight:500;text-align:left}` +
+  `button.choice:hover{border-color:#202124;background:#f6f8fa}` +
+  `@media(max-width:30rem){main{padding:1.5rem 1.25rem}}`;
+
 function page(res: Response, status: number, title: string, body: string, formAction = "'self'") {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}`);
@@ -91,36 +111,31 @@ function page(res: Response, status: number, title: string, body: string, formAc
     .type('html')
     .send(
       `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
-        `<title>${escapeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;line-height:1.5}` +
-        `label{display:block;margin:.4rem 0}a.button{display:inline-block;margin-top:.5rem}` +
-        `input{font-size:1.25rem;letter-spacing:.15em;text-transform:uppercase;padding:.4rem;width:10rem}button{font-size:1rem;padding:.45rem 1rem}</style></head>` +
-        `<body><h1>${escapeHtml(title)}</h1>${body}</body></html>`,
+        `<title>${escapeHtml(title)}</title><style>${ZOMA_PAGE_CSS}</style></head>` +
+        `<body><main><p class="brand">Zoma</p><h1>${escapeHtml(title)}</h1>${body}</main></body></html>`,
     );
 }
 
 function codeForm(message?: string) {
   return (
     (message ? `<p>${escapeHtml(message)}</p>` : '<p>Enter the code your agent showed you to connect Zoma to your AgentWeb account.</p>') +
-    `<form method="get" action="activate"><input name="user_code" placeholder="XXXX-XXXX" autocomplete="off" autofocus required> <button type="submit">Continue</button></form>`
+    `<form method="get" action="activate"><input class="code" name="user_code" placeholder="XXXX-XXXX" autocomplete="off" autofocus required><button type="submit">Continue</button></form>`
   );
 }
 
 function renderStep(res: Response, step: BrowserStep, req?: Request) {
   if (step.kind === 'redirect') return res.redirect(req?.method === 'POST' ? 303 : 302, step.url);
   if (step.kind === 'ask_ads_experience') {
+    // One click answers: each option is a submit button carrying the same `answer` field the radios used.
     const options = step.options
-      .map(
-        (o, i) =>
-          `<label><input type="radio" name="answer" value="${escapeHtml(o.value)}"${i === 0 ? ' required' : ''}> ${escapeHtml(o.label)}</label>`,
-      )
+      .map((o) => `<button type="submit" class="choice" name="answer" value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</button>`)
       .join('');
     return page(
       res,
       200,
       step.question,
       (step.message ? `<p><strong>${escapeHtml(step.message)}</strong></p>` : '<p>So Zoma can set you up the right way.</p>') +
-        `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}` +
-        `<p><button type="submit">Continue</button></p></form>`,
+        `<form method="post" action="${escapeHtml(step.action)}"><input type="hidden" name="t" value="${escapeHtml(step.token)}">${options}</form>`,
       // A "runs_ads" answer continues on to Meta (or Stripe) from this submit.
       PICKER_FORM_ACTION,
     );
@@ -130,7 +145,7 @@ function renderStep(res: Response, step: BrowserStep, req?: Request) {
       .map(
         (a, i) =>
           `<label><input type="checkbox" name="account_id" value="${escapeHtml(a.account_id)}"${i === 0 ? ' checked' : ''}> ` +
-          `${escapeHtml(a.name || a.account_id)} <small>(${escapeHtml(a.account_id)}${a.currency ? `, ${escapeHtml(a.currency)}` : ''})</small></label>`,
+          `<span>${escapeHtml(a.name || a.account_id)} <small>(${escapeHtml(a.account_id)}${a.currency ? `, ${escapeHtml(a.currency)}` : ''})</small></span></label>`,
       )
       .join('');
     return page(
