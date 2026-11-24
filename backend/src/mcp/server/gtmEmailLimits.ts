@@ -5,14 +5,19 @@
  * cannot turn a status report into a mail-bomb from AgentWeb's system sender:
  *
  *  - a call emails at most GTM_EMAIL_MAX_RECIPIENTS distinct people (enforced where the recipients are resolved, in the report service);
- *  - a key may send at most GTM_EMAIL_HOURLY_BUDGET emails in any rolling hour. A call RESERVES the most it could send before it starts
- *    and settles to what was actually attempted afterwards, so parallel calls cannot overshoot the budget together;
- *  - the same report (same plan, phase, people chosen and message) from the same key is refused for GTM_EMAIL_COOLDOWN_MS, so an agent
- *    that retries after an ambiguous failure does not mail everyone twice.
+ *  - an ACCOUNT may send at most GTM_EMAIL_HOURLY_BUDGET emails in any rolling hour, all of its keys together (the tool counts by the
+ *    account that owns the key, so minting more keys does not buy more). A call RESERVES the most it could send before it starts and
+ *    settles to what was actually attempted afterwards, so parallel calls cannot overshoot the budget together;
+ *  - the same report (same plan, phase, people chosen and message) from the same account is refused for GTM_EMAIL_COOLDOWN_MS, so an
+ *    agent that retries after an ambiguous failure does not mail everyone twice.
+ *
+ * These bound the VOLUME, not the audience: a key that may email can email any address that is on a plan it can edit, including a contact
+ * it wrote there itself with `manage_gtm_plan` (that needs only `tools:execute`). Grant `gtm:email` to an agent you trust with that.
  *
  * State is in memory and per process. Production runs ONE backend instance (Elastic Beanstalk MinSize=MaxSize=1, checked 2026-11-24), so
  * the numbers are exact there; if the backend ever scales out, each instance counts separately and the real limit is the instance count
  * times these (the audit line makes that visible). A restart empties the counters, which can only let one more hour of budget through.
+ * The limiter itself only counts whatever string it is given ("key" below); the tool gives it the account.
  */
 import { createHash } from 'crypto';
 
@@ -113,8 +118,12 @@ export class GtmEmailLimiter {
     return { ok: true, ticket: { keyId, fingerprint, entry } };
   }
 
-  /** The send finished: only what was actually attempted counts against the hour (never more than was reserved). */
+  /**
+   * The send finished: only what was actually attempted counts against the hour (never more than was reserved). A number that is not
+   * finite (NaN would turn every later budget check into "fits") leaves the whole reservation in place, the cautious reading.
+   */
   settle(ticket: Ticket, attempted: number): void {
+    if (typeof attempted !== 'number' || !Number.isFinite(attempted)) return;
     ticket.entry.count = Math.max(0, Math.min(Math.floor(attempted), ticket.entry.count));
   }
 
@@ -134,7 +143,8 @@ export class GtmEmailLimiter {
   }
 
   private prune(state: KeyState, now: number): void {
-    state.entries = state.entries.filter((e) => now - e.at < GTM_EMAIL_WINDOW_MS);
+    // an entry that has settled or been released to 0 counts for nothing: drop it, so refused calls cannot pile up entries or keep a key tracked
+    state.entries = state.entries.filter((e) => e.count > 0 && now - e.at < GTM_EMAIL_WINDOW_MS);
     for (const [fingerprint, at] of state.cooldowns) {
       if (now - at >= GTM_EMAIL_COOLDOWN_MS) state.cooldowns.delete(fingerprint);
     }

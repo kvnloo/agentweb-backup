@@ -10,7 +10,11 @@
  *  2. explicit choices: nobody is emailed by default, at least one `notify_*` must be true, an argument that is not an input is refused by
  *     name, the message is at most 2,000 characters;
  *  3. limits (gtmEmailLimits.ts): at most 10 people a call (the report service refuses before sending anything when it would reach more),
- *     about 50 emails an hour per key, and the same report is not sent twice within 10 minutes.
+ *     about 50 emails an hour per ACCOUNT (all of its keys together), and the same report is not sent twice within 10 minutes.
+ *
+ * The limits bound the volume, not the audience. The report goes to the addresses on the plan, and a key can write those itself
+ * (`manage_gtm_plan update dri`, which needs only `tools:execute`): a key that holds `gtm:email` can email any address it puts on a plan it
+ * owns, with up to 2,000 characters of its own text. The account owner grants the scope knowing that; the audit line is how it is seen.
  *
  * It calls the portal routes through `mcpFetch`, as the other GTM tools do, so the plan's owner check and the delegation and restriction
  * claims stay on the route; a key can email only the people on ITS OWN user's plans. A POST self-call is never retried, so a network
@@ -43,6 +47,9 @@ const enc = encodeURIComponent;
 
 const INPUTS = ['plan_id', 'phase_id', 'notify_user', 'notify_plan_poc', 'notify_phase_poc', 'notify_phase_pocs', 'message'] as const;
 
+/** Real plan and phase ids are letters, digits, hyphens and underscores. This tool sends email, so it accepts nothing else: no `.`, `..`, slash or space. */
+const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+
 function refuse(message: string): never {
   throw new Error(`${TOOL}: ${message} Nothing was emailed.`);
 }
@@ -68,11 +75,26 @@ export interface GtmEmailRequest {
   reserve: number;
 }
 
+function strictId(field: string, value: unknown): string {
+  const id = idArg(TOOL, field, value);
+  if (!ID_PATTERN.test(id)) refuse(`${field} is not a valid id. Use an id returned by manage_gtm_plan get or list_gtm_plans.`);
+  return id;
+}
+
 /** The request a `send_gtm_status_report` call makes, or the refusal. Pure: nothing is sent and no limit is touched here. */
 export function gtmEmailRequest(args: unknown): GtmEmailRequest {
+  try {
+    return buildRequest(args);
+  } catch (err: any) {
+    // the shared argument checks end "Nothing was changed."; for a tool that emails, say what matters
+    throw new Error(String(err?.message ?? err).replace(/ Nothing was changed\.$/, ' Nothing was emailed.'));
+  }
+}
+
+function buildRequest(args: unknown): GtmEmailRequest {
   const a = exactArgs(TOOL, args, INPUTS);
-  const planId = idArg(TOOL, 'plan_id', a.plan_id);
-  const phaseId = a.phase_id === undefined || a.phase_id === null ? undefined : idArg(TOOL, 'phase_id', a.phase_id);
+  const planId = strictId('plan_id', a.plan_id);
+  const phaseId = a.phase_id === undefined || a.phase_id === null ? undefined : strictId('phase_id', a.phase_id);
   const kind = phaseId === undefined ? 'plan' : 'phase';
 
   const user = flagArg(a, 'notify_user');
@@ -151,9 +173,10 @@ export async function sendGtmStatusReport(args: unknown, context: any, limiter: 
   }
   const about = { kind: request.kind, planId: request.planId, phaseId: request.phaseId, flags: Object.keys(request.flags) };
 
-  const keyId = context?.apiKeyId ?? `user:${context?.userId ?? 'unknown'}`;
+  // Counted per ACCOUNT: every key of one user shares the hour and the cooldown, so minting more keys does not buy more email.
+  const accountKey = context?.userId ? `account:${context.userId}` : context?.apiKeyId ? `key:${context.apiKeyId}` : 'unknown';
   const fingerprint = reportFingerprint({ planId: request.planId, phaseId: request.phaseId, flags: request.flags, message: request.message });
-  const reservation = limiter.reserve(keyId, fingerprint, request.reserve);
+  const reservation = limiter.reserve(accountKey, fingerprint, request.reserve);
   if (!reservation.ok) {
     audit({ outcome: 'refused', reason: reservation.reason, ...about });
     throw new Error(`${TOOL}: ${reservation.message}`);
@@ -194,9 +217,9 @@ mcpToolRegistry.register({
       + 'Choose who gets it by setting at least one of notify_user (the account owner), notify_plan_poc (the plan contact), notify_phase_poc (a phase report: that phase\'s contact), '
       + 'notify_phase_pocs (a plan report: every phase contact) to true; nobody is emailed by default. message: an optional note, at most '
       + `${GTM_EMAIL_MAX_MESSAGE_CHARS} characters. `
-      + `Limits: at most ${GTM_EMAIL_MAX_RECIPIENTS} people per call (a report that would reach more sends nothing), about ${GTM_EMAIL_HOURLY_BUDGET} emails an hour per key, `
+      + `Limits: at most ${GTM_EMAIL_MAX_RECIPIENTS} people per call (a report that would reach more sends nothing), about ${GTM_EMAIL_HOURLY_BUDGET} emails an hour per account (all your keys together), `
       + `and the same report is not sent twice within ${GTM_EMAIL_COOLDOWN_MS / 60_000} minutes. `
-      + 'The email goes from AgentWeb to the addresses on the plan, so check the contacts first with manage_gtm_plan get. '
+      + 'The email goes from AgentWeb to whatever addresses are on the plan, including contacts set with manage_gtm_plan, so check them first with manage_gtm_plan get. '
       + 'The answer says how many emails were accepted and how many failed. Any other argument is refused by name.',
     inputSchema: {
       type: 'object',
