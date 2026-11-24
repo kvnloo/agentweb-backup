@@ -707,6 +707,13 @@ describe('GTM Plan Notification Service', () => {
       expect(over).toEqual({ recipients: 1, sent: 0, failed: 0, overCap: 0 });
     });
 
+    it('a phase report counts every list contact: the plan contact and the phase contact, 2', async () => {
+      const phasePlan: any = { ...wide, dri: 'a@x.test, b@x.test', phases: [{ id: 'phase-a', title: 'A', dri: 'c@x.test;d@x.test', status: 'in_progress', workItems: [] }] };
+      const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPlanPoc: true, notifyPhasePoc: true, maxRecipients: 10 });
+      expect(result).toMatchObject({ sent: 0, failed: 0, multiAddressContacts: 2 });
+      expect(mockResendService.sendSystemEmail).not.toHaveBeenCalled();
+    });
+
     it('a phase report refuses a list contact too', async () => {
       const phasePlan: any = { ...wide, phases: [{ id: 'phase-a', title: 'A', dri: 'a@x.test,b@x.test,c@x.test', status: 'in_progress', workItems: [] }] };
       const result = await sendPhaseStatusReport(phasePlan, 'phase-a', { notifyPhasePoc: true, maxRecipients: 10 });
