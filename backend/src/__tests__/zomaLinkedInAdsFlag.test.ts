@@ -185,6 +185,23 @@ describe('flag OFF: the product is exactly what Meta, Google and X alone produce
     expect(formatZomaUsage(usage)).not.toMatch(LINKEDIN);
   });
 
+  it('the served guide is byte-identical to the guide without the LinkedIn block (no stray blank line)', () => {
+    const lines = doc.split('\n');
+    const start = lines.findIndex((l) => l.trim() === '<!-- zoma-linkedin:start -->');
+    const end = lines.findIndex((l) => l.trim() === '<!-- zoma-linkedin:end -->');
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const withoutBlock = [...lines.slice(0, start), ...lines.slice(end + 1)].join('\n');
+    const stripGoogle = (text: string) => text.replace(/<!-- zoma-google:start -->[\s\S]*?<!-- zoma-google:end -->\n?/g, '');
+    const keepGoogle = (text: string) => text.replace(/<!-- zoma-google:(start|end) -->\n?/g, '');
+    expect(zomaSkillDoc(doc, false, false, false)).toBe(stripGoogle(withoutBlock));
+    expect(zomaSkillDoc(doc, true, false, false)).toBe(keepGoogle(withoutBlock));
+    expect(Buffer.byteLength(zomaSkillDoc(doc, false, false, false))).toBe(Buffer.byteLength(stripGoogle(withoutBlock)));
+    // main's spacing before "## Usage": two blank lines once Google is stripped, one when it is kept
+    expect(zomaSkillDoc(doc, false, false, false)).toMatch(/[^\n]\n\n\n## Usage\n/);
+    expect(zomaSkillDoc(doc, true, false, false)).toMatch(/[^\n]\n\n## Usage\n/);
+  });
+
   it('a LinkedIn tool call is not routed: it falls to the Meta path, and LinkedIn is never called', async () => {
     const deps = gatewayDeps([metaAccount(), liAccount()], { execute: jest.fn().mockRejectedValue(new MetaToolkitRefusal('not part of the toolkit')) as any });
     for (const tool of ['linkedin_ads_read', 'linkedin_ads_write']) {

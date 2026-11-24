@@ -43,6 +43,7 @@ import { buildLinkedInAdsConnectUrl, zomaLinkedInScopes } from '../services/link
 import { createAccount } from '../services/connectedAccountsDb';
 import { listAdAccounts } from '../services/linkedInAdsService';
 import { getJwtSecret } from '../config/jwt';
+import { rateLimiter } from '../middleware/rateLimiter';
 import {
   completeLinkedInAdsConnect, defaultZomaLinkedInAdsDeps, selectLinkedInAdsAccounts, type ZomaLinkedInAdsDeps,
 } from '../mcp/zomaLinkedInAdsConnect';
@@ -255,18 +256,39 @@ describe('the Zoma pages: user bound from the verified state, invalid links get 
     expect(inactive).toMatchObject({ kind: 'page', status: 400, title: 'No active LinkedIn ad account' });
   });
 
-  it('through the HTTP routes: flag off is a 404 page for both, flag on without a valid state is the invalid-link page', async () => {
-    delete process.env.ZOMA_LINKEDIN_ADS_ENABLED;
-    const app = zomaApp();
-    const off = await request(app).get('/api/zoma/linkedin/callback').query({ code: 'c', state: zomaState() });
-    expect(off.status).toBe(404);
-    expect(off.text).toContain('This link is not available.');
-    expect((await request(app).post('/api/zoma/linkedin/select').type('form').send({ t: 'x', account_id: '1' })).status).toBe(404);
+  it('through the HTTP routes: flag on without a valid state is the invalid-link page', async () => {
     process.env.ZOMA_LINKEDIN_ADS_ENABLED = 'read';
-    const on = await request(app).get('/api/zoma/linkedin/callback').query({ code: 'c', state: tamper(zomaState()) });
+    const on = await request(zomaApp()).get('/api/zoma/linkedin/callback').query({ code: 'c', state: tamper(zomaState()) });
     expect(on.status).toBe(400);
     expect(on.text).toContain('LinkedIn Ads connection link is invalid or has expired');
     expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('flag off: the LinkedIn routes do not exist: they fall through like any unknown route and use none of the shared throttle', async () => {
+    const check = jest.spyOn(rateLimiter, 'check');
+    const app = express();
+    app.use(express.urlencoded({ extended: false }));
+    app.use('/api/zoma', createZomaRouter());
+    app.use((_req, res) => res.status(404).type('text').send('UNKNOWN ROUTE'));
+    for (const value of [undefined, 'false', 'TRUE']) {
+      if (value === undefined) delete process.env.ZOMA_LINKEDIN_ADS_ENABLED; else process.env.ZOMA_LINKEDIN_ADS_ENABLED = value;
+      const unknown = await request(app).get('/api/zoma/not-a-route').query({ code: 'c', state: zomaState() });
+      const callback = await request(app).get('/api/zoma/linkedin/callback').query({ code: 'c', state: zomaState() });
+      const select = await request(app).post('/api/zoma/linkedin/select').type('form').send({ t: 'x', account_id: '1' });
+      for (const res of [callback, select]) {
+        expect(res.status).toBe(unknown.status);
+        expect(res.text).toBe(unknown.text);
+        expect(res.headers['content-type']).toBe(unknown.headers['content-type']);
+        expect(res.headers['content-security-policy']).toBeUndefined();
+      }
+    }
+    expect(check.mock.calls.filter(([key]) => String(key).startsWith('zoma-activate'))).toEqual([]);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    // On, the same routes are real and do spend the bucket.
+    process.env.ZOMA_LINKEDIN_ADS_ENABLED = 'read';
+    expect((await request(app).get('/api/zoma/linkedin/callback').query({ state: 'x' })).status).toBe(400);
+    expect(check.mock.calls.filter(([key]) => String(key).startsWith('zoma-activate')).length).toBe(1);
+    check.mockRestore();
   });
 });
 
