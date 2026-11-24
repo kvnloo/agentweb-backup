@@ -15,6 +15,14 @@ const esc = (value: unknown): string => escapeText(String(value ?? ''));
 /** A single header-safe line: a title written with a line break must not be able to add a header to the email it names. */
 const oneLine = (value: unknown): string => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
 
+/**
+ * How many people one contact entry stands for. Contacts (`dri`) are stored as written, with no validation in the portal, so an entry can be
+ * "a@x.com, b@x.com" or a list; the cap counts the people in it, not the entry. An entry with no "@" counts as one.
+ */
+function peopleIn(entry: string): number {
+  return Math.max(1, String(entry).split(/[\s,;]+/).filter((part) => part.includes('@')).length);
+}
+
 /** Distinct people: the same mailbox written in another case is one person, and gets one email. The first spelling is kept. */
 function distinctRecipients(addresses: string[]): string[] {
   const seen = new Map<string, string>();
@@ -321,7 +329,9 @@ export async function sendPhaseStatusReport(
       return result;
     }
     // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
-    if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+    const people = uniqueRecipients.reduce((sum, entry) => sum + peopleIn(entry), 0);
+    if (exceedsRecipientCap(people, notifications.maxRecipients)) {
+      result.recipients = people;
       result.overCap = notifications.maxRecipients;
       return result;
     }
@@ -553,7 +563,9 @@ export async function sendPlanStatusReport(
       return result;
     }
     // Refuse before sending anything, so a cap is a promise about the whole report and never a partial send
-    if (exceedsRecipientCap(uniqueRecipients.length, notifications.maxRecipients)) {
+    const people = uniqueRecipients.reduce((sum, entry) => sum + peopleIn(entry), 0);
+    if (exceedsRecipientCap(people, notifications.maxRecipients)) {
+      result.recipients = people;
       result.overCap = notifications.maxRecipients;
       return result;
     }
