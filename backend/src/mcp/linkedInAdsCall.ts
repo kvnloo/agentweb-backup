@@ -43,6 +43,10 @@ export function classifyLinkedInFailure(result: LinkedInCallResult): LinkedInFai
   return 'rejected';
 }
 
+/** Read mode (ZOMA_LINKEDIN_ADS_ENABLED=read): changes are not offered at all. */
+export const LINKEDIN_WRITES_NOT_AVAILABLE =
+  'LinkedIn Ads changes are not available yet. Creating or editing needs LinkedIn Standard-tier approval for the Zoma app, and then only works on ad accounts LinkedIn has enabled for it. Reading and reporting work.';
+
 /** Customer message for a write LinkedIn refused because the app is not enabled for the ad account. */
 export const LINKEDIN_WRITE_NOT_ENABLED =
   'LinkedIn write access is not enabled for this ad account yet, so nothing was changed. Reporting (GET_ANALYTICS) still works.';
@@ -65,6 +69,16 @@ export function linkedInRateLimitedResult(what: string, changedNothing: boolean,
     message:
       `LinkedIn is rate limiting this app right now, so ${what} was not done${changedNothing ? ' and nothing was changed' : ''}. ` +
       `Wait about ${retryAfterSeconds} seconds, then try once more. Do not retry in a loop.`,
+  };
+}
+
+/** Zoma's own per-user throttle answered, so LinkedIn was not called at all. */
+export function linkedInThrottledResult(retryAfterSeconds: number) {
+  return {
+    success: false as const,
+    error_type: 'rate_limited' as const,
+    retry_after_seconds: retryAfterSeconds,
+    message: `Too many LinkedIn Ads calls from this account in the last minute, so this call was not made and nothing was changed. Wait about ${retryAfterSeconds} seconds, then try again.`,
   };
 }
 
