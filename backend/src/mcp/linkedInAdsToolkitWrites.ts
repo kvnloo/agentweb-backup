@@ -35,7 +35,9 @@
  * tier: writes only work for ad accounts on its Account Management list) is turned into a customer
  * message (LINKEDIN_WRITE_NOT_ENABLED) and is never reported as applied.
  */
+import crypto from 'crypto';
 import { getJwtSecret } from '../config/jwt';
+import { buildUtmSpec, mergeUtmIntoUrl } from '../utils/adUtm';
 import { evaluateMetaSpendCeiling, type MetaSpendCeilingPolicy } from '../services/agentMode/metaSpendCeiling';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { formatMicros, googleSpendCeilingPolicyFromEnv, majorToMicros } from './googleToolkitWrites';
@@ -51,32 +53,62 @@ import { MetaToolkitRefusal } from './metaToolkitErrors';
 import { assertZomaWriteReady, ZomaNotReadyError } from './zomaOnboarding';
 import { linkedInAdsWritesEnabled } from './zomaToolDefinitions';
 import {
-  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches, type WriteVerification,
+  consumeToken, defaultConsumedTokenStore, type ConsumedTokens, previewFingerprint, previewResponse, previewTokenMatches, stableStringify, type WriteVerification,
 } from './zomaWriteGuard';
 
 // ── Spend ceiling (LINKEDIN_ADS_TOOLKIT_SPEND_CEILING) ───────────────────────────
 
 /**
- * The ceiling is keyed by currency code, because LinkedIn budgets are decimal strings in the ad
- * account's own currency: {"USD":{"maxDailyBudget":100000000,"maxChangeRatio":3},"EUR":{...}} with
- * money in MICROS of that currency, like GOOGLE_TOOLKIT_SPEND_CEILING and X_ADS_TOOLKIT_SPEND_CEILING.
+ * Zoma's spend limit for LinkedIn, keyed by currency code, because LinkedIn budgets are decimal strings in the ad
+ * account's own currency. LINKEDIN_ADS_TOOLKIT_SPEND_CEILING is JSON like
+ * {"USD":{"maxDailyBudget":100000000,"maxChangeRatio":3,"maxTotalBudget":2000000000},"EUR":{...}}, money in
+ * MICROS of that currency (the unit of GOOGLE_TOOLKIT_SPEND_CEILING and X_ADS_TOOLKIT_SPEND_CEILING); no message
+ * to a customer ever shows micros.
  *   - unset or empty: the built-in default below (conservative: USD only), so nothing new is required and
  *     full mode is never unlimited. (Google's and X's unset means no ceiling; LinkedIn's does not.)
  *   - set but not that shape (not JSON, not an object, a key that is not a 3-letter currency code, a
- *     value with no limit): fails closed. Every budget write is refused until it is fixed.
- *   - set: a budget write on an account whose currency is missing, or is not a key of the policy, is
- *     refused; the account's own entry is then evaluated as for the other providers.
+ *     value with no limit): fails closed. Every budget INCREASE is refused until it is fixed.
+ *   - set: a budget increase on an account whose currency is missing, or is not a key of the policy, is
+ *     refused; the account's own entry is then applied.
+ *   - a total (lifetime) budget is capped by maxTotalBudget; an entry that sets maxDailyBudget but no
+ *     maxTotalBudget caps the total at 30 x that daily limit; an entry with neither has no total cap.
+ *   - a change that LOWERS a budget is never refused for being above a limit (see executeLinkedInAdsWrite).
  */
-export type LinkedInSpendCeiling = { unreadable: true } | { byCurrency: Record<string, MetaSpendCeilingPolicy> };
+export interface LinkedInCurrencyPolicy extends MetaSpendCeilingPolicy {
+  /** Highest total (lifetime) budget, micros. */
+  maxTotalBudget?: number;
+}
+export type LinkedInSpendCeiling = { unreadable: true } | { byCurrency: Record<string, LinkedInCurrencyPolicy> };
+
+/** A total budget may be this many days of the daily limit when nothing says otherwise. */
+export const DEFAULT_TOTAL_BUDGET_DAYS = 30;
 
 /**
  * Built in, used when LINKEDIN_ADS_TOOLKIT_SPEND_CEILING is unset (no env var is needed for it to hold):
- * USD only, a daily budget of at most 50.00 and a single change of at most 2x. Any other currency is
- * refused until the env var configures it. Setting the env var REPLACES this default entirely.
- * Units are the parser's: micros of the account currency (50 USD = 50_000_000).
- * TO CONFIRM WITH HARSHA: both numbers and the USD-only choice.
+ * USD only, a daily budget of at most 50.00, a single change of at most 2x, a total budget of at most 1,500.00
+ * (30 x the daily limit). Any other currency is refused until the env var configures it. Setting the env var
+ * REPLACES this default entirely. Micros of the account currency (50 USD = 50_000_000).
+ * TO CONFIRM WITH HARSHA: these numbers and the USD-only choice.
  */
-export const DEFAULT_LINKEDIN_SPEND_CEILING: LinkedInSpendCeiling = { byCurrency: { USD: { maxDailyBudget: 50_000_000, maxChangeRatio: 2 } } };
+export const DEFAULT_LINKEDIN_SPEND_CEILING: LinkedInSpendCeiling = {
+  byCurrency: { USD: { maxDailyBudget: 50_000_000, maxChangeRatio: 2, maxTotalBudget: DEFAULT_TOTAL_BUDGET_DAYS * 50_000_000 } },
+};
+
+/** The cap on a total (lifetime) budget under a policy, micros; undefined when it sets none. */
+export const totalBudgetCap = (policy: LinkedInCurrencyPolicy): number | undefined =>
+  policy.maxTotalBudget ?? (typeof policy.maxDailyBudget === 'number' ? policy.maxDailyBudget * DEFAULT_TOTAL_BUDGET_DAYS : undefined);
+
+function currencyPolicyFromEntry(entry: Record<string, unknown>): LinkedInCurrencyPolicy {
+  const total = entry.maxTotalBudget;
+  const totalOk = total === undefined || (typeof total === 'number' && Number.isFinite(total) && total > 0);
+  const hasEvaluated = entry.maxDailyBudget !== undefined || entry.maxChangeRatio !== undefined;
+  // The same parser the sibling providers use for the two limits it knows; anything it cannot read refuses everything.
+  const base: MetaSpendCeilingPolicy = hasEvaluated
+    ? (googleSpendCeilingPolicyFromEnv(JSON.stringify({ maxDailyBudget: entry.maxDailyBudget, maxChangeRatio: entry.maxChangeRatio })) ?? { maxChangeRatio: -1 })
+    : {};
+  if (!totalOk || (!hasEvaluated && total === undefined)) return { maxChangeRatio: -1 };
+  return { ...base, ...(total !== undefined ? { maxTotalBudget: total as number } : {}) };
+}
 
 export function linkedInSpendCeilingFromEnv(raw: string | undefined = process.env.LINKEDIN_ADS_TOOLKIT_SPEND_CEILING): LinkedInSpendCeiling | null {
   if (!raw) return DEFAULT_LINKEDIN_SPEND_CEILING;
@@ -85,9 +117,7 @@ export function linkedInSpendCeilingFromEnv(raw: string | undefined = process.en
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       const entries = Object.entries(parsed as Record<string, unknown>);
       if (entries.length > 0 && entries.every(([code, value]) => /^[A-Z]{3}$/.test(code) && value && typeof value === 'object' && !Array.isArray(value))) {
-        // Each entry goes through the same parser the sibling providers use; a malformed entry becomes the
-        // evaluator's refuse-everything policy for that currency.
-        return { byCurrency: Object.fromEntries(entries.map(([code, value]) => [code, googleSpendCeilingPolicyFromEnv(JSON.stringify(value)) ?? { maxChangeRatio: -1 }])) };
+        return { byCurrency: Object.fromEntries(entries.map(([code, value]) => [code, currencyPolicyFromEntry(value as Record<string, unknown>)])) };
       }
     }
   } catch {
@@ -96,25 +126,45 @@ export function linkedInSpendCeilingFromEnv(raw: string | undefined = process.en
   return { unreadable: true };
 }
 
-/** The policy that applies to a money write on an account in `currency`, or the reason the write is refused. */
-export function ceilingForCurrency(ceiling: LinkedInSpendCeiling | null, currency: string): { policy: MetaSpendCeilingPolicy | null; refusal?: string } {
+const SUPPORT = 'Zoma support (support@agentweb.pro)';
+
+/** The policy that applies to a budget increase on an account in `currency`, or the reason it is refused. */
+export function ceilingForCurrency(ceiling: LinkedInSpendCeiling | null, currency: string): { policy: LinkedInCurrencyPolicy | null; refusal?: string } {
   if (!ceiling) return { policy: null };
   if ('unreadable' in ceiling) {
-    return { policy: null, refusal: 'The LinkedIn spend ceiling setting could not be read (it must be JSON keyed by currency code, e.g. {"USD":{"maxDailyBudget":100000000}}), so no budget was changed. An account admin has to fix it.' };
+    return { policy: null, refusal: `Zoma's spend limit for LinkedIn is misconfigured, so no budget was changed. Please contact ${SUPPORT}.` };
   }
-  if (!currency) return { policy: null, refusal: 'This LinkedIn ad account has no currency on record, so a budget cannot be checked against the spend ceiling and nothing was changed. Reconnect LinkedIn Ads.' };
+  if (!currency) return { policy: null, refusal: 'This LinkedIn ad account has no currency on record, so a budget cannot be checked against Zoma\'s spend limit and nothing was changed. Reconnect LinkedIn Ads.' };
   const policy = ceiling.byCurrency[currency];
   if (!policy) {
-    return { policy: null, refusal: `The spend ceiling does not cover ${currency}, the currency of this ad account (it covers ${Object.keys(ceiling.byCurrency).join(', ')}), so no budget was changed. An account admin can add ${currency} to it.` };
+    return {
+      policy: null,
+      refusal: `Zoma's spend limit for LinkedIn currently covers ${Object.keys(ceiling.byCurrency).join(', ')} ad accounts only, and this ad account is in ${currency}, so no budget was changed. Ask ${SUPPORT} to enable ${currency}.`,
+    };
   }
   return { policy };
+}
+
+/** "at most 50.00 USD a day, a change of at most 2x and at most 1,500.00 USD in total": what a policy allows, in words. */
+function describePolicy(policy: LinkedInCurrencyPolicy, currency: string): string {
+  const parts: string[] = [];
+  if (typeof policy.maxDailyBudget === 'number') parts.push(`at most ${formatMicros(policy.maxDailyBudget, currency)} a day`);
+  if (typeof policy.maxChangeRatio === 'number') parts.push(`a single change of at most ${policy.maxChangeRatio}x`);
+  const total = totalBudgetCap(policy);
+  if (total !== undefined) parts.push(`at most ${formatMicros(total, currency)} in total`);
+  return parts.length ? parts.join(', ') : 'no limit';
+}
+
+/** Why a budget was refused, in terms a customer can act on (what the limit is and who changes it). */
+function limitRefusal(what: string, policy: LinkedInCurrencyPolicy, currency: string): string {
+  return `${what} Zoma's safety limit for LinkedIn ${currency} ad accounts is ${describePolicy(policy, currency)}. It is Zoma's own default limit: to raise it, ask ${SUPPORT}. Do not split the change to get around it. Nothing was sent.`;
 }
 
 // ── Dependencies ──────────────────────────────────────────────────────────────
 
 export type LinkedInAdsWriteApi = Pick<
   typeof linkedInAdsService,
-  | 'getCampaignGroup' | 'getCampaign' | 'getCreative' | 'listCampaigns'
+  | 'getCampaignGroup' | 'getCampaign' | 'getCreative' | 'getPost' | 'listCampaigns'
   | 'createCampaignGroup' | 'updateCampaignGroup' | 'createCampaign' | 'updateCampaign' | 'createCreative' | 'updateCreativeStatus'
 >;
 
@@ -185,10 +235,46 @@ const ACCEPTED: Record<string, string[]> = {
 };
 const ENVELOPE = ['entity_type', 'action', 'account_id', 'confirm', 'preview_token'];
 
+/** Line breaks and other control characters (and bidi overrides) in text the user is asked to approve. */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
+const noControlChars = (value: string, field: string): string => {
+  if (CONTROL_CHARS.test(value)) throw new MetaToolkitRefusal(`${field} must not contain line breaks or other control characters.`);
+  return value;
+};
 const requireName = (v: unknown): string => {
   if (typeof v !== 'string' || !v.trim() || v.trim().length > 100) throw new MetaToolkitRefusal('name must be 1-100 characters.');
-  return v.trim();
+  return noControlChars(v.trim(), 'name');
 };
+
+/**
+ * Text that did not come from this call (a name or content stored on LinkedIn) or that a caller typed, as it is
+ * echoed in a preview: control characters and newlines become spaces (so it can never start a line of its own and
+ * pose as part of the preview), runs of spaces collapse, and a long text is cut with a visible marker.
+ */
+export function previewText(value: unknown, max = 200): string {
+  let raw: string;
+  try {
+    raw = String(value ?? '');
+  } catch {
+    raw = '';
+  }
+  const text = raw.replace(new RegExp(CONTROL_CHARS.source, 'g'), ' ').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}… [cut: ${text.length - max} more characters]` : text;
+}
+
+/** The URL LinkedIn really receives for a text ad: the service appends its utm tags (appendLinkedInUtm); a URL it cannot parse is sent as it is. */
+export function finalLandingPage(url: string, campaignId: string): string {
+  try {
+    return mergeUtmIntoUrl(url, buildUtmSpec('linkedin', { campaign: campaignId }));
+  } catch {
+    return url;
+  }
+}
+
+/** The preview as a whole is bounded: a change too large to show in full is refused rather than approved unseen. */
+export const PREVIEW_MAX_CHARS = 20_000;
+/** How many of a group's campaigns an ACTIVATE preview lists by name. */
+export const PREVIEW_MAX_LISTED_CAMPAIGNS = 20;
 const isoToMs = (v: unknown, field: string): number => {
   const ms = typeof v === 'string' ? Date.parse(v) : NaN;
   if (!Number.isFinite(ms) || !/\d{4}-\d{2}-\d{2}/.test(String(v))) throw new MetaToolkitRefusal(`${field} must be an ISO 8601 date-time, e.g. 2026-12-01T09:00:00Z.`);
@@ -210,6 +296,7 @@ export const microsToAmount = (micros: number, currency: string): string => (mic
 /** A LinkedIn amount string → micros; undefined when it is not a finite non-negative number. */
 export const amountToMicros = (amount: unknown): number | undefined => {
   if (typeof amount !== 'string' && typeof amount !== 'number') return undefined;
+  if (typeof amount === 'string' && !amount.trim()) return undefined; // "" is not zero: Number("") would say so
   const n = Number(amount);
   return Number.isFinite(n) && n >= 0 ? Math.round(n * 1e6) : undefined;
 };
@@ -397,9 +484,12 @@ export function validateLinkedInAdsWriteShape(rawArgs: any, currency: string): V
       } else {
         if (typeof a.headline !== 'string' || !a.headline.trim() || a.headline.trim().length > 25) throw new MetaToolkitRefusal('headline is required for a text ad (up to 25 characters), or pass post_urn.');
         if (typeof a.description !== 'string' || !a.description.trim() || a.description.trim().length > 75) throw new MetaToolkitRefusal('description is required for a text ad (up to 75 characters).');
+        noControlChars(a.headline.trim(), 'headline');
+        noControlChars(a.description.trim(), 'description');
         let url: URL | null = null;
         try { url = typeof a.landing_page === 'string' ? new URL(a.landing_page) : null; } catch { url = null; }
-        if (!url || url.protocol !== 'https:' || String(a.landing_page).length > 2000) throw new MetaToolkitRefusal('landing_page is required for a text ad and must be an https URL.');
+        if (!url || url.protocol !== 'https:' || String(a.landing_page).length > 1000) throw new MetaToolkitRefusal('landing_page is required for a text ad and must be an https URL of at most 1000 characters.');
+        noControlChars(String(a.landing_page), 'landing_page');
         if (a.image_urn !== undefined && (typeof a.image_urn !== 'string' || !/^urn:li:image:[A-Za-z0-9_-]{1,80}$/.test(a.image_urn))) throw new MetaToolkitRefusal('image_urn must look like urn:li:image:C4E10AQ...');
         Object.assign(params, { headline: a.headline.trim(), description: a.description.trim(), landing_page: a.landing_page, ...(a.image_urn ? { image_urn: a.image_urn } : {}) });
         expect.push({ path: 'content.textAd.headline', value: params.headline, as: 'string' }, { path: 'content.textAd.description', value: params.description, as: 'string' });
@@ -431,6 +521,8 @@ const stateOf = (kind: Kind, row: any) => {
     id: trailingId(row.id), status: row.intendedStatus, campaign: trailingId(row.campaign),
     reference: typeof row.content?.reference === 'string' ? row.content.reference : undefined,
     headline: textAd?.headline, description: textAd?.description, landingPage: textAd?.landingPage, image: textAd?.image,
+    // EVERYTHING LinkedIn holds as this creative's content, shown or not: a change to any part of it voids the preview token.
+    contentHash: crypto.createHash('sha256').update(stableStringify(row.content ?? null)).digest('hex'),
   };
 };
 
@@ -495,7 +587,8 @@ export async function executeLinkedInAdsWrite(
   };
   const cur = /^[A-Z]{3}$/.test(session.currency) ? session.currency : '';
   const money = (micros: number | undefined) => (micros === undefined ? 'not set' : cur ? formatMicros(micros, cur) : `${micros / 1e6}`);
-  const moneyOf = (m: any) => (m?.amount === undefined ? 'not set' : `${m.amount} ${m.currencyCode ?? ''}`.trim());
+  // A budget as LinkedIn answered it (currencyCode) or as the preview state holds it (currency).
+  const moneyOf = (m: any) => (m?.amount === undefined ? 'not set' : `${m.amount} ${m.currencyCode ?? m.currency ?? ''}`.trim());
 
   // State the preview describes (and the token is bound to).
   const lines: string[] = ['PREVIEW — nothing has changed yet.'];
@@ -507,17 +600,20 @@ export async function executeLinkedInAdsWrite(
   const unlockCurrencies: Array<string | undefined> = [];
   const isActivate = v.action === 'ACTIVATE';
   const verb = (kind: Kind) => ({ group: 'campaign group', campaign: 'campaign', creative: 'creative' })[kind];
+  // Everything below that did not come from this call (names and content stored on LinkedIn, post text) or that a
+  // caller typed goes through previewText, so it can neither start a line of its own nor run on without end.
+  const t = (value: unknown, max = 200) => previewText(value, max);
 
   if (v.action === 'CREATE') {
     if (v.kind === 'group') {
-      lines.push(`Create campaign group "${v.params.name}" as DRAFT (it cannot deliver).`);
+      lines.push(`Create campaign group "${t(v.params.name, 150)}" as DRAFT (it cannot deliver).`);
       lines.push(`Schedule: starts ${iso(v.params.run_schedule_start)}${v.params.run_schedule_end ? `, ends ${iso(v.params.run_schedule_end)}` : ', no end date'}.`);
       lines.push(`Total budget: ${money(v.totalMicros)}.`);
     } else if (v.kind === 'campaign') {
       const group = await readEntity('group', v.parent!.id);
       if (TERMINAL.includes(group.status)) throw new MetaToolkitRefusal(`Campaign group ${v.parent!.id} is ${group.status}, so no campaign can be added to it. Nothing was sent.`);
       state = { parent: stateOf('group', group) };
-      lines.push(`Create campaign "${v.params.name}" in campaign group "${group.name}" (id ${v.parent!.id}, group is ${group.status}) as DRAFT (it cannot deliver).`);
+      lines.push(`Create campaign "${t(v.params.name, 150)}" in campaign group "${t(group.name, 150)}" (id ${v.parent!.id}, group is ${t(group.status, 30)}) as DRAFT (it cannot deliver).`);
       lines.push(`Type ${v.params.type}, objective ${v.params.objective_type}, cost type ${v.params.cost_type} with a bid of ${money(v.unitCostMicros)}.`);
       lines.push(`Daily budget: ${money(v.dailyMicros)}.${v.totalMicros !== undefined ? ` Total budget: ${money(v.totalMicros)}.` : ''}`);
       lines.push(`Schedule: starts ${iso(v.params.run_schedule_start)}${v.params.run_schedule_end ? `, ends ${iso(v.params.run_schedule_end)}` : ', no end date'}.`);
@@ -528,10 +624,12 @@ export async function executeLinkedInAdsWrite(
       const campaign = await readEntity('campaign', v.parent!.id);
       if (TERMINAL.includes(campaign.status)) throw new MetaToolkitRefusal(`Campaign ${v.parent!.id} is ${campaign.status}, so no creative can be added to it. Nothing was sent.`);
       state = { parent: stateOf('campaign', campaign) };
-      lines.push(`Create a creative in campaign "${campaign.name}" (id ${v.parent!.id}, campaign is ${campaign.status}) as DRAFT (it cannot deliver).`);
+      lines.push(`Create a creative in campaign "${t(campaign.name, 150)}" (id ${v.parent!.id}, campaign is ${t(campaign.status, 30)}) as DRAFT (it cannot deliver).`);
       if (v.params.post_urn) lines.push(`Post: ${v.params.post_urn}`);
       else {
-        lines.push(`Text ad headline: ${v.params.headline}`, `Text ad description: ${v.params.description}`, `Landing page: ${v.params.landing_page} (LinkedIn adds utm_source, utm_medium and utm_campaign tags to it)`);
+        lines.push(`Text ad headline: ${t(v.params.headline, 60)}`, `Text ad description: ${t(v.params.description, 150)}`);
+        // The URL as given AND the URL LinkedIn receives: the service appends its tracking tags (appendLinkedInUtm).
+        lines.push(`Landing page: ${t(v.params.landing_page, 1000)}`, `Landing page as sent (LinkedIn tracking tags added): ${t(finalLandingPage(v.params.landing_page, v.parent!.id), 1500)}`);
         if (v.params.image_urn) lines.push(`Image: ${v.params.image_urn}`);
       }
     }
@@ -541,19 +639,40 @@ export async function executeLinkedInAdsWrite(
     const priorState = stateOf(v.kind, prior);
     state = { prior: priorState };
     const priorStatus = String(priorState.status);
-    const name = v.kind === 'creative' ? `creative ${v.target!.id}` : `${verb(v.kind)} "${priorState.name}" (id ${v.target!.id})`;
+    const name = v.kind === 'creative' ? `creative ${v.target!.id}` : `${verb(v.kind)} "${t(priorState.name, 150)}" (id ${v.target!.id})`;
     if (v.params.status) {
       if (TERMINAL.includes(priorStatus)) throw new MetaToolkitRefusal(`The ${name} is ${priorStatus} and cannot be ${isActivate ? 'activated' : 'paused'}. Nothing was sent.`);
       if (priorStatus === v.params.status) throw new MetaToolkitRefusal(`The ${name} is already ${priorStatus}. Nothing was sent.`);
       lines.push(`${isActivate ? 'Activate' : 'Pause'} ${name}: ${priorStatus} → ${v.params.status}.`);
       if (v.kind === 'creative') {
-        // What the user is approving to put live: the creative's own content, as LinkedIn holds it.
+        // What the user is approving to put live: the creative's own content, as LinkedIn holds it. A creative
+        // whose content cannot be described is never activated: approving it would be approving blind.
         const c = priorState as any;
-        if (c.reference) lines.push(`Post: ${c.reference}`);
-        if (c.headline !== undefined) lines.push(`Text ad headline: ${c.headline}`);
-        if (c.description !== undefined) lines.push(`Text ad description: ${c.description}`);
-        if (c.landingPage !== undefined) lines.push(`Landing page: ${c.landingPage}`);
-        if (c.image !== undefined) lines.push(`Image: ${c.image}`);
+        if (isActivate && !c.reference && c.headline === undefined) {
+          throw new MetaToolkitRefusal('LinkedIn did not describe this creative\'s content, so it cannot be shown to you and is not activated from here. Nothing was sent.');
+        }
+        if (c.reference) {
+          lines.push(`Post: ${c.reference}`);
+          if (isActivate) {
+            // The post text is what people will read: fetch it (the service's getPost) and show it, or refuse.
+            const post = await callLinkedIn(session, (tok) => api.getPost(tok, c.reference), { changedNothing: true });
+            const body: any = post.data;
+            if (!post.success || !body || typeof body !== 'object' || typeof body.commentary !== 'string') {
+              throw new MetaToolkitRefusal(`LinkedIn would not give Zoma the text of the post this creative runs (${c.reference}), so it cannot be shown to you and is not activated from here. Nothing was sent.`);
+            }
+            lines.push(`Post text: ${t(body.commentary, 1500)}`);
+            if (typeof body.contentLandingPage === 'string') lines.push(`Post landing page: ${t(body.contentLandingPage, 1000)}`);
+            // Bound into the token: a post edited after the preview voids it.
+            state = {
+              ...state,
+              post: crypto.createHash('sha256').update(stableStringify({ commentary: body.commentary, landing: body.contentLandingPage ?? null, content: body.content ?? null })).digest('hex'),
+            };
+          }
+        }
+        if (c.headline !== undefined) lines.push(`Text ad headline: ${t(c.headline, 300)}`);
+        if (c.description !== undefined) lines.push(`Text ad description: ${t(c.description, 300)}`);
+        if (c.landingPage !== undefined) lines.push(`Landing page: ${t(c.landingPage, 1500)}`);
+        if (c.image !== undefined) lines.push(`Image: ${t(c.image, 120)}`);
         if (!c.reference && c.headline === undefined) lines.push('LinkedIn did not describe this creative\'s content, so it cannot be shown here.');
         if (c.campaign) lines.push(`Campaign: ${c.campaign}`);
       }
@@ -578,11 +697,11 @@ export async function executeLinkedInAdsWrite(
           if (unlockMicros === undefined) unlockUnbounded = 'It has no daily budget, so its daily spend cannot be bounded.';
           const groupId = (priorState as any).group as string | undefined;
           if (groupId) {
-            const g = await callLinkedIn(session, (t) => api.getCampaignGroup(t, acct, groupId), { changedNothing: true });
-            if (g.success && typeof g.data?.status === 'string') lines.push(`It delivers only while its campaign group "${g.data.name}" is ACTIVE (now ${g.data.status}).`);
+            const g = await callLinkedIn(session, (tok) => api.getCampaignGroup(tok, acct, groupId), { changedNothing: true });
+            if (g.success && typeof g.data?.status === 'string') lines.push(`It delivers only while its campaign group "${t(g.data.name, 150)}" is ACTIVE (now ${t(g.data.status, 30)}).`);
           }
         } else if (v.kind === 'group') {
-          const listed = await before('list the campaigns of the campaign group', (t) => api.listCampaigns(t, acct, { campaign_group_id: v.target!.id }));
+          const listed = await before('list the campaigns of the campaign group', (tok) => api.listCampaigns(tok, acct, { campaign_group_id: v.target!.id }));
           const campaigns: any[] = Array.isArray(listed.data?.elements) ? listed.data.elements : [];
           const live = campaigns.filter((c) => c?.status === 'ACTIVE');
           state = { ...state, campaigns: campaigns.map((c) => ({ id: trailingId(c?.id), status: c?.status, daily: c?.dailyBudget?.amount === undefined ? undefined : String(c.dailyBudget.amount) })) };
@@ -590,7 +709,11 @@ export async function executeLinkedInAdsWrite(
           unlockCurrencies.push(...live.filter((c) => c?.dailyBudget).map((c) => c.dailyBudget.currencyCode));
           unlockMicros = unbounded.length ? undefined : live.reduce((sum, c) => sum + (amountToMicros(c.dailyBudget.amount) as number), 0);
           if (unbounded.length) unlockUnbounded = `${unbounded.length} ACTIVE campaign(s) in it have no daily budget (${unbounded.map((c) => trailingId(c?.id)).join(', ')}), so the daily spend cannot be bounded.`;
-          for (const c of campaigns.slice(0, 20)) lines.push(`Campaign ${trailingId(c?.id)} "${c?.name ?? ''}": ${c?.status}, daily budget ${moneyOf(c?.dailyBudget)}`);
+          for (const c of campaigns.slice(0, PREVIEW_MAX_LISTED_CAMPAIGNS)) lines.push(`Campaign ${trailingId(c?.id)} "${t(c?.name, 150)}": ${t(c?.status, 30)}, daily budget ${moneyOf(c?.dailyBudget)}`);
+          if (campaigns.length > PREVIEW_MAX_LISTED_CAMPAIGNS) {
+            const rest = campaigns.slice(PREVIEW_MAX_LISTED_CAMPAIGNS);
+            lines.push(`...and ${rest.length} more campaign(s) not listed here (${rest.filter((c) => c?.status === 'ACTIVE').length} of them ACTIVE; the total below counts every ACTIVE campaign).`);
+          }
           lines.push(live.length
             ? `Its ${live.length} ACTIVE campaign(s) can start delivering${unlockMicros === undefined ? '' : ` and can spend up to ${money(unlockMicros)}/day together`}; DRAFT or PAUSED ones spend only after their own ACTIVATE.`
             : 'It has no ACTIVE campaigns, so nothing delivers until a campaign in it is activated.');
@@ -602,14 +725,14 @@ export async function executeLinkedInAdsWrite(
           unlockMicros = amountToMicros(campaign.dailyBudget?.amount);
           if (campaign.dailyBudget) unlockCurrencies.push(campaign.dailyBudget.currencyCode);
           if (unlockMicros === undefined) unlockUnbounded = 'Its campaign has no daily budget, so its daily spend cannot be bounded.';
-          lines.push(`It can serve in campaign "${campaign.name}" (now ${campaign.status}), which spends up to ${money(unlockMicros)}/day.`);
+          lines.push(`It can serve in campaign "${t(campaign.name, 150)}" (now ${t(campaign.status, 30)}), which spends up to ${money(unlockMicros)}/day.`);
         }
       }
     } else {
       if (TERMINAL.includes(priorStatus)) throw new MetaToolkitRefusal(`The ${name} is ${priorStatus} and cannot be edited. Nothing was sent.`);
       const p = priorState as any;
       lines.push(`Change ${name}.`);
-      if (v.params.name !== undefined) lines.push(`Rename ${name} → "${v.params.name}".`);
+      if (v.params.name !== undefined) lines.push(`Rename ${name} → "${t(v.params.name, 150)}".`);
       if (v.params.daily_budget_amount !== undefined) lines.push(`Daily budget: ${moneyOf(p.dailyBudget)} → ${v.params.daily_budget_amount} ${cur}.`);
       if (v.params.total_budget_amount !== undefined) lines.push(`Total budget: ${moneyOf(p.totalBudget)} → ${v.params.total_budget_amount} ${cur}.`);
       if (v.params.unit_cost_amount !== undefined) lines.push(`Bid: ${moneyOf(p.unitCost)} → ${v.params.unit_cost_amount} ${cur}.`);
@@ -625,39 +748,70 @@ export async function executeLinkedInAdsWrite(
     }
   }
 
-  // Spend ceiling (micros of the account currency): budgets set here, and what an ACTIVATE unlocks.
-  const moneyWrite = v.dailyMicros !== undefined || v.totalMicros !== undefined || isActivate;
-  if (moneyWrite) {
-    const { policy, refusal } = ceilingForCurrency(deps.spendCeiling(), cur);
-    if (refusal) throw new MetaToolkitRefusal(refusal);
-    if (policy) {
-      const priorDaily = amountToMicros(((state.prior as any)?.dailyBudget)?.amount);
-      const priorTotal = amountToMicros(((state.prior as any)?.totalBudget)?.amount);
-      // The ceiling is in the account's own currency. A budget LinkedIn reports in another currency (or none) would be
-      // compared as if it were the same money, so the write is refused instead.
-      const compared = [
-        ...(isActivate ? unlockCurrencies : []),
-        ...(v.dailyMicros !== undefined && priorDaily !== undefined ? [((state.prior as any)?.dailyBudget)?.currency] : []),
-        ...(v.totalMicros !== undefined && priorTotal !== undefined ? [((state.prior as any)?.totalBudget)?.currency] : []),
-      ];
-      const bad = compared.find((currency) => !currency || String(currency).toUpperCase() !== cur);
-      if (compared.some((currency) => !currency || String(currency).toUpperCase() !== cur)) {
-        throw new MetaToolkitRefusal(
-          `A budget this change depends on is in ${bad ? String(bad) : 'an unknown currency'}, but this ad account's currency is ${cur}, so it cannot be checked against the spend ceiling. Nothing was sent.`,
-        );
+  // Spend limit (micros of the account currency): budgets raised here, and what an ACTIVATE unlocks.
+  {
+    const priorOf = (key: 'dailyBudget' | 'totalBudget') => {
+      const m = (state.prior as any)?.[key];
+      return { present: !!m, micros: amountToMicros(m?.amount), currency: m?.currency as string | undefined };
+    };
+    const changes: Array<{ label: string; field: 'daily_budget' | 'lifetime_budget'; proposed: number; prior: ReturnType<typeof priorOf> }> = [];
+    if (v.dailyMicros !== undefined) changes.push({ label: 'daily budget', field: 'daily_budget', proposed: v.dailyMicros, prior: priorOf('dailyBudget') });
+    if (v.totalMicros !== undefined) changes.push({ label: 'total budget', field: 'lifetime_budget', proposed: v.totalMicros, prior: priorOf('totalBudget') });
+    // A stored budget that exists but cannot be read fails closed: skipping the ratio check would let any raise through.
+    for (const change of changes) {
+      if (change.prior.present && change.prior.micros === undefined) {
+        throw new MetaToolkitRefusal(`The ${change.label} LinkedIn holds for this ${verb(v.kind)} could not be read, so the change cannot be checked against Zoma's spend limit. Nothing was sent.`);
       }
-      const checks: Array<{ label: string; field: 'daily_budget' | 'lifetime_budget'; proposed: unknown; prior?: unknown }> = [];
-      if (v.dailyMicros !== undefined) checks.push({ label: '', field: 'daily_budget', proposed: v.dailyMicros, prior: priorDaily });
-      if (v.totalMicros !== undefined) checks.push({ label: '', field: 'lifetime_budget', proposed: v.totalMicros, prior: priorTotal });
-      if (isActivate) {
-        if (unlockUnbounded) throw new MetaToolkitRefusal(`${unlockUnbounded} With a spend ceiling set, activating is refused until every budget it unlocks is a daily budget. Nothing was sent.`);
-        checks.push({ label: 'Activating would start spend at its daily budget. ', field: 'daily_budget', proposed: unlockMicros });
-      }
-      for (const check of checks) {
-        const verdict = evaluateMetaSpendCeiling(policy, { field: check.field, proposed: check.proposed, prior: check.prior });
-        if (!verdict.allowed) throw new MetaToolkitRefusal(`${check.label}${verdict.message.replace('(minor units)', '(micros)')}`);
+      // Compared in the account's own currency or not at all.
+      if (change.prior.present && String(change.prior.currency ?? '').toUpperCase() !== cur) {
+        throw new MetaToolkitRefusal(`The ${change.label} LinkedIn holds is in ${change.prior.currency ? String(change.prior.currency) : 'an unknown currency'}, but this ad account's currency is ${cur || 'unknown'}, so the change cannot be checked against Zoma's spend limit. Nothing was sent.`);
       }
     }
+    // Lowering a budget is never refused for still being above a limit: it can only reduce spend.
+    const increases = changes.filter((change) => !(change.prior.micros !== undefined && change.proposed <= change.prior.micros));
+    if (increases.length > 0 || isActivate) {
+      const { policy, refusal } = ceilingForCurrency(deps.spendCeiling(), cur);
+      if (refusal) throw new MetaToolkitRefusal(refusal);
+      if (policy) {
+        const total = totalBudgetCap(policy);
+        for (const change of increases) {
+          const verdict = evaluateMetaSpendCeiling(policy, { field: change.field, proposed: change.proposed, prior: change.prior.micros });
+          if (!verdict.allowed) {
+            throw new MetaToolkitRefusal(verdict.code === 'SPEND_CEILING_INVALID'
+              ? `Zoma's spend limit for this ad account could not be evaluated, so nothing was sent. Please contact ${SUPPORT}.`
+              : limitRefusal(
+                verdict.ceiling === 'maxDailyBudget'
+                  ? `The daily budget of ${formatMicros(change.proposed, cur)} is above the limit.`
+                  : `This change takes the ${change.label} from ${formatMicros(change.prior.micros ?? 0, cur)} to ${formatMicros(change.proposed, cur)}, more than ${policy.maxChangeRatio}x in one change.`,
+                policy, cur,
+              ));
+          }
+          if (change.field === 'lifetime_budget' && total !== undefined && change.proposed > total) {
+            throw new MetaToolkitRefusal(limitRefusal(`The total (lifetime) budget of ${formatMicros(change.proposed, cur)} is above the limit.`, policy, cur));
+          }
+        }
+        if (isActivate) {
+          // What an ACTIVATE unlocks must be in the account's currency and bounded, then within the daily limit.
+          const wrong = unlockCurrencies.find((currency) => !currency || String(currency).toUpperCase() !== cur);
+          if (unlockCurrencies.some((currency) => !currency || String(currency).toUpperCase() !== cur)) {
+            throw new MetaToolkitRefusal(
+              `A budget this change depends on is in ${wrong ? String(wrong) : 'an unknown currency'}, but this ad account's currency is ${cur}, so it cannot be checked against Zoma's spend limit. Nothing was sent.`,
+            );
+          }
+          if (unlockUnbounded) throw new MetaToolkitRefusal(`${unlockUnbounded} With a spend limit in force, activating is refused until every budget it unlocks is a daily budget. Nothing was sent.`);
+          const verdict = evaluateMetaSpendCeiling(policy, { field: 'daily_budget', proposed: unlockMicros });
+          if (!verdict.allowed) {
+            throw new MetaToolkitRefusal(verdict.code === 'SPEND_CEILING_INVALID'
+              ? `Zoma's spend limit for this ad account could not be evaluated, so nothing was sent. Please contact ${SUPPORT}.`
+              : limitRefusal(`Activating would start spend at ${formatMicros(unlockMicros as number, cur)} a day, above the limit.`, policy, cur));
+          }
+        }
+      }
+    }
+  }
+
+  if (lines.join('\n').length > PREVIEW_MAX_CHARS) {
+    throw new MetaToolkitRefusal(`This change is too large to show you in full (over ${PREVIEW_MAX_CHARS} characters), so it is not previewed and nothing was sent. Split it into smaller changes.`);
   }
 
   const fingerprint = previewFingerprint({ platform: 'linkedin_ads', userId, accountId: acct, op: v.op, params: v.params, state, currency: cur });
