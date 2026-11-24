@@ -105,6 +105,10 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
   'mark_browser_session_failed',
   // 5c. one-time login codes and magic links read from the owner's connected mailbox: with a browser, that is a log-in to a site as the owner
   'read_verification_code',
+  // `email` (search, list, get, send): search and get return full message bodies from the owner's connected mailbox, which is how a visitor could read a
+  // login code, magic link or password-reset mail that THEIR OWN browser just triggered for a site the owner has an account on; that is read_verification_code
+  // by another name, so the whole tool is sensitive (send is the write)
+  'email',
   // 5d. the OLD agent-engine task tools: the task runs under the owner's account in a real browser and reads the owner's own saved logins and
   // cookies there (`useSharedBrowser: false`), which the OFF rule refuses for the browser tools themselves
   'create_task_from_prompt',
@@ -152,6 +156,28 @@ export const SHARE_VISITOR_SENSITIVE_TOOLS: ReadonlySet<string> = new Set<string
 ]);
 
 /**
+ * Tools that exist only at RUNTIME, from an external MCP server the owner's account runs with the owner's own token (the per-user GitHub server in
+ * `mcp/client/mcp_config.ts`), so they are not in the static registry the guard test walks. Their WRITE tools are sensitive by name; their reads (get_,
+ * list_, search_) are not listed. The names are the ones the server publishes (@modelcontextprotocol/server-github); `shareVisitorSensitiveTools.test.ts`
+ * pins that none of them shadows a tool of ours. Servers an operator adds through the `mcp_servers` setting are not covered (a limit, in the dev note).
+ */
+export const SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS: ReadonlySet<string> = new Set<string>([
+  'create_or_update_file',
+  'push_files',
+  'create_repository',
+  'fork_repository',
+  'create_branch',
+  'create_issue',
+  'update_issue',
+  'add_issue_comment',
+  'create_pull_request',
+  'merge_pull_request',
+  'update_pull_request_branch',
+  'create_pull_request_review',
+  'delete_file',
+]);
+
+/**
  * A tool that mixes reads and sensitive writes is judged by one argument.
  *  - `action`: the argument that says what the call does. A value is allowed (even when sensitive actions are off) when it is in
  *    `allowedValues` or starts with one of `allowedPrefixes`; EVERY other value, a missing argument and a non-text one is sensitive, so
@@ -186,7 +212,6 @@ export type SensitiveByArgument =
 const READ_PREFIXES: readonly string[] = ['get', 'list', 'search'];
 
 export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, SensitiveByArgument>> = {
-  email: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // send is the write
   linkedin_outreach: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // send-invite, send-message, send-inmail, accept/cancel/withdraw invitations
   linkedin_manage_post: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // repost, comment, react, delete_post
   twitter_manage_post: { kind: 'action', argument: 'action', allowedPrefixes: READ_PREFIXES }, // reply, post_thread, quote_tweet, delete_tweet, like, retweet...
@@ -222,6 +247,8 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   // `dri` is an email address: every later status report and update notice of the plan goes to it, so a visitor naming an address makes the owner's next report reach it
   update_gtm_work_item: { kind: 'present', arguments: ['notify_user', 'notify_item_poc', 'notify_phase_poc', 'notify_plan_poc', 'dri'] },
   update_gtm_plan: { kind: 'present', arguments: ['dri'] },
+  add_gtm_phase: { kind: 'present', arguments: ['dri'] },
+  create_gtm_plan: { kind: 'present', arguments: ['dri'] },
   update_gtm_phase: { kind: 'present', arguments: ['dri'] },
   // an `autocomplete` plan tells later turns to carry on without pausing, so steps a visitor wrote run unattended in the owner's next turn
   create_work_plan: { kind: 'present', arguments: ['autocomplete'] },
@@ -231,6 +258,30 @@ export const SHARE_VISITOR_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, Sensit
   create_google_doc: { kind: 'present', arguments: ['share_with_emails'] },
   create_google_sheet: { kind: 'present', arguments: ['share_with_emails'] },
 };
+
+/**
+ * Calls that are sensitive ONLY in a scheduled run of a schedule a visitor wrote (the `share_visitor_schedule` profile), not in a visitor's own chat. A Meta
+ * write in a visitor's chat halts into an approval deck that only the owner can answer (unless Full control is on); in an UNATTENDED run the same write is
+ * staged as an Approval Desk decision that AgentWeb's own approver can approve, without the owner, and the write is then sent with the owner's Meta token.
+ * So a schedule a visitor wrote may read the ad account but never write to it (the owner adopting the schedule lifts this).
+ */
+export const SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT: Readonly<Record<string, SensitiveByArgument>> = {
+  call_meta_marketing_api: { kind: 'action', argument: 'action', allowedValues: ['preview'], allowedPrefixes: READ_PREFIXES },
+};
+
+/** True when this call is sensitive in a scheduled run of a visitor-made schedule (see above). Pure. */
+export function isSensitiveInVisitorScheduleCall(toolName: string, args?: unknown): boolean {
+  if (typeof toolName !== 'string' || !Object.prototype.hasOwnProperty.call(SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, toolName)) return false;
+  const rule = SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT[toolName];
+  if (rule.kind !== 'action') return false;
+  const record = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const raw = record[rule.argument];
+  if (typeof raw !== 'string') return true;
+  const value = normaliseActionValue(raw);
+  if (rule.allowedValues?.includes(value)) return false;
+  if (rule.allowedPrefixes?.some((prefix) => value.startsWith(prefix))) return false;
+  return true;
+}
 
 function normaliseActionValue(value: string): string {
   return value.trim().toLowerCase().replace(/_/g, '-');
@@ -245,7 +296,7 @@ function isSet(value: unknown): boolean {
 
 /** True for a tool that is sensitive whatever its arguments (the whole-tool list). A tool judged by an argument is not: it needs the call. */
 export function isSensitiveWholeTool(toolName: string): boolean {
-  return typeof toolName === 'string' && SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName);
+  return typeof toolName === 'string' && (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) || SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS.has(toolName));
 }
 
 /**
@@ -255,13 +306,13 @@ export function isSensitiveWholeTool(toolName: string): boolean {
  */
 export function isFullControlGatedWholeTool(toolName: string): boolean {
   return typeof toolName === 'string'
-    && (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) || SHARE_VISITOR_BLOCKED_TOOLS.has(toolName) || toolName === 'connect_account');
+    && (isSensitiveWholeTool(toolName) || SHARE_VISITOR_BLOCKED_TOOLS.has(toolName) || toolName === 'connect_account');
 }
 
 /** True when this call is sensitive (see above). Pure: it does not know about any link, only about the tool and its arguments. */
 export function isSensitiveToolCall(toolName: string, args?: unknown): boolean {
   if (typeof toolName !== 'string') return false;
-  if (SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName)) return true;
+  if (isSensitiveWholeTool(toolName)) return true;
   // Own keys only: a tool called "constructor" must not read as an entry on Object.prototype.
   if (!Object.prototype.hasOwnProperty.call(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT, toolName)) return false;
   const rule = SHARE_VISITOR_SENSITIVE_BY_ARGUMENT[toolName];
@@ -351,7 +402,7 @@ const PROFILES: Record<RestrictionProfileId, RestrictionProfile> = {
       const reason = 'because this schedule was set up or edited through a share link';
       const way = 'The owner can adopt the schedule in the portal to lift this limit.';
       // ENG-3170: no link to ask, so a visitor-made schedule never runs a sensitive action until the owner adopts it.
-      if (nameOnly ? SHARE_VISITOR_SENSITIVE_TOOLS.has(toolName) : isSensitiveToolCall(toolName, args)) return sensitiveActionScheduleRefusal(toolName);
+      if (nameOnly ? isSensitiveWholeTool(toolName) : (isSensitiveToolCall(toolName, args) || isSensitiveInVisitorScheduleCall(toolName, args))) return sensitiveActionScheduleRefusal(toolName);
       switch (classifyRestrictedTool(toolName, adminToolNames)) {
         case 'admin':
           return `Tool "${toolName}" is not available in this scheduled run ${reason}. ${way}`;

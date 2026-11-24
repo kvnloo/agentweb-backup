@@ -156,9 +156,9 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
     it('ENG-3170: through executeTool, a marked schedule still RUNS the read side of a tool judged by its action and is refused the write side (the schedule is judged from its stored provenance, not from a profile in the call)', async () => {
       marked();
       await expect(runWith('call_google_ads_api', { isUnattendedRun: true }, valid('call_google_ads_api', { action: 'LIST', entity_type: 'CAMPAIGN' }))).resolves.toEqual({ ran: true });
-      await expect(runWith('email', { isUnattendedRun: true }, valid('email', { action: 'search' }))).resolves.toEqual({ ran: true });
+      await expect(runWith('linkedin_outreach', { isUnattendedRun: true }, valid('linkedin_outreach', { action: 'search-people' }))).resolves.toEqual({ ran: true });
       expect(dispatch).toHaveBeenCalledTimes(2);
-      for (const [tool, extra] of [['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }], ['email', { action: 'send' }]] as Array<[string, Record<string, unknown>]>) {
+      for (const [tool, extra] of [['call_google_ads_api', { action: 'PAUSE', entity_type: 'CAMPAIGN' }], ['linkedin_outreach', { action: 'send-invite' }]] as Array<[string, Record<string, unknown>]>) {
         await expect(runWith(tool, { isUnattendedRun: true }, valid(tool, extra))).rejects.toMatchObject({
           deniedBy: 'restriction_profile',
           message: expect.stringContaining('The owner can adopt the schedule in the portal to lift this limit.'),
@@ -169,7 +169,7 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
 
     it('ENG-3170: still runs the READ side of a tool that also writes, and spends the schedule reads only for a sensitive call', async () => {
       marked();
-      for (const [tool, args] of [['call_google_ads_api', { action: 'LIST' }], ['email', { action: 'search' }], ['call_hubspot_api', { action: 'GET_STATS' }]] as Array<[string, any]>) {
+      for (const [tool, args] of [['call_google_ads_api', { action: 'LIST' }], ['linkedin_outreach', { action: 'search-people' }], ['call_hubspot_api', { action: 'GET_STATS' }]] as Array<[string, any]>) {
         const result = await (service as any).scheduledRunRestriction(tool, 'run-session', { isUnattendedRun: true }, args);
         expect(result.refusal).toBeNull();
       }
@@ -393,4 +393,64 @@ describe('AgentModeService.executeTool: scheduled runs of a visitor-marked sched
       expect(getSchedule).not.toHaveBeenCalled();
     });
   });
+
+  describe('ENG-3170 (final reviews): the browser of a scheduled run, and Meta writes', () => {
+    const BROWSER = 'playwright_browser_run_code';
+    const names = () => dispatch.mock.calls.map((c) => c[0] as string);
+    const loads = () => names().filter((n) => n === 'load_browser_cookies').length;
+
+    it('an UNMARKED schedule keeps its logins: the owner\'s saved cookies are loaded for its browser step, no profile is added', async () => {
+      scheduleWith(undefined);
+      await runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' });
+      expect(loads()).toBeGreaterThan(0);
+      const browserCall = dispatch.mock.calls.find((c) => c[0] === BROWSER)!;
+      expect(browserCall[2]).not.toHaveProperty('restrictionProfile');
+    });
+
+    it('a MARKED schedule: the browser step still runs, but it borrows no logins (and says why in its profile)', async () => {
+      marked();
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' })).resolves.toEqual({ ran: true });
+      expect(names()).toContain(BROWSER);
+      expect(loads()).toBe(0);
+      expect(dispatch.mock.calls.find((c) => c[0] === BROWSER)![2]).toMatchObject({ restrictionProfile: 'share_visitor_schedule' });
+    });
+
+    it('a schedule that cannot be read: the browser step still runs, without the owner\'s logins (a blip must not run a visitor\'s schedule as the owner)', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await expect(runWith(BROWSER, { isUnattendedRun: true }, { code: 'x' })).resolves.toEqual({ ran: true });
+      expect(names()).toContain(BROWSER);
+      expect(loads()).toBe(0);
+    });
+
+    it('an ATTENDED browser step is untouched: nothing about the schedule is read, the owner\'s logins load', async () => {
+      marked();
+      await runWith(BROWSER, {}, { code: 'x' });
+      expect(getSchedule).not.toHaveBeenCalled();
+      expect(loads()).toBeGreaterThan(0);
+    });
+
+    it('Meta: a MARKED schedule may read the ad account but not write to it (an unattended write is staged for an approver who is not the owner)', async () => {
+      marked();
+      const meta = (action: string) => runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action }));
+      await expect(meta('LIST')).resolves.toEqual({ ran: true });
+      await expect(meta('GET')).resolves.toEqual({ ran: true });
+      dispatch.mockClear();
+      for (const action of ['CREATE', 'UPDATE', 'PAUSE', 'ARCHIVE', 'COPY', 'RETAG_UTM']) {
+        await expect(meta(action)).rejects.toMatchObject({ deniedBy: 'restriction_profile', message: expect.stringContaining('set up or edited through a share link') });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it('Meta: an UNMARKED schedule (the owner\'s own) writes exactly as before; a visitor\'s own chat is not asked about it either', async () => {
+      scheduleWith(undefined);
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'CREATE' }))).resolves.toEqual({ ran: true });
+    });
+
+    it('Meta: a schedule that cannot be read refuses the WRITE of an unattended run (rather than assume it is the owner\'s)', async () => {
+      getSchedule.mockRejectedValue(new Error('throttled'));
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'CREATE' }))).rejects.toMatchObject({ deniedBy: 'restriction_profile' });
+      await expect(runWith('call_meta_marketing_api', { isUnattendedRun: true }, valid('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'LIST' }))).resolves.toEqual({ ran: true });
+    });
+  });
+
 });

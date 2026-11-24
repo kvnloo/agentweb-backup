@@ -8,8 +8,7 @@ import {
   restrictionRefusal,
   sensitiveActionRefusal,
   sensitiveActionScheduleRefusal,
-  sensitiveActionUnverifiableRefusal,
-} from '../services/toolRestrictionProfiles';
+  sensitiveActionUnverifiableRefusal, SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS, SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT, isSensitiveInVisitorScheduleCall } from '../services/toolRestrictionProfiles';
 import { AgentModeService, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 
 /**
@@ -68,6 +67,13 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       'create_image_task_from_prompt', 'generate_landing_page', 'duplicate_landing_page', 'create_skill', 'save_work_plan',
       'attach_knowledge_base_files', 'create_knowledge_base', 'create_html_template', 'create_book_outline', 'update_google_doc', 'update_google_sheet',
       'report_product_issues', 'write_clickup_doc', 'create_clickup_task', 'coding_agent', 'list_test_accounts', 'open_site_signin',
+      // the third review round: the mailbox is where a login code or reset link would be read from
+      'email',
+    ].sort());
+
+    expect([...SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS].sort()).toEqual([
+      'add_issue_comment', 'create_branch', 'create_issue', 'create_or_update_file', 'create_pull_request', 'create_pull_request_review', 'create_repository',
+      'delete_file', 'fork_repository', 'merge_pull_request', 'push_files', 'update_issue', 'update_pull_request_branch',
     ].sort());
   });
 
@@ -84,7 +90,6 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
   describe('a tool that mixes reads and writes is judged by its action', () => {
     const mixed: Array<[string, string[], string[]]> = [
       // tool, reads, writes
-      ['email', ['search', 'list', 'get'], ['send']],
       ['linkedin_outreach', ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'get-company', 'search-parameters', 'list-post-engagers'], ['send-invite', 'send-message', 'send-inmail', 'accept-invitation', 'cancel-invitation', 'withdraw-stale-invitations', 'set-daily-invite-cap', 'update-conversation-history']],
       ['linkedin_manage_post', ['list_comments', 'get_analytics'], ['repost', 'comment', 'react', 'delete_post']],
       ['twitter_manage_post', ['get_tweet_metrics', 'list_replies', 'get_retweeters', 'get_liking_users', 'get_quote_tweets'], ['reply', 'post_thread', 'quote_tweet', 'delete_tweet', 'like', 'unlike', 'retweet', 'unretweet']],
@@ -180,6 +185,34 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
     });
   });
 
+  describe('email is sensitive whatever its action: search and get read login codes and magic links out of the owner\'s mailbox', () => {
+    it.each(['search', 'list', 'get', 'send', '', undefined])('action %p', (action) => {
+      expect(isSensitiveToolCall('email', { action })).toBe(true);
+    });
+    it('and with no arguments at all', () => { expect(isSensitiveToolCall('email', undefined)).toBe(true); expect(isSensitiveToolCall('email', {})).toBe(true); });
+  });
+
+  describe('the tools that exist only at runtime (the per-user GitHub MCP server)', () => {
+    it('their write tools are sensitive by name, whatever the arguments; their reads are not listed', () => {
+      for (const tool of SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS) for (const args of [undefined, {}, { owner: 'o', repo: 'r' }]) expect(isSensitiveToolCall(tool, args)).toBe(true);
+      for (const read of ['get_file_contents', 'search_repositories', 'list_commits', 'get_issue', 'search_code', 'list_pull_requests']) expect(isSensitiveToolCall(read, {})).toBe(false);
+    });
+  });
+
+  describe('Meta writes are sensitive only in a run of a schedule a visitor wrote (an unattended run stages them for an approver who is not the owner)', () => {
+    const meta = (action: unknown) => isSensitiveInVisitorScheduleCall('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action });
+    it.each(['LIST', 'GET', 'SEARCH', 'PREVIEW', 'GET_MATCH_QUALITY', 'get_insights', ' list '])('the read action %p is allowed', (action) => expect(meta(action)).toBe(false));
+    it.each(['CREATE', 'UPDATE', 'PAUSE', 'RESUME', 'DELETE', 'ARCHIVE', 'COPY', 'RETAG_UTM', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'brand-new-action', '', undefined, 7, ['LIST']])('%p is sensitive (fail closed)', (action) => expect(meta(action)).toBe(true));
+    it('a missing argument object is sensitive, and no other tool is judged', () => {
+      expect(isSensitiveInVisitorScheduleCall('call_meta_marketing_api', undefined)).toBe(true);
+      expect(isSensitiveInVisitorScheduleCall('get_leads', { action: 'CREATE' })).toBe(false);
+      expect(isSensitiveInVisitorScheduleCall('constructor', {})).toBe(false);
+    });
+    it('it is NOT sensitive in a visitor\'s own chat (the rule that judges those calls does not know it)', () => {
+      expect(isSensitiveToolCall('call_meta_marketing_api', { entity_type: 'CAMPAIGN', action: 'CREATE' })).toBe(false);
+    });
+  });
+
   describe('a tool that reaches someone only when an argument is set', () => {
     it.each([
       ['google_calendar_create_event', 'attendees', ['a@example.com'], []],
@@ -194,6 +227,8 @@ describe('isSensitiveToolCall (what counts as sensitive)', () => {
       ['update_gtm_work_item', 'dri', 'someone@example.com', ''],
       ['update_gtm_plan', 'dri', 'someone@example.com', ''],
       ['update_gtm_phase', 'dri', 'someone@example.com', ''],
+      ['add_gtm_phase', 'dri', 'someone@example.com', ''],
+      ['create_gtm_plan', 'dri', 'someone@example.com', ''],
       ['create_schedule_from_template', 'email_notifications', ['someone@example.com'], []],
       ['submit_scheduled_chat_variables', 'trigger_run', true, false],
       ['create_work_plan', 'autocomplete', true, false],
@@ -261,7 +296,7 @@ describe('Full control: what depends on the link (owner, 2026-11-23: everything 
   });
 
   it('ordinary tools and tools judged by an argument are not whole-tool gated', () => {
-    for (const tool of ['read_brand_guidelines', 'list_leads', 'email', 'call_hubspot_api', 'google_calendar_create_event', 'unknown_tool', 'constructor']) {
+    for (const tool of ['read_brand_guidelines', 'list_leads', 'call_google_ads_api', 'call_hubspot_api', 'google_calendar_create_event', 'unknown_tool', 'constructor']) {
       expect({ tool, gated: isFullControlGatedWholeTool(tool) }).toEqual({ tool, gated: false });
     }
   });
@@ -313,7 +348,7 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   delete_memory: 'on the visitor block list',
   delete_org_memory: 'on the visitor block list',
   // protected another way
-  call_meta_marketing_api: 'every write halts into an approval deck; a visitor can answer it only on a link whose owner turned on Full control (the share route answers 403 otherwise)',
+  call_meta_marketing_api: 'in a visitor\'s own chat every write halts into an approval deck that only the owner can answer (the share route answers 403 otherwise); in a run of a schedule a visitor wrote it is refused (SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT)',
   manage_schedule_template: 'visitor writes are refused (ENG-2816)',
   // internal: nothing leaves the account, or nothing is lost
   find_or_lookup_email: 'a lookup',
@@ -355,9 +390,7 @@ const REVIEWED_NOT_SENSITIVE: Record<string, string> = {
   save_file: 'writes a file in the session\'s own workspace',
   // The exhaustive pass over every registered tool (2026-11-24). Mutating, and judged NOT to break the promise (each verified in the code):
   add_gtm_common_items: 'database writes only, no notification (a `dri` set inside items is a known limit: the update tools and the work-item tool carry the rule)',
-  add_gtm_phase: 'database write only, no notification (see add_gtm_common_items)',
   add_gtm_work_items: 'database write only, no notification (see add_gtm_common_items)',
-  create_gtm_plan: 'database write only, no notification',
   add_lead_engagement: 'writes one custom.* event on a lead',
   assign_lead: 'a label on the lead; the previous value is logged; it grants no access',
   compose_video: 'output is saved to AgentWeb storage and returned to the chat',
@@ -426,6 +459,15 @@ describe('the sensitive list against the real tool registry', () => {
   it('every tool named in the sensitive list exists (a renamed tool must not leave a name that protects nothing)', () => {
     const missing = [...SHARE_VISITOR_SENSITIVE_TOOLS, ...Object.keys(SHARE_VISITOR_SENSITIVE_BY_ARGUMENT)].filter((name) => !tools.has(name));
     expect(missing).toEqual([]);
+  });
+
+  it('the runtime (GitHub MCP) tool names never shadow a tool of ours, and the schedule-only Meta rule names a tool and an argument that exist', () => {
+    expect([...SHARE_VISITOR_SENSITIVE_RUNTIME_TOOLS].filter((name) => tools.has(name))).toEqual([]);
+    const props = schemaOf(tools.get('call_meta_marketing_api'))?.properties ?? {};
+    for (const [name, rule] of Object.entries(SHARE_VISITOR_SCHEDULE_ONLY_SENSITIVE_BY_ARGUMENT)) {
+      expect(tools.has(name)).toBe(true);
+      if (rule.kind === 'action') expect(Object.keys(props)).toContain(rule.argument);
+    }
   });
 
   it('every argument a rule reads exists in that tool\'s input schema', () => {
