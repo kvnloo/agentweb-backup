@@ -44,6 +44,8 @@ export interface LinkedInTokenDeps {
   loadOAuthConfig: () => Promise<{ clientId: string; clientSecret: string }>;
   refresh: (refreshToken: string, clientId: string, clientSecret: string) => Promise<{ access_token: string; refresh_token?: string; expires_in: number }>;
   saveTokens: (ownerUserId: string, accountId: string, tokens: { access_token: string; refresh_token?: string; token_expires_at: number }) => Promise<void>;
+  /** Reads the stored account row again (null when it is gone). Optional so a caller can leave the re-read out. */
+  reload?: (ownerUserId: string, accountId: string) => Promise<ConnectedAccount | null>;
 }
 
 export const defaultLinkedInTokenDeps: LinkedInTokenDeps = {
@@ -52,6 +54,10 @@ export const defaultLinkedInTokenDeps: LinkedInTokenDeps = {
   refresh: async (refreshToken, clientId, clientSecret) => (await import('./linkedInAdsService')).refreshAccessToken(refreshToken, clientId, clientSecret),
   saveTokens: async (ownerUserId, accountId, tokens) => {
     await (await import('./connectedAccountsDb')).updateAccountTokens(ownerUserId, 'linkedin_ads', tokens, accountId);
+  },
+  reload: async (ownerUserId, accountId) => {
+    const rows = await (await import('./connectedAccountsDb')).getAccountsByUserId(ownerUserId);
+    return rows.find((a) => a.platform === 'linkedin_ads' && a.account_id === accountId) ?? null;
   },
 };
 
@@ -66,6 +72,20 @@ const inFlight = new Map<string, Promise<string>>();
 /** Test hook: forget refreshes in flight. */
 export function resetLinkedInRefreshesForTests() {
   inFlight.clear();
+}
+
+/** The stored access token if another refresh replaced ours and it is still good; otherwise null. Never throws. */
+async function reloadedToken(ownerUserId: string, accountId: string, staleAccessToken: string, deps: LinkedInTokenDeps): Promise<string | null> {
+  try {
+    const row = deps.reload ? await deps.reload(ownerUserId, accountId) : null;
+    const fresh: any = row?.config;
+    if (fresh?.access_token && String(fresh.access_token) !== staleAccessToken && typeof fresh.token_expires_at === 'number' && fresh.token_expires_at > deps.now() + LINKEDIN_TOKEN_REFRESH_BUFFER_MS) {
+      return String(fresh.access_token);
+    }
+  } catch {
+    /* an unreadable row is the same as an unchanged one */
+  }
+  return null;
 }
 
 const RECONNECT = 'The LinkedIn Ads connection has expired or was revoked and could not be renewed. Reconnect LinkedIn Ads.';
@@ -98,7 +118,13 @@ export async function getFreshLinkedInAdsToken(
         // Status only: an axios error carries the request (with the client secret) and must never be logged or returned.
         const status = Number(error?.response?.status);
         console.error('[linkedin-ads-toolkit] token refresh failed', Number.isFinite(status) && status > 0 ? `status ${status}` : 'no response');
-        if (status === 400 || status === 401) throw new LinkedInConnectionError('reconnect', RECONNECT);
+        if (status === 400 || status === 401) {
+          // Another request or instance may have refreshed first and used up (rotated) the refresh token we hold.
+          // Before asking the customer to reconnect, read the row once: if its tokens changed and are good, use them.
+          const newer = await reloadedToken(ownerUserId, account.account_id, String(cfg.access_token ?? ''), deps);
+          if (newer) return newer;
+          throw new LinkedInConnectionError('reconnect', RECONNECT);
+        }
         throw new LinkedInConnectionError('temporary', 'LinkedIn could not renew the connection just now. Try again shortly.');
       }
       try {
